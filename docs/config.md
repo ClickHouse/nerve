@@ -1407,7 +1407,20 @@ Notifications go to the same conversation as in Socket Mode
 answers the notification only in the conversation where it was delivered,
 and the card then shows the answer without buttons. A press that answers
 nothing, for example a second press, gets a short notice and the card stays.
-An expired card is edited without buttons. `/nerve` commands, including the host commands
+An expired card is edited without buttons.
+
+When the config names no conversation, Nerve sends the card through the
+gateway's `notify` operation. The gateway posts it in the agent's
+notification channel, which an administrator sets in the hosted platform's
+console. That channel must allow posts in the agent's Slack access rules, and
+the agent's Slack app must be a member of it. A conversation in the config
+takes precedence. Nerve uses `notify` only when exactly one connection
+advertises it. A gateway that does not advertise it gets no card, and Nerve
+logs no warning about the missing `notifications.slack_channel_id`. When the
+console sets no notification channel, the gateway refuses the card, and Nerve
+logs a warning for each card.
+
+`/nerve` commands, including the host commands
 `doctor` and `restart`, are not available in hosted mode; `nerve doctor`
 reports this and the local settings that still apply.
 
@@ -1667,7 +1680,9 @@ list every transport you want. A name nothing delivers to is skipped with a
 warning. Slack in the list costs nothing while Slack is off.
 
 Names and globs are not resolved for the `slack_channel_id` fallback. Without
-a literal channel ID, delivery is skipped with a warning.
+a literal channel ID, delivery is skipped with a warning. In
+[hosted mode](#hosted-mode), the channel gateway can post the card in the
+notification channel set in the console instead, so there is no warning.
 
 ### Outbound Slack message tool
 

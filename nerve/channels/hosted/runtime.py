@@ -11,6 +11,7 @@ per event, so it follows a reload.
 
 from __future__ import annotations
 
+import functools
 import logging
 import uuid
 from typing import TYPE_CHECKING, Any, Callable
@@ -229,12 +230,19 @@ def _identifier_test(provider: str) -> Callable[[str], bool] | None:
 
 
 def _notification_rules(provider: str) -> dict[str, Any]:
-    """How a provider chooses its notification conversation and button styles."""
+    """How a provider chooses its notification conversation and button styles.
+
+    A config that names no Slack conversation is not a problem in hosted
+    mode, because the gateway can choose one, so that case logs no warning.
+    """
     if provider == "slack":
         from nerve.channels.slack import notification_target
         from nerve.channels.slack_presentation import approval_style
 
-        return {"notification_target": notification_target, "button_style": approval_style}
+        return {
+            "notification_target": functools.partial(notification_target, warn_unset=False),
+            "button_style": approval_style,
+        }
     return {}
 
 

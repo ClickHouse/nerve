@@ -525,6 +525,17 @@ class SendOperation:
 
 
 @_record
+class NotifyOperation:
+    """Content for the agent's notification conversation.
+
+    The control plane sets that conversation, and the gateway chooses it.
+    Nerve names no conversation.
+    """
+
+    content: tuple[ContentPart, ...] = ()
+
+
+@_record
 class EditOperation:
     target: MessageTarget = struct(MessageTarget)
     content: tuple[ContentPart, ...] = ()
@@ -590,6 +601,7 @@ class Operation:
     kind: str = ""
     deadline_millis: int = 0
     send: SendOperation | None = omit_empty(None)
+    notify: NotifyOperation | None = omit_empty(None)
     edit: EditOperation | None = omit_empty(None)
     delete: DeleteOperation | None = omit_empty(None)
     reaction: ReactionOperation | None = omit_empty(None)
@@ -628,6 +640,10 @@ def validate_operation_result(operation: Operation, result: OperationResult) -> 
         return
     if operation.kind == "send" and result.target is None:
         malformed("successful send has no message target")
+    # The gateway chooses the conversation of a notify, so Nerve reads it
+    # from the target.
+    if operation.kind == "notify" and (result.target is None or not result.target.conversation.id):
+        malformed("successful notify has no message target in a conversation")
     if operation.kind == "file_read" and result.transfer is None:
         malformed("successful file read has no transfer")
 

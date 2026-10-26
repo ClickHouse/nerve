@@ -11,7 +11,9 @@ parts, reactions and the typing mark, the send tool allowed and refused,
 rate-limited, ambiguous, unavailable, and unsupported operations, a stream
 that closes during an operation, late results, and the in-flight operation
 limit. Also file uploads and attachment reads through transfers, the checks
-on read transfers, and notification cards with their answers and expiry.
+on read transfers, and notification cards with their answers and expiry, in
+the conversation that the config names or, through ``notify``, in the one
+that the gateway chooses.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -48,7 +51,9 @@ from nerve.channels.hosted.runtime import HostedChannelRuntime
 from nerve.gateway import server as gateway_server
 
 from tests.fake_channel_gateway import (
+    CAPABILITIES,
     CONNECTION_ID,
+    NOTIFICATION_CONVERSATION,
     FakeChannelGateway,
     NerveServer,
     message_event,
@@ -1073,3 +1078,140 @@ class TestNotifications:
 
         assert posted is None
         assert noticed.gateway.sent_operations("send") == []
+
+
+NOTIFY_OPERATIONS = [*CAPABILITIES["operations"], "notify"]
+FIRST_MESSAGE_ID = "1700009000.000001"
+
+
+@pytest_asyncio.fixture
+async def unaddressed(tmp_path, db, monkeypatch, caplog):
+    """A hosted agent whose config names no notification conversation."""
+    caplog.set_level(logging.DEBUG)
+    harness = await start_hosted(tmp_path, db, monkeypatch, notifications=True)
+    await db.create_session("s1", actor=None)
+    try:
+        yield harness
+    finally:
+        await stop_hosted(harness)
+
+
+async def notify_stream(hosted: Hosted, operations: list[str] = NOTIFY_OPERATIONS):
+    """A stream whose connection advertises *operations*, ready to send."""
+    stream = await hosted.stream(advertise=False)
+    await stream.advertise(operations=operations)
+    await hosted.gateway.wait_for(lambda: hosted.runtime.streams.connections("send"))
+    return stream
+
+
+async def notify_card(hosted: Hosted) -> str:
+    """Ask a yes-or-no question and return its ID, once its notify is sent."""
+    asked = await hosted.notifications.ask_question(
+        session_id="s1", title="Deploy now?", options=["yes", "no"],
+    )
+    await hosted.gateway.wait_for(lambda: hosted.gateway.sent_operations("notify"))
+    return asked["notification_id"]
+
+
+class TestGatewayNotificationConversation:
+    async def test_a_conversation_in_the_config_wins_over_notify(self, unaddressed):
+        unaddressed.config.notifications.slack_channel_id = TOOL_TARGET
+        await notify_stream(unaddressed)
+
+        posted = await unaddressed.runtime.channels["slack"].post_notification(
+            "n1", "Deploy now?", [("Yes", "yes")],
+        )
+
+        assert posted == (TOOL_TARGET, FIRST_MESSAGE_ID)
+        [card] = unaddressed.gateway.sent_operations("send")
+        assert card["destination"] == {"conversation": {"id": TOOL_TARGET}}
+        assert unaddressed.gateway.sent_operations("notify") == []
+
+    async def test_without_one_the_card_goes_through_notify(self, unaddressed, caplog):
+        await notify_stream(unaddressed)
+
+        notification_id = await notify_card(unaddressed)
+
+        [record] = records(unaddressed, "notify")
+        assert set(record["operation"]) == {"kind", "deadline_millis", "notify"}
+        card = record["operation"]["notify"]
+        assert set(card) == {"content"}
+        assert "Deploy now?" in text_of(card["content"])
+        elements = card["content"][-1]["actions"]["elements"]
+        assert [(e["action_id"], e.get("style")) for e in elements] == [
+            (f"notif:{notification_id}:yes", "primary"),
+            (f"notif:{notification_id}:no", "danger"),
+        ]
+        assert unaddressed.gateway.sent_operations("send") == []
+        delivery = await unaddressed.db.get_latest_notification_delivery(notification_id, "slack")
+        assert (delivery["target"], str(delivery["message_id"])) == (NOTIFICATION_CONVERSATION, FIRST_MESSAGE_ID)
+        assert "No notifications.slack_channel_id" not in caplog.text
+
+    async def test_a_press_in_the_gateways_conversation_answers_the_card(self, unaddressed):
+        stream = await notify_stream(unaddressed)
+        notification_id = await notify_card(unaddressed)
+
+        inbox_id = unaddressed.gateway.store(interaction_event(
+            f"notif:{notification_id}:yes", message_id=FIRST_MESSAGE_ID, conversation=NOTIFICATION_CONVERSATION,
+        ))
+        await stream.nudge("invoke")
+
+        assert (await unaddressed.acknowledged(inbox_id))[inbox_id] == "accepted"
+        await unaddressed.gateway.wait_for(lambda: unaddressed.gateway.sent_operations("interaction"))
+        [update] = unaddressed.gateway.sent_operations("interaction")
+        assert update["response"] == "update"
+        assert "Deploy now?" in text_of(update["content"])
+        assert "✅ Answered: yes" in text_of(update["content"])
+        notification = await unaddressed.db.get_notification(notification_id)
+        assert (notification["status"], notification["answer"]) == ("answered", "yes")
+
+    async def test_expiry_edits_the_card_in_the_gateways_conversation(self, unaddressed):
+        await notify_stream(unaddressed)
+        notification_id = await notify_card(unaddressed)
+        past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        await unaddressed.db.update_notification(notification_id, expires_at=past)
+
+        assert await unaddressed.notifications.expire_stale() == 1
+
+        await unaddressed.gateway.wait_for(lambda: unaddressed.gateway.sent_operations("edit"))
+        [edit] = unaddressed.gateway.sent_operations("edit")
+        assert edit["target"] == {
+            "conversation": {"id": NOTIFICATION_CONVERSATION}, "message": {"id": FIRST_MESSAGE_ID},
+        }
+        assert "Expired unanswered" in text_of(edit["content"])
+        assert not any(part["kind"] == "actions" for part in edit["content"])
+
+    async def test_a_gateway_without_notify_gets_no_card(self, unaddressed, caplog):
+        await notify_stream(unaddressed, CAPABILITIES["operations"])
+
+        posted = await unaddressed.runtime.channels["slack"].post_notification("n1", "Deploy now?")
+
+        assert posted is None
+        assert unaddressed.gateway.operations == []
+        assert "No notifications.slack_channel_id" not in caplog.text
+
+    async def test_a_refused_notify_gives_no_card_and_one_warning(self, unaddressed, caplog):
+        unaddressed.gateway.notification_conversation = ""
+        await notify_stream(unaddressed)
+
+        posted = await unaddressed.runtime.channels["slack"].post_notification("n1", "Deploy now?")
+
+        assert posted is None
+        assert len(records(unaddressed, "notify")) == 1
+        warnings = [record for record in caplog.records if record.levelno == logging.WARNING]
+        assert [record.getMessage() for record in warnings] == [
+            "Hosted slack notification n1 was not posted: notify operation forbidden (invalid_target)",
+        ]
+
+    async def test_several_connections_with_notify_get_no_card(self, unaddressed, caplog):
+        stream = await notify_stream(unaddressed)
+        await stream.advertise(connection_id=str(uuid.uuid4()), operations=NOTIFY_OPERATIONS)
+        await unaddressed.gateway.wait_for(
+            lambda: len(unaddressed.runtime.streams.connections("notify")) == 2,
+        )
+
+        posted = await unaddressed.runtime.channels["slack"].post_notification("n1", "Deploy now?")
+
+        assert posted is None
+        assert unaddressed.gateway.operations == []
+        assert "several slack connections advertise notify" in caplog.text

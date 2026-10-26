@@ -54,6 +54,7 @@ from nerve.channels.hosted.contract.model import (
     MessageContainer,
     MessageReference,
     MessageTarget,
+    NotifyOperation,
     Reaction,
     ReactionOperation,
     SendOperation,
@@ -242,6 +243,20 @@ class TestOperationResults:
         assert self.refused(self.READ, kind="file_read", outcome="succeeded") == "malformed_frame"
         validate_operation_result(self.SEND, self.result(kind="send", outcome="forbidden"))
 
+    def test_a_successful_notify_names_the_conversation_that_the_gateway_chose(self):
+        notify = Operation(kind="notify", deadline_millis=30000, notify=NotifyOperation())
+        target = {"conversation": {"id": "C0NOTICES"}, "message": {"id": "1.2"}}
+
+        result = self.result(kind="notify", outcome="succeeded", target=target)
+        validate_operation_result(notify, result)
+        assert (result.target.conversation.id, result.target.message.id) == ("C0NOTICES", "1.2")
+        assert self.refused(notify, kind="notify", outcome="succeeded") == "malformed_frame"
+        assert self.refused(
+            notify, kind="notify", outcome="succeeded", target={"message": {"id": "1.2"}},
+        ) == "malformed_frame"
+        assert self.refused(notify, kind="send", outcome="succeeded", target=target) == "scope_mismatch"
+        validate_operation_result(notify, self.result(kind="notify", outcome="forbidden", reason_code="invalid_target"))
+
     def test_results_and_transfers_name_their_connection(self):
         assert reason(frame("operation_result", {"kind": "send", "outcome": "forbidden"})) == "scope_mismatch"
         assert reason(frame("transfer", {"transfer_id": "t", "total_bytes": 1, "data": "AA=="})) == "scope_mismatch"
@@ -310,6 +325,17 @@ SENT: list[tuple[str, Any, dict[str, Any]]] = [
             }]}},
         ],
     }}),
+    ("operation", Operation(kind="notify", deadline_millis=10000, notify=NotifyOperation(content=(
+        ContentPart(kind="text", text=TextContent(format="markdown", body="Deploy now?")),
+        ContentPart(kind="actions", actions=ActionsContent(elements=(
+            ActionElement(kind="button", action_id="notif:n1:yes", label="Yes", value="yes"),
+        ))),
+    ))), {"kind": "notify", "deadline_millis": 10000, "notify": {"content": [
+        {"kind": "text", "text": {"format": "markdown", "body": "Deploy now?"}},
+        {"kind": "actions", "actions": {"elements": [
+            {"kind": "button", "action_id": "notif:n1:yes", "label": "Yes", "value": "yes"},
+        ]}},
+    ]}}),
     ("operation", Operation(kind="edit", deadline_millis=30000, edit=EditOperation(
         target=MESSAGE, content=(ContentPart(kind="text", text=TextContent(format="markdown", body="Done")),),
     )), {"kind": "edit", "deadline_millis": 30000, "edit": {

@@ -186,11 +186,23 @@ class TestDoctor:
         assert "[WARN] slack.commands enables restart, but host commands are not available" in report
         assert "[WARN] slack.deny_channels has a rule that is not a conversation id" in report
 
-    def test_hosted_mode_warns_without_a_notification_conversation(self):
-        report = doctor_report(hosted_config())
+    def test_hosted_mode_lets_the_gateway_choose_the_notification_conversation(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            report = doctor_report(hosted_config())
 
         assert "[--] Slack send tool off" in report
-        assert "[WARN] Slack notifications have no conversation" in report
+        assert "[--] Slack notifications: the config names no conversation; the gateway" in report
+        assert "notification channel set in the console" in report
+        assert "[WARN] Slack notifications" not in report
+        assert "No notifications.slack_channel_id is set" not in caplog.text
+
+    def test_hosted_mode_warns_about_a_notification_conversation_that_is_not_an_id(self):
+        config = hosted_config()
+        config.notifications.slack_channel_id = "#deployments"
+
+        report = doctor_report(config)
+
+        assert "[WARN] notifications.slack_channel_id is not a Slack conversation id" in report
 
     @pytest.mark.parametrize(("source", "line"), [
         ({}, "[--] Slack channel source off (slack.source.enabled is false)"),
