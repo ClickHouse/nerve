@@ -1649,10 +1649,14 @@ def _hosted_github_lines(config, errors: list[str], warnings: list[str]) -> list
     from nerve.channels.hosted.auth import KeyFileError, read_key_file
 
     lines: list[str] = []
+    watching = config.sync.github_repos.enabled and bool(config.sync.github_repos.repos)
     if not github.enabled:
         lines.append(
             "[--] GitHub is hosted but switched off (sync.github.enabled is false); "
-            "the gateway is told that this agent subscribes to nothing"
+            + (
+                "the gateway is told that this agent takes no notifications"
+                if watching else "the gateway is told that this agent subscribes to nothing"
+            )
         )
     hosted = config.channels.hosted
     problems = hosted.problems()
@@ -1669,13 +1673,46 @@ def _hosted_github_lines(config, errors: list[str], warnings: list[str]) -> list
             f"published from sync.github, PR watch {'on' if github.pr_watch else 'off'}, "
             f"inbox {github.inbox}"
         )
-    if github.enabled and config.slack.mode == "hosted" and not config.slack.enabled:
+    if (
+        (github.enabled or config.sync.github_repos.enabled)
+        and config.slack.mode == "hosted" and not config.slack.enabled
+    ):
         warnings.append(
             "[WARN] Slack is hosted but switched off (slack.enabled is false): Nerve "
             "reads nothing from the channel gateway until it is switched on, so the "
             "hosted GitHub records wait there too"
         )
     return lines
+
+
+def _github_repos_lines(config, warnings: list[str]) -> list[str]:
+    """The doctor line of the repository watch (``sync.github_repos``).
+
+    Its mode follows ``sync.github.mode``: the channel gateway polls the
+    repositories when GitHub is hosted, gh on this machine otherwise. The
+    line says so, with the number of repositories, the types, and whether
+    updates are reported.
+    """
+    watch = config.sync.github_repos
+    if not watch.enabled:
+        return ["[--] GitHub repository watch off (sync.github_repos.enabled is false)"]
+    if not watch.repos:
+        warnings.append(
+            "[WARN] GitHub repository watch is on but sync.github_repos.repos is empty, "
+            "so it watches nothing"
+        )
+        return []
+    how = (
+        "mode hosted, the channel gateway polls" if config.sync.github.mode == "hosted"
+        else "mode poll, gh on this machine"
+    )
+    count = len(watch.repos)
+    line = (
+        f"[OK] GitHub repository watch ({how}): {count} "
+        f"{'repository' if count == 1 else 'repositories'}; types {', '.join(watch.types)}; "
+        f"updates {'on' if watch.updates else 'off'}"
+    )
+    return [line]
 
 
 def _source_suffix(config, path: str) -> str:
@@ -2168,6 +2205,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     else:
         lines.append("[--] Slack disabled")
     lines.extend(_hosted_github_lines(config, errors, warnings))
+    lines.extend(_github_repos_lines(config, warnings))
 
     # Check SSL
     if config.gateway.ssl.enabled:

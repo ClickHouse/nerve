@@ -50,8 +50,14 @@ def _norm(value: object) -> str:
     return str(value).strip().lower()
 
 
-def _matches_any(value: str, patterns: list[str]) -> bool:
-    """Case-insensitive shell-glob match of *value* against any pattern."""
+def matches_any(value: object, patterns: list[str]) -> bool:
+    """Case-insensitive shell-glob match of *value* against any pattern.
+
+    The guardrail rules, for a source that applies them itself (the GitHub
+    Repos source's ``deny_authors``): both sides are stripped and lowered,
+    then matched with :func:`fnmatch.fnmatchcase`, so ``[...]`` is a
+    character class.
+    """
     norm_value = _norm(value)
     return any(fnmatch.fnmatchcase(norm_value, _norm(p)) for p in patterns)
 
@@ -102,14 +108,14 @@ class FieldRule:
         values = self._values(record)
 
         # deny wins — drop on any deny match.
-        if self.deny and any(_matches_any(v, self.deny) for v in values):
+        if self.deny and any(matches_any(v, self.deny) for v in values):
             return False
 
         # allow gate — when set, require a match. An absent field fails closed.
         if self.allow:
             if not values:
                 return False
-            return any(_matches_any(v, self.allow) for v in values)
+            return any(matches_any(v, self.allow) for v in values)
 
         return True
 

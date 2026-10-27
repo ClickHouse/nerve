@@ -5,6 +5,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+# A source cursor is opaque, and it can be long: the GitHub Repos source keeps
+# JSON state in its cursor. Log lines and the agent's source tools show it cut
+# to this many characters, with its length.
+MAX_CURSOR_DISPLAY_CHARS = 120
+
+
+def cursor_text(cursor: str | None) -> str:
+    """*cursor* for a log line or a listing: as it is, or cut, with its length."""
+    if cursor is None or len(cursor) <= MAX_CURSOR_DISPLAY_CHARS:
+        return str(cursor)
+    return f"{cursor[:MAX_CURSOR_DISPLAY_CHARS]}… ({len(cursor)} chars)"
+
 
 @dataclass
 class SourceRecord:

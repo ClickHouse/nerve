@@ -515,13 +515,13 @@ GH_HOSTED_HINT = (
 def gh_needed(config: NerveConfig) -> bool:
     """Whether something in *config* runs the gh CLI.
 
-    Hosted GitHub (``sync.github.mode: hosted``) does not; the GitHub events
-    and repos sources still do.
+    Hosted GitHub (``sync.github.mode: hosted``) does not, the repository
+    watch (``github_repos``) included; the GitHub events source still does.
     """
     sync = config.sync
     if sync.github.mode != "hosted":
         return True
-    return bool(sync.github_events.enabled or sync.github_repos.enabled)
+    return bool(sync.github_events.enabled)
 
 #: The GitHub CLI probe's hint when ``gh auth status`` timed out or could not run.
 GH_NO_ANSWER = "gh auth status did not answer."

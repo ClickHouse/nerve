@@ -10,6 +10,7 @@ A frame that fails a check closes its stream.
 from __future__ import annotations
 
 import dataclasses
+import re
 import unicodedata
 import uuid
 from datetime import datetime, timezone
@@ -66,6 +67,14 @@ MAX_SUBSCRIPTION_PATTERNS = 256
 MAX_SUBSCRIPTION_PATTERN_BYTES = 256
 # The inboxes that a source subscription may name; empty means participating.
 SUBSCRIPTION_INBOXES = ("", "participating", "all")
+# The provider whose subscription names repositories to watch, and only it.
+REPO_WATCH_PROVIDER = "github_repos"
+# Such a subscription names 1 to this many repositories, each once.
+MAX_REPO_WATCHES = 50
+# What a watched repository may report.
+REPO_WATCH_TYPES = ("pull_request", "issue", "release")
+# A repository as GitHub names it: owner/name.
+_REPO_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_.-]{1,100}")
 # A provider name is a lowercase token of at most this many bytes.
 MAX_PROVIDER_BYTES = 64
 _PROVIDER_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-.")
@@ -108,6 +117,15 @@ def valid_pattern(pattern: str) -> bool:
         and byte_length(pattern) <= MAX_SUBSCRIPTION_PATTERN_BYTES
         and not any(unicodedata.category(character) == "Cc" for character in pattern)
     )
+
+
+def valid_repo_name(name: str) -> bool:
+    """Whether the gateway takes *name* as a watched repository.
+
+    An ``owner/repo`` name as GitHub writes them, whose repository part is
+    not ``.`` or ``..``.
+    """
+    return _REPO_NAME.fullmatch(name) is not None and name.split("/", 1)[1] not in (".", "..")
 
 
 def valid_provider(provider: str) -> bool:
@@ -743,6 +761,28 @@ class SourceFilters:
 
 
 @_record
+class RepoWatch:
+    """One repository that the ``github_repos`` source follows.
+
+    ``types`` names what is reported (:data:`REPO_WATCH_TYPES`). A pull
+    request or an issue that a GitHub App or a ``[bot]`` account opened is
+    reported only with ``include_bots``; a release is reported whoever
+    published it. An item whose author's login matches a ``deny_authors``
+    glob never is. Without ``include_drafts`` a draft pull
+    request is reported when it becomes ready for review, and with
+    ``updates`` a reported pull request is reported again when its head
+    commit, its draft state or its state changes. Every member is sent.
+    """
+
+    name: str = ""
+    types: tuple[str, ...] = ()
+    include_bots: bool = False
+    include_drafts: bool = False
+    updates: bool = False
+    deny_authors: tuple[str, ...] = ()
+
+
+@_record
 class SourceSubscription:
     """What the agent takes from one provider's hosted source.
 
@@ -751,12 +791,18 @@ class SourceSubscription:
     lists: ``all`` for the account's whole inbox, ``participating`` or empty
     for the threads it takes part in. Nerve sends it only as ``all``, so the
     frame of an agent that keeps the default is unchanged.
+
+    ``repos`` are the repositories that the ``github_repos`` provider
+    watches. Only that provider carries them, and it carries no filters,
+    ``pr_watch`` or ``inbox``. Nerve sends it only while the repository watch
+    is switched on, so every other frame is unchanged.
     """
 
     provider: str = ""
     filters: SourceFilters = struct(SourceFilters)
     pr_watch: bool = omit_empty(False)
     inbox: str = omit_empty("")
+    repos: tuple[RepoWatch, ...] = omit_empty(())
 
 
 @_record
@@ -774,8 +820,9 @@ class Subscriptions:
         """Check what the gateway checks, before Nerve sends it.
 
         The version, the number of sources, each provider name and that no
-        provider appears twice, each inbox, and the bounds of every filter
-        list.
+        provider appears twice, each inbox, the bounds of every filter list,
+        and the watched repositories, which only ``github_repos`` names (see
+        :func:`_validate_repo_watches`).
         """
         if self.version != SUBSCRIPTIONS_VERSION:
             reject(RejectionReason.VERSION_UNSUPPORTED, f"unknown subscriptions version {self.version!r}")
@@ -795,23 +842,78 @@ class Subscriptions:
             if source.inbox not in SUBSCRIPTION_INBOXES:
                 malformed("source subscription inbox is not 'participating' or 'all'")
             for patterns in source.filters.pattern_lists().values():
-                if len(patterns) > MAX_SUBSCRIPTION_PATTERNS:
-                    reject(RejectionReason.LIMIT_EXCEEDED, "source filter has too many patterns")
-                if not all(valid_pattern(pattern) for pattern in patterns):
-                    reject(
-                        RejectionReason.LIMIT_EXCEEDED,
-                        "source filter pattern is empty, too long, or has a control character",
-                    )
+                _validate_patterns(patterns, "source filter")
+            if source.provider == REPO_WATCH_PROVIDER:
+                _validate_repo_watches(source)
+            elif source.repos:
+                malformed(f"only a {REPO_WATCH_PROVIDER} subscription names repositories")
 
     def without_filters(self) -> Subscriptions:
         """The same sources with no filter patterns.
 
         The gateway then keeps every record of those sources, and Nerve's own
-        inbox filter is the only one that drops records.
+        inbox filter is the only one that drops records. A watched
+        repository's ``deny_authors`` are filter patterns too.
         """
         return dataclasses.replace(self, sources=tuple(
-            dataclasses.replace(source, filters=SourceFilters()) for source in self.sources
+            dataclasses.replace(
+                source,
+                filters=SourceFilters(),
+                repos=tuple(dataclasses.replace(repo, deny_authors=()) for repo in source.repos),
+            )
+            for source in self.sources
         ))
+
+
+def _validate_patterns(patterns: tuple[str, ...], what: str) -> None:
+    """The bounds of one pattern list: its length and each pattern."""
+    if len(patterns) > MAX_SUBSCRIPTION_PATTERNS:
+        reject(RejectionReason.LIMIT_EXCEEDED, f"{what} has too many patterns")
+    if not all(valid_pattern(pattern) for pattern in patterns):
+        reject(
+            RejectionReason.LIMIT_EXCEEDED,
+            f"{what} pattern is empty, too long, or has a control character",
+        )
+
+
+def _validate_repo_watches(source: SourceSubscription) -> None:
+    """Check a ``github_repos`` subscription as the gateway does.
+
+    It names 1 to :data:`MAX_REPO_WATCHES` repositories, each an
+    ``owner/repo`` name (:func:`valid_repo_name`) and each once, ignoring
+    case; every one reports one or more of :data:`REPO_WATCH_TYPES`, each
+    once, and has at most :data:`MAX_SUBSCRIPTION_PATTERNS` ``deny_authors``
+    that a filter list would take. It carries no filters, ``pr_watch`` or
+    ``inbox``.
+    """
+    if any(source.filters.pattern_lists().values()) or source.pr_watch or source.inbox:
+        malformed(f"a {REPO_WATCH_PROVIDER} subscription carries filters, pr_watch or an inbox")
+    if not source.repos:
+        malformed(f"a {REPO_WATCH_PROVIDER} subscription names no repository")
+    if len(source.repos) > MAX_REPO_WATCHES:
+        reject(
+            RejectionReason.LIMIT_EXCEEDED,
+            f"a {REPO_WATCH_PROVIDER} subscription names too many repositories",
+        )
+    names: set[str] = set()
+    for repo in source.repos:
+        if not valid_repo_name(repo.name):
+            malformed("a watched repository is not an owner/repo name")
+        if repo.name.lower() in names:
+            malformed(f"a {REPO_WATCH_PROVIDER} subscription repeats a repository")
+        names.add(repo.name.lower())
+        for kind in repo.types:
+            if kind not in REPO_WATCH_TYPES:
+                reject(RejectionReason.KIND_UNSUPPORTED, f"a watched repository reports {kind!r}")
+        if not repo.types or len(set(repo.types)) < len(repo.types):
+            malformed("a watched repository reports no type, or one twice")
+        if len(repo.deny_authors) > MAX_SUBSCRIPTION_PATTERNS:
+            reject(RejectionReason.LIMIT_EXCEEDED, "a watched repository has too many deny_authors")
+        if not all(valid_pattern(pattern) for pattern in repo.deny_authors):
+            malformed(
+                "a watched repository's deny_authors pattern is empty, too long, or has a "
+                "control character"
+            )
 
 
 # ---------------------------------------------------------------------- #

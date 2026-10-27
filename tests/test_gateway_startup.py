@@ -303,9 +303,11 @@ async def test_hosted_source_deliveries_are_handed_to_the_cron_service(harness, 
     async with harness["server"].lifespan(MagicMock()):
         runtime = harness["server"]._hosted_channels
         cron = harness["server"]._cron_service
-        assert runtime is not None and set(runtime.sources) == {"github"}
+        # GitHub is hosted as a whole: the repository watch comes with it.
+        assert runtime is not None and set(runtime.sources) == {"github", "github_repos"}
         assert isinstance(cron, Cron)
         assert runtime.sources["github"]._listener == cron.on_source_delivered
+        assert runtime.sources["github_repos"]._listener == cron.on_source_delivered
 
 
 @pytest.mark.asyncio

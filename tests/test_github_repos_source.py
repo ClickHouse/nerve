@@ -1,200 +1,1001 @@
-"""Unit tests for :class:`GitHubReposSource`.
+"""The GitHub Repos source in poll mode: what is new in repositories the agent follows.
 
-The source watches a configured set of repos and surfaces newly-created issues
-and PRs. These tests stub the ``_gh_api_get`` call (no network / no gh CLI) and
-exercise the cursor semantics, issue-vs-PR classification, and error isolation.
+A fake ``gh api`` serves the pulls, issues and releases listings of a few
+repositories, newest change first as GitHub does; each test lists once for the
+baseline, changes the repositories, and lists again. The records are pinned to
+the shape the channel gateway builds for the hosted mode (same id, type,
+summary, content, timestamp and metadata), so that the guardrails, the gates
+and the agent see the same thing in both modes.
 """
 
 from __future__ import annotations
 
+import copy
+import json
+import logging
 import re
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 
-from nerve.sources.github_repos import GitHubReposSource
+from nerve.channels.hosted.contract import MetadataEntry
+from nerve.channels.hosted.sources import buffered_record
+from nerve.config import GitHubReposSyncConfig, NerveConfig
+from nerve.sources import github_repos as module
+from nerve.sources.github_hosted import record_from_buffer
+from nerve.sources.github_repos import GitHubReposSource, github_repos_inbox_filter
+from nerve.sources.models import SourceRecord
+
+REPO = "acme/widgets"
+OTHER = "other-org/other-repo"
+START = datetime(2026, 10, 27, 10, 0, tzinfo=UTC)
+SHA_A = "a" * 40
+SHA_B = "b" * 40
 
 
-def _issue(num, gid, created_at, title, *, is_pr=False, state="open",
-           body="Some body text."):
-    """Build a minimal issue/PR dict shaped like the GitHub /issues API.
+def at(minutes: int) -> str:
+    """A GitHub timestamp *minutes* after the start of the test day."""
+    return (START + timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    ``gid=None`` omits the numeric id (to exercise the repo#number fallback);
-    ``body`` is overridable to exercise truncation / empty-body handling.
-    """
-    d = {
-        "number": num,
-        "title": title,
-        "created_at": created_at,
+
+def user(login: str = "alice", kind: str = "User") -> dict[str, Any]:
+    return {"login": login, "type": kind}
+
+
+def pull(
+    number: int, *, created: int = 0, updated: int | None = None, author: str = "alice",
+    kind: str = "User", draft: bool = False, state: str = "open", merged: int | None = None,
+    sha: str = SHA_A, title: str | None = None, body: str = "", labels: tuple[str, ...] = (),
+    repo: str = REPO,
+) -> dict[str, Any]:
+    """A pull request as the pulls listing returns it."""
+    return {
+        "number": number,
+        "title": title or f"Pull request {number}",
+        "user": user(author, kind),
         "state": state,
-        "html_url": f"https://github.com/owner/repo/issues/{num}",
-        "user": {"login": "alice"},
-        "labels": [{"name": "bug"}],
+        "draft": draft,
+        "merged_at": at(merged) if merged is not None else None,
+        "closed_at": at(merged if merged is not None else updated or created) if state == "closed" else None,
+        "created_at": at(created),
+        "updated_at": at(created if updated is None else updated),
+        "head": {"sha": sha, "ref": "feature", "label": f"{author}:feature"},
+        "base": {"ref": "main"},
+        "labels": [{"name": name} for name in labels],
         "body": body,
+        "html_url": f"https://github.com/{repo}/pull/{number}",
     }
-    if gid is not None:
-        d["id"] = gid
-    if is_pr:
-        d["pull_request"] = {"url": "https://api.github.com/.../pulls/1"}
-    return d
 
 
-# Canned per-repo payloads (returned newest-first, as the real API does with
-# sort=created&direction=desc).
-_REPO_DATA = {
-    "owner/repo-a": [
-        _issue(2, 102, "2026-06-12T11:00:00Z", "PR A2", is_pr=True),
-        _issue(1, 101, "2026-06-12T10:00:00Z", "Issue A1"),
-    ],
-    "owner/repo-b": [
-        _issue(3, 103, "2026-06-12T09:00:00Z", "Issue B1"),
-    ],
-}
+def issue(
+    number: int, *, created: int = 0, updated: int | None = None, author: str = "alice",
+    kind: str = "User", state: str = "open", title: str | None = None, body: str = "",
+    labels: tuple[str, ...] = (), repo: str = REPO,
+) -> dict[str, Any]:
+    """An issue as the issues listing returns it."""
+    return {
+        "number": number,
+        "title": title or f"Issue {number}",
+        "user": user(author, kind),
+        "state": state,
+        "created_at": at(created),
+        "updated_at": at(created if updated is None else updated),
+        "labels": [{"name": name} for name in labels],
+        "body": body,
+        "html_url": f"https://github.com/{repo}/issues/{number}",
+    }
 
 
-def _make_source(repos, data=None):
-    """Build a source with ``_gh_api_get`` stubbed from a {repo: items} map."""
-    data = _REPO_DATA if data is None else data
-    src = GitHubReposSource(config={"repos": repos})
+def as_issue(pr: dict[str, Any]) -> dict[str, Any]:
+    """A pull request as the issues listing returns it: with a pull_request key."""
+    item = {k: pr[k] for k in ("number", "title", "user", "state", "created_at", "updated_at", "body")}
+    item["pull_request"] = {"url": "https://api.github.com/repos/acme/widgets/pulls/1"}
+    return item
 
-    async def fake_gh_api_get(endpoint, timeout=30):
-        m = re.match(r"repos/([^/]+/[^/]+)/issues", endpoint)
-        repo = m.group(1) if m else None
-        return data.get(repo, [])
 
-    # Instance attribute shadows the staticmethod; called as self._gh_api_get(endpoint).
-    src._gh_api_get = fake_gh_api_get
+def release(
+    release_id: int, *, tag: str, name: str = "", created: int = 0, published: int | None = 0,
+    author: str = "alice", kind: str = "User", draft: bool = False, prerelease: bool = False,
+    body: str = "",
+) -> dict[str, Any]:
+    """A release as the releases listing returns it; a draft has no published_at."""
+    return {
+        "id": release_id,
+        "tag_name": tag,
+        "name": name,
+        "author": user(author, kind),
+        "draft": draft,
+        "prerelease": prerelease,
+        "created_at": at(created),
+        "published_at": None if draft or published is None else at(published),
+        "body": body,
+        "html_url": f"https://github.com/{REPO}/releases/tag/{tag}",
+    }
+
+
+class FakeGitHub:
+    """``gh api`` over a few repositories' listings; records every endpoint asked for."""
+
+    _ENDPOINT = re.compile(r"repos/([^/]+/[^/?]+)/(pulls|issues|releases)\?(.*)")
+
+    def __init__(self) -> None:
+        self.pulls: dict[str, list[dict]] = {}
+        self.issues: dict[str, list[dict]] = {}
+        self.releases: dict[str, list[dict]] = {}
+        self.calls: list[str] = []
+        self.failing: set[str] = set()
+
+    async def gh_api_get(self, endpoint: str, timeout: float = 30) -> Any:
+        self.calls.append(endpoint)
+        repo, listing, _ = self._ENDPOINT.fullmatch(endpoint).groups()
+        if f"{repo} {listing}" in self.failing:
+            raise RuntimeError("gh: Not Found (HTTP 404)")
+        items = list(getattr(self, listing).get(repo, []))
+        if listing == "issues":
+            items += [as_issue(pr) for pr in self.pulls.get(repo, [])]
+        key = "created_at" if listing == "releases" else "updated_at"
+        return copy.deepcopy(sorted(items, key=lambda item: item[key], reverse=True))
+
+
+# When the tests read the listings, unless a test moves the clock.
+NOW = START + timedelta(hours=1)
+STAMP = NOW.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def source(fake: FakeGitHub, *, clock: Any = None, **settings: Any) -> GitHubReposSource:
+    """A source over *fake*, reading at *clock* (``NOW``); settings as in sync.github_repos."""
+    settings.setdefault("repos", [REPO])
+    src = GitHubReposSource(config=settings, clock=clock or (lambda: NOW))
+    src._gh_api_get = fake.gh_api_get
     return src
 
 
+def read(since: str, *at: str, listed_at: str = STAMP) -> dict[str, Any]:
+    """A listing of the cursor: its newest time, when it was read, and the
+    keys of the items created in that newest second."""
+    return {"since": since, "listed_at": listed_at, "at": list(at)}
+
+
+async def baseline(src: GitHubReposSource) -> str:
+    result = await src.fetch(None)
+    assert result.records == []
+    return result.next_cursor
+
+
+def cursor_of(result) -> dict[str, Any]:
+    return json.loads(result.next_cursor)
+
+
+# ---------------------------------------------------------------------- #
+#  Listings, baseline and cursor                                          #
+# ---------------------------------------------------------------------- #
+
+
 @pytest.mark.asyncio
-async def test_first_run_establishes_baseline_no_records():
-    """cursor=None emits no records but sets the cursor to the newest item."""
-    src = _make_source(["owner/repo-a", "owner/repo-b"])
-    result = await src.fetch(cursor=None)
+@pytest.mark.parametrize(("types", "listings"), [
+    (None, ["pulls", "issues"]),
+    (["pull_request"], ["pulls"]),
+    (["issue"], ["issues"]),
+    (["release"], ["releases"]),
+    (["release", "issue", "pull_request"], ["pulls", "issues", "releases"]),
+])
+async def test_each_type_is_one_listing_of_each_repository(types, listings):
+    fake = FakeGitHub()
+    settings = {"repos": [REPO, OTHER]} if types is None else {"repos": [REPO, OTHER], "types": types}
+
+    await source(fake, **settings).fetch(None)
+
+    query = {
+        "pulls": "state=all&sort=updated&direction=desc&per_page=100",
+        "issues": "state=all&sort=updated&direction=desc&per_page=100",
+        "releases": "per_page=30",
+    }
+    assert sorted(fake.calls) == sorted(
+        f"repos/{repo}/{listing}?{query[listing]}" for repo in (REPO, OTHER) for listing in listings
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_listings_and_the_bot_filter():
+    """New pull requests, issues and releases arrive from their listings. A
+    pull request or an issue that a GitHub App or a [bot] account opened does
+    only with include_bots; a release arrives whoever published it, release
+    automation being the normal case."""
+    fake = FakeGitHub()
+    everything = ["pull_request", "issue", "release"]
+
+    async def reported(**settings: Any) -> dict[str, str]:
+        fake.pulls[REPO], fake.issues[REPO], fake.releases[REPO] = [], [], []
+        src = source(fake, types=everything, **settings)
+        cursor = await baseline(src)
+        fake.pulls[REPO] = [
+            pull(1, created=1, author="alice"),
+            pull(2, created=2, author="widget-builder", kind="Bot"),
+            pull(3, created=3, author="updater[bot]"),
+        ]
+        fake.issues[REPO] = [issue(4, created=4, author="bob"), issue(5, created=5, author="triage[bot]")]
+        fake.releases[REPO] = [
+            release(900, tag="v2.0.0", created=6, published=6, author="github-actions[bot]", kind="Bot"),
+            release(901, tag="v2.0.1", created=7, published=7, author="carol"),
+        ]
+        result = await src.fetch(cursor)
+        return {record.id: record.metadata["author_kind"] for record in result.records}
+
+    assert await reported() == {
+        f"{REPO}#1:opened:open": "human",
+        f"{REPO}#4:opened:open": "human",
+        f"{REPO}#:released:900": "bot",
+        f"{REPO}#:released:901": "human",
+    }
+    assert await reported(include_bots=True) == {
+        f"{REPO}#1:opened:open": "human",
+        f"{REPO}#2:opened:open": "bot",
+        f"{REPO}#3:opened:open": "bot",
+        f"{REPO}#4:opened:open": "human",
+        f"{REPO}#5:opened:open": "bot",
+        f"{REPO}#:released:900": "bot",
+        f"{REPO}#:released:901": "human",
+    }
+
+
+@pytest.mark.asyncio
+async def test_the_first_listing_is_a_baseline_without_records():
+    fake = FakeGitHub()
+    fake.pulls[REPO] = [pull(1, created=-30, updated=-5), pull(2, created=-20)]
+    fake.issues[REPO] = [issue(3, created=-40, updated=-10)]
+    fake.releases[REPO] = [
+        release(900, tag="v1.0.0", created=-60, published=-50),
+        release(901, tag="v1.1.0-draft", created=-1, draft=True),
+    ]
+    src = source(fake, repos=[REPO, OTHER], types=["pull_request", "issue", "release"])
+
+    result = await src.fetch(None)
 
     assert result.records == []
-    # Newest created_at across both repos.
-    assert result.next_cursor == "2026-06-12T11:00:00Z"
+    assert cursor_of(result) == {"v": 1, "repos": {
+        # The issues listing holds the pull requests too; drafts are not published.
+        REPO: {"pulls": read(at(-5)), "issues": read(at(-5)), "releases": read(at(-50), "900")},
+        # Nothing listed: everything listed later is new.
+        OTHER: {"pulls": read(""), "issues": read(""), "releases": read("")},
+    }}
 
 
 @pytest.mark.asyncio
-async def test_fetch_new_items_since_cursor():
-    """All items created after the cursor are returned, oldest-first."""
-    src = _make_source(["owner/repo-a", "owner/repo-b"])
-    result = await src.fetch(cursor="2026-06-12T08:00:00Z")
+async def test_what_existed_before_is_never_opened_and_only_new_items_are():
+    fake = FakeGitHub()
+    fake.pulls[REPO] = [pull(1, created=-30)]
+    fake.issues[REPO] = [issue(2, created=-30)]
+    fake.pulls[OTHER] = []
+    src = source(fake, repos=[REPO, OTHER])
+    cursor = await baseline(src)
+    # Old items move (a comment, a push, a close) and new ones appear.
+    fake.pulls[REPO] = [pull(1, created=-30, updated=10, sha=SHA_B), pull(5, created=12)]
+    fake.issues[REPO] = [issue(2, created=-30, updated=11, state="closed"), issue(6, created=13)]
+    fake.pulls[OTHER] = [pull(1, created=14, repo=OTHER)]
 
-    # 3 items, sorted oldest-first by created_at.
-    titles = [r.summary for r in result.records]
-    assert len(result.records) == 3
-    assert "Issue B1" in titles[0]   # 09:00
-    assert "Issue A1" in titles[1]   # 10:00
-    assert "PR A2" in titles[2]      # 11:00
-    # Cursor advances to the newest ingested item.
-    assert result.next_cursor == "2026-06-12T11:00:00Z"
+    result = await src.fetch(cursor)
 
-
-@pytest.mark.asyncio
-async def test_cursor_filter_is_strictly_greater():
-    """An item whose created_at equals the cursor is NOT re-emitted."""
-    src = _make_source(["owner/repo-a", "owner/repo-b"])
-    result = await src.fetch(cursor="2026-06-12T10:00:00Z")
-
-    # Only PR A2 (11:00) is strictly newer than 10:00.
-    assert len(result.records) == 1
-    assert "PR A2" in result.records[0].summary
-    assert result.next_cursor == "2026-06-12T11:00:00Z"
+    assert [record.id for record in result.records] == [
+        f"{REPO}#5:opened:open", f"{REPO}#6:opened:open", f"{OTHER}#1:opened:open",
+    ]
+    again = await src.fetch(result.next_cursor)
+    assert again.records == []
+    assert again.next_cursor == result.next_cursor
 
 
 @pytest.mark.asyncio
-async def test_no_new_items_keeps_cursor():
-    """When nothing is newer than the cursor, the cursor is unchanged."""
-    src = _make_source(["owner/repo-a", "owner/repo-b"])
-    result = await src.fetch(cursor="2026-06-12T23:00:00Z")
+async def test_a_pull_request_created_in_the_cursors_second_after_the_listing_is_reported_once():
+    """GitHub's times have a resolution of one second. A pull request created
+    in the cursor's own second that the listing did not show yet (created a
+    moment later, or a replica behind) is new. The one the listing showed is
+    not, also when it changes and is listed again: the inbox would take it as
+    a changed record and show it a second time."""
+    fake = FakeGitHub()
+    fake.pulls[REPO] = [pull(1, created=5)]
+    src = source(fake, types=["pull_request"])
+    cursor = await baseline(src)
+    assert json.loads(cursor)["repos"][REPO]["pulls"] == read(at(5), "1")
+    fake.pulls[REPO] = [pull(1, created=5, updated=8, labels=("triage",)), pull(2, created=5)]
+
+    result = await src.fetch(cursor)
+
+    assert [record.id for record in result.records] == [f"{REPO}#2:opened:open"]
+    assert (await src.fetch(result.next_cursor)).records == []
+
+
+@pytest.mark.asyncio
+async def test_an_issue_created_in_the_cursors_second_after_the_listing_is_reported_once():
+    fake = FakeGitHub()
+    fake.issues[REPO] = [issue(1, created=5)]
+    src = source(fake, types=["issue"])
+    cursor = await baseline(src)
+    fake.issues[REPO] = [issue(1, created=5, updated=9), issue(2, created=5)]
+
+    result = await src.fetch(cursor)
+
+    assert [record.id for record in result.records] == [f"{REPO}#2:opened:open"]
+    assert (await src.fetch(result.next_cursor)).records == []
+
+
+@pytest.mark.asyncio
+async def test_a_release_published_in_the_cursors_second_after_the_listing_is_reported_once():
+    fake = FakeGitHub()
+    fake.releases[REPO] = [release(900, tag="v1.0.0", created=4, published=5)]
+    src = source(fake, types=["release"])
+    cursor = await baseline(src)
+    fake.releases[REPO].append(release(901, tag="v1.0.1", created=5, published=5))
+
+    result = await src.fetch(cursor)
+
+    assert [record.id for record in result.records] == [f"{REPO}#:released:901"]
+    assert cursor_of(result)["repos"][REPO]["releases"] == read(at(5), "900", "901")
+    assert (await src.fetch(result.next_cursor)).records == []
+
+
+@pytest.mark.asyncio
+async def test_a_listing_read_more_than_a_day_ago_starts_fresh():
+    """Nothing older than a day is backfilled: after a long outage, or with
+    the watch switched off for longer, the next listing is a new baseline,
+    and the pull requests it followed are forgotten."""
+    fake = FakeGitHub()
+    now = [NOW]
+    src = source(fake, types=["pull_request", "issue"], updates=True, clock=lambda: now[0])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=5)]
+    cursor = (await src.fetch(cursor)).next_cursor
+    assert json.loads(cursor)["repos"][REPO]["prs"] == {"1": [SHA_A[:12], False, False]}
+    fake.pulls[REPO] = [pull(1, created=5, updated=1490, sha=SHA_B), pull(2, created=1495)]
+    fake.issues[REPO] = [issue(3, created=1496)]
+    now[0] = NOW + timedelta(hours=24, minutes=1)
+
+    result = await src.fetch(cursor)
 
     assert result.records == []
-    assert result.next_cursor == "2026-06-12T23:00:00Z"
+    stamp = now[0].strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert cursor_of(result) == {"v": 1, "repos": {REPO: {
+        "pulls": read(at(1495), "2", listed_at=stamp), "issues": read(at(1496), "3", listed_at=stamp),
+    }}}
 
 
 @pytest.mark.asyncio
-async def test_issue_vs_pr_classification():
-    """Records carry the right record_type and renderer-friendly metadata."""
-    src = _make_source(["owner/repo-a"])
-    result = await src.fetch(cursor="2026-06-12T08:00:00Z")
+async def test_a_listing_read_within_a_day_picks_up_where_it_left():
+    fake = FakeGitHub()
+    now = [NOW]
+    src = source(fake, types=["pull_request"], clock=lambda: now[0])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1400)]
+    now[0] = NOW + timedelta(hours=23, minutes=59)
 
-    by_type = {r.record_type: r for r in result.records}
-    assert set(by_type) == {"github_issue", "github_pr"}
+    result = await src.fetch(cursor)
 
-    issue = by_type["github_issue"]
-    assert issue.source == "github_repos"
-    assert issue.metadata["subject_type"] == "Issue"
-    assert issue.metadata["reason"] == "new_issue"
-    assert issue.metadata["repo_name"] == "owner/repo-a"
-    assert issue.id == "101"  # numeric GitHub id, stringified
-    assert "Some body text." in issue.content
-
-    pr = by_type["github_pr"]
-    assert pr.metadata["subject_type"] == "PullRequest"
-    assert pr.metadata["reason"] == "new_pr"
+    assert [record.id for record in result.records] == [f"{REPO}#1:opened:open"]
 
 
 @pytest.mark.asyncio
-async def test_no_repos_is_noop():
-    """Empty repo list returns nothing and preserves the cursor."""
-    src = _make_source([])
-    result = await src.fetch(cursor="2026-06-12T08:00:00Z")
+async def test_records_come_oldest_first_across_repositories():
+    fake = FakeGitHub()
+    src = source(fake, repos=[REPO, OTHER], types=["pull_request"])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=30), pull(2, created=10)]
+    fake.pulls[OTHER] = [pull(1, created=20, repo=OTHER)]
+
+    result = await src.fetch(cursor)
+
+    assert [record.timestamp for record in result.records] == [at(10), at(20), at(30)]
+
+
+# ---------------------------------------------------------------------- #
+#  Records: the gateway's shape                                           #
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_new_pull_request_is_built_as_the_gateway_builds_it():
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(
+        12, created=5, title="Add a widget cache", body="Caches widgets between requests.",
+        labels=("enhancement", "cache"), sha=SHA_A,
+    )]
+
+    [record] = (await src.fetch(cursor)).records
+
+    assert record.id == f"{REPO}#12:opened:open"
+    assert (record.source, record.record_type) == ("github_repos", "github_repo_activity")
+    assert record.summary == "[acme/widgets] New PR #12: Add a widget cache"
+    assert record.content == (
+        "Repository: acme/widgets\n"
+        "Type: PullRequest\n"
+        "Event: opened\n"
+        "PR: #12 Add a widget cache\n"
+        "Author: alice\n"
+        "State: open\n"
+        "Draft: false\n"
+        "Base ← head: main ← alice:feature\n"
+        "Labels: enhancement, cache\n"
+        "Created: 2026-10-27T10:05:00Z\n"
+        "Updated: 2026-10-27T10:05:00Z\n"
+        "URL: https://github.com/acme/widgets/pull/12\n"
+        "\n"
+        "--- Description ---\n"
+        "Caches widgets between requests."
+    )
+    assert record.timestamp == at(5)
+    assert list(record.metadata.items()) == [
+        ("repo_name", REPO), ("number", "12"), ("event", "opened"), ("subject_type", "PullRequest"),
+        ("author", "alice"), ("author_kind", "human"), ("head_sha", SHA_A),
+        ("subject_url", "https://github.com/acme/widgets/pull/12"),
+        ("repo_url", "https://github.com/acme/widgets"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_base_and_head_line_needs_both_as_the_gateway_prints_it():
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"])
+    cursor = await baseline(src)
+    headless = pull(12, created=5)
+    headless["head"] = {"sha": SHA_A, "ref": "", "label": ""}
+    fake.pulls[REPO] = [headless]
+
+    [record] = (await src.fetch(cursor)).records
+
+    assert "Base ← head:" not in record.content
+    assert "Draft: false\nCreated: " in record.content
+
+
+@pytest.mark.asyncio
+async def test_a_new_issue_is_built_as_the_gateway_builds_it():
+    fake = FakeGitHub()
+    src = source(fake, types=["issue"])
+    cursor = await baseline(src)
+    fake.issues[REPO] = [issue(7, created=3, updated=4, title="Widgets leak", author="bob", labels=("bug",))]
+
+    [record] = (await src.fetch(cursor)).records
+
+    assert record.id == f"{REPO}#7:opened:open"
+    assert record.summary == "[acme/widgets] New Issue #7: Widgets leak"
+    assert record.content == (
+        "Repository: acme/widgets\n"
+        "Type: Issue\n"
+        "Event: opened\n"
+        "Issue: #7 Widgets leak\n"
+        "Author: bob\n"
+        "State: open\n"
+        "Labels: bug\n"
+        "Created: 2026-10-27T10:03:00Z\n"
+        "Updated: 2026-10-27T10:04:00Z\n"
+        "URL: https://github.com/acme/widgets/issues/7"
+    )
+    assert record.timestamp == at(3)
+    assert record.metadata == {
+        "repo_name": REPO, "number": "7", "event": "opened", "subject_type": "Issue",
+        "author": "bob", "author_kind": "human", "head_sha": "",
+        "subject_url": "https://github.com/acme/widgets/issues/7",
+        "repo_url": "https://github.com/acme/widgets",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("name", "summary", "line"), [
+    ("Widgets 1.2", "[acme/widgets] New release v1.2.0: Widgets 1.2", "Release: v1.2.0 Widgets 1.2"),
+    ("", "[acme/widgets] New release v1.2.0", "Release: v1.2.0"),
+    ("v1.2.0", "[acme/widgets] New release v1.2.0", "Release: v1.2.0"),
+])
+async def test_a_release_is_built_as_the_gateway_builds_it(name, summary, line):
+    fake = FakeGitHub()
+    src = source(fake, types=["release"])
+    cursor = await baseline(src)
+    fake.releases[REPO] = [
+        release(123456789, tag="v1.2.0", name=name, created=2, published=8, prerelease=True, body="Faster widgets."),
+        release(123456790, tag="v1.3.0", created=9, draft=True),
+    ]
+
+    [record] = (await src.fetch(cursor)).records
+
+    assert record.id == f"{REPO}#:released:123456789"
+    assert record.summary == summary
+    assert record.content == (
+        "Repository: acme/widgets\n"
+        "Type: Release\n"
+        "Event: released\n"
+        f"{line}\n"
+        "Author: alice\n"
+        "Prerelease: true\n"
+        "Created: 2026-10-27T10:02:00Z\n"
+        "Published: 2026-10-27T10:08:00Z\n"
+        "URL: https://github.com/acme/widgets/releases/tag/v1.2.0\n"
+        "\n"
+        "--- Description ---\n"
+        "Faster widgets."
+    )
+    assert record.timestamp == at(8)
+    assert record.metadata == {
+        "repo_name": REPO, "number": "", "event": "released", "subject_type": "Release",
+        "author": "alice", "author_kind": "human", "head_sha": "",
+        "subject_url": "https://github.com/acme/widgets/releases/tag/v1.2.0",
+        "repo_url": "https://github.com/acme/widgets",
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_long_body_is_capped_and_an_empty_one_leaves_out_the_description():
+    fake = FakeGitHub()
+    src = source(fake, types=["issue"])
+    cursor = await baseline(src)
+    fake.issues[REPO] = [issue(1, created=1, body="x" * 5000), issue(2, created=2, body="")]
+
+    long, empty = (await src.fetch(cursor)).records
+
+    assert long.content.endswith("\n\n--- Description ---\n" + "x" * 4000 + "\n[... truncated]")
+    assert "--- Description ---" not in empty.content
+
+
+@pytest.mark.asyncio
+async def test_a_record_reads_the_same_after_the_trip_through_the_gateway_buffer():
+    """The metadata as the gateway sends it (strings, empty ones included),
+    buffered and drained by the hosted source: the same record as here."""
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request", "release"])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(12, created=5)]
+    fake.releases[REPO] = [release(55, tag="v1", created=6, published=6)]
+
+    for record in (await src.fetch(cursor)).records:
+        event = _source_record_event(record)
+        drained = record_from_buffer(buffered_record(event), source="github_repos")
+        assert drained == SourceRecord(
+            id=record.id, source="github_repos", record_type=record.record_type,
+            summary=record.summary, content=record.content, timestamp=record.timestamp,
+            metadata=record.metadata,
+        )
+
+
+def _source_record_event(record: SourceRecord):
+    """The contract event of a record, as the gateway would deliver it."""
+    from nerve.channels.hosted.contract.model import (
+        ConversationReference,
+        Event,
+        SourceRecordPayload,
+    )
+
+    return Event(
+        event_id="github_repos:1", provider="github_repos", kind="source_record",
+        conversation=ConversationReference(id=REPO),
+        record=SourceRecordPayload(
+            id=record.id, record_type=record.record_type, summary=record.summary,
+            content=record.content,
+            timestamp=datetime.fromisoformat(record.timestamp),
+            metadata=tuple(MetadataEntry(key=key, value=value) for key, value in record.metadata.items()),
+        ),
+    )
+
+
+# ---------------------------------------------------------------------- #
+#  Filters                                                                #
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_deny_authors_are_case_insensitive_globs_and_drop_before_anything_is_reported():
+    """Releases included: only the bot filter leaves them alone."""
+    fake = FakeGitHub()
+    src = source(
+        fake, types=["pull_request", "issue", "release"], deny_authors=["Noisy-*", "spammer"],
+    )
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1, author="noisy-ci"), pull(2, created=2, author="alice")]
+    fake.issues[REPO] = [issue(3, created=3, author="SPAMMER"), issue(4, created=4, author="bob")]
+    fake.releases[REPO] = [
+        release(900, tag="v2.0.0", created=5, published=5, author="noisy-releaser", kind="Bot"),
+        release(901, tag="v2.0.1", created=6, published=6, author="carol"),
+    ]
+
+    result = await src.fetch(cursor)
+
+    assert [record.metadata["author"] for record in result.records] == ["alice", "bob", "carol"]
+
+
+def test_the_inbox_filter_drops_what_the_settings_drop():
+    """The second net, for records the gateway delivered before a reload."""
+    settings = GitHubReposSyncConfig(types=["pull_request", "release"], deny_authors=["noisy-*"])
+
+    def record(name: str, **metadata: str) -> SourceRecord:
+        fields = {"author": "alice", "author_kind": "human", "subject_type": "PullRequest", **metadata}
+        return SourceRecord(
+            id=name, source="github_repos", record_type="github_repo_activity",
+            summary="s", content="c", timestamp=at(0), metadata=fields,
+        )
+
+    kept, dropped = github_repos_inbox_filter(settings).partition([
+        record("pr"),
+        record("denied", author="Noisy-CI"),
+        record("bot pr", author_kind="bot"),
+        record("issue", subject_type="Issue"),
+        record("bot release", subject_type="Release", author="github-actions[bot]", author_kind="bot"),
+        record("denied release", subject_type="Release", author="noisy-releaser"),
+    ])
+
+    assert [r.id for r in kept] == ["pr", "bot release"]
+    assert [r.id for r in dropped] == ["denied", "bot pr", "issue", "denied release"]
+    with_bots = github_repos_inbox_filter(GitHubReposSyncConfig(include_bots=True))
+    assert with_bots.passes(record("bot pr", author_kind="bot"))
+    # A repository the watch no longer names: its records already on the way.
+    watching = github_repos_inbox_filter(GitHubReposSyncConfig(repos=["acme/widgets"]))
+    assert watching.passes(record("watched", repo_name="ACME/Widgets"))
+    assert not watching.passes(record("dropped", repo_name="other-org/other-repo"))
+
+
+# ---------------------------------------------------------------------- #
+#  Drafts and updates                                                     #
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_a_draft_is_reported_when_opened_by_default():
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1, draft=True)]
+
+    [record] = (await src.fetch(cursor)).records
+
+    assert record.id == f"{REPO}#1:opened:open"
+    assert "Draft: true" in record.content
+
+
+@pytest.mark.asyncio
+async def test_without_drafts_a_draft_is_held_until_it_is_ready():
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], include_drafts=False)
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1, draft=True), pull(2, created=2, draft=True)]
+
+    held = await src.fetch(cursor)
+
+    assert held.records == []
+    assert cursor_of(held)["repos"][REPO]["prs"] == {
+        "1": [SHA_A[:12], True, True], "2": [SHA_A[:12], True, True],
+    }
+    # A push while it is a draft reports nothing; the other draft is closed.
+    fake.pulls[REPO] = [
+        pull(1, created=1, updated=5, draft=True, sha=SHA_B),
+        pull(2, created=2, updated=6, draft=True, state="closed"),
+    ]
+    pushed = await src.fetch(held.next_cursor)
+    assert pushed.records == []
+    assert cursor_of(pushed)["repos"][REPO]["prs"] == {"1": [SHA_B[:12], True, True]}
+
+    fake.pulls[REPO][0] = pull(1, created=1, updated=9, draft=False, sha=SHA_B, title="Widget cache")
+    ready = await src.fetch(pushed.next_cursor)
+
+    [record] = ready.records
+    assert record.id == f"{REPO}#1:ready:{SHA_B}"
+    assert record.summary == "[acme/widgets] PR #1 ready for review: Widget cache"
+    assert "Event: ready" in record.content and record.timestamp == at(9)
+    assert record.metadata["event"] == "ready"
+    # Reported once; without updates nothing is followed any more.
+    assert "prs" not in cursor_of(ready)["repos"][REPO]
+    assert (await src.fetch(ready.next_cursor)).records == []
+
+
+@pytest.mark.asyncio
+async def test_a_held_draft_still_waits_after_drafts_are_included():
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], include_drafts=False)
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1, draft=True)]
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=1, updated=4, draft=False)]
+
+    [record] = (await source(fake, types=["pull_request"]).fetch(cursor)).records
+
+    assert record.metadata["event"] == "ready"
+
+
+@pytest.mark.asyncio
+async def test_with_updates_a_reported_pull_request_is_followed_until_it_is_merged():
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], updates=True)
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1, draft=True, sha=SHA_A)]
+
+    def step(**changes: Any) -> None:
+        current = fake.pulls[REPO][0]
+        fake.pulls[REPO] = [pull(1, created=1, **{
+            "draft": current["draft"], "sha": current["head"]["sha"], **changes,
+        })]
+
+    async def events() -> list[str]:
+        nonlocal cursor
+        result = await src.fetch(cursor)
+        cursor = result.next_cursor
+        return [record.id for record in result.records]
+
+    assert await events() == [f"{REPO}#1:opened:open"]
+    step(updated=2)  # a comment or a label: only updated_at moves
+    assert await events() == []
+    step(updated=3, sha=SHA_B)
+    assert await events() == [f"{REPO}#1:updated:{SHA_B}"]
+    step(updated=4, draft=False, sha="c" * 40)  # ready and pushed: one record, ready
+    assert await events() == [f"{REPO}#1:ready:{'c' * 40}"]
+    step(updated=5, draft=True)  # back to draft: nothing
+    assert await events() == []
+    step(updated=6, sha="d" * 40, state="closed", merged=6)  # pushed and merged: merged
+    assert await events() == [f"{REPO}#1:merged:merged"]
+    assert "prs" not in json.loads(cursor)["repos"][REPO]
+    step(updated=7, state="open")  # reopened: no longer followed
+    assert await events() == []
+
+
+@pytest.mark.asyncio
+async def test_with_updates_a_close_without_a_merge_is_closed():
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], updates=True)
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1, title="Widget cache")]
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=1, updated=8, state="closed", title="Widget cache")]
+
+    [record] = (await src.fetch(cursor)).records
+
+    assert record.id == f"{REPO}#1:closed:closed"
+    assert record.summary == "[acme/widgets] PR #1 closed: Widget cache"
+    assert record.timestamp == at(8)
+    assert "State: closed" in record.content
+
+
+@pytest.mark.asyncio
+async def test_a_pull_request_first_seen_merged_is_only_opened():
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], updates=True)
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1, updated=2, state="closed", merged=2)]
+
+    result = await src.fetch(cursor)
+
+    [record] = result.records
+    assert record.id == f"{REPO}#1:opened:open" and "State: merged" in record.content
+    assert "prs" not in cursor_of(result)["repos"][REPO]
+
+
+@pytest.mark.asyncio
+async def test_without_updates_nothing_is_followed_and_turning_them_off_forgets():
+    fake = FakeGitHub()
+    followed = source(fake, types=["pull_request"], updates=True)
+    cursor = await baseline(followed)
+    fake.pulls[REPO] = [pull(1, created=1)]
+    cursor = (await followed.fetch(cursor)).next_cursor
+    assert json.loads(cursor)["repos"][REPO]["prs"] == {"1": [SHA_A[:12], False, False]}
+    fake.pulls[REPO] = [pull(1, created=1, updated=3, sha=SHA_B)]
+
+    result = await source(fake, types=["pull_request"]).fetch(cursor)
 
     assert result.records == []
-    assert result.next_cursor == "2026-06-12T08:00:00Z"
+    assert "prs" not in cursor_of(result)["repos"][REPO]
 
 
 @pytest.mark.asyncio
-async def test_one_repo_error_does_not_block_others():
-    """A repo whose fetch raises is skipped; healthy repos still ingest."""
-    src = GitHubReposSource(config={"repos": ["owner/repo-a", "owner/repo-b"]})
+async def test_a_followed_pull_request_whose_author_is_denied_is_dropped_silently():
+    fake = FakeGitHub()
+    cursor = await baseline(source(fake, types=["pull_request"], updates=True))
+    fake.pulls[REPO] = [pull(1, created=1, author="alice")]
+    cursor = (await source(fake, types=["pull_request"], updates=True).fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=1, updated=2, author="alice", sha=SHA_B)]
 
-    async def flaky_gh_api_get(endpoint, timeout=30):
-        if "repo-b" in endpoint:
-            raise RuntimeError("boom")
-        m = re.match(r"repos/([^/]+/[^/]+)/issues", endpoint)
-        return _REPO_DATA.get(m.group(1), [])
+    result = await source(fake, types=["pull_request"], updates=True, deny_authors=["alice"]).fetch(cursor)
 
-    src._gh_api_get = flaky_gh_api_get
-    result = await src.fetch(cursor="2026-06-12T08:00:00Z")
-
-    # repo-b raised, so only repo-a's two items come through.
-    repos_seen = {r.metadata["repo_name"] for r in result.records}
-    assert repos_seen == {"owner/repo-a"}
-    assert len(result.records) == 2
+    assert result.records == []
+    assert "prs" not in cursor_of(result)["repos"][REPO]
 
 
 @pytest.mark.asyncio
-async def test_long_body_is_truncated():
-    """Bodies longer than the cap are cut to _MAX_BODY_CHARS with a marker."""
-    src = _make_source(["owner/repo-a"], data={
-        "owner/repo-a": [_issue(7, 201, "2026-06-12T12:00:00Z", "Big", body="x" * 5000)],
-    })
-    result = await src.fetch(cursor="2026-06-12T00:00:00Z")
-    content = result.records[0].content
-    assert "[... truncated]" in content
-    # Only the first 4000 body chars survive (nothing else in the record has 'x').
-    assert content.count("x") == 4000
+async def test_at_most_so_many_pull_requests_are_followed_the_one_listed_longest_ago_first(monkeypatch):
+    monkeypatch.setattr(module, "MAX_FINGERPRINTS", 2)
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], updates=True)
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1), pull(2, created=2)]
+    cursor = (await src.fetch(cursor)).next_cursor
+    # 1 is listed again (a comment), then 3 opens: 2 was listed longest ago.
+    fake.pulls[REPO] = [pull(1, created=1, updated=5), pull(2, created=2), pull(3, created=6)]
+
+    result = await src.fetch(cursor)
+
+    assert list(cursor_of(result)["repos"][REPO]["prs"]) == ["1", "3"]
+
+
+# ---------------------------------------------------------------------- #
+#  Cursor upgrades and failures                                           #
+# ---------------------------------------------------------------------- #
 
 
 @pytest.mark.asyncio
-async def test_empty_body_omits_description_section():
-    """An issue with no body produces no '--- Description ---' block."""
-    src = _make_source(["owner/repo-a"], data={
-        "owner/repo-a": [_issue(10, 202, "2026-06-12T12:00:00Z", "Empty", body="")],
-    })
-    result = await src.fetch(cursor="2026-06-12T00:00:00Z")
-    assert "--- Description ---" not in result.records[0].content
+async def test_the_cursor_of_the_earlier_source_still_reads():
+    """One ISO timestamp, the newest created_at the earlier version saw: it
+    becomes every listing's cursor (and when it was read), so nothing is
+    repeated or skipped. What was created in that very second was the earlier
+    version's last report, and is not reported again."""
+    fake = FakeGitHub()
+    fake.pulls[REPO] = [pull(1, created=-10), pull(2, created=5)]
+    fake.issues[REPO] = [issue(3, created=0, updated=7), issue(4, created=6)]
+    src = source(fake)
+
+    result = await src.fetch(at(0))
+
+    assert [record.id for record in result.records] == [f"{REPO}#2:opened:open", f"{REPO}#4:opened:open"]
+    assert cursor_of(result) == {"v": 1, "repos": {REPO: {"pulls": read(at(5), "2"), "issues": read(at(7))}}}
 
 
 @pytest.mark.asyncio
-async def test_record_id_falls_back_to_repo_number():
-    """When GitHub's numeric id is absent, the record id is '<repo>#<number>'."""
-    src = _make_source(["owner/repo-a"], data={
-        "owner/repo-a": [_issue(9, None, "2026-06-12T12:00:00Z", "No id")],
-    })
-    result = await src.fetch(cursor="2026-06-12T00:00:00Z")
-    assert result.records[0].id == "owner/repo-a#9"
+async def test_the_cursor_of_the_earlier_source_more_than_a_day_old_starts_fresh():
+    fake = FakeGitHub()
+    fake.pulls[REPO] = [pull(1, created=5)]
+    src = source(fake, types=["pull_request"], clock=lambda: START + timedelta(hours=25))
+
+    assert (await src.fetch(at(0))).records == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cursor", [
+    "57", "not a cursor", "{broken json", '{"v": 1, "repos": []}',
+    # A listing whose reading time is unknown counts as read long ago.
+    json.dumps({"v": 1, "repos": {REPO: {"pulls": {"since": at(0), "at": []}}}}),
+])
+async def test_a_cursor_that_cannot_be_read_takes_a_baseline(cursor):
+    """A buffer position left by the hosted mode, or anything unreadable,
+    is no cursor: nothing is reported."""
+    fake = FakeGitHub()
+    fake.pulls[REPO] = [pull(1, created=5)]
+
+    result = await source(fake, types=["pull_request"]).fetch(cursor)
+
+    assert result.records == []
+    assert cursor_of(result) == {"v": 1, "repos": {REPO: {"pulls": read(at(5), "1")}}}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_listing_keeps_its_cursor_and_the_others_report(caplog):
+    fake = FakeGitHub()
+    src = source(fake, repos=[REPO, OTHER], types=["pull_request"])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1)]
+    fake.pulls[OTHER] = [pull(2, created=2, repo=OTHER)]
+    fake.failing = {f"{OTHER} pulls"}
+
+    result = await src.fetch(cursor)
+
+    assert [record.id for record in result.records] == [f"{REPO}#1:opened:open"]
+    assert cursor_of(result)["repos"][OTHER] == {"pulls": read("")}
+    assert "1 of 2 listings failed" in caplog.text
+    fake.failing = set()
+    later = await src.fetch(result.next_cursor)
+    assert [record.id for record in later.records] == [f"{OTHER}#2:opened:open"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_in_which_every_listing_fails_fails():
+    fake = FakeGitHub()
+    fake.failing = {f"{REPO} pulls", f"{REPO} issues"}
+
+    with pytest.raises(RuntimeError, match="every GitHub listing failed"):
+        await source(fake).fetch(None)
+
+
+@pytest.mark.asyncio
+async def test_a_repository_or_type_added_takes_its_own_baseline_and_a_removed_one_is_forgotten():
+    fake = FakeGitHub()
+    cursor = await baseline(source(fake, repos=[REPO], types=["pull_request"]))
+    fake.pulls[REPO] = [pull(1, created=1)]
+    fake.pulls[OTHER] = [pull(2, created=2, repo=OTHER)]
+    fake.issues[OTHER] = [issue(3, created=3, repo=OTHER)]
+
+    result = await source(fake, repos=[OTHER], types=["pull_request", "issue"]).fetch(cursor)
+
+    assert result.records == []
+    assert cursor_of(result) == {"v": 1, "repos": {OTHER: {"pulls": read(at(2), "2"), "issues": read(at(3), "3")}}}
+
+
+@pytest.mark.asyncio
+async def test_no_repository_reads_nothing_and_keeps_the_cursor():
+    fake = FakeGitHub()
+
+    result = await source(fake, repos=[]).fetch("keep")
+
+    assert (result.records, result.next_cursor, fake.calls) == ([], "keep", [])
+
+
+@pytest.mark.asyncio
+async def test_gh_failures_are_reported_with_what_failed(monkeypatch):
+    class Proc:
+        returncode = 1
+
+        async def communicate(self):
+            return b"", b"gh: Not Found (HTTP 404)"
+
+    async def failing(*argv, **kwargs):
+        return Proc()
+
+    monkeypatch.setattr("nerve.sources.github_repos.asyncio.create_subprocess_exec", failing)
+
+    with pytest.raises(RuntimeError, match=r"repos/acme/widgets/pulls.*HTTP 404"):
+        await GitHubReposSource._gh_api_get("repos/acme/widgets/pulls?per_page=100")
+
+
+def test_the_registry_hands_the_settings_to_the_polling_source():
+    from nerve.sources.registry import build_source_runners
+
+    config = NerveConfig.from_dict({"sync": {"github_repos": {
+        "enabled": True, "repos": [REPO], "types": ["release"], "include_bots": True,
+        "include_drafts": False, "updates": True, "deny_authors": ["noisy-*"],
+    }}})
+
+    (runner,) = [r for r in build_source_runners(config, db=None) if r.job_id == "source:github_repos"]
+
+    src = runner.source
+    assert isinstance(src, GitHubReposSource) and src.push_fed is False
+    assert (src._repos, src._types, src._include_bots, src._include_drafts, src._updates, src._deny_authors) == (
+        [REPO], ("release",), True, False, True, ["noisy-*"],
+    )
+    assert [rule.field for rule in runner.inbox_filter.rules if rule.active] == [
+        "repo_name", "author", "subject_type",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_source_tools_show_a_long_cursor_cut(db):
+    """The JSON cursor grows with the repositories and the pull requests it
+    follows; the agent's source listings show its start and its length."""
+    from nerve.agent.tools.handlers.sources import (
+        list_sources_handler,
+        sync_status_handler,
+    )
+    from nerve.agent.tools.registry import ToolContext
+
+    state = {REPO: {"pulls": at(5), "prs": {str(n): [SHA_A[:12], False, False] for n in range(40)}}}
+    cursor = json.dumps({"v": 1, "repos": state}, separators=(",", ":"))
+    await db.set_sync_cursor("github_repos", cursor)
+    await db.set_sync_cursor("telegram", '{"pts": 1, "qts": 0, "date": 1700000000, "seq": 0}')
+    await db.insert_source_messages([SourceRecord(
+        id="r1", source="github_repos", record_type="github_repo_activity", summary="s", content="c",
+        timestamp=at(5), metadata={},
+    )], source="github_repos")
+    ctx = ToolContext(session_id="s", db=db)
+
+    for handler, args in ((sync_status_handler, {"source": "all"}), (list_sources_handler, {})):
+        text = (await handler(ctx, args)).text_content
+        assert f"cursor: {cursor[:120]}… ({len(cursor)} chars)" in text
+        assert cursor not in text
+    status = (await sync_status_handler(ctx, {"source": "telegram"})).text_content
+    assert 'cursor: {"pts": 1, "qts": 0, "date": 1700000000, "seq": 0}' in status
+
+
+@pytest.mark.asyncio
+async def test_the_runner_logs_a_long_cursor_cut(db, caplog):
+    """The JSON cursor of a large watch is kilobytes; the runner's log lines
+    show its start and its length, as the agent's tools do."""
+    from nerve.sources.base import Source
+    from nerve.sources.models import FetchResult
+    from nerve.sources.runner import SourceRunner
+
+    def cursor(n: int) -> str:
+        state = {f"acme/repo-{k}": {"pulls": read(at(n))} for k in range(10)}
+        return json.dumps({"v": 1, "repos": state}, separators=(",", ":"))
+
+    class Repos(Source):
+        source_name = "github_repos"
+
+        async def fetch(self, cursor_value: str | None, limit: int = 100) -> FetchResult:
+            return FetchResult(records=[], next_cursor=cursor(2))
+
+    await db.set_sync_cursor("github_repos", cursor(1))
+    caplog.set_level(logging.INFO, logger="nerve.sources.runner")
+
+    await SourceRunner(Repos(), db).run()
+
+    lines = [record.getMessage() for record in caplog.records if record.name == "nerve.sources.runner"]
+    assert any(f"(cursor={cursor(1)[:120]}… ({len(cursor(1))} chars)," in line for line in lines)
+    assert any(f"cursor advanced to {cursor(2)[:120]}… ({len(cursor(2))} chars)" in line for line in lines)
+    assert not any(cursor(1) in line or cursor(2) in line for line in lines)

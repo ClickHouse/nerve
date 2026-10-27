@@ -42,12 +42,16 @@ from nerve.channels.hosted.runtime import (
 from nerve.channels.hosted.sources import (
     BUFFER_MAX_ROWS,
     HostedSourceConsumer,
+    buffered_record,
+    github_repos_subscription,
     github_subscription,
+    hosted_sources,
     subscriptions_for,
 )
 from nerve.channels.router import ChannelRouter
 from nerve.cli import doctor_report
 from nerve.config import (
+    GitHubReposSyncConfig,
     GitHubSyncConfig,
     NerveConfig,
     SlackConfig,
@@ -77,6 +81,38 @@ GITHUB_DENY = {"deny_repos": ["owner/noisy"], "deny_reasons": ["subscribed"]}
 
 def hosted_github(**settings: Any) -> GitHubSyncConfig:
     return GitHubSyncConfig(mode="hosted", **settings)
+
+
+# The metadata of a github_repos record: every key, empty ones included.
+REPO_ACTIVITY_METADATA = {
+    "repo_name": "acme/widgets", "number": "12", "event": "opened", "subject_type": "PullRequest",
+    "author": "alice", "author_kind": "human", "head_sha": "a" * 40,
+    "subject_url": "https://github.com/acme/widgets/pull/12", "repo_url": "https://github.com/acme/widgets",
+}
+
+
+def repo_activity_event(*, record_id: str = "acme/widgets#12:opened:open", **metadata: str) -> dict[str, Any]:
+    """A record of the repository watch as the gateway delivers it, without a delivery."""
+    event = source_record_event(
+        record_id=record_id, record_type="github_repo_activity", repository="acme/widgets",
+    )
+    event["provider"] = "github_repos"
+    event["event_id"] = f"github_repos:{record_id}"
+    event["admission"]["observe"]["provenance"]["provider"] = "github_repos"
+    event["record"]["summary"] = "[acme/widgets] New PR #12: Add a widget cache"
+    event["record"]["content"] = (
+        "Repository: acme/widgets\nType: PullRequest\nEvent: opened\nPR: #12 Add a widget cache"
+    )
+    event["record"]["metadata"] = [
+        {"key": key, "value": value} if value else {"key": key}
+        for key, value in {**REPO_ACTIVITY_METADATA, **metadata}.items()
+    ]
+    return event
+
+
+def repo_activity_payload() -> dict[str, Any]:
+    """The buffer row of :func:`repo_activity_event`."""
+    return buffered_record(decoded(repo_activity_event()))
 
 
 async def eventually(predicate, timeout: float = EVENT_TIMEOUT) -> None:
@@ -148,6 +184,132 @@ class TestSettings:
 
         assert config_reload.restart_required(NerveConfig(), after) == []
 
+    def test_the_repository_watch_defaults(self):
+        watch = NerveConfig().sync.github_repos
+
+        assert (
+            watch.enabled, watch.repos, watch.types, watch.include_bots, watch.include_drafts,
+            watch.updates, watch.deny_authors,
+        ) == (False, [], ["pull_request", "issue"], False, True, False, [])
+        assert GitHubReposSyncConfig.from_dict({}) == watch
+
+    def test_the_repository_watch_settings_are_read(self):
+        watch = NerveConfig.from_dict({"sync": {"github_repos": {
+            "enabled": "true", "repos": [" acme/widgets ", None, "", "Other-Org/other.repo_2"],
+            "types": ["Release", "pull_request", "release"], "include_bots": "yes",
+            "include_drafts": "false", "updates": "on", "deny_authors": [" noisy-* ", ""],
+        }}}).sync.github_repos
+
+        assert watch.repos == ["acme/widgets", "Other-Org/other.repo_2"]
+        assert watch.types == ["pull_request", "release"]
+        assert (watch.include_bots, watch.include_drafts, watch.updates) == (True, False, True)
+        assert watch.deny_authors == ["noisy-*"]
+        assert validate_config_keys({"sync": {"github_repos": {
+            "types": ["issue"], "include_bots": True, "include_drafts": False, "updates": True,
+            "deny_authors": [],
+        }}}) == []
+
+    @pytest.mark.parametrize("blank", [None, "", "  "])
+    def test_blank_types_mean_the_default(self, blank):
+        assert GitHubReposSyncConfig.from_dict({"types": blank}).types == ["pull_request", "issue"]
+
+    def test_one_repository_written_as_a_string_is_a_list_of_one(self):
+        """A ${VAR} reference on a list setting reads as one string."""
+        watch = GitHubReposSyncConfig.from_dict({"repos": "acme/widgets", "types": "release"})
+
+        assert (watch.repos, watch.types) == (["acme/widgets"], ["release"])
+
+    @pytest.mark.parametrize(("settings", "message"), [
+        ({"types": ["pull_request", "commits"]},
+         "sync.github_repos.types must be one or more of ('pull_request', 'issue', 'release'), got 'commits'"),
+        ({"types": []},
+         "sync.github_repos.types must be one or more of ('pull_request', 'issue', 'release'), got none"),
+        ({"enabled": True, "repos": [f"acme/repo-{n}" for n in range(51)]},
+         "sync.github_repos.repos must name at most 50 repositories, got 51"),
+        ({"enabled": True, "repos": ["acme"]},
+         "sync.github_repos.repos entries must be owner/repo names as GitHub writes them, got 'acme'"),
+        ({"enabled": True, "repos": ["acme/widgets/extra"]},
+         "sync.github_repos.repos entries must be owner/repo names as GitHub writes them, got 'acme/widgets/extra'"),
+        ({"enabled": True, "repos": ["-acme/widgets"]},
+         "sync.github_repos.repos entries must be owner/repo names as GitHub writes them, got '-acme/widgets'"),
+        ({"enabled": "true", "repos": ["acme/wid gets"]},
+         "sync.github_repos.repos entries must be owner/repo names as GitHub writes them, got 'acme/wid gets'"),
+        ({"enabled": True, "repos": ["acme/.."]},
+         "sync.github_repos.repos entries must be owner/repo names as GitHub writes them, got 'acme/..'"),
+        ({"enabled": True, "repos": ["acme/widgets", "ACME/Widgets"]},
+         "sync.github_repos.repos names 'ACME/Widgets' twice"),
+        ({"enabled": True, "repos": {"acme": "widgets"}}, (
+            "sync.github_repos.repos entries must be owner/repo names as GitHub writes them, "
+            "got \"{'acme': 'widgets'}\""
+        )),
+        ({"types": {"issue": True}}, (
+            "sync.github_repos.types must be one or more of ('pull_request', 'issue', 'release'), "
+            "got \"{'issue': true}\""
+        )),
+    ])
+    def test_a_repository_watch_the_gateway_would_refuse_refuses_to_load(self, settings, message):
+        with pytest.raises(ValueError) as refused:
+            NerveConfig.from_dict({"sync": {"github_repos": settings}})
+
+        assert str(refused.value) == message
+
+    def test_fifty_repositories_load(self):
+        repos = [f"acme/repo-{n}" for n in range(50)]
+
+        assert GitHubReposSyncConfig.from_dict({"enabled": True, "repos": repos}).repos == repos
+
+    def test_repos_of_the_earlier_source_load_with_a_warning_while_the_watch_is_off(self, caplog):
+        """The earlier source took any value. A watch that is off must not stop
+        such a config from loading; switching it on refuses it until it is
+        fixed. types and the other new keys have no earlier values and stay
+        strict."""
+        legacy = [
+            "https://github.com/acme/widgets", "acme/widgets/", "acme/widgets/extra",
+            "Acme/Widgets", "acme/widgets", *(f"acme/repo-{n}" for n in range(46)),
+        ]
+
+        with caplog.at_level(logging.WARNING, logger="nerve.config"):
+            watch = NerveConfig.from_dict({"sync": {"github_repos": {"repos": legacy}}}).sync.github_repos
+
+        assert (watch.enabled, watch.repos) == (False, legacy)
+        [warning] = [r.getMessage() for r in caplog.records if r.name == "nerve.config"]
+        assert warning == (
+            "sync.github_repos is switched off, and its repos would refuse to load once it is "
+            "switched on: not owner/repo names: 'https://github.com/acme/widgets', 'acme/widgets/', "
+            "'acme/widgets/extra'; named twice: 'acme/widgets'; more than 50 repositories (51)"
+        )
+        with pytest.raises(ValueError, match="got 'https://github.com/acme/widgets'"):
+            NerveConfig.from_dict({"sync": {"github_repos": {"enabled": True, "repos": legacy}}})
+        with pytest.raises(ValueError, match="sync.github_repos.types must be one or more of"):
+            NerveConfig.from_dict({"sync": {"github_repos": {"types": ["commits"]}}})
+
+    def test_a_watch_that_is_off_with_good_repos_logs_nothing(self, caplog):
+        with caplog.at_level(logging.WARNING, logger="nerve.config"):
+            GitHubReposSyncConfig.from_dict({"repos": ["acme/widgets", "other-org/other-repo"]})
+
+        assert [r for r in caplog.records if r.name == "nerve.config"] == []
+
+    def test_a_bad_repository_watch_fails_the_load_and_the_validation(self, tmp_path):
+        from nerve.config_validate import validate_config_bundle
+
+        (tmp_path / "config.yaml").write_text(
+            "sync:\n  github_repos:\n    types: [pull_request, commits]\n", encoding="utf-8",
+        )
+
+        with pytest.raises(ValueError, match=r"sync\.github_repos\.types must be one or more of"):
+            config_module.load_config(tmp_path)
+        errors = validate_config_bundle(tmp_path).errors
+        assert any("sync.github_repos.types must be one or more of" in e for e in errors)
+
+    def test_the_repository_watch_follows_a_reload(self):
+        after = NerveConfig()
+        after.sync.github_repos = GitHubReposSyncConfig(
+            enabled=True, repos=["acme/widgets"], types=["release"], include_bots=True,
+            include_drafts=False, updates=True, deny_authors=["noisy-*"],
+        )
+
+        assert config_reload.restart_required(NerveConfig(), after) == []
+
     @pytest.mark.parametrize(("value", "expected"), [
         (None, 60), (0, 0), (15, 15), ("120", 120), (900, 900), (-5, 0), ("soon", 60),
     ])
@@ -190,13 +352,16 @@ class TestSettings:
         assert changed == ["sync.github.mode: 'poll' → 'hosted'"]
 
     def test_hosted_github_is_a_hosted_provider_without_hosted_slack(self):
+        """GitHub is hosted as a whole: the repository watch comes with it,
+        switched on or not."""
         config = NerveConfig()
         config.sync.github = hosted_github()
 
-        assert hosted_providers(config) == ["github"]
+        assert hosted_providers(config) == ["github", "github_repos"]
         assert hosted_channel_providers(config) == []
         config.slack = SlackConfig(mode="hosted")
-        assert hosted_providers(config) == ["slack", "github"]
+        assert hosted_providers(config) == ["slack", "github", "github_repos"]
+        assert hosted_providers(NerveConfig()) == []
 
 
 # ---------------------------------------------------------------------- #
@@ -267,6 +432,82 @@ class TestSubscriptionsBuilder:
         assert subscription.filters.deny_repos[0] == "owner/noisy"
         assert len(subscription.filters.deny_repos) == MAX_SUBSCRIPTION_PATTERNS
         Subscriptions(version="1", sources=(subscription,)).validate()
+
+    def test_the_frame_is_unchanged_unless_the_repository_watch_is_on_and_lists_a_repository(self):
+        """An older gateway refuses the repos member and closes the stream,
+        Slack included: every agent that does not watch a repository sends
+        the very bytes it sent before."""
+        def frame(**watch: Any) -> str:
+            config = NerveConfig()
+            config.sync.github = hosted_github()
+            config.sync.github_repos = GitHubReposSyncConfig(**watch)
+            subscriptions = subscriptions_for(config, hosted_sources(config))
+            subscriptions.validate()
+            return dumps(subscriptions)
+
+        unchanged = '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true}]}'
+        assert frame() == unchanged
+        assert frame(repos=["acme/widgets"], updates=True) == unchanged
+        assert frame(enabled=True) == unchanged
+        assert frame(
+            enabled=True, repos=["acme/widgets", "other-org/other-repo"], include_drafts=False,
+            deny_authors=["noisy-*"],
+        ) == (
+            '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true},'
+            '{"provider":"github_repos","filters":{},"repos":['
+            '{"name":"acme/widgets","types":["pull_request","issue"],"include_bots":false,'
+            '"include_drafts":false,"updates":false,"deny_authors":["noisy-*"]},'
+            '{"name":"other-org/other-repo","types":["pull_request","issue"],"include_bots":false,'
+            '"include_drafts":false,"updates":false,"deny_authors":["noisy-*"]}]}]}'
+        )
+
+    def test_the_repository_watch_goes_without_the_notifications_and_never_in_poll_mode(self):
+        watch = GitHubReposSyncConfig(
+            enabled=True, repos=["acme/widgets"], types=["release"], include_bots=True, updates=True,
+        )
+        config = NerveConfig()
+        config.sync.github = hosted_github(enabled=False)
+        config.sync.github_repos = watch
+
+        assert dumps(subscriptions_for(config, hosted_sources(config))) == (
+            '{"version":"1","sources":[{"provider":"github_repos","filters":{},"repos":['
+            '{"name":"acme/widgets","types":["release"],"include_bots":true,"include_drafts":true,'
+            '"updates":true,"deny_authors":[]}]}]}'
+        )
+        polling = NerveConfig()
+        polling.sync.github_repos = watch
+        assert hosted_sources(polling) == []
+
+    def test_deny_authors_the_gateway_cannot_take_keep_the_patterns_that_fit(self, caplog):
+        patterns = ["x" * 257, "noisy-*", "tab\there"] + [f"bot-{n}" for n in range(300)]
+
+        with caplog.at_level(logging.WARNING):
+            watch = github_repos_subscription(GitHubReposSyncConfig(
+                enabled=True, repos=["acme/widgets"], deny_authors=patterns,
+            ))
+
+        assert watch.repos[0].deny_authors[0] == "noisy-*"
+        assert len(watch.repos[0].deny_authors) == MAX_SUBSCRIPTION_PATTERNS
+        assert "sync.github_repos.deny_authors" in caplog.text
+        Subscriptions(version="1", sources=(watch,)).validate()
+
+    def test_names_the_gateway_would_refuse_are_not_published(self, caplog):
+        """The config refuses to load them; a list built in code loses them,
+        so that the gateway never closes the stream over one."""
+        settings = GitHubReposSyncConfig(enabled=True, repos=[
+            "acme/widgets", "not a repo", "ACME/Widgets", "acme/..", *(f"acme/r{n}" for n in range(60)),
+        ])
+
+        with caplog.at_level(logging.WARNING):
+            watch = github_repos_subscription(settings)
+
+        assert [repo.name for repo in watch.repos][:2] == ["acme/widgets", "acme/r0"]
+        assert len(watch.repos) == 50
+        assert "'not a repo' is not published" in caplog.text
+        assert "the gateway watches the first 50" in caplog.text
+        Subscriptions(version="1", sources=(watch,)).validate()
+        assert github_repos_subscription(GitHubReposSyncConfig(enabled=True, repos=["bad name"])) is None
+        assert github_repos_subscription(GitHubReposSyncConfig(enabled=True, repos=["a/b"], types=[])) is None
 
 
 # ---------------------------------------------------------------------- #
@@ -462,6 +703,34 @@ class TestRegistry:
         config.sync.github = hosted_github(enabled=False)
 
         assert self.runner(config, db) is None
+
+    async def test_hosted_mode_drains_the_repository_watch_from_its_own_buffer(self, db):
+        """GitHub is hosted as a whole: the repository watch runs as the
+        push-fed drain of the github_repos buffer, with its guardrail."""
+        config = NerveConfig()
+        config.sync.github = hosted_github(enabled=False)
+        config.sync.github_repos = GitHubReposSyncConfig(
+            enabled=True, repos=["acme/widgets"], deny_authors=["noisy-*"],
+        )
+        await db.insert_channel_observation("github", "github:owner/repo", TestBufferedRecords().payload())
+        await db.insert_channel_observation("github_repos", "github_repos:acme/widgets", repo_activity_payload())
+
+        (runner,) = [r for r in build_source_runners(config, db) if r.job_id == "source:github_repos"]
+        result = await runner.source.fetch(None)
+
+        assert isinstance(runner.source, HostedGitHubSource)
+        assert (runner.source.source_name, runner.source.push_fed) == ("github_repos", True)
+        assert [rule.field for rule in runner.inbox_filter.rules if rule.active] == [
+            "repo_name", "author", "subject_type", "author_kind",
+        ]
+        assert [(r.id, r.source) for r in result.records] == [("acme/widgets#12:opened:open", "github_repos")]
+        assert result.records[0].metadata == REPO_ACTIVITY_METADATA
+        assert await runner.source.has_undrained(None) is True
+        assert await runner.source.has_undrained(result.next_cursor) is False
+
+    async def test_no_hosted_source_for_another_provider(self, db):
+        with pytest.raises(ValueError, match="no hosted GitHub source for provider 'gitlab'"):
+            HostedGitHubSource(db, "gitlab")
 
 
 @pytest.mark.asyncio
@@ -896,6 +1165,110 @@ class TestStreams:
         assert stream.close_code is None
         assert "source subscriptions not sent: the gateway would refuse them" in caplog.text
 
+    async def test_the_repository_watch_is_published_and_its_records_reach_the_inbox(self, hosted):
+        hosted.config.sync.github_repos = GitHubReposSyncConfig(
+            enabled=True, repos=["acme/widgets"], types=["pull_request"], updates=True,
+        )
+        stream = await hosted.stream()
+        [subscriptions] = await hosted.subscriptions()
+        inbox_id = hosted.gateway.store(repo_activity_event())
+
+        await stream.nudge("observe")
+
+        assert subscriptions["sources"][1] == {"provider": "github_repos", "filters": {}, "repos": [{
+            "name": "acme/widgets", "types": ["pull_request"], "include_bots": False,
+            "include_drafts": True, "updates": True, "deny_authors": [],
+        }]}
+        assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
+        assert len(await hosted.db.read_channel_observations("github_repos")) == 1
+        assert await hosted.db.read_channel_observations("github") == []
+        (runner,) = [
+            r for r in build_source_runners(hosted.config, hosted.db) if r.job_id == "source:github_repos"
+        ]
+        assert (await runner.run()).records_ingested == 1
+        stored = await hosted.db.get_source_message("github_repos", "acme/widgets#12:opened:open")
+        assert stored["record_type"] == "github_repo_activity"
+        assert stored["summary"] == "[acme/widgets] New PR #12: Add a widget cache"
+        assert stored["metadata"] == REPO_ACTIVITY_METADATA
+
+    async def test_the_repository_watch_guardrail_drops_what_the_settings_drop(self, hosted):
+        """Records the gateway took before a reload changed the settings. The
+        bot rule is for pull requests and issues: a bot's release is kept."""
+        hosted.config.sync.github_repos = GitHubReposSyncConfig(
+            enabled=True, repos=["acme/widgets"], types=["pull_request", "release"],
+            deny_authors=["noisy-*"],
+        )
+        stream = await hosted.stream()
+        kept = hosted.gateway.store(repo_activity_event())
+        denied = hosted.gateway.store(repo_activity_event(record_id="acme/widgets#13:opened:open", author="noisy-ci"))
+        bot = hosted.gateway.store(repo_activity_event(
+            record_id="acme/widgets#14:opened:open", author="updater[bot]", author_kind="bot",
+        ))
+        bot_release = hosted.gateway.store(repo_activity_event(
+            record_id="acme/widgets#:released:55", number="", event="released", subject_type="Release",
+            author="github-actions[bot]", author_kind="bot", head_sha="",
+            subject_url="https://github.com/acme/widgets/releases/tag/v1.2.0",
+        ))
+
+        await stream.nudge("observe")
+
+        await hosted.acknowledged(kept, denied, bot, bot_release)
+        (runner,) = [
+            r for r in build_source_runners(hosted.config, hosted.db) if r.job_id == "source:github_repos"
+        ]
+        result = await runner.run()
+        assert (result.records_ingested, result.records_dropped) == (2, 2)
+        stored = await hosted.db.get_source_message("github_repos", "acme/widgets#:released:55")
+        assert stored["metadata"]["author_kind"] == "bot"
+        assert stored["metadata"]["subject_url"] == "https://github.com/acme/widgets/releases/tag/v1.2.0"
+
+    async def test_switching_the_repository_watch_on_and_off_follows_a_reload(self, hosted, db):
+        """No new UI: the switch is sync.github_repos.enabled, and a reload
+        rebuilds the runner and publishes the subscriptions again."""
+        cron = CronService(hosted.config, AsyncMock(), db)
+        cron.scheduler.start(paused=True)
+        engine = SimpleNamespace(get_channel_runtime={"hosted": hosted.runtime}.get)
+        try:
+            cron._register_source_runners()
+            await hosted.stream()
+            await hosted.subscriptions(1)
+
+            async def reload(**watch: Any) -> tuple[dict, list[str]]:
+                hosted.config.sync.github_repos = GitHubReposSyncConfig(**watch)
+                sources = await cron.reload_sources()
+                assert await config_reload._republish_hosted_subscriptions(engine) == "published on 1 stream(s)"
+                latest = hosted.gateway.subscriptions[-1]
+                return sources, [source["provider"] for source in latest["sources"]]
+
+            sources, providers = await reload(enabled=True, repos=["acme/widgets"])
+            await hosted.subscriptions(2)
+            assert "source:github_repos" in sources["sources"]
+            assert providers == ["github", "github_repos"]
+            (runner,) = [r for r in cron._source_runners if r.job_id == "source:github_repos"]
+            assert isinstance(runner.source, HostedGitHubSource) and runner.source.push_fed is True
+
+            sources, providers = await reload(enabled=False, repos=["acme/widgets"])
+            await hosted.subscriptions(3)
+            assert sources["removed"] == ["source:github_repos"]
+            assert providers == ["github"]
+        finally:
+            cron.scheduler.shutdown(wait=False)
+
+    async def test_deny_authors_go_with_the_filter_patterns_when_the_frame_is_too_large(self, hosted):
+        hosted.config.sync.github.allow_repos = [f"owner/{'r' * 200}-{n}" for n in range(100)]
+        hosted.config.sync.github_repos = GitHubReposSyncConfig(
+            enabled=True, repos=["acme/widgets"], deny_authors=["noisy-*"],
+        )
+        stream = await hosted.stream(negotiate=False)
+        await stream.negotiate(frame_bytes=16384)
+
+        [subscriptions] = await hosted.subscriptions()
+
+        assert subscriptions["sources"][0] == {"provider": "github", "filters": {}, "pr_watch": True}
+        assert subscriptions["sources"][1]["repos"][0]["deny_authors"] == []
+        assert subscriptions["sources"][1]["repos"][0]["name"] == "acme/widgets"
+        assert stream.close_code is None
+
     async def test_a_switched_off_source_subscribes_to_nothing_and_keeps_what_arrives(self, hosted):
         hosted.config.sync.github.enabled = False
         stream = await hosted.stream()
@@ -915,7 +1288,7 @@ class TestSharedStreams:
         harness = await start(tmp_path, db, monkeypatch, slack=True)
         try:
             assert set(harness.runtime.channels) == {"slack"}
-            assert set(harness.runtime.sources) == {"github"}
+            assert set(harness.runtime.sources) == {"github", "github_repos"}
             assert harness.router.get_channel("github") is None
             stream = await harness.stream()
             observed = harness.gateway.store(message_event(
@@ -1033,6 +1406,43 @@ class TestRunsOnDelivery:
         finally:
             await cron.stop()
             await stop(harness)
+
+
+@pytest.mark.asyncio
+class TestSchedule:
+    async def forecast(self, config: NerveConfig, db) -> dict[str, Any]:
+        """The schedule report's entry for the repository watch's runner."""
+        service = CronService(config, AsyncMock(), db)
+        service.scheduler.start(paused=True)
+        try:
+            service._register_source_runners()
+            report = await service.schedule_report()
+        finally:
+            service.scheduler.shutdown(wait=False)
+        return {job["id"]: job for job in report["jobs"]}["source:github_repos"]
+
+    async def test_a_scheduled_drain_of_the_hosted_repository_watch_is_no_wake(self, db):
+        """The gateway delivers the records and the delivery runs the drain;
+        with nothing waiting, its scheduled run is not counted as the next
+        task, so a parked machine is not woken for it."""
+        from nerve.cron import service as cron_service
+
+        config = NerveConfig()
+        config.sync.github = hosted_github(enabled=False)
+        config.sync.github_repos = GitHubReposSyncConfig(enabled=True, repos=["acme/widgets"])
+
+        idle = await self.forecast(config, db)
+        await db.insert_channel_observation("github_repos", "github_repos:acme/widgets", repo_activity_payload())
+        waiting = await self.forecast(config, db)
+
+        assert (idle["forecast"], idle["reason"]) == ("skip", cron_service._PUSH_FED_REASON)
+        assert waiting["forecast"] == "run"
+
+    async def test_the_polling_repository_watch_counts(self, db):
+        config = NerveConfig()
+        config.sync.github_repos = GitHubReposSyncConfig(enabled=True, repos=["acme/widgets"])
+
+        assert (await self.forecast(config, db))["forecast"] == "run"
 
 
 # ---------------------------------------------------------------------- #
@@ -1169,13 +1579,59 @@ class TestDoctor:
         ("poll", "[WARN] gh CLI not found (needed for sync)"),
     ])
     def test_gh_is_asked_for_only_when_something_runs_it(self, tmp_path, monkeypatch, mode, expected):
+        """The repository watch is hosted with the rest of GitHub."""
         import shutil
 
         monkeypatch.setattr(shutil, "which", lambda name: None)
         config = doctor_config(tmp_path)
         config.sync.github.mode = mode
+        config.sync.github_repos = GitHubReposSyncConfig(enabled=True, repos=["acme/widgets"])
 
         assert expected in doctor_report(config)
+
+    @pytest.mark.parametrize(("mode", "line"), [
+        ("hosted", (
+            "[OK] GitHub repository watch (mode hosted, the channel gateway polls): 2 repositories; "
+            "types pull_request, release; updates on\n"
+        )),
+        ("poll", (
+            "[OK] GitHub repository watch (mode poll, gh on this machine): 2 repositories; "
+            "types pull_request, release; updates on\n"
+        )),
+    ])
+    def test_the_repository_watch_is_reported(self, tmp_path, mode, line):
+        config = doctor_config(tmp_path)
+        config.sync.github.mode = mode
+        config.sync.github_repos = GitHubReposSyncConfig(
+            enabled=True, repos=["acme/widgets", "other-org/other-repo"], types=["pull_request", "release"],
+            updates=True,
+        )
+
+        assert line in doctor_report(config)
+
+    def test_a_repository_watch_that_is_off_or_lists_nothing_says_so(self, tmp_path):
+        config = doctor_config(tmp_path)
+
+        assert "[--] GitHub repository watch off (sync.github_repos.enabled is false)\n" in doctor_report(config)
+        config.sync.github_repos = GitHubReposSyncConfig(enabled=True)
+        assert (
+            "[WARN] GitHub repository watch is on but sync.github_repos.repos is empty, so it watches nothing"
+        ) in doctor_report(config)
+        config.sync.github_repos = GitHubReposSyncConfig(enabled=True, repos=["acme/widgets"])
+        assert "1 repository; types pull_request, issue; updates off\n" in doctor_report(config)
+
+    def test_notifications_off_with_a_repository_watch_on_still_subscribe_to_the_watch(self, tmp_path):
+        config = doctor_config(tmp_path, enabled=False)
+        config.sync.github_repos = GitHubReposSyncConfig(enabled=True, repos=["acme/widgets"])
+        config.slack = SlackConfig.from_dict({"mode": "hosted", "enabled": False})
+
+        report = doctor_report(config)
+
+        assert (
+            "[--] GitHub is hosted but switched off (sync.github.enabled is false); the gateway is "
+            "told that this agent takes no notifications\n"
+        ) in report
+        assert "[WARN] Slack is hosted but switched off (slack.enabled is false)" in report
 
 
 @pytest.mark.asyncio
@@ -1223,6 +1679,7 @@ class TestSetupPage:
         monkeypatch.setattr(setup_checks, "_version_of", lambda argv: None)
         config = NerveConfig()
         config.sync.github = hosted_github()
+        config.sync.github_repos = GitHubReposSyncConfig(enabled=True, repos=["acme/widgets"])
         try:
             checks = {check["id"]: check for check in await setup_checks.environment(config)}
             config.sync.github.mode = "poll"

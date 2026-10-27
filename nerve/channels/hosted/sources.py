@@ -4,7 +4,9 @@ In hosted mode the channel gateway polls a source instead of this process.
 It applies the filters that Nerve publishes before it stores a record, keeps
 the records in the agent's inbox until Nerve reads them, also while Nerve is
 not running, and Nerve reads them over the same streams that carry hosted
-channel traffic. GitHub is the only hosted source.
+channel traffic. GitHub is the hosted source, as a whole: with
+``sync.github.mode: hosted`` both the notifications (provider ``github``) and
+the repository watch (provider ``github_repos``) come from the gateway.
 
 :class:`HostedSourceConsumer` takes a provider's records from the inbox reader
 and writes each one to the local ``channel_observations`` buffer under the
@@ -30,26 +32,33 @@ from nerve.channels.hosted.contract import (
     EVENT_KIND_SOURCE_RECORD,
     SUBSCRIPTIONS_VERSION,
     Event,
+    RepoWatch,
     SourceFilters,
     SourceSubscription,
     Subscriptions,
 )
 from nerve.channels.hosted.contract.model import (
+    MAX_REPO_WATCHES,
     MAX_SUBSCRIPTION_PATTERN_BYTES,
     MAX_SUBSCRIPTION_PATTERNS,
+    REPO_WATCH_PROVIDER,
+    REPO_WATCH_TYPES,
     ZERO_TIME,
     valid_pattern,
+    valid_repo_name,
 )
 from nerve.channels.hosted.contract.wire import format_time
 from nerve.channels.hosted.intake import Disposition
 
 if TYPE_CHECKING:
-    from nerve.config import GitHubSyncConfig, NerveConfig
+    from nerve.config import GitHubReposSyncConfig, GitHubSyncConfig, NerveConfig
     from nerve.db import Database
 
 logger = logging.getLogger(__name__)
 
 GITHUB = "github"
+# The repository watch: the repositories that sync.github_repos names.
+GITHUB_REPOS = REPO_WATCH_PROVIDER
 
 # Row target of a provider's buffer. The gateway keeps at most this many
 # source records for an agent, and the runner drains the buffer after every
@@ -58,8 +67,12 @@ BUFFER_MAX_ROWS = 2_000
 
 
 def hosted_sources(config: NerveConfig) -> list[str]:
-    """The source providers whose records come from the gateway."""
-    return [GITHUB] if config.sync.github.mode == "hosted" else []
+    """The source providers whose records come from the gateway.
+
+    GitHub is hosted as a whole: ``sync.github.mode: hosted`` makes the
+    repository watch (``github_repos``) hosted too.
+    """
+    return [GITHUB, GITHUB_REPOS] if config.sync.github.mode == "hosted" else []
 
 
 # ---------------------------------------------------------------------- #
@@ -71,11 +84,19 @@ def subscriptions_for(config: NerveConfig, providers: Iterable[str]) -> Subscrip
     """What the agent subscribes to, among the hosted *providers*.
 
     A provider that is switched off is left out, so the gateway stops polling
-    it for this agent.
+    it for this agent. So is a repository watch that names no repository:
+    the ``github_repos`` subscription is sent only while the watch is on and
+    lists a repository, and an agent without one sends the same frame as
+    before the watch existed.
     """
+    providers = set(providers)
     sources: list[SourceSubscription] = []
     if GITHUB in providers and config.sync.github.enabled:
         sources.append(github_subscription(config.sync.github))
+    if GITHUB_REPOS in providers and config.sync.github_repos.enabled:
+        watch = github_repos_subscription(config.sync.github_repos)
+        if watch is not None:
+            sources.append(watch)
     return Subscriptions(version=SUBSCRIPTIONS_VERSION, sources=tuple(sources))
 
 
@@ -94,16 +115,65 @@ def github_subscription(settings: GitHubSyncConfig) -> SourceSubscription:
     return SourceSubscription(
         provider=GITHUB,
         filters=SourceFilters(
-            allow_repos=_allow_list("allow_repos", settings.allow_repos),
-            deny_repos=_deny_list("deny_repos", settings.deny_repos),
-            allow_actors=_allow_list("allow_actors", settings.allow_actors),
-            deny_actors=_deny_list("deny_actors", settings.deny_actors),
-            allow_reasons=_allow_list("allow_reasons", settings.allow_reasons),
-            deny_reasons=_deny_list("deny_reasons", settings.deny_reasons),
-            deny_ci_branches=_deny_list("deny_ci_branches", settings.deny_ci_branches),
+            allow_repos=_allow_list("sync.github.allow_repos", settings.allow_repos),
+            deny_repos=_deny_list("sync.github.deny_repos", settings.deny_repos),
+            allow_actors=_allow_list("sync.github.allow_actors", settings.allow_actors),
+            deny_actors=_deny_list("sync.github.deny_actors", settings.deny_actors),
+            allow_reasons=_allow_list("sync.github.allow_reasons", settings.allow_reasons),
+            deny_reasons=_deny_list("sync.github.deny_reasons", settings.deny_reasons),
+            deny_ci_branches=_deny_list("sync.github.deny_ci_branches", settings.deny_ci_branches),
         ),
         pr_watch=bool(settings.pr_watch),
         inbox="all" if settings.inbox == "all" else "",
+    )
+
+
+def github_repos_subscription(settings: GitHubReposSyncConfig) -> SourceSubscription | None:
+    """The repository watch subscription, or ``None`` when it watches nothing.
+
+    Every repository of ``sync.github_repos.repos`` carries the same
+    settings, all of them sent. The config refuses to load names the gateway
+    would not take; a list built some other way loses those names, past
+    :data:`MAX_REPO_WATCHES` too, with a warning, so that the gateway never
+    closes the stream over them. ``deny_authors`` goes as a deny list does:
+    the patterns that fit, while the inbox filter applies them all.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for value in settings.repos or ():
+        name = str(value or "").strip()
+        if not name:
+            continue
+        # The gateway compares names ignoring case, as GitHub does.
+        if not valid_repo_name(name) or name.lower() in seen:
+            logger.warning("sync.github_repos.repos: %r is not published to the gateway", name)
+            continue
+        seen.add(name.lower())
+        names.append(name)
+    if len(names) > MAX_REPO_WATCHES:
+        logger.warning(
+            "sync.github_repos.repos names %d repositories; the gateway watches the first %d",
+            len(names), MAX_REPO_WATCHES,
+        )
+        names = names[:MAX_REPO_WATCHES]
+    chosen = {str(kind).strip().lower() for kind in settings.types or ()}
+    types = tuple(kind for kind in REPO_WATCH_TYPES if kind in chosen)
+    if not names or not types:
+        return None
+    deny_authors = _deny_list("sync.github_repos.deny_authors", settings.deny_authors)
+    return SourceSubscription(
+        provider=GITHUB_REPOS,
+        repos=tuple(
+            RepoWatch(
+                name=name,
+                types=types,
+                include_bots=bool(settings.include_bots),
+                include_drafts=bool(settings.include_drafts),
+                updates=bool(settings.updates),
+                deny_authors=deny_authors,
+            )
+            for name in names
+        ),
     )
 
 
@@ -114,28 +184,28 @@ def _patterns(values: object) -> list[str]:
     return [text for text in (str(value).strip() for value in values if value is not None) if text]
 
 
-def _allow_list(key: str, values: object) -> tuple[str, ...]:
+def _allow_list(setting: str, values: object) -> tuple[str, ...]:
     patterns = _patterns(values)
     if len(patterns) <= MAX_SUBSCRIPTION_PATTERNS and all(valid_pattern(p) for p in patterns):
         return tuple(patterns)
     logger.warning(
-        "sync.github.%s has more than %d patterns, or one longer than %d bytes or with a "
+        "%s has more than %d patterns, or one longer than %d bytes or with a "
         "control character; the gateway is told to keep every record and the inbox "
         "filter applies the list alone",
-        key, MAX_SUBSCRIPTION_PATTERNS, MAX_SUBSCRIPTION_PATTERN_BYTES,
+        setting, MAX_SUBSCRIPTION_PATTERNS, MAX_SUBSCRIPTION_PATTERN_BYTES,
     )
     return ()
 
 
-def _deny_list(key: str, values: object) -> tuple[str, ...]:
+def _deny_list(setting: str, values: object) -> tuple[str, ...]:
     patterns = _patterns(values)
     kept = [p for p in patterns if valid_pattern(p)][:MAX_SUBSCRIPTION_PATTERNS]
     if len(kept) < len(patterns):
         logger.warning(
-            "sync.github.%s has more than %d patterns, or one longer than %d bytes or with "
+            "%s has more than %d patterns, or one longer than %d bytes or with "
             "a control character; the gateway gets the first %d usable ones and the inbox "
             "filter applies the rest",
-            key, MAX_SUBSCRIPTION_PATTERNS, MAX_SUBSCRIPTION_PATTERN_BYTES, len(kept),
+            setting, MAX_SUBSCRIPTION_PATTERNS, MAX_SUBSCRIPTION_PATTERN_BYTES, len(kept),
         )
     return tuple(kept)
 
@@ -264,8 +334,10 @@ class HostedSourceConsumer:
 __all__ = [
     "BUFFER_MAX_ROWS",
     "GITHUB",
+    "GITHUB_REPOS",
     "HostedSourceConsumer",
     "buffered_record",
+    "github_repos_subscription",
     "github_subscription",
     "hosted_sources",
     "subscriptions_for",
