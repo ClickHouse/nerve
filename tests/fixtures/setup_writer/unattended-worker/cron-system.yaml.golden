@@ -104,3 +104,114 @@ jobs:
   session_mode: persistent
   enabled: true
   context_rotate_hours: 168
+- id: machine-maintenance
+  schedule: 0 4 * * 0
+  prompt: 'You are running the weekly machine maintenance job. Free disk space and
+    remove clutter on the machine you run on. Remove only items that are old and that
+    nothing uses. Never destroy data without asking first.
+
+
+    ## 1. Learn this machine
+
+
+    Each machine is different, so do not use a fixed list of commands. Find out what
+    this machine has:
+
+    - Disk use: `df -h`, then `du` on the large directories (home, the workspace,
+    repository clones, caches, temporary directories).
+
+    - Where clutter collects: Git repositories and their worktrees, build and compile
+    caches, package manager caches, Docker (images, containers, volumes, build cache),
+    temporary files, old logs, the trash.
+
+    - What runs: processes and containers that listen on a port (for example `ss -ltnp`
+    and `docker ps`), with their start time, command and working directory.
+
+    - What you already know: TOOLS.md, your memory (what earlier runs found, what
+    must be kept), and the answers to the questions earlier runs asked.
+
+
+    If the disk has a lot of free space, nothing is clearly old and no leftover service
+    runs, stop.
+
+
+    ## 2. Sort the candidates
+
+
+    A candidate is old (not used or changed for some weeks) and nothing uses it now.
+    A leftover service is a candidate too: a dev server, preview, test database, tunnel
+    or test container that still listens on a port, that a past task or test run started
+    (often from a worktree or a temporary directory), and that nothing uses now. It
+    uses memory and can expose the machine on an open port. Put each candidate in
+    one of two groups.
+
+
+    **Remove without asking**: items that hold no data, because a tool makes them
+    again when it needs them or because the work is stored somewhere else:
+
+    - build, compile and package download caches;
+
+    - dangling Docker images and unused Docker build cache;
+
+    - a Git worktree whose branch is merged (its pull request is merged), with no
+    uncommitted changes, no untracked files and no unpushed commits;
+
+    - temporary files that no process uses.
+
+
+    **Ask first**: anything that can hold data that is not stored somewhere else:
+
+    - leftover services: a running service can hold state, and the person can still
+    use it;
+
+    - Docker volumes, stopped containers, tagged images;
+
+    - a worktree or branch with uncommitted, untracked or unpushed work, or whose
+    pull request is open or closed without a merge;
+
+    - user files, databases, logs, and anything else you are not sure about.
+
+
+    When you are not sure which group an item is in, it is in "Ask first".
+
+
+    Never stop or remove, and never offer to: Nerve itself, its state directory and
+    workspace; system services and services that a service manager or a deployment
+    keeps running; anything that a session or job of this agent uses now, and the
+    worktrees and files that a running process uses.
+
+
+    ## 3. Act
+
+
+    - Remove the items of the first group with each tool''s own command (for example
+    `git worktree remove`, `docker image prune`, the clean command of the package
+    manager or build cache), not with a raw recursive delete. Where a trash command
+    is installed, use it in place of `rm`.
+
+    - For the second group, send one `ask_user` that lists each item with its size,
+    its age and why you think nothing uses it; for a service, also its port, its command
+    and where it started. Remove or stop only the items that the answer approves.
+    When there is no answer, change nothing in that group.
+
+
+    ## 4. Report
+
+
+    Say what you removed or stopped and how much space it freed (`df -h` before and
+    after). When you also ask a question, put this in the `ask_user`; otherwise send
+    one `notify` (priority low) when you changed something. When you changed nothing
+    and have no question, send nothing.
+
+
+    Save to memory only lasting facts about this machine that make the next run faster
+    or safer, for example a directory that must be kept. Do not save a log of this
+    run.
+
+    '
+  description: 'Weekly cleanup of the machine Nerve runs on: old build caches, Docker
+    leftovers, worktrees of merged pull requests, temporary services left running
+    on open ports. It asks you before it removes or stops anything that can hold data.'
+  model: ''
+  session_mode: isolated
+  enabled: true

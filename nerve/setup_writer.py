@@ -210,6 +210,78 @@ PRODUCTIVITY_CRONS = [
             "Do not send another notification about it.\n"
         ),
     },
+    {
+        "id": "machine-maintenance",
+        "name": "Machine Maintenance",
+        "display_name": "Machine maintenance",
+        "schedule": "0 4 * * 0",
+        "description": "Weekly cleanup of the machine Nerve runs on: old build caches, Docker leftovers, worktrees of merged pull requests, temporary services left running on open ports. It asks you before it removes or stops anything that can hold data.",
+        "requires": None,
+        "session_mode": "isolated",
+        "reminder_mode": False,
+        "prompt": (
+            "You are running the weekly machine maintenance job. Free disk space and remove clutter "
+            "on the machine you run on. Remove only items that are old and that nothing uses. "
+            "Never destroy data without asking first.\n\n"
+            "## 1. Learn this machine\n\n"
+            "Each machine is different, so do not use a fixed list of commands. Find out what this "
+            "machine has:\n"
+            "- Disk use: `df -h`, then `du` on the large directories (home, the workspace, "
+            "repository clones, caches, temporary directories).\n"
+            "- Where clutter collects: Git repositories and their worktrees, build and compile "
+            "caches, package manager caches, Docker (images, containers, volumes, build cache), "
+            "temporary files, old logs, the trash.\n"
+            "- What runs: processes and containers that listen on a port (for example `ss -ltnp` "
+            "and `docker ps`), with their start time, command and working directory.\n"
+            "- What you already know: TOOLS.md, your memory (what earlier runs found, what must be "
+            "kept), and the answers to the questions earlier runs asked.\n\n"
+            "If the disk has a lot of free space, nothing is clearly old and no leftover service "
+            "runs, stop.\n\n"
+            "## 2. Sort the candidates\n\n"
+            "A candidate is old (not used or changed for some weeks) and nothing uses it now. "
+            "A leftover service is a candidate too: a dev server, preview, test database, tunnel "
+            "or test container that still listens on a port, that a past task or test run started "
+            "(often from a worktree or a temporary directory), and that nothing uses now. It "
+            "uses memory and can expose the machine on an open port. "
+            "Put each candidate in one of two groups.\n\n"
+            "**Remove without asking**: items that hold no data, because a tool makes them again "
+            "when it needs them or because the work is stored somewhere else:\n"
+            "- build, compile and package download caches;\n"
+            "- dangling Docker images and unused Docker build cache;\n"
+            "- a Git worktree whose branch is merged (its pull request is merged), with no "
+            "uncommitted changes, no untracked files and no unpushed commits;\n"
+            "- temporary files that no process uses.\n\n"
+            "**Ask first**: anything that can hold data that is not stored somewhere else:\n"
+            "- leftover services: a running service can hold state, and the person can still "
+            "use it;\n"
+            "- Docker volumes, stopped containers, tagged images;\n"
+            "- a worktree or branch with uncommitted, untracked or unpushed work, or whose pull "
+            "request is open or closed without a merge;\n"
+            "- user files, databases, logs, and anything else you are not sure about.\n\n"
+            "When you are not sure which group an item is in, it is in \"Ask first\".\n\n"
+            "Never stop or remove, and never offer to: Nerve itself, its state directory and "
+            "workspace; system services and services that a service manager or a deployment "
+            "keeps running; anything that a session or job of this agent uses now, and the "
+            "worktrees and files that a running process uses.\n\n"
+            "## 3. Act\n\n"
+            "- Remove the items of the first group with each tool's own command (for example "
+            "`git worktree remove`, `docker image prune`, the clean command of the package manager "
+            "or build cache), not with a raw recursive delete. Where a trash command is installed, "
+            "use it in place of `rm`.\n"
+            "- For the second group, send one `ask_user` that lists each item with its size, its "
+            "age and why you think nothing uses it; for a service, also its port, its command and "
+            "where it started. Remove or stop only the items that the answer approves. When there "
+            "is no answer, change nothing in that group.\n\n"
+            "## 4. Report\n\n"
+            "Say what you removed or stopped and how much space it freed (`df -h` before and "
+            "after). When "
+            "you also ask a question, put this in the `ask_user`; otherwise send one `notify` "
+            "(priority low) when you changed something. When you changed nothing and have no "
+            "question, send nothing.\n\n"
+            "Save to memory only lasting facts about this machine that make the next run faster "
+            "or safer, for example a directory that must be kept. Do not save a log of this run.\n"
+        ),
+    },
 ]
 
 # The optional crons each mode switches on when nobody chose otherwise: what
@@ -219,13 +291,13 @@ PRODUCTIVITY_CRONS = [
 # onboarding conversation, which enables the job (overridden by id in
 # ``jobs.yaml``, scoped to the worker's tag) when the answer is yes.
 DEFAULT_CRONS: dict[str, list[str]] = {
-    "personal": ["inbox-processor", "task-planner"],
-    "worker": ["skill-reviser", "skill-extractor"],
+    "personal": ["inbox-processor", "task-planner", "machine-maintenance"],
+    "worker": ["skill-reviser", "skill-extractor", "machine-maintenance"],
 }
 
 # The optional crons a worker install carries at all — task-planner included,
 # written disabled, so it stays one toggle away.
-_WORKER_CRONS = ("skill-reviser", "skill-extractor", "task-planner")
+_WORKER_CRONS = ("skill-reviser", "skill-extractor", "task-planner", "machine-maintenance")
 
 # Quiet hours: ``quiet_start`` and ``quiet_end`` both empty means there are
 # none; otherwise both are ``HH:MM``. The window an enabled-but-unspecified

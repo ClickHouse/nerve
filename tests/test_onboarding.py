@@ -1410,6 +1410,6 @@ class TestEffectiveCronState:
             "    prompt: Review the skills.\n    enabled: false\n"
         ))
         before = system_cron_file(tmp_path).read_text()
-        plan = plan_optional_crons(tmp_path, {"skill-extractor"})
+        plan = plan_optional_crons(tmp_path, {"skill-extractor", "machine-maintenance"})
         assert "skill-reviser" not in plan.disabled and "skill-reviser" not in plan.enabled
         assert plan.text is None and system_cron_file(tmp_path).read_text() == before
