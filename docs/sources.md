@@ -210,7 +210,9 @@ running. Nerve reads them over the hosted channel streams.
   repo, an actor or a reason. If the whole subscription is still larger than
   the gateway's frame limit, it goes with no patterns at all, and the guardrail
   here does all the filtering. With `enabled: false` Nerve tells the gateway
-  that it subscribes to nothing.
+  that it takes no notifications, and with no
+  [repository watch](#hosted-repository-watch) either, that it subscribes to
+  nothing.
 - **The gateway must know the subscriptions.** A gateway that predates hosted
   sources closes a stream that publishes them, hosted Slack traffic included,
   so update the gateway before an agent switches to `mode: hosted`.
@@ -241,6 +243,11 @@ running. Nerve reads them over the hosted channel streams.
   they switch it on and off together with GitHub. On a machine with a `gh`
   login it can still be switched on in the settings, until the GitHub switch
   is saved again.
+- **The repository watch is hosted too.** With `sync.github_repos.enabled`,
+  the gateway also polls the repositories it lists and delivers their records
+  to the `github_repos` source, independently of `sync.github.enabled`. It
+  needs a gateway that knows the repository watch; see
+  [Hosted repository watch](#hosted-repository-watch).
 - **A switched-off hosted Slack holds GitHub back.** Nerve reads the events of
   every hosted provider from one ordered inbox at the gateway, and it stops
   reading while a hosted channel cannot take events. With `slack.mode: hosted`
@@ -254,10 +261,11 @@ running. Nerve reads them over the hosted channel streams.
   follow-up.
 - **Restart-only.** A change of `mode` takes effect at the next restart. To go
   back from `hosted` to `poll`, switch the source off first: set
-  `enabled: false` and reload while the mode is still `hosted`. Nerve then
+  `enabled: false` (and `sync.github_repos.enabled: false`, if the repository
+  watch is on) and reload while the mode is still `hosted`. Nerve then
   tells the gateway that it subscribes to nothing (a subscriptions frame of
   `{"version":"1"}`), and the gateway stops polling GitHub for the agent at
-  once. Then set `mode: poll`, switch `enabled` back on, and restart. In poll
+  once. Then set `mode: poll`, switch them back on, and restart. In poll
   mode Nerve publishes no subscriptions at all. The gateway also counts an agent
   as subscribed to nothing when a stream opens and publishes no subscriptions
   within a short grace period, or when Nerve no longer serves the stream
@@ -286,6 +294,139 @@ on the `github_pr_activity` gate.
 - **Event types:** PushEvent, PullRequestEvent, IssueCommentEvent, IssuesEvent, PullRequestReviewEvent, CreateEvent, DeleteEvent, ForkEvent (with type-specific formatting); other event types get generic formatting
 - **Note:** GitHub's Events API returns truncated payloads (e.g., PR titles and URLs may be missing). The source constructs URLs from repo name + number and handles missing fields gracefully
 - **Default schedule:** `*/15 * * * *` (every 15 min)
+
+### GitHub Repos
+
+Repositories that the agent follows although its GitHub account takes no part
+in them: the new pull requests, issues and releases there arrive as
+`github_repos` records, and with `updates: true` so does each new commit,
+ready for review, merge or close of a pull request it reported. It
+is the self-service form of GitHub's "Custom watch", which has no API. Nothing
+is set on the GitHub account (no watch, no e-mail), and it does not depend on
+`sync.github.inbox`. What the account itself takes part in (mentions, review
+requests, its own pull requests) still comes through the [GitHub](#github)
+notifications, and in hosted mode through `pr_watch`.
+
+- **Adapter:** `nerve/sources/github_repos.py` — `gh api` on this machine. With `sync.github.mode: hosted` the channel gateway polls instead (see [Hosted repository watch](#hosted-repository-watch))
+- **Listings:** one request per repository and type, the most recently changed first:
+  - `pull_request`: `GET /repos/{repo}/pulls?state=all&sort=updated&direction=desc&per_page=100`
+  - `issue`: `GET /repos/{repo}/issues?state=all&sort=updated&direction=desc&per_page=100`. The issues endpoint lists the pull requests too; they are skipped
+  - `release`: `GET /repos/{repo}/releases?per_page=30`. Draft releases are skipped, prereleases are not
+- **One page each:** a repository with more than 100 pull requests (or issues) changed between two runs loses the oldest of those changes. `batch_size` does not cap this source
+- **Cursor:** JSON. Per repository and listing: the newest `updated_at` listed (`published_at` for releases), when the listing was read, and the numbers (release ids) of the items created in that newest second. Per repository, the pull requests it follows: a held draft (`include_drafts: false`) and, with `updates`, a reported pull request while it is open, as head commit, draft and held. At most 1,000 per repository; the one listed longest ago is forgotten first
+- **First run:** the baseline. Each listing's cursor is set and nothing is reported, so switching the source on does not fill the inbox with history; a repository or a type added later takes its own baseline, and one removed is forgotten. An item is new when it was created (a release: published) after the last listing: later than the listing's cursor, or in the cursor's own second and not listed then, since GitHub's times have a resolution of one second. So an older pull request that changes later is never reported as new, and an item is reported once
+- **No backfill:** nothing older than a day is backfilled. A listing last read more than a day ago (the watch switched off for longer, or a long outage) starts fresh with a new baseline, and the pull requests it followed are forgotten
+- **Failures:** a listing that fails (a repository that does not exist or that the `gh` login cannot read, a rate limit) keeps its cursor and is read again on the next run; the other listings still report. A run in which every listing fails fails, and the source's health shows it
+- **Upgrades:** the cursor of the earlier version of this source, one timestamp, becomes the cursor of every listing (unless it is more than a day old), so nothing is repeated or skipped; a buffer position left by the hosted mode is no cursor (a new baseline). The earlier version took any `repos` value: one that the watch now refuses (a URL such as `https://github.com/acme/widgets`, a trailing slash, `owner/repo/x`, the same repository twice, more than 50) only logs a warning while the watch is off, and refuses the config once it is on
+- **Default schedule:** `*/15 * * * *` (every 15 min); in hosted mode the fallback cadence of the drain
+- **Disabled by default**
+
+```yaml
+sync:
+  github_repos:
+    enabled: true
+    repos: ["acme/widgets", "other-org/other-repo"]
+    types: [pull_request, issue]    # pull_request | issue | release
+    include_bots: false             # PRs and issues a GitHub App or a [bot] account opened
+    include_drafts: true            # false: a draft is reported when it is ready for review
+    updates: false                  # true: commits, ready, merge and close of reported PRs
+    deny_authors: []                # case-insensitive globs on the author's login
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `github_repos.repos` | list | `[]` | `owner/repo` names as GitHub writes them, each once (case does not matter), at most 50. While the watch is on, a name GitHub would not take, the same repository twice, or more than 50 refuses to load; while it is off, a warning names them. Empty = the source does nothing |
+| `github_repos.types` | list | `[pull_request, issue]` | What is reported: `pull_request`, `issue`, `release`. Case does not matter; an unknown type, or an empty list, refuses to load |
+| `github_repos.include_bots` | bool | `false` | Also report the pull requests and issues that a GitHub App (`user.type` `Bot`) or an account whose login ends in `[bot]` opened. A release is reported whoever published it: release automation (`github-actions[bot]`, a release bot) is the normal case. `author_kind` still says `bot` on such a release |
+| `github_repos.include_drafts` | bool | `true` | `false`: a new draft pull request is held and reported when it is marked ready for review (event `ready`), never as `opened`; one closed while it is a draft is never reported |
+| `github_repos.updates` | bool | `false` | Also report, for each pull request this source reported, a new head commit (`updated`), ready for review (`ready`), and its merge (`merged`) or close (`closed`), after which it is no longer followed |
+| `github_repos.deny_authors` | list | `[]` | Case-insensitive globs on the author's login, with the [guardrail](#guardrails-inbox-filtering) rules; what they match is never reported, releases included. `[...]` is a character class (`*[bot]` matches every login ending in `b`, `o` or `t`); bot pull requests and issues are dropped by `include_bots` already |
+
+Events (the record's `Event:` line and `event` metadata):
+
+| `event` | When | Record ID | `timestamp` |
+|---------|------|-----------|-------------|
+| `opened` | A pull request or an issue was created since the last run (a draft only with `include_drafts: true`) | `<repo>#<number>:opened:open` | `created_at` |
+| `ready` | A held draft (`include_drafts: false`) was marked ready for review; with `updates`, so was a reported draft | `<repo>#<number>:ready:<head sha>` | `updated_at` |
+| `updated` | `updates`: a reported pull request has a new head commit | `<repo>#<number>:updated:<head sha>` | `updated_at` |
+| `merged` | `updates`: a reported pull request was merged | `<repo>#<number>:merged:merged` | `merged_at` |
+| `closed` | `updates`: a reported pull request was closed without a merge | `<repo>#<number>:closed:closed` | `closed_at` |
+| `released` | A release was published since the last run | `<repo>#:released:<release id>` | `published_at` |
+
+A pull request gives one record per run: `merged` or `closed`, else `ready`,
+else `updated`; back to draft gives none, and one seen for the first time is
+`opened` whatever its state. Comments, reviews and labels move `updated_at` and
+report nothing; issues report only `opened`. An event has one record ID, so a
+listing read twice stores it once.
+
+The record (type `github_repo_activity`) is built the same way in both modes.
+Its summary is, for example, `[acme/widgets] New PR #12: Add a widget cache`,
+`[acme/widgets] PR #12 merged: Add a widget cache` or
+`[acme/widgets] New release v1.2.0: Widgets 1.2`. Its content has the lines
+`Repository:`, `Type:`, `Event:`, `PR: #12 <title>` (`Issue: #7 <title>`,
+`Release: <tag> <name>`), `Author:`, `State:` (`merged` for a merged pull
+request), `Draft:` and `Base ← head:` for a pull request, `Prerelease:` for a
+release, `Labels:`, `Created:`, `Updated:` (`Published:`), `URL:`, then the
+description capped at 4,000 characters. Like every source record it is
+untrusted content. Its metadata, which the guardrails and gates match on, is
+the same in both modes:
+
+| Key | Value |
+|-----|-------|
+| `repo_name` | `owner/repo`, as configured |
+| `number` | The pull request or issue number as a decimal string; empty for a release |
+| `event` | `opened`, `ready`, `updated`, `merged`, `closed` or `released` |
+| `subject_type` | `PullRequest`, `Issue` or `Release` |
+| `author` | The login that opened the item or published the release |
+| `author_kind` | `bot` (a GitHub App, or a login ending in `[bot]`) or `human` |
+| `head_sha` | The pull request's head commit; empty otherwise |
+| `subject_url` | The page of the pull request, issue or release (the `URL:` line), which the Sources page links to |
+| `repo_url` | `https://github.com/<owner>/<repo>`, as configured |
+
+The settings are applied before anything is reported or remembered, and the
+inbox guardrail applies them again to what arrives (`repo_name` against
+`repos`, `author` against `deny_authors`, `author_kind` against
+`include_bots` for pull requests and issues, `subject_type` against
+`types`), which catches the records delivered before a reload changed them.
+Everything here follows a reload.
+
+#### Hosted repository watch
+
+GitHub is hosted as a whole: with `sync.github.mode: hosted` the channel
+gateway polls the watched repositories too, and `gh` is not needed on this
+machine for them.
+
+- **Who polls.** The gateway, with the GitHub credential connected to the
+  agent (the one of the [hosted GitHub source](#hosted-github-source)), on the
+  notifications cadence (60 s), with conditional requests, which cost no rate
+  limit while nothing changed. With many repositories it spreads them over a
+  few polls. It builds the records described above and keeps them until Nerve
+  reads them, also while Nerve is not running; a repository it cannot read is
+  paused while the others keep being polled.
+- **What is published.** Nerve sends the gateway a `github_repos`
+  subscription: each repository with `types`, `include_bots`,
+  `include_drafts`, `updates` and `deny_authors`, when a stream opens and again
+  on every reload, only while `enabled` is true and `repos` lists a
+  repository. Switching it off and reloading tells the gateway to stop. A
+  `deny_authors` list the gateway cannot take (more than 256 patterns, or a
+  pattern longer than 256 bytes or with a control character) goes with the
+  patterns that fit, and the inbox guardrail here applies them all.
+- **It starts fresh.** The gateway backfills nothing older than a day either,
+  and it forgets the repositories of an agent that stops subscribing to them,
+  so switching the watch off and on, or a long outage, starts from a new
+  baseline.
+- **The gateway must know the repository watch.** The subscription carries a
+  `repos` member that a gateway older than the repository watch refuses: it
+  closes the stream, hosted Slack traffic included. Update the gateway before
+  an agent switches the watch on in hosted mode. An agent that does not
+  switch it on sends the same subscription as before, so it is unaffected.
+- **Same source, same name.** The records go to their own local buffer, and
+  the `source:github_repos` runner drains it, as the `github` runner drains
+  the notifications (see [Hosted GitHub source](#hosted-github-source)): it
+  runs as soon as records are delivered, and its scheduled run is a fallback
+  that is not the instance's next scheduled task while nothing waits, so a
+  platform that parks the machine does not wake it for that run. The mode
+  follows `sync.github.mode`, which is restart-only.
 
 ### Telegram account sync
 - **Adapter:** `nerve/sources/telegram.py` — uses Telethon (user account API).
@@ -515,6 +656,18 @@ sync:
     username: ""                  # Auto-detect from gh auth
     batch_size: 50
     condense: false               # Events are naturally short
+
+  github_repos:
+    enabled: false
+    schedule: "*/15 * * * *"      # Poll mode; in hosted mode the fallback cadence of the drain
+    repos: []                     # Required: owner/repo names, at most 50. Example: ["acme/widgets"]
+    types: [pull_request, issue]  # pull_request | issue | release
+    include_bots: false           # Also PRs and issues a GitHub App or a [bot] account opened
+    include_drafts: true          # false: a draft PR is reported when it is ready for review
+    updates: false                # true: also commits, ready, merge and close of reported PRs
+    deny_authors: []              # Globs on the author's login; never reported
+    batch_size: 50
+    condense: false
 ```
 
 ### Config Fields
@@ -897,7 +1050,7 @@ The Sources page (`/sources`) has three tabs:
 - `consumer_cursors` — Per (consumer, source) read position with TTL and session linking
 - `source_messages` — Inbox messages with `raw_content` (original HTML), `processed_content` (LLM-condensed), TTL-based expiry
 - `source_run_log` — Per-run diagnostics (records ingested, errors, timestamps)
-- `channel_observations` — Push buffer for chat messages a channel collected for the inbox, drained by `ChannelSource`, and for the records of the hosted GitHub source, drained by the `github` runner. Trimmed toward a per-transport row target and TTL-swept by daily cleanup
+- `channel_observations` — Push buffer for chat messages a channel collected for the inbox, drained by `ChannelSource`, and for the records of the hosted GitHub sources, drained by the `github` and `github_repos` runners. Trimmed toward a per-transport row target and TTL-swept by daily cleanup
 - `cron_logs` — Job execution history (source jobs use `source:<name>` as job ID)
 
 ### API Endpoints
@@ -1065,8 +1218,9 @@ export function MyRenderer({ content, metadata, summary }: Props) {
 | `nerve/sources/telegram.py` | Telegram adapter (Telethon) |
 | `nerve/sources/gmail.py` | Gmail adapter (gog CLI) |
 | `nerve/sources/github.py` | GitHub notifications adapter (gh CLI), record builder, GitHub guardrail |
-| `nerve/sources/github_hosted.py` | GitHub source in hosted mode: drains the records the channel gateway delivered |
+| `nerve/sources/github_hosted.py` | GitHub sources in hosted mode (`github`, `github_repos`): drain the records the channel gateway delivered |
 | `nerve/sources/github_events.py` | GitHub user events adapter (gh CLI) |
+| `nerve/sources/github_repos.py` | GitHub repository watch adapter (gh CLI), record builder, its guardrail |
 | `nerve/agent/tools.py` | Consumer tools: `list_sources`, `poll_source`, `read_source` |
 | `web/src/components/Sources/` | Source message renderers (email, GitHub, default markdown) |
 

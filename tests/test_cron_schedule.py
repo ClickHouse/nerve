@@ -32,6 +32,7 @@ from nerve.cron.service import CronService, ScheduledTick
 from nerve.sources.channel import ChannelSource
 from nerve.sources.github import GitHubSource
 from nerve.sources.github_hosted import HostedGitHubSource
+from nerve.sources.github_repos import GitHubReposSource
 from nerve.sources.models import IngestResult, SourceRecord
 from tests.actor_rows import mock_system_principal
 
@@ -499,7 +500,11 @@ async def test_a_cursor_that_cannot_be_read_leaves_the_drain_uncounted(held):
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("make", "channel"),
-    [(lambda db: ChannelSource("slack", db), "slack"), (HostedGitHubSource, "github")],
+    [
+        (lambda db: ChannelSource("slack", db), "slack"),
+        (HostedGitHubSource, "github"),
+        (lambda db: HostedGitHubSource(db, "github_repos"), "github_repos"),
+    ],
 )
 async def test_push_fed_sources_look_past_their_cursor_for_waiting_records(make, channel):
     db = AsyncMock()
@@ -516,7 +521,10 @@ async def test_push_fed_sources_look_past_their_cursor_for_waiting_records(make,
 
 @pytest.mark.parametrize(
     ("source", "fed"),
-    [(HostedGitHubSource, True), (ChannelSource, True), (GitHubSource, False)],
+    [
+        (HostedGitHubSource, True), (HostedGitHubSource(AsyncMock(), "github_repos"), True),
+        (ChannelSource, True), (GitHubSource, False), (GitHubReposSource, False),
+    ],
 )
 def test_the_sources_say_whether_deliveries_feed_them(source, fed):
     assert source.push_fed is fed

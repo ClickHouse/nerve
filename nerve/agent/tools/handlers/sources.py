@@ -18,6 +18,7 @@ from nerve.agent.tools.schemas import (
     READ_SOURCE_SCHEMA,
     SYNC_STATUS_SCHEMA,
 )
+from nerve.sources.models import cursor_text
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +115,7 @@ async def sync_status_handler(ctx: ToolContext, args: dict) -> ToolResult:
         cursor = await ctx.db.get_sync_cursor(s)
         last_run = await ctx.db.get_last_source_run(s)
 
-        cursor_info = f"cursor: {cursor}" if cursor else "no cursor yet"
+        cursor_info = f"cursor: {cursor_text(cursor)}" if cursor else "no cursor yet"
 
         if last_run:
             ran_at = last_run.get("ran_at", "?")
@@ -146,7 +147,7 @@ async def list_sources_handler(ctx: ToolContext, args: dict) -> ToolResult:
         sync_cursor = await ctx.db.get_sync_cursor(source_name)
         last_run = await ctx.db.get_last_source_run(source_name)
 
-        cursor_info = f"cursor: {sync_cursor}" if sync_cursor else "no cursor"
+        cursor_info = f"cursor: {cursor_text(sync_cursor)}" if sync_cursor else "no cursor"
         run_info = ""
         if last_run:
             ran_at = last_run.get("ran_at", "?")

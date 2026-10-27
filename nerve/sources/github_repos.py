@@ -1,218 +1,850 @@
-"""GitHub Repos source — monitors a set of repos for newly-created issues and PRs.
+"""GitHub Repos source: what is new in repositories that the agent follows.
 
 Where the ``github`` source surfaces notifications involving *you* and the
 ``github_events`` source captures *your own* actions, this source watches a
-configured set of repositories and surfaces brand-new issues and pull requests
-as they are opened. It lets the agent monitor repos for new activity it would
-not otherwise be notified about (you don't have to be a participant).
+configured set of repositories (``sync.github_repos.repos``) that the account
+need not take part in, and reports new pull requests, issues and releases
+there (``types``). Nothing is set on the GitHub account: no watch, no e-mail.
 
-Cursor semantics: ISO 8601 timestamp = newest ``created_at`` seen across all
-monitored repos. On first run (no cursor) it establishes a baseline cursor from
-the newest item *without* backfilling history — same approach as
-``github_events`` — so enabling the source doesn't dump the entire backlog into
-the inbox.
+This module is the poll mode: the gh CLI, on the source's schedule. With
+``sync.github.mode: hosted`` the channel gateway polls the same listings for
+the agent and builds the same records, which
+:class:`~nerve.sources.github_hosted.HostedGitHubSource` drains.
 
-A single cursor is shared across all repos. Every run fetches every repo, so any
-item created after the cursor (in any repo) has ``created_at > cursor`` and is
-caught. DB-level dedup on ``(source, id)`` handles same-second overlap.
+One request per repository and type, the most recently changed first:
 
-API: ``GET /repos/{owner}/{repo}/issues?state=all&sort=created&direction=desc``
-The issues endpoint returns BOTH issues and pull requests; PRs carry a
-``pull_request`` key, which is how we tell them apart.
+* ``pull_request``: ``GET /repos/{repo}/pulls?state=all&sort=updated&direction=desc&per_page=100``
+* ``issue``: ``GET /repos/{repo}/issues?state=all&sort=updated&direction=desc&per_page=100``;
+  the issues endpoint lists the pull requests too, and they are skipped
+* ``release``: ``GET /repos/{repo}/releases?per_page=30``; drafts are skipped
+
+Events (the record's ``Event:`` line and ``event`` metadata):
+
+* ``opened``: a pull request or an issue created since the last listing
+* ``ready``: a draft marked ready for review. With ``include_drafts`` false
+  a new draft is held and reported then, never as opened; with ``updates``,
+  a reported draft too
+* ``updated``, ``merged``, ``closed``: with ``updates``, a new head commit, a
+  merge, or a close without one, of a pull request already reported. One
+  record per pull request and run: merged or closed, else ready, else updated
+* ``released``: a release published since the last listing
+
+Comments, reviews and labels move ``updated_at`` and report nothing. Before
+anything is reported or remembered, a pull request or an issue is dropped
+whose author is a GitHub App or a ``[bot]`` account (unless
+``include_bots``; a release is reported whoever published it, release
+automation being the normal case), and any item whose author's login
+matches a ``deny_authors`` glob (the guardrail rules).
+
+The cursor is JSON: per repository, for each listing its newest
+``updated_at`` (``published_at`` for releases), when it was read, and the keys
+of the items created in that newest second; and the fingerprints of the pull
+requests it follows (``[head commit, draft, held]``), a held draft or, with
+``updates``, a reported pull request that is still open::
+
+    {"v": 1, "repos": {"acme/widgets": {"pulls": {"since": "2026-10-27T10:05:00Z",
+     "listed_at": "2026-10-27T10:20:00Z", "at": ["12"]},
+     "prs": {"12": ["0123456789ab", false, false]}}}}
+
+An item is new when it was created (published) after the last listing: later
+than its cursor, or in the cursor's own second and not listed then, since
+GitHub's times have a resolution of one second. At most
+:data:`MAX_FINGERPRINTS` pull requests are followed per repository; the one
+listed longest ago is forgotten first. A listing without a cursor is the
+baseline: its cursor is set and nothing is reported, so switching the source
+on, or adding a repository or a type, does not fill the inbox with history.
+So is a listing last read more than a day ago (:data:`STALE_AFTER`): nothing
+older than a day is backfilled, and a long outage, or the source switched off
+for longer, starts fresh. A listing that fails keeps its cursor. The earlier
+cursor of this source, one ISO timestamp (the newest ``created_at`` seen),
+stands for every listing and for when it was last read; a buffer position
+(digits), left by the hosted mode, is no cursor.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
-from datetime import datetime, timezone
-from typing import Any
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
 
 from nerve.sources.base import Source
+from nerve.sources.filters import FieldRule, InboxFilter, matches_any
 from nerve.sources.models import FetchResult, SourceRecord
+
+if TYPE_CHECKING:
+    from nerve.config import GitHubReposSyncConfig
 
 logger = logging.getLogger(__name__)
 
-# Cap for issue/PR body text to keep records reasonable.
+SOURCE_NAME = "github_repos"
+# Every record of this source, in both modes.
+RECORD_TYPE = "github_repo_activity"
+
+# Cap for issue/PR/release body text to keep records reasonable.
 _MAX_BODY_CHARS = 4_000
 
-# Concurrent gh API calls — one per repo, bounded.
+# Concurrent gh API calls, bounded.
 _MAX_CONCURRENT_FETCHES = 5
+
+# Pull requests followed per repository (held drafts, reported ones with
+# updates); the one listed longest ago is forgotten first.
+MAX_FINGERPRINTS = 1_000
+
+# Head commit characters a fingerprint keeps: enough to tell two apart.
+_FINGERPRINT_SHA_CHARS = 12
+
+_CURSOR_VERSION = 1
+
+# A listing last read longer ago than this starts again from a baseline:
+# nothing older than a day is backfilled, the horizon of the notifications
+# source's first run too.
+STALE_AFTER = timedelta(hours=24)
+
+# What each type lists: its name in the cursor, and the endpoint.
+_LISTINGS: dict[str, tuple[str, str]] = {
+    "pull_request": (
+        "pulls", "repos/{repo}/pulls?state=all&sort=updated&direction=desc&per_page=100",
+    ),
+    "issue": (
+        "issues", "repos/{repo}/issues?state=all&sort=updated&direction=desc&per_page=100",
+    ),
+    "release": ("releases", "repos/{repo}/releases?per_page=30"),
+}
+_DEFAULT_TYPES = ("pull_request", "issue")
+
+# The record's subject_type for each type.
+SUBJECT_TYPES = {"pull_request": "PullRequest", "issue": "Issue", "release": "Release"}
+
+
+@dataclass
+class _PullRequestsAndIssuesRule(FieldRule):
+    """A rule that a release passes: ``include_bots`` is about pull requests
+    and issues, and a release is reported whoever published it."""
+
+    def passes(self, record: SourceRecord) -> bool:
+        if (record.metadata or {}).get("subject_type") == SUBJECT_TYPES["release"]:
+            return True
+        return super().passes(record)
+
+
+def github_repos_inbox_filter(settings: GitHubReposSyncConfig) -> InboxFilter:
+    """The inbox guardrail of the GitHub Repos source, from ``sync.github_repos``.
+
+    The polling source and the gateway apply these settings before anything
+    is stored; the guardrail applies them again to what arrives, as the
+    GitHub guardrail does. It catches the records delivered before a reload
+    changed the settings, and the ``deny_authors`` that the gateway was not
+    sent (see :func:`nerve.channels.hosted.sources.github_repos_subscription`).
+    """
+    rules = [
+        # A repository the watch no longer names: its records already on the way.
+        FieldRule(field="repo_name", allow=list(settings.repos or [])),
+        FieldRule(field="author", deny=list(settings.deny_authors or [])),
+        FieldRule(
+            field="subject_type",
+            allow=[SUBJECT_TYPES[kind] for kind in settings.types or () if kind in SUBJECT_TYPES],
+        ),
+    ]
+    if not settings.include_bots:
+        rules.append(_PullRequestsAndIssuesRule(field="author_kind", deny=["bot"]))
+    return InboxFilter(rules=rules)
+
+
+# ---------------------------------------------------------------------- #
+#  Cursor                                                                 #
+# ---------------------------------------------------------------------- #
+
+
+@dataclass
+class _Listing:
+    """What the cursor remembers of one listing of a repository.
+
+    ``since`` is the newest time the listing showed (``updated_at``, or
+    ``published_at`` for releases); ``""`` when it showed nothing, after which
+    everything it shows is new. ``listed_at`` is when this source last read
+    it. ``at`` holds the keys (the number, or the release id) of the items
+    created in the ``since`` second: GitHub's times have a resolution of one
+    second, so an item created in that second can come after the listing, and
+    a later listing reports it unless its key is here. ``None`` when those
+    items are unknown (the cursor of the earlier version of this source): then
+    nothing created in that second is new.
+    """
+
+    since: str
+    listed_at: str
+    at: list[str] | None = None
+
+    def as_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {"since": self.since, "listed_at": self.listed_at}
+        if self.at is not None:
+            out["at"] = self.at
+        return out
+
+
+@dataclass
+class _RepoState:
+    """What the cursor remembers of one repository.
+
+    Its listings by name (``pulls``, ``issues``, ``releases``), and in ``prs``
+    the pull requests it follows: number → ``[head commit, draft, held]``, in
+    the order in which they were last listed.
+    """
+
+    listings: dict[str, _Listing] = field(default_factory=dict)
+    prs: dict[str, list[Any]] = field(default_factory=dict)
+
+    def follow(self, number: str, head_sha: str, *, draft: bool, held: bool) -> None:
+        """Remember a pull request, as the one listed last."""
+        self.prs.pop(number, None)
+        self.prs[number] = [head_sha[:_FINGERPRINT_SHA_CHARS], draft, held]
+
+    def as_json(self) -> dict[str, Any]:
+        out: dict[str, Any] = {name: listing.as_json() for name, listing in self.listings.items()}
+        if self.prs:
+            out["prs"] = self.prs
+        return out
+
+
+def _read_listing(raw: object) -> _Listing | None:
+    """One listing of the cursor, or ``None`` when it cannot be read.
+
+    A listing that cannot be read takes a new baseline. One without a readable
+    ``listed_at`` counts as read long ago, which comes to the same.
+    """
+    if not isinstance(raw, dict):
+        return None
+    since = raw.get("since")
+    if not isinstance(since, str) or (since and _when(since) is None):
+        return None
+    at = raw.get("at")
+    if at is not None and not (isinstance(at, list) and all(isinstance(key, str) for key in at)):
+        return None
+    listed_at = raw.get("listed_at")
+    return _Listing(since=since, listed_at=listed_at if isinstance(listed_at, str) else "", at=at)
+
+
+def _read_cursor(cursor: str | None) -> tuple[dict[str, _RepoState], str | None]:
+    """The repository states in *cursor*, and the earlier source's timestamp.
+
+    Anything that cannot be read is no cursor: a listing without one takes a
+    baseline, which reports nothing.
+    """
+    text = (cursor or "").strip()
+    if not text:
+        return {}, None
+    if text.isdigit():
+        logger.info(
+            "github_repos: cursor %s is a buffer position of the hosted mode; "
+            "taking a baseline", text,
+        )
+        return {}, None
+    if not text.startswith("{"):
+        if _when(text) is not None:
+            return {}, text
+        logger.warning("github_repos: unreadable cursor %.80r; taking a baseline", text)
+        return {}, None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        logger.warning("github_repos: unreadable cursor %.80r; taking a baseline", text)
+        return {}, None
+    repos = data.get("repos") if isinstance(data, dict) else None
+    states: dict[str, _RepoState] = {}
+    for repo, raw in (repos.items() if isinstance(repos, dict) else ()):
+        if not isinstance(raw, dict):
+            continue
+        state = _RepoState()
+        for name, _ in _LISTINGS.values():
+            listing = _read_listing(raw.get(name))
+            if listing is not None:
+                state.listings[name] = listing
+        prs = raw.get("prs")
+        for number, entry in (prs.items() if isinstance(prs, dict) else ()):
+            if (
+                isinstance(entry, list) and len(entry) == 3
+                and isinstance(entry[0], str) and isinstance(entry[1], bool)
+                and isinstance(entry[2], bool)
+            ):
+                state.prs[str(number)] = entry
+        states[repo] = state
+    return states, None
+
+
+def _write_cursor(states: dict[str, _RepoState]) -> str:
+    return json.dumps(
+        {"v": _CURSOR_VERSION, "repos": {repo: state.as_json() for repo, state in states.items()}},
+        separators=(",", ":"),
+    )
+
+
+def _when(value: object) -> datetime | None:
+    """A GitHub timestamp as an aware datetime, or ``None``."""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or text.isdigit():
+        return None
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def _newest(current: str | None, candidate: object) -> str | None:
+    """The later of two GitHub timestamps, as written; unreadable ones lose."""
+    when = _when(candidate)
+    if when is None:
+        return current
+    if current is None or _when(current) is None or when > _when(current):
+        return str(candidate)
+    return current
+
+
+def _stamp(now: datetime) -> str:
+    """*now* as the cursor writes when a listing was read."""
+    return now.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _stale(listing: _Listing, now: datetime) -> bool:
+    """Whether *listing* was last read more than :data:`STALE_AFTER` before *now*."""
+    when = _when(listing.listed_at)
+    return when is None or now - when > STALE_AFTER
+
+
+def _number_key(item: dict[str, Any]) -> str:
+    return str(item.get("number"))
+
+
+def _release_key(item: dict[str, Any]) -> str:
+    return str(item.get("id"))
+
+
+@dataclass
+class _Scan:
+    """One listing read against its cursor.
+
+    ``changed`` holds the items listed at or after the cursor, oldest first:
+    at, not only after, so that an item that changed in the cursor's own
+    second after the last listing is not lost (one listed again changes
+    nothing). At a baseline (``previous`` is ``None``) it is empty.
+    ``listing`` is the listing's next cursor.
+    """
+
+    changed: list[dict[str, Any]]
+    listing: _Listing
+    previous: _Listing | None
+    new_key: str
+    key: Callable[[dict[str, Any]], str]
+
+    def is_new(self, item: dict[str, Any]) -> bool:
+        """Whether *item* was created (published) after the last listing:
+        later than its cursor, or in the cursor's own second and not listed
+        then."""
+        when = _when(item.get(self.new_key))
+        if when is None or self.previous is None:
+            return False
+        cutoff = _when(self.previous.since)
+        if cutoff is None or when > cutoff:
+            return True
+        return (
+            when == cutoff and self.previous.at is not None
+            and self.key(item) not in self.previous.at
+        )
+
+
+def _scan(
+    items: list[Any], previous: _Listing | None, now: datetime, *,
+    cursor_key: str, new_key: str, key: Callable[[dict[str, Any]], str],
+) -> _Scan:
+    """Read a listing against its cursor, *previous* (``None``: a baseline).
+
+    The next cursor is the newest *cursor_key* listed, with the keys of the
+    items whose *new_key* falls in that second, and those of the cursor
+    before it while the second stays the same.
+    """
+    listed = [
+        item for item in items
+        if isinstance(item, dict) and _when(item.get(cursor_key)) is not None
+    ]
+    newest = previous.since if previous is not None else None
+    for item in listed:
+        newest = _newest(newest, item.get(cursor_key))
+    since = newest or ""
+    boundary = _when(since)
+    at: set[str] | None = {
+        key(item) for item in listed
+        if boundary is not None and _when(item.get(new_key)) == boundary
+    }
+    if previous is not None and since == previous.since:
+        at = None if previous.at is None else at | set(previous.at)
+    listing = _Listing(since=since, listed_at=_stamp(now), at=None if at is None else sorted(at))
+    if previous is None:
+        return _Scan([], listing, None, new_key, key)
+    cutoff = _when(previous.since)
+    changed = [
+        item for item in listed
+        if cutoff is None or _when(item.get(cursor_key)) >= cutoff
+    ]
+    changed.sort(key=lambda item: _when(item.get(cursor_key)))
+    return _Scan(changed, listing, previous, new_key, key)
+
+
+# ---------------------------------------------------------------------- #
+#  Records                                                                #
+# ---------------------------------------------------------------------- #
+
+
+def _author(user: object) -> tuple[str, str]:
+    """``(login, kind)`` of an item's author; kind is ``bot`` or ``human``."""
+    if not isinstance(user, dict):
+        return "", "human"
+    login = str(user.get("login") or "")
+    bot = user.get("type") == "Bot" or login.endswith("[bot]")
+    return login, "bot" if bot else "human"
+
+
+def _head_sha(item: dict[str, Any]) -> str:
+    """A pull request's head commit, or ``""``."""
+    head = item.get("head")
+    return str(head.get("sha") or "") if isinstance(head, dict) else ""
+
+
+def _description(body: object) -> str | None:
+    """The record's description section, capped, or ``None`` without a body."""
+    text = body if isinstance(body, str) else ""
+    if not text:
+        return None
+    capped = text[:_MAX_BODY_CHARS]
+    if len(text) > _MAX_BODY_CHARS:
+        capped += "\n[... truncated]"
+    return f"\n--- Description ---\n{capped}"
+
+
+def _timestamp(item: dict[str, Any], key: str) -> str:
+    """The event's time: *key*, else when the item was updated or created."""
+    for name in (key, "updated_at", "created_at"):
+        value = item.get(name)
+        if isinstance(value, str) and value:
+            return value
+    return datetime.now(UTC).isoformat()
+
+
+def _metadata(
+    repo: str, item: dict[str, Any], number: str, event: str, subject_type: str,
+    author: tuple[str, str], head_sha: str,
+) -> dict[str, str]:
+    """The record's metadata: the keys, values and order that the gateway sends."""
+    return {
+        "repo_name": repo,
+        "number": number,
+        "event": event,
+        "subject_type": subject_type,
+        "author": author[0],
+        "author_kind": author[1],
+        "head_sha": head_sha,
+        # The item's page and the repository's, which the Sources page links to.
+        "subject_url": str(item.get("html_url") or ""),
+        "repo_url": f"https://github.com/{repo}",
+    }
+
+
+# The time each event is reported at, and the summary after "[repo] ".
+_PR_EVENT_TIMES = {
+    "opened": "created_at", "updated": "updated_at", "ready": "updated_at",
+    "merged": "merged_at", "closed": "closed_at",
+}
+_PR_SUMMARIES = {
+    "opened": "New PR #{number}: {title}",
+    "updated": "PR #{number} updated: {title}",
+    "ready": "PR #{number} ready for review: {title}",
+    "merged": "PR #{number} merged: {title}",
+    "closed": "PR #{number} closed: {title}",
+}
+
+
+def pull_request_record(repo: str, item: dict[str, Any], event: str) -> SourceRecord:
+    """The record of *event* on a pull request of the pulls listing."""
+    number = str(item.get("number"))
+    title = item.get("title") or "?"
+    author = _author(item.get("user"))
+    base = item.get("base") if isinstance(item.get("base"), dict) else {}
+    head = item.get("head") if isinstance(item.get("head"), dict) else {}
+    head_sha = _head_sha(item)
+    base_ref = str(base.get("ref") or "")
+    head_name = str(head.get("label") or head.get("ref") or "")
+    state = "merged" if item.get("merged_at") else str(item.get("state") or "")
+    content = [
+        f"Repository: {repo}",
+        "Type: PullRequest",
+        f"Event: {event}",
+        f"PR: #{number} {title}",
+        f"Author: {author[0]}" if author[0] else None,
+        f"State: {state}" if state else None,
+        f"Draft: {'true' if item.get('draft') else 'false'}",
+        f"Base ← head: {base_ref} ← {head_name}" if base_ref and head_name else None,
+        *_common_lines(item),
+        _description(item.get("body")),
+    ]
+    fingerprint = {"opened": "open", "merged": "merged", "closed": "closed"}.get(event, head_sha)
+    return SourceRecord(
+        id=f"{repo}#{number}:{event}:{fingerprint}",
+        source=SOURCE_NAME,
+        record_type=RECORD_TYPE,
+        summary=f"[{repo}] " + _PR_SUMMARIES[event].format(number=number, title=title),
+        content="\n".join(line for line in content if line),
+        timestamp=_timestamp(item, _PR_EVENT_TIMES[event]),
+        metadata=_metadata(repo, item, number, event, "PullRequest", author, head_sha),
+    )
+
+
+def issue_record(repo: str, item: dict[str, Any]) -> SourceRecord:
+    """The record of a new issue of the issues listing."""
+    number = str(item.get("number"))
+    title = item.get("title") or "?"
+    author = _author(item.get("user"))
+    state = str(item.get("state") or "")
+    content = [
+        f"Repository: {repo}",
+        "Type: Issue",
+        "Event: opened",
+        f"Issue: #{number} {title}",
+        f"Author: {author[0]}" if author[0] else None,
+        f"State: {state}" if state else None,
+        *_common_lines(item),
+        _description(item.get("body")),
+    ]
+    return SourceRecord(
+        id=f"{repo}#{number}:opened:open",
+        source=SOURCE_NAME,
+        record_type=RECORD_TYPE,
+        summary=f"[{repo}] New Issue #{number}: {title}",
+        content="\n".join(line for line in content if line),
+        timestamp=_timestamp(item, "created_at"),
+        metadata=_metadata(repo, item, number, "opened", "Issue", author, ""),
+    )
+
+
+def release_record(repo: str, item: dict[str, Any]) -> SourceRecord:
+    """The record of a release published, from the releases listing."""
+    tag = str(item.get("tag_name") or "")
+    name = str(item.get("name") or "")
+    named = f"{tag} {name}" if name and name != tag else tag
+    author = _author(item.get("author"))
+    content = [
+        f"Repository: {repo}",
+        "Type: Release",
+        "Event: released",
+        f"Release: {named}",
+        f"Author: {author[0]}" if author[0] else None,
+        f"Prerelease: {'true' if item.get('prerelease') else 'false'}",
+        f"Created: {item['created_at']}" if item.get("created_at") else None,
+        f"Published: {item['published_at']}" if item.get("published_at") else None,
+        f"URL: {item.get('html_url') or ''}",
+        _description(item.get("body")),
+    ]
+    return SourceRecord(
+        id=f"{repo}#:released:{item.get('id')}",
+        source=SOURCE_NAME,
+        record_type=RECORD_TYPE,
+        summary=f"[{repo}] New release {tag}" + (f": {name}" if name and name != tag else ""),
+        content="\n".join(line for line in content if line),
+        timestamp=_timestamp(item, "published_at"),
+        metadata=_metadata(repo, item, "", "released", "Release", author, ""),
+    )
+
+
+def _common_lines(item: dict[str, Any]) -> list[str | None]:
+    """The labels, the times and the URL of a pull request or an issue."""
+    labels = [
+        str(label["name"]) for label in item.get("labels") or ()
+        if isinstance(label, dict) and label.get("name")
+    ]
+    return [
+        f"Labels: {', '.join(labels)}" if labels else None,
+        f"Created: {item['created_at']}" if item.get("created_at") else None,
+        f"Updated: {item['updated_at']}" if item.get("updated_at") else None,
+        f"URL: {item.get('html_url') or ''}",
+    ]
+
+
+# ---------------------------------------------------------------------- #
+#  Source                                                                 #
+# ---------------------------------------------------------------------- #
 
 
 class GitHubReposSource(Source):
-    """Monitors a configured set of repos for newly-created issues and PRs."""
+    """Reports what is new in a configured set of repositories, with the gh CLI.
 
-    source_name = "github_repos"
+    *config* holds the ``sync.github_repos`` settings: ``repos``, ``types``,
+    ``include_bots``, ``include_drafts``, ``updates`` and ``deny_authors``;
+    a setting left out takes its default.
+    """
 
-    def __init__(self, config: dict[str, Any] | None = None):
+    source_name = SOURCE_NAME
+
+    def __init__(
+        self, config: dict[str, Any] | None = None, *, clock: Callable[[], datetime] | None = None,
+    ):
         self._config = config or {}
-        # Configured repos, e.g. ["ClickHouse/clickhouse-go", "owner/repo"].
+        # Configured repos, e.g. ["acme/widgets", "other-org/other-repo"].
         self._repos: list[str] = [
-            r.strip() for r in self._config.get("repos", []) if r and r.strip()
+            r.strip() for r in self._config.get("repos") or [] if r and r.strip()
         ]
+        chosen = self._config.get("types")
+        if chosen is None:
+            chosen = _DEFAULT_TYPES
+        elif isinstance(chosen, str):
+            chosen = [chosen]
+        self._types = tuple(kind for kind in _LISTINGS if kind in chosen)
+        self._include_bots = bool(self._config.get("include_bots", False))
+        self._include_drafts = bool(self._config.get("include_drafts", True))
+        self._updates = bool(self._config.get("updates", False))
+        self._deny_authors = [str(p) for p in self._config.get("deny_authors") or []]
+        # When a listing is read, for its cursor (a test sets the time).
+        self._clock = clock or (lambda: datetime.now(UTC))
 
     async def fetch(self, cursor: str | None, limit: int = 100) -> FetchResult:
-        """Fetch newly-created issues and PRs since cursor (ISO timestamp).
+        """Report what changed in every repository since *cursor*.
 
-        On first run (cursor=None) establishes a baseline cursor from the newest
-        item without emitting any records (no backfill).
+        Every listing is read in full each run (one page), so ``limit`` does
+        not cap this source. A listing that fails is left for the next run
+        with its cursor; when every listing fails, the run fails.
         """
-        if not self._repos:
-            logger.warning("github_repos: no repos configured — nothing to fetch")
+        if not self._repos or not self._types:
+            logger.warning("github_repos: no repos or no types configured — nothing to fetch")
             return FetchResult(records=[], next_cursor=cursor)
 
-        # GitHub caps per_page at 100. Each repo gets its own page-1 fetch.
-        per_page = min(limit, 100)
-        sem = asyncio.Semaphore(_MAX_CONCURRENT_FETCHES)
-        fetch_tasks = [self._fetch_repo(repo, per_page, sem) for repo in self._repos]
-        results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-
-        # Flatten into (repo, issue) pairs, skipping repos that errored.
-        items: list[tuple[str, dict]] = []
-        for repo, res in zip(self._repos, results):
-            if isinstance(res, Exception):
-                logger.warning("github_repos: fetch failed for %s: %s", repo, res)
-                continue
-            for issue in res:
-                if isinstance(issue, dict):
-                    items.append((repo, issue))
-
-        if not items:
-            return FetchResult(records=[], next_cursor=cursor)
-
-        # First run: establish baseline cursor, don't backfill history.
-        if cursor is None:
-            newest_ts = max(
-                (it.get("created_at", "") for _, it in items),
-                default=None,
-            )
-            logger.info(
-                "github_repos: first run, establishing baseline cursor=%s "
-                "(%d items skipped across %d repos)",
-                newest_ts, len(items), len(self._repos),
-            )
-            return FetchResult(records=[], next_cursor=newest_ts or cursor)
-
-        # Keep only items created strictly after the cursor. DB-level dedup on
-        # (source, id) covers any same-second overlap.
-        new_items = [
-            (repo, it) for repo, it in items
-            if it.get("created_at", "") > cursor
+        now = self._clock()
+        states, earlier = _read_cursor(cursor)
+        listings = [
+            (repo, kind, *_LISTINGS[kind]) for repo in self._repos for kind in self._types
         ]
-        if not new_items:
-            return FetchResult(records=[], next_cursor=cursor)
-
-        # Oldest-first for natural reading order in the inbox.
-        new_items.sort(key=lambda ri: ri[1].get("created_at", ""))
-        records = [self._issue_to_record(repo, it) for repo, it in new_items]
-
-        # Advance cursor to the newest created_at we just ingested.
-        newest_ts = max(it.get("created_at", "") for _, it in new_items)
-        return FetchResult(records=records, next_cursor=newest_ts, has_more=False)
-
-    # ------------------------------------------------------------------
-    # Fetch + formatting helpers
-    # ------------------------------------------------------------------
-
-    async def _fetch_repo(
-        self, repo: str, per_page: int, sem: asyncio.Semaphore,
-    ) -> list[dict]:
-        """Fetch the most-recently-created issues+PRs for a single repo.
-
-        Returns a list of issue dicts (PRs included — they carry a
-        ``pull_request`` key). Returns [] on any error.
-        """
-        endpoint = (
-            f"repos/{repo}/issues"
-            f"?state=all&sort=created&direction=desc&per_page={per_page}"
+        sem = asyncio.Semaphore(_MAX_CONCURRENT_FETCHES)
+        results = await asyncio.gather(
+            *(self._list(endpoint.format(repo=repo), sem) for repo, _, _, endpoint in listings),
+            return_exceptions=True,
         )
+        listed = {(repo, kind): result for (repo, kind, _, _), result in zip(listings, results)}
+
+        records: list[SourceRecord] = []
+        failures: list[str] = []
+        next_states: dict[str, _RepoState] = {}
+        for repo in self._repos:
+            old = states.get(repo)
+            if old is None:
+                # A repository new to the cursor takes a baseline, unless the
+                # earlier version of this source left its one timestamp: it
+                # stands for every listing, and for when it was last read.
+                old = _RepoState(listings={
+                    _LISTINGS[kind][0]: _Listing(since=earlier, listed_at=earlier)
+                    for kind in self._types
+                } if earlier else {})
+            state = self._carried(old)
+            for kind in self._types:
+                name = _LISTINGS[kind][0]
+                previous = old.listings.get(name)
+                result = listed[(repo, kind)]
+                if isinstance(result, BaseException):
+                    failures.append(f"{repo} {name}: {result}")
+                    if previous is not None:
+                        state.listings[name] = previous
+                    continue
+                if previous is not None and _stale(previous, now):
+                    # Nothing older than a day is backfilled: after a long
+                    # outage, or a watch switched off for longer, start fresh.
+                    logger.info(
+                        "github_repos: %s %s was last read at %s, more than a day ago; "
+                        "taking a new baseline", repo, name, previous.listed_at or "an unknown time",
+                    )
+                    previous = None
+                    if kind == "pull_request":
+                        state.prs.clear()
+                if kind == "pull_request":
+                    records += self._pull_requests(repo, result, previous, state, now)
+                elif kind == "issue":
+                    records += self._issues(repo, result, previous, state, now)
+                else:
+                    records += self._releases(repo, result, previous, state, now)
+            while len(state.prs) > MAX_FINGERPRINTS:
+                state.prs.pop(next(iter(state.prs)))
+            next_states[repo] = state
+
+        if failures:
+            if len(failures) == len(listings):
+                raise RuntimeError(
+                    f"every GitHub listing failed ({len(failures)}), e.g. {failures[0]}"
+                )
+            logger.warning(
+                "github_repos: %d of %d listings failed and keep their cursor, e.g. %s",
+                len(failures), len(listings), failures[0],
+            )
+        # Oldest first, for a natural reading order in the inbox.
+        latest = datetime.max.replace(tzinfo=UTC)
+        records.sort(key=lambda record: (_when(record.timestamp) or latest, record.id))
+        return FetchResult(records=records, next_cursor=_write_cursor(next_states), has_more=False)
+
+    def _carried(self, old: _RepoState) -> _RepoState:
+        """A repository's state for this run, with the fingerprints it still needs.
+
+        Held drafts stay; reported pull requests only with ``updates``, and
+        none of them without the ``pull_request`` type.
+        """
+        state = _RepoState()
+        if "pull_request" in self._types:
+            state.prs = {
+                number: entry for number, entry in old.prs.items()
+                if entry[2] or self._updates
+            }
+        return state
+
+    def _denied(self, login: str) -> bool:
+        """Whether *login* matches a ``deny_authors`` glob."""
+        return bool(self._deny_authors) and matches_any(login, self._deny_authors)
+
+    def _wanted(self, author: tuple[str, str]) -> bool:
+        """Whether a pull request or an issue of this author may be reported:
+        the bot and author filters. A release meets the author filter only."""
+        if author[1] == "bot" and not self._include_bots:
+            return False
+        return not self._denied(author[0])
+
+    def _pull_requests(
+        self, repo: str, items: list[Any], previous: _Listing | None, state: _RepoState,
+        now: datetime,
+    ) -> list[SourceRecord]:
+        """The events of a pulls listing, following the pull requests that need it."""
+        scan = _scan(
+            items, previous, now, cursor_key="updated_at", new_key="created_at", key=_number_key,
+        )
+        state.listings["pulls"] = scan.listing
+        records: list[SourceRecord] = []
+        for item in scan.changed:
+            number = item.get("number")
+            if not isinstance(number, int):
+                continue
+            key = str(number)
+            author = _author(item.get("user"))
+            head_sha = _head_sha(item)
+            draft = bool(item.get("draft"))
+            closed = item.get("state") == "closed"
+            followed = state.prs.get(key)
+            if followed is None:
+                if not scan.is_new(item) or not self._wanted(author):
+                    continue
+                if draft and not self._include_drafts:
+                    if not closed:
+                        state.follow(key, head_sha, draft=True, held=True)
+                    continue
+                records.append(pull_request_record(repo, item, "opened"))
+                if self._updates and not closed:
+                    state.follow(key, head_sha, draft=draft, held=False)
+                continue
+            if not self._wanted(author):
+                del state.prs[key]
+                continue
+            known_sha, was_draft, held = followed
+            if held:
+                if closed:
+                    del state.prs[key]
+                elif draft:
+                    state.follow(key, head_sha, draft=True, held=True)
+                else:
+                    records.append(pull_request_record(repo, item, "ready"))
+                    if self._updates:
+                        state.follow(key, head_sha, draft=False, held=False)
+                    else:
+                        del state.prs[key]
+                continue
+            # One record per pull request and run: merged or closed, else
+            # ready, else updated. Back to draft reports nothing.
+            if closed:
+                event = "merged" if item.get("merged_at") else "closed"
+                records.append(pull_request_record(repo, item, event))
+                del state.prs[key]
+                continue
+            if was_draft and not draft:
+                records.append(pull_request_record(repo, item, "ready"))
+            elif head_sha and head_sha[:_FINGERPRINT_SHA_CHARS] != known_sha:
+                records.append(pull_request_record(repo, item, "updated"))
+            state.follow(key, head_sha, draft=draft, held=False)
+        return records
+
+    def _issues(
+        self, repo: str, items: list[Any], previous: _Listing | None, state: _RepoState,
+        now: datetime,
+    ) -> list[SourceRecord]:
+        """The issues opened since the last listing; its pull requests are skipped."""
+        scan = _scan(
+            items, previous, now, cursor_key="updated_at", new_key="created_at", key=_number_key,
+        )
+        state.listings["issues"] = scan.listing
+        return [
+            issue_record(repo, item) for item in scan.changed
+            if "pull_request" not in item
+            and isinstance(item.get("number"), int)
+            and scan.is_new(item)
+            and self._wanted(_author(item.get("user")))
+        ]
+
+    def _releases(
+        self, repo: str, items: list[Any], previous: _Listing | None, state: _RepoState,
+        now: datetime,
+    ) -> list[SourceRecord]:
+        """The releases published since the last listing; drafts are skipped.
+
+        Whoever published a release, ``include_bots`` aside: release automation
+        is the normal case. ``deny_authors`` still applies.
+        """
+        published = [item for item in items if isinstance(item, dict) and not item.get("draft")]
+        scan = _scan(
+            published, previous, now,
+            cursor_key="published_at", new_key="published_at", key=_release_key,
+        )
+        state.listings["releases"] = scan.listing
+        return [
+            release_record(repo, item) for item in scan.changed
+            if isinstance(item.get("id"), int)
+            and scan.is_new(item)
+            and not self._denied(_author(item.get("author"))[0])
+        ]
+
+    async def _list(self, endpoint: str, sem: asyncio.Semaphore) -> list[Any]:
+        """One listing; raises when it cannot be read."""
         async with sem:
             data = await self._gh_api_get(endpoint)
         if not isinstance(data, list):
-            return []
+            raise TypeError(f"gh api {endpoint} did not return a list")
         return data
 
-    def _issue_to_record(self, repo: str, issue: dict) -> SourceRecord:
-        """Convert an issue/PR dict into a SourceRecord."""
-        number = issue.get("number")
-        title = issue.get("title", "?")
-        is_pr = "pull_request" in issue
-        kind = "PullRequest" if is_pr else "Issue"
-        kind_label = "PR" if is_pr else "Issue"
-        url = issue.get("html_url", "")
-        user = (issue.get("user") or {}).get("login", "")
-        state = issue.get("state", "")
-        created_at = issue.get("created_at", "")
-        labels = [lb.get("name", "") for lb in (issue.get("labels") or [])]
-        raw_body = issue.get("body") or ""
-
-        content_parts = [
-            f"Repository: {repo}",
-            f"Type: {kind}",
-            f"{kind_label}: #{number} {title}",
-            f"Author: {user}" if user else None,
-            f"State: {state}" if state else None,
-            f"Labels: {', '.join(labels)}" if labels else None,
-            f"Created: {created_at}",
-            f"URL: {url}",
-        ]
-        if raw_body:
-            body_text = raw_body[:_MAX_BODY_CHARS]
-            if len(raw_body) > _MAX_BODY_CHARS:
-                body_text += "\n[... truncated]"
-            content_parts.append(f"\n--- Description ---\n{body_text}")
-
-        # Prefer GitHub's globally-unique numeric id; fall back to repo#number.
-        record_id = str(issue.get("id") or "") or f"{repo}#{number}"
-
-        return SourceRecord(
-            id=record_id,
-            source="github_repos",
-            record_type="github_pr" if is_pr else "github_issue",
-            summary=f"[{repo}] New {kind_label} #{number}: {title}",
-            content="\n".join(p for p in content_parts if p),
-            timestamp=created_at or datetime.now(timezone.utc).isoformat(),
-            metadata={
-                # Keys aligned with the `github` source so the frontend
-                # GitHubRenderer renders a repo card + "View on GitHub" link.
-                "repo_name": repo,
-                "repo_url": f"https://github.com/{repo}",
-                "subject_type": kind,                       # Issue / PullRequest
-                "subject_url": url,
-                "reason": "new_pr" if is_pr else "new_issue",
-                "number": number,
-                "state": state,
-                "author": user,
-                "labels": labels,
-            },
-        )
-
     @staticmethod
-    async def _gh_api_get(endpoint: str, timeout: float = 30) -> dict | list | None:
-        """Call ``gh api <endpoint>`` and return parsed JSON, or None on error."""
+    async def _gh_api_get(endpoint: str, timeout: float = 30) -> Any:
+        """``gh api <endpoint>``, parsed. Raises :class:`RuntimeError` when it fails."""
         try:
             proc = await asyncio.create_subprocess_exec(
                 "gh", "api", endpoint,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+        except FileNotFoundError as error:
+            raise RuntimeError("gh CLI not found — install gh for the GitHub Repos source") from error
+        try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            if proc.returncode != 0:
-                logger.debug("gh api %s failed: %s", endpoint, stderr.decode()[:200])
-                return None
-            text = stdout.decode()
-            return json.loads(text) if text.strip() else None
-        except FileNotFoundError:
-            logger.error("gh CLI not found — install gh for GitHub sync")
-            return None
         except asyncio.TimeoutError:
-            logger.warning("gh api %s timed out", endpoint)
-            return None
-        except json.JSONDecodeError as e:
-            logger.warning("Failed to parse gh output for %s: %s", endpoint, e)
-            return None
-        except Exception as e:
-            logger.debug("gh api %s error: %s", endpoint, e)
-            return None
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=5)
+            raise RuntimeError(f"gh api {endpoint} timed out after {timeout:g}s") from None
+        if proc.returncode != 0:
+            detail = stderr.decode(errors="replace").strip()[:200]
+            raise RuntimeError(f"gh api {endpoint} failed: {detail}")
+        try:
+            return json.loads(stdout.decode(errors="replace") or "null")
+        except ValueError as error:
+            raise RuntimeError(f"gh api {endpoint} returned no JSON: {error}") from None

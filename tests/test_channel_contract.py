@@ -31,6 +31,7 @@ from nerve.channels.hosted.contract import (
     OperationResult,
     Payload,
     Rejected,
+    RepoWatch,
     SourceFilters,
     SourceSubscription,
     Subscriptions,
@@ -67,6 +68,7 @@ from nerve.channels.hosted.contract.model import (
     TypingOperation,
 )
 from nerve.channels.hosted.contract.model import MAX_TEXT_BYTES
+from nerve.channels.hosted.contract.wire import dumps
 from nerve.channels.hosted.runtime import RECEIVE_LIMITS
 from tests.fake_channel_gateway import (
     CONNECTION_ID,
@@ -729,3 +731,87 @@ class TestSubscriptions:
 
     def test_the_gateway_never_sends_subscriptions(self):
         assert reason(frame("subscriptions", {"version": "1"})) == "kind_unsupported"
+
+
+def repo_watch(*repos: RepoWatch, **source: Any) -> Subscriptions:
+    """A github_repos subscription of *repos* (one default repository without)."""
+    return Subscriptions(version="1", sources=(
+        SourceSubscription(provider="github_repos", repos=repos or (watched(),), **source),
+    ))
+
+
+def watched(name: str = "acme/widgets", **settings: Any) -> RepoWatch:
+    return RepoWatch(**{"name": name, "types": ("pull_request", "issue"), "include_drafts": True, **settings})
+
+
+class TestRepositoryWatch:
+    def test_every_member_of_a_watched_repository_is_sent(self):
+        body = repo_watch(watched(deny_authors=("noisy-*",)), watched("other-org/other-repo", updates=True))
+        envelope = Envelope(version="1", kind="subscriptions", request_id="o-2", payload=Payload(subscriptions=body))
+
+        value = json.loads(encode_envelope(envelope))
+
+        assert value["payload"]["subscriptions"]["sources"] == [{
+            "provider": "github_repos",
+            "filters": {},
+            "repos": [
+                {"name": "acme/widgets", "types": ["pull_request", "issue"], "include_bots": False,
+                 "include_drafts": True, "updates": False, "deny_authors": ["noisy-*"]},
+                {"name": "other-org/other-repo", "types": ["pull_request", "issue"], "include_bots": False,
+                 "include_drafts": True, "updates": True, "deny_authors": []},
+            ],
+        }]
+
+    def test_a_github_subscription_sends_no_repos_member(self):
+        assert dumps(github_subscription()) == (
+            '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true}]}'
+        )
+
+    def test_a_watch_the_gateway_takes_is_valid(self):
+        Subscriptions(version="1", sources=(
+            SourceSubscription(provider="github", pr_watch=True, inbox="all"),
+            SourceSubscription(provider="github_repos", repos=tuple(
+                watched(f"acme-{n}/r_{n}.x", types=("release",), deny_authors=("x" * 256,) * 256)
+                for n in range(50)
+            )),
+        )).validate()
+        repo_watch(watched("a/b", types=("pull_request", "issue", "release"))).validate()
+
+    @pytest.mark.parametrize(("subscriptions", "expected"), [
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="github_repos"),)), "malformed_frame"),
+        (repo_watch(*(watched(f"acme/r{n}") for n in range(51))), "limit_exceeded"),
+        (repo_watch(watched("acme")), "malformed_frame"),
+        (repo_watch(watched("-acme/widgets")), "malformed_frame"),
+        (repo_watch(watched("acme/wid gets")), "malformed_frame"),
+        (repo_watch(watched("acme/..")), "malformed_frame"),
+        (repo_watch(watched("acme/.")), "malformed_frame"),
+        (repo_watch(watched("a" * 40 + "/widgets")), "malformed_frame"),
+        (repo_watch(watched("acme/widgets"), watched("ACME/Widgets")), "malformed_frame"),
+        (repo_watch(watched(types=("pull_request", "commits"))), "kind_unsupported"),
+        (repo_watch(watched(types=())), "malformed_frame"),
+        (repo_watch(watched(types=("issue", "issue"))), "malformed_frame"),
+        (repo_watch(watched(deny_authors=tuple(f"bot-{n}" for n in range(257)))), "limit_exceeded"),
+        (repo_watch(watched(deny_authors=("x" * 257,))), "malformed_frame"),
+        (repo_watch(watched(deny_authors=("",))), "malformed_frame"),
+        (repo_watch(watched(deny_authors=("tab\there",))), "malformed_frame"),
+        (repo_watch(filters=SourceFilters(deny_actors=("alice",))), "malformed_frame"),
+        (repo_watch(pr_watch=True), "malformed_frame"),
+        (repo_watch(inbox="all"), "malformed_frame"),
+        (Subscriptions(version="1", sources=(
+            SourceSubscription(provider="github", repos=(watched(),)),
+        )), "malformed_frame"),
+    ])
+    def test_the_gateways_bounds_are_checked_before_sending(self, subscriptions, expected):
+        with pytest.raises(Rejected) as error:
+            subscriptions.validate()
+        assert error.value.reason == expected
+
+    def test_without_filters_drops_the_deny_authors_and_keeps_the_rest(self):
+        narrow = repo_watch(watched(deny_authors=("noisy-*",), updates=True))
+
+        wide = narrow.without_filters()
+
+        assert wide.sources == (SourceSubscription(
+            provider="github_repos", repos=(watched(updates=True),),
+        ),)
+        wide.validate()
