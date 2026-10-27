@@ -384,7 +384,10 @@ class TestPrompt:
         ]
         positions = [work.index(step) for step in steps]
         assert positions == sorted(positions)
-        assert "Targets the note leaves out you ask for as step 1 says" in work
+        assert (
+            "only for the targets the note leaves out, as step 1 says; the other questions come "
+            "after the explorer's findings, or now, in one form, when nothing needs an explorer"
+        ) in work
         assert FIRST_FORM_LEAD not in work
 
     @pytest.mark.parametrize("mode", ["personal", "worker"])
@@ -478,13 +481,20 @@ class TestPrompt:
         assert ", ".join(headings) + "." in " ".join(brief.split())
 
     @pytest.mark.parametrize("mode, description", VARIANTS)
-    def test_questions_in_the_foreground(self, mode, description):
-        ask = _between(onboarding_prompt(mode, description, GUIDE), "### 2. Ask in the foreground", "### 3.")
+    def test_questions_after_the_explorer_reports(self, mode, description):
+        ask = _between(onboarding_prompt(mode, description, GUIDE), "### 2. Ask after the explorer reports", "### 3.")
         for part in (
             "`AskUserQuestion`", "one to four questions per call",
             'the recommended default first with "(recommended)"', "At most two rounds",
+            # The first form only unblocks the explorer; the rest waits for its findings
+            # (real runs asked the second form while the explorer was still working).
+            "a first form only for the targets the explorer cannot start without",
+            "the other after the explorer's findings are in",
+            "what the findings settle is not asked",
+            "While the explorer works, ask nothing more: end your turn",
+            "When no explorer runs, one form asks everything",
             # Every question says why it is asked, every option what it leads to.
-            'Each question carries its reason in one clause ("so the review job knows how often to run")',
+            'Each question carries its reason in one clause ("so the review job knows which repositories to watch")',
             "each option's description says what choosing it leads to",
             "the account you act as on the code host", "the approval boundary", "the cadence",
             "where results go",
@@ -501,7 +511,7 @@ class TestPrompt:
         """Real runs sent a question card with no text: the explanation stayed
         in the thinking, which the person does not see. It goes in the form's
         intro, which the card shows, and asks nothing."""
-        ask = _between(onboarding_prompt(mode, description, GUIDE), "### 2. Ask in the foreground", "### 3.")
+        ask = _between(onboarding_prompt(mode, description, GUIDE), "### 2. Ask after the explorer reports", "### 3.")
         explain = _flat(_between(ask, "Explain before you ask, in the form's `intro`", "Ask only what neither"))
         for part in (
             "the card shows it above the questions",
@@ -522,7 +532,7 @@ class TestPrompt:
         """Free-text facts (repository names) were forced into AskUserQuestion's
         two to four options. The questions go into one ``ask_form`` form, each
         of the kind its answer needs; AskUserQuestion is only the fallback."""
-        ask = _flat(_between(onboarding_prompt(mode, description, GUIDE), "### 2. Ask in the foreground", "### 3."))
+        ask = _flat(_between(onboarding_prompt(mode, description, GUIDE), "### 2. Ask after the explorer reports", "### 3."))
         for part in (
             "with `ask_form`: one form per round, with up to six questions. At most two rounds",
             "repositories: `repos` (the person enters each as `owner/name`)",
@@ -534,7 +544,7 @@ class TestPrompt:
             "channels, topics and other names: `list`",
             "a link: `url`",
             "anything else, in the person's own words: `text`",
-            'its reason in one clause ("so the review job knows how often to run") as its `help`',
+            'its reason in one clause ("so the review job knows which repositories to watch") as its `help`',
             "Mark a question `required: false` when the setup works without its answer",
             "an optional question left empty comes back under `skipped`",
         ):
@@ -810,8 +820,10 @@ class TestChosenWork:
             "2. Restate the work as you understand it, in one sentence",
             "3. Say in one line what the explorer will study (step 1 below)",
             "4. In two to four lines, sketch how you intend to set this up",
-            "ask your first questions with `ask_form` (step 2 below), from the list above",
-            "The first round asks for the targets still missing (which repositories, which channels)",
+            "When targets are still missing (which repositories, which channels), ask for them now "
+            "with `ask_form` (step 2 below), from the list above: only them",
+            "Otherwise, while an explorer runs, ask nothing yet: the questions come after its "
+            "findings (step 2); when nothing needs an explorer, one form asks everything now",
         ]
         positions = [_flat(first).index(step) for step in steps]
         assert positions == sorted(positions)
@@ -863,7 +875,7 @@ class TestChosenWork:
         assert _form(_first_message(prompt)) is None
         first = _flat(_first_message(prompt))
         assert "offer no menu" in first
-        assert "(step 2 below). The first round asks for the targets still missing" in first
+        assert "ask for them now with `ask_form` (step 2 below): only them" in first
         # Words that name no work: ask what the work is, still without a menu.
         assert (
             "When what was written names no work you can start on (only targets, or only rules), "

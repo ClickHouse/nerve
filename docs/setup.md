@@ -310,11 +310,11 @@ recorded:
 - **With work chosen** (checkboxes, custom work, or both) it offers no menu
   and starts on that work in the same message. It explains before it asks:
   after the opening, it restates the work in one sentence, says what it
-  studies and sketches the setup it has in mind, and only then shows its
-  first questions.
+  studies and sketches the setup it has in mind, and only then asks — first
+  only for what the explorer still lacks, the rest once its findings are in.
   It works from the follow-up questions of each item you ticked (which
-  repositories, what a review may do, the label vocabulary, how often, and so
-  on), asks the questions the items share once (the account it acts as, what
+  repositories, what a review may do, the label vocabulary, and so on), asks
+  the questions the items share once (the account it acts as, what
   waits for your approval, where results go), and skips what setup or its
   explorer can tell. What does not fit into two rounds of questions becomes a
   default in its proposal, for you to change. An item whose connection the
@@ -376,21 +376,29 @@ Then:
    task. If it fails or finds only part, the proposal says so. With nothing to
    clone or fetch (a personal assistant for the inbox and reminders) there is
    no explorer.
-2. **It asks in the foreground** while the explorer works, and only what
-   neither the explorer nor setup can tell. It explains first, in the form's
-   intro (the text above the questions, because the chat does not show its
-   thinking as a message), then shows one
-   form of up to six questions per round, in at most two rounds, each saying
-   why it is asked and each in the shape its answer needs (the Nerve tool
-   `ask_form`): repositories as `owner/name` entries, decisions as a few
-   options that say what they lead to with its recommendation first and
-   **Other…** for your own words, channels and topics as a list, anything
-   else as free text. Typical questions: the account it acts as on the code
-   host (the login it knows is its recommendation), what waits for your
-   approval (its recommendation: drafts you approve for anything public, on
-   its own for reading, cloning and local checks), how often to look for new
-   work, and where results go. It never asks what setup recorded: the mode,
-   your name, time zone and quiet hours, the connected channels and sources.
+2. **It asks after the explorer reports**, and only what neither the
+   explorer nor setup can tell. A first form, when needed, asks only for the
+   targets the explorer cannot start without (which repositories, which
+   channels); the rest waits for the findings, so the options come from what
+   was found and nothing the findings settle is asked. It explains first, in
+   the form's intro (the text above the questions, because the chat does not
+   show its thinking as a message), then shows one form of up to six
+   questions per round, in at most two rounds, each saying why it is asked
+   and each in the shape its answer needs (the Nerve tool `ask_form`):
+   repositories as `owner/name` entries, decisions as a few options that say
+   what they lead to with its recommendation first and **Other…** for your
+   own words, channels and topics as a list, anything else as free text.
+   Typical questions: the account it acts as on the code host (the login it
+   knows is its recommendation), what waits for your approval (its
+   recommendation: drafts you approve for anything public, on its own for
+   reading, cloning and local checks), and where results go. It never asks
+   what setup recorded: the mode, your name, time zone and quiet hours, the
+   connected channels and sources. Work that arrives through a connected
+   source (GitHub notifications, mail, Slack; pull request activity too where
+   the GitHub source is hosted) is consumed by a job gated on new messages
+   from that source rather than by a timer that polls the service; on a
+   hosted instance the `nerve-cloud` skill says how each source reaches the
+   agent, and the agent reads it first.
 3. **It proposes the setup as a plan** once the findings and your answers
    are in, in Claude Code's plan mode. The plan has fixed headings: what it
    understood, what it found, the `TASK.md` sections (a worker), the cron
