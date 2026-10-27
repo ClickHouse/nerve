@@ -1214,10 +1214,12 @@ def create_app() -> FastAPI:
     )
 
     # Compress JSON responses. Sessions with heavy tool-call blobs can
-    # easily emit 1+ MB payloads on /api/sessions/{id}/messages, and most
-    # of that compresses ~3-4x. minimum_size=1024 skips tiny responses
-    # where the framing overhead would dominate.
-    app.add_middleware(GZipMiddleware, minimum_size=1024)
+    # emit tens of MB on /api/sessions/{id}/messages, and most of that
+    # compresses ~3-4x. minimum_size=1024 skips tiny responses where the
+    # framing overhead would dominate. Level 5 compresses a 30 MB response
+    # in about half the time of the default level 9, and the output is
+    # about 2% larger.
+    app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
 
     # REST routes
     app.include_router(register_all_routes())
