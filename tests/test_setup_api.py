@@ -457,7 +457,10 @@ class TestModeLock:
         assert profile["quiet_is_default"] is True
         optional = {o["id"]: o for o in step(state, "automation")["detail"]["optional"]}
         assert (optional["task-planner"]["enabled"], optional["task-planner"]["default_enabled"]) == (False, False)
-        assert all(optional[i]["enabled"] and optional[i]["default_enabled"] for i in ("skill-extractor", "skill-reviser"))
+        assert all(
+            optional[i]["enabled"] and optional[i]["default_enabled"]
+            for i in ("skill-extractor", "skill-reviser", "machine-maintenance")
+        )
         assert statuses(state)["automation"] == "pending"
 
     async def test_bad_mode_is_a_field_error(self, claimed):
@@ -1358,8 +1361,9 @@ class TestAutomation:
         assert auto["status"] == "done"
         assert {o["id"]: o["enabled"] for o in auto["detail"]["optional"]} == {
             "inbox-processor": False, "task-planner": True, "skill-extractor": False, "skill-reviser": False,
+            "machine-maintenance": False,
         }
-        assert auto["summary"] == "1 of 4 optional jobs on"
+        assert auto["summary"] == "1 of 5 optional jobs on"
         assert "automation" in setup_state.load_state().answered
         text = (claimed.workspace / "config" / "cron" / "system.yaml").read_text()
         assert text.startswith("# Nerve — System Cron Jobs")
@@ -1367,7 +1371,9 @@ class TestAutomation:
     async def test_default_set_still_records_answered(self, claimed):
         choose(claimed, "personal")
         async with claimed.client() as http:
-            state = (await http.put("/api/setup/automation", json={"crons": ["inbox-processor", "task-planner"]})).json()
+            state = (await http.put("/api/setup/automation", json={
+                "crons": ["inbox-processor", "task-planner", "machine-maintenance"],
+            })).json()
         assert step(state, "automation")["status"] == "done"
 
     async def test_a_worker_can_switch_task_planner_on(self, claimed):
@@ -1376,11 +1382,11 @@ class TestAutomation:
         async with claimed.client() as http:
             before = step((await http.get("/api/setup")).json(), "automation")
             assert {o["id"]: o["default_enabled"] for o in before["detail"]["optional"]} == {
-                "task-planner": False, "skill-extractor": True, "skill-reviser": True,
+                "task-planner": False, "skill-extractor": True, "skill-reviser": True, "machine-maintenance": True,
             }
-            assert before["summary"] == "2 of 3 optional jobs on"
+            assert before["summary"] == "3 of 4 optional jobs on"
             state = (await http.put("/api/setup/automation", json={
-                "crons": ["task-planner", "skill-extractor", "skill-reviser"],
+                "crons": ["task-planner", "skill-extractor", "skill-reviser", "machine-maintenance"],
             })).json()
         auto = step(state, "automation")
         assert auto["status"] == "done"

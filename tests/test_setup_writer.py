@@ -667,7 +667,7 @@ class TestApplyMode:
         assert settings["memory"]["categories"][0]["name"] == "personal_info"
         assert "timezone" not in settings, "the About-you step owns the timezone"
         crons = setup_writer.list_optional_crons(ws)
-        assert {c.id for c in crons if c.enabled} == {"inbox-processor", "task-planner"}
+        assert {c.id for c in crons if c.enabled} == {"inbox-processor", "task-planner", "machine-maintenance"}
 
     def test_apply_mode_never_overwrites_onboarded_task(self, tmp_path: Path) -> None:
         ws = tmp_path / "ws"
@@ -794,7 +794,9 @@ class TestApplyMode:
         config = NerveConfig.from_dict({"workspace": str(ws), **settings})
         assert (config.quiet_start, config.quiet_end) == ("", "")
         crons = {c.id: c.enabled for c in setup_writer.list_optional_crons(ws)}
-        assert crons == {"task-planner": False, "skill-extractor": True, "skill-reviser": True}
+        assert crons == {
+            "task-planner": False, "skill-extractor": True, "skill-reviser": True, "machine-maintenance": True,
+        }
 
     def test_personal_mode_keeps_the_installer_window(self, tmp_path: Path) -> None:
         ws = tmp_path / "ws"
@@ -1065,6 +1067,7 @@ class TestFixRoundTwoWriterRules:
             "task-planner": "Task planner",
             "skill-extractor": "Skill extractor",
             "skill-reviser": "Skill reviser",
+            "machine-maintenance": "Machine maintenance",
         }
         assert "name" not in yaml.safe_load(setup_writer.system_cron_file(ws).read_text(encoding="utf-8"))["jobs"][0]
 
@@ -1121,16 +1124,56 @@ class TestModeDefaults:
         assert apply_profile_templates(ws, quiet=("22:00", "07:00")) == []
 
     def test_worker_default_crons_leave_task_planner_available_but_off(self) -> None:
-        assert setup_writer.DEFAULT_CRONS["worker"] == ["skill-reviser", "skill-extractor"]
-        assert setup_writer.DEFAULT_CRONS["personal"] == ["inbox-processor", "task-planner"]
-        assert setup_writer.optional_cron_ids_for("worker") == ("task-planner", "skill-extractor", "skill-reviser")
+        assert setup_writer.DEFAULT_CRONS["worker"] == ["skill-reviser", "skill-extractor", "machine-maintenance"]
+        assert setup_writer.DEFAULT_CRONS["personal"] == ["inbox-processor", "task-planner", "machine-maintenance"]
+        assert setup_writer.optional_cron_ids_for("worker") == (
+            "task-planner", "skill-extractor", "skill-reviser", "machine-maintenance",
+        )
         jobs = setup_writer.build_cron_jobs(SetupChoices(
             mode="worker", enabled_crons=list(setup_writer.DEFAULT_CRONS["worker"]),
         ))
         assert {job["id"]: job["enabled"] for job in jobs} == {
             "memory-maintenance": True, "task-planner": False,
-            "skill-extractor": True, "skill-reviser": True,
+            "skill-extractor": True, "skill-reviser": True, "machine-maintenance": True,
         }
+
+
+class TestMachineMaintenance:
+    """The weekly cleanup job: on by default in both modes, offered as a
+    toggle on the Automation step, and worded the same under every memory
+    backend."""
+
+    @staticmethod
+    def _job() -> dict:
+        return next(c for c in setup_writer.PRODUCTIVITY_CRONS if c["id"] == "machine-maintenance")
+
+    @pytest.mark.parametrize("mode", ["personal", "worker"])
+    def test_on_by_default_and_optional_in_both_modes(self, tmp_path: Path, mode: str) -> None:
+        assert "machine-maintenance" in setup_writer.DEFAULT_CRONS[mode]
+        assert "machine-maintenance" in setup_writer.optional_cron_ids_for(mode)
+        ws = tmp_path / "ws"
+        setup_writer.apply_mode(ws, mode)
+        toggle = next(t for t in setup_writer.list_optional_crons(ws) if t.id == "machine-maintenance")
+        assert toggle.enabled and toggle.name == "Machine maintenance"
+        setup_writer.set_optional_crons(ws, set(setup_writer.DEFAULT_CRONS[mode]) - {"machine-maintenance"})
+        assert not next(t for t in setup_writer.list_optional_crons(ws) if t.id == "machine-maintenance").enabled
+
+    def test_runs_weekly_in_its_own_session(self) -> None:
+        job = self._job()
+        assert setup_writer.describe_cron(job["schedule"]) == "Sundays at 04:00"
+        assert job["session_mode"] == "isolated"
+        assert "ask_user" in job["prompt"]
+
+    def test_names_no_memory_tool(self) -> None:
+        """Loom serves none of Nerve's memory tools, and this prompt has no
+        Loom wording: it says "your memory" and lets the session pick."""
+        job = self._job()
+        memory_tools = {
+            "memory_recall", "memory_expand_category", "session_context", "conversation_history",
+            "memory_records_by_date", "memorize", "memory_update", "memory_delete", "category_update",
+        }
+        assert not {name for name in memory_tools if re.search(rf"\b{name}\b", job["prompt"])}
+        assert setup_writer._cron_prompt(job, "loom") == job["prompt"]
 
 
 class TestHostedGitHubKeepsTheEventsSourceOff:

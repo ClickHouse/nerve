@@ -31,7 +31,7 @@ Each job plays one role, and each role moves tasks in one direction:
 | Monitor | Watches a waiting status and returns the task when the external event happens | `tasks` on that status, plus `github_pr_activity` for PRs | `persistent` or `isolated` |
 | Planner (`task-planner`) | Proposes a plan for an open task that has none. Ships disabled for workers; onboarding enables it when the worker plans through the approval loop | `tasks` on `pending`, and the worker's tag once overridden | `persistent` |
 | Skills (`skill-extractor`, `skill-reviser`) | Propose new or revised skills, each as a task with a plan | None | `persistent` |
-| Maintenance (`memory-maintenance`) | Tidies long-term memory; moves no tasks | None | `isolated` |
+| Maintenance (`memory-maintenance`, `machine-maintenance`) | Tidies long-term memory, and once a week the machine (old caches, Docker leftovers, worktrees of merged pull requests, leftover services); asks before it removes or stops anything that can hold data; moves no tasks | None | `isolated` |
 
 The last three ship in `system.yaml` ([cron.md](cron.md#built-in-system-crons)); scan, work and monitor jobs are yours, in `config/cron/jobs.yaml`. `task-planner` ships disabled for workers. When the worker should plan through the approval loop (`task-planner` proposes, the operator approves, and an implementation session does the work), onboarding enables it by overriding the job by id in `jobs.yaml`, with a prompt and a `tasks` gate that name the worker's tag; a job in `jobs.yaml` replaces the `system.yaml` job with the same id. Add a work job when `TASK.md` § Approval Required grants autonomy for routine items. When both run, give each its own tasks by tag.
 
