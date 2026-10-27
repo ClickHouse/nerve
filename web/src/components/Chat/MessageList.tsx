@@ -13,6 +13,7 @@ import { StreamingMessage } from './StreamingMessage';
 import { SelectionToolbar } from './SelectionToolbar';
 import { MessageActions } from './MessageActions';
 import { GitBranch } from '../ui/icons';
+import { followScrollEnd } from '../../utils/followScrollEnd';
 
 function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }: {
   messages: ChatMessage[];
@@ -54,8 +55,13 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
     isNearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
   }, []);
 
+  // Stops the follow of the end that starts after the first load, while it runs.
+  const stopFollow = useRef<(() => void) | null>(null);
+  useEffect(() => () => stopFollow.current?.(), []);
+
   useEffect(() => {
-    if (!isNearBottom.current) {
+    // While the end is followed after the first load, the follow scrolls.
+    if (stopFollow.current || !isNearBottom.current) {
       prevMessageCount.current = messages.length;
       return;
     }
@@ -63,6 +69,12 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
     const wasEmpty = prevMessageCount.current === 0 && messages.length > 0;
     prevMessageCount.current = messages.length;
     endRef.current?.scrollIntoView({ behavior: wasEmpty ? 'instant' : 'smooth' });
+    // The rows near the end take their real height only after this jump.
+    if (wasEmpty && containerRef.current) {
+      stopFollow.current = followScrollEnd(containerRef.current, () => {
+        stopFollow.current = null;
+      });
+    }
   }, [messages.length, streamingBlockCount, isStreaming]);
 
   return (
@@ -109,7 +121,7 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
         );
         const forks = msg.id != null ? messageForks?.get(String(msg.id)) : undefined;
         return (
-          <div key={msg.id ?? i}>
+          <div key={msg.id ?? i} className="chat-row">
             {msg.role === 'user'
               ? <UserMessage
                   message={msg}

@@ -542,6 +542,14 @@ body {
 [data-cui-theme="light"] .msg-assistant { background: var(--theme-surface); }
 [data-cui-theme="light"] .msg-user { background: transparent; }
 
+/* One row of the message list. When the row is off screen, the browser skips
+   its style, layout and paint, which is most of the cost of opening a long
+   chat. The DOM stays, so find in page and text selection still work. `auto`
+   keeps the last rendered height of a row; 400px is the estimate before the
+   row was rendered once. Paint containment clips at the padding box, so
+   nothing in a message may draw outside its row. */
+.chat-row { content-visibility: auto; contain-intrinsic-size: auto 400px; }
+
 /* Markdown rendering styles */
 .markdown-content h1 { font-size: 1.5em; font-weight: 600; margin: 0.8em 0 0.4em; }
 .markdown-content h2 { font-size: 1.25em; font-weight: 600; margin: 0.7em 0 0.3em; }
