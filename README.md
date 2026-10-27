@@ -84,7 +84,7 @@ The mode is chosen on the setup page: run `nerve init`, open the page it
 prints, and pick **Worker** on the Mode step. When you finish setup, the agent
 opens its onboarding conversation: it starts from the note you left on the Mode
 step (or asks what to work on), studies the repositories and sources in the
-background while it asks you the few things only you know, proposes the setup
+background, then asks you the few things only you know, proposes the setup
 as a plan you approve, edit or send back, and applies it. The same choice in a terminal is
 `nerve init --terminal`; unattended installs set `NERVE_MODE=worker` and
 `NERVE_TASK`. Without the browser, a worker with a task description sets

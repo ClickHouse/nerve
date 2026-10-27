@@ -122,7 +122,6 @@ CATALOG: tuple[WorkItem, ...] = (
             _ask("what a review may do: comment only, request changes, or approve"),
             _ask("drafts the person approves, or comments posted directly", SHARED_APPROVAL),
             _ask("which pull requests: all, only on request, or by label, and whether to skip bots and drafts"),
-            _ask("how often to look for new pull requests"),
         ),
     ),
     WorkItem(
@@ -133,7 +132,6 @@ CATALOG: tuple[WorkItem, ...] = (
             _ask("which repositories"),
             _ask("the label vocabulary"),
             _ask("whether it may label, comment or close"),
-            _ask("how often to triage new issues"),
         ),
     ),
     WorkItem(

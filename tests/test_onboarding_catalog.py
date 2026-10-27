@@ -112,7 +112,6 @@ class TestCatalog:
                 "what a review may do: comment only, request changes, or approve",
                 "drafts the person approves, or comments posted directly",
                 "which pull requests: all, only on request, or by label, and whether to skip bots and drafts",
-                "how often to look for new pull requests",
             ],
             "note": "",
         }

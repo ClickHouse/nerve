@@ -144,7 +144,13 @@ per line of `TASK.md` § Triggers. Gate a job with `run_if` where the guide says
 so it stays idle until there is work: a `tasks` gate on the status and tag a \
 work job owns, a `messages` gate for inbox-driven \
 work, a `github_pr_activity` gate (with the bot's login as `author`) for a PR \
-monitor. Scan jobs that create the work run on their schedule, ungated. \
+monitor with a polling GitHub source. Work that reaches this instance through a connected source (GitHub \
+notifications, mail, Slack; pull request activity too where the GitHub source \
+is hosted) is inbox-driven: a job gated on `messages` for that source consumes \
+it, not a timer that polls the service; a timer is for work no source \
+delivers. When a skill named `nerve-cloud` is present, it says how each \
+source reaches this instance: read it before you design these jobs. Scan \
+jobs that create the work run on their schedule, ungated. \
 `lock: true` and `catchup: false` on anything that may outrun its interval. \
 Procedure for one job goes in `config/cron/prompts/<job>.md`, loaded with \
 `prompt_file` and opening with "`TASK.md` is the kernel; this file is your \
@@ -329,10 +335,12 @@ scan job that finds new pull requests, a review job gated on a tag, review \
 comments as drafts the person approves) and why the questions that follow \
 matter.
 
-Then start the explorer on the targets setup names, if any, and ask your \
-first questions with `ask_form` (step 2 below){questions}. The first \
-round asks for the targets still missing (which repositories, which \
-channels), so that the explorer can start on them.
+Then start the explorer on the targets setup names, if any. When targets \
+are still missing (which repositories, which channels), ask for them now \
+with `ask_form` (step 2 below){questions}: only them, so that the explorer \
+can start on them. Otherwise, while an explorer runs, ask nothing yet: the \
+questions come after its findings (step 2); when nothing needs an explorer, \
+one form asks everything now.
 {unclear}"""
 
 _CHOSEN_FROM_LIST = ", from the list above"
@@ -373,8 +381,9 @@ comments as drafts the person approves) and why the questions that follow \
 matter.
 
 Then start the explorer on the targets the note names, and ask your first \
-questions with `ask_form` (step 2 below). Targets the note leaves out \
-you ask for as step 1 says.
+questions with `ask_form` (step 2 below) only for the targets the note \
+leaves out, as step 1 says; the other questions come after the explorer's \
+findings, or now, in one form, when nothing needs an explorer.
 
 **When the note names no work** (only rules, such as "never merge anything", \
 or only targets, such as "org/repo-a"), ask what the work is. {form}
@@ -443,6 +452,18 @@ sources, quiet hours, memory) and nothing this work does not need.
 want": at most three one-liners, and none of them a kind of work from the \
 options that the person saw, at setup or in the form of your first \
 message, and did not choose. Outside it, pitch nothing.
+- Integrations with external services (GitHub, Slack, mail, MCP tools, \
+memory) are set up the way this instance documents them, not invented: when \
+a skill named `nerve-cloud` is present, read it (`skill_get`, then the \
+reference page for the service) before you design how work reaches the \
+agent, and follow it. Work that already arrives through a connected source \
+(GitHub notifications, mail, Slack; pull request activity too where the \
+GitHub source is hosted) is consumed by a job gated on new messages from \
+that source, not by a timer that polls the service; a timer is for work no \
+source delivers (digests, research, periodic checks). Without that skill, \
+`list_sources` shows the connected sources, and Nerve's documentation \
+describes them (`docs/sources.md` and `docs/cron.md` in the Nerve \
+repository).
 """
 
 _EXPLORE_STEP = """\
@@ -493,7 +514,7 @@ URL; "not found" is a valid finding.
 """
 
 _ASK_STEP = """\
-### 2. Ask in the foreground, while the explorer works
+### 2. Ask after the explorer reports
 
 Explain before you ask, in the form's `intro`: the card shows it above the \
 questions. The person does not see your thinking, so an explanation that you \
@@ -506,8 +527,14 @@ questions: they go in the form, and until the turn ends the person can answer \
 only the form.
 
 Ask only what neither the explorer nor setup can tell you, with `ask_form`: \
-one form per round, with up to six questions. At most two rounds. Give each \
-question the kind its answer needs:
+one form per round, with up to six questions. At most two rounds: a first \
+form only for the targets the explorer cannot start without (which \
+repositories, which channels), and the other after the explorer's findings \
+are in. That form's options come from what was found (the login you know, \
+the repositories, labels and checks the explorer saw), and what the findings \
+settle is not asked. While the explorer works, ask nothing more: end your \
+turn, its findings reach you on their own. When no explorer runs, one form \
+asks everything. Give each question the kind its answer needs:
 
 - repositories: `repos` (the person enters each as `owner/name`);
 - a decision, such as the account you act as, the approval boundary or the \
@@ -519,9 +546,9 @@ apply at once;
 - a link: `url`;
 - anything else, in the person's own words: `text`.
 
-Each question carries its reason in one clause ("so the review job knows how \
-often to run") as its `help`, and each option's description says what \
-choosing it leads to. Mark a question `required: false` when the setup works \
+Each question carries its reason in one clause ("so the review job knows \
+which repositories to watch") as its `help`, and each option's description \
+says what choosing it leads to. Mark a question `required: false` when the setup works \
 without its answer; an optional question left empty comes back under \
 `skipped`. Typical questions:
 
@@ -529,8 +556,6 @@ without its answer; an optional question left empty comes back under \
 - the approval boundary; recommended: drafts the person approves for anything \
 public (review comments, issues, PRs), and on your own for reading, cloning \
 and local checks;
-- the cadence; recommended: every 30 minutes for PR review, hourly for issue \
-triage, daily for research;
 - where results go: this chat, a channel, or notifications only;
 - for a personal assistant: which of the connected inboxes and calendars to \
 read, and how reminders reach the person.
@@ -825,7 +850,7 @@ def _chosen_section(work: WorkSelection, who: str) -> str:
         parts.append(
             "Your questions in step 2 come from this list. Ask only what neither setup, "
             "the facts about this instance nor the explorer's findings answer; one "
-            "question covers what several items share (which repositories, how often); "
+            "question covers what several items share (which repositories, where results go); "
             "what does not fit into two rounds goes into the plan as your recommended "
             "default, for the person to change.\n\n" + _settle_list(items)
         )
@@ -867,7 +892,8 @@ def onboarding_prompt(
       questions the items raise, the shared ones once), and a first message
       without a menu that explains first (restates the work, names what the
       explorer studies, sketches the setup it intends), then starts a
-      background explorer and asks its first questions in the same turn.
+      background explorer and, in the same turn, asks only for the targets
+      it still lacks; the other questions follow the explorer's findings.
     - ``work`` with only rules: the same section, the first form, and the
       rules carried into the plan.
     - ``task_description``, a free-text note (an older client, ``nerve init
