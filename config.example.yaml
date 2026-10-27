@@ -343,9 +343,10 @@ sync:
   # Repositories you follow without taking part in them: new PRs, issues and
   # releases there. Nothing is set on the GitHub account. With
   # sync.github.mode: hosted the channel gateway polls them too (it must know
-  # the repository watch). Nothing older than a day is backfilled: a long
-  # outage, or the watch switched off for more than a day (in hosted mode,
-  # switched off at all), starts fresh. See docs/sources.md "GitHub Repos".
+  # the repository watch). Nothing older than a day is backfilled: a check
+  # more than a day after the last (a daily schedule, an outage) reports the
+  # last day's items, with an hour of grace; in hosted mode, switching the
+  # watch off and on starts fresh. See docs/sources.md "GitHub Repos".
   github_repos:
     enabled: false
     schedule: "*/15 * * * *"       # poll mode; hosted: the fallback drain
