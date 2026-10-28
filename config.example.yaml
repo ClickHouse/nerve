@@ -178,8 +178,12 @@ telegram:
 # By default they go to the owner's DM. Point telegram_chat_id at a dedicated group
 # to collect them there instead; enable delivery_only_sink to make that group one-way
 # (inbound messages and reactions there never start an agent turn). Default: off.
+# telegram_thread_id picks one topic of that group, e.g. a "System" topic; then
+# only that topic is one-way. A session that lives in a topic of its own gets its
+# notifications in that topic instead.
 # notifications:
 #   telegram_chat_id: -1000000000000
+#   telegram_thread_id: 7
 #   delivery_only_sink: false
 
 slack:

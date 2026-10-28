@@ -1412,6 +1412,14 @@ as one Markdown file. The agent in the topic has the session's full history.
 Nothing changes on upgrade: existing sessions get a topic only when you open
 one this way.
 
+Notifications follow the session. A push from a session that lives in a topic
+(`notify`, a question, an approval) is delivered into that topic, without the
+"Session:" footer, and is answered there: a button on the card, or `/reply`
+typed in the topic. Pushes from other sessions go to the
+[notification sink](#notification-sink) as before. Output that a session
+produces after its turn has ended, when a background job finishes, does not
+reach Telegram yet, topic or not.
+
 Telegram does not say which topic a reaction's message is in, so Nerve looks
 the message up in its recent-message cache (the last 200 messages). A reaction
 to a message that is no longer cached, in a chat that has topics, is ignored
@@ -1429,6 +1437,7 @@ or to `notifications.telegram_chat_id` when set (e.g. a dedicated group).
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `notifications.telegram_chat_id` | int | - | Chat that receives pushes instead of the owner's DM — e.g. a dedicated notification group |
+| `notifications.telegram_thread_id` | int | - | A topic in that chat for the pushes, e.g. a "System" topic (the number at the end of the topic's link). With `delivery_only_sink`, only this topic is one-way |
 | `notifications.delivery_only_sink` | bool | `false` | When the sink is a group/supergroup, make it one-way: inbound messages and reactions there never start an agent turn. Off by default (backward-compatible); inline-button answers and `/reply` still work. |
 
 ### Pairing
