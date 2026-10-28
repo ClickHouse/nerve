@@ -47,7 +47,7 @@ Record the human's rules in their words, with the scope (per-action, per-session
 - Priority: `urgent` security, payments, deadline today · `high` review requested, deadline near · `normal` task, job done · `low` FYI.
 - A cron that creates tasks or finds problems notifies; only housekeeping stays silent. `plan_propose` notifies with a link to the plan on its own. In monitoring loops, notify each decision you make on your own.
 - `notify` is not gated by quiet hours: hold anything below `urgent` yourself.
-- Chat apps: no markdown tables, full URLs, at most one `react` per message.
+- Chat apps: no markdown tables (Telegram renders them), full URLs, at most one `react` per message.
 
 ## Defects: say it, then register it
 - Tell the human about anything broken when you find it, in plain words, even mid-task. Register it only after they confirm it; evidence stays in the context file.

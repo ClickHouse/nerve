@@ -1353,6 +1353,7 @@ carry text. A `.png` or `.ico` has to be committed by a human.
 | `telegram.allowed_users` | list[int] | `[]` | User IDs allowed to use the bot in private and group chats |
 | `telegram.stream_mode` | string | `partial` | `partial` (edit msgs) or `full` |
 | `telegram.reply_routes_to_origin_session` | bool | `true` | A reply routes to the session that produced the replied-to message (and makes it active); a reply that cannot be tied to a live session is refused with a hint. `/new <message>` is the escape hatch: it starts a fresh session with that message, reply or not. `false` restores the old behaviour: a reply is context-only and lands in the active session. The message→session map is stored in the database (`channel_reply_routes`, kept 90 days) whether the flag is on or off, so it survives a restart and turning the flag back on covers earlier messages. Either way, a reply to a pending `ask_user` card answers the question, like `/reply` |
+| `telegram.rich_messages` | bool | `true` | Send answers and plain notifications as rich messages, so headings, tables, task lists and code blocks render, and one message holds 32,768 characters (see [Rich messages](#rich-messages)). `false` sends HTML messages of up to 4,096 characters, as before |
 | `telegram.topics.enabled` | bool | `true` | One forum topic is one session (see [Topics](#topics)). `false` treats every topic message as a message to the chat, as before |
 | `telegram.topics.new_session_creates_topic` | bool | `true` | `/new` and the `/sessions` ➕ button, used in the chat itself, open the new session in a new topic when the chat has topics |
 | `telegram.topics.auto_rename` | bool | `true` | Rename a topic the bot opened as "New session" after its session's generated title |
@@ -1428,6 +1429,43 @@ rather than sent to a session that never saw the message.
 Streaming edits share one budget per chat, because Telegram rate limits the
 chat rather than the topic. With several topics answering at once, the
 previews update less often, and the final answers are unaffected.
+
+### Rich messages
+
+With `telegram.rich_messages` on (the default), final answers and plain
+notifications go out as rich messages (Bot API 10.1). Headings, tables, task
+lists, code blocks with their language, quotes, collapsible
+`<details>` sections and footnotes render, and one message holds 32,768
+characters. A longer answer is split between blocks. A code block too long for
+one message is closed at the cut and reopened, with its language, in the next.
+
+The streaming preview stays a plain message that is edited in place, and the
+final answer replaces it. Cards with buttons stay HTML: answering a question,
+"Open plan" and the expiry note all edit the card's text, and a rich message
+has no text to edit. So do the `/sessions` views and the catch-up card.
+
+Rich messages read GitHub-flavoured Markdown, which differs from a chat
+message in a few places, so Nerve adjusts the text first:
+
+- A single line break would join two lines into one paragraph. It becomes a
+  hard break, so lines stay apart as written.
+- `$` would start a formula ("$5 and $10" would turn into one), so it is
+  escaped. Formulas therefore do not render.
+- Telegram drops a tag it does not render, so `std::vector<int>` would show
+  as `std::vector`. A `<` that does not start one of the tags an answer may
+  use on purpose (`<details>`, `<summary>`, `<u>`, `<sub>`, `<sup>`,
+  `<tg-spoiler>`, `<blockquote>` and the like) or a `<https://…>` link is
+  escaped.
+- A table gets a blank line before and after it.
+
+Code blocks and inline code are sent exactly as written.
+
+If Telegram refuses a rich message, for example a table with more than 20
+columns, that message goes out as HTML of up to 4,096 characters per message,
+as before. A Bot API server without `sendRichMessage` (an older self-hosted
+one) turns rich messages off until Nerve restarts. How a Telegram app older
+than Bot API 10.1 shows a rich message is untested; set
+`rich_messages: false` if someone using the bot cannot update theirs.
 
 ### Notification sink
 

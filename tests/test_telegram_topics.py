@@ -66,6 +66,17 @@ class _Bot:
         self._next_id += 1
         return SimpleNamespace(message_id=self._next_id)
 
+    async def do_api_request(self, endpoint, api_kwargs=None, return_type=None, **kwargs):
+        """A raw Bot API call (``sendRichMessage``), recorded under its endpoint."""
+        params = dict(api_kwargs or {})
+        self.calls.append((endpoint, params))
+        if self.fail_next:
+            raise self.fail_next.pop(0)
+        if params.get("message_thread_id") in self.refuse_threads:
+            raise RuntimeError("Bad Request: message thread not found")
+        self._next_id += 1
+        return SimpleNamespace(message_id=self._next_id)
+
     def __getattr__(self, name):
         async def call(*args, **kwargs):
             self.calls.append((name, kwargs))
@@ -77,6 +88,13 @@ class _Bot:
 
     def named(self, name):
         return [kwargs for called, kwargs in self.calls if called == name]
+
+    def texts_sent(self):
+        """Every message sent, as HTML or as a rich message, in order."""
+        return [
+            kwargs for called, kwargs in self.calls
+            if called in ("send_message", "sendRichMessage")
+        ]
 
 
 class _Router:
@@ -149,10 +167,11 @@ class _Router:
         return True
 
 
-def _channel(router=None, *, topics=True, dm_topics=False, source=None):
+def _channel(router=None, *, topics=True, dm_topics=False, source=None, rich=True):
     cfg = NerveConfig()
     cfg.telegram.allowed_users = [OWNER]
     cfg.telegram.topics = TelegramTopicsConfig(enabled=topics)
+    cfg.telegram.rich_messages = rich
     if source is not None:
         cfg.telegram.source = source
     ch = TelegramChannel(lambda: cfg, router=router or _Router())
@@ -421,8 +440,9 @@ async def test_outbound_to_a_topic_carries_the_thread(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_outbound_to_the_chat_sends_no_thread(tmp_path):
-    ch = _channel()
+@pytest.mark.parametrize("rich", [True, False])
+async def test_outbound_to_the_chat_sends_no_thread(tmp_path, rich):
+    ch = _channel(rich=rich)
     bot = ch._app.bot
     attachment = tmp_path / "note.md"
     attachment.write_text("x")
@@ -456,27 +476,29 @@ async def test_streaming_edits_share_one_budget_per_chat():
 
 
 @pytest.mark.asyncio
-async def test_final_send_waits_out_a_rate_limit_once():
-    ch = _channel()
+@pytest.mark.parametrize("rich", [True, False])
+async def test_final_send_waits_out_a_rate_limit_once(rich):
+    ch = _channel(rich=rich)
     bot = ch._app.bot
     bot.fail_next = [RetryAfter(0)]
 
     await ch.send(OutboundMessage(target=f"{CHAT}:{TOPIC}", text="answer"))
 
-    sends = bot.named("send_message")
+    sends = bot.texts_sent()
     assert len(sends) == 2  # the limited attempt, then the delivery
     assert sends[-1]["message_thread_id"] == TOPIC
 
 
 @pytest.mark.asyncio
-async def test_final_send_does_not_wait_out_a_long_rate_limit():
-    ch = _channel()
+@pytest.mark.parametrize("rich", [True, False])
+async def test_final_send_does_not_wait_out_a_long_rate_limit(rich):
+    ch = _channel(rich=rich)
     bot = ch._app.bot
     bot.fail_next = [RetryAfter(3600)]
 
     with pytest.raises(RetryAfter):
         await ch.send(OutboundMessage(target=str(CHAT), text="answer"))
-    assert len(bot.named("send_message")) == 1
+    assert len(bot.texts_sent()) == 1
 
 
 # --------------------------------------------------------------------------- #

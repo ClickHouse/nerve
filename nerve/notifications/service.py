@@ -1481,11 +1481,23 @@ class NotificationService:
                 markup = InlineKeyboardMarkup(
                     [[InlineKeyboardButton("Open plan", callback_data=callback_data)]]
                 )
-            msg = await self._send_telegram_html(
-                bot, chat_id, text, reply_markup=markup, silent=silent,
-                link_preview=link_preview,
-                thread_id=thread_id,
-            )
+            from nerve.channels.telegram import TelegramChannel
+
+            msg = None
+            channel = self._get_telegram_channel()
+            if markup is None and isinstance(channel, TelegramChannel):
+                # A plain card can be a rich message. One with a button
+                # cannot: "Open plan" edits the card's text in place.
+                msg = await channel.send_rich_notification(
+                    chat_id, thread_id, text, silent=silent,
+                    link_preview=link_preview,
+                )
+            if msg is None:
+                msg = await self._send_telegram_html(
+                    bot, chat_id, text, reply_markup=markup, silent=silent,
+                    link_preview=link_preview,
+                    thread_id=thread_id,
+                )
             msg_id = str(msg.message_id)
 
         # Cache for reaction context lookups, and record the reply route so a

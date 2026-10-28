@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
+import functools
 import html as _html
 import logging
 import re
@@ -17,15 +18,16 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import RetryAfter
+from telegram.error import EndPointNotFound, RetryAfter
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, MessageReactionHandler, filters
 
 from nerve.agent.engine import NotAcceptingTurnsError
@@ -63,6 +65,14 @@ REPLY_UNRESOLVED_MSG = (
     "Reply with /new <your message> to start a new session with it quoted, "
     "or send the message without replying to reach the active session."
 )
+# A rich message's limit (Bot API 10.1), in characters of its text
+RICH_MSG_LEN = 32768
+# Blocks in one rich message, as _line_weights counts them: lines outside
+# code, and one per code block. Telegram's cap is 500 blocks, and a list item
+# is two of them (the item and its paragraph).
+_RICH_MAX_BLOCKS = 200
+# Read/write timeout for sending a rich message: up to 32 KB to parse
+_RICH_TIMEOUT = 20.0
 # Minimum interval between message edits (seconds) to avoid rate limits
 EDIT_INTERVAL = 1.5
 # Chats whose last streaming edit time is remembered (see _claim_chat_edit)
@@ -229,6 +239,343 @@ def _md_to_tg_html(text: str) -> str:
     return text
 
 
+# ---------------------------------------------------------------------- #
+#  Markdown blocks: splitting and rich messages                            #
+# ---------------------------------------------------------------------- #
+
+# A code fence's opening line: up to three spaces, then ``` or ~~~ and an
+# optional info string (the language).
+_FENCE_OPEN_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
+# A table's delimiter row, such as "|:---|---:|" or "--- | ---".
+_TABLE_DELIM_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
+_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(\s|$)")
+_RULE_RE = re.compile(r"^ {0,3}([-*_=])(\s*\1){2,}\s*$")
+# An inline code span: a run of backticks, its text, the same run again.
+_CODE_SPAN_RE = re.compile(r"(`+)(.+?)\1")
+# HTML tags a rich message renders and an answer may use on purpose. Telegram
+# drops anything else that looks like a tag ("Vec<String>" shows as "Vec"),
+# so every other "<" is escaped.
+_RICH_TAGS = (
+    "a", "b", "blockquote", "br", "code", "del", "details", "em", "i", "ins",
+    "pre", "s", "strike", "strong", "sub", "summary", "sup", "tg-spoiler", "u",
+)
+_RICH_TAG_RE = re.compile(
+    r"</?(?:%s)(?=[\s>/])" % "|".join(map(re.escape, _RICH_TAGS)), re.IGNORECASE,
+)
+_AUTOLINK_RE = re.compile(r"<(?:https?|mailto|tg):[^\s<>]*>", re.IGNORECASE)
+
+
+def _is_table_delim(line: str) -> bool:
+    """Whether *line* is a table's delimiter row ("---" alone is a rule, not one)."""
+    return "|" in line and bool(_TABLE_DELIM_RE.match(line))
+
+
+def _closes_fence(line: str, closer: str) -> bool:
+    """Whether *line* closes a fence opened with *closer* (e.g. ``` or ~~~~)."""
+    marker = closer.strip()
+    stripped = line.strip()
+    return (
+        len(line) - len(line.lstrip(" ")) <= 3
+        and len(stripped) >= len(marker)
+        and set(stripped) == {marker[0]}
+    )
+
+
+# Where a line sits relative to code fences (see _fence_marks)
+_OUTSIDE, _OPENS, _INSIDE = 0, 1, 2
+
+
+def _fence_marks(lines: list[str]) -> list[int]:
+    """For each line: outside code, opening a fence, or inside one (its closer too)."""
+    marks: list[int] = []
+    closer: str | None = None
+    for line in lines:
+        if closer is None:
+            m = _FENCE_OPEN_RE.match(line)
+            if m and not (m.group(2)[0] == "`" and "`" in m.group(3)):
+                closer = m.group(1) + m.group(2)
+                marks.append(_OPENS)
+                continue
+            marks.append(_OUTSIDE)
+        else:
+            marks.append(_INSIDE)
+            if _closes_fence(line, closer):
+                closer = None
+    return marks
+
+
+def _code_lines(lines: list[str]) -> list[bool]:
+    """For each line, whether it belongs to a code fence (its markers included)."""
+    return [mark != _OUTSIDE for mark in _fence_marks(lines)]
+
+
+def _line_weights(lines: list[str]) -> list[int]:
+    """What each line adds to a rich message's block count.
+
+    A line outside code adds one, a code block one however long it is. A
+    list item is a second block (its paragraph), which the cap leaves room
+    for.
+    """
+    return [
+        1 if mark == _OPENS else 0 if mark == _INSIDE else int(bool(line.strip()))
+        for line, mark in zip(lines, _fence_marks(lines))
+    ]
+
+
+def _weight(text: str) -> int:
+    return sum(_line_weights(text.split("\n")))
+
+
+def _markdown_blocks(text: str) -> list[str]:
+    """Markdown cut at blank lines, with each code fence kept whole."""
+    lines = text.split("\n")
+    blocks: list[str] = []
+    current: list[str] = []
+    for line, code in zip(lines, _code_lines(lines)):
+        if not code and not line.strip():
+            if current:
+                blocks.append("\n".join(current))
+                current = []
+            continue
+        current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
+
+
+def _fits(text: str, limit: int, max_blocks: int) -> bool:
+    return len(text) <= limit and (not max_blocks or _weight(text) <= max_blocks)
+
+
+def _fit_block(block: str, limit: int, max_blocks: int) -> list[str]:
+    """One block as pieces that fit, cut at line ends.
+
+    A cut inside a code fence closes the fence and reopens it, language and
+    all, at the top of the next piece, so each piece renders on its own. A
+    line longer than a piece is cut too.
+    """
+    if _fits(block, limit, max_blocks):
+        return [block]
+    source = block.split("\n")
+    pieces: list[str] = []
+    lines: list[str] = []
+    used = 0
+    weight = 0
+    opener: str | None = None  # the open fence's first line
+    closer = ""
+    for line, line_weight in zip(source, _line_weights(source)):
+        reserve = len(closer) + 1 if opener is not None else 0
+        width = max(1, limit - reserve - (len(opener) + 1 if opener else 0) - 1)
+        for seg in [line[i:i + width] for i in range(0, len(line), width)] or [""]:
+            full = used + len(seg) + 1 + reserve > limit or (
+                max_blocks and weight + line_weight > max_blocks
+            )
+            if lines and full:
+                if opener is not None:
+                    lines.append(closer)
+                pieces.append("\n".join(lines))
+                lines = [opener] if opener is not None else []
+                used = sum(len(kept) + 1 for kept in lines)
+                weight = 1 if opener is not None else 0
+            lines.append(seg)
+            used += len(seg) + 1
+            weight += line_weight
+        if opener is None:
+            m = _FENCE_OPEN_RE.match(line)
+            if m:
+                opener, closer = line, m.group(1) + m.group(2)
+        elif _closes_fence(line, closer):
+            opener, closer = None, ""
+    if lines:
+        pieces.append("\n".join(lines))
+    return pieces
+
+
+def _split_markdown(text: str, limit: int, max_blocks: int = 0) -> list[str]:
+    """Markdown in parts of at most *limit* characters, cut between blocks.
+
+    A part ends at a blank line and never inside a code fence; a block too
+    long for one part is cut by :func:`_fit_block`. *max_blocks*, when set,
+    also caps a part's block count as :func:`_line_weights` reckons it.
+    Blank-line runs between blocks come out as a single blank line.
+    """
+    if not text:
+        return []
+    if _fits(text, limit, max_blocks):
+        return [text]
+    parts: list[str] = []
+    current: list[str] = []
+    size = 0
+    blocks = 0
+    for block in _markdown_blocks(text):
+        for piece in _fit_block(block, limit, max_blocks):
+            piece_blocks = _weight(piece) if max_blocks else 0
+            if current and (
+                size + 2 + len(piece) > limit
+                or (max_blocks and blocks + piece_blocks > max_blocks)
+            ):
+                parts.append("\n\n".join(current))
+                current, size, blocks = [], 0, 0
+            if current:
+                size += 2
+            current.append(piece)
+            size += len(piece)
+            blocks += piece_blocks
+    if current:
+        parts.append("\n\n".join(current))
+    return parts
+
+
+def _escape_rich_text(text: str) -> str:
+    """Escape what a rich message would misread in text outside code.
+
+    ``$`` would open a formula ("$5 and $10" turns into one), and a ``<``
+    that starts no tag Telegram renders would make the text after it vanish.
+    A character the text already escapes with a backslash is left alone.
+    """
+    out: list[str] = []
+    escaped = False
+    for i, ch in enumerate(text):
+        if escaped:
+            out.append(ch)
+            escaped = False
+        elif ch == "\\":
+            out.append(ch)
+            escaped = True
+        elif ch == "$":
+            out.append("\\$")
+        elif ch == "<" and not (
+            _RICH_TAG_RE.match(text, i) or _AUTOLINK_RE.match(text, i)
+        ):
+            out.append("&lt;")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _escape_rich_line(line: str) -> str:
+    """:func:`_escape_rich_text` for one line, leaving its code spans alone."""
+    out: list[str] = []
+    pos = 0
+    for m in _CODE_SPAN_RE.finditer(line):
+        out.append(_escape_rich_text(line[pos:m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(_escape_rich_text(line[pos:]))
+    return "".join(out)
+
+
+def _rich_markdown(text: str) -> str:
+    """An answer's Markdown, ready for a rich message.
+
+    Rich messages parse GitHub-flavoured Markdown, which differs from how a
+    Telegram message shows text in two ways that matter to an answer: a
+    single newline joins two lines into one paragraph, and some characters
+    are markup (see :func:`_escape_rich_text`). So each line break inside a
+    paragraph becomes a hard break, and those characters are escaped. Code
+    fences and code spans stay exactly as written, and so do tables. A table
+    gets a blank line before and after it, because without one Telegram reads
+    it as part of the paragraph next to it.
+    """
+    lines = text.split("\n")
+    code = _code_lines(lines)
+    count = len(lines)
+    out: list[str] = []
+    in_table = False
+    piped_table = False  # the table's rows start with "|"
+    for i, line in enumerate(lines):
+        if code[i]:
+            out.append(line)
+            continue
+        if not line.strip():
+            in_table = False
+            out.append(line)
+            continue
+        nxt = lines[i + 1] if i + 1 < count else ""
+        nxt_code = code[i + 1] if i + 1 < count else True
+        if _is_table_delim(line):
+            in_table = True
+            piped_table = line.lstrip().startswith("|")
+        table_next = (
+            not in_table
+            and i + 2 < count
+            and not code[i + 1] and not code[i + 2]
+            and "|" in nxt
+            and _is_table_delim(lines[i + 2])
+        )
+        line = _escape_rich_line(line)
+        table_line = (
+            in_table or line.lstrip().startswith("|") or _is_table_delim(nxt)
+        )
+        if (
+            nxt.strip()
+            and not nxt_code
+            and not table_line
+            and not table_next
+            and not nxt.lstrip().startswith("|")
+            and not _HEADING_RE.match(line)
+            and not _RULE_RE.match(line)
+            and not line.endswith(("  ", "\\"))
+        ):
+            line += "  "
+        out.append(line)
+        if table_next:
+            out.append("")
+        elif (
+            in_table and piped_table and nxt.strip() and not nxt_code
+            and not nxt.lstrip().startswith("|")
+        ):
+            out.append("")
+            in_table = False
+    return "\n".join(out)
+
+
+def _rich_inline_text(node: Any) -> str:
+    """The plain text of a rich message's inline content."""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        return "".join(_rich_inline_text(part) for part in node)
+    if isinstance(node, dict):
+        if "expression" in node:
+            return str(node["expression"])
+        return _rich_inline_text(node.get("text", ""))
+    return ""
+
+
+def _rich_block_lines(blocks: Any) -> list[str]:
+    """The plain-text lines of a list of rich message blocks."""
+    lines: list[str] = []
+    for block in blocks if isinstance(blocks, list) else ():
+        if not isinstance(block, dict):
+            continue
+        if "summary" in block:
+            lines.append(_rich_inline_text(block["summary"]))
+        if "text" in block or "expression" in block:
+            lines.append(_rich_inline_text(block))
+        for row in block.get("cells") or ():
+            if isinstance(row, list):
+                lines.append(" | ".join(_rich_inline_text(cell) for cell in row))
+        for item in block.get("items") or ():
+            if isinstance(item, dict):
+                lines.extend(_rich_block_lines(item.get("blocks")))
+        lines.extend(_rich_block_lines(block.get("blocks")))
+    return [line for line in lines if line]
+
+
+def _rich_plain_text(message: Any) -> str:
+    """The text of a rich message, or ``""`` for any other message.
+
+    A rich message carries no ``text``: python-telegram-bot keeps the parsed
+    blocks under ``api_kwargs["rich_message"]``, as a field it does not know.
+    """
+    extra = getattr(message, "api_kwargs", None)
+    rich = extra.get("rich_message") if isinstance(extra, Mapping) else None
+    if not isinstance(rich, Mapping):
+        return ""
+    return "\n".join(_rich_block_lines(rich.get("blocks")))
+
+
 def _format_forward_context(message: Any) -> str:
     """Extract forward origin info from a Telegram message.
 
@@ -319,7 +666,11 @@ def _format_reply_context(message: Any) -> str:
         sender = "user"
 
     # Original message text
-    original = getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
+    original = (
+        getattr(reply, "text", None)
+        or getattr(reply, "caption", None)
+        or _rich_plain_text(reply)
+    )
     if original:
         display = original if len(original) <= 500 else original[:500] + "…"
         parts.append(f'[Reply to {sender}: "{display}"]')
@@ -885,6 +1236,9 @@ class TelegramChannel(BaseChannel):
         self._last_chat_edit: collections.OrderedDict[int, float] = (
             collections.OrderedDict()
         )
+        # Set when the Bot API server has no sendRichMessage (an older
+        # self-hosted one): answers go out as HTML until restart.
+        self._rich_unavailable = False
         # Rate limiter for replies to unauthorized users: user_id -> monotonic ts
         self._unauth_reply_times: dict[int, float] = {}
         # /plans revise flow: (chat_id, prompt_message_id) ->
@@ -1268,27 +1622,130 @@ class TelegramChannel(BaseChannel):
     # ------------------------------------------------------------------ #
 
     async def send(self, message: OutboundMessage) -> None:
-        """Send a message to a Telegram chat, or to a topic in it."""
+        """Send a message to a Telegram chat, or to a topic in it.
+
+        With ``telegram.rich_messages`` on, the text goes out as rich
+        messages of up to 32,768 characters, and a part Telegram refuses is
+        sent as HTML instead. Otherwise it goes out as HTML messages of up to
+        4,096 characters. Either way a long text is cut between blocks.
+        """
         if self._app is None:
             return
         chat_id, thread_id = parse_target(message.target)
-        text = message.text
-        # Split long messages
-        for i in range(0, len(text), MAX_MSG_LEN):
-            chunk = text[i:i + MAX_MSG_LEN]
-            try:
-                sent = await self._send_chunk(chat_id, thread_id, chunk)
-            except RetryAfter as exc:
-                # Topics put several sessions in one chat, and they share its
-                # rate limit. This is the final answer, so wait the limit out
-                # once rather than leave the half-streamed placeholder.
-                wait = _retry_after_seconds(exc)
-                if wait > _SEND_RETRY_MAX_WAIT:
-                    raise
-                await asyncio.sleep(wait)
-                sent = await self._send_chunk(chat_id, thread_id, chunk)
+        session_id = message.session_id
+        if not self._rich_on():
+            await self._send_html(chat_id, thread_id, message.text, session_id)
+            return
+        for part in _split_markdown(message.text, RICH_MSG_LEN, _RICH_MAX_BLOCKS):
+            sent = await self._send_rich(chat_id, thread_id, part)
+            if sent is None:
+                await self._send_html(chat_id, thread_id, part, session_id)
+            else:
+                self._cache_message(sent.message_id, chat_id, part, thread_id)
+                await self._record_reply_route(sent.message_id, chat_id, session_id)
+
+    @staticmethod
+    async def _with_retry(send: Callable[[], Awaitable[Any]]) -> Any:
+        """Run *send*, and once more after Telegram's advised wait if it is rate limited.
+
+        Topics put several sessions in one chat, and they share its rate
+        limit. A final answer is worth one wait, rather than leaving the
+        half-streamed placeholder.
+        """
+        try:
+            return await send()
+        except RetryAfter as exc:
+            wait = _retry_after_seconds(exc)
+            if wait > _SEND_RETRY_MAX_WAIT:
+                raise
+            await asyncio.sleep(wait)
+            return await send()
+
+    async def _send_html(
+        self, chat_id: int, thread_id: int | None, text: str,
+        session_id: str | None = None,
+    ) -> None:
+        """Send Markdown *text* as HTML messages of up to 4,096 characters, cut between blocks.
+
+        Each message records a reply route to *session_id* (see ``_record_reply_route``).
+        """
+        for chunk in _split_markdown(text, MAX_MSG_LEN):
+            sent = await self._with_retry(
+                functools.partial(self._send_chunk, chat_id, thread_id, chunk),
+            )
             self._cache_message(sent.message_id, chat_id, chunk, thread_id)
-            await self._record_reply_route(sent.message_id, chat_id, message.session_id)
+            await self._record_reply_route(sent.message_id, chat_id, session_id)
+
+    def _rich_on(self) -> bool:
+        """Whether text goes out as rich messages (Bot API 10.1)."""
+        return self.config.telegram.rich_messages and not self._rich_unavailable
+
+    async def _send_rich(
+        self, chat_id: int, thread_id: int | None, text: str,
+        *, silent: bool = False, link_preview: Any = None,
+    ) -> Any | None:
+        """Send Markdown *text* as one rich message; ``None`` means send it as HTML.
+
+        ``None`` when rich messages are off, the text is empty or over the
+        limit, or Telegram refuses it. A Bot API server without
+        ``sendRichMessage`` (an older self-hosted one) turns them off until
+        restart. A rate limit that outlasts one wait is raised: the HTML
+        path would hit it too.
+        """
+        if not self._rich_on() or not text.strip() or len(text) > RICH_MSG_LEN:
+            return None
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "rich_message": {"markdown": _rich_markdown(text)},
+            **_in_thread(thread_id),
+        }
+        if silent:
+            params["disable_notification"] = True
+        if link_preview is not None:
+            # A notification's choice (NotificationService._telegram_link_preview).
+            params["link_preview_options"] = link_preview.to_dict()
+        try:
+            return await self._with_retry(functools.partial(
+                self._app.bot.do_api_request,
+                "sendRichMessage",
+                api_kwargs=params,
+                return_type=Message,
+                read_timeout=_RICH_TIMEOUT,
+                write_timeout=_RICH_TIMEOUT,
+            ))
+        except RetryAfter:
+            raise
+        except EndPointNotFound as exc:
+            self._rich_unavailable = True
+            logger.warning(
+                "The Bot API server has no sendRichMessage (%s); "
+                "sending HTML until restart", exc,
+            )
+        except Exception as exc:
+            logger.info(
+                "Telegram refused a rich message in chat %s, sending HTML: %s",
+                chat_id, exc,
+            )
+        return None
+
+    async def send_rich_notification(
+        self, chat_id: int, thread_id: int | None, text: str,
+        *, silent: bool = False, link_preview: Any = None,
+    ) -> Any | None:
+        """A notification as one rich message; ``None`` means send it as HTML.
+
+        Only for a card that nothing edits later. Buttons, the "Open plan"
+        view and the expiry note all edit the card's text, and a rich
+        message has none.
+        """
+        if self._app is None:
+            return None
+        try:
+            return await self._send_rich(
+                chat_id, thread_id, text, silent=silent, link_preview=link_preview,
+            )
+        except RetryAfter:
+            return None  # the HTML path waits it out or fails, as before
 
     async def _send_chunk(
         self, chat_id: int, thread_id: int | None, chunk: str,
@@ -1314,7 +1771,7 @@ class TelegramChannel(BaseChannel):
         """Return text unchanged.
 
         Long messages must NOT be truncated here: send() already splits text into
-        MAX_MSG_LEN-sized chunks and delivers them as sequential messages. Truncating
+        parts that fit and delivers them as sequential messages. Truncating
         first (the old behaviour) defeated that chunking and dropped the tail of long
         replies with a "... (truncated)" marker.
         """

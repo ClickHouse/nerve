@@ -1701,6 +1701,10 @@ class TelegramConfig:
     source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
     # Forum topics as sessions — see TelegramTopicsConfig.
     topics: TelegramTopicsConfig = field(default_factory=TelegramTopicsConfig)
+    # Send answers and plain notifications as rich messages (Bot API 10.1):
+    # headings, tables, task lists and code blocks render, and one message
+    # holds 32,768 characters. A message Telegram refuses goes out as HTML.
+    rich_messages: bool = True
 
     @classmethod
     @_coerced
@@ -1751,6 +1755,7 @@ class TelegramConfig:
                 d.get("source", {}), subject="chats",
             ).outside_hosted_mode("chats"),
             topics=TelegramTopicsConfig.from_dict(d.get("topics", {})),
+            rich_messages=d.get("rich_messages", True),
         )
 
 

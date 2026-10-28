@@ -50,6 +50,7 @@ def _make_channel(
     cfg = SimpleNamespace(telegram=SimpleNamespace(
         allowed_users=[],
         reply_routes_to_origin_session=routing_enabled,
+        rich_messages=False,
     ))
     return TelegramChannel(lambda: cfg, router or _FakeRouter(db))
 

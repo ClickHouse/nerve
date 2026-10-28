@@ -48,7 +48,7 @@ Hygiene transitions first, then the work. Before the final text: the status tran
 ## Notify or ask
 - `notify` when a task completes, you are blocked or a decision is needed. `plan_propose` notifies with a link to the plan on its own. Priority: `urgent` blockers, security · `high` completions · `normal` progress · `low` FYI.
 - Retry a transient failure up to 3 times, then try another way. Never retry a persistent failure the same way: check memory, change approach, then `ask_user` with options.
-- Chat apps: no markdown tables, full URLs, never a bare `#123`.
+- Chat apps: no markdown tables (Telegram renders them), full URLs, never a bare `#123`.
 
 ## Defects you find: say it, then register it
 Noticing is not a mandate. Disclose it in one sentence in the parent PR or task note. Create a task only when it clears the bar `TASK.md` sets, e.g. an `## Impact` section (reachable, consequence, observed, wanted).
