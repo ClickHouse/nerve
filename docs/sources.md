@@ -315,9 +315,9 @@ notifications, and in hosted mode through `pr_watch`.
 - **One page each:** a repository with more than 100 pull requests (or issues) changed between two runs loses the oldest of those changes. `batch_size` does not cap this source
 - **Cursor:** JSON. Per repository and listing: the newest `updated_at` listed (`published_at` for releases), when the listing was read, and the numbers (release ids) of the items created in that newest second. Per repository, the pull requests it follows: a held draft (`include_drafts: false`) and, with `updates`, a reported pull request while it is open, as head commit, draft and held. At most 1,000 per repository; the one listed longest ago is forgotten first
 - **First run:** the baseline. Each listing's cursor is set and nothing is reported, so switching the source on does not fill the inbox with history; a repository or a type added later takes its own baseline, and one removed is forgotten. An item is new when it was created (a release: published) after the last listing: later than the listing's cursor, or in the cursor's own second and not listed then, since GitHub's times have a resolution of one second. So an older pull request that changes later is never reported as new, and an item is reported once
-- **No backfill:** nothing older than a day is backfilled. A listing last read more than a day ago (the watch switched off for longer, or a long outage) starts fresh with a new baseline, and the pull requests it followed are forgotten
+- **No backfill beyond a day:** nothing older than a day is backfilled, and the last day is. A check more than a day after the last one (a daily schedule, which always comes a moment past the day; a weekday schedule after the weekend; the watch switched off for longer; a long outage) reads the listing as of a day and an hour ago: it reports the items of the last day, with an hour of grace for the scheduler's delay (an item created moments after the last check is not lost), within the one page, and nothing older, and the pull requests it follows stay followed. So switching the watch off and on in poll mode resumes where it left within the day, and beyond it reports the last day's items
 - **Failures:** a listing that fails (a repository that does not exist or that the `gh` login cannot read, a rate limit) keeps its cursor and is read again on the next run; the other listings still report. A run in which every listing fails fails, and the source's health shows it
-- **Upgrades:** the cursor of the earlier version of this source, one timestamp, becomes the cursor of every listing (unless it is more than a day old), so nothing is repeated or skipped; a buffer position left by the hosted mode is no cursor (a new baseline). The earlier version took any `repos` value: one that the watch now refuses (a URL such as `https://github.com/acme/widgets`, a trailing slash, `owner/repo/x`, the same repository twice, more than 50) only logs a warning while the watch is off, and refuses the config once it is on
+- **Upgrades:** the cursor of the earlier version of this source, one timestamp, becomes the cursor of every listing (one more than a day old reports the last day), so nothing is repeated or skipped; a buffer position left by the hosted mode is no cursor (a new baseline). The earlier version took any `repos` value: one that the watch now refuses (a URL such as `https://github.com/acme/widgets`, a trailing slash, `owner/repo/x`, the same repository twice, more than 50) only logs a warning while the watch is off, and refuses the config once it is on
 - **Default schedule:** `*/15 * * * *` (every 15 min); in hosted mode the fallback cadence of the drain
 - **Disabled by default**
 
@@ -411,10 +411,10 @@ machine for them.
   `deny_authors` list the gateway cannot take (more than 256 patterns, or a
   pattern longer than 256 bytes or with a control character) goes with the
   patterns that fit, and the inbox guardrail here applies them all.
-- **It starts fresh.** The gateway backfills nothing older than a day either,
-  and it forgets the repositories of an agent that stops subscribing to them,
-  so switching the watch off and on, or a long outage, starts from a new
-  baseline.
+- **It starts fresh when switched off.** The gateway backfills nothing older
+  than a day either (after a gap it reports the last day), and it forgets the
+  repositories of an agent that stops subscribing to them, so switching the
+  watch off and on in hosted mode starts from a new baseline.
 - **The gateway must know the repository watch.** The subscription carries a
   `repos` member that a gateway older than the repository watch refuses: it
   closes the stream, hosted Slack traffic included. Update the gateway before

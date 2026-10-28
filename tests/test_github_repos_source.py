@@ -333,29 +333,123 @@ async def test_a_release_published_in_the_cursors_second_after_the_listing_is_re
     assert (await src.fetch(result.next_cursor)).records == []
 
 
+# Minutes in a day, for times given as minutes after START (NOW is at(60)).
+DAY = 24 * 60
+
+
 @pytest.mark.asyncio
-async def test_a_listing_read_more_than_a_day_ago_starts_fresh():
-    """Nothing older than a day is backfilled: after a long outage, or with
-    the watch switched off for longer, the next listing is a new baseline,
-    and the pull requests it followed are forgotten."""
+async def test_a_check_a_day_and_a_second_after_the_last_reports_the_last_day():
+    """A daily schedule comes back a day and a moment after the last check.
+    Nothing older than a day is backfilled, but the last day is: what was
+    opened since the last check is reported; an older item that only
+    changed is not."""
     fake = FakeGitHub()
+    fake.issues[REPO] = [issue(1, created=-600)]
     now = [NOW]
-    src = source(fake, types=["pull_request", "issue"], updates=True, clock=lambda: now[0])
+    src = source(fake, types=["pull_request", "issue"], clock=lambda: now[0])
     cursor = await baseline(src)
-    fake.pulls[REPO] = [pull(1, created=5)]
-    cursor = (await src.fetch(cursor)).next_cursor
-    assert json.loads(cursor)["repos"][REPO]["prs"] == {"1": [SHA_A[:12], False, False]}
-    fake.pulls[REPO] = [pull(1, created=5, updated=1490, sha=SHA_B), pull(2, created=1495)]
-    fake.issues[REPO] = [issue(3, created=1496)]
-    now[0] = NOW + timedelta(hours=24, minutes=1)
+    fake.pulls[REPO] = [pull(2, created=120)]
+    fake.issues[REPO] = [issue(1, created=-600, updated=1000), issue(3, created=1260)]
+    now[0] = NOW + timedelta(hours=24, seconds=1)
 
     result = await src.fetch(cursor)
 
-    assert result.records == []
-    stamp = now[0].strftime("%Y-%m-%dT%H:%M:%SZ")
-    assert cursor_of(result) == {"v": 1, "repos": {REPO: {
-        "pulls": read(at(1495), "2", listed_at=stamp), "issues": read(at(1496), "3", listed_at=stamp),
-    }}}
+    assert [record.id for record in result.records] == [f"{REPO}#2:opened:open", f"{REPO}#3:opened:open"]
+    assert (await src.fetch(result.next_cursor)).records == []
+
+
+@pytest.mark.asyncio
+async def test_a_check_a_day_and_five_seconds_after_the_last_keeps_an_item_of_the_moment_after_it():
+    """The window reaches an hour further back than the day, for the
+    scheduler's delay: a pull request created 2 s after the last check, which
+    that check did not list, is still reported; the one it listed is not."""
+    fake = FakeGitHub()
+    fake.pulls[REPO] = [pull(1, created=-600)]
+    now = [NOW]
+    src = source(fake, types=["pull_request"], clock=lambda: now[0])
+    cursor = await baseline(src)
+    moment_after = pull(2, created=60)
+    moment_after["created_at"] = moment_after["updated_at"] = (
+        NOW + timedelta(seconds=2)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    fake.pulls[REPO] = [pull(1, created=-600), moment_after]
+    now[0] = NOW + timedelta(hours=24, seconds=5)
+
+    result = await src.fetch(cursor)
+
+    assert [record.id for record in result.records] == [f"{REPO}#2:opened:open"]
+
+
+@pytest.mark.asyncio
+async def test_a_check_a_week_after_the_last_reports_only_the_last_day():
+    fake = FakeGitHub()
+    now = [NOW]
+    src = source(fake, types=["pull_request", "issue", "release"], clock=lambda: now[0])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [
+        pull(1, created=60 + DAY),
+        pull(2, created=60 + 6 * DAY + 720),
+        pull(4, created=60 + 6 * DAY - 30),
+        pull(5, created=60 + 6 * DAY - 120),
+    ]
+    fake.issues[REPO] = [issue(3, created=60 + 6 * DAY + 1380)]
+    fake.releases[REPO] = [
+        release(900, tag="v1", created=60 + 3 * DAY, published=60 + 3 * DAY),
+        release(901, tag="v2", created=60 + 6 * DAY + 1200, published=60 + 6 * DAY + 1200),
+    ]
+    now[0] = NOW + timedelta(days=7)
+
+    result = await src.fetch(cursor)
+
+    # Six days, four days and 26 h old: not reported. 24.5 h old (within the
+    # hour of grace), 12, 4 and 1 h old: reported.
+    assert [record.id for record in result.records] == [
+        f"{REPO}#4:opened:open", f"{REPO}#2:opened:open", f"{REPO}#:released:901", f"{REPO}#3:opened:open",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_after_a_gap_the_followed_pull_requests_stay_followed():
+    """updates with a daily schedule: a followed pull request that changed in
+    the last day is reported after the gap, as it is without one."""
+    fake = FakeGitHub()
+    now = [NOW]
+    src = source(fake, types=["pull_request"], updates=True, clock=lambda: now[0])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=90)]
+    now[0] = NOW + timedelta(hours=1)
+    opened = await src.fetch(cursor)
+    assert [record.id for record in opened.records] == [f"{REPO}#1:opened:open"]
+    fake.pulls[REPO] = [pull(1, created=90, updated=60 + 2 * DAY, sha=SHA_B)]
+    now[0] = NOW + timedelta(days=2, hours=1)
+
+    result = await src.fetch(opened.next_cursor)
+
+    assert [record.id for record in result.records] == [f"{REPO}#1:updated:{SHA_B}"]
+
+
+@pytest.mark.asyncio
+async def test_a_listing_whose_reading_time_is_unknown_is_read_against_the_last_day():
+    fake = FakeGitHub()
+    fake.pulls[REPO] = [pull(1, created=-3000), pull(2, created=5)]
+    cursor = json.dumps({"v": 1, "repos": {REPO: {"pulls": {"since": at(-4000), "at": []}}}})
+
+    result = await source(fake, types=["pull_request"]).fetch(cursor)
+
+    assert [record.id for record in result.records] == [f"{REPO}#2:opened:open"]
+
+
+@pytest.mark.asyncio
+async def test_a_stale_listing_whose_cursor_falls_within_the_day_keeps_its_keys():
+    """Its cursor second is still the window's: the item it saw there is not
+    reported again, the one it did not see is."""
+    fake = FakeGitHub()
+    fake.pulls[REPO] = [pull(1, created=5), pull(2, created=5)]
+    cursor = json.dumps({"v": 1, "repos": {REPO: {"pulls": {"since": at(5), "at": ["1"]}}}})
+
+    result = await source(fake, types=["pull_request"]).fetch(cursor)
+
+    assert [record.id for record in result.records] == [f"{REPO}#2:opened:open"]
 
 
 @pytest.mark.asyncio
@@ -830,20 +924,19 @@ async def test_the_cursor_of_the_earlier_source_still_reads():
 
 
 @pytest.mark.asyncio
-async def test_the_cursor_of_the_earlier_source_more_than_a_day_old_starts_fresh():
+async def test_the_cursor_of_the_earlier_source_more_than_a_day_old_reports_the_last_day():
+    """24.5 h old is within the day and its hour of grace; 25 h 55 min old is not."""
     fake = FakeGitHub()
-    fake.pulls[REPO] = [pull(1, created=5)]
-    src = source(fake, types=["pull_request"], clock=lambda: START + timedelta(hours=25))
+    fake.pulls[REPO] = [pull(1, created=5), pull(2, created=90)]
+    src = source(fake, types=["pull_request"], clock=lambda: START + timedelta(hours=26))
 
-    assert (await src.fetch(at(0))).records == []
+    result = await src.fetch(at(0))
+
+    assert [record.id for record in result.records] == [f"{REPO}#2:opened:open"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cursor", [
-    "57", "not a cursor", "{broken json", '{"v": 1, "repos": []}',
-    # A listing whose reading time is unknown counts as read long ago.
-    json.dumps({"v": 1, "repos": {REPO: {"pulls": {"since": at(0), "at": []}}}}),
-])
+@pytest.mark.parametrize("cursor", ["57", "not a cursor", "{broken json", '{"v": 1, "repos": []}'])
 async def test_a_cursor_that_cannot_be_read_takes_a_baseline(cursor):
     """A buffer position left by the hosted mode, or anything unreadable,
     is no cursor: nothing is reported."""

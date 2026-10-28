@@ -53,12 +53,16 @@ GitHub's times have a resolution of one second. At most
 listed longest ago is forgotten first. A listing without a cursor is the
 baseline: its cursor is set and nothing is reported, so switching the source
 on, or adding a repository or a type, does not fill the inbox with history.
-So is a listing last read more than a day ago (:data:`STALE_AFTER`): nothing
-older than a day is backfilled, and a long outage, or the source switched off
-for longer, starts fresh. A listing that fails keeps its cursor. The earlier
-cursor of this source, one ISO timestamp (the newest ``created_at`` seen),
-stands for every listing and for when it was last read; a buffer position
-(digits), left by the hosted mode, is no cursor.
+Nothing older than a day is backfilled: a listing last read more than a day
+ago (:data:`STALE_AFTER`; a daily schedule, a long outage, the source switched
+off for longer) is read as of a day and an hour ago (:data:`STALE_GRACE`, for
+the scheduler's delay), so it reports what is new in the last day, with an
+hour of grace, and nothing older, and the pull requests it follows stay
+followed. A
+listing that fails keeps its cursor. The earlier cursor of this source, one
+ISO timestamp (the newest ``created_at`` seen), stands for every listing and
+for when it was last read; a buffer position (digits), left by the hosted
+mode, is no cursor.
 """
 
 from __future__ import annotations
@@ -100,10 +104,13 @@ _FINGERPRINT_SHA_CHARS = 12
 
 _CURSOR_VERSION = 1
 
-# A listing last read longer ago than this starts again from a baseline:
-# nothing older than a day is backfilled, the horizon of the notifications
-# source's first run too.
+# A listing last read longer ago than this is read as of this long ago, and
+# STALE_GRACE more: nothing older than a day is backfilled (the horizon of the
+# notifications source's first run too), and the last day is, with an hour of
+# grace for the scheduler's delay. A daily check comes back a day and a moment
+# after the last one, and an item created in that moment is not lost.
 STALE_AFTER = timedelta(hours=24)
+STALE_GRACE = timedelta(hours=1)
 
 # What each type lists: its name in the cursor, and the endpoint.
 _LISTINGS: dict[str, tuple[str, str]] = {
@@ -315,6 +322,27 @@ def _stale(listing: _Listing, now: datetime) -> bool:
     """Whether *listing* was last read more than :data:`STALE_AFTER` before *now*."""
     when = _when(listing.listed_at)
     return when is None or now - when > STALE_AFTER
+
+
+def _window(listing: _Listing, now: datetime) -> _Listing:
+    """The cursor to read a stale *listing* against: the last day, with an hour of grace.
+
+    A daily schedule comes back a day and a moment later, a weekday one after
+    the weekend: what is new in the last day (and the hour of
+    :data:`STALE_GRACE` before it, for the scheduler's delay) is reported,
+    nothing older. The cursor is *listing*'s own when it falls within that
+    window (its keys still name what it saw in its second); otherwise the
+    window's start, with no keys. Never earlier than *listing*'s own cursor,
+    so nothing is reported twice: nothing listed back then was created after
+    that cursor.
+    """
+    # Cut to the second first, as the stored stamp is, so a cursor on exactly
+    # that second keeps its keys (the gateway compares the same way).
+    start = _stamp(now - STALE_AFTER - STALE_GRACE)
+    since = _when(listing.since)
+    if since is not None and since >= _when(start):
+        return listing
+    return _Listing(since=start, listed_at=listing.listed_at, at=[])
 
 
 def _number_key(item: dict[str, Any]) -> str:
@@ -656,15 +684,15 @@ class GitHubReposSource(Source):
                         state.listings[name] = previous
                     continue
                 if previous is not None and _stale(previous, now):
-                    # Nothing older than a day is backfilled: after a long
-                    # outage, or a watch switched off for longer, start fresh.
+                    # Nothing older than a day is backfilled, and the last day
+                    # is: a daily schedule is always a moment past the day.
+                    # The pull requests it follows stay followed.
                     logger.info(
                         "github_repos: %s %s was last read at %s, more than a day ago; "
-                        "taking a new baseline", repo, name, previous.listed_at or "an unknown time",
+                        "reporting what is new in the last day",
+                        repo, name, previous.listed_at or "an unknown time",
                     )
-                    previous = None
-                    if kind == "pull_request":
-                        state.prs.clear()
+                    previous = _window(previous, now)
                 if kind == "pull_request":
                     records += self._pull_requests(repo, result, previous, state, now)
                 elif kind == "issue":
