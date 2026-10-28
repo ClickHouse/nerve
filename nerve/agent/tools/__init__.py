@@ -157,6 +157,14 @@ async def _send_file_impl(args: dict, session_id: str) -> dict:
     return result.to_dict()
 
 
+async def _send_image_impl(args: dict, session_id: str) -> dict:
+    """Back-compat for tests."""
+    from nerve.agent.tools.handlers.notifications import send_image_handler
+    ctx = _legacy_ctx(session_id)
+    result = await send_image_handler(ctx, args)
+    return result.to_dict()
+
+
 # --- Legacy SdkMcpTool re-exports ---
 #
 # The default registry is built once at module import. Each named tool
@@ -270,5 +278,6 @@ __all__ = [
     "_react_impl",
     "_send_sticker_impl",
     "_send_file_impl",
+    "_send_image_impl",
     "_legacy_ctx",
 ]

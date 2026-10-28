@@ -160,7 +160,7 @@ class TestDefaultRegistry:
             # sources
             "list_sources", "poll_source",
             # notifications
-            "notify", "ask_user", "react", "send_sticker", "send_file",
+            "notify", "ask_user", "react", "send_sticker", "send_file", "send_image",
             "send_channel_message",
             # forms
             "ask_form",

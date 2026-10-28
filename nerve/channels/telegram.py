@@ -804,6 +804,7 @@ class TelegramChannel(BaseChannel):
             | ChannelCapability.TYPING_INDICATOR
             | ChannelCapability.REACTIONS
             | ChannelCapability.SEND_FILES
+            | ChannelCapability.SEND_IMAGES
         )
         if self.config.telegram.stream_mode == "partial":
             caps |= ChannelCapability.STREAMING
@@ -1281,6 +1282,58 @@ class TelegramChannel(BaseChannel):
         except Exception as e:
             logger.warning("send_file: send_document failed for %s: %s", target, e)
             return False
+
+    # ------------------------------------------------------------------ #
+    #  Images: deliver an image inline via send_photo                     #
+    # ------------------------------------------------------------------ #
+
+    async def send_image(
+        self, target: str, *, file_path: str = "", url: str = "", caption: str = "",
+    ) -> bool:
+        """Send an image to a Telegram chat as an inline photo.
+
+        Exactly one of *file_path* (local path) or *url* (remote URL)
+        must be provided.  Telegram accepts JPEG, PNG, GIF (non-animated),
+        BMP, TIFF, and WebP; photos up to 10 MiB, dimensions up to
+        10 000 px total (width + height).  Captions are capped at 1024
+        characters by the Telegram API.
+        """
+        if self._app is None:
+            return False
+
+        photo: Path | str
+        if file_path:
+            photo = Path(file_path)
+            if not photo.is_file():
+                return False
+        elif url:
+            photo = url
+        else:
+            return False
+
+        # Convert markdown caption to Telegram HTML, same as send().
+        html_caption = _md_to_tg_html(caption) if caption else None
+        try:
+            await self._app.bot.send_photo(
+                chat_id=int(target),
+                photo=photo,
+                caption=html_caption,
+                parse_mode=ParseMode.HTML if html_caption else None,
+            )
+            return True
+        except Exception:
+            # Fallback: retry with plain-text caption (HTML parse failure,
+            # or caption too long after conversion).
+            try:
+                await self._app.bot.send_photo(
+                    chat_id=int(target),
+                    photo=photo,
+                    caption=caption[:1024] if caption else None,
+                )
+                return True
+            except Exception as e:
+                logger.warning("send_image: send_photo failed for %s: %s", target, e)
+                return False
 
     # ------------------------------------------------------------------ #
     #  Message cache (for reaction context)                                #

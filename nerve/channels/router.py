@@ -542,6 +542,39 @@ class ChannelRouter:
             return False
 
     # ------------------------------------------------------------------ #
+    #  Image delivery                                                      #
+    # ------------------------------------------------------------------ #
+
+    async def send_image(
+        self,
+        session_id: str,
+        *,
+        file_path: str = "",
+        url: str = "",
+        caption: str = "",
+        channel: str | None = None,
+    ) -> bool:
+        """Deliver an image via the channel passed by the caller.
+
+        Same guard semantics as ``send_file`` — refuses delivery when
+        ``channel`` is None to prevent cron/planner leakage.
+
+        Returns True on successful delivery, False otherwise.
+        """
+        if channel is None:
+            return False
+
+        chan_obj = self._channels.get(channel)
+        if not chan_obj or ChannelCapability.SEND_IMAGES not in chan_obj.capabilities:
+            return False
+
+        ctx = self._message_context.get(session_id)
+        target = ctx["target"] if ctx and ctx.get("channel_name") == channel else ""
+        return await chan_obj.send_image(
+            target, file_path=file_path, url=url, caption=caption,
+        )
+
+    # ------------------------------------------------------------------ #
     #  Interactive tool response routing                                    #
     # ------------------------------------------------------------------ #
 

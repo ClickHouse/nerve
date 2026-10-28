@@ -1,5 +1,5 @@
 """Notification tool handlers — notify, ask_user, propose_action, react,
-send_sticker, send_file, send_channel_message.
+send_sticker, send_file, send_image, send_channel_message.
 
 Most of these need ``ctx.session_id`` so the channel router can deliver to
 the correct chat (web, Telegram). The session_id arrives via
@@ -37,6 +37,7 @@ from nerve.agent.tools.schemas import (
     REACT_SCHEMA,
     SEND_CHANNEL_MESSAGE_SCHEMA,
     SEND_FILE_SCHEMA,
+    SEND_IMAGE_SCHEMA,
     SEND_STICKER_SCHEMA,
 )
 
@@ -532,6 +533,58 @@ async def send_channel_message_handler(ctx: ToolContext, args: dict) -> ToolResu
     )
 
 
+async def send_image_handler(ctx: ToolContext, args: dict) -> ToolResult:
+    """Send an image inline via the channel router.
+
+    Accepts either a local *file_path* (workspace-contained) or a remote
+    *url*.  An optional *caption* is forwarded to the channel.
+    """
+    file_path = args.get("file_path", "")
+    url = args.get("url", "")
+    caption = args.get("caption", "")
+
+    if not file_path and not url:
+        return ToolResult.text("Error: provide either file_path or url.")
+    if file_path and url:
+        return ToolResult.text("Error: provide file_path or url, not both.")
+
+    # Workspace containment for local files
+    if file_path:
+        resolved = Path(file_path).resolve()
+        if not resolved.is_file():
+            return ToolResult.text(f"Error: file not found: {file_path}")
+        if ctx.workspace:
+            try:
+                resolved.relative_to(ctx.workspace.resolve())
+            except ValueError:
+                return ToolResult.text("Error: file must be within the workspace.")
+        file_path = str(resolved)
+
+    delivered = False
+    if ctx.engine is not None:
+        try:
+            active_channel = ctx.engine.get_active_channel(ctx.session_id)
+            delivered = await ctx.engine.router.send_image(
+                ctx.session_id,
+                file_path=file_path,
+                url=url,
+                caption=caption,
+                channel=active_channel,
+            )
+        except Exception as e:
+            logger.error("send_image dispatch failed: %s", e)
+            delivered = False
+
+    if delivered:
+        source = Path(file_path).name if file_path else url
+        return ToolResult.text(f"Image sent: {source}")
+
+    return ToolResult.text(
+        "Image delivery not available on this channel. "
+        "Try send_file as a fallback, or open the web panel."
+    )
+
+
 NOTIFY_SPEC = ToolSpec(
     name="notify",
     description=(
@@ -640,6 +693,19 @@ SEND_CHANNEL_MESSAGE_SPEC = ToolSpec(
 )
 
 
+SEND_IMAGE_SPEC = ToolSpec(
+    name="send_image",
+    description=(
+        "Send an image to the user displayed inline in the chat. "
+        "On Telegram the image is delivered as a photo (not a document attachment). "
+        "Provide either a local file_path or a remote url, plus an optional caption. "
+        "Use this when you want to share a picture, screenshot, chart, or any visual content."
+    ),
+    input_schema=SEND_IMAGE_SCHEMA,
+    handler=send_image_handler,
+)
+
+
 NOTIFICATION_SPECS = [
     NOTIFY_SPEC,
     ASK_USER_SPEC,
@@ -649,4 +715,5 @@ NOTIFICATION_SPECS = [
     SEND_STICKER_SPEC,
     SEND_FILE_SPEC,
     SEND_CHANNEL_MESSAGE_SPEC,
+    SEND_IMAGE_SPEC,
 ]
