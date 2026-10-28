@@ -156,6 +156,8 @@ telegram:
   # BotFather has topics on for the bot. The chat itself keeps working as before.
   # topics:
   #   enabled: true
+  #   new_session_creates_topic: true   # /new in the chat opens a topic for it
+  #   auto_rename: true                 # name "New session" topics after the session
   #
   # Feed the source inbox from watched group chats, reaching it as the source
   # "telegram:observed". This grant is independent of allowed_users: a sender

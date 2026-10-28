@@ -1656,6 +1656,11 @@ class TelegramTopicsConfig:
     """
 
     enabled: bool = True
+    # /new and the /sessions "New session" button, used in the chat itself,
+    # open a new topic for the new session when the chat has topics.
+    new_session_creates_topic: bool = True
+    # Name a topic the bot opened after its session's generated title.
+    auto_rename: bool = True
 
     @classmethod
     @_coerced
@@ -1664,7 +1669,11 @@ class TelegramTopicsConfig:
             return cls(enabled=d)
         if not isinstance(d, dict):
             return cls()
-        return cls(enabled=d.get("enabled", True))
+        return cls(
+            enabled=d.get("enabled", True),
+            new_session_creates_topic=d.get("new_session_creates_topic", True),
+            auto_rename=d.get("auto_rename", True),
+        )
 
 
 @dataclass

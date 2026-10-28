@@ -1354,6 +1354,8 @@ carry text. A `.png` or `.ico` has to be committed by a human.
 | `telegram.stream_mode` | string | `partial` | `partial` (edit msgs) or `full` |
 | `telegram.reply_routes_to_origin_session` | bool | `true` | A reply routes to the session that produced the replied-to message (and makes it active); a reply that cannot be tied to a live session is refused with a hint. `/new <message>` is the escape hatch: it starts a fresh session with that message, reply or not. `false` restores the old behaviour: a reply is context-only and lands in the active session. The message→session map is stored in the database (`channel_reply_routes`, kept 90 days) whether the flag is on or off, so it survives a restart and turning the flag back on covers earlier messages. Either way, a reply to a pending `ask_user` card answers the question, like `/reply` |
 | `telegram.topics.enabled` | bool | `true` | One forum topic is one session (see [Topics](#topics)). `false` treats every topic message as a message to the chat, as before |
+| `telegram.topics.new_session_creates_topic` | bool | `true` | `/new` and the `/sessions` ➕ button, used in the chat itself, open the new session in a new topic when the chat has topics |
+| `telegram.topics.auto_rename` | bool | `true` | Rename a topic the bot opened as "New session" after its session's generated title |
 
 ### Topics
 
@@ -1368,12 +1370,17 @@ Telegram decides where topics exist, so that is where you turn them on:
 - **Group:** a forum supergroup (group settings → Topics). The bot needs to
   see the messages: make it an admin, or disable privacy mode with BotFather.
 - **Private chat:** turn on topics for the bot in its BotFather settings
-  (Telegram added topics in private chats in Bot API 9.3).
+  (Telegram added topics in private chats in Bot API 9.3, and topics that a
+  bot creates there in 9.4). Restart Nerve after changing it: the bot reads
+  the setting once, at start, to know it may open topics in private chats.
+
+For the bot to open, rename and follow topics in a group, make it an admin
+with the *Manage Topics* right.
 
 A topic stays bound to its session. It does not roll over to a fresh session
 after a quiet spell, because a topic that silently forgot its conversation
-would defeat the point. Inside a topic, `/new [title]` starts a new session
-for that topic only, `/session <id>` and the `/sessions` buttons bind the topic
+would defeat the point. Inside a topic, `/new [message]` starts a new session
+for that topic only (text after `/new` is its first message), `/session <id>` and the `/sessions` buttons bind the topic
 to another session, and `/stop` and `/star` act on the topic's session. Other
 topics and the chat itself are unaffected. If the topic's session is archived,
 the next message in the topic starts a new one.
@@ -1381,6 +1388,29 @@ the next message in the topic starts a new one.
 `telegram.reply_routes_to_origin_session` applies to the chat itself, not to
 topics: in a topic, a reply goes to the topic's session like any other
 message there. Replies to a pending `ask_user` card still answer it.
+
+New sessions get topics of their own. In the chat itself (not inside a
+topic), `/new [message]` and the `/sessions` ➕ button open a new topic with a
+new session, and the chat's current session keeps running. Text after `/new`
+is the new session's first message, sent in the new topic. The topic is
+called "New session" until the session's generated title replaces it. If Telegram refuses the topic (the group is not a forum, or the bot lacks
+*Manage Topics*), the new session starts in the chat as before, and the reply
+says why.
+
+Topics people make follow the same rules. Creating a topic gives it a session
+at once, titled with the topic's name; renaming the topic retitles the
+session, and closing it stops the session. Only a session without a title
+gets a generated one, so a topic someone named keeps its name.
+
+In the chat itself, `/sessions` also offers **↗ Topic** next to each session.
+It opens the session in a new topic named after it, or brings up the topic it
+already has. If the chat was on that session, it moves to the topic, and the
+chat's next message starts a new session. Telegram cannot move messages into
+a topic, so the topic starts with the session's catch-up card: the last
+messages, and a **📄 Send transcript** button that sends the whole conversation
+as one Markdown file. The agent in the topic has the session's full history.
+Nothing changes on upgrade: existing sessions get a topic only when you open
+one this way.
 
 Telegram does not say which topic a reaction's message is in, so Nerve looks
 the message up in its recent-message cache (the last 200 messages). A reaction

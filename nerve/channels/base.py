@@ -289,3 +289,15 @@ class BaseChannel(abc.ABC):
         Only called if channel declares SEND_FILES capability.
         """
         return False
+
+    # ------------------------------------------------------------------ #
+    #  Optional: session titles                                             #
+    # ------------------------------------------------------------------ #
+
+    async def on_session_titled(self, session_id: str, title: str) -> None:
+        """A session got its generated title.
+
+        For a channel that names something after the session, such as a
+        Telegram topic. The default does nothing.
+        """
+        return None

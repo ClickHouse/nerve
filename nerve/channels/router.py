@@ -626,6 +626,36 @@ class ChannelRouter:
             limit=limit, offset=offset, current_id=current_id,
         )
 
+    async def channel_keys_for_session(self, session_id: str) -> list[str]:
+        """The channel keys routed to a session, most recently used first."""
+        return await self.engine.db.get_channel_keys_for_session(session_id)
+
+    async def forget_channel(self, channel_key: str) -> None:
+        """Unmap a channel key, so its next message starts a new session."""
+        await self.engine.db.delete_channel_session(channel_key)
+
+    async def set_session_title(self, session_id: str, title: str) -> None:
+        """Retitle a session from a channel, e.g. after a Telegram topic rename."""
+        await self.engine.db.update_session_title(
+            session_id, title, attribution=UNATTRIBUTED, reason="channel",
+        )
+        await broadcaster.broadcast(session_id, {
+            "type": "session_updated",
+            "session_id": session_id,
+            "title": title,
+        })
+
+    async def session_titled(self, session_id: str, title: str) -> None:
+        """Tell every channel that a session got its generated title."""
+        for channel in list(self._channels.values()):
+            try:
+                await channel.on_session_titled(session_id, title)
+            except Exception as exc:
+                logger.warning(
+                    "%s could not act on the title of session %s: %s",
+                    channel.name, session_id, exc,
+                )
+
     async def list_conversation_sessions(
         self, channel_key: str, limit: int = 20,
     ) -> list[dict[str, Any]]:

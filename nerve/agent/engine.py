@@ -5751,6 +5751,11 @@ class AgentEngine:
                     "Generated title for session %s: %s",
                     session_id, title,
                 )
+                # Channels that name things after the session (a Telegram
+                # topic) hear it here; the broadcast reaches listeners of
+                # this session only.
+                if self._router is not None:
+                    await self._router.session_titled(session_id, title)
         except Exception as e:
             logger.warning("Failed to generate session title: %s", e)
 

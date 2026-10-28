@@ -830,6 +830,21 @@ class SessionStore:
             (channel_key, session_id, now),
         )
 
+    async def get_channel_keys_for_session(self, session_id: str) -> list[str]:
+        """The channel keys mapped to a session, most recently used first."""
+        async with self.db.execute(
+            "SELECT channel_key FROM channel_sessions WHERE session_id = ? "
+            "ORDER BY updated_at DESC",
+            (session_id,),
+        ) as cursor:
+            return [row[0] async for row in cursor]
+
+    async def delete_channel_session(self, channel_key: str) -> None:
+        """Remove one channel-to-session mapping. The session itself stays."""
+        await self._write(
+            "DELETE FROM channel_sessions WHERE channel_key = ?", (channel_key,),
+        )
+
     # --- Session cleanup queries (V3) ---
 
     async def get_sessions_by_status(self, statuses: list[str]) -> list[dict]:

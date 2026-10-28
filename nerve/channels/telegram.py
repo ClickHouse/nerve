@@ -72,6 +72,13 @@ _SEND_RETRY_MAX_WAIT = 30.0
 # A forum's General topic. Telegram refuses it as a message_thread_id, and
 # Nerve treats it as the chat itself.
 GENERAL_TOPIC_ID = 1
+# The name of a topic that /new opens without a title, until the session's
+# generated title replaces it
+NEW_TOPIC_NAME = "New session"
+# Telegram's limit for a topic name
+_TOPIC_NAME_MAX = 128
+# Messages in a "Send transcript" document, newest kept when a session has more
+_TRANSCRIPT_MAX_MESSAGES = 10_000
 # Watchdog: check every 30s, log heartbeat every ~5 min
 WATCHDOG_INTERVAL = 30
 WATCHDOG_HEARTBEAT_EVERY = 10
@@ -116,6 +123,14 @@ def parse_target(target: str) -> tuple[int, int | None]:
     return int(chat), (int(thread) if sep else None)
 
 
+def _topic_name(text: str | None) -> str:
+    """A topic name Telegram accepts: one line of 1 to 128 characters."""
+    name = " ".join(str(text or "").split())
+    if len(name) > _TOPIC_NAME_MAX:
+        name = name[:_TOPIC_NAME_MAX - 1].rstrip() + "…"
+    return name or NEW_TOPIC_NAME
+
+
 def _in_thread(thread_id: int | None) -> dict[str, int]:
     """The ``message_thread_id`` keyword for a topic, and none for the chat itself."""
     return {"message_thread_id": thread_id} if thread_id is not None else {}
@@ -141,6 +156,17 @@ class _Address:
     @property
     def channel_key(self) -> str:
         return f"telegram:{self.target}"
+
+
+def _address_of_key(channel_key: str) -> _Address | None:
+    """The address behind a ``telegram:<target>`` channel key, else ``None``."""
+    prefix, _, target = channel_key.partition(":")
+    if prefix != "telegram" or not target:
+        return None
+    try:
+        return _Address(*parse_target(target))
+    except ValueError:
+        return None
 
 
 def _md_to_tg_html(text: str) -> str:
@@ -351,8 +377,13 @@ def build_sessions_view(
     offset: int = 0,
     has_prev: bool = False,
     has_next: bool = False,
+    topic_buttons: bool = False,
 ) -> "tuple[str, InlineKeyboardMarkup]":
     """Render the /sessions inline keyboard (pure, sync — unit-testable).
+
+    With ``topic_buttons`` (the list was asked for in a chat with topics,
+    outside any topic) each row also offers ``↗ Topic`` (``sesstopic:<id>``),
+    which opens that session in a topic of its own.
 
     One tap-to-switch button per session (the current one marked ✓), with the
     session id carried in ``callback_data`` as ``sess:<id>`` — so switching
@@ -371,9 +402,11 @@ def build_sessions_view(
         # ids are short, but guard defensively so a button always round-trips.
         if sid is None or len(cb.encode("utf-8")) > 64:
             continue
-        rows.append(
-            [InlineKeyboardButton(_session_label(s, current_id), callback_data=cb)]
-        )
+        row = [InlineKeyboardButton(_session_label(s, current_id), callback_data=cb)]
+        topic_cb = f"sesstopic:{sid}"
+        if topic_buttons and len(topic_cb.encode("utf-8")) <= 64:
+            row.append(InlineKeyboardButton("↗ Topic", callback_data=topic_cb))
+        rows.append(row)
     shown = len(rows)
 
     # Pager row — only the arrows that lead somewhere, so no tap is a dead end.
@@ -416,6 +449,8 @@ def build_sessions_view(
         if offset or has_next:
             text += f"\nPage {offset // _SESSIONS_PAGE_SIZE + 1}"
         text += "\n➕ New session keeps the current one running."
+        if topic_buttons:
+            text += "\n↗ Topic opens a session in a topic of its own."
         text += "\n⭐ = kept alive (never auto-closed); /star or /unstar the current session."
     elif has_prev:
         text = "No more sessions — tap ⬅️ Prev to go back."
@@ -595,6 +630,33 @@ _PLAN_STATUS_EMOJI = {
     "superseded": "🗂",
     "failed": "⚠️",
 }
+
+
+def build_session_transcript(
+    session: dict, messages: list[dict], tzname: str | None,
+) -> str:
+    """The session's conversation as one Markdown document (oldest first).
+
+    Telegram cannot move messages into a topic, so a session opened in a new
+    topic offers this instead of replaying its history message by message.
+    """
+    tz = _safe_zone(tzname)
+    sid = session.get("id") or ""
+    lines = [f"# {session.get('title') or sid}", "", f"Session `{sid}`", ""]
+    for m in messages:
+        who = {"user": "You", "assistant": "Assistant"}.get(m.get("role") or "")
+        content = (m.get("content") or "").strip()
+        if not who or not content:
+            continue
+        day, hm = _fmt_local(m.get("created_at") or "", tz)
+        lines += [f"## {who} · {day} {hm}", "", content, ""]
+    return "\n".join(lines)
+
+
+def _transcript_filename(session: dict) -> str:
+    """``<title>.md``, safe on any file system; the id when there is no title."""
+    stem = re.sub(r"[^\w.-]+", "-", session.get("title") or "").strip("-.")
+    return f"{stem[:60] or session.get('id') or 'session'}.md"
 
 
 def _tg_len(text: str) -> int:
@@ -962,6 +1024,12 @@ class TelegramChannel(BaseChannel):
             "reply", self._source_routed_command(self._handle_reply),
         ))
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+        app.add_handler(MessageHandler(
+            filters.StatusUpdate.FORUM_TOPIC_CREATED
+            | filters.StatusUpdate.FORUM_TOPIC_EDITED
+            | filters.StatusUpdate.FORUM_TOPIC_CLOSED,
+            self._handle_topic_service,
+        ))
         app.add_handler(MessageHandler(
             filters.TEXT | filters.PHOTO | filters.COMMAND | filters.Sticker.ALL | filters.Document.ALL,
             self._handle_message,
@@ -1602,24 +1670,242 @@ class TelegramChannel(BaseChannel):
             return False
         return capable and self._topics_enabled()
 
-    async def _session_for(self, address: _Address) -> str | None:
+    async def _session_for(
+        self, address: _Address, message: Any = None,
+    ) -> str | None:
         """The session a topic is bound to, binding a new one on first use.
 
         ``None`` for the chat itself: the router picks that session as it
         always has, idle rollover included. A topic never rolls over. It
         stays bound until ``/new``, ``/session`` or ``/sessions`` rebinds it,
-        or its session is archived.
+        or its session is archived. A new session takes the topic's name when
+        *message* shows it.
         """
         if address.thread_id is None:
             return None
-        key = address.channel_key
+        return await self._bind_topic(address, title=self._topic_title_of(message))
+
+    async def _bind_topic(self, topic: _Address, title: str | None = None) -> str:
+        """The session bound to *topic*, or a new one titled *title*, bound now."""
+        key = topic.channel_key
         lock = self._topic_locks.setdefault(key, asyncio.Lock())
         async with lock:
             session_id = await self.router.get_last_session(key)
             if session_id is None:
-                session_id = await self.router.create_session(key, source="telegram")
+                session_id = await self.router.create_session(
+                    key, title=title, source="telegram",
+                )
                 logger.info("Telegram topic %s bound to new session %s", key, session_id)
             return session_id
+
+    def _bot_id(self) -> int | None:
+        try:
+            return self._app.bot.id
+        except Exception:  # noqa: BLE001 — no application, or getMe not run yet
+            return None
+
+    def _topic_title_of(self, message: Any) -> str | None:
+        """The name a person gave the topic *message* is in, if Telegram shows it.
+
+        Every message in a topic carries the topic's creation message as its
+        ``reply_to_message``. A topic the bot opened is skipped: its name is a
+        placeholder or the session's own title already.
+        """
+        root = getattr(message, "reply_to_message", None)
+        created = getattr(root, "forum_topic_created", None)
+        if created is None:
+            return None
+        author = getattr(root, "from_user", None)
+        if author is not None and author.id == self._bot_id():
+            return None
+        return getattr(created, "name", None) or None
+
+    def _creates_topics(self, chat: Any) -> bool:
+        """Whether a new session started in *chat* gets a topic of its own."""
+        return (
+            self.config.telegram.topics.new_session_creates_topic
+            and self._chat_may_have_topics(chat)
+        )
+
+    async def _open_topic(self, chat_id: int, name: str | None) -> tuple[int | None, str]:
+        """Create a topic; ``(thread_id, "")``, or ``(None, why Telegram refused)``."""
+        try:
+            topic = await self._app.bot.create_forum_topic(
+                chat_id=chat_id, name=_topic_name(name),
+            )
+        except Exception as exc:
+            logger.info("Telegram refused a topic in chat %s: %s", chat_id, exc)
+            return None, str(exc) or type(exc).__name__
+        return topic.message_thread_id, ""
+
+    async def _start_in_new_topic(
+        self, chat_id: int, title: str | None,
+    ) -> tuple[_Address | None, str | None, str]:
+        """Open a topic for a new session: ``(topic, session_id, "")``, or
+        ``(None, None, why not)``.
+
+        The chat's own session is left alone: the new session lives in the topic.
+        """
+        thread_id, error = await self._open_topic(chat_id, title)
+        if thread_id is None:
+            return None, None, error
+        topic = _Address(chat_id, thread_id)
+        session_id = await self._bind_topic(topic, title=title)
+        welcome = f"New session: {session_id}" + (f" — {title}" if title else "")
+        try:
+            await self._app.bot.send_message(
+                chat_id=chat_id, text=welcome, message_thread_id=thread_id,
+            )
+        except Exception as exc:  # the topic and its session exist either way
+            logger.info("Could not greet %s: %s", topic.channel_key, exc)
+        return topic, session_id, ""
+
+    async def _post_session_card(self, topic: _Address, session: dict) -> bool:
+        """Post the session's catch-up card into *topic*; False if Telegram refuses.
+
+        Telegram cannot move history into a topic, so the card shows the last
+        messages and offers the whole conversation as a document.
+        """
+        sid = session["id"]
+        messages = await self.router.get_session_messages(sid, limit=_TAIL_WINDOW)
+        total = await self.router.count_session_messages(sid)
+        text, markup = build_session_tail_view(
+            session, messages, total, _TAIL_WINDOW, self.config.timezone,
+        )
+        rows = [list(row) for row in markup.inline_keyboard]
+        if total:
+            rows.append([InlineKeyboardButton(
+                "📄 Send transcript", callback_data=f"sesstx:{sid}",
+            )])
+        try:
+            await self._app.bot.send_message(
+                chat_id=topic.chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(rows),
+                **_in_thread(topic.thread_id),
+            )
+        except Exception as exc:
+            logger.info("Could not post into %s: %s", topic.channel_key, exc)
+            return False
+        return True
+
+    async def _open_in_topic(self, query: Any, session_id: str) -> None:
+        """The ``↗ Topic`` button: show a session in a topic of its own.
+
+        A session already open in a topic of this chat is brought up there. A
+        session the chat itself was on moves to the topic, and the chat's next
+        message starts a new session, so one session never has two windows
+        in the same chat.
+        """
+        chat_id = query.message.chat.id
+        session = await self.router.get_session(session_id)
+        if not session or session.get("status") == "archived":
+            await query.answer("That session is no longer available", show_alert=True)
+            return
+        for key in await self.router.channel_keys_for_session(session_id):
+            topic = _address_of_key(key)
+            if topic is None or topic.chat_id != chat_id or topic.thread_id is None:
+                continue
+            if await self._post_session_card(topic, session):
+                await query.answer("It is open in a topic already. Posted it there.")
+                return
+            await self.router.forget_channel(key)  # the topic is gone
+        thread_id, error = await self._open_topic(
+            chat_id, session.get("title") or f"Session {session_id}",
+        )
+        if thread_id is None:
+            await query.answer(
+                _fit_text(f"Couldn't open a topic: {error}", _TOAST_MAX_LEN),
+                show_alert=True,
+            )
+            return
+        topic = _Address(chat_id, thread_id)
+        await self.router.switch_session(topic.channel_key, session_id)
+        root_key = _Address(chat_id).channel_key
+        if await self.router.get_last_session(root_key) == session_id:
+            await self.router.forget_channel(root_key)
+        await query.answer("Opened in a new topic")
+        await self._post_session_card(topic, session)
+
+    async def _send_transcript(self, query: Any, session_id: str) -> None:
+        """The ``📄 Send transcript`` button: the whole conversation as a ``.md`` file."""
+        session = await self.router.get_session(session_id)
+        if not session:
+            await query.answer("That session is no longer available", show_alert=True)
+            return
+        messages = await self.router.get_session_messages(
+            session_id, limit=_TRANSCRIPT_MAX_MESSAGES,
+        )
+        document = build_session_transcript(session, messages, self.config.timezone)
+        address = self._address_of(query.message.chat.id, query.message)
+        await query.answer("Sending the transcript")
+        try:
+            await self._app.bot.send_document(
+                chat_id=address.chat_id,
+                document=document.encode("utf-8"),
+                filename=_transcript_filename(session),
+                **_in_thread(address.thread_id),
+            )
+        except Exception as exc:
+            logger.warning("Could not send the transcript of %s: %s", session_id, exc)
+
+    async def _handle_topic_service(self, update: Update, context: Any) -> None:
+        """Keep sessions in step with the topics people create, rename and close.
+
+        Created: the topic gets a session at once, titled with the topic's
+        name. Renamed: the session takes the new name. Closed: the session is
+        stopped. A change the bot made itself is skipped, because the code
+        that made it has done the binding already.
+        """
+        self._touch()
+        message, chat, user = update.message, update.effective_chat, update.effective_user
+        if message is None or chat is None or user is None:
+            return
+        if user.id == self._bot_id() or not self._is_authorized(user.id):
+            return
+        if self._is_delivery_only_sink(chat) or not self._topics_enabled():
+            return
+        thread_id = message.message_thread_id
+        if type(thread_id) is not int or thread_id == GENERAL_TOPIC_ID:
+            return
+        topic = _Address(chat.id, thread_id)
+        if message.forum_topic_created is not None:
+            await self._bind_topic(topic, title=message.forum_topic_created.name or None)
+            return
+        session_id = await self.router.get_last_session(topic.channel_key)
+        if session_id is None:
+            return
+        if message.forum_topic_edited is not None:
+            if message.forum_topic_edited.name:
+                await self.router.set_session_title(
+                    session_id, message.forum_topic_edited.name,
+                )
+        elif message.forum_topic_closed is not None:
+            await self.router.stop_session(session_id)
+
+    async def on_session_titled(self, session_id: str, title: str) -> None:
+        """Name the session's topics after its generated title.
+
+        A session gets a generated title only when it had none, and every
+        topic a person named gave its session that name, so this renames
+        topics the bot opened as "New session" and leaves names people chose.
+        """
+        topics = self.config.telegram.topics
+        if self._app is None or not topics.enabled or not topics.auto_rename:
+            return
+        for key in await self.router.channel_keys_for_session(session_id):
+            topic = _address_of_key(key)
+            if topic is None or topic.thread_id is None:
+                continue
+            try:
+                await self._app.bot.edit_forum_topic(
+                    chat_id=topic.chat_id,
+                    message_thread_id=topic.thread_id,
+                    name=_topic_name(title),
+                )
+            except Exception as exc:
+                logger.info("Could not rename topic %s: %s", key, exc)
 
     # ------------------------------------------------------------------ #
     #  Auth                                                                #
@@ -1833,7 +2119,7 @@ class TelegramChannel(BaseChannel):
             # Show current session. A topic shows the session it is bound to
             # (binding one if it has none); the chat applies the idle rollover.
             current = (
-                await self._session_for(address)
+                await self._session_for(address, update.message)
                 or await self.router.get_active_session(channel_key, source="telegram")
             )
             await update.message.reply_text(
@@ -1851,7 +2137,7 @@ class TelegramChannel(BaseChannel):
             await update.message.reply_text(str(e))
 
     async def _sessions_view_for(
-        self, channel_key: str, offset: int = 0,
+        self, channel_key: str, offset: int = 0, *, chat: Any = None,
     ) -> "tuple[str, InlineKeyboardMarkup]":
         """Build the inline-keyboard sessions view for a channel.
 
@@ -1861,7 +2147,8 @@ class TelegramChannel(BaseChannel):
         store pins the current session first with starred (kept-alive) ones
         ahead of the rest, so an idle starred session is never buried. Filtering
         and ordering happen in SQL; we fetch one extra row to learn whether a
-        further page exists.
+        further page exists. Asked for in a *chat* with topics, outside any
+        topic, each session can also be opened in a topic of its own.
         """
         offset = max(0, offset)
         current = await self.router.get_last_session(channel_key)
@@ -1869,9 +2156,17 @@ class TelegramChannel(BaseChannel):
             limit=_SESSIONS_PAGE_SIZE + 1, offset=offset, current_id=current,
         )
         has_next = len(page) > _SESSIONS_PAGE_SIZE
+        address = _address_of_key(channel_key)
+        topic_buttons = (
+            chat is not None
+            and address is not None
+            and address.thread_id is None
+            and self._chat_may_have_topics(chat)
+        )
         return build_sessions_view(
             page[:_SESSIONS_PAGE_SIZE], current,
             offset=offset, has_prev=offset > 0, has_next=has_next,
+            topic_buttons=topic_buttons,
         )
 
     async def _handle_sessions(self, update: Update, context: Any) -> None:
@@ -1884,7 +2179,9 @@ class TelegramChannel(BaseChannel):
         if not self._is_authorized(update.effective_user.id):
             return
         channel_key = self._address(update).channel_key
-        text, markup = await self._sessions_view_for(channel_key)
+        text, markup = await self._sessions_view_for(
+            channel_key, chat=update.effective_chat,
+        )
         await update.message.reply_text(text, reply_markup=markup)
 
     # ------------------------------------------------------------------ #
@@ -2201,12 +2498,37 @@ class TelegramChannel(BaseChannel):
         answer a message without continuing the session it came from.
 
         Inside a topic this rebinds that topic only; the chat and every other
-        topic keep their sessions.
+        topic keep their sessions. In the chat itself, when it has topics, the
+        new session opens in a new topic instead, and the chat's session is
+        left running.
         """
         self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
-        channel_key = self._address(update).channel_key
+        address = self._address(update)
+        channel_key = address.channel_key
+        # Taken from the raw text rather than ``context.args``, which is
+        # whitespace-split and would flatten a multi-line message. No title:
+        # the engine names the session from its first exchange.
+        parts = (update.message.text or "").split(maxsplit=1)
+        first_message = parts[1] if len(parts) > 1 else ""
+
+        if address.thread_id is None and self._creates_topics(update.effective_chat):
+            topic, session_id, error = await self._start_in_new_topic(address.chat_id, None)
+            if topic is not None and session_id:
+                await update.message.reply_text(
+                    f"New session `{session_id}` is in the topic "
+                    f"“{_topic_name(None)}”.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                if first_message:
+                    await self._deliver_message(
+                        update, first_message, session_id=session_id, address=topic,
+                    )
+                return
+            await update.message.reply_text(
+                f"Couldn't open a topic ({error}), so the new session is here."
+            )
 
         # Stop the current session before creating a new one
         prev = await self.router.get_last_session(channel_key)
@@ -2218,11 +2540,6 @@ class TelegramChannel(BaseChannel):
                     parse_mode=ParseMode.MARKDOWN,
                 )
 
-        # Taken from the raw text rather than ``context.args``, which is
-        # whitespace-split and would flatten a multi-line message. No title:
-        # the engine names the session from its first exchange.
-        parts = (update.message.text or "").split(maxsplit=1)
-        first_message = parts[1] if len(parts) > 1 else ""
         session_id = await self.router.create_session(channel_key, source="telegram")
         await update.message.reply_text(
             f"New session: `{session_id}`", parse_mode=ParseMode.MARKDOWN,
@@ -2692,6 +3009,7 @@ class TelegramChannel(BaseChannel):
 
     async def _deliver_message(
         self, update: Update, text: str, *, session_id: str | None = None,
+        address: _Address | None = None,
     ) -> None:
         """Turn one inbound message into an agent turn.
 
@@ -2701,9 +3019,11 @@ class TelegramChannel(BaseChannel):
         passes the session it just created, so the message gets there even as
         a reply — no routing lookup, no rejection. Otherwise a reply routes to
         the session that produced the replied-to message when routing is on,
-        and anything else lands in the chat's active session.
+        and anything else lands in the chat's active session. ``address``
+        overrides where the message is taken to come from: ``/new <text>`` in a
+        chat with topics passes the topic it just opened.
         """
-        address = self._address(update)
+        address = address or self._address(update)
         chat_id = address.chat_id
 
         # Cache for reaction lookups (raw text, before reply-context prefix)
@@ -2778,7 +3098,7 @@ class TelegramChannel(BaseChannel):
         if target_session is None and address.thread_id is not None:
             # A topic is bound to one session: every message in it, a reply
             # included, goes there (see _session_for).
-            target_session = await self._session_for(address)
+            target_session = await self._session_for(address, update.message)
         elif target_session is None and self._reply_routing_enabled():
             # Route a reply to the session that produced the replied-to message
             # (and make it active). An unresolvable reply is rejected with a
@@ -3013,7 +3333,7 @@ class TelegramChannel(BaseChannel):
         if address.thread_id is not None:
             # A topic is bound to one session: every message in it, a reply
             # included, goes there (see _session_for).
-            target_session = await self._session_for(address)
+            target_session = await self._session_for(address, updates[0].message)
         elif self._reply_routing_enabled():
             # Route a reply to the session that produced the replied-to message
             # (and make it active). An unresolvable reply is rejected with a
@@ -3106,7 +3426,9 @@ class TelegramChannel(BaseChannel):
             channel_key = self._address_of(
                 query.message.chat.id, query.message,
             ).channel_key
-            text, markup = await self._sessions_view_for(channel_key)
+            text, markup = await self._sessions_view_for(
+                channel_key, chat=query.message.chat,
+            )
             await self._safe_edit(query, text, markup)
             return
         messages = await self.router.get_session_messages(session_id, limit=window)
@@ -3122,9 +3444,12 @@ class TelegramChannel(BaseChannel):
         callback_data forms:
           ``sess:list``           — (re)show the session switch list (first page)
           ``sess:page:<offset>``  — show the switch list at a pagination offset
-          ``sess:new``            — create a fresh session (current keeps running)
+          ``sess:new``            — create a fresh session (current keeps running);
+                                    in a chat with topics, in a new topic
           ``sess:<id>``           — switch routing to <id>, then show its history
           ``sesstail:<id>:<win>`` — widen the catch-up window (informational only)
+          ``sesstopic:<id>``      — open <id> in a topic of its own
+          ``sesstx:<id>``         — send <id>'s whole conversation as a document
 
         After a switch/create the card is replaced by that session's recent
         history (native order, oldest→newest) so the user can catch up — which
@@ -3136,14 +3461,22 @@ class TelegramChannel(BaseChannel):
             return
         # The card sits in the topic it was asked for in, so a tap there
         # switches that topic only.
-        channel_key = self._address_of(
-            query.message.chat.id, query.message,
-        ).channel_key
+        chat = query.message.chat
+        address = self._address_of(chat.id, query.message)
+        channel_key = address.channel_key
         data = query.data
+
+        if data.startswith("sesstopic:"):
+            await self._open_in_topic(query, data.split(":", 1)[1])
+            return
+
+        if data.startswith("sesstx:"):
+            await self._send_transcript(query, data.split(":", 1)[1])
+            return
 
         if data == "sess:list":
             await query.answer()
-            text, markup = await self._sessions_view_for(channel_key)
+            text, markup = await self._sessions_view_for(channel_key, chat=chat)
             await self._safe_edit(query, text, markup)
             return
 
@@ -3153,9 +3486,23 @@ class TelegramChannel(BaseChannel):
             except (IndexError, ValueError):
                 page_offset = 0
             await query.answer()
-            text, markup = await self._sessions_view_for(channel_key, page_offset)
+            text, markup = await self._sessions_view_for(
+                channel_key, page_offset, chat=chat,
+            )
             await self._safe_edit(query, text, markup)
             return
+
+        topic_error = ""
+        if (
+            data == "sess:new"
+            and address.thread_id is None
+            and self._creates_topics(chat)
+        ):
+            _, session_id, topic_error = await self._start_in_new_topic(chat.id, None)
+            if session_id:
+                await query.answer("Started a new session in a new topic")
+                return
+            # Telegram refused the topic: start the session here instead.
 
         if data.startswith("sesstail:"):
             parts = data.split(":")
@@ -3176,7 +3523,13 @@ class TelegramChannel(BaseChannel):
                 sid = await self.router.create_session(
                     channel_key, source="telegram",
                 )
-                await query.answer("Started a new session")
+                if topic_error:
+                    await query.answer(_fit_text(
+                        f"Couldn't open a topic ({topic_error}), "
+                        "so the new session is here.", _TOAST_MAX_LEN,
+                    ), show_alert=True)
+                else:
+                    await query.answer("Started a new session")
             else:
                 await self.router.switch_session(channel_key, target)
                 await query.answer("Switched")
@@ -3184,7 +3537,7 @@ class TelegramChannel(BaseChannel):
             await query.answer(
                 "That session is no longer available", show_alert=True,
             )
-            text, markup = await self._sessions_view_for(channel_key)
+            text, markup = await self._sessions_view_for(channel_key, chat=chat)
             await self._safe_edit(query, text, markup)
             return
         await self._edit_session_tail(query, sid, _TAIL_WINDOW)
@@ -3201,10 +3554,7 @@ class TelegramChannel(BaseChannel):
             return
 
         # /sessions inline keyboard: switch/create/list + history buttons.
-        if (
-            query.data.startswith("sess:")
-            or query.data.startswith("sesstail:")
-        ):
+        if query.data.startswith(("sess:", "sesstail:", "sesstopic:", "sesstx:")):
             await self._handle_session_button(query)
             return
 
