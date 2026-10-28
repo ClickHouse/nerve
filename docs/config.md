@@ -24,7 +24,7 @@ and migration splits a legacy `config.yaml` on the same table:
 | Layer | Gets |
 |-------|------|
 | `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `gateway.public_url`, `proxy`, `docker`, `telegram.enabled`, `slack.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `mcp_apps`, `workflows.runs_dir` |
-| `settings.yaml` | `timezone`, `gateway.host`/`port`/`loop`, `provider.type`/`aws_region` (incl. the region-scoped Bedrock model IDs), `agent.*`, `memory.*`, `sessions.*`, `sync.*`, the rest of `workflows.*` (the budget caps and cadence), `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode` |
+| `settings.yaml` | `timezone`, `gateway.host`/`port`/`loop`, `provider.type`/`aws_region` (incl. the region-scoped Bedrock model IDs), `agent.*`, `memory.*`, `sessions.*`, `sync.*`, the rest of `workflows.*` (the budget caps and cadence), `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode`/`topics.*` |
 
 The test is whether the value would be wrong on another machine: filesystem
 paths, credential handles, whose mailboxes this person syncs, which agent
@@ -256,7 +256,7 @@ A reload is always explicit. Two things cause one:
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
-| `telegram.dm_policy`, `.stream_mode`, `.reply_routes_to_origin_session` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; toggling `reply_routes_to_origin_session` takes effect on the next message, and applies to replies to earlier messages too (routes are recorded while it is off); `allowed_users` does not follow it (see the restart table) |
+| `telegram.dm_policy`, `.stream_mode`, `.reply_routes_to_origin_session`, `.topics.*` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; toggling `reply_routes_to_origin_session` takes effect on the next message, and applies to replies to earlier messages too (routes are recorded while it is off); `allowed_users` does not follow it (see the restart table) |
 | `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source and the events of the other hosted providers included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
 | `email.enabled` | ✅ read per event. The reload publishes the subscriptions to the gateway again, which then takes or refuses new mail. When no stream sends them, the reload reports `subscriptions` with a "not sent yet" note, which is not an error: the next stream that connects sends them before Nerve reads from it. The email channel must exist: usable `channels.hosted` settings at startup give it. Without usable settings the reload repeats the startup warning under `email`; with usable settings and no email channel it says that a restart is needed (see [Email](#email)) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
@@ -1353,6 +1353,43 @@ carry text. A `.png` or `.ico` has to be committed by a human.
 | `telegram.allowed_users` | list[int] | `[]` | User IDs allowed to use the bot in private and group chats |
 | `telegram.stream_mode` | string | `partial` | `partial` (edit msgs) or `full` |
 | `telegram.reply_routes_to_origin_session` | bool | `true` | A reply routes to the session that produced the replied-to message (and makes it active); a reply that cannot be tied to a live session is refused with a hint. `/new <message>` is the escape hatch: it starts a fresh session with that message, reply or not. `false` restores the old behaviour: a reply is context-only and lands in the active session. The message→session map is stored in the database (`channel_reply_routes`, kept 90 days) whether the flag is on or off, so it survives a restart and turning the flag back on covers earlier messages. Either way, a reply to a pending `ask_user` card answers the question, like `/reply` |
+| `telegram.topics.enabled` | bool | `true` | One forum topic is one session (see [Topics](#topics)). `false` treats every topic message as a message to the chat, as before |
+
+### Topics
+
+In a chat with topics, each topic is its own session. A message in a topic
+goes to that topic's session, and the reply, the streamed preview, files,
+stickers and reactions come back to the same topic. The chat itself (for a
+forum, its General topic) keeps working as before: one session at a time,
+with the idle rollover of `sessions.sticky_period_minutes`.
+
+Telegram decides where topics exist, so that is where you turn them on:
+
+- **Group:** a forum supergroup (group settings → Topics). The bot needs to
+  see the messages: make it an admin, or disable privacy mode with BotFather.
+- **Private chat:** turn on topics for the bot in its BotFather settings
+  (Telegram added topics in private chats in Bot API 9.3).
+
+A topic stays bound to its session. It does not roll over to a fresh session
+after a quiet spell, because a topic that silently forgot its conversation
+would defeat the point. Inside a topic, `/new [title]` starts a new session
+for that topic only, `/session <id>` and the `/sessions` buttons bind the topic
+to another session, and `/stop` and `/star` act on the topic's session. Other
+topics and the chat itself are unaffected. If the topic's session is archived,
+the next message in the topic starts a new one.
+
+`telegram.reply_routes_to_origin_session` applies to the chat itself, not to
+topics: in a topic, a reply goes to the topic's session like any other
+message there. Replies to a pending `ask_user` card still answer it.
+
+Telegram does not say which topic a reaction's message is in, so Nerve looks
+the message up in its recent-message cache (the last 200 messages). A reaction
+to a message that is no longer cached, in a chat that has topics, is ignored
+rather than sent to a session that never saw the message.
+
+Streaming edits share one budget per chat, because Telegram rate limits the
+chat rather than the topic. With several topics answering at once, the
+previews update less often, and the final answers are unaffected.
 
 ### Notification sink
 

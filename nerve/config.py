@@ -1646,6 +1646,28 @@ class ChannelSourceConfig:
 
 
 @dataclass
+class TelegramTopicsConfig:
+    """Forum topics as sessions: one topic is one session.
+
+    Telegram sends topic messages only from a forum supergroup, or from a
+    private chat once BotFather has topics on for the bot, so that is where
+    the real opt-in lives. ``enabled`` is the kill switch: off, every topic
+    message is treated as a message to the chat itself, as before.
+    """
+
+    enabled: bool = True
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: Any) -> TelegramTopicsConfig:
+        if isinstance(d, bool):  # `topics: false` switches the block off whole
+            return cls(enabled=d)
+        if not isinstance(d, dict):
+            return cls()
+        return cls(enabled=d.get("enabled", True))
+
+
+@dataclass
 class TelegramConfig:
     enabled: bool = True
     bot_token: str = ""
@@ -1668,6 +1690,8 @@ class TelegramConfig:
     reply_routes_to_origin_session: bool = True
     # Chats whose traffic feeds the inbox — see ChannelSourceConfig.
     source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
+    # Forum topics as sessions — see TelegramTopicsConfig.
+    topics: TelegramTopicsConfig = field(default_factory=TelegramTopicsConfig)
 
     @classmethod
     @_coerced
@@ -1717,6 +1741,7 @@ class TelegramConfig:
             source=ChannelSourceConfig.from_dict(
                 d.get("source", {}), subject="chats",
             ).outside_hosted_mode("chats"),
+            topics=TelegramTopicsConfig.from_dict(d.get("topics", {})),
         )
 
 

@@ -152,6 +152,10 @@ telegram:
   dm_policy: pairing
   # allowed_users: [123456789]   # users allowed to use the bot (or pair instead)
   stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
+  # One forum topic = one session, in forum groups and in private chats where
+  # BotFather has topics on for the bot. The chat itself keeps working as before.
+  # topics:
+  #   enabled: true
   #
   # Feed the source inbox from watched group chats, reaching it as the source
   # "telegram:observed". This grant is independent of allowed_users: a sender
