@@ -192,3 +192,64 @@ async def test_runner_condenses_and_counts_a_repeated_id_once(db, monkeypatch, r
 
     assert result.records_ingested == 1
     assert condensed == [[repeat_content]]
+
+
+@pytest.mark.asyncio
+async def test_a_new_source_s_first_records_are_unread_for_the_existing_consumers(db):
+    # The inbox consumer already reads another source.
+    await db.insert_source_messages([dataclasses.replace(_record("x"), source="other")], source="other")
+    await db.set_consumer_cursor("inbox", "other", await db.get_source_max_rowid("other"))
+    assert not await db.consumer_has_unread("inbox")
+
+    result = await SourceRunner(_FixedSource([_record("a")]), db).run()
+
+    assert result.records_ingested == 1
+    assert await db.consumer_has_unread("inbox")
+    assert await db.peek_consumer_cursor("inbox", SOURCE_NAME) == 0
+    messages = await db.read_source_messages_by_rowid(
+        SOURCE_NAME, after_seq=await db.get_consumer_cursor("inbox", SOURCE_NAME),
+    )
+    assert [m["id"] for m in messages] == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_a_baseline_run_seeds_the_cursor_so_later_records_wake_the_consumer(db):
+    await db.set_consumer_cursor("inbox", "other", 0)
+    source = _FixedSource([], next_cursor="baseline")
+    runner = SourceRunner(source, db)
+
+    await runner.run()
+    assert await db.peek_consumer_cursor("inbox", SOURCE_NAME) == 0
+    assert not await db.consumer_has_unread("inbox")
+
+    source.records, source.next_cursor = [_record("later")], "next"
+    await runner.run()
+    assert await db.consumer_has_unread("inbox")
+
+    from nerve.agent.tools.handlers.sources import poll_all_sources_handler
+    from nerve.agent.tools.registry import ToolContext
+
+    text = (await poll_all_sources_handler(
+        ToolContext(session_id="s", db=db), {"consumer": "inbox"},
+    )).text_content
+    assert "Record later" in text
+    assert f"{SOURCE_NAME}: 1 new" in text
+
+
+@pytest.mark.asyncio
+async def test_seeding_leaves_an_existing_cursor_and_only_runs_without_a_source_cursor(db):
+    await db.insert_source_messages([_record("old")], source=SOURCE_NAME)
+    await db.set_consumer_cursor("inbox", SOURCE_NAME, 0)
+    await db.set_consumer_cursor("other-consumer", "other", 0)
+
+    assert await db.seed_consumer_cursors(SOURCE_NAME) == 1
+    assert await db.peek_consumer_cursor("inbox", SOURCE_NAME) == 0
+    # A consumer new to the source starts past what is already stored.
+    assert await db.peek_consumer_cursor("other-consumer", SOURCE_NAME) == (
+        await db.get_source_max_rowid(SOURCE_NAME)
+    )
+
+    await db.set_sync_cursor(SOURCE_NAME, "stored")
+    await db.set_consumer_cursor("late", "other", 0)
+    await SourceRunner(_FixedSource([]), db).run()
+    assert await db.peek_consumer_cursor("late", SOURCE_NAME) is None

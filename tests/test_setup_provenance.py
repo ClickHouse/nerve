@@ -147,6 +147,7 @@ class TestCredentialSourcesOnAnInstall:
             "sync.telegram.api_hash": "file",
             "github_token": None,
             "sync.gmail.accounts": "environment",
+            "sync.linear.api_key": None,
         }
         for value in (_KEY, _TG, "REPLACE_HASH_VALUE", "alice@example.com"):
             assert value not in str(sources)

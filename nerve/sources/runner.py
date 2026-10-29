@@ -322,6 +322,8 @@ class SourceRunner:
         there.
         """
         cursor = await self.db.get_sync_cursor(self.source.source_name)
+        if cursor is None:
+            await self._seed_consumer_cursors()
         total_ingested = 0
         total_dropped = 0
 
@@ -360,6 +362,31 @@ class SourceRunner:
         return IngestResult(
             records_ingested=total_ingested, records_dropped=total_dropped,
         )
+
+    async def _seed_consumer_cursors(self) -> None:
+        """Before a source's first run, start the existing consumers' cursors on it.
+
+        Before it stores anything, so that its first records are unread for
+        them, and a ``messages`` gate on any source fires for them. Best
+        effort: a failure is logged and the run goes on.
+        """
+        from nerve.cron.gates import _consumer_cursor_ttl_days
+
+        try:
+            seeded = await self.db.seed_consumer_cursors(
+                self.source.source_name, ttl_days=_consumer_cursor_ttl_days(),
+            )
+        except Exception:  # noqa: BLE001 — the run itself must not fail on this
+            logger.warning(
+                "Source %s: could not start the consumers' cursors",
+                self.source.source_name, exc_info=True,
+            )
+            return
+        if seeded:
+            logger.info(
+                "Source %s: first run, started %d consumer cursor(s) on it",
+                self.source.source_name, seeded,
+            )
 
     async def _ingest_batch(self, cursor: str | None) -> _BatchResult:
         """One fetch → preprocess → guardrail → persist → condense → drop hook → advance cycle."""

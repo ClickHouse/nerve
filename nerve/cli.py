@@ -1715,6 +1715,40 @@ def _github_repos_lines(config, warnings: list[str]) -> list[str]:
     return [line]
 
 
+def _linear_lines(config, warnings: list[str]) -> list[str]:
+    """The doctor line of the Linear source (``sync.linear``), and its MCP server.
+
+    No network from a CLI process: the key is not tried, only whether one is
+    set and where it comes from. In external auth mode the platform manages
+    the agent's MCP servers, so the Linear one is not registered there.
+    """
+    linear = config.sync.linear
+    if not linear.enabled:
+        return ["[--] Linear source off (sync.linear.enabled is false)"]
+    if not linear.api_key:
+        warnings.append(
+            "[WARN] Linear source is on but sync.linear.api_key is empty, so it is "
+            "not scheduled — set it in config.local.yaml"
+        )
+        return []
+    if not linear.mcp:
+        mcp = "MCP off"
+    elif linear.mcp_server in config.mcp_servers:
+        mcp = "MCP registered as linear"
+    else:
+        # The built-in one gives way to a user entry of the same name.
+        mcp = "MCP from mcp_servers.linear"
+    if linear.mcp and _external_auth_in_this_shell():
+        warnings.append(
+            "[WARN] Linear MCP server: external auth mode ignores the configured MCP "
+            "servers, so the agent cannot write to Linear through it"
+        )
+    return [
+        f"[OK] Linear source: types {', '.join(linear.types)}; schedule {linear.schedule}; "
+        f"{mcp}{_source_suffix(config, 'sync.linear.api_key')}"
+    ]
+
+
 def _source_suffix(config, path: str) -> str:
     """`` (environment)`` / `` (config-repo)`` after a configured connection
     line when the value did not come from a file on this machine; ``""`` for
@@ -2206,6 +2240,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         lines.append("[--] Slack disabled")
     lines.extend(_hosted_github_lines(config, errors, warnings))
     lines.extend(_github_repos_lines(config, warnings))
+    lines.extend(_linear_lines(config, warnings))
 
     # Check SSL
     if config.gateway.ssl.enabled:

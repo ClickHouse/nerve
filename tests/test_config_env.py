@@ -279,6 +279,7 @@ class TestDefaultTimezone:
 # watch is on, so with the probe's defaults it keeps any entry.)
 _CHECKED_LIST_ENTRIES = {
     ("GitHubReposSyncConfig", "types"): "release",
+    ("LinearSyncConfig", "types"): "comments",
 }
 
 
