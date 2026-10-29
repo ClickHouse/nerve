@@ -71,6 +71,7 @@ CREDENTIAL_PATHS: tuple[str, ...] = (
     "sync.telegram.api_hash",
     "github_token",
     "sync.gmail.accounts",
+    "sync.linear.api_key",
 )
 
 #: Held by the channel gateway when Slack runs in hosted mode.

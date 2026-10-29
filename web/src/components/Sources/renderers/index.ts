@@ -1,8 +1,9 @@
 export { MarkdownRenderer } from './MarkdownRenderer';
 export { EmailRenderer } from './EmailRenderer';
 export { GitHubRenderer } from './GitHubRenderer';
+export { LinearRenderer } from './LinearRenderer';
 
-export type RendererType = 'email' | 'github' | 'default';
+export type RendererType = 'email' | 'github' | 'linear' | 'default';
 
 /**
  * Map a source name to the appropriate renderer type.
@@ -22,6 +23,7 @@ export function getRendererType(source: string): RendererType {
     case 'gmail': return 'email';
     case 'github': return 'github';
     case 'github_repos': return 'github';
+    case 'linear': return 'linear';
     default: return 'default';
   }
 }

@@ -2264,6 +2264,99 @@ class GitHubReposSyncConfig:
         )
 
 
+# What the Linear source can report (see LinearSyncConfig.types), each with
+# the Linear notification types it asks for. Reactions are never asked for.
+LINEAR_TYPES: dict[str, tuple[str, ...]] = {
+    "assigned": ("issueAssignedToYou",),
+    "mentioned": ("issueMention", "issueCommentMention"),
+    "comments": ("issueNewComment",),
+}
+# Linear's hosted MCP server, which the agent writes back through.
+LINEAR_MCP_URL = "https://mcp.linear.app/mcp"
+
+
+def _linear_types(value: object) -> list[str]:
+    """``sync.linear.types``, checked against :data:`LINEAR_TYPES`.
+
+    Unset (missing, null or blank) is all of them. Case does not matter, a
+    type named twice counts once, and they are kept in the order of
+    :data:`LINEAR_TYPES`. An unknown type, or an empty list, refuses to load.
+    """
+    known = tuple(LINEAR_TYPES)
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return list(known)
+    chosen: list[str] = []
+    for entry in value if isinstance(value, (list, tuple)) else [value]:
+        name = str(entry or "").strip().lower()
+        if name not in LINEAR_TYPES:
+            raise ValueError(f"sync.linear.types must be one or more of {known}, got {name!r}")
+        chosen.append(name)
+    if not chosen:
+        raise ValueError(f"sync.linear.types must be one or more of {known}, got none")
+    return [kind for kind in known if kind in chosen]
+
+
+@dataclass
+class LinearSyncConfig:
+    """Config for the Linear source: notifications of the user the key belongs to.
+
+    The agent is a regular Linear user (a service account, or a person's API
+    key). The source reports its issue notifications (``types``), and with
+    ``mcp`` the agent gets Linear's MCP server, with the same key, to write
+    back. All of it follows a reload. See docs/sources.md "Linear".
+    """
+    enabled: bool = False
+    schedule: str = "*/5 * * * *"
+    # A personal API key (lin_api_...) or an OAuth access token. Belongs in
+    # config.local.yaml.
+    api_key: str = ""
+    # assigned, mentioned, comments (LINEAR_TYPES). An unknown type or an
+    # empty list refuses to load.
+    types: list[str] = field(default_factory=lambda: list(LINEAR_TYPES))
+    # Also report the comments and mentions of apps, bots and external users.
+    # An assignment is reported whoever made it.
+    include_bots: bool = False
+    # Case-insensitive globs on the actor's name, display name or e-mail
+    # (deny wins). Dropped before anything is stored.
+    deny_actors: list[str] = field(default_factory=list)
+    # Case-insensitive globs on the team key (e.g. "ENG"). A non-empty allow
+    # list drops every other team's issues.
+    allow_teams: list[str] = field(default_factory=list)
+    deny_teams: list[str] = field(default_factory=list)
+    # Register Linear's MCP server as "linear" (unless mcp_servers names one).
+    mcp: bool = True
+    batch_size: int = 50
+    condense: bool = False
+
+    @property
+    def mcp_server(self) -> McpServerConfig | None:
+        """The MCP server this source registers, or ``None`` when it registers none."""
+        if not (self.enabled and self.mcp and self.api_key):
+            return None
+        return McpServerConfig(
+            name="linear", type="http", url=LINEAR_MCP_URL,
+            # Linear's MCP server takes a personal key as a bearer token too.
+            headers={"Authorization": f"Bearer {self.api_key}"},
+        )
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> LinearSyncConfig:
+        return cls(
+            enabled=d.get("enabled", False),
+            schedule=d.get("schedule", "*/5 * * * *"),
+            api_key=str(d.get("api_key") or "").strip(),
+            types=_linear_types(d.get("types")),
+            include_bots=d.get("include_bots", False),
+            deny_actors=_str_list(d.get("deny_actors") or [], clean=True),
+            allow_teams=_str_list(d.get("allow_teams") or [], clean=True),
+            deny_teams=_str_list(d.get("deny_teams") or [], clean=True),
+            mcp=d.get("mcp", True),
+            batch_size=d.get("batch_size", 50),
+            condense=d.get("condense", False),
+        )
+
+
 @dataclass
 class CodexOriginConfig:
     """A single Codex thread sync origin.
@@ -2366,6 +2459,7 @@ class SyncConfig:
     github: GitHubSyncConfig = field(default_factory=GitHubSyncConfig)
     github_events: GitHubEventsSyncConfig = field(default_factory=GitHubEventsSyncConfig)
     github_repos: GitHubReposSyncConfig = field(default_factory=GitHubReposSyncConfig)
+    linear: LinearSyncConfig = field(default_factory=LinearSyncConfig)
     codex: CodexSyncConfig = field(default_factory=CodexSyncConfig)
     message_ttl_days: int = 7           # How long to keep source messages in the inbox
     consumer_cursor_ttl_days: int = 2   # Consumer cursors expire after N days of inactivity
@@ -2380,6 +2474,7 @@ class SyncConfig:
             github=GitHubSyncConfig.from_dict(d.get("github", {})),
             github_events=GitHubEventsSyncConfig.from_dict(d.get("github_events", {})),
             github_repos=GitHubReposSyncConfig.from_dict(d.get("github_repos", {})),
+            linear=LinearSyncConfig.from_dict(d.get("linear", {})),
             codex=CodexSyncConfig.from_dict(d.get("codex", {})),
             message_ttl_days=d.get("message_ttl_days", 7),
             consumer_cursor_ttl_days=d.get("consumer_cursor_ttl_days", 2),
@@ -3598,12 +3693,38 @@ class McpServerConfig:
 
 
 def _parse_mcp_servers(d: dict) -> list[McpServerConfig]:
-    """Parse the mcp_servers dict from merged YAML config."""
+    """Parse the mcp_servers dict from merged YAML config, plus the built-in ones.
+
+    The one place both the startup config and :func:`load_mcp_servers` (a
+    reload) get their servers from, so a built-in server comes and goes with
+    the setting that registers it.
+    """
     raw = d.get("mcp_servers", {})
-    if not isinstance(raw, dict):
+    servers = [
+        McpServerConfig.from_dict(name, cfg) for name, cfg in raw.items()
+        if isinstance(cfg, dict)
+    ] if isinstance(raw, dict) else []
+    taken = set(raw) if isinstance(raw, dict) else set()
+    return servers + _builtin_mcp_servers(d, taken)
+
+
+def _builtin_mcp_servers(d: dict, taken: set[str]) -> list[McpServerConfig]:
+    """The MCP servers that Nerve's own settings register, except those in *taken*.
+
+    A server the user names in ``mcp_servers`` wins over a built-in one of
+    the same name, enabled or not.
+    """
+    sync = d.get("sync")
+    linear_raw = sync.get("linear") if isinstance(sync, dict) else None
+    if not isinstance(linear_raw, dict) or "linear" in taken:
         return []
-    return [McpServerConfig.from_dict(name, cfg) for name, cfg in raw.items()
-            if isinstance(cfg, dict)]
+    try:
+        server = LinearSyncConfig.from_dict(linear_raw).mcp_server
+    except ValueError:
+        # The config load reports it; a reload of the MCP servers alone
+        # must not fail on it.
+        return []
+    return [server] if server is not None else []
 
 
 def _normalize_mcp_gateway_url(value: Any) -> str:
