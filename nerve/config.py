@@ -2960,6 +2960,66 @@ class RetentionConfig:
         )
 
 
+EXTERNAL_VERIFICATION_REQUIRE = "require"
+EXTERNAL_VERIFICATION_LOG = "log"
+EXTERNAL_VERIFICATION_MODES = (EXTERNAL_VERIFICATION_REQUIRE, EXTERNAL_VERIFICATION_LOG)
+
+
+@dataclass
+class ExternalAuthConfig:
+    """The check of the gateway's actor context in external mode.
+
+    With ``gateway_jwks_file`` set, Nerve accepts an ``X-Nerve-Actor-Context``
+    header only with a signature from a key in that local JWK Set file, and
+    with claims for exactly ``tenant_id``, ``agent_id`` and the request (see
+    :mod:`nerve.gateway.actor_context`). ``verification: log`` logs a failed
+    check and uses the header anyway, for a first rollout. Without
+    ``gateway_jwks_file``, Nerve reads the header without a check. The mode
+    itself comes only from ``NERVE_AUTH_MODE``.
+    """
+
+    gateway_jwks_file: Path | None = None
+    tenant_id: str = ""
+    agent_id: str = ""
+    verification: str = EXTERNAL_VERIFICATION_REQUIRE
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> ExternalAuthConfig:
+        return cls(
+            gateway_jwks_file=_expand_path(d.get("gateway_jwks_file")),
+            tenant_id=str(d.get("tenant_id") or "").strip(),
+            agent_id=str(d.get("agent_id") or "").strip(),
+            verification=str(
+                d.get("verification") or EXTERNAL_VERIFICATION_REQUIRE,
+            ).strip().lower(),
+        )
+
+    def problems(self) -> list[str]:
+        """Why these settings cannot check the actor context. Empty when they
+        can, and when ``gateway_jwks_file`` is unset (no check).
+
+        The key file itself is read by the verifier and by ``nerve doctor``.
+        """
+        if self.gateway_jwks_file is None:
+            return []
+        found: list[str] = []
+        if not self.gateway_jwks_file.is_absolute():
+            # The daemon and `nerve doctor` can start in different directories.
+            found.append("auth.external.gateway_jwks_file must be an absolute path")
+        for key in ("tenant_id", "agent_id"):
+            value = getattr(self, key)
+            try:
+                canonical = str(uuid.UUID(value)) == value
+            except ValueError:
+                canonical = False
+            if not canonical:
+                found.append(f"auth.external.{key} must be a lowercase UUID")
+        if self.verification not in EXTERNAL_VERIFICATION_MODES:
+            found.append("auth.external.verification must be require or log")
+        return found
+
+
 @dataclass
 class AuthConfig:
     password_hash: str = ""
@@ -2973,6 +3033,7 @@ class AuthConfig:
     # logged out mid-work. Only a tab left untouched for the whole window
     # comes back to a password prompt.
     jwt_expiry_hours: int = 720  # 30 days
+    external: ExternalAuthConfig = field(default_factory=ExternalAuthConfig)
 
     @classmethod
     @_coerced
@@ -2981,6 +3042,7 @@ class AuthConfig:
             password_hash=d.get("password_hash", ""),
             jwt_secret=d.get("jwt_secret", ""),
             jwt_expiry_hours=max(1, _lenient_int(d.get("jwt_expiry_hours"), 720)),
+            external=ExternalAuthConfig.from_dict(d.get("external") or {}),
         )
 
 

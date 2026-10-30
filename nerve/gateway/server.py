@@ -33,13 +33,16 @@ from nerve import paths
 from nerve.agent.agents.emitter import agent_channel
 from nerve.agent.engine import AgentEngine, NotAcceptingTurnsError
 from nerve.agent.streaming import broadcaster
-from nerve.config import NerveConfig, get_config
+from nerve.config import EXTERNAL_VERIFICATION_LOG, NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
 from nerve.db.base import check_database_file
+from nerve.gateway.actor_context import KeysUnavailable
 from nerve.gateway.auth import (
     ACTOR_CONTEXT_HEADER,
     AUTH_MODE_EXTERNAL,
     SESSION_TOKEN_HEADER,
+    ActorContextMiddleware,
+    actor_context_verifier,
     auth_mode_from_env,
     authenticate_websocket,
     identity_store,
@@ -1120,11 +1123,32 @@ def create_app() -> FastAPI:
     """
     pin_auth_mode(auth_mode_from_env())
     if is_external_mode():
-        logger.warning(
-            "Authentication mode is %s: Nerve trusts the %s header without a "
-            "signature check. Only the gateway must be able to reach this server.",
-            AUTH_MODE_EXTERNAL, ACTOR_CONTEXT_HEADER,
-        )
+        external = get_config().auth.external
+        if external.gateway_jwks_file is None:
+            logger.warning(
+                "Authentication mode is %s: Nerve trusts the %s header without a "
+                "signature check. Only the gateway must be able to reach this server.",
+                AUTH_MODE_EXTERNAL, ACTOR_CONTEXT_HEADER,
+            )
+        elif external.verification == EXTERNAL_VERIFICATION_LOG:
+            logger.warning(
+                "Authentication mode is %s: Nerve checks the %s header but uses it "
+                "also when the check fails (verification=log, key file %s).",
+                AUTH_MODE_EXTERNAL, ACTOR_CONTEXT_HEADER, external.gateway_jwks_file,
+            )
+        else:
+            logger.info(
+                "Authentication mode is %s: Nerve verifies the %s header "
+                "(verification=%s, key file %s).",
+                AUTH_MODE_EXTERNAL, ACTOR_CONTEXT_HEADER,
+                external.verification, external.gateway_jwks_file,
+            )
+        if external.gateway_jwks_file is not None:
+            # Read the key file now, so that a problem shows in the startup log.
+            try:
+                actor_context_verifier(external)
+            except KeysUnavailable as e:
+                logger.warning("The %s header cannot be verified: %s", ACTOR_CONTEXT_HEADER, e)
 
     app = FastAPI(
         title="Nerve",
@@ -1220,6 +1244,12 @@ def create_app() -> FastAPI:
     # in about half the time of the default level 9, and the output is
     # about 2% larger.
     app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=5)
+
+    # In external mode, check the actor context header when a request
+    # arrives. FastAPI reads the body before require_auth runs, so a slow
+    # upload would otherwise outlast its assertion.
+    if is_external_mode():
+        app.add_middleware(ActorContextMiddleware)
 
     # REST routes
     app.include_router(register_all_routes())

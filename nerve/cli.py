@@ -1685,6 +1685,38 @@ def _hosted_github_lines(config, errors: list[str], warnings: list[str]) -> list
     return lines
 
 
+def _actor_context_lines(config, errors: list[str], warnings: list[str]) -> list[str]:
+    """Doctor lines for the actor context check of external mode (``auth.external``)."""
+    from nerve.config import EXTERNAL_VERIFICATION_LOG
+    from nerve.gateway.actor_context import KeyFileError, read_key_file
+
+    settings = config.auth.external
+    if settings.gateway_jwks_file is None:
+        warnings.append(
+            "[WARN] Actor context: the X-Nerve-Actor-Context header is not verified "
+            "(auth.external.gateway_jwks_file is not set), so only the gateway must "
+            "be able to reach Nerve"
+        )
+        return []
+    problems = settings.problems()
+    if not problems:
+        try:
+            keys = read_key_file(settings.gateway_jwks_file)
+        except KeyFileError as error:
+            problems = [f"auth.external.gateway_jwks_file: {error}"]
+    if problems:
+        errors.extend(f"[ERR] Actor context: {problem}" for problem in problems)
+        return []
+    source = f"agent {settings.agent_id}, {len(keys)} gateway key(s) from {settings.gateway_jwks_file}"
+    if settings.verification == EXTERNAL_VERIFICATION_LOG:
+        warnings.append(
+            "[WARN] Actor context: auth.external.verification is log, so a header "
+            f"that fails the check is used anyway ({source})"
+        )
+        return []
+    return [f"[OK] Actor context verified (verification: {settings.verification}): {source}"]
+
+
 def _github_repos_lines(config, warnings: list[str]) -> list[str]:
     """The doctor line of the repository watch (``sync.github_repos``).
 
@@ -2258,6 +2290,8 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     else:
         lines.append(f"[OK] Auth mode: {mode} ({mode_source})")
     external = mode == AUTH_MODE_EXTERNAL
+    if external:
+        lines.extend(_actor_context_lines(config, errors, warnings))
 
     configured = bool(config.auth.password_hash)
     identity_state = inspect_bootstrap_state(paths.db_path())

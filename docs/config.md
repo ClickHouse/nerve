@@ -248,7 +248,7 @@ A reload is always explicit. Two things cause one:
 | Skills (`skills/`, and the platform skills in `skills/` in the config directory) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
 | `setup.local_secrets` | ✅ read on every request of the setup page |
-| Web gateway auth (`auth.*`) | partly. `auth.jwt_expiry_hours` follows a reload for newly issued or refreshed tokens. The deprecated `auth.password_hash` follows a reload only for accounts without a local password. `auth.jwt_secret` requires a restart (see the restart table) |
+| Web gateway auth (`auth.*`) | partly. `auth.jwt_expiry_hours` follows a reload for newly issued or refreshed tokens. The deprecated `auth.password_hash` follows a reload only for accounts without a local password. `auth.external.*` follows a reload, which also reads the file that `gateway_jwks_file` names again. `auth.jwt_secret` requires a restart (see the restart table) |
 | `gateway.drain_timeout_seconds` | ✅ read when the shutdown signal arrives (see [Shutdown Sequence](architecture.md#shutdown-sequence)) |
 | `notifications.*` | ✅ read per notification |
 | `workspace_sync.*` | ✅ from the next sync cycle |
@@ -2182,6 +2182,10 @@ a server or a tool that the organization removed.
 |-----|------|---------|-------------|
 | `auth.password_hash` | string | - | Deprecated compatibility setting. Manage passwords from the Accounts page. If neither this setting nor the sole account has a password, anyone who can reach the gateway can act as the owner. See [Accounts and identity](accounts.md) |
 | `auth.jwt_secret` | string | - | JWT signing secret. When unset, Nerve generates one and stores it in `nerve.db`. Changing it requires a restart and signs users out. See [Accounts and identity](accounts.md) |
+| `auth.external.gateway_jwks_file` | path | - | External mode only. An absolute path to the gateway's public actor signing keys, a JWK Set file. When set, Nerve verifies the `X-Nerve-Actor-Context` header. See [Actor context verification](#actor-context-verification) |
+| `auth.external.tenant_id` | string | - | The tenant of this instance, a lower-case UUID. Required with `gateway_jwks_file` |
+| `auth.external.agent_id` | string | - | The agent of this instance, a lower-case UUID. Required with `gateway_jwks_file` |
+| `auth.external.verification` | string | `require` | `require` refuses a header that fails the check. `log` logs the failure and uses the header anyway, for a first rollout |
 
 ### Authentication mode
 
@@ -2201,10 +2205,74 @@ error. `nerve restart` checks the value before it stops the running daemon.
 runs `nerve doctor`. It does not ask the running server, so the mode of a
 daemon that started with a different environment can be different.
 
-> **Warning:** In external mode, Nerve trusts the `X-Nerve-Actor-Context`
-> header and does not check its signature. A caller that can send a request to
-> Nerve can act as any person. Use external mode only when the gateway is the
-> only caller that can reach Nerve.
+#### Actor context verification
+
+The gateway signs the `X-Nerve-Actor-Context` header with an Ed25519 key. To
+check it, give Nerve the gateway's public keys and the identity of this
+instance in `auth.external`. The mode itself still comes only from
+`NERVE_AUTH_MODE`.
+
+```yaml
+auth:
+  external:
+    gateway_jwks_file: /etc/nerve/actor-keys.json   # an absolute path
+    tenant_id: 00000000-0000-0000-0000-000000000000
+    agent_id: 00000000-0000-0000-0000-000000000000
+    verification: require                            # or log
+```
+
+The file is a JWK Set of Ed25519 public keys (`kty` `OKP`, `crv` `Ed25519`,
+`alg` `EdDSA`, `use` `sig`, a unique `kid`, and `x`). Nerve reads only `keys`
+and ignores the other members of the document. A file with a private key
+member is refused. Nerve reads the file at startup and on each reload, and
+again, at most once a minute, when a header names an unknown `kid`. When a
+later read fails, the keys of the last good read stay in use. Nerve never
+fetches keys over the network.
+
+With the file set, Nerve accepts the header of an HTTP request or a WebSocket
+upgrade only when all of these are true:
+
+- The header is a compact JWS. Its protected header has `typ`
+  `nerve-actor-context+jws`, `alg` `EdDSA` and a `kid` from the file, and no
+  `jwk`, `jku`, `x5c`, `x5u` or `crit`. The signature verifies with that key.
+- The payload has `version` `"1"`, the configured `tenant_id` and `agent_id`,
+  `signer_id` `urn:nerve:gateway:actor:<tenant_id>:<agent_id>`, `audience`
+  `urn:nerve:runtime:<tenant_id>:<agent_id>`, `actor_kind` `human`, and a UUID
+  in `principal_id`.
+- `request_binding` names this request. `kind` is `http`, or `websocket` for an
+  upgrade, which also needs a `gateway_connection_id`. `method` is the request
+  method. `target` is the request-target that Nerve received: the raw path, and
+  `?` and the query when there is a query. Without a query, `/path?` also
+  matches.
+- `issued_at` is at most 30 seconds in the future, `expires_at` is at most 30
+  seconds in the past, and `expires_at` is 1 to 30 seconds after `issued_at`.
+- Nerve has not accepted the same `assertion_id` before. Nerve keeps accepted
+  IDs in memory until they expire, at most 10,000; when it is full, it forgets
+  the oldest.
+
+Nerve checks the header of an HTTP request when the request arrives, before it
+reads the body, and the header of a WebSocket upgrade when it accepts the
+socket.
+
+| Result | Response |
+|---|---|
+| All checks pass | The request acts as `principal_id`, with `profile.display_name`, as without the check |
+| A check fails | `401`. The reason, the `kid` and the request ID go to the log, never the header |
+| No usable key set: the file cannot be read or used, or an `auth.external` setting is invalid | `503` |
+| A check fails, or no usable key set, with `verification: log` | Nerve logs the failure and reads the header without the check |
+
+The server accepts a WebSocket before it authenticates it, so a failed check
+and a missing key set both close the socket with `4001`.
+
+A reload applies changed `auth.external` settings and reads the file again.
+In external mode, `nerve doctor` reads the file, reports invalid settings, and
+warns when `verification` is `log`. Startup logs the key file and the
+`verification` value, as a warning when it is `log`.
+
+> **Warning:** Without `auth.external.gateway_jwks_file`, Nerve trusts the
+> `X-Nerve-Actor-Context` header and does not check its signature. A caller
+> that can send a request to Nerve can act as any person. Then use external
+> mode only when the gateway is the only caller that can reach Nerve.
 
 #### Inference principal header
 
