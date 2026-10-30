@@ -472,6 +472,10 @@ _WORKING_DIR_PATH_KEYS: dict[tuple[str, ...], str] = {
         "hosted channels would try to read a directory as the gateway's public "
         "key file, so they do not start and every stream upgrade is refused"
     ),
+    ("auth", "external", "gateway_jwks_file"): (
+        "external mode would have no key to check the actor context header with, "
+        "so every request that carries the header is refused"
+    ),
     ("workspace",): (
         "the entire workspace (settings.yaml, the cron config, memory, "
         "everything nerve syncs) would be read from and written to whatever "
