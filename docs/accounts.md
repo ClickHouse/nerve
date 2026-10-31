@@ -136,8 +136,15 @@ and names the person behind each request. See
 | Backend and external MCP token | The system actor |
 
 The header is a compact JWS. Nerve reads `principal_id` and
-`profile.display_name` from its payload. It does not check the signature or
-any other claim. `principal_id` must be a UUID, and Nerve uses its lowercase
+`profile.display_name` from its payload. With `auth.external.gateway_jwks_file`
+set, Nerve first checks the gateway's signature with a key from that file, and
+the claims: this tenant and agent, the method and target of this request, the
+issue and expiry times, and that the assertion was not used before. It checks
+a request when the request arrives, before it reads the body. A failed check
+gives `401`, and a missing key set gives `503`. See
+[Actor context verification](config.md#actor-context-verification). Without
+that setting, Nerve does not check the signature or any other claim.
+`principal_id` must be a UUID, and Nerve uses its lowercase
 form as the actor ID. `profile.display_name` must be a string, `null`, or
 absent. A header that Nerve cannot read, a header that names the system actor,
 and a request with more than one header give `401`. When the header is
@@ -182,10 +189,10 @@ In external mode:
   actor for Nerve's own model calls. See
   [Inference principal header](config.md#inference-principal-header).
 
-> **Warning:** Nerve trusts the header. Use external mode only when the
-> gateway is the only caller that can reach Nerve. A caller that can send the
-> header can act as any person, also as the actor of an account from an earlier
-> local mode.
+> **Warning:** Without `auth.external.gateway_jwks_file`, Nerve trusts the
+> header. Then use external mode only when the gateway is the only caller that
+> can reach Nerve. A caller that can send the header can act as any person,
+> also as the actor of an account from an earlier local mode.
 
 ### The system actor in external mode
 
