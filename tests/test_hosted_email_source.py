@@ -26,6 +26,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nerve import config_reload
 from nerve.channels.hosted.contract import (
     Envelope,
     Payload,
@@ -172,6 +173,13 @@ class TestSettings:
 
         assert hosted_email(config) is False
         assert hosted_sources(config) == hosted_providers(config) == []
+
+    def test_switching_email_on_reports_the_restart_and_off_does_not(self):
+        off, on = NerveConfig(), NerveConfig()
+        on.sync.email.enabled = True
+
+        assert config_reload.restart_required(off, on) == ["sync.email.enabled: False → True"]
+        assert config_reload.restart_required(on, off) == []
 
     def test_a_switched_off_source_is_not_hosted(self):
         config = hosted_config()
@@ -335,6 +343,20 @@ class TestRegistry:
 
         assert [r for r in caplog.records if r.name == "nerve.sources.registry"] == []
 
+    async def test_a_reload_keeps_the_drain_until_email_is_switched_off(self, db):
+        """channels.hosted is restart-only: the runtime keeps taking email
+        after a reload breaks those settings, so the drain stays too."""
+        service = CronService(hosted_config(), AsyncMock(), db)
+        service.scheduler.start(paused=True)
+        try:
+            service._register_source_runners()
+            service.config = NerveConfig.from_dict({"sync": {"email": {"enabled": True}}})
+            assert "source:email" in (await service.reload_sources())["sources"]
+            service.config.sync.email.enabled = False
+            assert "source:email" not in (await service.reload_sources())["sources"]
+        finally:
+            service.scheduler.shutdown(wait=False)
+
     async def forecast(self, config: NerveConfig, db) -> dict[str, Any]:
         service = CronService(config, AsyncMock(), db)
         service.scheduler.start(paused=True)
@@ -422,8 +444,6 @@ class TestStreams:
             await stop(harness)
 
     async def test_a_reload_that_switches_email_off_unsubscribes(self, tmp_path, db, monkeypatch):
-        from nerve import config_reload
-
         harness = await start(tmp_path, db, monkeypatch, github=False, email=True)
         try:
             await harness.stream()

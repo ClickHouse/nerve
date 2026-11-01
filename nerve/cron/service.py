@@ -15,7 +15,7 @@ import json
 import logging
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, is_dataclass
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
@@ -500,6 +500,10 @@ class CronService:
         # GitHub source for the mode the service started with.
         github_mode = getattr(getattr(getattr(config, "sync", None), "github", None), "mode", None)
         self._github_mode = github_mode if isinstance(github_mode, str) else None
+        # channels.hosted is restart-only too: the hosted email source is
+        # built for the hosted settings the service started with.
+        hosted = getattr(getattr(config, "channels", None), "hosted", None)
+        self._hosted_settings = copy.copy(hosted) if is_dataclass(hosted) else None
         # Hosted source deliveries (see on_source_delivered): the sources whose
         # drain is running, those delivered to again meanwhile, the pending
         # delivery run of each job, and the delivery runs that have started.
@@ -963,17 +967,26 @@ class CronService:
         service started with: the mode is restart-only, so a reload must not
         swap the GitHub source under a running hosted runtime (or bring one up
         that does not exist). Shallow copies, so nothing else is frozen.
+        ``channels.hosted`` keeps its startup value too, so a reload does not
+        remove the email drain while the runtime still takes email.
         """
         config = self.config
         github = getattr(getattr(config, "sync", None), "github", None)
-        if self._github_mode is None or github is None or github.mode == self._github_mode:
+        channels = getattr(config, "channels", None)
+        move_github = self._github_mode is not None and github is not None and github.mode != self._github_mode
+        hosted = getattr(channels, "hosted", None)
+        move_hosted = self._hosted_settings is not None and hosted is not None and hosted != self._hosted_settings
+        if not (move_github or move_hosted):
             return config
-        pinned_github = copy.copy(github)
-        pinned_github.mode = self._github_mode
-        pinned_sync = copy.copy(config.sync)
-        pinned_sync.github = pinned_github
         pinned = copy.copy(config)
-        pinned.sync = pinned_sync
+        if move_github:
+            pinned_github = copy.copy(github)
+            pinned_github.mode = self._github_mode
+            pinned.sync = copy.copy(config.sync)
+            pinned.sync.github = pinned_github
+        if move_hosted:
+            pinned.channels = copy.copy(channels)
+            pinned.channels.hosted = self._hosted_settings
         return pinned
 
     def _register_source_runners(self) -> None:

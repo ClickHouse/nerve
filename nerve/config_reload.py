@@ -78,6 +78,12 @@ _RESTART_ONLY_PATHS = (
     "xmemory",
 )
 
+# Restart-only when switched on, and only then: the value at startup decides
+# what is built, and switching off follows a reload.
+_RESTART_TO_ENABLE_PATHS = (
+    "sync.email.enabled",
+)
+
 # Paths whose value the summary must not carry. It is logged and returned over
 # HTTP, so a secret printed here is a secret in the log file as well.
 _SECRET_PATHS = frozenset({
@@ -134,6 +140,11 @@ def restart_required(old_config, new_config) -> list[str]:
         if before is _UNSET or after is _UNSET:
             continue
         if before != after:
+            changed.append(_describe(path, before, after))
+    for path in _RESTART_TO_ENABLE_PATHS:
+        before = _dotted_attr(old_config, path)
+        after = _dotted_attr(new_config, path)
+        if before is not _UNSET and after is not _UNSET and not before and after:
             changed.append(_describe(path, before, after))
     return changed
 

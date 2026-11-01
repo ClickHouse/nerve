@@ -14,6 +14,7 @@ import pytest_asyncio
 import nerve.sources.registry as registry
 from nerve.config_reload import (
     _RESTART_ONLY_PATHS,
+    _RESTART_TO_ENABLE_PATHS,
     _UNSET,
     _dotted_attr,
     reload_all,
@@ -252,7 +253,7 @@ def _compared(path: str) -> bool:
     """True when some entry in the tuple compares *path* — itself, or its section."""
     return any(
         path == entry or path.startswith(f"{entry}.")
-        for entry in _RESTART_ONLY_PATHS
+        for entry in (*_RESTART_ONLY_PATHS, *_RESTART_TO_ENABLE_PATHS)
     )
 
 
@@ -271,7 +272,6 @@ class TestRestartTableCoverage:
         "ollama.enabled": "conditional: only while the proxy is not running",
         "workspace_sync.enabled": "conditional: only turning it on",
         "retention.enabled": "conditional: only turning it on",
-        "sync.email.enabled": "conditional: only turning it on",
     }
 
     def test_every_documented_setting_is_compared(self):
@@ -305,7 +305,7 @@ class TestRestartTableCoverage:
 
     def test_every_compared_setting_is_documented(self):
         undocumented = []
-        for entry in _RESTART_ONLY_PATHS:
+        for entry in (*_RESTART_ONLY_PATHS, *_RESTART_TO_ENABLE_PATHS):
             if not any(
                 entry == doc
                 or entry.startswith(f"{doc}.")
@@ -333,7 +333,7 @@ class TestRestartTableCoverage:
 
         defaults = NerveConfig()
         missing = [
-            path for path in _RESTART_ONLY_PATHS
+            path for path in (*_RESTART_ONLY_PATHS, *_RESTART_TO_ENABLE_PATHS)
             if _dotted_attr(defaults, path) is _UNSET
         ]
         assert not missing, (
