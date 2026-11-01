@@ -49,6 +49,18 @@ needed callers, contracts and tests using read-only GitHub requests pinned to SH
 Truncated file/search pagination fails visibly. Source acquisition has a 100 MB
 bound and does not silently substitute a truncated API patch.
 
+Workers use three session-bound MCP tools, without shell execution:
+`code_review_input` supplies the snapshot and prior report;
+`code_review_read_source` reads numbered, paginated source at the stored head,
+base or merge-base SHA (including unchanged files); `code_review_checkpoint`
+saves the four report stages in order and validates the final verdict. These
+tools reject non-review sessions, paused/disabled profiles and settled or stopped
+attempts. They accept no repository, run ID, arbitrary SHA or local output path.
+Source reads are GET-only; report writes use directory descriptors and refuse
+symlink traversal. The restricted Codex sandbox remains enabled. This also works
+in containers where nested Linux namespaces prevent shell sandbox startup.
+No command execution capability is exposed by these tools.
+
 Each workflow writes description, before/after sequence diagrams and code review
 in order. The instructions cover bugs, adjacent behavior, compatibility, enablement
 and invariants. New behavior uses Mermaid `rect rgb(220, 252, 231)` and the text

@@ -85,7 +85,12 @@ class CodeReviewStore:
                     core = lambda value: {k: v for k, v in value.items() if k not in ("ci", "failures")}
                     if core(prior) == core(snapshot):
                         failures = {encode(f): f for f in [*prior.get("failures", []), *snapshot.get("failures", [])]}
-                        snapshot["failures"] = [failures[key] for key in sorted(failures)]
+                        snapshot["failures"] = list(failures.values())
+                # Canonicalize the first observation too, before its fingerprint
+                # is stored. Otherwise the second poll creates a spurious version.
+                if "failures" in snapshot:
+                    failures = {encode(f): f for f in snapshot["failures"]}
+                    snapshot["failures"] = [failures[key] for key in sorted(failures)]
                 if snapshot.get("failures") == []:
                     snapshot.pop("failures", None)
                 fingerprint = digest({k: v for k, v in snapshot.items() if k != "ci"})

@@ -83,6 +83,15 @@ async def test_head_base_description_and_ci_versions(db):
     assert [v["status"] for v in versions].count("superseded") == 3
 
 
+async def test_first_ci_failure_order_does_not_create_a_version(db):
+    failures = [{"name": "z-build", "conclusion": "failure"}, {"name": "a-test", "conclusion": "failure"}]
+    first = await db.cr_observe("example", pr(), snapshot(failures=failures))
+    second = await db.cr_observe("example", pr(), snapshot(failures=list(reversed(failures))))
+    assert second["current_version"] == first["current_version"]
+    assert second["content_updated_at"] == first["content_updated_at"]
+    assert len(await db.cr_rows("SELECT * FROM code_review_versions")) == 1
+
+
 async def test_draft_close_reopen_and_search_removal(service, db):
     draft = pr(draft=True)
     assert await db.cr_observe("example", draft) is None

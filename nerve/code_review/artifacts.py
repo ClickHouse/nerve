@@ -36,6 +36,8 @@ def validate(output, snapshot):
     if any(not output.get(name, "").strip() for name in STAGES):
         raise ValueError("partial review: required stages are missing")
     verdict = json.loads(output["verdict.json"])
+    if not isinstance(verdict, dict):
+        raise ValueError("verdict must be a JSON object")
     if verdict.get("head") != snapshot["head"] or verdict.get("base") != snapshot["base"]:
         raise ValueError("review SHA does not match its input version")
     if verdict.get("severity") not in SEVERITIES:
@@ -48,6 +50,8 @@ def validate(output, snapshot):
     if not isinstance(verdict.get("findings"), list):
         raise ValueError("findings must be a list")
     for finding in verdict["findings"]:
+        if not isinstance(finding, dict):
+            raise ValueError("each finding must be a JSON object")
         if finding.get("severity") not in SEVERITIES[1:] or finding.get("sha") != snapshot["head"]:
             raise ValueError("finding lacks severity or exact head SHA")
         for field in ("path", "line", "condition", "impact", "evidence"):
