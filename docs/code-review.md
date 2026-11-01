@@ -66,7 +66,9 @@ in order. The instructions cover bugs, adjacent behavior, compatibility, enablem
 and invariants. New behavior uses Mermaid `rect rgb(220, 252, 231)` and the text
 «новое»; diagrams also retain their copyable source. Mermaid renders locally with
 strict security, sanitization, source configuration/link restrictions and a size
-cap. Invalid diagrams fall back to source. No diagram rendering service is used.
+cap. On a sequence-note syntax error, the renderer retries literal semicolons in
+note labels and discloses the display correction; the immutable source is kept.
+Other invalid diagrams fall back to source. No diagram rendering service is used.
 See [Mermaid sequence highlighting](https://mermaid.js.org/syntax/sequenceDiagram.html#background-highlighting)
 and [security configuration](https://mermaid.js.org/config/schema-docs/config.html).
 
@@ -110,7 +112,10 @@ read-only admission queue with backoff. Its paid run is settled and other PRs ca
 proceed. Recovery does not pay to recreate an already valid report.
 
 A terminal workflow row is not sufficient to release a reservation: the executor,
-kill and teardown tasks must have ended and recorded cost is reconciled. Metering
+kill and teardown tasks must have ended and recorded cost is reconciled. Native
+Codex parent token usage is priced during the active turn, even when no child
+workflow journals exist. Observed parent token cost survives an interrupted final
+usage event, and late meter samples cannot overwrite a terminal run. Metering
 is delayed, so actual provider billing may overshoot. The UI displays recorded
 spend and excess; new runs stop when committed budget reaches the cap. If a run
 actually started but was interrupted by a daemon restart, its unreported remainder

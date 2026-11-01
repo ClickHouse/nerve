@@ -1,10 +1,11 @@
 import { render, screen, waitFor, cleanup } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MermaidBlock } from './MermaidBlock';
+import { useThemeStore } from '../../stores/themeStore';
 
 const renderer = vi.hoisted(() => ({ initialize: vi.fn(), render: vi.fn() }));
 vi.mock('mermaid', () => ({ default: renderer }));
-afterEach(() => { cleanup(); vi.clearAllMocks(); });
+afterEach(() => { cleanup(); vi.resetAllMocks(); useThemeStore.setState({ resolved: 'light' }); });
 
 describe('MermaidBlock', () => {
   it('renders sanitized SVG and keeps copyable source', async () => {
@@ -36,4 +37,43 @@ describe('MermaidBlock', () => {
     await waitFor(() => expect(screen.queryByRole('img')).toBeNull());
     await screen.findByRole('alert');
   });
+});
+
+it('retries invalid sequence notes with literal semicolons and preserves source', async () => {
+  renderer.render.mockRejectedValueOnce(new Error('Parse error'))
+    .mockResolvedValueOnce({ svg: '<svg><text>ready; then done</text></svg>' });
+  const source = 'sequenceDiagram\nNote over A,B: ready; then done #59; unchanged';
+  render(<MermaidBlock source={source} />);
+  await screen.findByRole('img');
+  expect(renderer.render.mock.calls[1][1]).toBe('sequenceDiagram\nNote over A,B: ready#59; then done #59; unchanged');
+  expect(screen.getByText(/original source is preserved/)).toBeInTheDocument();
+  expect(screen.getByText(/ready; then done #59; unchanged/)).toBeInTheDocument();
+});
+
+it('does not reinterpret valid semicolon-separated diagrams', async () => {
+  renderer.render.mockResolvedValue({ svg: '<svg><text>valid</text></svg>' });
+  const source = 'sequenceDiagram\nNote over A,B: ready; A->>B: next';
+  render(<MermaidBlock source={source} />);
+  await screen.findByRole('img');
+  expect(renderer.render).toHaveBeenCalledTimes(1);
+  expect(renderer.render.mock.calls[0][1]).toBe(source);
+});
+
+it.each(['->>', '-->>', '-)', '--)', '-x', '--x', '<<->>', '-|/', '-|\\', '/|-'])('preserves inline %s commands while retrying a different malformed note', async (arrow) => {
+  renderer.render.mockRejectedValueOnce(new Error('Parse error'))
+    .mockResolvedValueOnce({ svg: '<svg><text>ready</text></svg>' });
+  const source = `sequenceDiagram\nNote over A,B: start; A${arrow}B: next\nNote over A,B: ready; finished`;
+  render(<MermaidBlock source={source} />);
+  await screen.findByRole('img');
+  expect(renderer.render.mock.calls[1][1]).toBe(`sequenceDiagram\nNote over A,B: start; A${arrow}B: next\nNote over A,B: ready#59; finished`);
+});
+
+it('keeps pale sequence highlights readable with light text in dark mode', async () => {
+  useThemeStore.setState({ resolved: 'dark' });
+  renderer.render.mockResolvedValue({ svg: '<svg><text>new behavior</text></svg>' });
+  render(<MermaidBlock source={'sequenceDiagram\nA->>B: new'} />);
+  await screen.findByRole('img');
+  expect(renderer.initialize).toHaveBeenCalledWith(expect.objectContaining({
+    theme: 'dark', themeCSS: 'rect.rect { fill-opacity: 0.16; }',
+  }));
 });

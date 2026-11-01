@@ -104,6 +104,7 @@ def _make_engine(db) -> MagicMock:
     engine._discard_client = AsyncMock()
     engine.is_session_running = MagicMock(return_value=False)
     engine.get_live_workflow_tokens = MagicMock(return_value=0)
+    engine.get_live_codex_parent_cost = MagicMock(return_value=0.0)
     engine.has_live_background_tasks = MagicMock(return_value=False)
     engine.get_codex_ultracode_run_ids = MagicMock(return_value=None)
     engine.add_stop_listener = MagicMock()
@@ -1106,3 +1107,65 @@ async def test_dispatch_guard_refuses_pending_run_before_executor(db, tmp_path):
     assert run["status"] == "failed"
     assert "draft" in run["error"]
     engine.run.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_native_codex_parent_enforces_budget_without_child_journals(service, db, engine, tmp_path):
+    session_id = await _seed_running(db, 'wfr-native01', 1.0)
+    await db._write('UPDATE workflow_runs SET engine=? WHERE id=?', (ENGINE_CODEX, 'wfr-native01'))
+    service.config.codex.home_dir = tmp_path / 'codex-without-journals'
+    engine.is_session_running.return_value = True
+    engine.get_live_codex_parent_cost.return_value = 1.25
+    await service._tick()
+    run = await db.get_workflow_run('wfr-native01')
+    assert run['status'] == 'budget_exhausted'
+    assert run['spent_usd'] == pytest.approx(1.25)
+    engine.get_live_codex_parent_cost.assert_called_with(session_id)
+    await asyncio.gather(*list(service._kill_tasks))
+    engine.stop_session.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_codex_live_parent_handoff_does_not_drop_or_double_count(service, db, engine, tmp_path):
+    sid = await _seed_running(db, 'wfr-native02', 5.0)
+    await db._write('UPDATE workflow_runs SET engine=? WHERE id=?', (ENGINE_CODEX, 'wfr-native02'))
+    service.config.codex.home_dir = tmp_path / 'codex-without-journals'
+    engine.is_session_running.return_value = True
+    engine.get_live_codex_parent_cost.return_value = 1.25
+    assert await service._refresh_spend('wfr-native02') == 1.25
+    # Client completes before the engine persists usage; never reset the meter.
+    engine.get_live_codex_parent_cost.return_value = 0.0
+    assert await service._refresh_spend('wfr-native02') == 1.25
+    assert await service._refresh_spend('wfr-native02', final=True) == 1.25
+    await db.record_turn_usage(sid, 100, 50, 0, 0, 200000, cost_usd=1.25, cost_basis='sdk_delta')
+    assert await service._refresh_spend('wfr-native02', final=True) == 1.25
+    # A second active turn adds only its own delta.
+    engine.get_live_codex_parent_cost.return_value = 0.5
+    assert await service._refresh_spend('wfr-native02') == 1.75
+
+
+@pytest.mark.asyncio
+async def test_late_meter_sample_cannot_overwrite_terminal_cost(service, db, engine):
+    await _seed_running(db, 'wfr-meter-race', 5.0)
+    started, release = asyncio.Event(), asyncio.Event()
+    async def delayed_cost(sid):
+        started.set()
+        await release.wait()
+        return 1.0
+    db.get_session_effective_cost = delayed_cost
+    sample = asyncio.create_task(service._refresh_spend('wfr-meter-race'))
+    await started.wait()
+    await db.transition_workflow_run('wfr-meter-race', 'done', spent_usd=2.0)
+    release.set()
+    assert await sample == 2.0
+    assert (await db.get_workflow_run('wfr-meter-race'))['spent_usd'] == 2.0
+
+
+@pytest.mark.asyncio
+async def test_codex_heuristic_child_estimate_is_not_permanent(service, db, engine):
+    sid = await _seed_running(db, "wfr-fallback", 10.0)
+    await db._write("UPDATE workflow_runs SET engine=? WHERE id=?", (ENGINE_CODEX, "wfr-fallback"))
+    await db.record_turn_usage(sid, 100, 50, 0, 0, 200000, cost_usd=3.0, cost_basis="sdk_delta")
+    service._live_estimate_codex = lambda run: 2.0
+    assert await service._refresh_spend("wfr-fallback") == 5.0
+    assert await service._refresh_spend("wfr-fallback", final=True) == 3.0
