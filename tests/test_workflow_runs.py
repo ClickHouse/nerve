@@ -1075,3 +1075,34 @@ class TestReviewRegressions:
         }
         cost = service._journal_cost(journal, run)
         assert cost > 0  # aggregate priced with the default codex model
+
+
+@pytest.mark.asyncio
+async def test_settled_spend_waits_through_executor_and_teardown(db, tmp_path):
+    """No accounting-release window between terminal CAS and client discard."""
+    engine = _make_engine(db)
+    service = WorkflowRunService(_make_config(tmp_path), db, engine)
+    gate = asyncio.Event()
+    began = asyncio.Event()
+    async def discard(*args, **kwargs):
+        began.set()
+        await gate.wait()
+    engine._discard_client.side_effect = discard
+    run = await service.start_run(ENGINE_CLAUDE, {"prompt": "Synthetic read-only audit"}, 5)
+    await asyncio.wait_for(began.wait(), 3)
+    assert await service.settled_spend(run["id"]) is None
+    gate.set()
+    await _drain(service)
+    assert await service.settled_spend(run["id"]) == 0
+
+
+@pytest.mark.asyncio
+async def test_dispatch_guard_refuses_pending_run_before_executor(db, tmp_path):
+    engine = _make_engine(db)
+    service = WorkflowRunService(_make_config(tmp_path), db, engine)
+    guard = AsyncMock(return_value="PR is draft")
+    service.add_dispatch_guard(guard)
+    run = await service.start_run(ENGINE_CLAUDE, {"prompt": "Synthetic audit"}, 5)
+    assert run["status"] == "failed"
+    assert "draft" in run["error"]
+    engine.run.assert_not_called()

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useReviewBoardName } from '../../hooks/useReviewBoardName';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../../stores/authStore';
 import { useNotificationStore } from '../../stores/notificationStore';
@@ -24,6 +25,7 @@ import { NAV_ITEMS, PRIMARY_PATHS, visibleNavItems, type NavItem } from './navIt
  * do not run twice.
  */
 export function BottomNav() {
+  const reviewBoardName = useReviewBoardName();
   const location = useLocation();
   const navigate = useNavigate();
   const { logout } = useAuthStore();
@@ -44,7 +46,7 @@ export function BottomNav() {
 
   // Setup stays in the drawer also when it is finished: the drawer is
   // already the place for rarely used destinations.
-  const available = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown, setupFinished: false });
+  const available = visibleNavItems(NAV_ITEMS.map(item => item.path === '/tasks-code-review' ? { ...item, label: reviewBoardName } : item), { hosted, ultracodeEnabled, setupKnown, setupFinished: false });
   const primary = PRIMARY_PATHS
     .map(p => available.find(i => i.path === p))
     .filter((i): i is NavItem => Boolean(i));

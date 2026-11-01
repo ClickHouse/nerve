@@ -283,3 +283,10 @@ Full-page markdown editor for task content:
 - **Back button** — returns to the task list
 
 Saving writes the full markdown file to disk and re-syncs the title and deadline to SQLite.
+
+## Code Review board
+
+[Code Review](code-review.md) adds an independent `/tasks-code-review` board for
+configured pull request review profiles. It keeps task lifecycle tied to PR closure,
+immutable review versions and content-based ordering separate from the ordinary
+manually ordered task board.

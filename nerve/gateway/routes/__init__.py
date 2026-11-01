@@ -40,6 +40,7 @@ from nerve.gateway.routes import (
     codex,
     workflow_runs,
     review_loops,
+    code_review,
     config,
 )
 
@@ -86,5 +87,6 @@ def register_all_routes() -> APIRouter:
     router.include_router(codex.router)
     router.include_router(workflow_runs.router)
     router.include_router(review_loops.router)
+    router.include_router(code_review.router)
     router.include_router(config.router)
     return router
