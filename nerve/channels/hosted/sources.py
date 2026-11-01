@@ -1,19 +1,23 @@
-"""Hosted sources: records that the shared gateway polls for this agent.
+"""Hosted sources: records that the shared gateway gets for this agent.
 
 In hosted mode the channel gateway polls a source instead of this process.
 It applies the filters that Nerve publishes before it stores a record, keeps
 the records in the agent's inbox until Nerve reads them, also while Nerve is
 not running, and Nerve reads them over the same streams that carry hosted
-channel traffic. GitHub is the hosted source, as a whole: with
+channel traffic. GitHub is a hosted source as a whole: with
 ``sync.github.mode: hosted`` both the notifications (provider ``github``) and
 the repository watch (provider ``github_repos``) come from the gateway.
+Email (provider ``email``) is hosted only: with ``sync.email.enabled`` and
+usable ``channels.hosted`` settings, the gateway delivers the mail that
+members of the agent send to the agent's address (:func:`hosted_email`).
 
 :class:`HostedSourceConsumer` takes a provider's records from the inbox reader
 and writes each one to the local ``channel_observations`` buffer under the
 provider's name. The provider's source runner drains that buffer into the
-inbox with the guardrail, drop hook, and condensing of the polling source
-(:mod:`nerve.sources.github_hosted`). A record is acknowledged only after its
-buffer row is written.
+inbox: for GitHub with the guardrail, drop hook, and condensing of the
+polling source (:mod:`nerve.sources.github_hosted`), for email with
+condensing (:mod:`nerve.sources.email_hosted`). A record is acknowledged only
+after its buffer row is written.
 
 :func:`subscriptions_for` builds the ``subscriptions`` frame from the same
 settings that build the inbox filter, so the gateway and Nerve drop the same
@@ -38,6 +42,7 @@ from nerve.channels.hosted.contract import (
     Subscriptions,
 )
 from nerve.channels.hosted.contract.model import (
+    EMAIL_PROVIDER,
     MAX_REPO_WATCHES,
     MAX_SUBSCRIPTION_PATTERN_BYTES,
     MAX_SUBSCRIPTION_PATTERNS,
@@ -59,6 +64,8 @@ logger = logging.getLogger(__name__)
 GITHUB = "github"
 # The repository watch: the repositories that sync.github_repos names.
 GITHUB_REPOS = REPO_WATCH_PROVIDER
+# Mail from the members of the agent, which sync.email switches on.
+EMAIL = EMAIL_PROVIDER
 
 # Row target of a provider's buffer. The gateway keeps at most this many
 # source records for an agent, and the runner drains the buffer after every
@@ -70,9 +77,24 @@ def hosted_sources(config: NerveConfig) -> list[str]:
     """The source providers whose records come from the gateway.
 
     GitHub is hosted as a whole: ``sync.github.mode: hosted`` makes the
-    repository watch (``github_repos``) hosted too.
+    repository watch (``github_repos``) hosted too. Email is hosted while
+    :func:`hosted_email` is true. A switched-off email source is left out,
+    so a runtime without another hosted source sends no subscriptions.
     """
-    return [GITHUB, GITHUB_REPOS] if config.sync.github.mode == "hosted" else []
+    providers = [GITHUB, GITHUB_REPOS] if config.sync.github.mode == "hosted" else []
+    if hosted_email(config):
+        providers.append(EMAIL)
+    return providers
+
+
+def hosted_email(config: NerveConfig) -> bool:
+    """Whether the hosted email source is on.
+
+    It needs ``sync.email.enabled`` and ``channels.hosted`` settings that can
+    authenticate a stream (:meth:`~nerve.config.HostedChannelsConfig.problems`
+    finds no problem), because email has no polling mode.
+    """
+    return bool(config.sync.email.enabled) and not config.channels.hosted.problems()
 
 
 # ---------------------------------------------------------------------- #
@@ -87,7 +109,9 @@ def subscriptions_for(config: NerveConfig, providers: Iterable[str]) -> Subscrip
     it for this agent. So is a repository watch that names no repository:
     the ``github_repos`` subscription is sent only while the watch is on and
     lists a repository, and an agent without one sends the same frame as
-    before the watch existed.
+    before the watch existed. The ``email`` subscription is sent while
+    ``sync.email.enabled`` is true; without it the gateway refuses the
+    agent's mail.
     """
     providers = set(providers)
     sources: list[SourceSubscription] = []
@@ -97,7 +121,19 @@ def subscriptions_for(config: NerveConfig, providers: Iterable[str]) -> Subscrip
         watch = github_repos_subscription(config.sync.github_repos)
         if watch is not None:
             sources.append(watch)
+    if EMAIL in providers and config.sync.email.enabled:
+        sources.append(email_subscription())
     return Subscriptions(version=SUBSCRIPTIONS_VERSION, sources=tuple(sources))
+
+
+def email_subscription() -> SourceSubscription:
+    """The email subscription: the provider with empty filters, and nothing more.
+
+    The platform decides which mail reaches the agent, so there is nothing
+    to filter. A new member would make a gateway that does not know it close
+    the stream, so the subscription carries none.
+    """
+    return SourceSubscription(provider=EMAIL)
 
 
 def github_subscription(settings: GitHubSyncConfig) -> SourceSubscription:
@@ -333,12 +369,15 @@ class HostedSourceConsumer:
 
 __all__ = [
     "BUFFER_MAX_ROWS",
+    "EMAIL",
     "GITHUB",
     "GITHUB_REPOS",
     "HostedSourceConsumer",
     "buffered_record",
+    "email_subscription",
     "github_repos_subscription",
     "github_subscription",
+    "hosted_email",
     "hosted_sources",
     "subscriptions_for",
 ]

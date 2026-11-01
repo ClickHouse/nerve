@@ -69,6 +69,9 @@ MAX_SUBSCRIPTION_PATTERN_BYTES = 256
 SUBSCRIPTION_INBOXES = ("", "participating", "all")
 # The provider whose subscription names repositories to watch, and only it.
 REPO_WATCH_PROVIDER = "github_repos"
+# The provider of the mail that members send to the agent. Its subscription
+# names only the provider, with empty filters.
+EMAIL_PROVIDER = "email"
 # Such a subscription names 1 to this many repositories, each once.
 MAX_REPO_WATCHES = 50
 # What a watched repository may report.
@@ -796,6 +799,8 @@ class SourceSubscription:
     watches. Only that provider carries them, and it carries no filters,
     ``pr_watch`` or ``inbox``. Nerve sends it only while the repository watch
     is switched on, so every other frame is unchanged.
+
+    The ``email`` subscription carries only its provider and empty filters.
     """
 
     provider: str = ""
@@ -821,8 +826,9 @@ class Subscriptions:
 
         The version, the number of sources, each provider name and that no
         provider appears twice, each inbox, the bounds of every filter list,
-        and the watched repositories, which only ``github_repos`` names (see
-        :func:`_validate_repo_watches`).
+        the watched repositories, which only ``github_repos`` names (see
+        :func:`_validate_repo_watches`), and that an ``email`` subscription
+        carries nothing but its provider.
         """
         if self.version != SUBSCRIPTIONS_VERSION:
             reject(RejectionReason.VERSION_UNSUPPORTED, f"unknown subscriptions version {self.version!r}")
@@ -847,6 +853,10 @@ class Subscriptions:
                 _validate_repo_watches(source)
             elif source.repos:
                 malformed(f"only a {REPO_WATCH_PROVIDER} subscription names repositories")
+            if source.provider == EMAIL_PROVIDER and (
+                any(source.filters.pattern_lists().values()) or source.pr_watch or source.inbox
+            ):
+                malformed(f"an {EMAIL_PROVIDER} subscription carries filters, pr_watch or an inbox")
 
     def without_filters(self) -> Subscriptions:
         """The same sources with no filter patterns.

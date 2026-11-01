@@ -377,9 +377,10 @@ async def _republish_hosted_subscriptions(engine) -> str | None:
 
     The filters, ``pr_watch`` and ``inbox`` follow a reload this way, and so
     does the repository watch (``sync.github_repos``: switched on or off, its
-    repositories and settings); the gateway keeps the newest subscription it
-    received. (In poll mode they follow with the rebuilt source runners.)
-    ``None`` without hosted sources.
+    repositories and settings), and so does ``sync.email.enabled`` switched
+    off; the gateway keeps the newest subscription it received. (In poll mode
+    they follow with the rebuilt source runners.) ``None`` without hosted
+    sources.
     """
     if engine is None:
         return None

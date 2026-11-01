@@ -815,16 +815,18 @@ class Harness:
 
 
 async def start(
-    tmp_path, db, monkeypatch, *, slack: bool = False, github: bool = True,
+    tmp_path, db, monkeypatch, *, slack: bool = False, github: bool = True, email: bool = False,
     config_getter: Callable[[], NerveConfig] | None = None, **settings: Any,
 ) -> Harness:
     """A hosted runtime on real streams. Its config getter returns this config
-    object unless *config_getter* is given (``get_config`` follows a reload)."""
+    object unless *config_getter* is given (``get_config`` follows a reload).
+    *email* switches the hosted email source on."""
     config = slack_hosted_config(tmp_path)
     if not slack:
         config.slack = SlackConfig()
     if github:
         config.sync.github = hosted_github(**settings)
+    config.sync.email.enabled = email
     monkeypatch.setattr(config_module, "_config", config)
     engine = MagicMock()
     engine.db = db

@@ -2265,6 +2265,35 @@ class GitHubReposSyncConfig:
 
 
 @dataclass
+class EmailSyncConfig:
+    """Config for the hosted email source: mail from the members of the agent.
+
+    The source works only in hosted mode (``channels.hosted``). The channel
+    gateway delivers the mail that the platform routes to the agent, and the
+    runner drains it into the inbox. The platform decides which mail is
+    routed; this setting only says whether Nerve takes it. Without usable
+    ``channels.hosted`` settings Nerve logs a warning and registers nothing.
+    Switching it on takes effect at the next restart; switching it off, and
+    the other settings, follow a reload. See docs/sources.md "Hosted email".
+    """
+    enabled: bool = False
+    # The fallback cadence of the drain, which also runs on every delivery.
+    schedule: str = "*/15 * * * *"
+    batch_size: int = 30
+    condense: bool = False
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> EmailSyncConfig:
+        return cls(
+            enabled=d.get("enabled", False),
+            schedule=d.get("schedule", "*/15 * * * *"),
+            batch_size=d.get("batch_size", 30),
+            condense=d.get("condense", False),
+        )
+
+
+@dataclass
 class CodexOriginConfig:
     """A single Codex thread sync origin.
 
@@ -2366,6 +2395,7 @@ class SyncConfig:
     github: GitHubSyncConfig = field(default_factory=GitHubSyncConfig)
     github_events: GitHubEventsSyncConfig = field(default_factory=GitHubEventsSyncConfig)
     github_repos: GitHubReposSyncConfig = field(default_factory=GitHubReposSyncConfig)
+    email: EmailSyncConfig = field(default_factory=EmailSyncConfig)
     codex: CodexSyncConfig = field(default_factory=CodexSyncConfig)
     message_ttl_days: int = 7           # How long to keep source messages in the inbox
     consumer_cursor_ttl_days: int = 2   # Consumer cursors expire after N days of inactivity
@@ -2380,6 +2410,7 @@ class SyncConfig:
             github=GitHubSyncConfig.from_dict(d.get("github", {})),
             github_events=GitHubEventsSyncConfig.from_dict(d.get("github_events", {})),
             github_repos=GitHubReposSyncConfig.from_dict(d.get("github_repos", {})),
+            email=EmailSyncConfig.from_dict(d.get("email", {})),
             codex=CodexSyncConfig.from_dict(d.get("codex", {})),
             message_ttl_days=d.get("message_ttl_days", 7),
             consumer_cursor_ttl_days=d.get("consumer_cursor_ttl_days", 2),

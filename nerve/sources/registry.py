@@ -277,6 +277,35 @@ def build_source_runners(
             gh_repos.deny_authors or [],
         )
 
+    # Email from the members of the agent. Hosted only: the gateway delivers
+    # the mail that the platform routes to the agent, and the runner drains
+    # it. The platform admits only member mail, so there is no guardrail and
+    # no drop hook.
+    email = config.sync.email
+    if email.enabled:
+        from nerve.channels.hosted.sources import hosted_email
+
+        if hosted_email(config):
+            from nerve.sources.email_hosted import HostedEmailSource
+
+            runners.append(SourceRunner(
+                source=HostedEmailSource(db),
+                db=db,
+                batch_size=email.batch_size,
+                condense=email.condense,
+                condense_model=condense_model,
+                condense_client_factory=condense_factory,
+                ttl_days=ttl_days,
+            ))
+            logger.info("Registered source: email (hosted, batch=%d)", email.batch_size)
+        else:
+            logger.warning(
+                "sync.email.enabled is set, but the email source works only in hosted "
+                "mode and the channels.hosted settings are not usable (%s); it is not "
+                "registered",
+                "; ".join(config.channels.hosted.problems()),
+            )
+
     # Channel source drains. Not a poll: the channel transport already
     # delivered and buffered these events. This only moves them into the
     # inbox. What to watch is a property of the channel, so the config lives at
