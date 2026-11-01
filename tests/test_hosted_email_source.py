@@ -14,9 +14,11 @@ a stand-in.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import json
 import logging
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -51,6 +53,8 @@ from nerve.config import (
 )
 from nerve.cron.service import CronService
 from nerve.sources.email_hosted import HostedEmailSource
+from nerve.sources.github_hosted import HostedGitHubSource
+from nerve.sources.models import SourceRecord
 from nerve.sources.registry import build_source_runners
 from tests.fake_channel_gateway import source_record_event
 from tests.test_hosted_channel_config import HOSTED
@@ -452,28 +456,32 @@ class TestStreams:
 
 
 # ---------------------------------------------------------------------- #
-#  Jobs that a delivery runs                                              #
+#  The first mail, and the jobs that a delivery runs                      #
 # ---------------------------------------------------------------------- #
 
 
-@pytest.mark.asyncio
-async def test_a_mail_runs_the_inbox_job_once_and_not_the_others(tmp_path, db, monkeypatch):
-    """The push wake: the delivery drains the mail at once, and a job gated
-    on messages for any source (as the default inbox processor is) runs once."""
-    harness = await start(tmp_path, db, monkeypatch, github=False, email=True)
-    cron_dir = tmp_path / "cron"
+NEVER = "0 0 1 1 *"
+
+
+def default_inbox_job() -> dict[str, Any]:
+    """The default inbox processor, as the setup page writes it, on a
+    schedule that does not come in the test."""
+    from nerve.setup_writer import PRODUCTIVITY_CRONS
+
+    [job] = [job for job in PRODUCTIVITY_CRONS if job["id"] == "inbox-processor"]
+    return {"id": job["id"], "schedule": NEVER, "prompt": job["prompt"], "run_if": job["run_if"]}
+
+
+@contextlib.asynccontextmanager
+async def running_cron(harness: Harness, jobs: list[dict[str, Any]]) -> AsyncIterator[tuple[CronService, list[str]]]:
+    """The cron service on *harness*, with *jobs*, hearing the deliveries.
+    Yields it with the IDs of the jobs that ran, in order."""
+    cron_dir = harness.config.workspace.parent / "cron"
     harness.config.cron.jobs_file = cron_dir / "jobs.yaml"
     harness.config.cron.system_file = cron_dir / "system.yaml"
     harness.config.cron.gate_plugins_dir = cron_dir / "gates"
     harness.config.cron.delivery_debounce_seconds = 1
-    never = "0 0 1 1 *"
-    write_jobs(harness.config.cron.jobs_file, [
-        {"id": "inbox-processor", "schedule": never, "prompt": "Process the inbox",
-         "run_if": [{"type": "messages", "consumer": "inbox"}]},
-        {"id": "pr-monitor", "schedule": never, "prompt": "Look at the PRs",
-         "run_if": [{"type": "messages", "sources": ["github"]}]},
-        {"id": "daily-briefing", "schedule": never, "prompt": "Brief me"},
-    ])
+    write_jobs(harness.config.cron.jobs_file, jobs)
     turns: list[str] = []
 
     async def run_cron(**kwargs: Any):
@@ -482,26 +490,151 @@ async def test_a_mail_runs_the_inbox_job_once_and_not_the_others(tmp_path, db, m
 
     engine = MagicMock()
     engine.run_cron = run_cron
-    cron = CronService(harness.config, engine, db)
+    cron = CronService(harness.config, engine, harness.db)
     await cron.start()
     harness.runtime.set_delivery_listener(cron.on_source_delivered)
     try:
-        # The inbox consumer has read email before, so its cursor exists.
-        await db.get_consumer_cursor("inbox", "email")
-        stream = await harness.stream()
-        inbox_ids = [
-            harness.gateway.store(email_event(id=f"{RECORD_ID}-{n}")) for n in range(2)
-        ]
-
-        await stream.nudge("observe")
-
-        await harness.acknowledged(*inbox_ids)
-        await eventually(lambda: turns == ["inbox-processor"])
-        assert await db.get_source_message("email", f"{RECORD_ID}-1") is not None
-        await asyncio.sleep(1.5)
-        assert turns == ["inbox-processor"]
-        logs = await db.get_cron_logs(job_id="source:email", limit=10)
-        assert logs and all(log["status"] == "success" for log in logs)
+        yield cron, turns
     finally:
         await cron.stop()
-        await stop(harness)
+
+
+async def poll_all(harness: Harness, consumer: str) -> str:
+    """What ``poll_all_sources`` gives *consumer*."""
+    from nerve.agent.tools.handlers.sources import poll_all_sources_handler
+    from nerve.agent.tools.registry import ToolContext
+
+    ctx = ToolContext(session_id="test", db=harness.db, config=harness.config)
+    result = await poll_all_sources_handler(ctx, {"consumer": consumer})
+    return result.content[0]["text"]
+
+
+async def cursors(db) -> dict[tuple[str, str], int]:
+    async with db.db.execute("SELECT consumer, source, cursor_seq FROM consumer_cursors") as rows:
+        return {(row[0], row[1]): row[2] async for row in rows}
+
+
+@pytest.mark.asyncio
+class TestFirstMail:
+    async def test_a_fresh_agent_reads_its_first_mail(self, tmp_path, db, monkeypatch):
+        """No consumer has read anything yet. The default inbox processor's
+        gate passes for the first mail, which the delivery drained at once,
+        and its poll returns that mail. The other jobs do not run."""
+        harness = await start(tmp_path, db, monkeypatch, github=False, email=True)
+        try:
+            assert await cursors(db) == {}
+            jobs = [
+                default_inbox_job(),
+                {"id": "pr-monitor", "schedule": NEVER, "prompt": "Look at the PRs",
+                 "run_if": [{"type": "messages", "sources": ["github"]}]},
+                {"id": "daily-briefing", "schedule": NEVER, "prompt": "Brief me"},
+            ]
+            async with running_cron(harness, jobs) as (_, turns):
+                assert await cursors(db) == {("inbox", "email"): 0}
+                stream = await harness.stream()
+                inbox_id = harness.gateway.store(email_event())
+
+                await stream.nudge("observe")
+
+                await harness.acknowledged(inbox_id)
+                await eventually(lambda: turns == ["inbox-processor"])
+                await asyncio.sleep(1.5)
+                assert turns == ["inbox-processor"]
+                logs = await db.get_cron_logs(job_id="source:email", limit=10)
+                assert logs and all(log["status"] == "success" for log in logs)
+            text = await poll_all(harness, "inbox")
+            assert f"email: {EVENT['record']['summary']}" in text
+            assert "email: 1 new" in text
+        finally:
+            await stop(harness)
+
+    async def test_an_agent_that_reads_other_sources_reads_its_first_mail(self, tmp_path, db, monkeypatch):
+        """Email is switched on later. The consumers that already hold cursors
+        get one on email too, also a consumer that no gate names."""
+        await db.insert_source_messages([source_record(n) for n in range(2)], "github")
+        await db.set_consumer_cursor("inbox", "github", await db.get_source_max_rowid("github"))
+        await db.set_consumer_cursor("weekly", "github", 0)
+        harness = await start(tmp_path, db, monkeypatch, github=False, email=True)
+        try:
+            async with running_cron(harness, [default_inbox_job()]) as (_, turns):
+                stream = await harness.stream()
+                inbox_id = harness.gateway.store(email_event())
+
+                await stream.nudge("observe")
+
+                await harness.acknowledged(inbox_id)
+                await eventually(lambda: turns == ["inbox-processor"])
+            inbox = await poll_all(harness, "inbox")
+            weekly = await poll_all(harness, "weekly")
+            assert "email: 1 new" in inbox and "github: 0 new" in inbox
+            assert "email: 1 new" in weekly and "github: 2 new" in weekly
+        finally:
+            await stop(harness)
+
+    async def test_a_cursor_is_never_moved_and_a_restart_starts_nothing(self, db):
+        await db.insert_source_messages([email_record(n) for n in range(3)], "email")
+        await db.set_consumer_cursor("inbox", "email", 1)
+        await db.set_consumer_cursor("expired", "email", 0, ttl_days=-1)
+        config = hosted_config()
+
+        for _ in range(2):
+            service = CronService(config, AsyncMock(), db)
+            service._jobs = []
+            service._register_source_runners()
+            await service._start_consumer_cursors(service._source_runners)
+
+        assert await cursors(db) == {("inbox", "email"): 1, ("expired", "email"): 0}
+        assert await db.peek_consumer_cursor("expired", "email") is None
+
+    async def test_a_new_consumer_starts_at_the_newest_mail(self, db):
+        """A mail stored before the source was registered, say before a
+        restart, is not new to a consumer that starts reading now."""
+        await db.insert_source_messages([email_record(n) for n in range(2)], "email")
+        newest = await db.get_source_max_rowid("email")
+
+        started = await db.start_consumer_cursors("email", ["triage", ""], ttl_days=2)
+
+        assert started == ["triage"]
+        assert await db.peek_consumer_cursor("triage", "email") == newest
+
+    async def test_a_source_reload_that_registers_the_email_runner_starts_the_cursors(self, db):
+        service = CronService(NerveConfig.from_dict({"channels": {"hosted": HOSTED}}), AsyncMock(), db)
+        service.scheduler.start(paused=True)
+        try:
+            service._jobs = []
+            service._register_source_runners()
+            await service._start_consumer_cursors(service._source_runners)
+            await db.set_consumer_cursor("inbox", "github", 0)
+            assert await cursors(db) == {("inbox", "github"): 0}
+
+            service.config = hosted_config()
+            await service.reload_sources()
+
+            assert await cursors(db) == {("inbox", "github"): 0, ("inbox", "email"): 0}
+        finally:
+            service.scheduler.shutdown(wait=False)
+
+
+@pytest.mark.parametrize(("source", "starts"), [
+    (HostedEmailSource, True),
+    (HostedGitHubSource, False),
+    (lambda db: HostedGitHubSource(db, "github_repos"), False),
+])
+def test_only_the_email_source_starts_consumer_cursors(source, starts):
+    """Hosted GitHub keeps the cursors that start when a consumer first reads it."""
+    assert source(AsyncMock()).starts_consumer_cursors is starts
+
+
+def email_record(n: int) -> SourceRecord:
+    return SourceRecord(
+        id=f"{RECORD_ID}-{n}", source="email", record_type="email_message",
+        summary=f"Email from Example Member: note {n}", content="Hi", timestamp="2026-09-16T11:00:00Z",
+    )
+
+
+def source_record(n: int) -> SourceRecord:
+    return SourceRecord(
+        id=f"900000000{n}", source="github", record_type="github_notification",
+        summary=f"[owner/repo] Fix {n} (mention)", content="Repository: owner/repo",
+        timestamp="2026-09-16T10:00:00Z",
+    )
