@@ -54,7 +54,7 @@ Consumers read from the inbox using the `poll_source` agent tool with a named co
 
 **Key properties:**
 - Consumer cursors are independent — multiple consumers can read the same source at different positions
-- New consumer cursors initialize to the latest message (no backlog flooding)
+- New consumer cursors initialize to the latest message (no backlog flooding). The hosted email source starts the cursors of the known consumers when its runner is registered, before its first mail (see [Hosted email](#hosted-email))
 - Consumer cursors expire after N days of inactivity (configurable, default: 2 days); a `messages` gate that checks the consumer renews the cursors it reads (see [cron.md](cron.md#messages))
 - Cross-source deduplication happens naturally because one agent session sees messages from all sources
 
@@ -428,6 +428,94 @@ machine for them.
   platform that parks the machine does not wake it for that run. The mode
   follows `sync.github.mode`, which is restart-only.
 
+### Hosted email
+
+Members of a hosted agent can send email to the address of the agent. With
+`sync.email.enabled: true`, the channel gateway delivers that mail to Nerve as
+source records, and the `source:email` runner drains them into the inbox.
+There is no polling mode: this process does not connect to a mail server.
+
+- **Hosted mode only.** The source needs the `channels.hosted` settings (see
+  [Hosted mode](config.md#hosted-mode)), and it uses the same streams as hosted
+  Slack and hosted GitHub. If these settings cannot authenticate a stream,
+  Nerve logs a warning and registers no email source. The platform normally
+  sets `sync.email.enabled` for hosted agents.
+- **Only members can send.** The gateway sends only mail that a member of the
+  agent sent. The platform decides which mail it routes to the agent, for
+  example only when receiving is turned on for the agent. `sync.email.enabled`
+  only tells the gateway whether Nerve takes the mail that the platform
+  routes. Other mail does not come to Nerve.
+- **What arrives.** One `email_message` record for each mail, with the source
+  `email`. The summary is `Email from <sender name>: <subject>`. The content
+  starts with a short header (the sender's name and principal ID, the subject,
+  the date, and the number of attachments) and then gives the text of the mail
+  as the member wrote it, with the quoted text. If the mail is too long, the
+  text is cut and the content says so. The record never contains an email
+  address: it identifies the sender by principal ID and display name.
+  Attachments are listed in the metadata and are never delivered.
+- **The content is untrusted data.** A member's mail can contain quoted or
+  forwarded text from other people, and text that tells the agent to do
+  something. `poll_source` and `read_source` show it with the untrusted data
+  warning, as they show all source content (see [Security](#security)).
+- **Same runner, no guardrail.** The records go to a local buffer, and the
+  `source:email` runner drains it as soon as records arrive. Jobs gated on
+  `messages` for `email`, or for any source (as the default inbox processor
+  is), run once `cron.delivery_debounce_seconds` after the first record of a
+  burst (see [Runs on delivery](cron.md#runs-on-delivery)). `condense`, health
+  checks, consumer cursors, `messages` gates and the Sources page work as for
+  the other sources. There is no guardrail and no drop hook, because the
+  platform sends only member mail. The run on `sync.email.schedule` is a
+  fallback. While nothing waits in the buffer, that run is not the instance's
+  next scheduled task, so a platform that parks the machine does not wake it
+  for that run.
+- **The first mail is unread.** When the cron service registers the runner,
+  each consumer that a `messages` gate names, and each consumer that has a
+  cursor on another source, gets a cursor on `email` at its newest message,
+  unless it has one already. The first mail after the switch is then unread
+  for those consumers, for example for the default inbox processor.
+- **The subscription.** While the source is on, the subscriptions that Nerve
+  publishes include `{"provider":"email","filters":{}}`, with no other
+  members. When the subscriptions do not include it, the gateway refuses mail
+  for the agent and does not keep it for later. A gateway that does not know
+  email ignores the entry. When the source is off and no other hosted source
+  publishes subscriptions, Nerve rejects an email record that arrives
+  (`configuration_invalid`), and the gateway removes it.
+- **A switched-off hosted Slack holds email back.** Nerve reads the events of
+  every hosted provider from one ordered inbox at the gateway, as for GitHub
+  (see [Hosted GitHub source](#hosted-github-source)). With `slack.mode:
+  hosted` and `slack.enabled: false`, the mail waits at the gateway until
+  Slack is switched on again.
+- **Switching it on needs a restart.** The consumers of the gateway's records
+  are made at startup. Switching the source off follows a reload: Nerve tells
+  the gateway that it takes no email, and the runner stops. The records that
+  are already in the local buffer stay there until the source is on again,
+  for `sync.message_ttl_days` at most.
+
+Metadata of an `email_message` record (a value that does not fit the
+channel contract's limits is left out):
+
+| Key | Type | Value |
+|-----|------|-------|
+| `sender_principal_id` | string | The principal ID of the member who sent the mail |
+| `sender_name` | string | The display name of that member |
+| `subject` | string | The subject of the mail |
+| `message_id` | string | The `Message-ID` header of the mail, with the angle brackets |
+| `in_reply_to` | string | The `In-Reply-To` header of the mail, if it has one |
+| `thread_id` | string | The first ID of the `References` header; if there is none, `In-Reply-To`; if there is none, `message_id` |
+| `attachments` | list | One entry for each attachment: `<name>; <type>; <bytes> bytes` |
+| `truncated` | bool | `true` when the text of the mail was cut |
+
+A tool that sends mail can use `message_id` to reply in the member's thread.
+
+```yaml
+sync:
+  email:
+    enabled: true                 # hosted mode only; switching it on needs a restart
+    schedule: "*/15 * * * *"      # the fallback cadence of the drain
+    batch_size: 30
+    condense: false
+```
+
 ### Telegram account sync
 - **Adapter:** `nerve/sources/telegram.py` — uses Telethon (user account API).
   This is the pull sync for your own Telegram account, and is separate from the
@@ -667,6 +755,12 @@ sync:
     updates: false                # true: also commits, ready, merge and close of reported PRs
     deny_authors: []              # Globs on the author's login; never reported
     batch_size: 50
+    condense: false
+
+  email:
+    enabled: false                # Hosted mode only: mail from the members of the agent (restart to switch on)
+    schedule: "*/15 * * * *"      # The fallback cadence of the drain
+    batch_size: 30
     condense: false
 ```
 
@@ -1050,7 +1144,7 @@ The Sources page (`/sources`) has three tabs:
 - `consumer_cursors` — Per (consumer, source) read position with TTL and session linking
 - `source_messages` — Inbox messages with `raw_content` (original HTML), `processed_content` (LLM-condensed), TTL-based expiry
 - `source_run_log` — Per-run diagnostics (records ingested, errors, timestamps)
-- `channel_observations` — Push buffer for chat messages a channel collected for the inbox, drained by `ChannelSource`, and for the records of the hosted GitHub sources, drained by the `github` and `github_repos` runners. Trimmed toward a per-transport row target and TTL-swept by daily cleanup
+- `channel_observations` — Push buffer for chat messages a channel collected for the inbox, drained by `ChannelSource`, and for the records of the hosted sources, drained by the `github`, `github_repos` and `email` runners. Trimmed toward a per-transport row target and TTL-swept by daily cleanup
 - `cron_logs` — Job execution history (source jobs use `source:<name>` as job ID)
 
 ### API Endpoints
@@ -1218,7 +1312,9 @@ export function MyRenderer({ content, metadata, summary }: Props) {
 | `nerve/sources/telegram.py` | Telegram adapter (Telethon) |
 | `nerve/sources/gmail.py` | Gmail adapter (gog CLI) |
 | `nerve/sources/github.py` | GitHub notifications adapter (gh CLI), record builder, GitHub guardrail |
+| `nerve/sources/hosted.py` | The drain of every hosted source: reads the records the channel gateway delivered from the local buffer |
 | `nerve/sources/github_hosted.py` | GitHub sources in hosted mode (`github`, `github_repos`): drain the records the channel gateway delivered |
+| `nerve/sources/email_hosted.py` | The hosted email source (`email`): drains the mail from members that the channel gateway delivered |
 | `nerve/sources/github_events.py` | GitHub user events adapter (gh CLI) |
 | `nerve/sources/github_repos.py` | GitHub repository watch adapter (gh CLI), record builder, its guardrail |
 | `nerve/agent/tools.py` | Consumer tools: `list_sources`, `poll_source`, `read_source` |

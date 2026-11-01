@@ -271,6 +271,7 @@ class TestRestartTableCoverage:
         "ollama.enabled": "conditional: only while the proxy is not running",
         "workspace_sync.enabled": "conditional: only turning it on",
         "retention.enabled": "conditional: only turning it on",
+        "sync.email.enabled": "conditional: only turning it on",
     }
 
     def test_every_documented_setting_is_compared(self):

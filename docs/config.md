@@ -242,7 +242,7 @@ A reload is always explicit. Two things cause one:
 | Cron jobs (`config/cron/*.yaml`) | ✅ |
 | Custom cron gate plugins (new, edited *and* deleted `.py` files) | ✅ the registry is rebuilt from the directory |
 | Cron file locations (`cron.jobs_file`, `system_file`, `gate_plugins_dir`) | ✅ re-read from the new config |
-| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. In hosted mode the GitHub filters, `pr_watch`, `inbox` and the repository watch (`sync.github_repos`) are published to the gateway again. **`sync.codex` and `sync.github.mode` are not among these**; see the restart table |
+| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.email`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. In hosted mode the GitHub filters, `pr_watch`, `inbox`, the repository watch (`sync.github_repos`) and the email subscription (`sync.email.enabled`) are published to the gateway again. **`sync.codex` and `sync.github.mode` are not among these, and switching `sync.email` on needs a restart**; see the restart table |
 | `cron.delivery_debounce_seconds` | ✅ read for each delivery |
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
 | Skills (`skills/`, and the platform skills in `skills/` in the config directory) | ✅ re-scanned |
@@ -297,6 +297,7 @@ reload cannot inspect, and are documented here only.
 | `mcp_gateway_url` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
 | `slack.mode`, `channels.hosted.*` | the hosted channel, its stream endpoint, and its token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
 | `sync.github.mode` | the GitHub sources (`github` and the repository watch, `github_repos`), and in hosted mode the stream endpoint and the consumers of the gateway's records, are chosen at startup. Until a restart the sources keep the mode they started with, and so does the `github_pr_activity` gate. The filters, `pr_watch`, `inbox` and `sync.github_repos` do follow a reload: in hosted mode the reload publishes them to the gateway again. To go back to `poll`, set `enabled: false` (and `sync.github_repos.enabled: false`) and reload first (see [sources.md](sources.md#hosted-github-source)) |
+| Turning `sync.email.enabled` **on** | the stream endpoint and the consumers of the gateway's records are made at startup, for the hosted email source only when it is on. Until a restart the gateway is not told that the agent takes email. Turning it **off** follows a reload: the reload tells the gateway that the agent takes no email, and the runner stops (see [sources.md](sources.md#hosted-email)) |
 | `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
 | `workflows.poll_interval_seconds`, `workflows.review_loop.reconcile_interval_seconds` | both loops were handed their interval when they started. Everything else under `workflows.*` is read per use (see the table above) |
@@ -1448,10 +1449,13 @@ notifications, and with `sync.github_repos` the repositories it watches; the
 `channels.hosted` settings above apply unchanged, and they are enough on their
 own: Slack need not be hosted too. See
 [Hosted GitHub source](sources.md#hosted-github-source) and
-[Hosted repository watch](sources.md#hosted-repository-watch).
+[Hosted repository watch](sources.md#hosted-repository-watch). With
+`sync.email.enabled` the gateway also streams the mail that members of the
+agent send to its address; email has no other mode. See
+[Hosted email](sources.md#hosted-email).
 
-When Slack is hosted as well, its switch also holds GitHub back. Nerve reads
-the events of every hosted provider from one ordered inbox, and it reads
+When Slack is hosted as well, its switch also holds GitHub and email back.
+Nerve reads the events of every hosted provider from one ordered inbox, and it reads
 nothing while hosted Slack is switched off (`slack.enabled: false`): the
 GitHub records wait at the gateway until Slack is switched on again, and past
 the gateway's limit of stored records the oldest are dropped. Keep a hosted
@@ -1837,6 +1841,19 @@ reload:
 | `sync.github_repos.include_drafts` | bool | `true` | `false`: a draft pull request is reported when it is marked ready for review (event `ready`), not when it is opened |
 | `sync.github_repos.updates` | bool | `false` | Also report a new head commit, ready for review, and the merge or close of each pull request the watch reported |
 | `sync.github_repos.deny_authors` | list | `[]` | Case-insensitive globs on the author's login, with the guardrail rules; what they match is never reported, releases included |
+
+**Email-specific** (mail that members of a hosted agent send to its address;
+see [sources.md](sources.md#hosted-email)). Hosted mode only: the channel
+gateway delivers the mail, and the `channels.hosted` settings must be usable
+(see [Hosted mode](#hosted-mode)). The platform decides which mail reaches
+the agent; these settings decide only whether Nerve takes it:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `sync.email.enabled` | bool | `false` | Take the mail that the gateway delivers. Without usable `channels.hosted` settings, Nerve logs a warning and registers no email source. Switching it on needs a restart; switching it off follows a reload, and the gateway then refuses mail for the agent |
+| `sync.email.schedule` | cron | `*/15 * * * *` | The fallback cadence of the drain, which also runs on every delivery |
+| `sync.email.batch_size` | int | `30` | Max records per drain |
+| `sync.email.condense` | bool | `false` | LLM-condense long mail via `memory.fast_model` |
 
 `cron.delivery_debounce_seconds` (int, default `60`) spaces the job runs that a
 hosted delivery starts; a negative value reads as `0`, and a value above `600`
