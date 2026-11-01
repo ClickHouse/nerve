@@ -1381,7 +1381,7 @@ wheels = [
 
 [[package]]
 name = "memu-py"
-version = "1.4.0"
+version = "1.5.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "alembic" },
@@ -1395,13 +1395,13 @@ dependencies = [
     { name = "pydantic" },
     { name = "sqlmodel" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/d8/c3/2e0b5512aef7d537d9a644c5fce58753a856ac62fac06dbcc4779aacd2e1/memu_py-1.4.0.tar.gz", hash = "sha256:87294c186b2f574e9185e44cd4c9e3e73cdf5847e32fc5dff922dddb121d0728", size = 12048061, upload-time = "2026-02-06T00:59:19.191Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/97/95/e46407b2c83d7bb605340fc0a86f9b28ccf2d8e66270d40aa18ae0aff8e9/memu_py-1.5.1.tar.gz", hash = "sha256:476789f33003a19b6f5d2883ddbae0a4f1d2f3c9e52ecff445e26620473d0f48", size = 12540347, upload-time = "2026-03-23T07:40:44.56Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/f1/da/2a927f156d047a162540cb10f2f134fbf64af923a7cffd370dc71e6815d0/memu_py-1.4.0-cp313-abi3-macosx_10_12_x86_64.whl", hash = "sha256:af655e096f23d7f2fd1d801a6cc86895d79e51ca276ba22764ff47a3310f8c48", size = 374726, upload-time = "2026-02-06T00:59:10.409Z" },
-    { url = "https://files.pythonhosted.org/packages/81/7f/159711b0a3205c1f748ee79d82f97c7f9f8345861e95aeba380f94180856/memu_py-1.4.0-cp313-abi3-macosx_11_0_arm64.whl", hash = "sha256:0c3d10a2fd49f1466e5d19e10bc22b397e5a2f63acee8a67540c3bfd22951a90", size = 372081, upload-time = "2026-02-06T00:59:11.773Z" },
-    { url = "https://files.pythonhosted.org/packages/51/ad/7582389da6ad09b032fdf5a002e6dd2aab977ee1fc0987ef57de18aef07c/memu_py-1.4.0-cp313-abi3-manylinux_2_39_aarch64.whl", hash = "sha256:6cf38358000aeeb1021c672dc8428e9944b801b73981035c049e5e0c3e037d0d", size = 395989, upload-time = "2026-02-06T00:59:13.285Z" },
-    { url = "https://files.pythonhosted.org/packages/72/09/0d6d5a7ebad6867b96c87f572a94f5d300346fb0c3dd9d6f1b5a18ec59f4/memu_py-1.4.0-cp313-abi3-manylinux_2_39_x86_64.whl", hash = "sha256:0da072a5df3ed7657f5a459633c04135dac3560932f179574872be735718e351", size = 403948, upload-time = "2026-02-06T00:59:15.276Z" },
-    { url = "https://files.pythonhosted.org/packages/a1/4e/7631a5adb70e8974038266671d60bc86de2682600674fa0fb06c3afdad1c/memu_py-1.4.0-cp313-abi3-win_amd64.whl", hash = "sha256:a69e4fc86feda6f5b52ff7ed544793958cc625d656762f6b6afd603cc5340d1e", size = 268153, upload-time = "2026-02-06T00:59:16.703Z" },
+    { url = "https://files.pythonhosted.org/packages/f1/71/b9d6409304f2455f1fdd2b8fcaef5419b1890ee802a1bd5b68e8b6d43bd2/memu_py-1.5.1-cp313-abi3-macosx_10_12_x86_64.whl", hash = "sha256:24d4a71650997267ad6f00a42cabdde4474e21ad04809cedd66ae5ed6c9f2784", size = 378268, upload-time = "2026-03-23T07:40:37Z" },
+    { url = "https://files.pythonhosted.org/packages/a7/06/c5af830fa14eece0105e0aa915e9c6d5b54820121bab72215c32ba812b5b/memu_py-1.5.1-cp313-abi3-macosx_11_0_arm64.whl", hash = "sha256:bb123aebc509e670449ff48bdd16ce71adfe620f9e6a0aed8b94f05d0d921f27", size = 375794, upload-time = "2026-03-23T07:40:38.547Z" },
+    { url = "https://files.pythonhosted.org/packages/87/a2/49753e1fa7cea4143a4494de7d6f9c8b25c9df4c110942c60cf57a92da63/memu_py-1.5.1-cp313-abi3-manylinux_2_39_aarch64.whl", hash = "sha256:f14ff39c47ecb3113c62ea9b498968d0bfbdd32467b1a1309a04237b22f96ac5", size = 400850, upload-time = "2026-03-23T07:40:39.844Z" },
+    { url = "https://files.pythonhosted.org/packages/fd/cf/a3de0da0f3467a2c8449b96f758fdf8911a97a4490f6546cd81f6ead3d20/memu_py-1.5.1-cp313-abi3-manylinux_2_39_x86_64.whl", hash = "sha256:14b091e7e26e5c61a6f366cc120cf8cbeaed38f8af84f74cd2c9f986b43d69c2", size = 408744, upload-time = "2026-03-23T07:40:41.104Z" },
+    { url = "https://files.pythonhosted.org/packages/e2/5b/9418f93faffdb1707f89f4741919df4add6d6c5500fa295cb670d30260c1/memu_py-1.5.1-cp313-abi3-win_amd64.whl", hash = "sha256:980613a3758c453436ac71a6f5ed607236355aa2d04eb8a9bb878cf176a98c17", size = 272511, upload-time = "2026-03-23T07:40:42.832Z" },
 ]
 
 [[package]]
@@ -1539,7 +1539,7 @@ requires-dist = [
     { name = "langfuse", specifier = ">=4.17.0" },
     { name = "langsmith", extras = ["claude-agent-sdk"], specifier = ">=0.4.0" },
     { name = "mcp", specifier = ">=2,<3" },
-    { name = "memu-py", specifier = "==1.4.0" },
+    { name = "memu-py", specifier = "==1.5.1" },
     { name = "opentelemetry-instrumentation-anthropic", specifier = ">=0.40.0" },
     { name = "pyjwt", extras = ["crypto"], specifier = ">=2.10.1" },
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8,<10" },
