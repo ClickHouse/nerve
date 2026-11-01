@@ -22,6 +22,7 @@ import os
 import signal
 import tempfile
 from collections import OrderedDict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
@@ -192,6 +193,13 @@ class SourceRunner:
             here, because the alternative is a phantom ``config.sync``
             section that duplicates it, or a runner that is silently never
             scheduled. See :meth:`CronService._source_schedule`.
+        cursor_ttl_days: TTL of the consumer cursors that the runner starts
+            for a source with ``starts_consumer_cursors`` (see
+            :meth:`_start_consumer_cursors`).
+
+    ``cursor_consumers`` returns the consumers that need a cursor on such a
+    source besides the consumers that already hold one. The cron service sets
+    it to the consumers that the ``messages`` gates of its current jobs name.
     """
 
     def __init__(
@@ -207,6 +215,7 @@ class SourceRunner:
         inbox_filter: InboxFilter | None = None,
         drop_hook: list[str] | None = None,
         schedule: str = "",
+        cursor_ttl_days: int = 2,
     ):
         self.source = source
         self.db = db
@@ -224,10 +233,38 @@ class SourceRunner:
         self.drop_hook = self._valid_drop_hook(drop_hook)
         self._drop_hook_seen: OrderedDict[tuple[str, str], None] = OrderedDict()
         self.schedule = schedule
+        self.cursor_ttl_days = cursor_ttl_days
+        self.cursor_consumers: Callable[[], Iterable[str]] = tuple
         self._lock = asyncio.Lock()
         self._condense_client: Any | None = None
         self.health = SourceHealth()
         self._notification_service: Any | None = None
+
+    async def _start_consumer_cursors(self) -> None:
+        """Make the records about to be stored unread for the consumers.
+
+        For a source with ``starts_consumer_cursors``, right before each
+        batch is stored: each consumer that :attr:`cursor_consumers` names,
+        and each consumer with a cursor on any source, gets a cursor on this
+        source at its newest message if it has none or its cursor has
+        expired (``Database.start_consumer_cursors``). A live cursor does not
+        move. Without this step, a consumer whose cursor is missing or
+        expired starts at the newest message when it reads, after the new
+        records. Best effort: a failure is logged and the batch is stored.
+        """
+        name = self.source.source_name
+        try:
+            started = await self.db.start_consumer_cursors(
+                name, list(self.cursor_consumers()), ttl_days=self.cursor_ttl_days,
+            )
+        except Exception as e:  # noqa: BLE001 - the records are stored anyway
+            logger.warning("Source %s: could not start the consumer cursors: %s", name, e)
+            return
+        if started:
+            logger.info(
+                "Source %s: started the cursors of consumers %s at the newest message",
+                name, ", ".join(started),
+            )
 
     def set_notification_service(self, service: Any) -> None:
         """Set the notification service for degradation alerts."""
@@ -421,6 +458,8 @@ class SourceRunner:
         dropped_count = len(dropped)
 
         # 2. Persist to inbox (post-preprocess, pre-condense — human-readable)
+        if records and getattr(self.source, "starts_consumer_cursors", False) is True:
+            await self._start_consumer_cursors()
         try:
             stored_ids = set(await self._persist_to_inbox(records))
         except Exception as e:

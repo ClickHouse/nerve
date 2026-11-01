@@ -360,6 +360,14 @@ sync:
                                    # close of the PRs it reported
     # deny_authors: []             # case-insensitive globs on the author login
     batch_size: 50
+  # Hosted mode only (needs channels.hosted): the mail that members of the
+  # agent send to its address, delivered by the channel gateway. The platform
+  # decides which mail reaches the agent. Switching it on needs a restart.
+  # See docs/sources.md "Hosted email".
+  # email:
+  #   enabled: false
+  #   schedule: "*/15 * * * *"     # the fallback drain; it also runs on delivery
+  #   batch_size: 30
 
 # Memory (memU)
 memory:

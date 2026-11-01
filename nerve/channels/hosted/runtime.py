@@ -3,10 +3,11 @@
 The runtime owns the token verifier, the stream manager, the operation
 runner, the inbox reader, one :class:`HostedChannel` for each chat provider in
 hosted mode, and one :class:`HostedSourceConsumer` for each hosted source. The
-hosted settings and the provider modes are read once at startup; a change
-needs a restart. A reload reads the gateway key file again and publishes the
-source subscriptions again. The source grant of each chat provider is read
-per event, so it follows a reload.
+hosted settings, the provider modes, and whether the email source is on are
+read once at startup; a change needs a restart. A reload reads the gateway key
+file again and publishes the source subscriptions again, so a source switched
+off by a reload is left out of them. The source grant of each chat provider is
+read per event, so it follows a reload.
 """
 
 from __future__ import annotations
@@ -67,9 +68,11 @@ def hosted_channel_providers(config: NerveConfig) -> list[str]:
 def hosted_providers(config: NerveConfig) -> list[str]:
     """Every provider whose traffic comes from the gateway: chat, then sources.
 
-    A hosted source that is switched off is included too: the gateway is
-    told that the agent subscribes to nothing, and the records already on
-    their way are kept for when it is switched on.
+    A hosted GitHub source that is switched off is included too: the gateway
+    is told that the agent subscribes to nothing, and the records already on
+    their way are kept for when it is switched on. Email is included only
+    while it is switched on (see
+    :func:`~nerve.channels.hosted.sources.hosted_sources`).
     """
     return hosted_channel_providers(config) + hosted_sources(config)
 

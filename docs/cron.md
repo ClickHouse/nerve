@@ -651,7 +651,7 @@ in when they arrive, and goes on without them after 10 seconds.
   says no, so does every later run;
 - the next run of each source runner, except a source whose buffer only the
   running instance writes, as records are delivered to it (the hosted GitHub
-  source and the channel drains `<channel>:observed`, `Source.push_fed`), while
+  and email sources and the channel drains `<channel>:observed`, `Source.push_fed`), while
   nothing delivered waits in that buffer: nothing is added to it while the
   machine is parked, so the scheduled run is not counted; a run with delivered
   records waiting counts;
@@ -674,7 +674,7 @@ timezone-aware, or it raises `ValueError`.
 `jobs` lists the jobs `GET /api/cron/jobs` lists. `forecast` is `run` or `skip`
 for a job's next run and `null` for a job without one (a disabled job, say);
 `reason` says why a run is forecast to be skipped. For a `Source.push_fed`
-source (the hosted GitHub source, the channel drains), `skip` means the
+source (the hosted GitHub and email sources, the channel drains), `skip` means the
 scheduled run is not counted in `next` because nothing delivered waits in its
 buffer; the run itself still fires.
 
@@ -706,9 +706,11 @@ See [sources.md](sources.md) for full documentation.
 
 ### Runs on delivery
 
-A hosted source — GitHub with `sync.github.mode: hosted`, see
-[Hosted GitHub source](sources.md#hosted-github-source) — does not wait for its
-schedule. When the channel gateway delivers records, the source's runner runs
+A hosted source does not wait for its schedule: GitHub with
+`sync.github.mode: hosted` (see
+[Hosted GitHub source](sources.md#hosted-github-source)), and email with
+`sync.email.enabled` (see [Hosted email](sources.md#hosted-email)). When the
+channel gateway delivers records, the source's runner runs
 at once, after any run of it already in progress (which may have fetched
 before the records arrived); deliveries during that drain make it run once
 more. Then every enabled job on the schedule (a job whose schedule did not

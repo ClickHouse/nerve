@@ -29,6 +29,19 @@ class Source(abc.ABC):
     # only way its records come in.
     push_fed: bool = False
 
+    # True for a source whose records the consumers must read also when a
+    # consumer has no cursor on it yet, or its cursor expired while the
+    # machine was parked: the hosted email source, which a person uses to send
+    # mail to the agent. Right before the runner stores a batch, each
+    # consumer that a ``messages`` gate of a current cron job names, and each
+    # consumer with a cursor on any source, gets a cursor on the source at its
+    # newest message if it has none or its cursor has expired
+    # (SourceRunner._start_consumer_cursors). A live cursor does not move.
+    # Without it, such a consumer's cursor starts at the newest message when
+    # the consumer reads the source, after the new records, so it never reads
+    # them, and a ``messages`` gate for any source does not see them.
+    starts_consumer_cursors: bool = False
+
     async def has_undrained(self, cursor: str | None) -> bool:
         """Whether a run from *cursor* would find delivered records waiting.
 

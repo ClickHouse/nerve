@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
@@ -398,6 +399,49 @@ class SourceStore:
                    updated_at=excluded.updated_at, expires_at=excluded.expires_at""",
             (consumer, source, cursor_seq, session_id, now.isoformat(), expires),
         )
+
+    async def start_consumer_cursors(
+        self, source: str, consumers: Iterable[str], ttl_days: int = 2,
+    ) -> list[str]:
+        """Start a cursor on *source* at its newest message for each consumer
+        that has none on it, or whose cursor on it has expired.
+
+        The consumers are *consumers* and each consumer that holds a cursor on
+        any source, expired or not. A started cursor is live for *ttl_days*.
+        An expired cursor gets what :meth:`get_consumer_cursor` gives it when
+        it is next read: the newest message and a new TTL. A live cursor keeps
+        its position and TTL. The newest message is read in the same
+        transaction as the writes, so a message that is stored later is unread
+        for every cursor started here. Returns the consumers whose cursor was
+        started.
+        """
+        moment = datetime.now(UTC)
+        now = moment.isoformat()
+        expires = (moment + timedelta(days=ttl_days)).isoformat()
+        started: list[str] = []
+        async with self._atomic():
+            async with self.db.execute("SELECT DISTINCT consumer FROM consumer_cursors") as cursor:
+                names = {row[0] async for row in cursor}
+            names.update(name for name in consumers if name)
+            async with self.db.execute(
+                "SELECT COALESCE(MAX(rowid), 0) FROM source_messages WHERE source = ?", (source,),
+            ) as cursor:
+                newest = (await cursor.fetchone())[0]
+            for consumer in sorted(names):
+                cursor = await self.db.execute(
+                    """INSERT INTO consumer_cursors (consumer, source, cursor_seq, updated_at, expires_at)
+                       VALUES (?, ?, ?, ?, ?)
+                       ON CONFLICT(consumer, source) DO UPDATE SET
+                           cursor_seq=excluded.cursor_seq, updated_at=excluded.updated_at,
+                           expires_at=excluded.expires_at
+                       WHERE consumer_cursors.expires_at IS NOT NULL
+                         AND consumer_cursors.expires_at <= ?""",
+                    (consumer, source, newest, now, expires, now),
+                )
+                if cursor.rowcount:
+                    started.append(consumer)
+                await cursor.close()
+        return started
 
     async def keep_consumer_cursors_alive(
         self, consumer: str, sources: list[str] | None = None, ttl_days: int = 2,

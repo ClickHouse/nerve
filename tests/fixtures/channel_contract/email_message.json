@@ -1,0 +1,71 @@
+{
+  "event_id": "email:0100019a2b3c4d5e-example-message-0001-000000",
+  "message_revision_id": "0100019a2b3c4d5e-example-message-0001-000000",
+  "tenant_id": "6f1d3a2c-0b4e-4f7a-9c1d-2e5b8a3f7c04",
+  "agent_id": "b28c5e91-7d4a-4c3b-8f61-0a9e2d4b6c17",
+  "connection_id": "8c82bd61-913c-40f2-b7cb-c50ba5c56a07",
+  "provider": "email",
+  "kind": "source_record",
+  "conversation": {
+    "id": "92299bd5-d16c-4453-911b-2d913a065f1c",
+    "kind": "direct"
+  },
+  "admission": {
+    "purpose": "observe",
+    "observe": {
+      "provenance": {
+        "provider": "email",
+        "issuer": "",
+        "installation_id": ""
+      }
+    }
+  },
+  "delivery": {
+    "inbox_id": "1020",
+    "received_at": "2026-09-16T11:04:07.125Z"
+  },
+  "occurred_at": "2026-09-16T11:04:05Z",
+  "record": {
+    "id": "0100019a2b3c4d5e-example-message-0001-000000",
+    "record_type": "email_message",
+    "summary": "Email from Robin Example: Re: Quarterly report draft",
+    "content": "From: Robin Example (member 92299bd5-d16c-4453-911b-2d913a065f1c)\nSubject: Re: Quarterly report draft\nDate: Wed, 16 Sep 2026 13:04:01 +0200\nAttachments: 1 (listed in the metadata, not delivered)\n\nThanks for the summary. Could you check the numbers in the attached draft\nbefore Friday?\n\nRobin",
+    "timestamp": "2026-09-16T11:04:05Z",
+    "metadata": [
+      {
+        "key": "sender_principal_id",
+        "value": "92299bd5-d16c-4453-911b-2d913a065f1c"
+      },
+      {
+        "key": "sender_name",
+        "value": "Robin Example"
+      },
+      {
+        "key": "subject",
+        "value": "Re: Quarterly report draft"
+      },
+      {
+        "key": "message_id",
+        "value": "<reply-0001@mail.example.test>"
+      },
+      {
+        "key": "in_reply_to",
+        "value": "<summary-0001@agents.example.test>"
+      },
+      {
+        "key": "thread_id",
+        "value": "<report-0001@mail.example.test>"
+      },
+      {
+        "key": "attachments",
+        "values": [
+          "draft.pdf; application/pdf; 48213 bytes"
+        ]
+      },
+      {
+        "key": "truncated",
+        "value": "false"
+      }
+    ]
+  }
+}
