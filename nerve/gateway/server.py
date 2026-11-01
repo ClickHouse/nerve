@@ -78,6 +78,7 @@ _engine: AgentEngine | None = None
 _cron_service = None  # CronService
 _workflow_run_service = None  # WorkflowRunService (nerve.workflows)
 _review_loop_service = None  # ReviewLoopService (nerve.workflows.review_loop)
+_code_review_service = None
 # StreamableHTTPSessionManager assigned during lifespan when
 # config.mcp_endpoint.enabled. The /mcp/v1 mount handler reads it; until
 # lifespan finishes building it, the mount returns 503.
@@ -779,6 +780,22 @@ async def lifespan(app: FastAPI):
                 except Exception:
                     pass
 
+        global _code_review_service
+        if config.code_review.profiles:
+            from nerve.code_review import set_service
+            from nerve.code_review.service import CodeReviewService
+            try:
+                _code_review_service = CodeReviewService(config, db, _workflow_run_service, notification_service)
+                await _code_review_service.start()
+                set_service(_code_review_service)
+                startup_cleanups.append(("code review service", _code_review_service.stop))
+            except Exception:
+                logger.exception("Code Review service failed to start")
+                if _code_review_service:
+                    await _code_review_service.stop()
+                _code_review_service = None
+                set_service(None)
+
         # One-shot cleanup of retired houseofagents artifacts. Gated on the
         # NERVE-MANAGED binary existing (our own bin/ is ours): a standalone
         # houseofagents install the user runs outside Nerve keeps its
@@ -1079,6 +1096,11 @@ async def lifespan(app: FastAPI):
         _activity_reporter = None
     if cron_task:
         await cron_task.stop()
+    if _code_review_service is not None:
+        from nerve.code_review import set_service
+        await _code_review_service.stop()
+        _code_review_service = None
+        set_service(None)
     if _review_loop_service is not None:
         try:
             await _review_loop_service.stop()

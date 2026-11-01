@@ -111,6 +111,9 @@ class WorkflowRunService:
         self._exec_tasks: dict[str, asyncio.Task] = {}
         # run_id -> codex journal dollars already folded into recorded cost
         self._codex_live_base: dict[str, float] = {}
+        # Measured native parent usage survives a missing final usage event.
+        # Heuristic child journal estimates must never become a permanent floor.
+        self._codex_parent_floor: dict[str, float] = {}
         # Detached kill/teardown/dispatch tasks (referenced until done).
         self._kill_tasks: set[asyncio.Task] = set()
         self._dispatch_lock = asyncio.Lock()
@@ -123,6 +126,7 @@ class WorkflowRunService:
         # from _finalize_terminal with the fresh terminal run row. Listeners
         # must hand off quickly (enqueue) — never start work inline.
         self._completion_listeners: list[Any] = []
+        self._dispatch_guards: list[Any] = []
 
     # ------------------------------------------------------------------ #
     #  Lifespan                                                           #
@@ -360,6 +364,29 @@ class WorkflowRunService:
     async def get_run(self, run_id: str) -> dict | None:
         return await self.db.get_workflow_run(run_id)
 
+    async def settled_spend(self, run_id: str) -> float | None:
+        """Final controller accounting, after executor and teardown have ended.
+
+        Terminal state is recorded before kill enforcement, so controllers
+        must not release a reservation just because a row is terminal.
+        """
+        run = await self.db.get_workflow_run(run_id)
+        if run is None:
+            return 0.0
+        if run["status"] in ACTIVE_STATUSES or run_id in self._exec_tasks:
+            return None
+        session_id = run.get("session_id") or self._session_id(run_id)
+        if self.engine.is_session_running(session_id) or self.engine.has_live_background_tasks(session_id):
+            return None
+        if any(not task.done() and task.get_name() in {
+            f"workflow-kill-{run_id}", f"workflow-teardown-{run_id}",
+        } for task in self._kill_tasks):
+            return None
+        recorded = await self.db.get_session_effective_cost(session_id)
+        # Keep the high-water metered value on interrupted turns; recorded cost
+        # can arrive late or omit an interrupted CLI turn altogether.
+        return max(float(run.get("spent_usd") or 0), recorded)
+
     async def list_runs(
         self, status: str | None = None, limit: int = 50, offset: int = 0,
     ) -> list[dict]:
@@ -398,7 +425,28 @@ class WorkflowRunService:
                 # creating the executor task (zombie 'running' row).
                 await asyncio.shield(self._promote(run["id"]))
 
+    def add_dispatch_guard(self, callback: Any) -> None:
+        if callback not in self._dispatch_guards:
+            self._dispatch_guards.append(callback)
+
+    def remove_dispatch_guard(self, callback: Any) -> None:
+        if callback in self._dispatch_guards:
+            self._dispatch_guards.remove(callback)
+
     async def _promote(self, run_id: str) -> None:
+        run = await self.db.get_workflow_run(run_id)
+        if not run or run["status"] != "pending":
+            return
+        for guard in self._dispatch_guards:
+            try:
+                reason = await guard(run)
+            except Exception:
+                logger.exception("workflow dispatch guard failed for %s", run_id)
+                reason = "dispatch guard unavailable"
+            if reason:
+                if await self.db.transition_workflow_run(run_id, "failed", expect=("pending",), error=str(reason)):
+                    await self._finalize_terminal(run_id, "failed", {"reason": str(reason)})
+                return
         flipped = await self.db.transition_workflow_run(
             run_id, "running", expect=("pending",),
         )
@@ -696,8 +744,8 @@ class WorkflowRunService:
                     )
         finally:
             watches.close()
-            self._exec_tasks.pop(run_id, None)
             self._codex_live_base.pop(run_id, None)
+            self._codex_parent_floor.pop(run_id, None)
             fresh = await self.db.get_workflow_run(run_id)
             if fresh:
                 self._write_run_json(fresh)
@@ -708,6 +756,9 @@ class WorkflowRunService:
             self._spawn_detached(
                 self._teardown_client(run_id), f"workflow-teardown-{run_id}",
             )
+            # No await between registering teardown and releasing executor:
+            # controllers must never observe a gap with neither owner present.
+            self._exec_tasks.pop(run_id, None)
             # Free slot -> promote the queue. Detached: _execute may be
             # running its finally under cancellation, and dispatch must not
             # be interruptible mid-promotion.
@@ -758,7 +809,7 @@ class WorkflowRunService:
     def _is_quiet(run: dict | None) -> bool:
         """Loop-owned legs are reported by their controller, not per-run
         notifications (a 3-iteration loop would otherwise ping 6-8 times)."""
-        return str((run or {}).get("created_by") or "").startswith("review-loop:")
+        return str((run or {}).get("created_by") or "").startswith(("review-loop:", "code-review:"))
 
     # ------------------------------------------------------------------ #
     #  Budget monitor                                                     #
@@ -825,11 +876,18 @@ class WorkflowRunService:
         recorded = await self.db.get_session_effective_cost(session_id)
         live = 0.0 if final else self._live_estimate(run)
         spent = round(recorded + live, 6)
+        if run["engine"] == ENGINE_CODEX:
+            parent = self.engine.get_live_codex_parent_cost(session_id)
+            floor = max(self._codex_parent_floor.get(run_id, 0.0), recorded + parent)
+            self._codex_parent_floor[run_id] = floor
+            spent = round(max(spent, floor), 6)
         if abs(spent - float(run.get("spent_usd") or 0.0)) > 1e-9:
-            await self.db.update_workflow_run(run_id, {"spent_usd": spent})
-            fresh = await self.db.get_workflow_run(run_id)
+            fresh = await self.db.update_running_workflow_spend(
+                run_id, spent,
+            )
             if fresh:
                 await self._broadcast(fresh)
+                return float(fresh.get("spent_usd") or 0.0)
         return spent
 
     def _live_estimate(self, run: dict) -> float:
@@ -855,7 +913,7 @@ class WorkflowRunService:
         return estimate_turn_cost({"output_tokens": tokens}, spec_model)
 
     def _live_estimate_codex(self, run: dict) -> float:
-        """Price Ultracode journals attributed to this run.
+        """Price the native parent turn plus Ultracode journals for this run.
 
         Attribution prefers the exact run-id set the session's live Codex
         client tracked for its current turn; the fallback is heuristic
@@ -868,9 +926,10 @@ class WorkflowRunService:
         from nerve.agent.backends.codex import ultracode
 
         session_id = run.get("session_id") or ""
+        parent = self.engine.get_live_codex_parent_cost(session_id)
         run_dirpath = Path(self.config.codex.home_dir).expanduser() / "ultracode" / "runs"
         if not run_dirpath.is_dir():
-            return 0.0
+            return parent
         exact_ids = self.engine.get_codex_ultracode_run_ids(session_id)
         started = _iso_to_epoch(run.get("started_at"))
         run_cwd = self._effective_cwd(run)
@@ -900,7 +959,7 @@ class WorkflowRunService:
             self._codex_live_base[run["id"]] = total
             return 0.0
         base = self._codex_live_base.get(run["id"], 0.0)
-        return max(0.0, total - base)
+        return parent + max(0.0, total - base)
 
     def _journal_cost(self, journal: dict, run: dict) -> float:
         """Dollar-price one Ultracode journal (per-worker models when known,

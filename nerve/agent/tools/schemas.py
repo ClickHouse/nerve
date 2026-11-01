@@ -1097,3 +1097,24 @@ PROPOSE_CONFIG_CHANGE_SCHEMA = {
     },
     "required": ["title", "changes"],
 }
+
+# Code Review tools are bound to the authenticated workflow session.
+CODE_REVIEW_INPUT_SCHEMA = {"type": "object", "properties": {}, "required": [], "additionalProperties": False}
+CODE_REVIEW_SOURCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "revision": {"type": "string", "enum": ["head", "base", "merge_base"]},
+        "path": {"type": "string", "description": "Repository-relative file path."},
+        "start_line": {"type": "integer", "minimum": 1, "default": 1},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 400, "default": 200},
+    },
+    "required": ["revision", "path"], "additionalProperties": False,
+}
+CODE_REVIEW_CHECKPOINT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "stage": {"type": "string", "enum": ["description.md", "diagrams.md", "review.md", "verdict.json"]},
+        "content": {"type": "string", "description": "Full UTF-8 Markdown or JSON stage text."},
+    },
+    "required": ["stage", "content"], "additionalProperties": False,
+}

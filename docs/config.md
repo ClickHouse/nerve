@@ -284,6 +284,7 @@ reload cannot inspect, and are documented here only.
 |--------|-----|
 | `gateway.host`, `.port`, `.ssl.*` | the socket is already bound |
 | `gateway.loop` | the event loop is chosen when uvicorn starts. `asyncio` (the default) spawns subprocesses with `vfork()`; `uvloop` (also what `auto` picks when it is installed) uses a full `fork()`, which blocks the loop for seconds per spawn once the process is large |
+| `code_review` | profiles, schedules and budgets are captured at startup; pausing from the board is immediate and persistent |
 | `timezone` | the cron scheduler and every trigger built from it carry the old zone |
 | `agent.max_concurrent` | its semaphore cannot be resized under in-flight turns |
 | `workspace` | the skill manager, the tool context, the memory bridges and each session's working directory all captured it at startup. Following it in one of them and not the others would be worse than not following it at all |
@@ -2488,3 +2489,11 @@ restart. See [Platform activity reporting](platform-activity.md).
 | `platform.activity_socket` | path | `/run/nerve/guestd.sock` | The platform's local activity socket. `""` switches reporting off |
 | `platform.activity_interval_seconds` | int | `30` | Seconds between reports when nothing changes (held to 5–300) |
 | `platform.lease_ttl_seconds` | int | `120` | Lifetime of a keep-awake lease, renewed every half lifetime (held to 10–3600) |
+
+### Pull request Code Review
+
+`code_review` is a shareable settings section (restart required), with `board_name`
+and a `profiles` list. Each profile supplies `id`, `repository`, `query`, `enabled`
+(default false), `schedule`, `timezone`, `version_budget_usd`, `daily_budget_usd` and
+`max_attempts`. See [Code Review](code-review.md) for defaults, budget accounting,
+artifact retention, pause behavior and installation checks.

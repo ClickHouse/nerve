@@ -46,6 +46,7 @@ _RESTART_ONLY_PATHS = (
     "auth.jwt_secret",
     "channels.hosted",
     "codex.home_dir",
+    "code_review",
     "external_agents.enabled",
     "gateway.host",
     "gateway.loop",

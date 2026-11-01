@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { useReviewBoardName } from '../../hooks/useReviewBoardName';
 import { useLocation, useNavigate } from 'react-router-dom';
 import { useAuthStore } from '../../stores/authStore';
 import { useNotificationStore } from '../../stores/notificationStore';
@@ -12,6 +13,7 @@ import { ThemeToggle } from './ThemeToggle';
 import { NAV_ITEMS, visibleNavItems } from './navItems';
 
 export function NavRail() {
+  const reviewBoardName = useReviewBoardName();
   const location = useLocation();
   const navigate = useNavigate();
   const { logout } = useAuthStore();
@@ -32,7 +34,7 @@ export function NavRail() {
     api.getUltracodeDashboardStatus().then(s => setUltracodeEnabled(s.enabled)).catch(() => {});
   }, []);
 
-  const visibleItems = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown, setupFinished });
+  const visibleItems = visibleNavItems(NAV_ITEMS.map(item => item.path === '/tasks-code-review' ? { ...item, label: reviewBoardName } : item), { hosted, ultracodeEnabled, setupKnown, setupFinished });
 
   return (
     <div className="w-14 bg-surface border-r border-border flex flex-col items-center py-3 shrink-0">
