@@ -82,10 +82,13 @@ SENDER = EVENT["conversation"]["id"]
 
 def email_event(**record: Any) -> dict[str, Any]:
     """The contract's ``email_message`` event without its delivery, as the
-    fake gateway stores it, with *record* members changed."""
+    fake gateway stores it, with *record* members changed. The event ID
+    follows the record ID, as the gateway builds it."""
     event = copy.deepcopy(EVENT)
     del event["delivery"]
     event["record"].update(record)
+    event["event_id"] = f"email:{event['record']['id']}"
+    event["message_revision_id"] = event["record"]["id"]
     return event
 
 
