@@ -577,9 +577,6 @@ class CronService:
 
         # Register source runners (pure ingestors — no engine needed)
         self._register_source_runners()
-        # The scheduler is not running yet, so no runner has run when the
-        # consumer cursors of a source that asks for them start.
-        await self._start_consumer_cursors(self._source_runners)
 
         # Daily cleanup of expired messages and consumer cursors
         self.scheduler.add_job(
@@ -986,48 +983,25 @@ class CronService:
             from nerve.sources.registry import build_source_runners
 
             self._source_runners = build_source_runners(self._source_config(), self.db)
+            for runner in self._source_runners:
+                runner.cursor_consumers = self._gate_consumers
             self._schedule_source_runners(self._source_runners)
         except Exception as e:  # noqa: BLE001 — boot must not fail on a bad source
             logger.warning("Failed to register source runners: %s", e, exc_info=True)
 
-    async def _start_consumer_cursors(self, runners: list) -> None:
-        """Start the consumer cursors of the sources that ask for them.
+    def _gate_consumers(self) -> set[str]:
+        """The consumers that the ``messages`` gates of the current jobs name.
 
-        For each runner whose source has ``starts_consumer_cursors`` (see
-        :class:`~nerve.sources.base.Source`), every consumer that a
-        ``messages`` gate of a loaded job names, and every consumer with a
-        cursor on another source, gets a cursor on the source at its newest
-        message, unless it has one already. Called before such a runner can
-        run, so its first records are unread for those consumers. Best
-        effort: a failure is logged, and the source runs as it would without
-        the cursors.
+        A runner whose source has ``starts_consumer_cursors`` asks for them
+        before it stores records (``SourceRunner.cursor_consumers``). The jobs
+        are read at that time, so a consumer that a cron reload adds is in.
         """
         from nerve.cron.gates import MessagesGate
 
-        sources = [
-            runner.source.source_name for runner in runners
-            if getattr(runner.source, "starts_consumer_cursors", False) is True
-        ]
-        if not sources:
-            return
-        consumers = {
+        return {
             gate.consumer for job in self._jobs for gate in job.gates
             if isinstance(gate, MessagesGate)
         }
-        ttl_days = getattr(getattr(self.config, "sync", None), "consumer_cursor_ttl_days", None)
-        if not isinstance(ttl_days, int) or isinstance(ttl_days, bool) or ttl_days <= 0:
-            ttl_days = 2
-        for source in sources:
-            try:
-                started = await self.db.start_consumer_cursors(source, consumers, ttl_days=ttl_days)
-            except Exception as e:  # noqa: BLE001 - the source still runs
-                logger.warning("Could not start the consumer cursors of source %s: %s", source, e)
-                continue
-            if started:
-                logger.info(
-                    "Source %s: started the cursors of consumers %s at its newest message",
-                    source, ", ".join(started),
-                )
 
     async def reload_sources(self) -> dict:
         """Rebuild source runners from config and reschedule them without a
@@ -1060,8 +1034,6 @@ class CronService:
             # -- Plan: everything that can fail, before anything is applied ----
             new_runners = build_source_runners(self._source_config(), self.db)  # may raise → caller reports
             planned = self._plan_source_runners(new_runners)
-            # Before the new runners can run; it never raises.
-            await self._start_consumer_cursors(new_runners)
 
             # -- Apply: scheduler bookkeeping only -----------------------------
             old_ids = {r.job_id for r in self._source_runners}
@@ -1069,6 +1041,8 @@ class CronService:
                 if self.scheduler.get_job(jid) is not None:
                     self.scheduler.remove_job(jid)
             self._source_runners = new_runners
+            for runner in new_runners:
+                runner.cursor_consumers = self._gate_consumers
             self._apply_source_runners(planned)
             new_ids = {runner.job_id for runner, _, _ in planned}
         self._schedule_changed()

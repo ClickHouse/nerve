@@ -54,7 +54,7 @@ Consumers read from the inbox using the `poll_source` agent tool with a named co
 
 **Key properties:**
 - Consumer cursors are independent — multiple consumers can read the same source at different positions
-- New consumer cursors initialize to the latest message (no backlog flooding). The hosted email source starts the cursors of the known consumers when its runner is registered, before its first mail (see [Hosted email](#hosted-email))
+- New consumer cursors initialize to the latest message (no backlog flooding). The hosted email source starts missing and expired cursors of the known consumers right before it stores new mail, so that mail is unread (see [Hosted email](#hosted-email))
 - Consumer cursors expire after N days of inactivity (configurable, default: 2 days); a `messages` gate that checks the consumer renews the cursors it reads (see [cron.md](cron.md#messages))
 - Cross-source deduplication happens naturally because one agent session sees messages from all sources
 
@@ -468,11 +468,14 @@ There is no polling mode: this process does not connect to a mail server.
   fallback. While nothing waits in the buffer, that run is not the instance's
   next scheduled task, so a platform that parks the machine does not wake it
   for that run.
-- **The first mail is unread.** When the cron service registers the runner,
-  each consumer that a `messages` gate names, and each consumer that has a
-  cursor on another source, gets a cursor on `email` at its newest message,
-  unless it has one already. The first mail after the switch is then unread
-  for those consumers, for example for the default inbox processor.
+- **New mail is unread, also after a long park.** Right before the runner
+  stores mail, each consumer that a `messages` gate of a current cron job
+  names, and each consumer with a cursor on any source, gets a cursor on
+  `email` at its newest message if it has none or its cursor has expired. A
+  live cursor does not move. So the first mail after the switch, and a mail
+  that wakes a machine that was parked for longer than
+  `sync.consumer_cursor_ttl_days`, are unread for those consumers, for
+  example for the default inbox processor.
 - **The subscription.** While the source is on, the subscriptions that Nerve
   publishes include `{"provider":"email","filters":{}}`, with no other
   members. When the subscriptions do not include it, the gateway refuses mail

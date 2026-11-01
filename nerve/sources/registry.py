@@ -296,6 +296,7 @@ def build_source_runners(
                 condense_model=condense_model,
                 condense_client_factory=condense_factory,
                 ttl_days=ttl_days,
+                cursor_ttl_days=config.sync.consumer_cursor_ttl_days,
             ))
             logger.info("Registered source: email (hosted, batch=%d)", email.batch_size)
         else:

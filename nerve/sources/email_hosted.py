@@ -13,9 +13,10 @@ server, and there is no polling mode.
 
 The source runs as ``source:email``, with condensing, health checks,
 consumer cursors and ``messages`` gates. It has no guardrail and no drop
-hook, because the platform admits only member mail. When its runner is
-registered, the consumers get a cursor on it before the first mail arrives
-(``starts_consumer_cursors``), so the first mail is unread for them.
+hook, because the platform admits only member mail. Right before the
+runner stores mail, a consumer without a cursor on the source, or with an
+expired one, gets a cursor at the newest message (``starts_consumer_cursors``),
+so the first mail, and the first mail after a long park, is unread for it.
 
 A record names the sender by principal ID and display name, never by an
 email address. Its content is the member's text as written, rendered as
@@ -54,7 +55,8 @@ class HostedEmailSource(HostedRecordSource):
     source_name = SOURCE_NAME
     list_keys = _LIST_KEYS
     flag_keys = _FLAG_KEYS
-    # A member who sends the first mail expects the agent to read it.
+    # A member who sends a mail expects the agent to read it, also the first
+    # one and one that arrives after the machine was parked for days.
     starts_consumer_cursors = True
 
     def __init__(self, db: Database):

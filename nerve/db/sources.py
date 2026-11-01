@@ -404,17 +404,20 @@ class SourceStore:
         self, source: str, consumers: Iterable[str], ttl_days: int = 2,
     ) -> list[str]:
         """Start a cursor on *source* at its newest message for each consumer
-        that has none on it.
+        that has none on it, or whose cursor on it has expired.
 
         The consumers are *consumers* and each consumer that holds a cursor on
-        another source, expired or not. A consumer that has a cursor on
-        *source* keeps it as it is, expired or not, so a second call starts
-        nothing. The newest message is read in the same transaction as the
-        inserts, so a message that is stored later is unread for every cursor
-        started here. Returns the consumers whose cursor was started.
+        any source, expired or not. A started cursor is live for *ttl_days*.
+        An expired cursor gets what :meth:`get_consumer_cursor` gives it when
+        it is next read: the newest message and a new TTL. A live cursor keeps
+        its position and TTL. The newest message is read in the same
+        transaction as the writes, so a message that is stored later is unread
+        for every cursor started here. Returns the consumers whose cursor was
+        started.
         """
-        now = datetime.now(UTC)
-        expires = (now + timedelta(days=ttl_days)).isoformat()
+        moment = datetime.now(UTC)
+        now = moment.isoformat()
+        expires = (moment + timedelta(days=ttl_days)).isoformat()
         started: list[str] = []
         async with self._atomic():
             async with self.db.execute("SELECT DISTINCT consumer FROM consumer_cursors") as cursor:
@@ -428,8 +431,12 @@ class SourceStore:
                 cursor = await self.db.execute(
                     """INSERT INTO consumer_cursors (consumer, source, cursor_seq, updated_at, expires_at)
                        VALUES (?, ?, ?, ?, ?)
-                       ON CONFLICT(consumer, source) DO NOTHING""",
-                    (consumer, source, newest, now.isoformat(), expires),
+                       ON CONFLICT(consumer, source) DO UPDATE SET
+                           cursor_seq=excluded.cursor_seq, updated_at=excluded.updated_at,
+                           expires_at=excluded.expires_at
+                       WHERE consumer_cursors.expires_at IS NOT NULL
+                         AND consumer_cursors.expires_at <= ?""",
+                    (consumer, source, newest, now, expires, now),
                 )
                 if cursor.rowcount:
                     started.append(consumer)

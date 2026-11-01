@@ -459,7 +459,7 @@ class TestStreams:
 
 
 # ---------------------------------------------------------------------- #
-#  The first mail, and the jobs that a delivery runs                      #
+#  New mail is unread, and the jobs that a delivery runs                  #
 # ---------------------------------------------------------------------- #
 
 
@@ -484,6 +484,8 @@ async def running_cron(harness: Harness, jobs: list[dict[str, Any]]) -> AsyncIte
     harness.config.cron.system_file = cron_dir / "system.yaml"
     harness.config.cron.gate_plugins_dir = cron_dir / "gates"
     harness.config.cron.delivery_debounce_seconds = 1
+    # No polling GitHub source: the test makes no gh call.
+    harness.config.sync.github.enabled = harness.config.sync.github.mode == "hosted"
     write_jobs(harness.config.cron.jobs_file, jobs)
     turns: list[str] = []
 
@@ -517,15 +519,26 @@ async def cursors(db) -> dict[tuple[str, str], int]:
         return {(row[0], row[1]): row[2] async for row in rows}
 
 
+async def deliver(harness: Harness, stream, **record: Any) -> None:
+    """Store one mail at the gateway and wait until Nerve takes it."""
+    inbox_id = harness.gateway.store(email_event(**record))
+    await stream.nudge("observe")
+    assert (await harness.acknowledged(inbox_id))[inbox_id] == "accepted"
+
+
+def email_runner_of(cron: CronService):
+    (runner,) = [r for r in cron._source_runners if r.job_id == "source:email"]
+    return runner
+
+
 @pytest.mark.asyncio
-class TestFirstMail:
+class TestNewMailIsUnread:
     async def test_a_fresh_agent_reads_its_first_mail(self, tmp_path, db, monkeypatch):
         """No consumer has read anything yet. The default inbox processor's
         gate passes for the first mail, which the delivery drained at once,
         and its poll returns that mail. The other jobs do not run."""
         harness = await start(tmp_path, db, monkeypatch, github=False, email=True)
         try:
-            assert await cursors(db) == {}
             jobs = [
                 default_inbox_job(),
                 {"id": "pr-monitor", "schedule": NEVER, "prompt": "Look at the PRs",
@@ -533,16 +546,15 @@ class TestFirstMail:
                 {"id": "daily-briefing", "schedule": NEVER, "prompt": "Brief me"},
             ]
             async with running_cron(harness, jobs) as (_, turns):
-                assert await cursors(db) == {("inbox", "email"): 0}
+                assert await cursors(db) == {}
                 stream = await harness.stream()
-                inbox_id = harness.gateway.store(email_event())
 
-                await stream.nudge("observe")
+                await deliver(harness, stream)
 
-                await harness.acknowledged(inbox_id)
                 await eventually(lambda: turns == ["inbox-processor"])
                 await asyncio.sleep(1.5)
                 assert turns == ["inbox-processor"]
+                assert await cursors(db) == {("inbox", "email"): 0}
                 logs = await db.get_cron_logs(job_id="source:email", limit=10)
                 assert logs and all(log["status"] == "success" for log in logs)
             text = await poll_all(harness, "inbox")
@@ -561,11 +573,9 @@ class TestFirstMail:
         try:
             async with running_cron(harness, [default_inbox_job()]) as (_, turns):
                 stream = await harness.stream()
-                inbox_id = harness.gateway.store(email_event())
 
-                await stream.nudge("observe")
+                await deliver(harness, stream)
 
-                await harness.acknowledged(inbox_id)
                 await eventually(lambda: turns == ["inbox-processor"])
             inbox = await poll_all(harness, "inbox")
             weekly = await poll_all(harness, "weekly")
@@ -574,48 +584,111 @@ class TestFirstMail:
         finally:
             await stop(harness)
 
-    async def test_a_cursor_is_never_moved_and_a_restart_starts_nothing(self, db):
+    async def test_the_first_mail_after_a_long_park_is_read(self, tmp_path, db, monkeypatch):
+        """The machine was parked for longer than the cursor TTL: every cursor
+        of the inbox consumer expired. The mail that wakes it passes the gate,
+        and the poll returns it instead of starting after it."""
+        await db.insert_source_messages([email_record(n) for n in range(2)], "email")
+        read = await db.get_source_max_rowid("email")
+        # Written three days ago with a TTL of two days: expired a day ago.
+        await db.set_consumer_cursor("inbox", "email", read, ttl_days=-1)
+        await db.set_consumer_cursor("inbox", "github", 0, ttl_days=-1)
+        harness = await start(tmp_path, db, monkeypatch, github=False, email=True)
+        try:
+            async with running_cron(harness, [default_inbox_job()]) as (_, turns):
+                stream = await harness.stream()
+
+                await deliver(harness, stream)
+
+                await eventually(lambda: turns == ["inbox-processor"])
+                assert await db.peek_consumer_cursor("inbox", "email") == read
+            text = await poll_all(harness, "inbox")
+            assert "email: 1 new" in text
+            assert f"email: {EVENT['record']['summary']}" in text
+        finally:
+            await stop(harness)
+
+    async def test_a_live_cursor_with_unread_mail_does_not_move(self, tmp_path, db, monkeypatch):
+        """A scheduled drain and a manual one leave a live cursor where it is,
+        so the mail it has not read stays unread."""
         await db.insert_source_messages([email_record(n) for n in range(3)], "email")
         await db.set_consumer_cursor("inbox", "email", 1)
-        await db.set_consumer_cursor("expired", "email", 0, ttl_days=-1)
-        config = hosted_config()
+        harness = await start(tmp_path, db, monkeypatch, github=False, email=True)
+        try:
+            async with running_cron(harness, [default_inbox_job()]) as (cron, _):
+                runner = email_runner_of(cron)
+                for n, drain in enumerate((
+                    cron._run_source_wrapper(runner), runner.run(),
+                )):
+                    await HostedSourceConsumer("email", db, lambda: harness.config).deliver(
+                        decoded(email_event(id=f"{RECORD_ID}-new-{n}")),
+                    )
+                    await drain
+                    assert await db.peek_consumer_cursor("inbox", "email") == 1
+            assert "email: 4 new" in await poll_all(harness, "inbox")
+        finally:
+            await stop(harness)
+
+    async def test_a_consumer_that_a_cron_reload_adds_reads_the_next_mail(self, tmp_path, db, monkeypatch):
+        harness = await start(tmp_path, db, monkeypatch, github=False, email=True)
+        try:
+            async with running_cron(harness, [default_inbox_job()]) as (cron, turns):
+                stream = await harness.stream()
+                await deliver(harness, stream)
+                await eventually(lambda: turns == ["inbox-processor"])
+                first = await db.get_source_max_rowid("email")
+                write_jobs(harness.config.cron.jobs_file, [
+                    default_inbox_job(),
+                    {"id": "triage", "schedule": NEVER, "prompt": "Triage the mail",
+                     "run_if": [{"type": "messages", "consumer": "triage"}]},
+                ])
+                await cron.reload()
+                assert ("triage", "email") not in await cursors(db)
+
+                await deliver(harness, stream, id=f"{RECORD_ID}-2", summary="Email from Robin Example: Second")
+
+                await eventually(lambda: "triage" in turns)
+                assert await db.peek_consumer_cursor("triage", "email") == first
+            text = await poll_all(harness, "triage")
+            assert "email: 1 new" in text and "email: Email from Robin Example: Second" in text
+        finally:
+            await stop(harness)
+
+    async def test_a_restart_or_a_second_step_moves_no_cursor(self, db):
+        await db.insert_source_messages([email_record(n) for n in range(3)], "email")
+        await db.set_consumer_cursor("inbox", "email", 1)
 
         for _ in range(2):
-            service = CronService(config, AsyncMock(), db)
-            service._jobs = []
-            service._register_source_runners()
-            await service._start_consumer_cursors(service._source_runners)
+            assert await db.start_consumer_cursors("email", ["inbox"], ttl_days=2) == []
 
-        assert await cursors(db) == {("inbox", "email"): 1, ("expired", "email"): 0}
-        assert await db.peek_consumer_cursor("expired", "email") is None
+        assert await cursors(db) == {("inbox", "email"): 1}
 
-    async def test_a_new_consumer_starts_at_the_newest_mail(self, db):
-        """A mail stored before the source was registered, say before a
-        restart, is not new to a consumer that starts reading now."""
+    async def test_a_missing_or_expired_cursor_starts_at_the_newest_mail(self, db):
+        """A mail stored before, say before a restart, is not new to a
+        consumer that starts reading now."""
         await db.insert_source_messages([email_record(n) for n in range(2)], "email")
         newest = await db.get_source_max_rowid("email")
+        await db.set_consumer_cursor("expired", "email", 0, ttl_days=-1)
 
         started = await db.start_consumer_cursors("email", ["triage", ""], ttl_days=2)
 
-        assert started == ["triage"]
+        assert started == ["expired", "triage"]
         assert await db.peek_consumer_cursor("triage", "email") == newest
+        assert await db.peek_consumer_cursor("expired", "email") == newest
 
-    async def test_a_source_reload_that_registers_the_email_runner_starts_the_cursors(self, db):
-        service = CronService(NerveConfig.from_dict({"channels": {"hosted": HOSTED}}), AsyncMock(), db)
-        service.scheduler.start(paused=True)
-        try:
-            service._jobs = []
-            service._register_source_runners()
-            await service._start_consumer_cursors(service._source_runners)
-            await db.set_consumer_cursor("inbox", "github", 0)
-            assert await cursors(db) == {("inbox", "github"): 0}
+    async def test_a_failed_step_still_stores_the_mail(self, db, monkeypatch, caplog):
+        async def locked(*args, **kwargs):
+            raise RuntimeError("database is locked")
 
-            service.config = hosted_config()
-            await service.reload_sources()
+        [runner] = [r for r in build_source_runners(hosted_config(), db) if r.job_id == "source:email"]
+        monkeypatch.setattr(db, "start_consumer_cursors", locked)
+        await HostedSourceConsumer("email", db, hosted_config).deliver(decoded(email_event()))
 
-            assert await cursors(db) == {("inbox", "github"): 0, ("inbox", "email"): 0}
-        finally:
-            service.scheduler.shutdown(wait=False)
+        with caplog.at_level(logging.WARNING, logger="nerve.sources.runner"):
+            result = await runner.run()
+
+        assert (result.records_ingested, result.error) == (1, None)
+        assert "could not start the consumer cursors: database is locked" in caplog.text
 
 
 @pytest.mark.parametrize(("source", "starts"), [
