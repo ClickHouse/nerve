@@ -28,14 +28,20 @@ only a deny rule. The stored observation names the person that the gateway
 linked to the author, for attribution only: the sender rules do not see it,
 and it adds no actor.
 
+The channel serves the connections of its provider. A connection whose
+capabilities name no provider, as from an older gateway, serves every hosted
+chat channel. The provider's entry in
+:data:`~nerve.channels.hosted.providers.HOSTED_CHAT_PROVIDERS` gives the
+channel's switch and settings.
+
 Outbound messages are contract operations on the connection that the
-conversation's latest accepted event came on, or on the only connection that
-supports the operation. :meth:`send` posts CommonMark text in parts of at
-most the connection's advisory ``text_characters``. Streaming uses a
-placeholder message, edits paced by ``edit_interval_millis``, and a delete.
-The typing indicator is an ``eyes`` reaction on the message that started the
-turn. The gateway decides where the agent may post: a ``forbidden`` result of
-a send is a refusal, not a transport failure.
+conversation's latest accepted event came on, or on the only connection of
+the provider that supports the operation. :meth:`send` posts CommonMark text
+in parts of at most the connection's advisory ``text_characters``. Streaming
+uses a placeholder message, edits paced by ``edit_interval_millis``, and a
+delete. The typing indicator is an ``eyes`` reaction on the message that
+started the turn. The gateway decides where the agent may post: a
+``forbidden`` result of a send is a refusal, not a transport failure.
 
 Files go out through ``file_send``. The attachments of a message that starts
 a turn are read through ``file_read`` before the turn and use the
@@ -108,6 +114,11 @@ from nerve.channels.hosted.outbound import (
     split_text,
     truncate_text,
     valid_identifier,
+)
+from nerve.channels.hosted.providers import (
+    STREAM_MODE_PARTIAL,
+    HostedChannelSettings,
+    HostedChatProvider,
 )
 from nerve.channels.observation import ObservationPolicy
 
@@ -265,7 +276,7 @@ class HostedChannel(BaseChannel):
 
     def __init__(
         self,
-        provider: str,
+        provider: HostedChatProvider,
         router: ChannelRouter,
         config: Callable[[], NerveConfig],
         *,
@@ -276,7 +287,8 @@ class HostedChannel(BaseChannel):
         notifications: Any | None = None,
         button_style: Callable[[str], str] | None = None,
     ) -> None:
-        self._provider = provider
+        self._spec = provider
+        self._provider = provider.name
         self.router = router
         self._config = config
         self._max_inflight = max_inflight
@@ -334,8 +346,7 @@ class HostedChannel(BaseChannel):
             | ChannelCapability.TYPING_INDICATOR
             | ChannelCapability.SEND_FILES
         )
-        section = getattr(self._config(), self._provider, None)
-        if getattr(section, "stream_mode", "partial") == "partial":
+        if self._settings().stream_mode == STREAM_MODE_PARTIAL:
             capabilities |= ChannelCapability.STREAMING
         return capabilities
 
@@ -351,8 +362,10 @@ class HostedChannel(BaseChannel):
         editable = True
         if self._operations is not None:
             streams = self._operations.streams
-            senders = streams.connections("send")
-            editable = senders <= streams.connections("edit") & streams.connections("delete")
+            senders = streams.connections("send", self._provider)
+            editable = senders <= (
+                streams.connections("edit", self._provider) & streams.connections("delete", self._provider)
+            )
         return ChannelConstraints(
             max_message_length=min(
                 (item.text_characters for item in limits), default=DEFAULT_TEXT_CHARACTERS,
@@ -365,19 +378,20 @@ class HostedChannel(BaseChannel):
 
     @property
     def is_available(self) -> bool:
-        """Whether the provider is switched on and a stream advertises ``send`` now."""
+        """Whether the provider is switched on and a stream advertises ``send`` for it now."""
         return (
             self._switched_on()
             and self._operations is not None
-            and bool(self._operations.streams.connections("send"))
+            and bool(self._operations.streams.connections("send", self._provider))
         )
 
     def _switched_on(self) -> bool:
-        """Whether the provider is enabled and in hosted mode, read per call."""
-        section = getattr(self._config(), self._provider, None)
-        return bool(
-            section is not None and section.enabled and getattr(section, "mode", "") == "hosted",
-        )
+        """Whether the provider is switched on, read per call."""
+        return bool(self._spec.switched_on(self._config()))
+
+    def _settings(self) -> HostedChannelSettings:
+        """The provider's channel settings, read per call."""
+        return self._spec.settings(self._config())
 
     async def start(self) -> None:
         self._running = True
@@ -431,9 +445,9 @@ class HostedChannel(BaseChannel):
         """The connection for outbound work in *conversation_id*.
 
         That is the connection of the conversation's latest accepted event,
-        else the only connection that advertises *operation*, which may take
-        a short wait for a stream. Raises :class:`OperationFailed` when
-        neither exists.
+        else the only connection of the provider that advertises
+        *operation*, which may take a short wait for a stream. Raises
+        :class:`OperationFailed` when neither exists.
         """
         if not conversation_id:
             raise OperationFailed(operation, "unavailable", "invalid_target", local=True,
@@ -441,7 +455,9 @@ class HostedChannel(BaseChannel):
         connection = self._connections.get(conversation_id)
         if connection is not None:
             return connection
-        candidates = await self._operations.connections(operation) if self._operations else set()
+        candidates = (
+            await self._operations.connections(operation, self._provider) if self._operations else set()
+        )
         if len(candidates) == 1:
             return next(iter(candidates))
         raise OperationFailed(
@@ -465,7 +481,10 @@ class HostedChannel(BaseChannel):
         if self._operations is None:
             return []
         streams = self._operations.streams
-        found = (streams.capabilities_for(connection) for connection in streams.connections("send"))
+        found = (
+            streams.capabilities_for(connection)
+            for connection in streams.connections("send", self._provider)
+        )
         return [capabilities.limits for capabilities in found if capabilities is not None]
 
     async def _perform(self, connection_id: uuid.UUID, kind: str, payload: Any, **options: Any):
@@ -694,10 +713,10 @@ class HostedChannel(BaseChannel):
         The card goes with ``notify``, and the gateway posts it in the
         agent's notification channel, which an admin sets in the control
         plane. The config does not choose the conversation. Nerve sends the
-        card only when exactly one connection advertises ``notify``. Returns
-        ``(target, message_id)``, where the target is the card's
-        conversation, or ``None`` when there is no conversation or the post
-        fails.
+        card only when exactly one connection of the provider advertises
+        ``notify``. Returns ``(target, message_id)``, where the target is the
+        card's conversation, or ``None`` when there is no conversation or the
+        post fails.
         """
         if not self.is_available:
             return None
@@ -729,7 +748,7 @@ class HostedChannel(BaseChannel):
         return conversation, message_id
 
     def _notify_connection(self) -> uuid.UUID | None:
-        """The only connection that advertises ``notify`` now, else ``None``.
+        """The only connection of the provider that advertises ``notify`` now, else ``None``.
 
         It does not wait for a stream. The caller first makes sure that a
         stream can send, and a gateway without ``notify`` never advertises
@@ -737,7 +756,9 @@ class HostedChannel(BaseChannel):
         advertise it, because Nerve cannot tell which connection the card
         is for.
         """
-        candidates = self._operations.streams.connections("notify") if self._operations else set()
+        candidates = (
+            self._operations.streams.connections("notify", self._provider) if self._operations else set()
+        )
         if len(candidates) > 1:
             raise OperationFailed(
                 "notify", "unavailable", "invalid_target", local=True,
@@ -772,8 +793,8 @@ class HostedChannel(BaseChannel):
         """
         if not self._switched_on():
             return Decision(False, f"{self._provider} is switched off ({self._provider}.enabled is false)")
-        section = getattr(self._config(), self._provider, None)
-        if not getattr(section, "allow_outbound", False):
+        settings = self._settings()
+        if not settings.allow_outbound:
             return Decision(
                 False,
                 f"{self._provider}.allow_outbound is not enabled, so the agent may not post "
@@ -784,8 +805,8 @@ class HostedChannel(BaseChannel):
             return Decision(False, f"no {self._provider} conversation ID in the target")
         if self._is_id is not None and not self._is_id(conversation):
             return Decision(False, f"target must be a {self._provider} conversation ID, not a name")
-        allow = list(getattr(section, "allow_channels", None) or [])
-        deny = list(getattr(section, "deny_channels", None) or [])
+        allow = list(settings.allow_channels)
+        deny = list(settings.deny_channels)
         if allow or deny:
             gate = PatternGate("conversation", allow=allow, deny=deny)
             verdict = gate.check(self._identity(conversation, "", gate))
@@ -796,7 +817,7 @@ class HostedChannel(BaseChannel):
                     False, f"the destination is not approved by the {self._provider} channel policy",
                 )
         if self._connections.get(conversation) is None and self._operations is not None:
-            candidates = self._operations.streams.connections("send")
+            candidates = self._operations.streams.connections("send", self._provider)
             if len(candidates) > 1:
                 return Decision(
                     False,
@@ -829,22 +850,32 @@ class HostedChannel(BaseChannel):
     # ------------------------------------------------------------------ #
 
     def can_accept(self) -> bool:
-        """Whether the channel runs, is still switched on, and has room for a turn.
+        """Whether the channel runs, holds no events, and has room for a turn.
 
-        The provider section is read per call, so turning the provider off
-        by a reload stops intake until it is turned on again. Intake also
-        stops while the engine drains: the gateway keeps the events, and the
-        next start reads them.
+        The provider's switch is read per call. Turning a provider that
+        holds its events while off (Slack) off by a reload stops intake
+        until it is turned on again. A provider that does not hold them
+        never stops intake by its switch: :meth:`deliver` rejects its
+        events. Intake also stops while the engine drains: the gateway keeps
+        the events, and the next start reads them.
         """
         return (
             self._running
-            and self._switched_on()
+            and (self._switched_on() or not self._spec.hold_while_off)
             and len(self._inflight) < self._max_inflight
             and self.router.accepting_turns
         )
 
     async def deliver(self, event: Event) -> Disposition:
-        """Dispatch one admitted event and say what happened to it."""
+        """Dispatch one admitted event and say what happened to it.
+
+        While the provider is switched off, and it does not hold its events,
+        each event is rejected.
+        """
+        if not self._spec.hold_while_off and not self._switched_on():
+            return Disposition.rejected(
+                "configuration_invalid", f"{self._provider} is switched off ({self._provider}.enabled is false)",
+            )
         purpose = event.admission.purpose
         if purpose == "invoke" and event.kind == "message":
             disposition = await self._invoke_message(event)
@@ -1109,8 +1140,7 @@ class HostedChannel(BaseChannel):
     # ------------------------------------------------------------------ #
 
     def _source(self) -> ChannelSourceConfig | None:
-        section = getattr(self._config(), self._provider, None)
-        return getattr(section, "source", None)
+        return self._settings().source
 
     def _identity(self, id_: str, display_name: str, gate: PatternGate) -> Identity:
         """An identity whose display name can deny but never grant.

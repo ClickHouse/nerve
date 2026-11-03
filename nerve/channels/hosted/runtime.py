@@ -2,9 +2,9 @@
 
 The runtime owns the token verifier, the stream manager, the operation
 runner, the inbox reader, one :class:`HostedChannel` for each chat provider in
-hosted mode, and one :class:`HostedSourceConsumer` for each hosted source. The
-hosted settings and the provider modes are read once at startup; a change
-needs a restart. A reload reads the gateway key file again and publishes the
+hosted mode (see :mod:`nerve.channels.hosted.providers`), and one
+:class:`HostedSourceConsumer` for each hosted source. The hosted settings and
+the provider modes are read once at startup; a change needs a restart. A reload reads the gateway key file again and publishes the
 source subscriptions again. The source grant of each chat provider is read
 per event, so it follows a reload.
 """
@@ -26,6 +26,7 @@ from nerve.channels.hosted.contract import (
 from nerve.channels.hosted.intake import EventConsumer, InboxReader, ReaderSettings
 from nerve.channels.hosted.manager import StreamManager
 from nerve.channels.hosted.operations import OperationRunner, OperationTiming
+from nerve.channels.hosted.providers import hosted_chat_providers
 from nerve.channels.hosted.sources import (
     HostedSourceConsumer,
     hosted_sources,
@@ -56,11 +57,13 @@ RECEIVE_LIMITS = StreamLimits(
 def hosted_channel_providers(config: NerveConfig) -> list[str]:
     """The chat providers whose traffic comes from the gateway.
 
-    A provider that is switched off is included. Its channel reads
-    ``enabled`` for each event, so intake stays paused until a reload
-    switches the provider on.
+    A provider that is switched off is included. Its channel reads the
+    provider's switch for each event: a provider that holds its events
+    while off (Slack) pauses intake until a reload switches it on, and any
+    other provider rejects its events (see
+    :mod:`nerve.channels.hosted.providers`).
     """
-    return ["slack"] if config.slack.mode == "hosted" else []
+    return [provider.name for provider in hosted_chat_providers(config)]
 
 
 def hosted_providers(config: NerveConfig) -> list[str]:
@@ -96,7 +99,7 @@ class HostedChannelRuntime:
         problems = settings.problems()
         if problems:
             raise ValueError("; ".join(problems))
-        providers = hosted_channel_providers(config)
+        providers = hosted_chat_providers(config)
         source_providers = hosted_sources(config)
         if not providers and not source_providers:
             raise ValueError("no provider is in hosted mode")
@@ -126,13 +129,11 @@ class HostedChannelRuntime:
         )
         self.operations = OperationRunner(self.streams, operation_timing)
         self.channels: dict[str, HostedChannel] = {
-            provider: HostedChannel(
+            provider.name: HostedChannel(
                 provider, router, config_getter,
-                is_id=_identifier_test(provider),
                 operations=self.operations,
-                reaction_names=_reaction_names(provider),
                 notifications=notification_service,
-                **_notification_rules(provider),
+                **provider.channel_options(),
             )
             for provider in providers
         }
@@ -217,38 +218,6 @@ class HostedChannelRuntime:
 
     def _stream_nudged(self, stream: ChannelStream, purpose: str) -> None:
         self.reader.nudge(purpose)
-
-
-def _identifier_test(provider: str) -> Callable[[str], bool] | None:
-    """How a provider tells a literal ID from a name in a source pattern."""
-    if provider == "slack":
-        from nerve.channels.slack import is_slack_id
-
-        return is_slack_id
-    return None
-
-
-def _notification_rules(provider: str) -> dict[str, Any]:
-    """The button styles of a provider's notification cards.
-
-    The config does not choose the conversation of a card: the gateway posts
-    it in the agent's notification channel, which an admin sets in the
-    control plane.
-    """
-    if provider == "slack":
-        from nerve.channels.slack_presentation import approval_style
-
-        return {"button_style": approval_style}
-    return {}
-
-
-def _reaction_names(provider: str) -> dict[str, str]:
-    """A provider's short reaction names and their emoji."""
-    if provider == "slack":
-        from nerve.channels.slack_presentation import slack_emoji_by_name
-
-        return slack_emoji_by_name()
-    return {}
 
 
 __all__ = [
