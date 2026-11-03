@@ -822,3 +822,125 @@ async def test_a_cli_command_with_its_own_connection_names_the_system_actor(
 
     (headers,) = _MessagesApi.received
     assert _principal_values(headers) == [system_actor_id]
+
+
+# --------------------------------------------------------------------------- #
+#  Codex: the endpoint provider names the principal                           #
+# --------------------------------------------------------------------------- #
+
+_CODEX_ENDPOINT = "http://127.0.0.1:4000/v1"
+_CODEX_PRINCIPAL_ENV = "NERVE_CODEX_INFERENCE_PRINCIPAL"
+
+
+def _codex_principals(overrides: list[str], env: dict[str, str]) -> list[str]:
+    """The principal headers that Codex sends for these overrides and this env.
+
+    Codex 0.164.0 reads the ``http_headers`` and ``env_http_headers`` tables
+    of the selected provider. ``env_http_headers`` maps a header name to the
+    name of an environment variable, and Codex sends the header when the
+    variable is set and not empty. A later ``--config`` value of a key
+    replaces an earlier one.
+    """
+    import tomllib
+
+    values: dict[str, object] = {}
+    for line in overrides:
+        key, _, raw = line.partition("=")
+        values[key] = tomllib.loads(f"value = {raw}")["value"]
+    provider = values.get("model_provider")
+    if provider is None:
+        return []
+    base = f"model_providers.{provider}"
+    headers: dict[str, str] = {}
+    for name, value in (values.get(f"{base}.http_headers") or {}).items():
+        headers[name.lower()] = value
+    for name, variable in (values.get(f"{base}.env_http_headers") or {}).items():
+        if env.get(variable):
+            headers[name.lower()] = env[variable]
+    wanted = INFERENCE_PRINCIPAL_HEADER.lower()
+    return [value for name, value in headers.items() if name == wanted]
+
+
+def _codex_process(tmp_path, principal: str | None, **codex):
+    """The argv overrides and environment of the Codex process of a session."""
+    from nerve.agent.backends.codex import CodexBackend
+    from nerve.agent.backends.codex.backend import CodexClient
+    from tests.test_codex_appserver import _config, _deps, _spec
+
+    config = _config(tmp_path, **({"base_url": _CODEX_ENDPOINT} | codex))
+    backend = CodexBackend(_deps(config))
+    client = CodexClient(backend, _spec(config, inference_principal=principal))
+    return client._transport._config_overrides, client._transport._env
+
+
+class TestCodexEndpoint:
+    def test_a_session_names_its_cause_in_the_environment(self, external, tmp_path):
+        for actor in (ALICE, BOB):
+            overrides, env = _codex_process(tmp_path, actor.actor_id)
+            assert _codex_principals(overrides, env) == [actor.actor_id]
+            assert env[_CODEX_PRINCIPAL_ENV] == actor.actor_id
+            # The value is not in argv, which every local user can read.
+            assert not any(actor.actor_id in line for line in overrides)
+
+    def test_an_inherited_variable_does_not_reach_codex(
+        self, external, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setenv(_CODEX_PRINCIPAL_ENV, BOB.actor_id)
+        overrides, env = _codex_process(tmp_path, ALICE.actor_id)
+        assert _codex_principals(overrides, env) == [ALICE.actor_id]
+
+        overrides, env = _codex_process(tmp_path, None)
+        assert _codex_principals(overrides, env) == []
+        assert _CODEX_PRINCIPAL_ENV not in env
+        assert not any("env_http_headers" in line for line in overrides)
+
+    def test_local_mode_names_no_principal(self, monkeypatch, tmp_path):
+        monkeypatch.setenv(_CODEX_PRINCIPAL_ENV, BOB.actor_id)
+        overrides, env = _codex_process(tmp_path, ALICE.actor_id)
+        assert _codex_principals(overrides, env) == []
+        assert _CODEX_PRINCIPAL_ENV not in env
+
+    def test_codex_without_an_endpoint_names_no_principal(
+        self, external, monkeypatch, tmp_path,
+    ):
+        """Codex's own provider is not a Nerve proxy."""
+        monkeypatch.setenv(_CODEX_PRINCIPAL_ENV, BOB.actor_id)
+        overrides, env = _codex_process(tmp_path, ALICE.actor_id, base_url="")
+        assert not any(line.startswith("model_provider") for line in overrides)
+        assert _CODEX_PRINCIPAL_ENV not in env
+
+    def test_an_id_that_is_not_a_canonical_uuid_names_no_principal(
+        self, external, tmp_path,
+    ):
+        for bad in (ALICE.actor_id.upper(), f"{ALICE.actor_id}\nX-Other: 1"):
+            overrides, env = _codex_process(tmp_path, bad)
+            assert _codex_principals(overrides, env) == []
+            assert _CODEX_PRINCIPAL_ENV not in env
+
+    @pytest.mark.asyncio
+    async def test_the_preflight_names_the_system_actor(
+        self, external, global_db, monkeypatch, tmp_path,
+    ):
+        """The setup check and the model catalogue are Nerve's own calls."""
+        from nerve.agent.backends.codex import CodexBackend
+        from nerve.agent.backends.codex import backend as codex_backend
+        from tests.test_codex_appserver import _config, _deps
+
+        spawned: list[dict] = []
+
+        class _Recorded(codex_backend.CodexAppServerClient):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                spawned.append(kw)
+
+        monkeypatch.setattr(codex_backend, "CodexAppServerClient", _Recorded)
+        monkeypatch.setenv("FAKE_CODEX_MODE", "basic")
+        monkeypatch.setenv(_CODEX_PRINCIPAL_ENV, BOB.actor_id)
+        config = _config(tmp_path, base_url=_CODEX_ENDPOINT)
+        status = await CodexBackend(_deps(config)).preflight(force=True)
+
+        assert status["available"] is True, status
+        (process,) = spawned
+        assert _codex_principals(process["config_overrides"], process["env"]) == [
+            global_db.system_actor_id,
+        ]

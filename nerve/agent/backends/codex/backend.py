@@ -59,6 +59,11 @@ from nerve.agent.backends.codex.ultracode import (
 )
 from nerve.agent.backends.images import validate_image_data
 from nerve.agent.interactive import defer_idle_timeout
+from nerve.inference_principal import (
+    INFERENCE_PRINCIPAL_HEADER,
+    inference_principal,
+    system_principal_headers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,10 +136,24 @@ def _toml_str(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-# The Codex model provider for ``codex.base_url``, and the child environment
-# variable that holds its bearer key (Codex reads it through ``env_key``).
+# The Codex model provider for ``codex.base_url``, the child environment
+# variable that holds its bearer key (Codex reads it through ``env_key``), and
+# the child environment variable that holds the inference principal (Codex
+# reads it through ``env_http_headers``).
 _ENDPOINT_PROVIDER = "nerve-endpoint"
 _ENDPOINT_KEY_ENV = "NERVE_CODEX_ENDPOINT_KEY"
+_ENDPOINT_PRINCIPAL_ENV = "NERVE_CODEX_INFERENCE_PRINCIPAL"
+
+
+def _inherited_env() -> dict[str, str]:
+    """The environment of Nerve for a Codex process, without a principal.
+
+    Only :meth:`CodexBackend.endpoint_env` sets the principal variable, so a
+    Codex process never names a principal that it inherits from Nerve.
+    """
+    env = os.environ.copy()
+    env.pop(_ENDPOINT_PRINCIPAL_ENV, None)
+    return env
 
 
 # Reasoning-effort vocabulary shared by nerve's effort_map values and the
@@ -364,16 +383,20 @@ class CodexBackend:
                     return {}
 
                 # The same endpoint provider as sessions, so that the
-                # checks below see what sessions see.
+                # checks below see what sessions see. The checks are
+                # Nerve's own model calls: they name the system actor.
+                principal = system_principal_headers().get(
+                    INFERENCE_PRINCIPAL_HEADER,
+                )
                 transport = CodexAppServerClient(
                     bin_path=self.codex.bin_path,
                     cwd=str(self.config.workspace),
                     env={
-                        **os.environ, "CODEX_HOME": self._home_dir(),
-                        **self.endpoint_env(),
+                        **_inherited_env(), "CODEX_HOME": self._home_dir(),
+                        **self.endpoint_env(principal),
                     },
                     server_request_handler=_decline,
-                    config_overrides=self.endpoint_overrides(),
+                    config_overrides=self.endpoint_overrides(principal),
                     request_timeout=10,
                 )
                 try:
@@ -453,9 +476,9 @@ class CodexBackend:
     # -- config assembly (used by CodexClient) --------------------------- #
 
     def build_env(self, spec: SessionSpec) -> dict[str, str]:
-        env = os.environ.copy()
+        env = _inherited_env()
         env["CODEX_HOME"] = self._home_dir()
-        env.update(self.endpoint_env())
+        env.update(self.endpoint_env(spec.inference_principal))
         # Session-bound bearer token for the nerve MCP endpoint —
         # referenced from the MCP config via bearer_token_env_var so the
         # token never lands in any file.
@@ -585,7 +608,7 @@ class CodexBackend:
         if not self.codex.web_search:
             overrides.append("tools.web_search=false")
 
-        overrides += self.endpoint_overrides()
+        overrides += self.endpoint_overrides(spec.inference_principal)
 
         for key, value in (self.codex.extra_config or {}).items():
             if isinstance(value, str):
@@ -707,7 +730,7 @@ class CodexBackend:
             return os.environ.get(self.codex.api_key_env) or None
         return None
 
-    def endpoint_overrides(self) -> list[str]:
+    def endpoint_overrides(self, principal: str | None = None) -> list[str]:
         """``--config`` overrides that send Codex to ``codex.base_url``.
 
         Codex sends ``POST <base_url>/responses``. The only key source is
@@ -716,6 +739,11 @@ class CodexBackend:
         key, the provider reads it from the child environment (``env_key``),
         so the key is never in argv. Without a key, Codex sends no
         credential.
+
+        ``principal``: the principal that each request of the process names
+        (see :meth:`_endpoint_principal`). The provider reads it from the
+        child environment (``env_http_headers``) and sends it in one
+        ``X-Nerve-Inference-Principal`` header, so the value is not in argv.
         """
         if not self.codex.base_url:
             return []
@@ -728,13 +756,38 @@ class CodexBackend:
         ]
         if self.codex.api_key:
             overrides.append(f"{base}.env_key={_toml_str(_ENDPOINT_KEY_ENV)}")
+        if self._endpoint_principal(principal):
+            # A table value: for a header name in a quoted part of a dotted
+            # key, Codex 0.164.0 sends no header.
+            overrides.append(
+                f"{base}.env_http_headers="
+                f"{{{_toml_str(INFERENCE_PRINCIPAL_HEADER)}="
+                f"{_toml_str(_ENDPOINT_PRINCIPAL_ENV)}}}"
+            )
         return overrides
 
-    def endpoint_env(self) -> dict[str, str]:
+    def endpoint_env(self, principal: str | None = None) -> dict[str, str]:
         """The child environment for :meth:`endpoint_overrides`."""
+        env: dict[str, str] = {}
         if self.codex.base_url and self.codex.api_key:
-            return {_ENDPOINT_KEY_ENV: self.codex.api_key}
-        return {}
+            env[_ENDPOINT_KEY_ENV] = self.codex.api_key
+        principal = self._endpoint_principal(principal)
+        if principal:
+            env[_ENDPOINT_PRINCIPAL_ENV] = principal
+        return env
+
+    def _endpoint_principal(self, principal: str | None) -> str | None:
+        """The principal that the endpoint provider names, or ``None``.
+
+        Only with ``codex.base_url``: Codex's own provider sends no
+        principal. Checked again with
+        :func:`nerve.inference_principal.inference_principal`, because the
+        value goes into a header: ``None`` in local mode and for a value that
+        is not a canonical lower-case UUID.
+        """
+        if not self.codex.base_url:
+            return None
+        return inference_principal(principal)
 
 
 class CodexClient(AgentClient):
