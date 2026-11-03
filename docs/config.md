@@ -1493,6 +1493,10 @@ inbox too. Any other hosted chat provider refuses: while it is switched off,
 Nerve rejects its events and continues to read the events of the other
 providers.
 
+An event on a connection whose capabilities name another provider is
+rejected, and Nerve sends no operation of a channel through such a
+connection.
+
 ### Setting up the Slack app
 
 Socket Mode means the bot dials out to Slack, so Nerve needs no public URL.
