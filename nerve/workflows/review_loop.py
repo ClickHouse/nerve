@@ -422,7 +422,7 @@ class ReviewLoopService:
             # existing title (MCP-started loops attach to real chats).
             with contextlib.suppress(Exception):
                 session = await self.db.get_session(session_id)
-                if session is not None and not str(session.get("title") or "").strip():
+                if session is not None and session.get("title") in (None, "", session_id):
                     coro = self.engine._generate_session_title(  # noqa: SLF001 — engine-internal by design
                         session_id, f"Review loop goal: {goal[:300]}",
                     )

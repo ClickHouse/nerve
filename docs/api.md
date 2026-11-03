@@ -1027,6 +1027,14 @@ whose behalf all agent work in the session runs. Nerve sets it when it creates
 the session and never changes it (an actor id, or `null` when unknown). See
 [Attribution](accounts.md#attribution).
 
+`title_source` says who chose the title: `placeholder` (the first words of the
+first message), `generated` (the model's title from it), `fork` ("Fork of …"),
+`outcome` (the model's title from what the session did, see
+`agent.outcome_titles`), `manual` (a person renamed it), or `null` (the code
+that created the session named it, or nothing has yet). After the first
+message, Nerve renames a session on its own only from `placeholder`,
+`generated` and `fork`.
+
 Session list rows carry `pending_wakeup_at`, the fire time of the session's
 pending wakeup or deferred message (`null` when there is none), with
 `pending_wakeup_created_by_actor_id` (who scheduled it: a person, or the
@@ -1091,6 +1099,19 @@ Update `title`, `starred`, `model` or `parent_session_id`. A `model` change
 recreates the session's runtime, which would end its live background agents:
 while any run it answers `409` with
 `{"detail": {"code": "live_background_agents", "message": "…", "live": 2}}`.
+A `title` sets the session's `title_source` to `manual`, so Nerve no longer
+renames it on its own.
+
+#### `POST /api/sessions/{id}/regenerate-title`
+Retitle the session with `agent.title_model` from its first request and its
+last reply (a fork's own, with the parent's title), replacing any title, and
+broadcast `session_updated` to every client. Works whether or not
+`agent.outcome_titles` is on. Errors: `404` unknown session; `502` no title
+could be made (no API credential, a failed call, an empty conversation).
+
+```json
+Response: { "title": "Flaky checkout test timeout" }
+```
 
 #### `GET /api/sessions/{id}/status`
 Session status with lifecycle info.

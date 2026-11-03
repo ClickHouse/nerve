@@ -335,6 +335,8 @@ interface ChatState {
   /** Star an archived session: unarchive + star in one PATCH (hook fires). */
   starArchivedSession: (id: string) => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
+  /** Retitle a session from what it did (the server's title model). */
+  regenerateSessionTitle: (id: string) => Promise<void>;
   toggleStar: (id: string) => Promise<void>;
   /** Re-parent a session (drag onto another) or clear it (null → top-level). */
   setSessionParent: (childId: string, parentId: string | null) => Promise<void>;
@@ -1163,6 +1165,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }));
     } catch (e) {
       console.error('Failed to rename session:', e);
+    }
+  },
+
+  regenerateSessionTitle: async (id: string) => {
+    try {
+      const { title } = await api.regenerateSessionTitle(id);
+      set(s => ({
+        sessions: s.sessions.map(sess =>
+          sess.id === id ? { ...sess, title } : sess
+        ),
+      }));
+    } catch (e) {
+      console.error('Failed to regenerate session title:', e);
+      window.alert('Could not regenerate the name: no title could be made (a model API key, Bedrock or the proxy is needed).');
     }
   },
 

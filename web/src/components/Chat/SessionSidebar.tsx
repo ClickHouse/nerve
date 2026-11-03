@@ -1,6 +1,6 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, MoreHorizontal, Star, StarFilled, Pencil, Trash2, Archive, ArchiveRestore, Repeat, Unlink, GitBranch } from '../ui/icons';
+import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, MoreHorizontal, Star, StarFilled, Pencil, Trash2, Archive, ArchiveRestore, Repeat, Unlink, GitBranch, Sparkles } from '../ui/icons';
 import { Button, IconButton, TextField } from '../ui';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp, loadCollapsedGroups, saveCollapsedGroups, loadExpandedParents, saveExpandedParents } from '../../utils/dateGroups';
@@ -1166,6 +1166,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
   const navigate = useNavigate();
   // Unsent draft for this chat (hidden on the active one — its text is in the box).
   const hasDraft = useChatStore(s => !!(s.drafts[session.id] || '').trim());
+  const regenerateSessionTitle = useChatStore(s => s.regenerateSessionTitle);
   // Unread = updated since you last opened it (client-only, see readStorage).
   // Never for the open session or a running/parked one; feed-scoped via
   // showUnread.
@@ -1373,6 +1374,23 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
               <Pencil size={14} />
               Rename
             </Button>
+            {session.sdk_session_id && (
+              <Button
+                variant="subtle"
+                size="sm"
+                fullWidth
+                onClick={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setMenuOpen(false);
+                  void regenerateSessionTitle(session.id);
+                }}
+                className="justify-start gap-2.5 px-3 py-1.5 rounded-none text-left"
+              >
+                <Sparkles size={14} />
+                Regenerate name
+              </Button>
+            )}
             {archived ? (
               <Button
                 variant="subtle"

@@ -360,7 +360,7 @@ work uses the system actor.
 | Event | Change | Details |
 |---|---|---|
 | `created` | The session is created (actor: the creator; cause: the session's cause); also a resume (`reason: "resume"`) | `source`, `parent`, or `reason` |
-| `title_changed` | The title changes | `title`, `previous`; `reason` is `placeholder` or `generated` for a title that Nerve makes from the first message, `cron_rotation` for a rotated cron session |
+| `title_changed` | The title changes | `title`, `previous`; `reason` is `placeholder` or `generated` for a title that Nerve makes from the first message, `outcome` for one it makes when a turn ends (`agent.outcome_titles`), `regenerated` for Regenerate name (actor: the person), `cron_rotation` for a rotated cron session |
 | `starred`, `unstarred` | The session is starred or unstarred | |
 | `model_changed` | The model changes | `model`, `previous` |
 | `parent_changed` | The session moves under another session, or back to the top level | `parent_session_id`, `previous` |
