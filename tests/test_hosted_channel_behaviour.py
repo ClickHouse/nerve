@@ -13,7 +13,9 @@ router sends nothing to the conversation and the turn's text starts with a
 note for the agent, the ``keep`` session mode, in which a conversation
 keeps its last session past the sticky period, and simultaneous first
 messages of one conversation. The router's part is also tested on its own,
-with a channel that records every call.
+with a channel that records every call. One test runs a real engine whose
+model process is a stand-in, to show that the answer of a ``tool`` turn is
+stored in the session.
 """
 
 from __future__ import annotations
@@ -28,6 +30,9 @@ from unittest.mock import MagicMock
 import pytest
 import pytest_asyncio
 
+import nerve.config as config_module
+from nerve.agent.backends import claude as claude_backend
+from nerve.agent.engine import AgentEngine
 from nerve.agent.sessions import SessionManager
 from nerve.agent.streaming import broadcaster
 from nerve.channels.base import (
@@ -46,12 +51,29 @@ from nerve.channels.hosted.providers import (
     HostedChannelSettings,
     HostedChatProvider,
 )
-from nerve.channels.hosted.runtime import hosted_channel_providers
+from nerve.channels.hosted.runtime import HostedChannelRuntime, hosted_channel_providers
 from nerve.channels.router import ChannelRouter
 from nerve.config import NerveConfig, SlackConfig
+from nerve.gateway import server as gateway_server
+from nerve.inference_principal import CUSTOM_HEADERS_ENV
 
-from tests.fake_channel_gateway import CONNECTION_ID, message_event
-from tests.test_hosted_channel import Hosted, start_hosted, stop_hosted
+from tests.fake_channel_gateway import (
+    CONNECTION_ID,
+    EVENT_TIMEOUT,
+    FakeChannelGateway,
+    NerveServer,
+    message_event,
+)
+from tests.test_hosted_channel import (
+    FAST_OPERATIONS,
+    FAST_READER,
+    FAST_STREAM,
+    Hosted,
+    hosted_config,
+    start_hosted,
+    stop_hosted,
+)
+from tests.test_inference_principal import _FakeCli
 
 CHAT = "fixture_chat"
 CHAT_CONNECTION = "0d7c4b1e-6a3f-4e92-8b5d-2f1a9c7e3b60"
@@ -650,3 +672,84 @@ class TestSimultaneousFirstMessages:
         mapping = await db.get_channel_session("recording:room-1")
         assert {run["session_id"] for run in turns.runs} == {mapping["session_id"]}
 
+
+# ---------------------------------------------------------------------- #
+#  A real engine keeps the answer of a tool turn                          #
+# ---------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def cli(monkeypatch) -> list[_FakeCli]:
+    """The model processes that the engine starts: stand-ins that answer "ok"."""
+    started: list[_FakeCli] = []
+    monkeypatch.setattr(_FakeCli, "started", started)
+    monkeypatch.setattr(claude_backend, "ClaudeClient", _FakeCli)
+    monkeypatch.setattr(
+        claude_backend.ClaudeBackend, "validate_resume_target",
+        lambda self, native_id, cwd: native_id.startswith("native-"),
+    )
+    return started
+
+
+@pytest_asyncio.fixture
+async def engine_two(tmp_path, db, monkeypatch, cli):
+    """Slack and the test provider in front of a real engine."""
+    monkeypatch.setattr(providers_module, "HOSTED_CHAT_PROVIDERS", (SLACK, chat_provider(Switch())))
+    monkeypatch.delenv(CUSTOM_HEADERS_ENV, raising=False)
+    config = hosted_config(tmp_path)
+    config.agent.backend = "claude"
+    config.codex.home_dir = str(tmp_path / "codex-home")
+    monkeypatch.setattr(config_module, "_config", config)
+    engine = AgentEngine(config, db)
+    engine.router.BATCH_DEBOUNCE = 0.0
+    gateway = FakeChannelGateway(jwks_file=config.channels.hosted.gateway_jwks_file)
+    runtime = HostedChannelRuntime(
+        config, engine.router, lambda: config, stream_timing=FAST_STREAM,
+        reader_settings=FAST_READER, operation_timing=FAST_OPERATIONS,
+    )
+    await runtime.start()
+    monkeypatch.setattr(gateway_server, "_hosted_channels", runtime)
+    server = NerveServer(gateway_server.create_app())
+    await server.__aenter__()
+    try:
+        yield Hosted(config, db, engine.router, None, gateway, runtime, server)
+    finally:
+        await runtime.stop()
+        await gateway.close_all()
+        await server.__aexit__(None, None, None)
+        for session_id in list(engine._idle_watchers):
+            engine._stop_idle_watcher(session_id)
+
+
+async def transcript(db, channel_key: str, count: int) -> list[tuple[str, str]]:
+    """The session's messages, once it has *count* of them."""
+    deadline = asyncio.get_running_loop().time() + EVENT_TIMEOUT
+    while True:
+        mapping = await db.get_channel_session(channel_key)
+        if mapping is not None:
+            rows = await db.get_messages(mapping["session_id"])
+            if len(rows) >= count:
+                return [(row["role"], row["content"]) for row in rows]
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError(f"{channel_key} did not get {count} messages")
+        await asyncio.sleep(0.02)
+
+
+@pytest.mark.asyncio
+class TestToolAnswerInTheSession:
+    async def test_the_answer_is_stored_in_the_session_and_not_posted(self, engine_two, cli):
+        hosted = engine_two
+        stream = await hosted.stream(advertise=False)
+        await announce(stream, CHAT, CHAT_CONNECTION, answer="tool", reply_tool="send_reply", session="keep")
+        inbox_id = hosted.gateway.store(chat_event(text="Please check the report."))
+
+        await stream.nudge("invoke")
+
+        assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
+        said = await transcript(hosted.db, f"{CHAT}:room-1", 2)
+        assert said == [
+            ("user", f"{answer_note(CHAT, 'send_reply')}\n\nPlease check the report."),
+            ("assistant", "ok"),
+        ]
+        await asyncio.sleep(0.3)
+        assert hosted.gateway.operations == []
