@@ -84,7 +84,10 @@ class HostedChatProvider:
     for an agent whose ``subscriptions`` frame names the provider. While
     such a provider is switched on, the frame carries an entry with its name
     and no filters; while it is off, the frame leaves it out, and the
-    gateway refuses its events before it stores them.
+    gateway refuses its events before it stores them. ``outbound_setting``
+    names the config key that lets the agent post to a conversation that it
+    names (``allow_outbound`` of the settings), for the text of a refusal.
+    It is empty for a provider without such a key, which never allows it.
     """
 
     name: str
@@ -94,6 +97,7 @@ class HostedChatProvider:
     hold_while_off: bool = False
     channel_options: Callable[[], dict[str, Any]] = _no_options
     subscribes: bool = False
+    outbound_setting: str = ""
 
 
 # ---------------------------------------------------------------------- #
@@ -145,6 +149,7 @@ SLACK = HostedChatProvider(
     settings=_slack_settings,
     hold_while_off=True,
     channel_options=_slack_channel_options,
+    outbound_setting="slack.allow_outbound",
 )
 
 
