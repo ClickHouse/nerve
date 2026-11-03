@@ -1109,6 +1109,9 @@ codex:
   `${PROXY_API_KEY:-}` when the key is optional. In this mode Nerve does not
   read `codex.api_key_env` or the top-level `openai_api_key`, because they
   can hold an OpenAI key.
+- In external mode, each request names the principal that caused the work
+  in the `X-Nerve-Inference-Principal` header. See
+  [Inference principal header](#inference-principal-header).
 - Codex needs no login, and `codex.auth` has no effect. Preflight does not
   require an account and uses the same provider. `nerve codex doctor` and
   `GET /api/codex/status` show the endpoint in `preflight.base_url`.
@@ -2352,8 +2355,19 @@ environment only when it starts. The session's cause never changes, so a CLI
 process keeps its header for its whole life, and a process that Nerve starts
 again for the session (after a model change or a crash) gets the same header.
 
+Codex sends the header only to `codex.base_url` (see
+[Codex through an OpenAI-compatible endpoint](#codex-through-an-openai-compatible-endpoint)).
+Nerve gives the value to each Codex process in the environment variable
+`NERVE_CODEX_INFERENCE_PRINCIPAL`, and the `nerve-endpoint` provider reads it
+through `env_http_headers`. The value is not in the arguments of the process.
+One Codex process serves one session, and it keeps its header for its whole
+life, as the Claude CLI does. Nerve removes `NERVE_CODEX_INFERENCE_PRINCIPAL`
+from the environment that a Codex process inherits, so a session with no
+cause and local mode send no header. The Codex preflight (setup check and
+model catalogue) names the system actor.
+
 These requests have no header: memory embedding requests to the OpenAI API,
-and Codex sessions.
+and Codex requests to Codex's own provider (no `codex.base_url`).
 
 #### Inference trigger header
 
@@ -2372,7 +2386,8 @@ trigger field sends the value that Nerve derives from its source and its
 id. The header has the same rules as the principal header: local mode sends
 none, Nerve removes an inherited line for it from `ANTHROPIC_CUSTOM_HEADERS`,
 and a CLI process keeps it for its whole life. Nerve does not prove the
-value. The same requests as above have no header.
+value. The same requests as above have no header, and Codex requests to
+`codex.base_url` have no trigger header.
 
 ### System principal ID
 
