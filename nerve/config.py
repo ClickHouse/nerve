@@ -1091,6 +1091,7 @@ class AgentConfig:
     model: str = DEFAULT_MODEL
     cron_model: str = DEFAULT_CRON_MODEL
     title_model: str = DEFAULT_TITLE_MODEL  # Session title generation
+    outcome_titles: bool = False  # Retitle a session from what its turn did
     # Model-alias remapping for the Claude CLI subprocess: alias → model ID,
     # emitted as ANTHROPIC_DEFAULT_<ALIAS>_MODEL env vars so short aliases
     # ("opus" in Agent/Workflow tool calls, skill frontmatter, cron model
@@ -1230,6 +1231,7 @@ class AgentConfig:
             model=d.get("model", DEFAULT_MODEL),
             cron_model=d.get("cron_model", DEFAULT_CRON_MODEL),
             title_model=d.get("title_model", DEFAULT_TITLE_MODEL),
+            outcome_titles=d.get("outcome_titles", False),
             model_aliases={
                 str(k): str(v or "")
                 for k, v in (d.get("model_aliases") or {}).items()

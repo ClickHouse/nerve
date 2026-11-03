@@ -683,6 +683,144 @@ async def test_titles_that_nerve_sets_take_the_sessions_cause(install, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_a_rename_wins_over_a_model_title_that_arrives_later(install, monkeypatch):
+    model = _TitleModel("Launch plan review")
+    model.gate.set()
+    monkeypatch.setattr(install.config, "resolve_anthropic_api_key", lambda: "test-key")
+    monkeypatch.setattr(
+        install.config, "create_async_anthropic_client", lambda **kwargs: model,
+    )
+    alice = install.actor_id("alice")
+    async with _client(install.app()) as client:
+        session_id = await _new_session(client, install.headers("alice"))
+        await install.db.update_session_title(
+            session_id, "Review the launch plan", reason="placeholder", source="placeholder",
+        )
+        response = await client.patch(
+            f"/api/sessions/{session_id}", headers=install.headers("alice"),
+            json={"title": "launch plan"},
+        )
+        assert response.status_code == 200
+        assert response.json()["title_source"] == "manual"
+
+    await install.engine._generate_session_title(session_id, "Review the launch plan")
+
+    assert (await install.db.get_session(session_id))["title"] == "launch plan"
+    assert (await install.events(session_id, "title_changed"))[-1][1:] == (
+        alice, alice, {"title": "launch plan", "previous": "Review the launch plan"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_regenerate_name_is_the_persons_change(install, monkeypatch):
+    model = _TitleModel("Launch plan: two blockers")
+    model.gate.set()
+    monkeypatch.setattr(install.config, "resolve_anthropic_api_key", lambda: "test-key")
+    monkeypatch.setattr(install.config, "credential_available", lambda: True)
+    monkeypatch.setattr(
+        install.config, "create_async_anthropic_client", lambda **kwargs: model,
+    )
+    bob = install.actor_id("bob")
+    async with _client(install.app()) as client:
+        session_id = await _new_session(client, install.headers("alice"))
+        await client.patch(
+            f"/api/sessions/{session_id}", headers=install.headers("alice"),
+            json={"title": "launch plan"},
+        )
+        await install.db.add_message(session_id, "user", "Review the launch plan", actor=None)
+        await install.db.add_message(session_id, "assistant", "Two blockers.", actor=None)
+
+        response = await client.post(
+            f"/api/sessions/{session_id}/regenerate-title", headers=install.headers("bob"),
+        )
+        missing = await client.post(
+            "/api/sessions/no-such-session/regenerate-title", headers=install.headers("bob"),
+        )
+        monkeypatch.setattr(install.config, "resolve_anthropic_api_key", lambda: "")
+        failed = await client.post(
+            f"/api/sessions/{session_id}/regenerate-title", headers=install.headers("bob"),
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"title": "Launch plan: two blockers"}
+    assert (missing.status_code, failed.status_code) == (404, 502)
+    assert (await install.db.get_session(session_id))["title_source"] == "outcome"
+    assert (await install.events(session_id, "title_changed"))[-1][1:] == (
+        bob, bob, {
+            "title": "Launch plan: two blockers", "previous": "launch plan",
+            "reason": "regenerated",
+        },
+    )
+
+
+class _OutcomeModel(_TitleModel):
+    """Answers the first-message title at once; each outcome call takes the
+    next of ``outcomes`` (an empty one is no title)."""
+
+    def __init__(self, *outcomes: str):
+        super().__init__("Launch plan review")
+        self.gate.set()
+        self.outcomes = list(outcomes)
+        self.outcome_calls = 0
+
+    async def create(self, **kwargs):
+        if "system" not in kwargs:
+            return await super().create(**kwargs)
+        self.outcome_calls += 1
+        text = self.outcomes.pop(0) if self.outcomes else ""
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=text)], stop_reason="end_turn",
+        )
+
+
+@pytest.mark.asyncio
+async def test_outcome_titles_name_only_the_answer_to_the_first_message(install, monkeypatch):
+    """Only the turn that answers the first message asks for a title: not a
+    wakeup, not a second message, not the end of background work that a
+    second message overtook. A fork's first message does."""
+    install.use_fake_runtime(monkeypatch)
+    model = _OutcomeModel("", "Second blocker fix")
+    monkeypatch.setattr(install.config, "resolve_anthropic_api_key", lambda: "test-key")
+    monkeypatch.setattr(
+        install.config, "create_async_anthropic_client", lambda **kwargs: model,
+    )
+    engine, db = install.engine, install.db
+    parked: set[str] = set()
+    monkeypatch.setattr(engine, "_has_live_background_tasks", lambda sid: sid in parked)
+
+    async def turn(session_id: str, message: str, **kwargs) -> None:
+        await engine.run(session_id, message, source="web", actor=None, **kwargs)
+        await asyncio.gather(*engine._title_tasks)
+
+    await db.create_session("option-off", actor=None)
+    await turn("option-off", "Review the launch plan")
+    assert model.outcome_calls == 0
+
+    monkeypatch.setattr(install.config.agent, "outcome_titles", True)
+    # The first answer gets no usable title, so the session stays renamable.
+    await db.create_session("chat", actor=None)
+    await turn("chat", "Review the launch plan")
+    await turn("chat", "[wakeup] check again", internal=True)
+    await turn("chat", "And the rollout?")
+    assert model.outcome_calls == 1
+    assert (await db.get_session("chat"))["title_source"] == "generated"
+
+    await db.create_session("parked", actor=None)
+    parked.add("parked")
+    await turn("parked", "Review the launch plan")
+    await turn("parked", "And the rollout?")
+    parked.clear()
+    await turn("parked", "[background work settled]", internal=True)
+    assert model.outcome_calls == 1
+
+    await engine.sessions.mark_active("chat", sdk_session_id="native-chat")
+    fork = await engine.sessions.fork_session("chat", actor=None)
+    await turn(fork["id"], "Now the second blocker")
+    assert (await db.get_session(fork["id"]))["title"] == "Second blocker fix"
+    assert model.outcome_calls == 2
+
+
+@pytest.mark.asyncio
 async def test_the_created_event_names_the_creator_and_the_sessions_cause(install):
     """Nerve creates a session for Alice; a later call with another cause
     finds the session and records nothing."""

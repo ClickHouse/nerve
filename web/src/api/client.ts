@@ -1414,6 +1414,8 @@ export const api = {
     request<any>(`/sessions/${id}`, { method: 'DELETE' }),
   updateSession: (id: string, data: { title?: string; starred?: boolean; model?: string; parent_session_id?: string | null }) =>
     request<any>(`/sessions/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  regenerateSessionTitle: (id: string) =>
+    request<{ title: string }>(`/sessions/${id}/regenerate-title`, { method: 'POST' }),
   getMessages: (sessionId: string, limit = 100) =>
     request<{ messages: any[]; last_usage?: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number; cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }; max_context_tokens: number; num_turns?: number } }>(`/sessions/${sessionId}/messages?limit=${limit}`),
   forkSession: (sourceSessionId: string, atMessageId?: string, title?: string) =>
