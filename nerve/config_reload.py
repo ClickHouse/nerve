@@ -397,6 +397,38 @@ async def _republish_hosted_subscriptions(engine) -> str | None:
         return f"{_ERROR_PREFIX}{detail}"
 
 
+def _email_reload_notes(new_config, engine) -> tuple[str | None, str | None]:
+    """What a reload says about ``email.enabled``: a warning and a restart line.
+
+    Nothing while email is switched off or while its channel runs. Without
+    usable ``channels.hosted`` settings, the warning of the startup check.
+    With usable settings but no email channel in this process, because the
+    settings became usable after startup or the hosted runtime did not
+    start, a restart line: the channel is built only at startup.
+    """
+    email = getattr(new_config, "email", None)
+    if not getattr(email, "enabled", False):
+        return None, None
+    from nerve.channels.hosted.providers import EMAIL, email_warning
+
+    warning = email_warning(new_config)
+    if warning is not None:
+        logger.warning("config reload: %s", warning)
+        return warning, None
+    try:
+        runtime = engine.get_channel_runtime("hosted") if engine is not None else None
+    except Exception:  # noqa: BLE001 - a stand-in engine without runtimes
+        runtime = None
+    if EMAIL.name in (getattr(runtime, "channels", None) or {}):
+        return None, None
+    note = (
+        "email.enabled is set and the channels.hosted settings are usable, but this "
+        "process has no email channel: it is built at startup, so restart Nerve"
+    )
+    logger.warning("config reload: %s", note)
+    return note, "email.enabled: the email channel starts at the next restart"
+
+
 async def reload_all(engine, cron_service, config_dir: Path) -> dict:
     """Re-read config and hot-reload all reloadable subsystems.
 
@@ -428,6 +460,11 @@ async def reload_all(engine, cron_service, config_dir: Path) -> dict:
         # Not an error — the reload applied everything it can. Reported so the
         # caller can tell "applied" from "cannot apply without a restart".
         pending = restart_required(old_config, new_config)
+        email, email_restart = _email_reload_notes(new_config, engine)
+        if email is not None:
+            summary["email"] = email
+        if email_restart is not None:
+            pending.append(email_restart)
         if pending:
             summary["restart_required"] = "; ".join(pending)
             logger.warning(
