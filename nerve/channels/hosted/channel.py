@@ -894,9 +894,7 @@ class HostedChannel(BaseChannel):
         each event is rejected.
         """
         if not self._spec.hold_while_off and not self._switched_on():
-            return Disposition.rejected(
-                "configuration_invalid", f"{self._provider} is switched off ({self._provider}.enabled is false)",
-            )
+            return Disposition.rejected("configuration_invalid", f"{self._provider} is switched off")
         purpose = event.admission.purpose
         if purpose == "invoke" and event.kind == "message":
             disposition = await self._invoke_message(event)
