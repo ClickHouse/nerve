@@ -30,6 +30,17 @@ class MemoryBackendUnavailable(RuntimeError):
     """
 
 
+class MemoryRecallFailed(MemoryBackendUnavailable):
+    """Raised when a recall fails for a reason that is not an outage: a
+    request the model refused (a prompt over its limit), a bug, a broken
+    index.
+
+    It is a :class:`MemoryBackendUnavailable` so every caller that already
+    refuses to read an outage as an empty memory refuses this too; the tool
+    layer names it apart, because waiting will not fix it.
+    """
+
+
 async def recall_for_startup(bridge: Any, query: str, limit: int) -> list[dict]:
     """The memories a new session starts with; the engine freezes their
     summaries for the whole session.

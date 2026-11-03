@@ -33,7 +33,7 @@ import numpy as np
 from nerve import paths
 from nerve.config import ANTHROPIC_CLIENT_OPTIONS, NerveConfig
 from nerve.inference_principal import system_inference_headers
-from nerve.memory.backend import MemoryBackendUnavailable
+from nerve.memory.backend import MemoryBackendUnavailable, MemoryRecallFailed
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.utils.llm import response_text
 
@@ -127,6 +127,29 @@ def _is_sqlite_locked_error(exc: BaseException) -> bool:
 
 # Semantic dedup threshold — set from config at init time.
 _SEMANTIC_DEDUP_THRESHOLD = 0.85
+
+# Numbers, IDs, dates and times in a memory: two texts close in meaning but
+# differing in one of these ("3 failures" / "4 failures", "PR #71918
+# targets release/26.6" / "#71917 … release/26.4") are different facts, and
+# cosine similarity alone cannot tell (bge-small rates such pairs 0.95–0.98).
+_VALUE_TOKEN_RE = re.compile(r"[#@]?[a-z0-9]*\d[a-z0-9._:/-]*", re.IGNORECASE)
+_MONTH_WORDS = frozenset(
+    "january february march april june july august september october november december "
+    "jan feb mar apr jun jul aug sep sept oct nov dec".split()
+)
+
+
+def _value_tokens(text: str) -> frozenset[str]:
+    lower = (text or "").lower()
+    tokens = {t.strip(".:/-") for t in _VALUE_TOKEN_RE.findall(lower)}
+    tokens.update(w for w in re.findall(r"[a-z]+", lower) if w in _MONTH_WORDS)
+    return frozenset(tokens)
+
+
+def _values_differ(a: str, b: str) -> bool:
+    """Whether ``a`` and ``b`` carry different numbers, IDs, dates or times
+    — then they are not the same fact however close their vectors are."""
+    return _value_tokens(a) != _value_tokens(b)
 
 # Max characters for a category breadcrumb in recall() output. A category
 # summary is a whole rolled-up topic document (often 5–20KB); recall must
@@ -545,6 +568,245 @@ class _BedrockLLMClient:
         except Exception:
             pass
 
+
+def _local_embed_threads() -> int:
+    """ONNX threads for the local embedder: half the CPUs, at most 8.
+
+    Measured on 14 Apple cores with bge-small (batches of 16, sorted by
+    length): 2 threads 118 texts/s, 4 225/s, 6 318/s, 8 398/s; 14 threads
+    with batches of 64 was slower than 4. Half the CPUs leaves room for the
+    agent sessions sharing the machine.
+    """
+    import os
+
+    return max(1, min(8, (os.cpu_count() or 2) // 2))
+
+
+class _LocalEmbeddingClient:
+    """memU embedding client backed by fastembed: ONNX inside this process,
+    no API key, and no memory text leaves the machine (``memory.embedder:
+    local``).
+
+    memU asks its embedding profile's client for ``embed(inputs) ->
+    list[list[float]]``; Nerve puts this client in that profile's slot right
+    after memU starts, as it does with the Bedrock chat clients. The model is
+    loaded on the first embed: the first load downloads it into
+    ``~/.nerve/models/fastembed`` (65 MB for bge-small) and later loads read
+    it from there.
+
+    Inputs are embedded shortest first in batches of 4: padding then costs
+    least, and the ONNX arena, which keeps its high-water mark, stays small.
+    Measured with bge-small on 5.8K memories: batches of 4 run at 333
+    texts/s and grow the process by 28 MB over the loaded model (~170 MB);
+    16 run at 363/s and grow it by 102 MB; 64 by ~400 MB. Vectors are scaled
+    to length 1; an empty input gets a zero vector, so it never matches.
+    Calls are serialized: the model is fast, and one at a time keeps memory
+    flat.
+    """
+
+    _BATCH_SIZE = 4
+
+    def __init__(self, *, model_id: str, dim: int, cache_dir: str, threads: int | None = None) -> None:
+        self.embed_model = model_id
+        self.chat_model = ""
+        self.dim = dim
+        self._cache_dir = cache_dir
+        self._threads = threads or _local_embed_threads()
+        self._model: Any = None
+        self._lock = threading.Lock()
+
+    def _load(self) -> Any:
+        if self._model is None:
+            from fastembed import TextEmbedding
+
+            t0 = time.monotonic()
+            Path(self._cache_dir).mkdir(parents=True, exist_ok=True)
+            self._model = TextEmbedding(
+                model_name=self.embed_model, cache_dir=self._cache_dir, threads=self._threads,
+            )
+            logger.info(
+                "Local embedder %s loaded in %.1fs (%d threads)",
+                self.embed_model, time.monotonic() - t0, self._threads,
+            )
+        return self._model
+
+    def embed_array_sync(self, inputs: list[str]) -> np.ndarray:
+        """Embed ``inputs`` in order into one ``(len, dim)`` float32 matrix
+        (blocking; call off the event loop). No per-number Python objects,
+        which is what keeps a bulk pass's memory flat."""
+        out = np.zeros((len(inputs), self.dim), dtype=np.float32)
+        live = sorted(
+            (i for i, text in enumerate(inputs) if text and text.strip()),
+            key=lambda i: len(inputs[i]),
+        )
+        if not live:
+            return out
+        with self._lock:
+            model = self._load()
+            vectors = model.embed([inputs[i] for i in live], batch_size=self._BATCH_SIZE)
+            for i, vec in zip(live, vectors, strict=True):
+                out[i] = vec
+        norms = np.linalg.norm(out, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        out /= norms
+        return out
+
+    def embed_sync(self, inputs: list[str]) -> list[list[float]]:
+        """Embed ``inputs`` in order, as memU's clients return them."""
+        return self.embed_array_sync(inputs).tolist()
+
+    async def embed(self, inputs: list[str]) -> list[list[float]]:
+        return await asyncio.to_thread(self.embed_sync, list(inputs))
+
+    async def embed_array(self, inputs: list[str]) -> np.ndarray:
+        return await asyncio.to_thread(self.embed_array_sync, list(inputs))
+
+    async def chat(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("the local embedding client only embeds")
+
+    async def summarize(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("the local embedding client only embeds")
+
+    async def close(self) -> None:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Hybrid recall (vector + keyword) — used whenever an embedder is configured
+# ---------------------------------------------------------------------------
+
+# Candidates each search leg contributes before the lists are fused.
+_HYBRID_CANDIDATES = 50
+# Reciprocal rank fusion constant: a hit's leg score is 1 / (k + rank).
+_RRF_K = 60
+# The FTS5 table Nerve keeps beside memU's items table (triggers keep it in
+# step; see MemUBridge._ensure_fts_index).
+_FTS_TABLE = "memu_items_fts"
+# Words too common to help a keyword search, plus generic verbs a question
+# carries ("what makes …", "how do I use …"): BM25 rates a rare-ish verb
+# like "makes" as informative and pulls in rows that merely share it.
+_FTS_STOPWORDS = frozenset(
+    "a an and are as at be but by can did do does for from had has have how i if in into is it its "
+    "me my no not of on or our she so that the their them then there these they this to was we were "
+    "what when where which who why will with you your about after all also any been before being "
+    "could just more most other over should some such than too very would "
+    "make makes made get gets got use uses used want wants need needs like likes know think say said "
+    "tell told thing things way much many".split()
+)
+_FTS_MAX_TERMS = 24
+
+# How memU's extraction names the user ("The user's name is Alice", "The user
+# is named Alice Smith"); recall learns the name from these rows.
+_USER_NAME_RE = re.compile(
+    r"\bThe user(?:'s (?:first |full )?name is| is (?:named|called)| goes by)\s+"
+    r"([A-Z][\w-]+(?:\s+[A-Z][\w-]+)?)",
+)
+
+
+def _fts_match_expr(query: str, drop: frozenset[str] | set[str] = frozenset()) -> str:
+    """An FTS5 ``MATCH`` expression for free text: each word quoted (so
+    ``#4100``, ``a:b`` or a stray quote cannot break the syntax), common
+    words and the words in ``drop`` left out, joined with ``OR`` so BM25 ranks
+    rows by how many and how rare the matched words are. Empty when nothing
+    searchable is left."""
+    terms: list[str] = []
+    for word in re.findall(r"\w+", query.lower()):
+        if len(word) < 2 or word in _FTS_STOPWORDS or word in drop or word in terms:
+            continue
+        terms.append(word)
+        if len(terms) >= _FTS_MAX_TERMS:
+            break
+    return " OR ".join(f'"{t}"' for t in terms)
+
+
+def _learn_user_name_terms(summaries: Any) -> frozenset[str]:
+    """The words of the user's name, lowercased, from rows that state it
+    (``_USER_NAME_RE``); a name must be stated twice to count."""
+    counts: dict[str, int] = {}
+    for summary in summaries:
+        if not summary or "The user" not in summary:
+            continue
+        for match in _USER_NAME_RE.finditer(summary):
+            counts[match.group(1)] = counts.get(match.group(1), 0) + 1
+    terms: set[str] = set()
+    for name, n in counts.items():
+        if n >= 2:
+            terms.update(word.lower() for word in name.split())
+    return frozenset(terms)
+
+
+def _as_the_user(query: str, name_terms: frozenset[str] | set[str]) -> str:
+    """``query`` with the user's name written as memU writes it ("the
+    user"): "what makes Alice angry" → "what makes the user angry". The same
+    string when the query does not name the user."""
+    if not name_terms:
+        return query
+    alternation = "|".join(sorted((re.escape(t) for t in name_terms), key=len, reverse=True))
+    pattern = re.compile(rf"\b(?:{alternation})(?:\s+(?:{alternation}))*('s)?\b", re.IGNORECASE)
+    return pattern.sub(lambda m: "the user" + (m.group(1) or ""), query)
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _fuse_recall_hits(
+    legs: list[list[str]],
+    items: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> list[tuple[str, float]]:
+    """Merge ranked candidate lists (item ids, best first) into one ranking.
+
+    Reciprocal rank fusion (each list adds ``1 / (_RRF_K + rank)``), so a
+    row found by several legs beats one found by one, and no leg's raw
+    scores need to be comparable. Then two mild tie-breakers from memU's own
+    salience: a fact stated again (``reinforcement_count``) gains up to
+    ~25 %, and a fresh one up to ~33 % over a years-old one (half-life 90
+    days, never below 0.75), so stale snapshots sink without old facts
+    vanishing. Returns ``(item_id, score)`` best first; ids missing from
+    ``items`` are dropped.
+    """
+    import math
+
+    now = now or datetime.now(timezone.utc)
+    scores: dict[str, float] = {}
+    for leg in legs:
+        for rank, item_id in enumerate(leg):
+            scores[item_id] = scores.get(item_id, 0.0) + 1.0 / (_RRF_K + rank + 1)
+
+    fused: list[tuple[str, float]] = []
+    for item_id, score in scores.items():
+        item = items.get(item_id)
+        if item is None:
+            continue
+        extra = getattr(item, "extra", None) or {}
+        try:
+            reinforced = max(1, int(extra.get("reinforcement_count", 1) or 1))
+        except (TypeError, ValueError):
+            reinforced = 1
+        score *= 1.0 + min(0.25, 0.1 * math.log(reinforced))
+        stamp = (
+            _parse_iso(extra.get("last_reinforced_at"))
+            or _parse_iso(getattr(item, "updated_at", None))
+            or _parse_iso(getattr(item, "created_at", None))
+        )
+        if stamp is not None:
+            age_days = max(0.0, (now - stamp).total_seconds() / 86400.0)
+            score *= 0.75 + 0.25 * (0.5 ** (age_days / 90.0))
+        fused.append((item_id, score))
+    fused.sort(key=lambda pair: pair[1], reverse=True)
+    return fused
+
+
 # ---------------------------------------------------------------------------
 # Custom event extraction prompt blocks
 # ---------------------------------------------------------------------------
@@ -857,6 +1119,16 @@ class MemUBridge:
         # Debounce tracking for file re-indexing (path -> asyncio.Task)
         self._reindex_tasks: dict[str, asyncio.Task] = {}
         self._anthropic_client: Any | None = None  # Lazy sync Anthropic
+        # Where vectors come from: "local" (fastembed), "openai" or "none".
+        self._embedder_kind = config.memory.embedder_kind(config.openai_api_key)
+        self._local_embedder: _LocalEmbeddingClient | None = None
+        # Progress of the background pass that embeds rows stored without a
+        # vector (shown under ``embedder`` in the health snapshot).
+        self._embed_backfill: dict[str, Any] = {"state": "idle"}
+        self._embed_backfill_task: asyncio.Task | None = None
+        # The user's name words recall reads as "the user" (learned lazily).
+        self._user_name_terms: frozenset[str] | None = None
+        self._user_name_terms_rows = -1
         # Dedicated event loop (own thread) that runs ALL memU service
         # coroutines.  memU's async pipeline steps call synchronous
         # SQLite/numpy work inline; isolating the whole service on its own
@@ -1356,7 +1628,9 @@ class MemUBridge:
                         embedding, k=1, memory_type=str(memory_type),
                     )
                     if hits:
-                        if hits[0][1] >= threshold:
+                        if hits[0][1] >= threshold and not _values_differ(
+                            summary, getattr(self.items.get(hits[0][0]), "summary", ""),
+                        ):
                             match_id, score = hits[0]
                             matched = self.items[match_id]
                             logger.info(
@@ -1433,7 +1707,9 @@ class MemUBridge:
                     ]
                     if corpus:
                         hits = cosine_topk(embedding, corpus, k=1)
-                        if hits and hits[0][1] >= threshold:
+                        if hits and hits[0][1] >= threshold and not _values_differ(
+                            summary, getattr(self.items.get(hits[0][0]), "summary", ""),
+                        ):
                             match_id, score = hits[0]
                             matched = self.items[match_id]
                             logger.info(
@@ -1611,6 +1887,250 @@ class MemUBridge:
         except Exception as exc:
             logger.warning("memU index setup skipped: %s", exc)
 
+    @staticmethod
+    def _ensure_fts_index(sqlite_dsn: str, table: str = "memu_memory_items") -> None:
+        """Create the FTS5 table of item summaries and the triggers that keep
+        it in step with ``table``; fill it the first time.
+
+        A plain (not external-content) FTS5 table keyed by item id, as
+        ``tasks_fts`` in nerve.db: it does not depend on the items table's
+        rowid, and an update rewrites the id's row. Idempotent. Without FTS5
+        in the SQLite build it logs and returns: hybrid recall then runs on
+        vectors alone.
+        """
+        import sqlite3 as _sqlite3
+
+        db_path = sqlite_dsn.replace("sqlite:///", "")
+        fts = _FTS_TABLE
+        try:
+            conn = _sqlite3.connect(db_path, timeout=60)
+            conn.execute("PRAGMA busy_timeout=60000")
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (fts,),
+            ).fetchone()
+            t0 = time.monotonic()
+            conn.executescript(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS {fts}
+                    USING fts5(item_id UNINDEXED, summary, tokenize='unicode61 remove_diacritics 2');
+                CREATE TRIGGER IF NOT EXISTS {fts}_ai AFTER INSERT ON {table} BEGIN
+                    INSERT INTO {fts}(item_id, summary) VALUES (new.id, new.summary);
+                END;
+                CREATE TRIGGER IF NOT EXISTS {fts}_ad AFTER DELETE ON {table} BEGIN
+                    DELETE FROM {fts} WHERE item_id = old.id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS {fts}_au AFTER UPDATE OF id, summary ON {table} BEGIN
+                    DELETE FROM {fts} WHERE item_id = old.id;
+                    INSERT INTO {fts}(item_id, summary) VALUES (new.id, new.summary);
+                END;
+            """)
+            if not exists:
+                conn.execute(f"DELETE FROM {fts}")
+                conn.execute(f"INSERT INTO {fts}(item_id, summary) SELECT id, summary FROM {table}")
+                conn.commit()
+                logger.info(
+                    "memU keyword index %s built in %.1fs", fts, time.monotonic() - t0,
+                )
+            conn.close()
+        except Exception as exc:
+            logger.warning("memU keyword index setup skipped: %s", exc)
+
+    def _user_name_terms_for(self, items: dict[str, Any]) -> frozenset[str]:
+        """The user's name words, learned from the stored rows once (again
+        while none are known and the row count has changed)."""
+        cached = getattr(self, "_user_name_terms", None)
+        if cached is not None and (cached or self._user_name_terms_rows == len(items)):
+            return cached
+        terms = _learn_user_name_terms(getattr(item, "summary", "") for item in list(items.values()))
+        self._user_name_terms = terms
+        self._user_name_terms_rows = len(items)
+        if terms:
+            logger.info("Recall treats %s as 'the user'", sorted(terms))
+        return terms
+
+    def _fts_search(self, query: str, limit: int, drop: frozenset[str] = frozenset()) -> list[str]:
+        """Item ids whose summary matches ``query``'s words (less ``drop``),
+        best BM25 first (blocking; run off the memU loop). Empty when nothing
+        matches or the keyword index is missing."""
+        import sqlite3 as _sqlite3
+
+        expr = _fts_match_expr(query, drop)
+        if not expr:
+            return []
+        db_path = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
+        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+        try:
+            rows = conn.execute(
+                f"SELECT item_id FROM {_FTS_TABLE} WHERE {_FTS_TABLE} MATCH ? "
+                f"ORDER BY bm25({_FTS_TABLE}) LIMIT ?",
+                (expr, limit),
+            ).fetchall()
+        except _sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return []
+            raise
+        finally:
+            conn.close()
+        return [row[0] for row in rows]
+
+    def _inject_local_embedder(self) -> None:
+        """Put the fastembed client in memU's ``embedding`` profile slot
+        (memU's placeholder OpenAI client is never built)."""
+        from nerve.config import LOCAL_EMBED_MODELS
+
+        alias = self.config.memory.local_model
+        model_id, dim = LOCAL_EMBED_MODELS.get(alias, LOCAL_EMBED_MODELS["bge-small"])
+        if self._local_embedder is None:
+            self._local_embedder = _LocalEmbeddingClient(
+                model_id=model_id,
+                dim=dim,
+                cache_dir=str(paths.nerve_path("models", "fastembed")),
+            )
+        self._service._llm_clients["embedding"] = self._local_embedder
+        logger.info("Local embedder for memU: %s (%s, %d-d)", alias, model_id, dim)
+
+    async def _backfill_embeddings(self) -> None:
+        """Give every item and category stored without a vector one (memU
+        loop, in the background).
+
+        Writes ``embedding_json`` directly, leaving ``updated_at`` alone: an
+        embedding is not an edit, and ``memory_records_by_date(updated=true)``
+        (the daily maintenance job) must not see thousands of rows as changed.
+        The cached rows and the vector index are updated in place, so recall
+        finds a row as soon as its batch lands.
+        """
+        state = self._embed_backfill
+        try:
+            item_repo = self._service.database.memory_item_repo
+            cat_repo = self._service.database.memory_category_repo
+            local = self._local_embedder if self._embedder_kind == "local" else None
+            # Vectors from another model live in another space: re-embed
+            # every row when the recorded model changed, and any row whose
+            # width is not the local model's.
+            model_id = self.config.memory.local_model_id if local is not None else self.config.memory.embed_model
+            recorded = await asyncio.to_thread(self._embedding_model_marker)
+            redo_all = bool(recorded) and recorded != model_id
+            want_dim = local.dim if local is not None else None
+
+            def needs_vector(vec: Any) -> bool:
+                if redo_all or vec is None:
+                    return True
+                return want_dim is not None and len(vec) != want_dim
+
+            items = [
+                (item_id, item.summary or "")
+                for item_id, item in item_repo.items.items()
+                if needs_vector(getattr(item, "embedding", None))
+            ]
+            cats = [
+                (cat_id, f"{cat.name}: {cat.description or ''}\n{cat.summary or ''}".strip())
+                for cat_id, cat in cat_repo.categories.items()
+                if needs_vector(getattr(cat, "embedding", None))
+            ]
+            if not items and not cats:
+                await asyncio.to_thread(self._embedding_model_marker, model_id)
+                state.update({"state": "done", "missing": 0})
+                return
+            total = len(items) + len(cats)
+            state.update({"state": "running", "total": total, "done": 0})
+            logger.info(
+                "Embedding %d memories and %d categories with %s%s",
+                len(items), len(cats), model_id or "the configured embedder",
+                f" (vectors were from {recorded})" if redo_all else "",
+            )
+            client = self._service._get_llm_client("embedding")
+
+            async def embed(texts: list[str]) -> Any:
+                # The local embedder hands back one float32 matrix: no Python
+                # float per number, so thousands of rows cost megabytes.
+                if local is not None:
+                    return await local.embed_array(texts)
+                return await client.embed(texts)
+
+            t0 = time.monotonic()
+            idx = _vec_index_for(item_repo)
+            batch = 256
+            for start in range(0, len(items), batch):
+                chunk = items[start:start + batch]
+                vectors = await embed([text for _, text in chunk])
+                pairs = list(zip([item_id for item_id, _ in chunk], vectors, strict=True))
+                await asyncio.to_thread(self._store_embeddings_sync, item_repo, pairs)
+                for item_id, vec in pairs:
+                    cached = item_repo.items.get(item_id)
+                    if cached is None:
+                        continue
+                    arr = np.asarray(vec, dtype=np.float32)
+                    cached.__dict__["embedding"] = arr
+                    idx.upsert(item_id, str(cached.memory_type), arr)
+                idx.seen_items_len = len(item_repo.items)
+                state["done"] = start + len(chunk)
+            if cats:
+                vectors = await embed([text for _, text in cats])
+                pairs = list(zip([cat_id for cat_id, _ in cats], vectors, strict=True))
+                await asyncio.to_thread(self._store_embeddings_sync, cat_repo, pairs)
+                for cat_id, vec in pairs:
+                    cached = cat_repo.categories.get(cat_id)
+                    if cached is not None:
+                        cached.__dict__["embedding"] = np.asarray(vec, dtype=np.float32)
+            await asyncio.to_thread(self._embedding_model_marker, model_id)
+            seconds = round(time.monotonic() - t0, 1)
+            state.update({"state": "done", "done": total, "seconds": seconds})
+            logger.info("Embedded %d rows in %.1fs", total, seconds)
+            # Hand the pass's transient buffers back to the OS.
+            await asyncio.to_thread(self._release_memory)
+        except Exception as exc:
+            state.update({"state": "failed", "error": str(exc)[:300]})
+            logger.error("Embedding backfill failed: %s", exc, exc_info=True)
+
+    def _embedding_model_marker(self, model_id: str | None = None) -> str:
+        """Read (or, given ``model_id``, record) which model produced the
+        stored vectors, in a one-row table Nerve keeps in memU's database
+        (blocking). Empty when nothing is recorded yet."""
+        import sqlite3 as _sqlite3
+
+        db_path = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
+        conn = _sqlite3.connect(db_path, timeout=60)
+        try:
+            conn.execute("PRAGMA busy_timeout=60000")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS nerve_memu_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            if model_id is not None:
+                conn.execute(
+                    "INSERT INTO nerve_memu_meta (key, value) VALUES ('embedding_model', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (model_id,),
+                )
+                conn.commit()
+                return model_id
+            row = conn.execute("SELECT value FROM nerve_memu_meta WHERE key = 'embedding_model'").fetchone()
+            return row[0] if row else ""
+        finally:
+            conn.close()
+
+    def _store_embeddings_sync(self, repo: Any, pairs: list[tuple[str, list[float]]]) -> None:
+        """Write ``embedding_json`` for ``pairs`` of (row id, vector) into
+        ``repo``'s table, without touching ``updated_at`` (blocking)."""
+        import sqlite3 as _sqlite3
+
+        model = getattr(repo, "_memory_item_model", None) or getattr(repo, "_memory_category_model", None)
+        table = getattr(model, "__tablename__", None)
+        if not table:
+            raise RuntimeError(f"cannot tell the table of {type(repo).__name__}")
+        db_path = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
+        conn = _sqlite3.connect(db_path, timeout=60)
+        try:
+            conn.execute("PRAGMA busy_timeout=60000")
+            conn.executemany(
+                f"UPDATE {table} SET embedding_json = ? WHERE id = ?",
+                (
+                    (json.dumps(np.round(np.asarray(vec, dtype=np.float32), 6).tolist()), row_id)
+                    for row_id, vec in pairs
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def _attach_engine_pragmas(self) -> None:
         """Per-connection pragmas for memU's SQLAlchemy engine.
 
@@ -1667,7 +2187,7 @@ class MemUBridge:
 
             # Set semantic dedup threshold from config before patches run.
             global _SEMANTIC_DEDUP_THRESHOLD
-            _SEMANTIC_DEDUP_THRESHOLD = self.config.memory.semantic_dedup_threshold
+            _SEMANTIC_DEDUP_THRESHOLD = self.config.memory.dedup_threshold(self._embedder_kind)
 
             self._patch_sqlite_bugs()
 
@@ -1713,11 +2233,23 @@ class MemUBridge:
                 },
             }
 
-            if self.config.openai_api_key:
+            embedder = self._embedder_kind
+            if embedder == "openai":
                 llm_profiles["embedding"] = {
                     "base_url": "https://api.openai.com/v1",
                     "api_key": self.config.openai_api_key,
                     "embed_model": self.config.memory.embed_model,
+                    "client_backend": "sdk",
+                }
+            elif embedder == "local":
+                # memU wants an embedding profile to exist; its placeholder
+                # OpenAI client is never built, because the local fastembed
+                # client takes the profile's slot right after memU starts
+                # (_inject_local_embedder), before anything embeds.
+                llm_profiles["embedding"] = {
+                    "base_url": "https://placeholder.invalid/v1",
+                    "api_key": "local",
+                    "embed_model": self.config.memory.local_model_id,
                     "client_backend": "sdk",
                 }
 
@@ -1767,11 +2299,12 @@ class MemUBridge:
                     # conversations as instructions, generating long off-topic
                     # responses that exceed the per-call timeout.
                     "preprocess_llm_profile": fast_profile,
-                    # When no embedding provider is configured, all memory
-                    # work goes through Anthropic — use Haiku for extraction
-                    # too to avoid saturating the rate-limit budget.
+                    # Unless OpenAI also takes the embeddings, every model
+                    # call of memory work goes through Anthropic — use Haiku
+                    # for extraction too to avoid saturating the rate-limit
+                    # budget. (Local embeddings call no API at all.)
                     "memory_extract_llm_profile": (
-                        fast_profile if not self.config.openai_api_key
+                        fast_profile if embedder != "openai"
                         else memorize_profile
                     ),
                     "category_update_llm_profile": fast_profile,
@@ -1798,15 +2331,18 @@ class MemUBridge:
                         # See _KNOWLEDGE_CUSTOM_RULES / _KNOWLEDGE_CUSTOM_EXAMPLES.
                     },
                 },
+                # With an embedder, recall() runs Nerve's hybrid search and
+                # memU's retrieve workflow is not used; "rag" keeps memU's
+                # own vector paths consistent with that.
                 retrieve_config={
-                    "method": "llm" if not self.config.openai_api_key else "rag",
+                    "method": "llm" if embedder == "none" else "rag",
                     "route_intention": False,
                     "sufficiency_check": False,
                     "resource": {"enabled": False},
                     # Use Haiku for LLM-based ranking — cheaper and avoids
                     # sharing Sonnet's rate-limit budget with the main agent.
                     **({"llm_ranking_llm_profile": fast_profile}
-                       if not self.config.openai_api_key else {}),
+                       if embedder == "none" else {}),
                 },
             )
             self._available = True
@@ -1830,6 +2366,16 @@ class MemUBridge:
                 None,
             ) or "memu_memory_items"
             self._ensure_sqlite_indexes(sqlite_dsn, item_table)
+            # Keyword leg of hybrid recall: an FTS5 table kept in step with
+            # the items table by triggers.  Cheap to keep even without an
+            # embedder, so it is always there when one is switched on.
+            self._ensure_fts_index(sqlite_dsn, item_table)
+
+            # ── Local embedder injection ──
+            # Before anything embeds (category sync below creates missing
+            # categories with a vector).
+            if embedder == "local":
+                self._inject_local_embedder()
 
             # ── Bedrock client injection ──
             # Replace the placeholder OpenAISDKClient instances with real
@@ -1868,7 +2414,7 @@ class MemUBridge:
             # memorize pipeline's "categorize_items" step with one that
             # stores items and resources with embedding=None.  This
             # avoids KeyError on the missing "embedding" LLM profile.
-            if not self.config.openai_api_key:
+            if embedder == "none":
                 from memu.workflow.step import WorkflowStep as _WfStep
 
                 _svc = self._service
@@ -2124,6 +2670,14 @@ class MemUBridge:
 
                 _numpy_create_item._nerve_numpy_wrapped = True  # type: ignore[attr-defined]
                 SQLiteMemoryItemRepo.create_item = _numpy_create_item
+
+            # Rows stored without a vector (everything written while no
+            # embedder was configured) get one in the background; recall
+            # works meanwhile, its keyword leg covering the rest.
+            if self._hybrid_recall:
+                self._embed_backfill_task = asyncio.get_running_loop().create_task(
+                    self._backfill_embeddings(),
+                )
 
             return True
 
@@ -3160,6 +3714,15 @@ class MemUBridge:
             return []
         op_id = self._metrics.begin_op("recall", query[:80])
         try:
+            if self._hybrid_recall:
+                # Vector + keyword search over the stored rows; no model
+                # reads the memory (memU's retrieve workflow is not used).
+                items_out, cats_out = await self._submit(
+                    self._hybrid_recall_impl(query, limit, category_limit),
+                )
+                self._metrics.end_op(op_id, success=True)
+                return items_out + cats_out
+
             # Retrieve runs vector search (numpy) and possibly SQLite reads
             # inline — keep it on the memU loop.
             result = await self._submit(self._service.retrieve(
@@ -3215,12 +3778,70 @@ class MemUBridge:
         except Exception as e:
             logger.error("memU recall failed: %s", e)
             self._metrics.end_op(op_id, success=False, error=str(e))
-            # A transient backend outage must not masquerade as "no results" —
-            # surface it so the caller can flag amnesia instead of trusting the
-            # empty list.
+            # A failed recall must not masquerade as "no results": surface it
+            # so the caller can flag amnesia instead of trusting an empty
+            # list.  An outage may pass; anything else (a prompt over the
+            # model's limit, a broken index) will not, and is named so.
             if _is_transient_llm_error(e):
                 raise MemoryBackendUnavailable(f"memory backend unavailable: {e}") from e
-            return []
+            raise MemoryRecallFailed(f"memory recall failed: {e}") from e
+
+    async def _hybrid_recall_impl(
+        self, query: str, limit: int, category_limit: int,
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        """Hybrid recall (memU loop): the question's vector against every
+        item's, its words against the keyword index, fused by rank (see
+        :func:`_fuse_recall_hits`); categories ranked by their vectors and
+        reduced to breadcrumbs as in the LLM path."""
+        item_repo = self._service.database.memory_item_repo
+        name_terms = self._user_name_terms_for(item_repo.items)
+        # memU writes "the user", while a question names them ("what makes
+        # Alice angry"): searched as written, the name pulls up rows that
+        # merely state it.  A question that names the user is searched both
+        # ways, and its keyword leg leaves the name out; a question about the
+        # name itself ("who is Alice") is still found by the as-written leg.
+        as_user = _as_the_user(query, name_terms)
+        queries = [query] if as_user == query else [query, as_user]
+        client = self._service._get_llm_client("embedding")
+        qvecs = np.asarray(await client.embed(queries), dtype=np.float32)
+        qvec = qvecs[0]
+        index = _vec_index_for(item_repo)
+        legs = [
+            [item_id for item_id, _sim in index.search(vec, _HYBRID_CANDIDATES)]
+            for vec in qvecs
+        ]
+        legs.append(await asyncio.to_thread(
+            self._fts_search, query, _HYBRID_CANDIDATES, name_terms,
+        ))
+        fused = _fuse_recall_hits(legs, item_repo.items)
+
+        items_out: list[dict[str, str]] = []
+        for item_id, _score in fused[:limit]:
+            item = item_repo.items[item_id]
+            if item.summary:
+                items_out.append({
+                    "id": item_id, "type": str(item.memory_type or ""), "summary": item.summary,
+                })
+
+        cats_out: list[dict[str, str]] = []
+        qnorm = float(np.linalg.norm(qvec)) or 1.0
+        ranked: list[tuple[float, Any]] = []
+        for cat in self._service.database.memory_category_repo.categories.values():
+            vec = getattr(cat, "embedding", None)
+            if vec is None:
+                continue
+            arr = np.asarray(vec, dtype=np.float32)
+            if arr.shape != qvec.shape:
+                continue
+            ranked.append((float(arr @ qvec) / ((float(np.linalg.norm(arr)) or 1.0) * qnorm), cat))
+        ranked.sort(key=lambda pair: pair[0], reverse=True)
+        for _sim, cat in ranked[:category_limit]:
+            crumb = _category_breadcrumb(cat.name or "", cat.description or "", cat.summary or "")
+            if crumb or cat.name:
+                cats_out.append({
+                    "id": f"cat:{cat.id}", "type": "category", "name": cat.name or "", "summary": crumb,
+                })
+        return items_out, cats_out
 
     async def expand_category(
         self, category_id: str, query: str = "", limit: int = 20,
@@ -3497,7 +4118,7 @@ class MemUBridge:
             new_desc = description if description is not None else cat.description
             new_summary = summary if summary is not None else cat.summary
 
-            # Re-embed from the updated text (requires OpenAI key)
+            # Re-embed from the updated text (when an embedder is configured)
             embedding = None
             if self._has_embeddings:
                 try:
@@ -3658,6 +4279,7 @@ class MemUBridge:
             "total_resources": 0,
             "type_distribution": {},
             "events_missing_happened_at": 0,
+            "items_with_embeddings": 0,
             "db_size_mb": 0,
         }
 
@@ -3679,6 +4301,9 @@ class MemUBridge:
             stats["events_missing_happened_at"] = db.execute(
                 "SELECT COUNT(*) FROM memu_memory_items WHERE happened_at IS NULL AND memory_type = 'event'"
             ).fetchone()[0]
+            stats["items_with_embeddings"] = db.execute(
+                "SELECT COUNT(*) FROM memu_memory_items WHERE embedding_json IS NOT NULL"
+            ).fetchone()[0]
             db.close()
         except Exception as e:
             logger.warning("Failed to query memU DB stats: %s", e)
@@ -3689,6 +4314,15 @@ class MemUBridge:
         """Complete health snapshot for the diagnostics endpoint."""
         result = self._metrics.to_dict()
         result["database"] = await self.get_db_stats()
+        result["embedder"] = {
+            "kind": self._embedder_kind,
+            "model": (
+                self.config.memory.local_model_id if self._embedder_kind == "local"
+                else self.config.memory.embed_model if self._embedder_kind == "openai"
+                else ""
+            ),
+            "backfill": dict(self._embed_backfill),
+        }
         return result
 
     @property
@@ -3701,5 +4335,13 @@ class MemUBridge:
 
     @property
     def _has_embeddings(self) -> bool:
-        """Whether an embedding provider (e.g. OpenAI) is configured."""
-        return bool(self.config.openai_api_key)
+        """Whether an embedder is configured: fastembed (``local``) or OpenAI."""
+        return self._embedder_kind != "none"
+
+    @property
+    def _hybrid_recall(self) -> bool:
+        """Whether recall runs Nerve's hybrid search and the startup backfill
+        embeds stored rows: only when ``memory.embedder`` names an embedder.
+        An install that leaves it unset keeps memU's own recall, as before,
+        even with ``openai_api_key`` set."""
+        return self._has_embeddings and self.config.memory.embedder in ("local", "openai")

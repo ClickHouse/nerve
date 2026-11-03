@@ -27,7 +27,7 @@ from nerve.agent.tools.schemas import (
     MEMORY_UPDATE_SCHEMA,
     SESSION_CONTEXT_SCHEMA,
 )
-from nerve.memory.backend import MemoryBackendUnavailable
+from nerve.memory.backend import MemoryBackendUnavailable, MemoryRecallFailed
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +106,13 @@ async def memory_recall_handler(ctx: ToolContext, args: dict) -> ToolResult:
             if cats:
                 header += f" + {len(cats)} related topics"
             memu_block = f"{header}:\n\n{body}"
+    except MemoryRecallFailed as e:
+        logger.error("Memory recall failed: %s", e)
+        memu_block = (
+            f"⚠️ MEMORY RECALL FAILED ({e}) — recall is BROKEN, NOT empty, and retrying will not "
+            "fix it. Do NOT conclude 'no relevant memories'. Reconstruct context from other "
+            "sources (git history, your own notes) and tell the operator recall is failing."
+        )
     except MemoryBackendUnavailable as e:
         logger.warning("Memory recall: backend unavailable: %s", e)
         memu_block = (

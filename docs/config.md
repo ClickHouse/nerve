@@ -2221,8 +2221,10 @@ vision use it too.
 | `memory.recall_model` | string | `claude-sonnet-5-5` | Model for recall routing |
 | `memory.memorize_model` | string | `claude-sonnet-5-5` | Model for extraction & preprocessing |
 | `memory.fast_model` | string | `claude-haiku-5-5` | Model for categorization, date resolution, knowledge filtering |
-| `memory.embed_model` | string | *(empty)* | Embedding model (only used when `openai_api_key` is set, e.g. `text-embedding-3-small`) |
-| `memory.semantic_dedup_threshold` | float | `0.85` | Cosine similarity threshold for semantic deduplication (0 to disable) |
+| `memory.embedder` | string | *(empty)* | Where memU's vectors come from: `local` (fastembed inside the process, no API key, no memory text leaves the machine), `openai` (needs `openai_api_key`) or `none` (LLM-ranked recall). Empty: `openai` when `openai_api_key` is set, else `none`. See [Local embeddings](memory.md#local-embeddings) |
+| `memory.local_model` | string | `bge-small` | The fastembed model of `embedder: local`: `bge-small` (384-d), `bge-base` (768-d) or `minilm` (384-d). Changing it re-embeds every memory in the background |
+| `memory.embed_model` | string | *(empty)* | OpenAI embedding model of `embedder: openai` (e.g. `text-embedding-3-small`) |
+| `memory.semantic_dedup_threshold` | float | `0.85` (`0.96` with `embedder: local`) | Cosine similarity threshold for semantic deduplication (0 to disable). Unset with a local model it is 0.96: bge-small rates related-but-different facts higher than OpenAI's vectors do. Two texts whose numbers, IDs or dates differ are never merged |
 | `memory.knowledge_filter` | bool | `false` | Post-extraction LLM filter that deletes generic knowledge items (extra Haiku API call per memorize) |
 | `memory.categories` | list | `[]` | Seed categories — each entry has `name` and `description` fields. Used for semantic routing when memorizing and recalling facts. `nerve init` populates mode-appropriate defaults (personal: relationships, finances, health, etc.; worker: patterns, procedures, approvals, etc.). The Loom backend does not use them. |
 
