@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import hashlib
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -407,6 +408,8 @@ class TestOperationResults:
 # provider and behaviour. It must stay byte for byte the same as the
 # contract's ``testdata/frames/gateway/capabilities_behaviour.json``.
 BEHAVIOUR_SAMPLE = Path(__file__).parent / "fixtures" / "channel_contract" / "capabilities_behaviour.json"
+# The SHA-256 of the contract's sample, which the copy must match.
+BEHAVIOUR_SAMPLE_SHA256 = "62b4e7b2549cbe19e41bf44699f621db0db8685b35c612f6387b0b28a61f83ed"
 
 
 def behaviour_frame(**behaviour: Any) -> dict[str, Any]:
@@ -417,6 +420,9 @@ def behaviour_frame(**behaviour: Any) -> dict[str, Any]:
 
 
 class TestConnectionBehaviour:
+    def test_the_copy_of_the_contract_sample_has_its_exact_bytes(self):
+        assert hashlib.sha256(BEHAVIOUR_SAMPLE.read_bytes()).hexdigest() == BEHAVIOUR_SAMPLE_SHA256
+
     def test_the_contract_sample_decodes_into_its_provider_and_behaviour(self):
         envelope = decode(BEHAVIOUR_SAMPLE.read_text(encoding="utf-8"))
         body = envelope.body
