@@ -18,8 +18,11 @@ The capabilities of the event's connection can give a behaviour (see
 ``tool`` answer mode, the router sends nothing to the conversation for the
 turn, and the answer stays in the session. The turn's text then starts with
 a line that says so and names the reply tool, when the connection gives one
-(:func:`answer_note`). A connection without a behaviour, or whose
-capabilities Nerve does not have, has the ``post`` answer mode.
+(:func:`answer_note`). With the ``keep`` session mode, a conversation
+continues its last session however long it was idle, while that session is
+not archived or deleted. A connection without a behaviour, or whose
+capabilities Nerve does not have, has the ``post`` answer mode and the
+``rotate`` session mode: the session changes after the sticky period.
 
 An invoke event names the person that the gateway resolved from its author.
 In external mode, a message or reaction turn runs as that person, and an
@@ -1136,7 +1139,9 @@ class HostedChannel(BaseChannel):
         """Run the turn of one message.
 
         When the connection does not post answers, :func:`answer_note` comes
-        first, before the attachments that were read and the text.
+        first, before the attachments that were read and the text. When the
+        connection keeps sessions, the turn goes to the conversation's last
+        session, if it still has one.
         """
         try:
             message.actor = await self.router.actor_for_principal(
@@ -1148,6 +1153,8 @@ class HostedChannel(BaseChannel):
             if not behaviour.posts_answer:
                 note = answer_note(self._provider, behaviour.reply_tool)
                 message.text = f"{note}\n\n{message.text}" if message.text else note
+            if behaviour.keeps_session:
+                message.session_id = await self.router.get_last_session(message.channel_key)
             await self.router.handle_message(message)
         except asyncio.CancelledError:
             raise

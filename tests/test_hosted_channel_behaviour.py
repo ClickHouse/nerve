@@ -8,9 +8,10 @@ stand-in for the agent turn.
 
 Covered here: the table and its defaults, a switched-off provider that
 refuses its events while Slack goes on, channels that use only the
-connections of their own provider, and the ``tool`` answer mode, in which
-the router sends nothing to the conversation and the turn's text starts with
-a note for the agent. The router's part is also tested on its own, with a
+connections of their own provider, the ``tool`` answer mode, in which the
+router sends nothing to the conversation and the turn's text starts with a
+note for the agent, and the ``keep`` session mode, in which a conversation
+keeps its last session past the sticky period. The router's part is also tested on its own, with a
 channel that records every call.
 """
 
@@ -501,3 +502,76 @@ class TestRouterAnswerMode:
         assert channel.calls == []
         [run] = turns.runs
         assert run["user_message"] == "first\n\nsecond"
+
+
+# ---------------------------------------------------------------------- #
+#  The session mode                                                       #
+# ---------------------------------------------------------------------- #
+
+
+# Long before any sticky period.
+LONG_AGO = "2020-01-01T00:00:00+00:00"
+
+
+async def idle_session(hosted: Hosted, channel_key: str, *, status: str = "idle") -> str:
+    """The conversation's session, idle since long ago."""
+    session_id = await hosted.router.create_session(channel_key, source=CHAT)
+    await hosted.db.update_session_fields(session_id, {"status": status, "last_activity_at": LONG_AGO})
+    return session_id
+
+
+@pytest.mark.asyncio
+class TestKeepSession:
+    async def test_keep_continues_the_last_session_however_long_it_was_idle(self, two):
+        old = await idle_session(two, f"{CHAT}:room-1")
+        stream = await two.stream(advertise=False)
+        await announce(stream, CHAT, CHAT_CONNECTION, answer="tool", session="keep")
+
+        run = await turn_of(two, stream, chat_event(), StreamingTurns())
+
+        assert run["session_id"] == old
+        assert (await two.db.get_channel_session(f"{CHAT}:room-1"))["session_id"] == old
+
+    @pytest.mark.parametrize("behaviour", [{"session": "rotate"}, {}], ids=["rotate", "absent"])
+    async def test_rotate_starts_a_new_session_after_the_sticky_period(self, two, behaviour):
+        old = await idle_session(two, f"{CHAT}:room-1")
+        stream = await two.stream(advertise=False)
+        await announce(stream, CHAT, CHAT_CONNECTION, answer="tool", **behaviour)
+
+        run = await turn_of(two, stream, chat_event(), StreamingTurns())
+
+        assert run["session_id"] != old
+        assert (await two.db.get_channel_session(f"{CHAT}:room-1"))["session_id"] == run["session_id"]
+
+    async def test_keep_starts_a_new_session_when_the_last_one_is_archived(self, two):
+        old = await idle_session(two, f"{CHAT}:room-1", status="archived")
+        stream = await two.stream(advertise=False)
+        await announce(stream, CHAT, CHAT_CONNECTION, answer="tool", session="keep")
+
+        run = await turn_of(two, stream, chat_event(), StreamingTurns())
+
+        assert run["session_id"] != old
+
+    async def test_keep_starts_the_first_session_and_keeps_it_for_the_next_message(self, two):
+        stream = await two.stream(advertise=False)
+        await announce(stream, CHAT, CHAT_CONNECTION, answer="tool", session="keep")
+        turns = StreamingTurns()
+
+        first = await turn_of(two, stream, chat_event(message_id="m-1"), turns)
+        await two.db.update_session_fields(first["session_id"], {"status": "idle", "last_activity_at": LONG_AGO})
+        second = await turn_of(two, stream, chat_event(message_id="m-2"), turns)
+
+        assert second["session_id"] == first["session_id"]
+        assert [run["channel"] for run in turns.runs] == [CHAT, CHAT]
+
+    async def test_keep_holds_each_conversation_to_its_own_session(self, two):
+        first = await idle_session(two, f"{CHAT}:room-1")
+        second = await idle_session(two, f"{CHAT}:room-2")
+        stream = await two.stream(advertise=False)
+        await announce(stream, CHAT, CHAT_CONNECTION, answer="tool", session="keep")
+        turns = StreamingTurns()
+
+        one = await turn_of(two, stream, chat_event(conversation="room-2", message_id="m-3"), turns)
+        other = await turn_of(two, stream, chat_event(conversation="room-1", message_id="m-4"), turns)
+
+        assert (one["session_id"], other["session_id"]) == (second, first)
