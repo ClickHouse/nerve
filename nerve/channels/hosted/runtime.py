@@ -59,6 +59,14 @@ RECEIVE_LIMITS = StreamLimits(
 )
 
 
+class SubscriptionsNotSent(RuntimeError):
+    """A republish that no gateway stream sent.
+
+    A reload reports it as an error: the gateway still has the subscriptions
+    that it had before.
+    """
+
+
 def hosted_channel_providers(config: NerveConfig) -> list[str]:
     """The chat providers whose traffic comes from the gateway.
 
@@ -218,12 +226,28 @@ class HostedChannelRuntime:
         """Send the subscriptions again on every open stream, after a reload.
 
         ``None`` for a runtime that sends no frame (see
-        :meth:`subscriptions`), otherwise a summary for the reload.
+        :meth:`subscriptions`), otherwise a summary for the reload. Raises
+        :class:`SubscriptionsNotSent` when no stream sent them: the gateway
+        keeps the subscriptions that it had until a stream sends the current
+        ones, and each stream sends them when it connects, before Nerve
+        reads from it.
         """
         if not self._publishes:
             return None
+        ready = sum(1 for stream in self.streams.streams if stream.ready)
         sent = await self.streams.publish_subscriptions()
-        return f"published on {sent} stream(s)"
+        if sent:
+            return f"published on {sent} stream(s)"
+        if not ready:
+            raise SubscriptionsNotSent(
+                "not sent yet: no gateway stream is open; the gateway gets them when a "
+                "stream connects, before Nerve reads from it",
+            )
+        raise SubscriptionsNotSent(
+            f"not sent yet: none of the {ready} open stream(s) sent them in time; the "
+            "gateway gets them when a stream connects, before Nerve reads from it, or "
+            "at the next reload",
+        )
 
     def set_delivery_listener(self, listener: Callable[[str], Any] | None) -> None:
         """Call *listener* with the provider name whenever a source record is stored."""
@@ -244,6 +268,7 @@ class HostedChannelRuntime:
 __all__ = [
     "RECEIVE_LIMITS",
     "HostedChannelRuntime",
+    "SubscriptionsNotSent",
     "hosted_channel_providers",
     "hosted_providers",
 ]

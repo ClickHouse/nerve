@@ -374,6 +374,40 @@ class TestSubscriptionsFrame:
         await stream.nudge("invoke")
         assert (await hosted.acknowledged(refused))[refused] == "rejected"
 
+    async def test_a_switch_off_without_a_stream_is_not_sent_yet_and_reaches_the_next_stream(self, hosted):
+        """The gateway keeps the email entry until a stream sends the frame,
+        so the mail that it stores in the gap is rejected when Nerve reads it,
+        as the switch asks."""
+        first = await hosted.stream(advertise=False)
+        assert await self.first(hosted) == FRAME["payload"]["subscriptions"]
+        await first.close()
+        await hosted.gateway.wait_for(lambda: not any(s.ready for s in hosted.runtime.streams.streams))
+        hosted.config.email.enabled = False
+
+        outcome = await config_reload._republish_hosted_subscriptions(republisher(hosted.runtime))
+
+        assert outcome == NOT_SENT
+        assert config_reload.reload_failures({"subscriptions": outcome}) == {"subscriptions": NOT_SENT[7:]}
+        stored = hosted.gateway.store(mail())
+        stream = await hosted.stream(advertise=False)
+        await announce(hosted, stream)
+        await stream.nudge("invoke")
+        assert (await hosted.acknowledged(stored))[stored] == "rejected"
+        assert hosted.gateway.subscriptions[-1] == {"version": "1"}
+        assert sent_first(stream) == {"version": "1"}
+
+    async def test_a_switch_on_without_a_stream_is_not_sent_yet_and_reaches_the_next_stream(self, hosted):
+        hosted.config.email.enabled = False
+        hosted.config.email.enabled = True
+
+        outcome = await config_reload._republish_hosted_subscriptions(republisher(hosted.runtime))
+
+        assert outcome == NOT_SENT
+        stream = await hosted.stream(advertise=False)
+        await announce(hosted, stream)
+        await turn_of(hosted, stream, mail(), StreamingTurns())
+        assert sent_first(stream) == FRAME["payload"]["subscriptions"]
+
     async def test_the_email_entry_follows_the_github_sources(self, tmp_path, db, monkeypatch):
         harness = await start(tmp_path, db, monkeypatch)
         try:
@@ -392,6 +426,22 @@ class TestSubscriptionsFrame:
     async def first(hosted: Hosted) -> dict[str, Any]:
         await hosted.gateway.wait_for(lambda: bool(hosted.gateway.subscriptions))
         return hosted.gateway.subscriptions[0]
+
+
+# What a reload reports when no gateway stream is open.
+NOT_SENT = (
+    "error: not sent yet: no gateway stream is open; the gateway gets them when a stream "
+    "connects, before Nerve reads from it"
+)
+
+
+def sent_first(stream) -> dict[str, Any]:
+    """The subscriptions that *stream* sent, which come before its first read."""
+    kinds_sent = [frame["kind"] for frame in stream.frames if frame["kind"] != "heartbeat"]
+    assert kinds_sent[:2] == ["negotiation", "subscriptions"]
+    assert kinds_sent.index("subscriptions") < kinds_sent.index("inbox_read")
+    [frame] = stream.sent("subscriptions")
+    return frame["payload"]["subscriptions"]
 
 
 # ---------------------------------------------------------------------- #
