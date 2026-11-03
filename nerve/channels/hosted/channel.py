@@ -13,6 +13,14 @@ direct message, a mention of the agent, a reply in a thread that the agent
 takes part in, a reaction, an interaction, or a command. A mention of the
 agent carries the ``self`` flag, so intake needs no capabilities.
 
+The capabilities of the event's connection can give a behaviour (see
+:class:`~nerve.channels.hosted.contract.model.ConnectionBehaviour`). With the
+``tool`` answer mode, the router sends nothing to the conversation for the
+turn, and the answer stays in the session. The turn's text then starts with
+a line that says so and names the reply tool, when the connection gives one
+(:func:`answer_note`). A connection without a behaviour, or whose
+capabilities Nerve does not have, has the ``post`` answer mode.
+
 An invoke event names the person that the gateway resolved from its author.
 In external mode, a message or reaction turn runs as that person, and an
 interaction answers its notification as that person. In local mode, the
@@ -78,7 +86,7 @@ from nerve.channels.base import (
     OutboundRefused,
 )
 from nerve.channels.hosted.attachments import extract_attachments
-from nerve.channels.hosted.contract import ContentPart, Event
+from nerve.channels.hosted.contract import ConnectionBehaviour, ContentPart, Event
 from nerve.channels.hosted.contract.model import (
     MAX_TRANSFER_BYTES,
     AttachmentReference,
@@ -193,6 +201,16 @@ def describe_attachments(event: Event) -> str:
     return " ".join(
         f"[File: {attachment.name or 'unnamed'}]" for attachment in event.attachments
     )
+
+
+def answer_note(provider: str, reply_tool: str = "") -> str:
+    """The line before the text of a turn whose answer Nerve does not post.
+
+    It names the provider, says that the answer in the session goes to no
+    one, and names the tool that can answer, when the connection gives one.
+    """
+    how = f"To answer, use the {reply_tool} tool." if reply_tool else "This channel does not send answers."
+    return f"This message came through {provider}. Your answer in this session is not sent to anyone. {how}"
 
 
 def _why(error: Exception) -> str:
@@ -1092,17 +1110,34 @@ class HostedChannel(BaseChannel):
     def _dispatch(self, message: InboundMessage, event: Event, *, attachments: bool = False) -> Disposition:
         """Start the turn as a task. Acceptance does not wait for the turn.
 
-        The task first resolves the event's person into the message's actor.
+        The behaviour of the event's connection goes with the message. The
+        task first resolves the event's person into the message's actor.
         With *attachments*, it also reads the event's attachments.
         """
         if not self.can_accept():
             return Disposition.deferred(f"{self._provider} has {len(self._inflight)} turns starting")
-        task = asyncio.create_task(self._run_turn(message, event, attachments))
+        behaviour = self._behaviour(event)
+        message.post_answer = behaviour.posts_answer
+        task = asyncio.create_task(self._run_turn(message, event, attachments, behaviour))
         self._inflight.add(task)
         task.add_done_callback(self._inflight.discard)
         return Disposition.accepted()
 
-    async def _run_turn(self, message: InboundMessage, event: Event, attachments: bool) -> None:
+    def _behaviour(self, event: Event) -> ConnectionBehaviour:
+        """The behaviour that the event's connection announced, else the defaults."""
+        capabilities = (
+            self._operations.streams.capabilities_for(event.connection_id) if self._operations else None
+        )
+        return capabilities.behaviour if capabilities is not None else ConnectionBehaviour()
+
+    async def _run_turn(
+        self, message: InboundMessage, event: Event, attachments: bool, behaviour: ConnectionBehaviour,
+    ) -> None:
+        """Run the turn of one message.
+
+        When the connection does not post answers, :func:`answer_note` comes
+        first, before the attachments that were read and the text.
+        """
         try:
             message.actor = await self.router.actor_for_principal(
                 event.admission.invoke.resolved_principal_id,
@@ -1110,11 +1145,15 @@ class HostedChannel(BaseChannel):
             )
             if attachments:
                 await self._add_attachments(message, event)
+            if not behaviour.posts_answer:
+                note = answer_note(self._provider, behaviour.reply_tool)
+                message.text = f"{note}\n\n{message.text}" if message.text else note
             await self.router.handle_message(message)
         except asyncio.CancelledError:
             raise
         except NotAcceptingTurnsError:
-            # The stream adapter already sent the engine's error event.
+            # When the turn posts its answer, the stream adapter already sent
+            # the engine's error event.
             logger.info("Draining: refused a hosted %s turn for %s", self._provider, message.sender_id)
         except Exception as error:  # noqa: BLE001 - one turn must not stop intake
             logger.error(
@@ -1230,4 +1269,4 @@ class HostedChannel(BaseChannel):
         return Disposition.accepted()
 
 
-__all__ = ["HostedChannel", "describe_attachments", "render_content"]
+__all__ = ["HostedChannel", "answer_note", "describe_attachments", "render_content"]
