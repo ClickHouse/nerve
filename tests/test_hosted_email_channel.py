@@ -388,7 +388,7 @@ class TestSubscriptionsFrame:
         outcome = await config_reload._republish_hosted_subscriptions(republisher(hosted.runtime))
 
         assert outcome == NOT_SENT
-        assert config_reload.reload_failures({"subscriptions": outcome}) == {"subscriptions": NOT_SENT[7:]}
+        assert config_reload.reload_failures({"subscriptions": outcome}) == {}
         stored = hosted.gateway.store(mail())
         stream = await hosted.stream(advertise=False)
         await announce(hosted, stream)
@@ -429,9 +429,10 @@ class TestSubscriptionsFrame:
         return hosted.gateway.subscriptions[0]
 
 
-# What a reload reports when no gateway stream is open.
+# What a reload reports when no gateway stream is open: a note, not an error,
+# because every stream that connects sends the current subscriptions first.
 NOT_SENT = (
-    "error: not sent yet: no gateway stream is open; the gateway gets them when a stream "
+    "not sent yet: no gateway stream is open; the gateway gets them when a stream "
     "connects, before Nerve reads from it"
 )
 
@@ -497,6 +498,9 @@ class TestReloadReport:
 
             assert "email" not in summary
             assert "email.enabled" not in summary.get("restart_required", "")
+            # No stream is open: the subscriptions are a note, and the reload is ok.
+            assert summary["subscriptions"] == NOT_SENT
+            assert config_reload.reload_failures(summary) == {}
 
 
 # ---------------------------------------------------------------------- #

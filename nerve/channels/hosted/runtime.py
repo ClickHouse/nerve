@@ -59,14 +59,6 @@ RECEIVE_LIMITS = StreamLimits(
 )
 
 
-class SubscriptionsNotSent(RuntimeError):
-    """A republish that no gateway stream sent.
-
-    A reload reports it as an error: the gateway still has the subscriptions
-    that it had before.
-    """
-
-
 def hosted_channel_providers(config: NerveConfig) -> list[str]:
     """The chat providers whose traffic comes from the gateway.
 
@@ -226,11 +218,11 @@ class HostedChannelRuntime:
         """Send the subscriptions again on every open stream, after a reload.
 
         ``None`` for a runtime that sends no frame (see
-        :meth:`subscriptions`), otherwise a summary for the reload. Raises
-        :class:`SubscriptionsNotSent` when no stream sent them: the gateway
-        keeps the subscriptions that it had until a stream sends the current
-        ones, and each stream sends them when it connects, before Nerve
-        reads from it.
+        :meth:`subscriptions`), otherwise a summary for the reload. When no
+        stream sent them, the summary is a note that says so, not an error:
+        the gateway keeps the subscriptions that it had until a stream sends
+        the current ones, and each stream sends them when it connects,
+        before Nerve reads from it.
         """
         if not self._publishes:
             return None
@@ -239,14 +231,14 @@ class HostedChannelRuntime:
         if sent:
             return f"published on {sent} stream(s)"
         if not ready:
-            raise SubscriptionsNotSent(
+            return (
                 "not sent yet: no gateway stream is open; the gateway gets them when a "
-                "stream connects, before Nerve reads from it",
+                "stream connects, before Nerve reads from it"
             )
-        raise SubscriptionsNotSent(
+        return (
             f"not sent yet: none of the {ready} open stream(s) sent them in time; the "
             "gateway gets them when a stream connects, before Nerve reads from it, or "
-            "at the next reload",
+            "at the next reload"
         )
 
     def set_delivery_listener(self, listener: Callable[[str], Any] | None) -> None:
@@ -268,7 +260,6 @@ class HostedChannelRuntime:
 __all__ = [
     "RECEIVE_LIMITS",
     "HostedChannelRuntime",
-    "SubscriptionsNotSent",
     "hosted_channel_providers",
     "hosted_providers",
 ]
