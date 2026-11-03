@@ -12,12 +12,14 @@ import dataclasses
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
 
 from nerve.channels.hosted.contract import (
     AuthorReference,
+    ConnectionBehaviour,
     Drain,
     Envelope,
     Heartbeat,
@@ -401,7 +403,88 @@ class TestOperationResults:
         assert reason(value) == "limit_exceeded"
 
 
-TIME = datetime(2026, 9, 16, 10, 0, 0, 250000, tzinfo=timezone.utc)
+# A copy of the channel contract's sample of a connection that announces its
+# provider and behaviour. It must stay byte for byte the same as the
+# contract's ``testdata/frames/gateway/capabilities_behaviour.json``.
+BEHAVIOUR_SAMPLE = Path(__file__).parent / "fixtures" / "channel_contract" / "capabilities_behaviour.json"
+
+
+def behaviour_frame(**behaviour: Any) -> dict[str, Any]:
+    body = capabilities()
+    body["provider"] = "slack"
+    body["behaviour"] = behaviour
+    return frame("capabilities", body, connection_id=CONNECTION_ID)
+
+
+class TestConnectionBehaviour:
+    def test_the_contract_sample_decodes_into_its_provider_and_behaviour(self):
+        envelope = decode(BEHAVIOUR_SAMPLE.read_text(encoding="utf-8"))
+        body = envelope.body
+
+        assert envelope.connection_id == uuid.UUID("8c82bd61-913c-40f2-b7cb-c50ba5c56a07")
+        assert (body.provider, body.operations, body.limits.text_characters) == ("email", (), 4000)
+        assert body.behaviour == ConnectionBehaviour(answer="tool", reply_tool="mcp__email__send", session="keep")
+        assert (body.behaviour.posts_answer, body.behaviour.keeps_session) == (False, True)
+        assert body.serves("email") and not body.serves("slack")
+
+    def test_without_provider_and_behaviour_the_defaults_apply(self):
+        body = decode(frame("capabilities", capabilities(), connection_id=CONNECTION_ID)).body
+
+        assert (body.provider, body.behaviour) == ("", ConnectionBehaviour())
+        assert (body.behaviour.posts_answer, body.behaviour.keeps_session) == (True, False)
+        assert body.serves("slack") and body.serves("email")
+
+    @pytest.mark.parametrize("behaviour", [{}, {"answer": "post", "session": "rotate"}, {"answer": "", "session": ""}])
+    def test_the_slack_behaviour_is_the_default(self, behaviour):
+        body = decode(behaviour_frame(**behaviour)).body
+
+        assert (body.provider, body.behaviour.posts_answer, body.behaviour.keeps_session) == ("slack", True, False)
+
+    def test_a_tool_answer_needs_no_reply_tool(self):
+        body = decode(behaviour_frame(answer="tool")).body
+
+        assert (body.behaviour.posts_answer, body.behaviour.reply_tool) == (False, "")
+
+    def test_unknown_behaviour_members_are_ignored(self):
+        body = decode(behaviour_frame(answer="tool", presence="none")).body
+
+        assert body.behaviour == ConnectionBehaviour(answer="tool")
+
+    @pytest.mark.parametrize("behaviour", [{"answer": "none"}, {"session": "pinned"}, {"answer": "POST"}])
+    def test_an_unknown_mode_is_refused(self, behaviour):
+        assert reason(behaviour_frame(**behaviour)) == "kind_unsupported"
+
+    @pytest.mark.parametrize("behaviour", [
+        {"reply_tool": "send"},
+        {"answer": "post", "reply_tool": "send"},
+        {"answer": "tool", "reply_tool": "Send"},
+        {"answer": "tool", "reply_tool": "send-reply"},
+        {"answer": "tool", "reply_tool": "x" * 129},
+        {"answer": "tool", "reply_tool": "send\n"},
+    ], ids=["no_answer_mode", "post", "upper_case", "hyphen", "too_long", "line_feed"])
+    def test_a_reply_tool_outside_its_rules_is_malformed(self, behaviour):
+        assert reason(behaviour_frame(**behaviour)) == "malformed_frame"
+
+    def test_a_reply_tool_of_128_characters_is_taken(self):
+        body = decode(behaviour_frame(answer="tool", reply_tool="x" * 128)).body
+
+        assert body.behaviour.reply_tool == "x" * 128
+
+    @pytest.mark.parametrize("provider", ["Slack", "slack chat", "x" * 65])
+    def test_a_provider_that_is_not_a_lowercase_token_is_malformed(self, provider):
+        value = behaviour_frame()
+        value["payload"]["capabilities"]["provider"] = provider
+
+        assert reason(value) == "malformed_frame"
+
+    def test_a_behaviour_of_another_type_is_malformed(self):
+        value = behaviour_frame()
+        value["payload"]["capabilities"]["behaviour"] = "tool"
+
+        assert reason(value) == "malformed_frame"
+
+
+TIME =datetime(2026, 9, 16, 10, 0, 0, 250000, tzinfo=timezone.utc)
 MESSAGE = MessageTarget(conversation=ConversationReference(id="C1"), message=MessageReference(id="1.2"))
 MESSAGE_JSON = {"conversation": {"id": "C1"}, "message": {"id": "1.2"}}
 
