@@ -257,7 +257,7 @@ A reload is always explicit. Two things cause one:
 | `sessions.sticky_period_minutes` | ✅ |
 | `telegram.dm_policy`, `.stream_mode`, `.reply_routes_to_origin_session` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; toggling `reply_routes_to_origin_session` takes effect on the next message, and applies to replies to earlier messages too (routes are recorded while it is off); `allowed_users` does not follow it (see the restart table) |
 | `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source and the events of the other hosted providers included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
-| `email.enabled` | ✅ read per event. The reload publishes the subscriptions to the gateway again, which then takes or refuses new mail. When no stream sends them, the reload reports `subscriptions` as an error ("not sent yet"), and the next stream that connects sends them before Nerve reads from it. The email channel must exist: usable `channels.hosted` settings at startup give it. Without usable settings the reload repeats the startup warning under `email`; with usable settings and no email channel it says that a restart is needed (see [Email](#email)) |
+| `email.enabled` | ✅ read per event. The reload publishes the subscriptions to the gateway again, which then takes or refuses new mail. When no stream sends them, the reload reports `subscriptions` with a "not sent yet" note, which is not an error: the next stream that connects sends them before Nerve reads from it. The email channel must exist: usable `channels.hosted` settings at startup give it. Without usable settings the reload repeats the startup warning under `email`; with usable settings and no email channel it says that a restart is needed (see [Email](#email)) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
 | **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`, `codex.models`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, `agent.subagents.*`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.base_url`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
@@ -1832,11 +1832,12 @@ a reload switches email on or off without a restart:
 
 The gateway changes only when a stream sends it the subscriptions. When no
 stream is open, or no open stream sends them in time, the reload reports
-`subscriptions` as an error that says they are not sent yet. Each stream
-sends the current subscriptions when it connects, before Nerve reads from
-it. Until then the gateway keeps the subscriptions that it had: after a
-switch off, it can store more mail, and Nerve rejects that mail when it
-reads it. That is the result of the switch, not a fault.
+`subscriptions` with a note that says they are not sent yet. The note is
+not an error, and the reload stays `ok`: each stream sends the current
+subscriptions when it connects, before Nerve reads from it, so the gateway
+gets them. Until then the gateway keeps the subscriptions that it had:
+after a switch off, it can store more mail, and Nerve rejects that mail
+when it reads it. That is the result of the switch, not a fault.
 
 A reload while `email.enabled` is `true` also says what stops the channel:
 without usable `channels.hosted` settings, the reload repeats the startup

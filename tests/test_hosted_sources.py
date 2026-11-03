@@ -38,7 +38,6 @@ from nerve.channels.hosted.contract.wire import dumps
 from nerve.channels.hosted.providers import SLACK
 from nerve.channels.hosted.runtime import (
     HostedChannelRuntime,
-    SubscriptionsNotSent,
     hosted_channel_providers,
     hosted_providers,
 )
@@ -1098,8 +1097,8 @@ class TestStreams:
 
         async with stalled_through_negotiation(hosted) as stream:
             hosted.config.sync.github.deny_reasons = ["subscribed", "comment"]
-            with pytest.raises(SubscriptionsNotSent, match="none of the 1 open stream"):
-                await asyncio.wait_for(hosted.runtime.republish_subscriptions(), timeout=3)
+            outcome = await asyncio.wait_for(hosted.runtime.republish_subscriptions(), timeout=3)
+            assert outcome.startswith("not sent yet: none of the 1 open stream(s) sent them in time")
 
         await hosted.gateway.wait_for(lambda: bool(stream.sent("inbox_read")))
         [frame] = stream.sent("subscriptions")

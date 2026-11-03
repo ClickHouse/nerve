@@ -380,9 +380,10 @@ async def _republish_hosted_subscriptions(engine) -> str | None:
     repositories and settings) and ``email.enabled``; the gateway keeps the
     newest subscription it received. (In poll mode they follow with the
     rebuilt source runners.) ``None`` for a runtime that sends no
-    subscriptions. An error when no stream sent them: the gateway keeps the
-    subscriptions that it had until a stream connects and sends the current
-    ones.
+    subscriptions. When no stream sent them, a "not sent yet" note, not an
+    error: every stream that connects sends the current subscriptions before
+    Nerve reads from it, so the gateway gets them, and an error would make
+    workspace sync run the whole reload again on every cycle.
     """
     if engine is None:
         return None
