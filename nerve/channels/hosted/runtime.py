@@ -4,9 +4,10 @@ The runtime owns the token verifier, the stream manager, the operation
 runner, the inbox reader, one :class:`HostedChannel` for each chat provider in
 hosted mode (see :mod:`nerve.channels.hosted.providers`), and one
 :class:`HostedSourceConsumer` for each hosted source. The hosted settings and
-the provider modes are read once at startup; a change needs a restart. A reload reads the gateway key file again and publishes the
-source subscriptions again. The source grant of each chat provider is read
-per event, so it follows a reload.
+the provider modes are read once at startup; a change needs a restart. A
+reload reads the gateway key file again and publishes the source
+subscriptions again. The switch, the settings, and the source grant of each
+chat provider are read per event, so they follow a reload.
 """
 
 from __future__ import annotations
