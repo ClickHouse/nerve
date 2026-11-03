@@ -10,9 +10,10 @@ Covered here: the table and its defaults, a switched-off provider that
 refuses its events while Slack goes on, channels that use only the
 connections of their own provider, the ``tool`` answer mode, in which the
 router sends nothing to the conversation and the turn's text starts with a
-note for the agent, and the ``keep`` session mode, in which a conversation
-keeps its last session past the sticky period. The router's part is also tested on its own, with a
-channel that records every call.
+note for the agent, the ``keep`` session mode, in which a conversation
+keeps its last session past the sticky period, and simultaneous first
+messages of one conversation. The router's part is also tested on its own,
+with a channel that records every call.
 """
 
 from __future__ import annotations
@@ -575,3 +576,40 @@ class TestKeepSession:
         other = await turn_of(two, stream, chat_event(conversation="room-1", message_id="m-4"), turns)
 
         assert (one["session_id"], other["session_id"]) == (second, first)
+
+
+# ---------------------------------------------------------------------- #
+#  Simultaneous first messages                                            #
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+class TestSimultaneousFirstMessages:
+    async def test_two_first_messages_of_one_conversation_share_one_session(self, two):
+        stream = await two.stream(advertise=False)
+        await announce(stream, CHAT, CHAT_CONNECTION, answer="tool", session="keep")
+        await two.gateway.wait_for(lambda: two.runtime.streams.connections("send", CHAT))
+        turns = StreamingTurns()
+        two.router.engine.run = turns.run
+        first = two.gateway.store(chat_event(message_id="m-1", text="first"))
+        second = two.gateway.store(chat_event(message_id="m-2", text="second"))
+
+        await stream.nudge("invoke")
+
+        assert await two.acknowledged(first, second) == {first: "accepted", second: "accepted"}
+        await turns.wait_for(1)
+        await asyncio.sleep(0.3)
+        mapping = await two.db.get_channel_session(f"{CHAT}:room-1")
+        assert {run["session_id"] for run in turns.runs} == {mapping["session_id"]}
+        said = "\n\n".join(run["user_message"] for run in turns.runs)
+        assert said.index("first") < said.index("second")
+
+    async def test_the_router_resolves_one_session_for_simultaneous_messages(self, db):
+        turns = StreamingTurns()
+        router, _ = recording_router(db, turns)
+
+        await asyncio.gather(*(router.handle_message(inbound(f"message {n}")) for n in range(3)))
+
+        mapping = await db.get_channel_session("recording:room-1")
+        assert {run["session_id"] for run in turns.runs} == {mapping["session_id"]}
+

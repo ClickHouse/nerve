@@ -103,6 +103,9 @@ class ChannelRouter:
         self._pending_batches: dict[
             str, list[tuple[InboundMessage, asyncio.Future[str]]]
         ] = {}
+        # Per-channel-key locks: the messages of one conversation resolve
+        # their session and join its queue one at a time.
+        self._resolution_locks: dict[str, asyncio.Lock] = {}
 
     # ------------------------------------------------------------------ #
     #  Channel registry                                                    #
@@ -202,31 +205,36 @@ class ChannelRouter:
         (``post_answer``) sends nothing to the channel: no typing
         indicator, no streamed or final answer, and no error message.
 
+        The messages of one channel key resolve their session one at a
+        time, in arrival order. Simultaneous first messages of a
+        conversation thus share the session that the first one creates.
+
         Called by channel implementations when they receive a user message.
         """
         channel = self._channels.get(msg.channel_name)
         if not channel:
             raise ValueError(f"Unknown channel: {msg.channel_name}")
 
-        # Resolve session
-        if msg.session_id:
-            session_id = msg.session_id
-            await self.engine.sessions.set_active_session(
-                msg.channel_key, session_id,
-            )
-        else:
-            session_id = await self.engine.sessions.get_active_session(
-                msg.channel_key, source=msg.channel_name, actor=msg.actor,
-            )
-
-        # Store message context for reaction support
-        self._note_message_context(session_id, msg)
-
-        # Queue the message; a Future carries the result back to the caller.
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
-        self._pending_batches.setdefault(session_id, []).append(
-            (msg, future),
-        )
+        async with self._resolution_locks.setdefault(msg.channel_key, asyncio.Lock()):
+            # Resolve session
+            if msg.session_id:
+                session_id = msg.session_id
+                await self.engine.sessions.set_active_session(
+                    msg.channel_key, session_id,
+                )
+            else:
+                session_id = await self.engine.sessions.get_active_session(
+                    msg.channel_key, source=msg.channel_name, actor=msg.actor,
+                )
+
+            # Store message context for reaction support
+            self._note_message_context(session_id, msg)
+
+            # Queue the message; a Future carries the result back to the caller.
+            self._pending_batches.setdefault(session_id, []).append(
+                (msg, future),
+            )
 
         # If the session is already busy, the message is queued —
         # the driver coroutine will include it in the next batch.
