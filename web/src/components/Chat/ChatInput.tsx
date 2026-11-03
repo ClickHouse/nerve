@@ -4,6 +4,7 @@ import { Button, IconButton, Select, TextField } from '../ui';
 import { useChatStore, EMPTY_REVIEW_LOOP, registerComposerFlush } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { useAgentStore } from '../../stores/agentStore';
+import { useIsTouch } from '../../hooks/useMediaQuery';
 import { dockLine } from '../../stores/helpers/agentSelectors';
 import { api } from '../../api/client';
 import { randomUUID } from '../../utils/uuid';
@@ -377,6 +378,10 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
   // Not gated on `isStreaming`: while a turn runs, sending queues the message
   // on the server and it runs next.
   const canSend = !disabled && !rewriteActive && !!hasContent && allUploaded;
+  // An on-screen keyboard has no Shift+Enter, so on a touch device Enter types
+  // a newline and the Send button sends. Cmd/Ctrl+Enter sends everywhere, for
+  // a tablet with a hardware keyboard.
+  const enterSends = !useIsTouch();
 
   /** Actually dispatch a message (with current attachments) and reset the composer. */
   const dispatchSend = (message: string) => {
@@ -528,7 +533,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
     // Never intercept mid-IME-composition (Enter commits the candidate, etc.).
     if (e.nativeEvent.isComposing) return;
 
-    if (e.key === 'Enter' && !e.shiftKey) {
+    if (e.key === 'Enter' && !e.shiftKey && (enterSends || e.metaKey || e.ctrlKey)) {
       e.preventDefault();
       if (canSend) handleSend();
       return;
@@ -864,6 +869,9 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
             onChange={(e) => { const v = e.target.value; setInput(v); historyIndexRef.current = -1; scheduleDraft(activeSession, v); }}
             onBlur={() => { cancelDraftFlush(); setDraft(activeSession, input); }}
             onKeyDown={handleKeyDown}
+            // The label of the Enter key on an on-screen keyboard. It agrees
+            // with what Enter does.
+            enterKeyHint={enterSends ? 'send' : 'enter'}
             onPaste={handlePaste}
             placeholder={
               quotes.length > 0 ? 'Add context (optional)...'
@@ -1042,6 +1050,7 @@ function QuoteCard({ quote, instructionRef, onRemove, onUpdateInstruction, onSen
             value={quote.instruction}
             onChange={(e) => onUpdateInstruction(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter' && onSend) { e.preventDefault(); onSend(); } }}
+            enterKeyHint="send"
             placeholder={config.placeholder}
             className="mt-1.5 py-0.5 text-sm text-text-secondary border-b border-border transition-colors"
           />
