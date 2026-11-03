@@ -380,7 +380,9 @@ async def _republish_hosted_subscriptions(engine) -> str | None:
     repositories and settings) and ``email.enabled``; the gateway keeps the
     newest subscription it received. (In poll mode they follow with the
     rebuilt source runners.) ``None`` for a runtime that sends no
-    subscriptions.
+    subscriptions. An error when no stream sent them: the gateway keeps the
+    subscriptions that it had until a stream connects and sends the current
+    ones.
     """
     if engine is None:
         return None
@@ -391,7 +393,7 @@ async def _republish_hosted_subscriptions(engine) -> str | None:
         return await runtime.republish_subscriptions()
     except Exception as e:  # noqa: BLE001 - report the subsystem and continue
         detail = str(e) or type(e).__name__
-        logger.warning("Hosted source subscriptions were not published: %s", detail)
+        logger.warning("Hosted subscriptions: %s", detail)
         return f"{_ERROR_PREFIX}{detail}"
 
 
