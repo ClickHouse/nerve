@@ -19,13 +19,16 @@ choices are to hold all of them or to refuse those of the provider:
   stops reading until a reload switches the provider on. The events wait in
   the gateway inbox, also those of the other providers. Slack does this.
 - Without it, which is the default, its channel rejects each of its events,
-  and the reader continues with the events of the other providers.
+  and the reader continues with the events of the other providers. Email
+  does this.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Callable
+
+from nerve.channels.hosted.contract.model import EMAIL_PROVIDER
 
 if TYPE_CHECKING:
     from nerve.config import ChannelSourceConfig, NerveConfig
@@ -75,7 +78,12 @@ class HostedChatProvider:
     ``channel_options`` gives the provider's presentation rules, as keyword
     arguments of :class:`~nerve.channels.hosted.channel.HostedChannel`:
     ``is_id``, ``reaction_names`` and ``button_style``. A provider without
-    them gets the channel's defaults.
+    them gets the channel's defaults. ``subscribes`` says that the gateway
+    takes the provider's events only for an agent whose ``subscriptions``
+    frame names the provider. While such a provider is switched on, the
+    frame carries an entry with its name and no filters; while it is off,
+    the frame leaves it out, and the gateway refuses its events before it
+    stores them.
     """
 
     name: str
@@ -84,6 +92,7 @@ class HostedChatProvider:
     settings: Callable[[NerveConfig], HostedChannelSettings] = _no_settings
     hold_while_off: bool = False
     channel_options: Callable[[], dict[str, Any]] = _no_options
+    subscribes: bool = False
 
 
 # ---------------------------------------------------------------------- #
@@ -136,8 +145,59 @@ SLACK = HostedChatProvider(
     channel_options=_slack_channel_options,
 )
 
+
+# ---------------------------------------------------------------------- #
+#  Email                                                                  #
+# ---------------------------------------------------------------------- #
+
+
+def email_hosted(config: NerveConfig) -> bool:
+    """Whether the config gives Nerve an email channel.
+
+    Email has no mode of its own: the channel gateway is the only way that
+    mail arrives, so usable ``channels.hosted`` settings give the channel,
+    also while ``email.enabled`` is false. A reload can then switch email on
+    without a restart.
+    """
+    return not config.channels.hosted.problems()
+
+
+def _email_switched_on(config: NerveConfig) -> bool:
+    return bool(config.email.enabled)
+
+
+def email_warning(config: NerveConfig) -> str | None:
+    """Why ``email.enabled`` gives no email channel, or ``None``.
+
+    ``None`` also while email is switched off. Nerve logs the text at
+    startup, and ``nerve doctor`` shows it.
+    """
+    if not config.email.enabled:
+        return None
+    problems = config.channels.hosted.problems()
+    if not problems:
+        return None
+    return (
+        "email.enabled is set, but mail comes only through the channel gateway and the "
+        f"channels.hosted settings are not usable ({'; '.join(problems)}); no email channel "
+        "is registered"
+    )
+
+
+# The mail that members of the agent send to its address. Each mail is a
+# direct conversation of its own sender and thread. The gateway announces the
+# connection's behaviour: Nerve posts no answer, and the conversation keeps
+# its session. Email has no settings of its own, refuses its events while it
+# is switched off, and the gateway takes mail only for a subscribed agent.
+EMAIL = HostedChatProvider(
+    name=EMAIL_PROVIDER,
+    hosted=email_hosted,
+    switched_on=_email_switched_on,
+    subscribes=True,
+)
+
 # Every hosted chat provider, in the order of their channels.
-HOSTED_CHAT_PROVIDERS: tuple[HostedChatProvider, ...] = (SLACK,)
+HOSTED_CHAT_PROVIDERS: tuple[HostedChatProvider, ...] = (SLACK, EMAIL)
 
 
 def hosted_chat_providers(config: NerveConfig) -> list[HostedChatProvider]:
@@ -150,10 +210,13 @@ def hosted_chat_providers(config: NerveConfig) -> list[HostedChatProvider]:
 
 
 __all__ = [
+    "EMAIL",
     "HOSTED_CHAT_PROVIDERS",
     "SLACK",
     "STREAM_MODE_PARTIAL",
     "HostedChannelSettings",
     "HostedChatProvider",
+    "email_hosted",
+    "email_warning",
     "hosted_chat_providers",
 ]

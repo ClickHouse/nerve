@@ -373,13 +373,14 @@ def _reload_actor_context_keys() -> str | None:
 
 
 async def _republish_hosted_subscriptions(engine) -> str | None:
-    """Send the hosted source subscriptions to the gateway again.
+    """Send the hosted subscriptions to the gateway again.
 
     The filters, ``pr_watch`` and ``inbox`` follow a reload this way, and so
-    does the repository watch (``sync.github_repos``: switched on or off, its
-    repositories and settings); the gateway keeps the newest subscription it
-    received. (In poll mode they follow with the rebuilt source runners.)
-    ``None`` without hosted sources.
+    do the repository watch (``sync.github_repos``: switched on or off, its
+    repositories and settings) and ``email.enabled``; the gateway keeps the
+    newest subscription it received. (In poll mode they follow with the
+    rebuilt source runners.) ``None`` for a runtime that sends no
+    subscriptions.
     """
     if engine is None:
         return None
