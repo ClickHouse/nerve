@@ -257,6 +257,7 @@ A reload is always explicit. Two things cause one:
 | `sessions.sticky_period_minutes` | ✅ |
 | `telegram.dm_policy`, `.stream_mode` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
 | `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source and the events of the other hosted providers included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
+| `email.enabled` | ✅ read per event. The reload publishes the subscriptions to the gateway again, which then takes or refuses new mail. The email channel must exist: usable `channels.hosted` settings at startup give it (see [Email](#email)) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
 | **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`, `codex.models`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, `agent.subagents.*`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.base_url`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
@@ -295,7 +296,7 @@ reload cannot inspect, and are documented here only.
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
 | `mcp_gateway_url` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
-| `slack.mode`, `channels.hosted.*` | the hosted channel, its stream endpoint, and its token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
+| `slack.mode`, `channels.hosted.*` | the hosted channels, the email channel included, their stream endpoint, and their token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
 | `sync.github.mode` | the GitHub sources (`github` and the repository watch, `github_repos`), and in hosted mode the stream endpoint and the consumers of the gateway's records, are chosen at startup. Until a restart the sources keep the mode they started with, and so does the `github_pr_activity` gate. The filters, `pr_watch`, `inbox` and `sync.github_repos` do follow a reload: in hosted mode the reload publishes them to the gateway again. To go back to `poll`, set `enabled: false` (and `sync.github_repos.enabled: false`) and reload first (see [sources.md](sources.md#hosted-github-source)) |
 | `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
@@ -1452,24 +1453,28 @@ notifications, and with `sync.github_repos` the repositories it watches; the
 `channels.hosted` settings above apply unchanged, and they are enough on their
 own: Slack need not be hosted too. See
 [Hosted GitHub source](sources.md#hosted-github-source) and
-[Hosted repository watch](sources.md#hosted-repository-watch).
+[Hosted repository watch](sources.md#hosted-repository-watch). They also
+carry the mail that members send to the agent: the usable `channels.hosted`
+settings give the email channel, which `email.enabled` switches on (see
+[Email](#email)).
 
-When Slack is hosted as well, its switch also holds GitHub back. Nerve reads
-the events of every hosted provider from one ordered inbox, and it reads
-nothing while hosted Slack is switched off (`slack.enabled: false`): the
-GitHub records wait at the gateway until Slack is switched on again, and past
-the gateway's limit of stored records the oldest are dropped. Keep a hosted
-Slack switched on while GitHub is hosted; `nerve doctor` warns when it is off.
-This is a known limitation: a read for each provider on its own, which would
-keep GitHub records arriving while hosted Slack is off, is a follow-up.
+When Slack is hosted as well, its switch also holds GitHub and member mail
+back. Nerve reads the events of every hosted provider from one ordered
+inbox, and it reads nothing while hosted Slack is switched off
+(`slack.enabled: false`): the GitHub records wait at the gateway until Slack
+is switched on again, and past the gateway's limit of stored records the
+oldest are dropped. Keep a hosted Slack switched on while GitHub is hosted;
+`nerve doctor` warns when it is off. This is a known limitation: a read for
+each provider on its own, which would keep GitHub records arriving while
+hosted Slack is off, is a follow-up.
 
 #### Connection behaviour
 
-Nerve builds one hosted channel for each chat provider in hosted mode; Slack
-is the only hosted chat provider of this version. The capabilities that the
-gateway sends for a connection can name the connection's provider and a
-behaviour, which tells Nerve how to answer the turns of its events and which
-session they go to:
+Nerve builds one hosted channel for each chat provider in hosted mode. The
+hosted chat providers of this version are Slack and email (see
+[Email](#email)). The capabilities that the gateway sends for a connection
+can name the connection's provider and a behaviour, which tells Nerve how to
+answer the turns of its events and which session they go to:
 
 | Member | Values | Default | Effect |
 |--------|--------|---------|--------|
@@ -1478,21 +1483,24 @@ session they go to:
 | `session` | `rotate`, `keep` | `rotate` | `rotate`: a conversation gets a new session after `sessions.sticky_period_minutes` of idle time. `keep`: a conversation continues its last session, however long it was idle, until that session is archived or deleted |
 
 Slack connections post and rotate, so a gateway that sends no behaviour
-changes nothing. A connection whose capabilities Nerve does not have posts
-and rotates too. In `tool` mode, Nerve puts one line before the text of the
-turn: "This message came through *provider*. Your answer in this session is
-not sent to anyone. To answer, use the *reply tool* tool." Without a reply
-tool, the line ends with "This channel does not send answers."
+changes nothing. The email connection answers with `tool`, names the reply
+tool, and keeps its sessions. A connection whose capabilities Nerve does not
+have posts and rotates too. In `tool` mode, Nerve puts one line before the
+text of the turn: "This message came through *provider*. Your answer in this
+session is not sent to anyone. To answer, use the *reply tool* tool."
+Without a reply tool, the line ends with "This channel does not send
+answers."
 
 Each hosted chat provider has its own switch. Because the gateway keeps the
 events of every provider in one ordered inbox, a provider that is switched
 off either holds the events of all providers or refuses its own events.
 Hosted Slack holds them: while `slack.enabled` is `false`, Nerve reads
 nothing, and the events of the other hosted providers wait in the gateway
-inbox too. Any other hosted chat provider refuses: while it is switched off,
-Nerve rejects its events and continues to read the events of the other
-providers. Nerve also stops reading, for every provider, while one hosted
-channel has 100 turns in progress, and continues when one of them ends.
+inbox too. Any other hosted chat provider refuses, email included: while it
+is switched off, Nerve rejects its events and continues to read the events
+of the other providers. Nerve also stops reading, for every provider, while
+one hosted channel has 100 turns in progress, and continues when one of them
+ends.
 
 An event on a connection whose capabilities name another provider is
 rejected, and Nerve sends no operation of a channel through such a
@@ -1767,6 +1775,59 @@ Three differences from the inbound policy:
   multi-person DM, and only `conversations.info` can tell them apart, so a
   `G` target costs one cached lookup; a lookup that cannot answer is refused
   rather than guessed.
+
+## Email
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `email.enabled` | bool | `false` | Take the mail that members of the agent send to its address. Hosted mode only |
+
+```yaml
+email:
+  enabled: true
+```
+
+In hosted mode, the platform can give the agent an email address. The channel
+gateway delivers the mail that members of the agent send to that address, on
+the same streams as hosted Slack and the hosted GitHub source (see
+[Hosted mode](#hosted-mode)). The platform decides which mail reaches the
+agent; `email.enabled` decides only whether Nerve takes it. Email has no
+other mode, so it needs usable `channels.hosted` settings. Without them,
+Nerve logs a warning at startup, `nerve doctor` shows the same warning, and
+there is no email channel.
+
+Each mail starts a turn. The conversation of a mail is one sender and one
+email thread: the gateway gives each pair its own conversation ID, so two
+members never share a session, and the session key is
+`email:<conversation ID>`. A conversation continues its last session however
+long it was idle, until that session is archived or deleted.
+
+Nerve posts no answer to a mail: no typing indicator, no streamed answer, and
+no `Error:` message. The answer stays in the session. The agent answers by
+email only with the reply tool that the gateway names for the email
+connection, and only when sending email is on for the agent. The text of the
+turn starts with the line of [Connection behaviour](#connection-behaviour),
+then the mail as the gateway gives it: the sender's name and member ID, the
+subject, the date, the message and thread IDs, the attachments by name (they
+are not delivered), and the body. The agent never sees the sender's email
+address.
+
+The gateway takes mail for the agent only while the agent's subscriptions
+name `email`, and Nerve names it while `email.enabled` is `true`. Usable
+`channels.hosted` settings at startup give the email channel also while
+`email.enabled` is `false`, and Nerve reads the switch for each event. Thus
+a reload switches email on or off without a restart:
+
+- Switched on, the reload sends the subscriptions with `email` on every
+  stream, and the gateway takes new mail.
+- Switched off, the reload sends them without `email`, and the gateway
+  refuses new mail. Nerve rejects the mail that is still in the gateway
+  inbox, and continues to read the events of the other providers.
+
+While a hosted Slack is switched off, Nerve reads nothing from the gateway
+inbox, so member mail waits there too (see
+[Connection behaviour](#connection-behaviour)). `send_channel_message`
+cannot post through the email channel.
 
 ## Quiet Hours
 
