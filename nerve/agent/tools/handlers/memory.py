@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -28,6 +29,17 @@ from nerve.agent.tools.schemas import (
     SESSION_CONTEXT_SCHEMA,
 )
 from nerve.memory.backend import MemoryBackendUnavailable, MemoryRecallFailed
+
+# Transcript and file chunks (memory.extraction: none) are not facts: the date
+# and maintenance listings leave them out. Kept in step with memu_bridge's
+# CHUNK_MEMORY_TYPES without importing it (that pulls in memU's numpy stack).
+_CHUNK_TYPES_SQL = "'conversation', 'document'"
+_SESSION_FILE_RE = re.compile(r"session-(?P<sid>.+)-(?P<ts>\d{9,})\.json$")
+
+
+def _session_of_url(url: str | None) -> str:
+    match = _SESSION_FILE_RE.search(url or "")
+    return match["sid"] if match else ""
 
 logger = logging.getLogger(__name__)
 
@@ -297,15 +309,47 @@ def _fetch_history_rows(
     db = sqlite3.connect(db_path, timeout=10)
     db.row_factory = sqlite3.Row
     try:
-        rows = db.execute(
+        # Facts dated in the range; transcript and file chunks are not facts.
+        rows = [dict(r) for r in db.execute(
             "SELECT id, memory_type, summary, happened_at FROM memu_memory_items "
             "WHERE happened_at IS NOT NULL "
             "AND date(happened_at) >= date(?) AND date(happened_at) <= date(?) "
+            f"AND memory_type NOT IN ({_CHUNK_TYPES_SQL}) "
             "ORDER BY happened_at DESC "
             "LIMIT ?",
             (date, end_date, limit),
+        ).fetchall()]
+        # One line per session with transcript chunks in the range: when it
+        # started that day and what was asked first (the resource caption).
+        # SQLite returns the other columns from the row holding MIN().
+        sessions = db.execute(
+            "SELECT r.url AS url, r.caption AS caption, MIN(i.happened_at) AS happened_at "
+            "FROM memu_memory_items i JOIN memu_resources r ON r.id = i.resource_id "
+            "WHERE i.memory_type = 'conversation' AND i.happened_at IS NOT NULL "
+            "AND date(i.happened_at) >= date(?) AND date(i.happened_at) <= date(?) "
+            "GROUP BY r.id",
+            (date, end_date),
         ).fetchall()
-        return [dict(r) for r in rows]
+        firsts: dict[tuple[str, str], dict] = {}
+        for s in sessions:
+            sid = _session_of_url(s["url"]) or "?"
+            key = (sid, str(s["happened_at"])[:10])
+            if key not in firsts or str(s["happened_at"]) < str(firsts[key]["happened_at"]):
+                firsts[key] = dict(s)
+        for (sid, _day), s in firsts.items():
+            caption = (s["caption"] or "").strip()
+            rows.append({
+                "id": f"session:{sid}",
+                "memory_type": "conversation",
+                "summary": f"{str(s['happened_at'])[:16]} session {sid}" + (f": {caption}" if caption else ""),
+                "happened_at": s["happened_at"],
+            })
+        rows.sort(key=lambda r: str(r["happened_at"]), reverse=True)
+        return rows[:limit]
+    except sqlite3.OperationalError as e:
+        if "memu_resources" not in str(e):
+            raise
+        return rows[:limit]
     finally:
         db.close()
 
@@ -320,8 +364,9 @@ def _fetch_records_rows(
         if include_updated:
             query = (
                 "SELECT id, memory_type, summary, created_at, updated_at FROM memu_memory_items "
-                "WHERE (date(created_at) >= date(?) AND date(created_at) <= date(?)) "
-                "   OR (date(updated_at) >= date(?) AND date(updated_at) <= date(?) AND date(updated_at) != date(created_at)) "
+                "WHERE ((date(created_at) >= date(?) AND date(created_at) <= date(?)) "
+                "   OR (date(updated_at) >= date(?) AND date(updated_at) <= date(?) AND date(updated_at) != date(created_at))) "
+                f"  AND memory_type NOT IN ({_CHUNK_TYPES_SQL}) "
                 "ORDER BY created_at DESC "
                 "LIMIT ?"
             )
@@ -330,6 +375,7 @@ def _fetch_records_rows(
             query = (
                 "SELECT id, memory_type, summary, created_at, updated_at FROM memu_memory_items "
                 "WHERE date(created_at) >= date(?) AND date(created_at) <= date(?) "
+                f"AND memory_type NOT IN ({_CHUNK_TYPES_SQL}) "
                 "ORDER BY created_at DESC "
                 "LIMIT ?"
             )
@@ -423,7 +469,19 @@ async def memorize_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
         await asyncio.to_thread(_write_memorize_file)
 
-        memu_ok = await ctx.memory_bridge.memorize_file(str(mem_path), modality="document")
+        if getattr(ctx.memory_bridge, "verbatim_facts", False) is True:
+            # memory.extraction: none — stored as written, no model.
+            date = (args.get("date") or "").strip() or None
+            if date:
+                try:
+                    time.strptime(date, "%Y-%m-%d")
+                except ValueError:
+                    return ToolResult.text(f"Error: date must be YYYY-MM-DD, got {date!r}")
+            memu_ok = await ctx.memory_bridge.memorize_fact(
+                content, memory_type, date=date, source_path=str(mem_path),
+            )
+        else:
+            memu_ok = await ctx.memory_bridge.memorize_file(str(mem_path), modality="document")
     except MemoryBackendUnavailable as e:
         logger.warning("Memorize (memU): backend unavailable: %s", e)
         memu_err = str(e)

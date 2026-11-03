@@ -2590,6 +2590,13 @@ DEFAULT_LOCAL_EMBED_MODEL = "bge-small"
 # differ.
 LOCAL_SEMANTIC_DEDUP_THRESHOLD = 0.96
 
+# How memU turns what it is given into memories (``memory.extraction``):
+# ``llm`` is memU's pipeline, a model extracting facts from conversations and
+# files and rewriting category summaries; ``none`` calls no model at all — a
+# memorized fact is stored as written, and conversations and files are stored
+# as embedded chunks, which needs an embedder.
+MEMORY_EXTRACTIONS: tuple[str, ...] = ("llm", "none")
+
 
 # Loom's names: a namespace is lowercase letters, digits and hyphens, starting
 # with a letter or digit, at most 128 characters; an org name is checked as
@@ -2640,6 +2647,10 @@ class MemoryConfig:
     embedder: str = ""
     # The fastembed model of embedder "local" (LOCAL_EMBED_MODELS).
     local_model: str = DEFAULT_LOCAL_EMBED_MODEL
+    # "llm" (memU's extraction pipeline) or "none" (no model; MEMORY_EXTRACTIONS).
+    extraction: str = "llm"
+    # Session-id globs whose conversations are never indexed ("cron:nightly-report*").
+    skip_sessions: list[str] = field(default_factory=list)
     sqlite_dsn: str = ""
     semantic_dedup_threshold: float = 0.85  # Cosine similarity threshold for semantic dedup
     knowledge_filter: bool = False  # Post-extraction LLM filter for generic knowledge (extra API call)
@@ -2667,6 +2678,8 @@ class MemoryConfig:
             embed_model=d.get("embed_model", ""),
             embedder=str(d.get("embedder") or "").strip().lower(),
             local_model=str(d.get("local_model") or DEFAULT_LOCAL_EMBED_MODEL).strip().lower(),
+            extraction=str(d.get("extraction") or "llm").strip().lower(),
+            skip_sessions=_str_list(d.get("skip_sessions") or [], clean=True),
             sqlite_dsn=d.get("sqlite_dsn", default_dsn),
             semantic_dedup_threshold=d.get("semantic_dedup_threshold", 0.85),
             knowledge_filter=d.get("knowledge_filter", False),
@@ -4757,6 +4770,19 @@ class NerveConfig:
             )
         if backend == "memu" and embedder == "openai" and not self.openai_api_key:
             raise ValueError("memory.embedder: openai needs openai_api_key")
+        extraction = self.memory.extraction
+        if extraction not in MEMORY_EXTRACTIONS:
+            raise ValueError(
+                f"memory.extraction must be one of {MEMORY_EXTRACTIONS}, got {extraction!r}"
+            )
+        if (
+            backend == "memu" and extraction == "none"
+            and self.memory.embedder_kind(self.openai_api_key) == "none"
+        ):
+            raise ValueError(
+                "memory.extraction: none needs an embedder (memory.embedder: local or openai): "
+                "without a model, recall can only search vectors and keywords"
+            )
         if backend == "loom":
             loom = self.memory.loom
             loom.dashboard_url = _checked_http_url(loom.dashboard_url, "memory.loom.dashboard_url")

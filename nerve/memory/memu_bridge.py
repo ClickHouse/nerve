@@ -808,6 +808,182 @@ def _fuse_recall_hits(
 
 
 # ---------------------------------------------------------------------------
+# No-LLM writes (memory.extraction: none)
+# ---------------------------------------------------------------------------
+
+# Memory types of stored text that is not a fact: transcript chunks and
+# workspace-file chunks. Recall finds them (labelled, a few per answer);
+# the date and maintenance listings and the web UI's fact lists leave them out.
+CHUNK_MEMORY_TYPES: tuple[str, ...] = ("conversation", "document")
+FACT_MEMORY_TYPES: frozenset[str] = frozenset({"profile", "event", "knowledge", "behavior"})
+# Chunk size: about a screen of transcript, ~400 tokens, well inside the
+# local model's 512-token window; neighbouring pieces of one long message
+# overlap so a sentence cut at the border is whole in one of them.
+_CHUNK_CHARS = 1500
+_CHUNK_OVERLAP = 200
+# At most this share of a recall answer is chunks, so facts are not crowded out.
+_CHUNK_SHARE = 0.3
+
+
+class _RefusingLLMClient:
+    """Fills memU's chat profiles when ``memory.extraction`` is ``none``: any
+    call raises, so a code path that still reaches for a model fails loudly
+    (and in tests) instead of quietly sending memory text out."""
+
+    def __init__(self, profile: str) -> None:
+        self.profile = profile
+        self.chat_model = ""
+        self.embed_model = ""
+
+    def _refuse(self) -> RuntimeError:
+        return RuntimeError(
+            f"memory.extraction is 'none': memU may not call a language model (profile {self.profile!r})"
+        )
+
+    async def chat(self, *args: Any, **kwargs: Any) -> Any:
+        raise self._refuse()
+
+    async def summarize(self, *args: Any, **kwargs: Any) -> Any:
+        raise self._refuse()
+
+    async def embed(self, *args: Any, **kwargs: Any) -> Any:
+        raise self._refuse()
+
+    async def close(self) -> None:
+        return None
+
+
+def _split_long(text: str, size: int = _CHUNK_CHARS, overlap: int = _CHUNK_OVERLAP) -> list[str]:
+    """``text`` in pieces of at most ``size`` characters, cut at whitespace
+    where possible, each overlapping the previous by about ``overlap``."""
+    text = text.strip()
+    if len(text) <= size:
+        return [text] if text else []
+    pieces: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + size)
+        if end < len(text):
+            cut = text.rfind(" ", start + size // 2, end)
+            if cut > start:
+                end = cut
+        pieces.append(text[start:end].strip())
+        if end >= len(text):
+            break
+        start = max(end - overlap, start + 1)
+    return [p for p in pieces if p]
+
+
+def _chunk_conversation(entries: list[dict[str, str]]) -> list[tuple[str, str | None]]:
+    """A transcript as ``(chunk text, created_at of its first message)``:
+    consecutive messages packed into chunks of about ``_CHUNK_CHARS``, each
+    line ``role: content``; a message too long for one chunk is split."""
+    chunks: list[tuple[str, str | None]] = []
+    lines: list[str] = []
+    size = 0
+    first_ts: str | None = None
+    for entry in entries:
+        content = (entry.get("content") or "").strip()
+        if not content:
+            continue
+        for piece in _split_long(f"{entry.get('role', 'unknown')}: {content}"):
+            if lines and size + len(piece) + 1 > _CHUNK_CHARS:
+                chunks.append(("\n".join(lines), first_ts))
+                lines, size, first_ts = [], 0, None
+            if not lines:
+                first_ts = entry.get("created_at")
+            lines.append(piece)
+            size += len(piece) + 1
+    if lines:
+        chunks.append(("\n".join(lines), first_ts))
+    return chunks
+
+
+def _chunk_document(text: str) -> list[str]:
+    """A file's text in chunks of about ``_CHUNK_CHARS``, cut at blank lines
+    where possible."""
+    chunks: list[str] = []
+    buf: list[str] = []
+    size = 0
+    for para in re.split(r"\n\s*\n", text):
+        for piece in _split_long(para):
+            if buf and size + len(piece) + 2 > _CHUNK_CHARS:
+                chunks.append("\n\n".join(buf))
+                buf, size = [], 0
+            buf.append(piece)
+            size += len(piece) + 2
+    if buf:
+        chunks.append("\n\n".join(buf))
+    return chunks
+
+
+_MONTH_NUMBERS: dict[str, int] = {
+    name: number
+    for number, names in enumerate(
+        (("jan", "january"), ("feb", "february"), ("mar", "march"), ("apr", "april"),
+         ("may",), ("jun", "june"), ("jul", "july"), ("aug", "august"),
+         ("sep", "sept", "september"), ("oct", "october"), ("nov", "november"),
+         ("dec", "december")),
+        start=1,
+    )
+    for name in names
+}
+_MONTH_ALT = "|".join(sorted(_MONTH_NUMBERS, key=len, reverse=True))
+_ISO_DATE_RE = re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b")
+_MONTH_DAY_RE = re.compile(
+    rf"\b({_MONTH_ALT})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?\b(?:,?\s+(20\d{{2}}))?", re.IGNORECASE,
+)
+_DAY_MONTH_RE = re.compile(
+    rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_ALT})\b\.?(?:,?\s+(20\d{{2}}))?", re.IGNORECASE,
+)
+
+
+def _parse_event_date(text: str, reference: datetime) -> str | None:
+    """The date an event happened, from its own words: the first ISO date,
+    "November 3, 2026", "Nov 3", "3 November", or "today"/"yesterday"
+    (relative to ``reference``). A date without a year takes
+    ``reference``'s, or the year before when that would put it in the
+    future. ``YYYY-MM-DD``, or None when the text names no date."""
+    from datetime import date as _date
+
+    found: list[tuple[int, _date]] = []
+    for match in _ISO_DATE_RE.finditer(text):
+        try:
+            found.append((match.start(), _date(int(match[1]), int(match[2]), int(match[3]))))
+        except ValueError:
+            pass
+    for regex, month_group, day_group in ((_MONTH_DAY_RE, 1, 2), (_DAY_MONTH_RE, 2, 1)):
+        for match in regex.finditer(text):
+            month = _MONTH_NUMBERS[match[month_group].lower()]
+            year = int(match[3]) if match[3] else reference.year
+            try:
+                day = _date(year, month, int(match[day_group]))
+            except ValueError:
+                continue
+            if not match[3] and day > reference.date() + timedelta(days=1):
+                try:
+                    day = day.replace(year=year - 1)
+                except ValueError:
+                    continue
+            found.append((match.start(), day))
+    for match in re.finditer(r"\b(today|yesterday)\b", text, re.IGNORECASE):
+        offset = 0 if match[1].lower() == "today" else 1
+        found.append((match.start(), reference.date() - timedelta(days=offset)))
+    if not found:
+        return None
+    return min(found, key=lambda pair: pair[0])[1].isoformat()
+
+
+_SESSION_FILE_RE = re.compile(r"session-(?P<sid>.+)-(?P<ts>\d{9,})\.json$")
+
+
+def _session_of_url(url: str | None) -> str:
+    """The session id in a conversation file's name, or ""."""
+    match = _SESSION_FILE_RE.search(url or "")
+    return match["sid"] if match else ""
+
+
+# ---------------------------------------------------------------------------
 # Custom event extraction prompt blocks
 # ---------------------------------------------------------------------------
 # Override the "rules" and "examples" blocks for the event memory type so the
@@ -1121,6 +1297,9 @@ class MemUBridge:
         self._anthropic_client: Any | None = None  # Lazy sync Anthropic
         # Where vectors come from: "local" (fastembed), "openai" or "none".
         self._embedder_kind = config.memory.embedder_kind(config.openai_api_key)
+        # memory.extraction: none — no model call anywhere in memory: facts
+        # are stored as written, conversations and files as embedded chunks.
+        self._verbatim = config.memory.extraction == "none"
         self._local_embedder: _LocalEmbeddingClient | None = None
         # Progress of the background pass that embeds rows stored without a
         # vector (shown under ``embedder`` in the health snapshot).
@@ -1988,6 +2167,281 @@ class MemUBridge:
         self._service._llm_clients["embedding"] = self._local_embedder
         logger.info("Local embedder for memU: %s (%s, %d-d)", alias, model_id, dim)
 
+    # ------------------------------------------------------------------
+    # No-LLM writes (memory.extraction: none)
+    # ------------------------------------------------------------------
+
+    @property
+    def verbatim_facts(self) -> bool:
+        """Whether memory runs without a model (``memory.extraction: none``):
+        ``memorize`` stores a fact as written (:meth:`memorize_fact`)."""
+        return self._verbatim
+
+    def _inject_refusing_clients(self) -> None:
+        """Put a refusing client in every memU chat profile slot."""
+        for name in list(self._service.llm_profiles.profiles):
+            if name == "embedding":
+                continue
+            self._service._llm_clients[name] = _RefusingLLMClient(name)
+        logger.info("memory.extraction is 'none': memU's chat profiles refuse every call")
+
+    def _skips_session(self, session_id: str) -> bool:
+        """Whether ``memory.skip_sessions`` keeps this session out of memory."""
+        import fnmatch
+
+        return any(fnmatch.fnmatchcase(session_id, pattern) for pattern in self.config.memory.skip_sessions)
+
+    async def _embed_texts(self, texts: list[str]) -> np.ndarray:
+        """``texts`` as one ``(len, dim)`` float32 matrix (memU loop)."""
+        if self._embedder_kind == "local" and self._local_embedder is not None:
+            return await self._local_embedder.embed_array(texts)
+        return np.asarray(await self._service._get_llm_client("embedding").embed(texts), dtype=np.float32)
+
+    def _nearest_category_id(self, vec: np.ndarray) -> str | None:
+        """The category whose vector is closest to ``vec``; None without one."""
+        best: str | None = None
+        best_sim = -2.0
+        vnorm = float(np.linalg.norm(vec)) or 1.0
+        for cat_id, cat in self._service.database.memory_category_repo.categories.items():
+            cvec = getattr(cat, "embedding", None)
+            if cvec is None:
+                continue
+            arr = np.asarray(cvec, dtype=np.float32)
+            if arr.shape != vec.shape:
+                continue
+            sim = float(arr @ vec) / ((float(np.linalg.norm(arr)) or 1.0) * vnorm)
+            if sim > best_sim:
+                best, best_sim = cat_id, sim
+        return best
+
+    def _local_now(self) -> datetime:
+        try:
+            return datetime.now(ZoneInfo(self.config.timezone))
+        except Exception:
+            return datetime.now(timezone.utc)
+
+    def _local_stamp(self, value: str | None) -> str:
+        """A message timestamp as local ``YYYY-MM-DD HH:MM:SS`` in the
+        configured timezone (now when missing or unreadable)."""
+        parsed = _parse_iso(value) if value else None
+        try:
+            tz: Any = ZoneInfo(self.config.timezone)
+        except Exception:
+            tz = timezone.utc
+        moment = (parsed or datetime.now(timezone.utc)).astimezone(tz)
+        return moment.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _set_happened_at_sync(self, pairs: list[tuple[str, str]]) -> None:
+        """Write ``happened_at`` for (item id, value) pairs (blocking)."""
+        import sqlite3 as _sqlite3
+
+        if not pairs:
+            return
+        db_path = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
+        conn = _sqlite3.connect(db_path, timeout=60)
+        try:
+            conn.execute("PRAGMA busy_timeout=60000")
+            conn.executemany(
+                "UPDATE memu_memory_items SET happened_at = ? WHERE id = ?",
+                [(value, item_id) for item_id, value in pairs],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _cache_vector(self, repo: Any, item: Any, vec: np.ndarray) -> None:
+        """Keep a written row's vector in the cache and the vector index."""
+        cached = repo.items.get(item.id)
+        if cached is None:
+            return
+        cached.__dict__["embedding"] = vec
+        idx = _vec_index_note(repo)
+        if idx is not None:
+            idx.upsert(item.id, str(cached.memory_type), vec)
+            idx.seen_items_len = len(repo.items)
+
+    async def memorize_fact(
+        self,
+        content: str,
+        memory_type: str = "knowledge",
+        *,
+        date: str | None = None,
+        source_path: str | None = None,
+        source: str = "agent_tool",
+    ) -> bool:
+        """Store one fact as written — no model (``memory.extraction: none``).
+
+        The text is embedded locally; a near-identical fact of the same type
+        (see the semantic dedup) is reinforced instead of stored twice; a new
+        fact is linked to the category whose vector is closest. ``date``
+        (``YYYY-MM-DD``) is when an event happened; without it the date is
+        read from the text, and an event that names none happened today.
+        """
+        if not self._available or not self._service:
+            return False
+        op_id = self._metrics.begin_op("memorize_file", f"fact ({memory_type})")
+        try:
+            item_id, reinforced = await self._submit(
+                self._memorize_fact_impl(content, memory_type, date, source_path),
+            )
+        except Exception as exc:
+            self._metrics.end_op(op_id, success=False, error=str(exc))
+            raise
+        self._metrics.end_op(op_id, success=True)
+        await self._audit(
+            "item_updated" if reinforced else "item_created", "item", item_id, source,
+            {"memory_type": memory_type, "reinforced": reinforced, "verbatim": True},
+        )
+        return True
+
+    async def _memorize_fact_impl(
+        self, content: str, memory_type: str, date: str | None, source_path: str | None,
+    ) -> tuple[str, bool]:
+        content = content.strip()
+        if not content:
+            raise ValueError("nothing to memorize")
+        if memory_type not in FACT_MEMORY_TYPES:
+            raise ValueError(f"memory_type must be one of {sorted(FACT_MEMORY_TYPES)}, got {memory_type!r}")
+        db = self._service.database
+        vec = (await self._embed_texts([content]))[0]
+        resource = db.resource_repo.create_resource(
+            url=source_path or f"memorize:{int(time.time() * 1000)}",
+            modality="document",
+            local_path=source_path or "",
+            caption=content[:160],
+            embedding=None,
+            user_data={},
+        )
+        item = db.memory_item_repo.create_item(
+            resource_id=resource.id,
+            memory_type=memory_type,
+            summary=content,
+            embedding=vec,
+            user_data={},
+            reinforce=True,
+        )
+        reinforced = item.summary != content or int((item.extra or {}).get("reinforcement_count", 1) or 1) > 1
+        if reinforced:
+            logger.info("Memorize: reinforced %s instead of storing a near-identical fact", item.id)
+            return item.id, True
+        self._cache_vector(db.memory_item_repo, item, vec)
+        category_id = self._nearest_category_id(vec)
+        if category_id is not None:
+            db.category_item_repo.link_item_category(item.id, category_id, user_data={})
+        happened = None
+        if date:
+            happened = datetime.strptime(date, "%Y-%m-%d").date().isoformat()
+        elif memory_type == "event":
+            now = self._local_now()
+            happened = _parse_event_date(content, now) or now.date().isoformat()
+        if happened:
+            await asyncio.to_thread(self._set_happened_at_sync, [(item.id, happened)])
+        return item.id, False
+
+    async def _index_conversation_chunks_impl(
+        self, session_id: str, entries: list[dict[str, str]], conv_path: str,
+    ) -> int:
+        """Store a transcript as embedded ``conversation`` chunks (memU loop);
+        returns how many. The resource row carries the first user message as
+        its caption, which the date listing shows for the session."""
+        chunks = _chunk_conversation(entries)
+        if not chunks:
+            return 0
+        db = self._service.database
+        first_user = next((e["content"] for e in entries if e.get("role") == "user" and e.get("content")), "")
+        resource = db.resource_repo.create_resource(
+            url=conv_path,
+            modality="conversation",
+            local_path=conv_path,
+            caption=" ".join(first_user.split())[:160] or None,
+            embedding=None,
+            user_data={},
+        )
+        vectors = await self._embed_texts([text for text, _ in chunks])
+        stamps: list[tuple[str, str]] = []
+        for (text, first_ts), vec in zip(chunks, vectors, strict=True):
+            item = db.memory_item_repo.create_item(
+                resource_id=resource.id,
+                memory_type="conversation",
+                summary=text,
+                embedding=vec,
+                user_data={},
+            )
+            self._cache_vector(db.memory_item_repo, item, vec)
+            stamp = self._local_stamp(first_ts)
+            stamps.append((item.id, stamp))
+            cached = db.memory_item_repo.items.get(item.id)
+            if cached is not None:
+                cached.__dict__["happened_at"] = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+        await asyncio.to_thread(self._set_happened_at_sync, stamps)
+        return len(chunks)
+
+    async def _index_document_chunks_impl(self, file_path: str, modality: str) -> int:
+        """Store a file as embedded ``document`` chunks (memU loop)."""
+        text = await asyncio.to_thread(Path(file_path).read_text, encoding="utf-8", errors="replace")
+        chunks = _chunk_document(text)
+        if not chunks:
+            return 0
+        db = self._service.database
+        resource = db.resource_repo.create_resource(
+            url=file_path,
+            modality=modality,
+            local_path=file_path,
+            caption=Path(file_path).name,
+            embedding=None,
+            user_data={},
+        )
+        vectors = await self._embed_texts(chunks)
+        for text, vec in zip(chunks, vectors, strict=True):
+            item = db.memory_item_repo.create_item(
+                resource_id=resource.id,
+                memory_type="document",
+                summary=text,
+                embedding=vec,
+                user_data={},
+            )
+            self._cache_vector(db.memory_item_repo, item, vec)
+        return len(chunks)
+
+    async def _update_item_verbatim_impl(
+        self, memory_id: str, content: str | None, memory_type: str | None, categories: list[str] | None,
+    ) -> bool:
+        """Update an item without memU's category-summary step (memU loop)."""
+        db = self._service.database
+        repo = db.memory_item_repo
+        if memory_id not in repo.items:
+            return False
+        vec = (await self._embed_texts([content]))[0] if content is not None else None
+        repo.update_item(item_id=memory_id, memory_type=memory_type, summary=content, embedding=vec)
+        cached = repo.items.get(memory_id)
+        if vec is not None and cached is not None:
+            self._cache_vector(repo, cached, vec)
+        elif cached is not None and memory_type is not None:
+            idx = _vec_index_note(repo)
+            if idx is not None and getattr(cached, "embedding", None) is not None:
+                idx.upsert(memory_id, memory_type, cached.embedding)
+        if categories is not None:
+            ctx = self._service._get_context()
+            wanted = set(self._service._map_category_names_to_ids(categories, ctx))
+            current = {rel.category_id for rel in db.category_item_repo.get_item_categories(memory_id)}
+            for category_id in current - wanted:
+                db.category_item_repo.unlink_item_category(memory_id, category_id)
+            for category_id in wanted - current:
+                db.category_item_repo.link_item_category(memory_id, category_id, user_data={})
+        return True
+
+    async def _delete_item_verbatim_impl(self, memory_id: str) -> None:
+        """Delete an item and its category links, without memU's
+        category-summary step (memU loop)."""
+        db = self._service.database
+        for rel in list(db.category_item_repo.get_item_categories(memory_id)):
+            db.category_item_repo.unlink_item_category(memory_id, rel.category_id)
+        db.memory_item_repo.delete_item(memory_id)
+        idx = _vec_index_note(db.memory_item_repo)
+        if idx is not None:
+            idx.remove(memory_id)
+            idx.seen_items_len = len(db.memory_item_repo.items)
+
     async def _backfill_embeddings(self) -> None:
         """Give every item and category stored without a vector one (memU
         loop, in the background).
@@ -2386,6 +2840,10 @@ class MemUBridge:
                 self._inject_bedrock_clients()
             else:
                 self._name_system_principal()
+            # No-LLM memory: every chat profile refuses, so nothing in memU
+            # can reach a model (warm-up skips clients it cannot ping).
+            if self._verbatim:
+                self._inject_refusing_clients()
 
             await self._ensure_categories()
 
@@ -3129,6 +3587,21 @@ class MemUBridge:
         """Memorize a local file by its absolute path."""
         if not self._available or not self._service:
             return False
+        if self._verbatim:
+            # No extraction: the file's text as embedded chunks.
+            op_id = self._metrics.begin_op("memorize_file", file_path)
+            try:
+                count = await asyncio.wait_for(
+                    self._submit(self._index_document_chunks_impl(file_path, modality)),
+                    timeout=self._MEMORIZE_TIMEOUT,
+                )
+            except Exception as exc:
+                self._metrics.end_op(op_id, success=False, error=str(exc))
+                logger.error("Indexing %s failed: %s", file_path, exc)
+                return False
+            self._metrics.end_op(op_id, success=True)
+            await self._audit("file_indexed", "resource", file_path, source, {"chunks": count})
+            return True
 
         file_size = -1
         try:
@@ -3295,6 +3768,10 @@ class MemUBridge:
         """
         if not messages or not self._available:
             return False
+        if self._skips_session(session_id):
+            # Handled, not failed: the caller's watermark moves past it.
+            logger.info("Not indexing session %s (memory.skip_sessions)", session_id)
+            return True
 
         entries: list[dict[str, str]] = []
         earliest_ts: str | None = None
@@ -3336,6 +3813,17 @@ class MemUBridge:
                 "Memorizing conversation: session=%s, messages=%d, file=%s (%d bytes)",
                 session_id, len(entries), conv_path.name, payload_bytes,
             )
+            if self._verbatim:
+                # No extraction: the transcript itself, as embedded chunks.
+                count = await asyncio.wait_for(
+                    self._submit(self._index_conversation_chunks_impl(session_id, entries, str(conv_path))),
+                    timeout=self._MEMORIZE_TIMEOUT,
+                )
+                await self._audit("conversation_indexed", "resource", session_id, "bridge", {
+                    "message_count": len(entries), "chunks": count,
+                })
+                self._metrics.end_op(op_id, success=True)
+                return True
             ok = await self.memorize_file(str(conv_path), modality="conversation")
 
             # memU doesn't set happened_at from conversation timestamps.
@@ -3377,7 +3865,12 @@ class MemUBridge:
 
         Runs synchronous work (sqlite3 + Anthropic API) in a dedicated thread
         pool so it cannot starve the default asyncio executor.
+
+        Never with ``memory.extraction: none``: no model is called there, and
+        the no-LLM writes set their own dates.
         """
+        if self._verbatim:
+            return
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             self._blocking_pool, self._resolve_event_dates_sync, conversation_ts,
@@ -3786,6 +4279,25 @@ class MemUBridge:
                 raise MemoryBackendUnavailable(f"memory backend unavailable: {e}") from e
             raise MemoryRecallFailed(f"memory recall failed: {e}") from e
 
+    def _recall_entry(self, item_id: str, item: Any) -> dict[str, str]:
+        """One recall result. A chunk is prefixed with where it is from:
+        ``(2026-11-03 14:19, session 3f9a1c07)`` for a transcript, the file
+        name for a workspace file."""
+        mtype = str(item.memory_type or "")
+        summary = item.summary
+        if mtype in CHUNK_MEMORY_TYPES:
+            resource = self._service.database.resource_repo.resources.get(getattr(item, "resource_id", None) or "")
+            url = getattr(resource, "url", "") or ""
+            if mtype == "conversation":
+                when = getattr(item, "happened_at", None)
+                stamp = when.strftime("%Y-%m-%d %H:%M") if isinstance(when, datetime) else str(when or "")[:16]
+                where = ", ".join(part for part in (stamp, f"session {_session_of_url(url)}" if url else "") if part)
+            else:
+                where = Path(url).name if url else ""
+            if where:
+                summary = f"({where}) {summary}"
+        return {"id": item_id, "type": mtype, "summary": summary}
+
     async def _hybrid_recall_impl(
         self, query: str, limit: int, category_limit: int,
     ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
@@ -3815,13 +4327,28 @@ class MemUBridge:
         ))
         fused = _fuse_recall_hits(legs, item_repo.items)
 
+        # Facts first: chunks (transcripts, files) take at most _CHUNK_SHARE
+        # of the answer, and fill it only when the facts run out.
         items_out: list[dict[str, str]] = []
-        for item_id, _score in fused[:limit]:
+        chunk_cap = max(1, int(limit * _CHUNK_SHARE)) if limit > 0 else 0
+        chunks_taken = 0
+        held_back: list[str] = []
+        for item_id, _score in fused:
+            if len(items_out) >= limit:
+                break
             item = item_repo.items[item_id]
-            if item.summary:
-                items_out.append({
-                    "id": item_id, "type": str(item.memory_type or ""), "summary": item.summary,
-                })
+            if not item.summary:
+                continue
+            if str(item.memory_type or "") in CHUNK_MEMORY_TYPES:
+                if chunks_taken >= chunk_cap:
+                    held_back.append(item_id)
+                    continue
+                chunks_taken += 1
+            items_out.append(self._recall_entry(item_id, item))
+        for item_id in held_back:
+            if len(items_out) >= limit:
+                break
+            items_out.append(self._recall_entry(item_id, item_repo.items[item_id]))
 
         cats_out: list[dict[str, str]] = []
         qnorm = float(np.linalg.norm(qvec)) or 1.0
@@ -3967,7 +4494,14 @@ class MemUBridge:
                 kwargs["memory_type"] = memory_type
             if categories is not None:
                 kwargs["memory_categories"] = categories
-            await self._submit(self._service.update_memory_item(**kwargs))
+            if self._verbatim:
+                # memU's update rewrites category summaries with a model.
+                if not await self._submit(
+                    self._update_item_verbatim_impl(memory_id, content, memory_type, categories),
+                ):
+                    return False
+            else:
+                await self._submit(self._service.update_memory_item(**kwargs))
             logger.info("Updated memory item: %s", memory_id)
             await self._audit("item_updated", "item", memory_id, source, {
                 "content_changed": content is not None,
@@ -3984,7 +4518,11 @@ class MemUBridge:
         if not self._available or not self._service:
             return False
         try:
-            await self._submit(self._service.delete_memory_item(memory_id=memory_id))
+            if self._verbatim:
+                # memU's delete rewrites category summaries with a model.
+                await self._submit(self._delete_item_verbatim_impl(memory_id))
+            else:
+                await self._submit(self._service.delete_memory_item(memory_id=memory_id))
             logger.info("Deleted memory item: %s", memory_id)
             await self._audit("item_deleted", "item", memory_id, source)
             return True
@@ -4234,7 +4772,10 @@ class MemUBridge:
                 items = self._service.database.memory_item_repo.list_items()
                 for item_id, item in items.items():
                     if getattr(item, "resource_id", None) == res_id:
-                        await self._service.delete_memory_item(memory_id=item_id)
+                        if self._verbatim:
+                            await self._delete_item_verbatim_impl(item_id)
+                        else:
+                            await self._service.delete_memory_item(memory_id=item_id)
 
     def _collect_md_files(self, workspace: Path) -> list[tuple[Path, str]]:
         """Collect all .md files that should be indexed."""

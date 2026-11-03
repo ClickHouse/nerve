@@ -2223,6 +2223,8 @@ vision use it too.
 | `memory.fast_model` | string | `claude-haiku-5-5` | Model for categorization, date resolution, knowledge filtering |
 | `memory.embedder` | string | *(empty)* | Where memU's vectors come from: `local` (fastembed inside the process, no API key, no memory text leaves the machine), `openai` (needs `openai_api_key`) or `none` (LLM-ranked recall). Empty: `openai` when `openai_api_key` is set, else `none`. See [Local embeddings](memory.md#local-embeddings) |
 | `memory.local_model` | string | `bge-small` | The fastembed model of `embedder: local`: `bge-small` (384-d), `bge-base` (768-d) or `minilm` (384-d). Changing it re-embeds every memory in the background |
+| `memory.extraction` | string | `llm` | `llm`: memU's pipeline, a model extracting facts and rewriting category summaries. `none`: no model in memory — `memorize` stores facts as written, conversations and files are stored as embedded chunks; needs an embedder. See [Memory without a model](memory.md#memory-without-a-model) |
+| `memory.skip_sessions` | list | `[]` | Session-id globs (`cron:nightly-report*`) whose conversations are never indexed |
 | `memory.embed_model` | string | *(empty)* | OpenAI embedding model of `embedder: openai` (e.g. `text-embedding-3-small`) |
 | `memory.semantic_dedup_threshold` | float | `0.85` (`0.96` with `embedder: local`) | Cosine similarity threshold for semantic deduplication (0 to disable). Unset with a local model it is 0.96: bge-small rates related-but-different facts higher than OpenAI's vectors do. Two texts whose numbers, IDs or dates differ are never merged |
 | `memory.knowledge_filter` | bool | `false` | Post-extraction LLM filter that deletes generic knowledge items (extra Haiku API call per memorize) |

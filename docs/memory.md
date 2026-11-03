@@ -110,6 +110,20 @@ With an embedder, `memory_recall` (and the startup recall) skips memU's retrieve
 
 memU writes facts about "the user", while a question names them ("what makes Alice angry"); searched as written, the name pulls up rows that merely state it. Recall learns the user's name from rows that state it twice ("The user's name is …"), searches such a question a second time with the name written as "the user", and leaves the name out of the keyword leg. Category breadcrumbs are ranked by the categories' vectors.
 
+### Memory without a model
+
+`memory.extraction: none` (with an embedder, so recall works without a model either) turns memory into storage and search only: nothing in memory calls a language model, so with `embedder: local` no memory text leaves the machine. The agent still runs on its own model; what it writes with `memorize` is the distilled fact.
+
+- **`memorize`** stores the fact as written: one item of the given type, embedded, linked to the category whose vector is closest. A near-identical fact of the same type is reinforced instead (the semantic dedup above). An event's date comes from the tool's optional `date` (`YYYY-MM-DD`), else from its own words ("On November 3, 2026", "Nov 3", ISO dates, "today", "yesterday"), else today; other types stay timeless.
+- **Conversations** — at session close, rotation and in the sweep — are stored as the transcript itself, in `conversation` chunks of about 1,500 characters (about a screen), each dated by its first message in the configured timezone. The conversation's resource keeps its first user message as its caption.
+- **Workspace files** are stored as `document` chunks.
+- **Recall** labels a chunk with where it is from (`(2026-11-03 14:19, session 3f9a1c07) …`, or the file name) and gives chunks at most 30 % of an answer, more only when the facts run out.
+- **`conversation_history`** lists the facts dated in the range plus one line per session that day (start time, session id, first message); the chunks themselves are left out. `memory_records_by_date` and the web UI's Facts and Timeline tabs list facts only.
+- **`memory_update`, `memory_delete`** write directly, without memU's model-written category summaries; summaries stay as they are, and `category_update` still edits them.
+- **No fallback to a model:** memU's chat profiles get a client that refuses every call, and the event-date resolver and the knowledge filter are off.
+
+`memory.skip_sessions` (session-id globs, any extraction mode) keeps sessions out of memory altogether — for example `cron:nightly-report*` for a cron job whose runs are routine. A skipped conversation counts as handled, so the sweep does not offer it again.
+
 Config in `<workspace>/config/settings.yaml`:
 ```yaml
 memory:
@@ -118,6 +132,8 @@ memory:
   fast_model: claude-haiku-5-5            # extraction & categorization
   embedder: local                         # local | openai | none (unset: openai with a key, else none)
   local_model: bge-small                  # bge-small | bge-base | minilm (embedder: local)
+  extraction: none                        # llm (default) | none: no model anywhere in memory
+  skip_sessions: ["cron:nightly-report*"]       # never indexed
   # embed_model: text-embedding-3-small   # only for embedder: openai
   categories: [...]  # see Categories section above
 ```
