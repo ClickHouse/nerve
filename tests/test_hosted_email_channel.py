@@ -320,6 +320,12 @@ class TestMemberMail:
         assert await hosted.db.get_channel_session(CHANNEL_KEY) is None
         assert hosted.runtime.channels["email"].can_accept()
 
+    async def test_the_agent_cannot_post_through_the_email_channel(self, hosted):
+        verdict = await hosted.runtime.channels["email"].authorize_outbound(CONVERSATION)
+
+        assert not verdict.allowed
+        assert verdict.reason == "the email channel does not post to a conversation that the agent names"
+
 
 # ---------------------------------------------------------------------- #
 #  The subscriptions frame over real streams                              #

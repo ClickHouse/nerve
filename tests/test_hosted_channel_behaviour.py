@@ -210,7 +210,8 @@ class TestProviderWithoutSettings:
         assert two.gateway.acks[-1][0]["reason_code"] == "policy_denied"
         verdict = await channel.authorize_outbound("room-1")
         assert not verdict.allowed
-        assert "allow_outbound" in verdict.reason
+        # The provider has no outbound setting, so the refusal names none.
+        assert verdict.reason == "the fixture_chat channel does not post to a conversation that the agent names"
 
     async def test_switched_off_it_refuses_its_events_and_slack_goes_on(self, two, switch):
         switch.on = False

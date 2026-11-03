@@ -831,10 +831,14 @@ class HostedChannel(BaseChannel):
             return Decision(False, f"{self._provider} is switched off ({self._provider}.enabled is false)")
         settings = self._settings()
         if not settings.allow_outbound:
+            setting = self._spec.outbound_setting
+            if not setting:
+                return Decision(
+                    False, f"the {self._provider} channel does not post to a conversation that the agent names",
+                )
             return Decision(
                 False,
-                f"{self._provider}.allow_outbound is not enabled, so the agent may not post "
-                "to a conversation it names",
+                f"{setting} is not enabled, so the agent may not post to a conversation it names",
             )
         conversation, _ = parse_target(target)
         if not conversation:
