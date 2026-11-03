@@ -46,6 +46,7 @@ from nerve.channels.hosted.channel import answer_note
 from nerve.channels.hosted.operations import OperationFailed
 from nerve.channels.hosted import providers as providers_module
 from nerve.channels.hosted.providers import (
+    EMAIL,
     HOSTED_CHAT_PROVIDERS,
     SLACK,
     HostedChannelSettings,
@@ -145,9 +146,9 @@ async def announce(stream, provider: str | None, connection_id: str, **behaviour
 
 
 class TestProviderTable:
-    def test_slack_is_the_only_provider_and_holds_its_events_while_off(self):
-        assert HOSTED_CHAT_PROVIDERS == (SLACK,)
-        assert SLACK.hold_while_off
+    def test_slack_holds_its_events_while_off_and_email_refuses_them(self):
+        assert HOSTED_CHAT_PROVIDERS == (SLACK, EMAIL)
+        assert SLACK.hold_while_off and not EMAIL.hold_while_off
 
     def test_a_provider_is_hosted_as_its_config_says(self):
         config = NerveConfig()
@@ -209,7 +210,8 @@ class TestProviderWithoutSettings:
         assert two.gateway.acks[-1][0]["reason_code"] == "policy_denied"
         verdict = await channel.authorize_outbound("room-1")
         assert not verdict.allowed
-        assert "allow_outbound" in verdict.reason
+        # The provider has no outbound setting, so the refusal names none.
+        assert verdict.reason == "the fixture_chat channel does not post to a conversation that the agent names"
 
     async def test_switched_off_it_refuses_its_events_and_slack_goes_on(self, two, switch):
         switch.on = False

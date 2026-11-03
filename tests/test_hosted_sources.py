@@ -32,8 +32,10 @@ from nerve.channels.hosted.contract import (
     SourceSubscription,
     Subscriptions,
 )
+from nerve.channels.hosted import providers as providers_module
 from nerve.channels.hosted.contract.model import MAX_SUBSCRIPTION_PATTERNS
 from nerve.channels.hosted.contract.wire import dumps
+from nerve.channels.hosted.providers import SLACK
 from nerve.channels.hosted.runtime import (
     HostedChannelRuntime,
     hosted_channel_providers,
@@ -1096,7 +1098,7 @@ class TestStreams:
         async with stalled_through_negotiation(hosted) as stream:
             hosted.config.sync.github.deny_reasons = ["subscribed", "comment"]
             outcome = await asyncio.wait_for(hosted.runtime.republish_subscriptions(), timeout=3)
-            assert outcome == "published on 0 stream(s)"
+            assert outcome.startswith("not sent yet: none of the 1 open stream(s) sent them in time")
 
         await hosted.gateway.wait_for(lambda: bool(stream.sent("inbox_read")))
         [frame] = stream.sent("subscriptions")
@@ -1287,7 +1289,8 @@ class TestSharedStreams:
     async def test_slack_and_github_share_the_streams_and_the_reader(self, tmp_path, db, monkeypatch):
         harness = await start(tmp_path, db, monkeypatch, slack=True)
         try:
-            assert set(harness.runtime.channels) == {"slack"}
+            # The usable hosted settings give the email channel too.
+            assert set(harness.runtime.channels) == {"slack", "email"}
             assert set(harness.runtime.sources) == {"github", "github_repos"}
             assert harness.router.get_channel("github") is None
             stream = await harness.stream()
@@ -1327,6 +1330,9 @@ class TestSharedStreams:
             await stop(harness)
 
     async def test_without_hosted_sources_no_subscriptions_are_sent(self, tmp_path, db, monkeypatch):
+        """A runtime without an email channel, which the frame would name
+        (see test_hosted_email_channel)."""
+        monkeypatch.setattr(providers_module, "HOSTED_CHAT_PROVIDERS", (SLACK,))
         harness = await start(tmp_path, db, monkeypatch, slack=True, github=False)
         try:
             stream = await harness.stream()
@@ -1338,7 +1344,10 @@ class TestSharedStreams:
         finally:
             await stop(harness)
 
-    async def test_a_runtime_without_any_hosted_provider_is_refused(self, tmp_path, db):
+    async def test_a_runtime_without_any_hosted_provider_is_refused(self, tmp_path, db, monkeypatch):
+        """Usable hosted settings give the email channel, so only a table
+        without email leaves no provider."""
+        monkeypatch.setattr(providers_module, "HOSTED_CHAT_PROVIDERS", (SLACK,))
         config = slack_hosted_config(tmp_path)
         config.slack = SlackConfig()
 

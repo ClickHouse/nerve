@@ -373,13 +373,17 @@ def _reload_actor_context_keys() -> str | None:
 
 
 async def _republish_hosted_subscriptions(engine) -> str | None:
-    """Send the hosted source subscriptions to the gateway again.
+    """Send the hosted subscriptions to the gateway again.
 
     The filters, ``pr_watch`` and ``inbox`` follow a reload this way, and so
-    does the repository watch (``sync.github_repos``: switched on or off, its
-    repositories and settings); the gateway keeps the newest subscription it
-    received. (In poll mode they follow with the rebuilt source runners.)
-    ``None`` without hosted sources.
+    do the repository watch (``sync.github_repos``: switched on or off, its
+    repositories and settings) and ``email.enabled``; the gateway keeps the
+    newest subscription it received. (In poll mode they follow with the
+    rebuilt source runners.) ``None`` for a runtime that sends no
+    subscriptions. When no stream sent them, a "not sent yet" note, not an
+    error: every stream that connects sends the current subscriptions before
+    Nerve reads from it, so the gateway gets them, and an error would make
+    workspace sync run the whole reload again on every cycle.
     """
     if engine is None:
         return None
@@ -390,8 +394,40 @@ async def _republish_hosted_subscriptions(engine) -> str | None:
         return await runtime.republish_subscriptions()
     except Exception as e:  # noqa: BLE001 - report the subsystem and continue
         detail = str(e) or type(e).__name__
-        logger.warning("Hosted source subscriptions were not published: %s", detail)
+        logger.warning("Hosted subscriptions: %s", detail)
         return f"{_ERROR_PREFIX}{detail}"
+
+
+def _email_reload_notes(new_config, engine) -> tuple[str | None, str | None]:
+    """What a reload says about ``email.enabled``: a warning and a restart line.
+
+    Nothing while email is switched off or while its channel runs. Without
+    usable ``channels.hosted`` settings, the warning of the startup check.
+    With usable settings but no email channel in this process, because the
+    settings became usable after startup or the hosted runtime did not
+    start, a restart line: the channel is built only at startup.
+    """
+    email = getattr(new_config, "email", None)
+    if not getattr(email, "enabled", False):
+        return None, None
+    from nerve.channels.hosted.providers import EMAIL, email_warning
+
+    warning = email_warning(new_config)
+    if warning is not None:
+        logger.warning("config reload: %s", warning)
+        return warning, None
+    try:
+        runtime = engine.get_channel_runtime("hosted") if engine is not None else None
+    except Exception:  # noqa: BLE001 - a stand-in engine without runtimes
+        runtime = None
+    if EMAIL.name in (getattr(runtime, "channels", None) or {}):
+        return None, None
+    note = (
+        "email.enabled is set and the channels.hosted settings are usable, but this "
+        "process has no email channel: it is built at startup, so restart Nerve"
+    )
+    logger.warning("config reload: %s", note)
+    return note, "email.enabled: the email channel starts at the next restart"
 
 
 async def reload_all(engine, cron_service, config_dir: Path) -> dict:
@@ -425,6 +461,11 @@ async def reload_all(engine, cron_service, config_dir: Path) -> dict:
         # Not an error — the reload applied everything it can. Reported so the
         # caller can tell "applied" from "cannot apply without a restart".
         pending = restart_required(old_config, new_config)
+        email, email_restart = _email_reload_notes(new_config, engine)
+        if email is not None:
+            summary["email"] = email
+        if email_restart is not None:
+            pending.append(email_restart)
         if pending:
             summary["restart_required"] = "; ".join(pending)
             logger.warning(

@@ -1753,6 +1753,28 @@ class SlackConfig:
 
 
 @dataclass
+class EmailConfig:
+    """The email channel: mail that members of the agent send to its address.
+
+    Hosted mode only. The channel gateway delivers each member mail as an
+    event that starts or continues a session, and Nerve posts no answer: the
+    agent answers with a tool. The platform decides which mail reaches the
+    agent; ``enabled`` decides only whether Nerve takes it. The channel
+    exists when the ``channels.hosted`` settings are usable at startup, and
+    ``enabled`` is read for each event, so a reload switches it on or off.
+    Without usable ``channels.hosted`` settings, Nerve logs a warning and
+    registers no email channel. See docs/config.md "Email".
+    """
+
+    enabled: bool = False
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> EmailConfig:
+        return cls(enabled=d.get("enabled", False))
+
+
+@dataclass
 class TelegramSyncConfig:
     enabled: bool = True
     api_id: int = 0
@@ -3966,6 +3988,7 @@ class NerveConfig:
     agent: AgentConfig = field(default_factory=AgentConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     slack: SlackConfig = field(default_factory=SlackConfig)
+    email: EmailConfig = field(default_factory=EmailConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     cron: CronConfig = field(default_factory=CronConfig)
@@ -4379,6 +4402,7 @@ class NerveConfig:
             agent=AgentConfig.from_dict(d.get("agent", {})),
             telegram=TelegramConfig.from_dict(d.get("telegram", {}), locked=locked),
             slack=SlackConfig.from_dict(d.get("slack", {}), locked=locked),
+            email=EmailConfig.from_dict(d.get("email") or {}),
             sync=SyncConfig.from_dict(d.get("sync", {})),
             memory=MemoryConfig.from_dict(d.get("memory", {})),
             cron=CronConfig.from_dict(d.get("cron", {}), workspace=workspace, locked=locked),

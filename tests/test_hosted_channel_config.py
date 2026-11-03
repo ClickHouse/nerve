@@ -58,7 +58,8 @@ class TestParsing:
 
         assert (config.slack.enabled, config.slack.mode) == (True, "hosted")
         assert config.slack.bot_token == config.slack.app_token == ""
-        assert hosted_providers(config) == ["slack"]
+        # The usable hosted settings give the email channel too.
+        assert hosted_providers(config) == ["slack", "email"]
 
     def test_hosted_mode_under_lockdown_needs_no_local_opt_in(self):
         config = NerveConfig.from_dict({"lockdown": True, "slack": {"mode": "hosted"}})
