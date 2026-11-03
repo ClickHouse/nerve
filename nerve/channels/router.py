@@ -198,6 +198,10 @@ class ChannelRouter:
         one actor, each consecutive run of messages from one actor is a
         separate turn, in arrival order.
 
+        A turn whose messages do not ask to post their answer
+        (``post_answer``) sends nothing to the channel: no typing
+        indicator, no streamed or final answer, and no error message.
+
         Called by channel implementations when they receive a user message.
         """
         channel = self._channels.get(msg.channel_name)
@@ -276,17 +280,9 @@ class ChannelRouter:
         """Run the engine for a single message with streaming."""
         self._note_message_context(session_id, msg)
 
-        if ChannelCapability.TYPING_INDICATOR in channel.capabilities:
-            try:
-                await channel.send_typing(msg.sender_id)
-            except Exception as e:
-                logger.debug(
-                    "Typing indicator failed for %s: %s", msg.channel_name, e,
-                )
-
-        adapter = await self._setup_streaming(
-            channel, msg.sender_id, session_id,
-        )
+        if msg.post_answer:
+            await self._show_typing(channel, msg.sender_id, msg.channel_name)
+            await self._setup_streaming(channel, msg.sender_id, session_id)
         images = msg.metadata.get("images") if msg.metadata else None
 
         task = asyncio.create_task(
@@ -311,9 +307,10 @@ class ChannelRouter:
                 return task.result()
             return ""
         finally:
-            await self._teardown_streaming(
-                channel.name, msg.sender_id, session_id,
-            )
+            if msg.post_answer:
+                await self._teardown_streaming(
+                    channel.name, msg.sender_id, session_id,
+                )
 
     async def _run_batch(
         self,
@@ -323,10 +320,12 @@ class ChannelRouter:
     ) -> str:
         """Combine pending messages into one turn and run.
 
-        Every message in *pending* has the same actor.
+        Every message in *pending* has the same actor. The turn posts its
+        answer only when every message asks for it.
         """
         last_msg = pending[-1][0]
         sender_id = last_msg.sender_id
+        post_answer = all(m.post_answer for m, _ in pending)
 
         # Combine texts (each message on its own line)
         combined_text = "\n\n".join(m.text for m, _ in pending)
@@ -341,16 +340,9 @@ class ChannelRouter:
         # Update reaction context to the last message in the batch
         self._note_message_context(session_id, last_msg)
 
-        if ChannelCapability.TYPING_INDICATOR in channel.capabilities:
-            try:
-                await channel.send_typing(sender_id)
-            except Exception as e:
-                logger.debug(
-                    "Typing indicator failed for %s: %s",
-                    last_msg.channel_name, e,
-                )
-
-        adapter = await self._setup_streaming(channel, sender_id, session_id)
+        if post_answer:
+            await self._show_typing(channel, sender_id, last_msg.channel_name)
+            await self._setup_streaming(channel, sender_id, session_id)
 
         task = asyncio.create_task(
             self.engine.run(
@@ -371,8 +363,22 @@ class ChannelRouter:
                 return task.result()
             return ""
         finally:
-            await self._teardown_streaming(
-                channel.name, sender_id, session_id,
+            if post_answer:
+                await self._teardown_streaming(
+                    channel.name, sender_id, session_id,
+                )
+
+    async def _show_typing(
+        self, channel: BaseChannel, target: str, channel_name: str,
+    ) -> None:
+        """Show the typing indicator when the channel has one. A failure is only logged."""
+        if ChannelCapability.TYPING_INDICATOR not in channel.capabilities:
+            return
+        try:
+            await channel.send_typing(target)
+        except Exception as e:
+            logger.debug(
+                "Typing indicator failed for %s: %s", channel_name, e,
             )
 
     def _note_message_context(self, session_id: str, msg: InboundMessage) -> None:

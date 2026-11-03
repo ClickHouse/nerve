@@ -7,8 +7,11 @@ stream endpoint, with a real router, session manager, and database, and a
 stand-in for the agent turn.
 
 Covered here: the table and its defaults, a switched-off provider that
-refuses its events while Slack goes on, and channels that use only the
-connections of their own provider.
+refuses its events while Slack goes on, channels that use only the
+connections of their own provider, and the ``tool`` answer mode, in which
+the router sends nothing to the conversation and the turn's text starts with
+a note for the agent. The router's part is also tested on its own, with a
+channel that records every call.
 """
 
 from __future__ import annotations
@@ -18,10 +21,21 @@ import uuid
 from dataclasses import dataclass
 from typing import Any
 
+from unittest.mock import MagicMock
+
 import pytest
 import pytest_asyncio
 
-from nerve.channels.base import ChannelCapability, OutboundMessage
+from nerve.agent.sessions import SessionManager
+from nerve.agent.streaming import broadcaster
+from nerve.channels.base import (
+    BaseChannel,
+    ChannelCapability,
+    ChannelConstraints,
+    InboundMessage,
+    OutboundMessage,
+)
+from nerve.channels.hosted.channel import answer_note
 from nerve.channels.hosted import providers as providers_module
 from nerve.channels.hosted.providers import (
     HOSTED_CHAT_PROVIDERS,
@@ -30,6 +44,7 @@ from nerve.channels.hosted.providers import (
     HostedChatProvider,
 )
 from nerve.channels.hosted.runtime import hosted_channel_providers
+from nerve.channels.router import ChannelRouter
 from nerve.config import NerveConfig, SlackConfig
 
 from tests.fake_channel_gateway import CONNECTION_ID, message_event
@@ -278,3 +293,211 @@ class TestProviderScoping:
         assert two.runtime.channels[CHAT].is_available
         assert not two.runtime.channels["slack"].is_available
         assert (await two.runtime.channels["slack"].post_notification("n-2", "Deploy?", [("Yes", "yes")])) is None
+
+
+# ---------------------------------------------------------------------- #
+#  The answer mode                                                        #
+# ---------------------------------------------------------------------- #
+
+
+class StreamingTurns:
+    """An agent turn that streams an answer, or an error, into its session."""
+
+    def __init__(self, *, error: str | None = None) -> None:
+        self.runs: list[dict[str, Any]] = []
+        self.error = error
+
+    async def run(self, **kwargs: Any) -> str:
+        self.runs.append(kwargs)
+        session_id = kwargs["session_id"]
+        if self.error is not None:
+            await broadcaster.broadcast_error(session_id, self.error)
+            return ""
+        for word in ("The ", "report ", "is ", "fine."):
+            await broadcaster.broadcast_token(session_id, word)
+        await broadcaster.broadcast_done(session_id)
+        return "The report is fine."
+
+    async def wait_for(self, count: int) -> None:
+        for _ in range(500):
+            if len(self.runs) >= count:
+                return
+            await asyncio.sleep(0.01)
+        raise AssertionError(f"expected {count} turns, saw {len(self.runs)}")
+
+
+async def turn_of(hosted: Hosted, stream, event: dict[str, Any], turns: StreamingTurns) -> dict[str, Any]:
+    """Deliver *event*, wait for its turn, and give the turn's settled output time to arrive."""
+    hosted.router.engine.run = turns.run
+    inbox_id = hosted.gateway.store(event)
+    await stream.nudge("invoke")
+    assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
+    await turns.wait_for(len(turns.runs) + 1)
+    await asyncio.sleep(0.3)
+    return turns.runs[-1]
+
+
+def kinds(hosted: Hosted) -> list[str]:
+    return [record["kind"] for record in hosted.gateway.operations]
+
+
+@pytest.mark.asyncio
+class TestToolAnswer:
+    async def test_the_turn_posts_nothing_and_its_text_starts_with_the_note(self, two):
+        stream = await two.stream(advertise=False)
+        await announce(stream, CHAT, CHAT_CONNECTION, answer="tool", reply_tool="send_reply", session="rotate")
+        turns = StreamingTurns()
+
+        run = await turn_of(two, stream, chat_event(text="Please check the report."), turns)
+
+        assert kinds(two) == []
+        assert run["user_message"] == (
+            "This message came through fixture_chat. Your answer in this session is not sent to anyone. "
+            "To answer, use the send_reply tool.\n\nPlease check the report."
+        )
+        mapping = await two.db.get_channel_session(f"{CHAT}:room-1")
+        assert run["session_id"] == mapping["session_id"]
+
+    async def test_without_a_reply_tool_the_note_says_that_nothing_answers(self, two):
+        stream = await two.stream(advertise=False)
+        await announce(stream, CHAT, CHAT_CONNECTION, answer="tool")
+
+        run = await turn_of(two, stream, chat_event(text="FYI"), StreamingTurns())
+
+        assert kinds(two) == []
+        assert run["user_message"] == f"{answer_note(CHAT)}\n\nFYI"
+        assert answer_note(CHAT).endswith("This channel does not send answers.")
+
+    async def test_an_error_of_the_turn_is_not_posted(self, two):
+        stream = await two.stream(advertise=False)
+        await announce(stream, CHAT, CHAT_CONNECTION, answer="tool")
+
+        await turn_of(two, stream, chat_event(), StreamingTurns(error="the model is unavailable"))
+
+        assert kinds(two) == []
+
+    async def test_the_same_provider_with_the_post_mode_posts_the_answer(self, two):
+        stream = await two.stream(advertise=False)
+        await announce(stream, CHAT, CHAT_CONNECTION, answer="post", session="rotate")
+
+        run = await turn_of(two, stream, chat_event(text="Please check the report."), StreamingTurns())
+
+        assert run["user_message"] == "Please check the report."
+        assert "send" in kinds(two) and "reaction" in kinds(two)
+        final = two.gateway.sent_operations("send")[-1]
+        assert final["content"][0]["text"]["body"] == "The report is fine."
+
+    @pytest.mark.parametrize("behaviour", [None, SLACK_BEHAVIOUR], ids=["absent", "explicit"])
+    async def test_slack_posts_its_answer_as_before(self, two, behaviour):
+        stream = await two.stream(advertise=False)
+        await announce(stream, "slack", CONNECTION_ID, **(behaviour or {}))
+
+        run = await turn_of(two, stream, slack_event(text="how are the deploys?"), StreamingTurns())
+
+        assert run["user_message"] == "how are the deploys?"
+        assert {"reaction", "send", "delete"} <= set(kinds(two))
+        assert two.gateway.sent_operations("send")[-1]["content"][0]["text"]["body"] == "The report is fine."
+
+    async def test_a_connection_without_capabilities_posts_its_answer(self, two):
+        stream = await two.stream(advertise=False)
+
+        run = await turn_of(two, stream, chat_event(text="hello"), StreamingTurns())
+
+        assert run["user_message"] == "hello"
+
+
+class RecordingChannel(BaseChannel):
+    """A channel that streams and shows typing, and records every call."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    @property
+    def name(self) -> str:
+        return "recording"
+
+    @property
+    def capabilities(self) -> ChannelCapability:
+        return ChannelCapability.SEND_TEXT | ChannelCapability.STREAMING | ChannelCapability.TYPING_INDICATOR
+
+    @property
+    def constraints(self) -> ChannelConstraints:
+        return ChannelConstraints(max_message_length=4000, supports_message_edit=True)
+
+    async def start(self) -> None:
+        pass
+
+    async def stop(self) -> None:
+        pass
+
+    async def send(self, message: OutboundMessage) -> None:
+        self.calls.append(("send", message.text))
+
+    async def send_placeholder(self, target: str, session_id: str) -> str | None:
+        self.calls.append(("placeholder", target))
+        return "placeholder-1"
+
+    async def edit_message(self, target: str, message_id: str, text: str, *, throttle: bool = False) -> None:
+        self.calls.append(("edit", text))
+
+    async def delete_message(self, target: str, message_id: str) -> None:
+        self.calls.append(("delete", message_id))
+
+    async def send_typing(self, target: str) -> None:
+        self.calls.append(("typing", target))
+
+
+def recording_router(db, turns: StreamingTurns) -> tuple[ChannelRouter, RecordingChannel]:
+    engine = MagicMock()
+    engine.db = db
+    engine.sessions = SessionManager(db)
+    engine.run = turns.run
+    router = ChannelRouter(engine)
+    router.BATCH_DEBOUNCE = 0.0
+    channel = RecordingChannel()
+    router.register(channel)
+    return router, channel
+
+
+def inbound(text: str = "hello", *, post_answer: bool = True) -> InboundMessage:
+    return InboundMessage(
+        channel_name="recording", channel_key="recording:room-1", sender_id="room-1", text=text,
+        post_answer=post_answer,
+    )
+
+
+@pytest.mark.asyncio
+class TestRouterAnswerMode:
+    async def test_a_turn_that_posts_shows_typing_streams_and_sends(self, db):
+        router, channel = recording_router(db, StreamingTurns())
+
+        assert await router.handle_message(inbound()) == "The report is fine."
+
+        assert {"typing", "placeholder", "send", "delete"} <= {call[0] for call in channel.calls}
+
+    @pytest.mark.parametrize("error", [None, "the model is unavailable"], ids=["answer", "error"])
+    async def test_a_turn_that_does_not_post_sends_nothing_to_the_channel(self, db, error):
+        turns = StreamingTurns(error=error)
+        router, channel = recording_router(db, turns)
+
+        await router.handle_message(inbound(post_answer=False))
+
+        assert channel.calls == []
+        [run] = turns.runs
+        assert run["user_message"] == "hello"
+        assert await db.get_channel_session("recording:room-1") is not None
+
+    async def test_a_batch_posts_only_when_every_message_asks_for_it(self, db):
+        turns = StreamingTurns()
+        router, channel = recording_router(db, turns)
+        router.BATCH_DEBOUNCE = 0.1
+        await router.create_session("recording:room-1", source="recording")
+
+        await asyncio.gather(
+            router.handle_message(inbound("first", post_answer=False)),
+            router.handle_message(inbound("second")),
+        )
+
+        assert channel.calls == []
+        [run] = turns.runs
+        assert run["user_message"] == "first\n\nsecond"
