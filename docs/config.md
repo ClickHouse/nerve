@@ -1491,7 +1491,8 @@ Hosted Slack holds them: while `slack.enabled` is `false`, Nerve reads
 nothing, and the events of the other hosted providers wait in the gateway
 inbox too. Any other hosted chat provider refuses: while it is switched off,
 Nerve rejects its events and continues to read the events of the other
-providers.
+providers. Nerve also stops reading, for every provider, while one hosted
+channel has 100 turns in progress, and continues when one of them ends.
 
 An event on a connection whose capabilities name another provider is
 rejected, and Nerve sends no operation of a channel through such a
