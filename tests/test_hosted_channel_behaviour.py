@@ -38,6 +38,7 @@ from nerve.channels.base import (
     OutboundMessage,
 )
 from nerve.channels.hosted.channel import answer_note
+from nerve.channels.hosted.operations import OperationFailed
 from nerve.channels.hosted import providers as providers_module
 from nerve.channels.hosted.providers import (
     HOSTED_CHAT_PROVIDERS,
@@ -295,6 +296,42 @@ class TestProviderScoping:
         assert two.runtime.channels[CHAT].is_available
         assert not two.runtime.channels["slack"].is_available
         assert (await two.runtime.channels["slack"].post_notification("n-2", "Deploy?", [("Yes", "yes")])) is None
+
+    async def test_an_event_on_a_connection_of_another_provider_is_rejected(self, two):
+        stream = await two.stream(advertise=False)
+        await announce(stream, "slack", CONNECTION_ID, **SLACK_BEHAVIOUR)
+        await announce(stream, CHAT, CHAT_CONNECTION, answer="tool", session="keep")
+        await two.gateway.wait_for(lambda: len(two.runtime.streams.connections("send")) == 2)
+        on_slack = two.gateway.store(chat_event(connection_id=CONNECTION_ID))
+        on_chat = two.gateway.store(slack_event(connection_id=CHAT_CONNECTION))
+
+        await stream.nudge("invoke")
+
+        assert await two.acknowledged(on_slack, on_chat) == {on_slack: "rejected", on_chat: "rejected"}
+        assert [item["reason_code"] for item in two.gateway.acks[-1]] == ["configuration_invalid"] * 2
+        await asyncio.sleep(0.2)
+        assert two.turns.runs == []
+        assert two.runtime.channels[CHAT].connection_for("room-1") is None
+        assert two.runtime.channels["slack"].connection_for("D0DIRECT") is None
+
+    async def test_a_known_connection_that_now_serves_another_provider_gets_no_operation(self, two):
+        stream = await two.stream(advertise=False)
+        await announce(stream, CHAT, CHAT_CONNECTION, answer="tool")
+        inbox_id = two.gateway.store(chat_event())
+        await stream.nudge("invoke")
+        assert (await two.acknowledged(inbox_id))[inbox_id] == "accepted"
+        await two.turns.wait_for(1)
+        chat = two.runtime.channels[CHAT]
+        assert str(chat.connection_for("room-1")) == CHAT_CONNECTION
+
+        await announce(stream, "slack", CHAT_CONNECTION)
+        await two.gateway.wait_for(lambda: not two.runtime.streams.connections("send", CHAT))
+
+        with pytest.raises(OperationFailed):
+            await chat.send(OutboundMessage(target="room-1", text="through the wrong connection"))
+        await chat.set_reaction("room-1", "m-1", "\U0001f44d")
+        await chat.edit_message("room-1", "m-1", "edited")
+        assert two.gateway.operations == []
 
 
 # ---------------------------------------------------------------------- #

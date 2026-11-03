@@ -41,7 +41,8 @@ and it adds no actor.
 
 The channel serves the connections of its provider. A connection whose
 capabilities name no provider, as from an older gateway, serves every hosted
-chat channel. The provider's entry in
+chat channel. An event on a connection whose capabilities name another
+provider is rejected, and no operation goes to such a connection. The provider's entry in
 :data:`~nerve.channels.hosted.providers.HOSTED_CHAT_PROVIDERS` gives the
 channel's switch and settings.
 
@@ -474,7 +475,7 @@ class HostedChannel(BaseChannel):
             raise OperationFailed(operation, "unavailable", "invalid_target", local=True,
                                   detail="the target names no conversation")
         connection = self._connections.get(conversation_id)
-        if connection is not None:
+        if connection is not None and not self._foreign(connection):
             return connection
         candidates = (
             await self._operations.connections(operation, self._provider) if self._operations else set()
@@ -486,6 +487,17 @@ class HostedChannel(BaseChannel):
             local=True,
             detail=f"no single {self._provider} connection serves conversation {conversation_id}",
         )
+
+    def _foreign(self, connection_id: uuid.UUID) -> bool:
+        """Whether the capabilities of *connection_id* name another provider.
+
+        A connection without capabilities now, or whose capabilities name no
+        provider, is not foreign.
+        """
+        capabilities = (
+            self._operations.streams.capabilities_for(connection_id) if self._operations else None
+        )
+        return capabilities is not None and not capabilities.serves(self._provider)
 
     def _limits(self, connection_id: uuid.UUID) -> ConnectionLimits:
         capabilities = (
@@ -512,6 +524,9 @@ class HostedChannel(BaseChannel):
         if self._operations is None:
             raise OperationFailed(kind, "unavailable", "provider_unavailable", local=True,
                                   detail="no gateway streams")
+        if self._foreign(connection_id):
+            raise OperationFailed(kind, "unavailable", "invalid_target", local=True,
+                                  detail=f"connection {connection_id} serves another provider")
         return await self._operations.perform(connection_id, kind, payload, **options)
 
     async def _fitting(
@@ -837,7 +852,8 @@ class HostedChannel(BaseChannel):
                 return Decision(
                     False, f"the destination is not approved by the {self._provider} channel policy",
                 )
-        if self._connections.get(conversation) is None and self._operations is not None:
+        known = self._connections.get(conversation)
+        if (known is None or self._foreign(known)) and self._operations is not None:
             candidates = self._operations.streams.connections("send", self._provider)
             if len(candidates) > 1:
                 return Decision(
@@ -891,10 +907,16 @@ class HostedChannel(BaseChannel):
         """Dispatch one admitted event and say what happened to it.
 
         While the provider is switched off, and it does not hold its events,
-        each event is rejected.
+        each event is rejected. So is an event on a connection whose
+        capabilities name another provider: it is not remembered, and its
+        connection's behaviour does not apply.
         """
         if not self._spec.hold_while_off and not self._switched_on():
             return Disposition.rejected("configuration_invalid", f"{self._provider} is switched off")
+        if self._foreign(event.connection_id):
+            return Disposition.rejected(
+                "configuration_invalid", f"connection {event.connection_id} serves another provider",
+            )
         purpose = event.admission.purpose
         if purpose == "invoke" and event.kind == "message":
             disposition = await self._invoke_message(event)
@@ -981,7 +1003,7 @@ class HostedChannel(BaseChannel):
         self, event: Event, attachment: AttachmentReference, length: int,
     ) -> bytes | None:
         """Read up to *length* bytes of an attachment, or ``None`` on failure."""
-        if self._operations is None:
+        if self._operations is None or self._foreign(event.connection_id):
             return None
         try:
             return await self._operations.read(event.connection_id, "file_read", FileReadOperation(
