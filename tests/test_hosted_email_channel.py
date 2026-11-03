@@ -22,6 +22,7 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 import pytest_asyncio
@@ -442,6 +443,60 @@ def sent_first(stream) -> dict[str, Any]:
     assert kinds_sent.index("subscriptions") < kinds_sent.index("inbox_read")
     [frame] = stream.sent("subscriptions")
     return frame["payload"]["subscriptions"]
+
+
+# ---------------------------------------------------------------------- #
+#  The reload report                                                      #
+# ---------------------------------------------------------------------- #
+
+
+async def reload_to(monkeypatch, tmp_path, new: NerveConfig, runtime=None) -> dict[str, Any]:
+    """Run a whole reload from *new* with email off to *new*, with *runtime* as
+    the hosted runtime."""
+    import nerve.config as config_module
+
+    old = copy.deepcopy(new)
+    old.email.enabled = False
+    monkeypatch.setattr(config_module, "_config", old)
+    monkeypatch.setattr(config_module, "load_config", lambda config_dir=None: new)
+    engine = SimpleNamespace(
+        get_channel_runtime={"hosted": runtime}.get if runtime is not None else {}.get,
+        reload_mcp_config=AsyncMock(return_value=[]),
+    )
+    return await config_reload.reload_all(engine, None, tmp_path)
+
+
+@pytest.mark.asyncio
+class TestReloadReport:
+    async def test_email_without_usable_hosted_settings_is_a_warning(self, monkeypatch, tmp_path):
+        new = NerveConfig.from_dict({"email": {"enabled": True}})
+
+        summary = await reload_to(monkeypatch, tmp_path, new)
+
+        assert summary["email"] == email_warning(new)
+        assert "restart_required" not in summary
+        assert config_reload.reload_failures(summary) == {}
+
+    async def test_usable_settings_without_an_email_channel_need_a_restart(self, monkeypatch, tmp_path):
+        summary = await reload_to(monkeypatch, tmp_path, hosted_config(enabled=True))
+
+        assert summary["email"] == (
+            "email.enabled is set and the channels.hosted settings are usable, but this "
+            "process has no email channel: it is built at startup, so restart Nerve"
+        )
+        assert "email.enabled: the email channel starts at the next restart" in summary["restart_required"]
+
+    async def test_a_running_email_channel_or_a_switched_off_email_says_nothing(self, hosted, monkeypatch, tmp_path):
+        on = copy.deepcopy(hosted.config)
+        on.email.enabled = True
+        off = copy.deepcopy(on)
+        off.email.enabled = False
+
+        for new in (on, off):
+            summary = await reload_to(monkeypatch, tmp_path, new, hosted.runtime)
+
+            assert "email" not in summary
+            assert "email.enabled" not in summary.get("restart_required", "")
 
 
 # ---------------------------------------------------------------------- #
