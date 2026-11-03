@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import sqlite3
 import sys
 import types
@@ -160,6 +161,24 @@ async def _checks(bridge, db_path, ctx, refused) -> None:
     assert labelled and labelled[0].startswith("(2026-11-03 14:19, session 3f9a1c07) user: what is the status")
     out = await bridge.recall("merged PR 4100", limit=5, category_limit=0)
     assert out[0]["id"] == item_id
+
+    # A restart: memU's loader keeps no resource cache, and no extra or
+    # happened_at on cached items. Recall and dedup must not depend on them.
+    async def _restart_like():
+        db = bridge._service.database
+        db.resource_repo.resources.clear()
+        for cached in db.memory_item_repo.items.values():
+            cached.__dict__["extra"] = {}
+            cached.__dict__["happened_at"] = None
+        return bridge._hydrate_item_cache()
+
+    assert await bridge._submit(_restart_like()) > 0
+    out = await bridge.recall("parser fix PR 4242 status", limit=5, category_limit=0)
+    labelled = [m["summary"] for m in out if m["type"] == "conversation"]
+    assert labelled and labelled[0].startswith("(2026-11-03 14:19, session 3f9a1c07)"), labelled
+    assert await bridge.memorize_fact("On November 2, 2026, the user merged PR 4100 after code review", "event")
+    extra = json.loads(_rows(db_path, "SELECT extra FROM memu_memory_items WHERE id = ?", (item_id,))[0][0])
+    assert extra.get("content_hash") and extra.get("reinforcement_count") == 3, extra
 
     # The date listing: facts, plus one line for the session — not the chunk.
     history = (await conversation_history_handler(ctx, {"date": "2026-11-02", "end_date": "2026-11-03"}))

@@ -1816,18 +1816,24 @@ class MemUBridge:
                                 "Semantic dedup: reinforcing %s item %s (%.3f) instead of creating '%s'",
                                 memory_type, match_id, score, summary[:80],
                             )
-                            # Update DB row
+                            # Update DB row.  The count starts from the row's
+                            # own extra, not the cache's: memU's loader leaves
+                            # extra out of cached items, so a cache-based
+                            # write after a restart would drop the row's
+                            # content_hash and restart its count.
                             from sqlmodel import select as _sel
                             now = self._now()
                             extra = dict(matched.extra or {})
-                            extra["reinforcement_count"] = extra.get("reinforcement_count", 1) + 1
-                            extra["last_reinforced_at"] = now.isoformat()
                             with self._sessions.session() as session:
                                 row = session.exec(
                                     _sel(self._memory_item_model).where(
                                         self._memory_item_model.id == match_id
                                     )
                                 ).first()
+                                if row:
+                                    extra = {**extra, **dict(row.extra or {})}
+                                extra["reinforcement_count"] = int(extra.get("reinforcement_count", 1) or 1) + 1
+                                extra["last_reinforced_at"] = now.isoformat()
                                 if row:
                                     row.extra = extra
                                     row.updated_at = now
@@ -2249,6 +2255,62 @@ class MemUBridge:
         finally:
             conn.close()
 
+    def _hydrate_item_cache(self) -> int:
+        """Fill in what memU's loader leaves out of its cached items: each
+        row's ``extra`` (reinforcement count, content hash) and
+        ``happened_at``. Without them a restart blinds recall's salience and
+        chunk labels, and the semantic dedup would rewrite a row's extra
+        from an empty dict. One read of the items table (memU loop)."""
+        import sqlite3 as _sqlite3
+
+        items = self._service.database.memory_item_repo.items
+        db_path = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
+        try:
+            conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
+            try:
+                rows = conn.execute("SELECT id, extra, happened_at FROM memu_memory_items").fetchall()
+            finally:
+                conn.close()
+        except _sqlite3.Error as exc:
+            logger.warning("Could not hydrate memU's item cache: %s", exc)
+            return 0
+        filled = 0
+        for item_id, extra_json, happened in rows:
+            item = items.get(item_id)
+            if item is None:
+                continue
+            if extra_json and not getattr(item, "extra", None):
+                try:
+                    item.__dict__["extra"] = json.loads(extra_json) if isinstance(extra_json, str) else dict(extra_json)
+                except (TypeError, ValueError):
+                    pass
+            if happened and getattr(item, "happened_at", None) is None:
+                parsed = _parse_iso(happened)
+                if parsed is not None:
+                    item.__dict__["happened_at"] = parsed.replace(tzinfo=None)
+            filled += 1
+        return filled
+
+    def _chunk_sources(self, resource_ids: list[str]) -> dict[str, str]:
+        """Resource id → URL, from the database (blocking): memU keeps no
+        resource cache after a restart."""
+        import sqlite3 as _sqlite3
+
+        if not resource_ids:
+            return {}
+        db_path = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
+        try:
+            conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+            try:
+                marks = ",".join("?" * len(resource_ids))
+                return dict(conn.execute(
+                    f"SELECT id, url FROM memu_resources WHERE id IN ({marks})", resource_ids,
+                ).fetchall())
+            finally:
+                conn.close()
+        except _sqlite3.Error:
+            return {}
+
     def _cache_vector(self, repo: Any, item: Any, vec: np.ndarray) -> None:
         """Keep a written row's vector in the cache and the vector index."""
         cached = repo.items.get(item.id)
@@ -2336,6 +2398,9 @@ class MemUBridge:
             happened = _parse_event_date(content, now) or now.date().isoformat()
         if happened:
             await asyncio.to_thread(self._set_happened_at_sync, [(item.id, happened)])
+            cached = db.memory_item_repo.items.get(item.id)
+            if cached is not None:
+                cached.__dict__["happened_at"] = datetime.strptime(happened, "%Y-%m-%d")
         return item.id, False
 
     async def _index_conversation_chunks_impl(
@@ -3091,6 +3156,10 @@ class MemUBridge:
                 # Pre-build the persistent vector index so the first
                 # search doesn't pay the full matrix stack.
                 _vec_index_for(self._service.database.memory_item_repo)
+
+                # memU's loader leaves each row's extra (reinforcement,
+                # content hash) and happened_at out of the cache.
+                self._hydrate_item_cache()
 
                 logger.info(
                     "Preloaded %d items and %d categories into vector cache "
@@ -4279,15 +4348,15 @@ class MemUBridge:
                 raise MemoryBackendUnavailable(f"memory backend unavailable: {e}") from e
             raise MemoryRecallFailed(f"memory recall failed: {e}") from e
 
-    def _recall_entry(self, item_id: str, item: Any) -> dict[str, str]:
+    def _recall_entry(self, item_id: str, item: Any, sources: dict[str, str] | None = None) -> dict[str, str]:
         """One recall result. A chunk is prefixed with where it is from:
         ``(2026-11-03 14:19, session 3f9a1c07)`` for a transcript, the file
-        name for a workspace file."""
+        name for a workspace file. ``sources`` maps resource ids to URLs
+        (read from the database: memU keeps no resource cache)."""
         mtype = str(item.memory_type or "")
         summary = item.summary
         if mtype in CHUNK_MEMORY_TYPES:
-            resource = self._service.database.resource_repo.resources.get(getattr(item, "resource_id", None) or "")
-            url = getattr(resource, "url", "") or ""
+            url = (sources or {}).get(str(getattr(item, "resource_id", "") or ""), "")
             if mtype == "conversation":
                 when = getattr(item, "happened_at", None)
                 stamp = when.strftime("%Y-%m-%d %H:%M") if isinstance(when, datetime) else str(when or "")[:16]
@@ -4329,12 +4398,12 @@ class MemUBridge:
 
         # Facts first: chunks (transcripts, files) take at most _CHUNK_SHARE
         # of the answer, and fill it only when the facts run out.
-        items_out: list[dict[str, str]] = []
+        chosen: list[str] = []
         chunk_cap = max(1, int(limit * _CHUNK_SHARE)) if limit > 0 else 0
         chunks_taken = 0
         held_back: list[str] = []
         for item_id, _score in fused:
-            if len(items_out) >= limit:
+            if len(chosen) >= limit:
                 break
             item = item_repo.items[item_id]
             if not item.summary:
@@ -4344,11 +4413,18 @@ class MemUBridge:
                     held_back.append(item_id)
                     continue
                 chunks_taken += 1
-            items_out.append(self._recall_entry(item_id, item))
+            chosen.append(item_id)
         for item_id in held_back:
-            if len(items_out) >= limit:
+            if len(chosen) >= limit:
                 break
-            items_out.append(self._recall_entry(item_id, item_repo.items[item_id]))
+            chosen.append(item_id)
+        chunk_resources = sorted({
+            str(getattr(item_repo.items[i], "resource_id", "") or "")
+            for i in chosen
+            if str(item_repo.items[i].memory_type or "") in CHUNK_MEMORY_TYPES
+        } - {""})
+        sources = await asyncio.to_thread(self._chunk_sources, chunk_resources) if chunk_resources else {}
+        items_out = [self._recall_entry(i, item_repo.items[i], sources) for i in chosen]
 
         cats_out: list[dict[str, str]] = []
         qnorm = float(np.linalg.norm(qvec)) or 1.0
