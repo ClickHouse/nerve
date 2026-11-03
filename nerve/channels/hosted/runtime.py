@@ -5,13 +5,16 @@ runner, the inbox reader, one :class:`HostedChannel` for each chat provider in
 hosted mode (see :mod:`nerve.channels.hosted.providers`), and one
 :class:`HostedSourceConsumer` for each hosted source. The hosted settings and
 the provider modes are read once at startup; a change needs a restart. A
-reload reads the gateway key file again and publishes the source
-subscriptions again. The switch, the settings, and the source grant of each
-chat provider are read per event, so they follow a reload.
+reload reads the gateway key file again and publishes the subscriptions
+again: the hosted sources, and the chat providers that the frame names, such
+as email, each while it is switched on. The switch, the settings, and the
+source grant of each chat provider are read per event, so they follow a
+reload.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import uuid
 from typing import TYPE_CHECKING, Any, Callable
@@ -30,6 +33,7 @@ from nerve.channels.hosted.operations import OperationRunner, OperationTiming
 from nerve.channels.hosted.providers import hosted_chat_providers
 from nerve.channels.hosted.sources import (
     HostedSourceConsumer,
+    chat_subscription,
     hosted_sources,
     subscriptions_for,
 )
@@ -119,6 +123,12 @@ class HostedChannelRuntime:
             tenant_id=tenant_id,
             agent_id=agent_id,
         )
+        # The chat providers that the subscriptions frame names while they
+        # are switched on (see HostedChatProvider.subscribes). A runtime with
+        # one of them sends the frame also while all of them are off, so that
+        # a reload that switches one off takes its entry away at the gateway.
+        self._subscribing = [provider for provider in providers if provider.subscribes]
+        self._publishes = bool(source_providers or self._subscribing)
         self.streams = StreamManager(
             verifier=self.verifier,
             receive_limits=RECEIVE_LIMITS,
@@ -126,7 +136,7 @@ class HostedChannelRuntime:
             timing=stream_timing,
             on_ready=self._stream_ready,
             on_nudge=self._stream_nudged,
-            subscriptions=self.subscriptions if source_providers else None,
+            subscriptions=self.subscriptions if self._publishes else None,
         )
         self.operations = OperationRunner(self.streams, operation_timing)
         self.channels: dict[str, HostedChannel] = {
@@ -188,19 +198,29 @@ class HostedChannelRuntime:
     def subscriptions(self) -> Subscriptions | None:
         """The ``subscriptions`` payload from the current config.
 
-        ``None`` without hosted sources: such a runtime sends no frame, so a
-        gateway that predates the frame never receives one.
+        It names the hosted sources that are switched on, then each chat
+        provider that the frame names while it is switched on. ``None``
+        without hosted sources and without such a chat provider: that
+        runtime sends no frame, so a gateway that predates the frame never
+        receives one.
         """
-        if not self.sources:
+        if not self._publishes:
             return None
-        return subscriptions_for(self._config(), self.sources)
+        config = self._config()
+        body = subscriptions_for(config, self.sources)
+        chat = tuple(
+            chat_subscription(provider.name)
+            for provider in self._subscribing if provider.switched_on(config)
+        )
+        return dataclasses.replace(body, sources=body.sources + chat) if chat else body
 
     async def republish_subscriptions(self) -> str | None:
         """Send the subscriptions again on every open stream, after a reload.
 
-        ``None`` without hosted sources, otherwise a summary for the reload.
+        ``None`` for a runtime that sends no frame (see
+        :meth:`subscriptions`), otherwise a summary for the reload.
         """
-        if not self.sources:
+        if not self._publishes:
             return None
         sent = await self.streams.publish_subscriptions()
         return f"published on {sent} stream(s)"
