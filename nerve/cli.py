@@ -1685,6 +1685,37 @@ def _hosted_github_lines(config, errors: list[str], warnings: list[str]) -> list
     return lines
 
 
+def _email_lines(config, errors: list[str], warnings: list[str]) -> list[str]:
+    """Doctor lines for the email channel (``email.enabled``).
+
+    Mail comes only through the channel gateway, so the channel needs usable
+    ``channels.hosted`` settings and a key file that can be read. A
+    switched-off hosted Slack holds member mail back too. Nothing is shown
+    while email is switched off.
+    """
+    if not config.email.enabled:
+        return []
+    from nerve.channels.hosted.auth import KeyFileError, read_key_file
+    from nerve.channels.hosted.providers import email_warning
+
+    problem = email_warning(config)
+    if problem is not None:
+        warnings.append(f"[WARN] {problem}")
+        return []
+    try:
+        read_key_file(config.channels.hosted.gateway_jwks_file)
+    except KeyFileError as error:
+        errors.append(f"[ERR] Email is on but channels.hosted.gateway_jwks_file: {error}")
+        return []
+    if config.slack.mode == "hosted" and not config.slack.enabled:
+        warnings.append(
+            "[WARN] Slack is hosted but switched off (slack.enabled is false): Nerve "
+            "reads nothing from the channel gateway until it is switched on, so member "
+            "mail waits there too"
+        )
+    return ["[OK] Email from members comes from the channel gateway; Nerve posts no answer"]
+
+
 def _actor_context_lines(config, errors: list[str], warnings: list[str]) -> list[str]:
     """Doctor lines for the actor context check of external mode (``auth.external``)."""
     from nerve.config import EXTERNAL_VERIFICATION_LOG
@@ -2238,6 +2269,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         lines.append("[--] Slack disabled")
     lines.extend(_hosted_github_lines(config, errors, warnings))
     lines.extend(_github_repos_lines(config, warnings))
+    lines.extend(_email_lines(config, errors, warnings))
 
     # Check SSL
     if config.gateway.ssl.enabled:
