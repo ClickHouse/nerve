@@ -1,5 +1,5 @@
 """The email channel: the ``email`` setting, its provider entry, its
-subscription, and member mail over real streams.
+subscription, member mail over real streams, and ``nerve doctor``.
 
 ``fixtures/channel_contract`` holds copies of the channel contract's samples:
 the ``email_message`` event as the gateway delivers member mail, the
@@ -46,6 +46,7 @@ from nerve.channels.hosted.providers import (
 )
 from nerve.channels.hosted.runtime import hosted_channel_providers, hosted_providers
 from nerve.channels.hosted.sources import chat_subscription
+from nerve.cli import doctor_report
 from nerve.config import (
     EmailConfig,
     GitHubSyncConfig,
@@ -53,7 +54,7 @@ from nerve.config import (
     SlackConfig,
     validate_config_keys,
 )
-from tests.fake_channel_gateway import CONNECTION_ID, message_event
+from tests.fake_channel_gateway import CONNECTION_ID, FakeChannelGateway, message_event
 from tests.test_hosted_channel import Hosted, start_hosted, stop_hosted
 from tests.test_hosted_channel_behaviour import StreamingTurns, kinds, turn_of
 from tests.test_hosted_channel_config import HOSTED
@@ -386,3 +387,52 @@ class TestSubscriptionsFrame:
         await hosted.gateway.wait_for(lambda: bool(hosted.gateway.subscriptions))
         return hosted.gateway.subscriptions[0]
 
+
+# ---------------------------------------------------------------------- #
+#  nerve doctor                                                           #
+# ---------------------------------------------------------------------- #
+
+
+def doctor_config(tmp_path: Path, **settings: Any) -> NerveConfig:
+    gateway = FakeChannelGateway(jwks_file=tmp_path / "gateway-jwks.json")
+    return NerveConfig.from_dict({
+        "email": {"enabled": True},
+        "channels": {"hosted": {**HOSTED, "gateway_jwks_file": str(gateway.jwks_file), **settings}},
+    })
+
+
+class TestDoctor:
+    def test_email_from_the_gateway_is_reported(self, tmp_path):
+        report = doctor_report(doctor_config(tmp_path))
+
+        assert "[OK] Email from members comes from the channel gateway; Nerve posts no answer\n" in report
+
+    def test_a_switched_off_email_shows_nothing(self, tmp_path):
+        config = doctor_config(tmp_path)
+        config.email.enabled = False
+
+        assert "Email" not in doctor_report(config)
+
+    def test_unusable_hosted_settings_are_a_warning(self, tmp_path):
+        report = doctor_report(doctor_config(tmp_path, agent_id=""))
+
+        assert "[WARN] email.enabled is set, but mail comes only through the channel gateway" in report
+        assert "channels.hosted.agent_id must be a lowercase UUID" in report
+
+    def test_an_unusable_key_file_is_an_error(self, tmp_path):
+        report = doctor_report(doctor_config(tmp_path, gateway_jwks_file=str(tmp_path / "missing.json")))
+
+        assert "[ERR] Email is on but channels.hosted.gateway_jwks_file: cannot read" in report
+
+    @pytest.mark.parametrize(("slack", "warned"), [
+        ({"mode": "hosted", "enabled": False}, True),
+        ({"mode": "hosted"}, False),
+        ({"mode": "socket", "enabled": False}, False),
+    ])
+    def test_a_switched_off_hosted_slack_is_said_to_hold_mail_back(self, tmp_path, slack, warned):
+        config = doctor_config(tmp_path)
+        config.slack = SlackConfig.from_dict(slack)
+
+        report = doctor_report(config)
+
+        assert ("so member mail waits there too" in report) is warned
