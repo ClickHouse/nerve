@@ -1,4 +1,5 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
+import type { ChatMessage } from '../../types/chat';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -74,5 +75,26 @@ describe('empty transcript', () => {
     useSetupStore.setState({ state: withStep(makeState(), step('provider', { status: 'done' })) });
     renderEmpty();
     expect(screen.getByText('Start a conversation')).toBeInTheDocument();
+  });
+});
+
+describe('long history rendering', () => {
+  it('mounts a bounded recent window and reveals earlier messages on request', () => {
+    const messages: ChatMessage[] = Array.from({ length: 35 }, (_, i) => ({
+      id: i + 1,
+      role: 'user',
+      blocks: [{ type: 'text', content: `Test turn ${i}` }],
+    }));
+    render(
+      <MemoryRouter>
+        <MessageList messages={messages} isStreaming={false} />
+      </MemoryRouter>,
+    );
+
+    expect(screen.queryByText('Test turn 0')).not.toBeInTheDocument();
+    expect(screen.getByText('Test turn 34')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Show earlier messages (5 loaded)' }));
+    expect(screen.getByText('Test turn 0')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Show earlier messages/ })).not.toBeInTheDocument();
   });
 });
