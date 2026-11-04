@@ -26,3 +26,21 @@ it('labels an old report by SHA and keeps current unreviewed state visible', asy
   expect(await screen.findByText('Old description')).toBeInTheDocument();
   expect(screen.getByText('old-sha', { selector: 'code' })).toBeInTheDocument();
 });
+
+it('resets selected history when the surrounding task panel switches to a different PR', async () => {
+  vi.mocked(codeReview.detail).mockImplementation(async id => ({
+    pr: { id, task_id: id, profile: 'example', repository: 'alice/example', number: 1,
+      title: 'Example PR', url: 'https://example.com', state: 'open', draft: 0, head: id + '-head', base: 'base',
+      current_version: id + '-version', reviewed_version: null, review_state: 'queued', severity: 'none',
+      ci: '{}', content_updated_at: '', last_polled_at: '', error: '' },
+    versions: [{ id: id + '-version', head: id + '-head', base: 'base', status: 'queued', created_at: '', updated_at: '', error: '', spent_usd: 0 }], total: 1,
+  }));
+  vi.mocked(codeReview.version).mockImplementation(async (id, version) => ({
+    version: { id: version, head: id + '-head', base: 'base', status: 'queued', created_at: '', updated_at: '', error: '', spent_usd: 0, snapshot: {} },
+    attempts: [], reports: [],
+  }));
+  const { rerender } = render(<MemoryRouter><CodeReviewHistory prId="first" /></MemoryRouter>);
+  expect(await screen.findByRole('combobox')).toHaveValue('first-version');
+  rerender(<MemoryRouter><CodeReviewHistory prId="second" /></MemoryRouter>);
+  expect(await screen.findByRole('combobox')).toHaveValue('second-version');
+});

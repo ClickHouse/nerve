@@ -18,7 +18,7 @@ pytestmark = pytest.mark.asyncio
 @pytest_asyncio.fixture
 async def worker(db, service):
     row = await service.observe(service.profile('example'), 1)
-    claim = await db.cr_reserve('example', '2026-01-01', 5, 30, 3)
+    claim = await db.cr_reserve('example', '2026-01-01', 5, 30, 3, review_mode="automatic")
     run_id = claim['run_id']
     sid = 'workflow:' + run_id
     await db.create_session(sid, source='workflow', actor=None)

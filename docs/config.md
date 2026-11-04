@@ -2495,5 +2495,7 @@ restart. See [Platform activity reporting](platform-activity.md).
 `code_review` is a shareable settings section (restart required), with `board_name`
 and a `profiles` list. Each profile supplies `id`, `repository`, `query`, `enabled`
 (default false), `schedule`, `timezone`, `version_budget_usd`, `daily_budget_usd` and
-`max_attempts`. See [Code Review](code-review.md) for defaults, budget accounting,
+`max_attempts` (automatic mode only). `review_mode` defaults to `manual`, including
+existing profiles that omit it; `automatic` requires explicit configuration. Polling
+and task updates use no models in either mode. See [Code Review](code-review.md) for defaults, budget accounting,
 artifact retention, pause behavior and installation checks.

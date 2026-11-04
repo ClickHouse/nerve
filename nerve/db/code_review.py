@@ -7,6 +7,7 @@ import json
 import uuid
 
 from nerve.utils.time import utc_now_iso
+from nerve.db.code_review_requests import CodeReviewRequests
 
 
 def encode(value):
@@ -17,7 +18,7 @@ def digest(value):
     return hashlib.sha256(encode(value).encode()).hexdigest()
 
 
-class CodeReviewStore:
+class CodeReviewStore(CodeReviewRequests):
     async def cr_rows(self, sql, args=()):
         async with self.db.execute(sql, args) as cursor:
             return [dict(row) for row in await cursor.fetchall()]
@@ -131,6 +132,11 @@ class CodeReviewStore:
             if old and (old["state"] != state or old["draft"] != draft):
                 await self.cr_event(pr_id, "lifecycle", f"{state}, draft={draft}")
             await self.db.execute(
+                "UPDATE code_review_requests SET state='cancelled',reason=?,updated_at=? "
+                "WHERE pr_id=? AND state IN ('pending','claimed') AND (version_id!=? OR ? OR ?!='open')",
+                ("PR изменился. Нужен новый ручной запрос", now, pr_id, current, draft, state),
+            )
+            await self.db.execute(
                 """UPDATE code_review_prs SET title=?,state=?,draft=?,head=?,base=?,base_ref=?,
                    current_version=?,review_state=?,ci=?,last_polled_at=?,pr_updated_at=?,error='',
                    content_updated_at=CASE WHEN ? THEN ? ELSE content_updated_at END WHERE id=?""",
@@ -149,21 +155,38 @@ class CodeReviewStore:
         )
         return row["used"]
 
-    async def cr_reserve(self, profile, day, version_cap, daily_cap, max_attempts, version_id=None):
+    async def cr_reserve(self, profile, day, version_cap, daily_cap, max_attempts, version_id=None,
+                         *, review_mode="manual", request_id=None):
         now = utc_now_iso()
         async with self._atomic():
             settings = await self.cr_one("SELECT * FROM code_review_profiles WHERE id=?", (profile,))
             if not settings or settings["paused"]:
                 return None
+            request = None
+            if review_mode != "automatic" or request_id:
+                request = await self.cr_one(
+                    "SELECT * FROM code_review_requests WHERE id=? AND profile=? AND version_id=? AND state='pending'",
+                    (request_id, profile, version_id),
+                )
+                if not request:
+                    return None
+                reason = ("Запрос истёк при смене суток. Запустите проверку снова" if request["day"] != day else
+                          await self.cr_manual_eligibility(request["pr_id"], version_id, day, version_cap, daily_cap))
+                if reason:
+                    await self.db.execute(
+                        "UPDATE code_review_requests SET state='cancelled',reason=?,updated_at=? WHERE id=?",
+                        (reason, now, request_id),
+                    )
+                    return None
             if await self.cr_one("SELECT run_id FROM code_review_attempts WHERE profile=? AND settled=0", (profile,)):
                 return None
             row = await self.cr_one(
                 """SELECT v.*,p.task_id,p.number,p.repository,p.severity FROM code_review_versions v
                    JOIN code_review_prs p ON p.id=v.pr_id WHERE p.profile=? AND p.state='open'
                    AND p.draft=0 AND p.error='' AND p.current_version=v.id
-                   AND v.status IN ('queued','waiting_budget','retry') AND v.retry_at<=?
+                   AND (? OR (v.status IN ('queued','waiting_budget','retry') AND v.retry_at<=?))
                    AND (? IS NULL OR v.id=?)
-                   ORDER BY p.queue_since,p.id LIMIT 1""", (profile, now, version_id, version_id),
+                   ORDER BY p.queue_since,p.id LIMIT 1""", (profile, bool(request), now, version_id, version_id),
             )
             if not row:
                 return None
@@ -173,7 +196,7 @@ class CodeReviewStore:
             )
             remaining = version_cap - attempts["used"]
             daily = daily_cap - await self.cr_day_spend(day)
-            if attempts["n"] >= max_attempts or remaining <= 0.001:
+            if (not request and attempts["n"] >= max_attempts) or remaining <= 0.001:
                 state = "review_limit" if remaining <= 0.001 else "error"
                 await self.db.execute("UPDATE code_review_versions SET status=?,updated_at=? WHERE id=?", (state, now, row["id"]))
                 await self.db.execute("UPDATE code_review_prs SET review_state=? WHERE id=?", (state, row["pr_id"]))
@@ -191,7 +214,13 @@ class CodeReviewStore:
             )
             await self.db.execute("UPDATE code_review_versions SET status='running',updated_at=? WHERE id=?", (now, row["id"]))
             await self.db.execute("UPDATE code_review_prs SET review_state='running',queue_since=? WHERE id=?", (now, row["pr_id"]))
-            return {**row, "run_id": run_id, "budget": amount, "attempt": attempts["n"] + 1}
+            if request:
+                await self.db.execute(
+                    "UPDATE code_review_requests SET state='claimed',run_id=?,updated_at=? WHERE id=?",
+                    (run_id, now, request_id),
+                )
+            return {**row, "run_id": run_id, "budget": amount, "attempt": attempts["n"] + 1,
+                    "actor_id": request["actor_id"] if request else None}
 
     async def cr_settle(self, run_id, spent, day, status, artifact_path, error="", severity="none", retry_at="", serious_keys=(), uncertain=0):
         now = utc_now_iso()
@@ -199,6 +228,14 @@ class CodeReviewStore:
             attempt = await self.cr_one("SELECT * FROM code_review_attempts WHERE run_id=?", (run_id,))
             if not attempt or attempt["settled"]:
                 return False
+            manual = await self.cr_one("SELECT * FROM code_review_requests WHERE run_id=?", (run_id,))
+            if manual:
+                if status in ('retry', 'waiting_budget'):
+                    status, retry_at = "error", ""
+                await self.db.execute(
+                    "UPDATE code_review_requests SET state='finished',updated_at=? WHERE run_id=? AND state='claimed'",
+                    (now, run_id),
+                )
             await self.db.execute(
                 "UPDATE code_review_attempts SET settled=1,spent=MAX(spent,?),uncertain=?,end_day=?,artifact_path=? WHERE run_id=?",
                 (spent, uncertain, day, artifact_path, run_id),

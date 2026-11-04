@@ -47,7 +47,7 @@ async def db(tmp_path):
 
 @pytest.fixture
 def service(db, tmp_path):
-    profile = ReviewProfile("example", "alice/example", "team-review-requested:alice/team", enabled=True)
+    profile = ReviewProfile("example", "alice/example", "team-review-requested:alice/team", enabled=True, review_mode="automatic")
     config = NerveConfig(workspace=tmp_path, code_review=CodeReviewConfig(profiles=[profile]))
     github = SimpleNamespace(pr=AsyncMock(return_value=pr()), snapshot=AsyncMock(return_value=snapshot()),
                              search=AsyncMock(return_value=[1]), sources=AsyncMock(return_value=[]))
@@ -101,7 +101,7 @@ async def test_draft_close_reopen_and_search_removal(service, db):
     await service.poll("example")
     paused = await db.cr_one("SELECT * FROM code_review_prs")
     assert paused["review_state"] == "paused"
-    assert not await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    assert not await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     service.github.pr.return_value = pr(state="closed", merged=True)
     await service.poll("example")
     assert (await db.get_task(row["task_id"]))["status"] == "done"
@@ -130,8 +130,8 @@ async def test_atomic_reservation_concurrency_and_restart(db, tmp_path):
     other = Database(tmp_path / "state.db")
     await other.connect()
     try:
-        claims = await asyncio.gather(db.cr_reserve("example", "2026-01-01", 5, 30, 3),
-                                      other.cr_reserve("example", "2026-01-01", 5, 30, 3))
+        claims = await asyncio.gather(db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic"),
+                                      other.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic"))
         assert sum(c is not None for c in claims) == 1
         assert await other.cr_day_spend("2026-01-02") == 5  # unsettled across midnight
     finally:
@@ -141,14 +141,14 @@ async def test_atomic_reservation_concurrency_and_restart(db, tmp_path):
 async def test_version_budget_retries_and_midnight(db):
     data = pr()
     await db.cr_observe("example", data, snapshot(data))
-    first = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    first = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     await db.cr_settle(first["run_id"], 3, "2026-01-02", "retry", "")
     assert await db.cr_day_spend("2026-01-01") == 3
     assert await db.cr_day_spend("2026-01-02") == 3
-    second = await db.cr_reserve("example", "2026-01-02", 5, 30, 3)
+    second = await db.cr_reserve("example", "2026-01-02", 5, 30, 3, review_mode="automatic")
     assert second["budget"] == 2
     await db.cr_settle(second["run_id"], 2.1, "2026-01-02", "retry", "")
-    assert not await db.cr_reserve("example", "2026-01-03", 5, 30, 3)
+    assert not await db.cr_reserve("example", "2026-01-03", 5, 30, 3, review_mode="automatic")
     assert (await db.cr_one("SELECT * FROM code_review_versions"))["status"] == "review_limit"
     assert not await db.cr_settle(first["run_id"], 0, "2026-01-02", "complete", "")
 
@@ -157,17 +157,17 @@ async def test_daily_budget_shared_across_profiles(db):
     await db.cr_profiles(["another"])
     await db.cr_observe("example", pr(), snapshot())
     await db.cr_observe("another", pr(), snapshot())
-    first = await db.cr_reserve("example", "2026-01-01", 5, 5, 3)
+    first = await db.cr_reserve("example", "2026-01-01", 5, 5, 3, review_mode="automatic")
     assert first["budget"] == 5
-    assert not await db.cr_reserve("another", "2026-01-01", 5, 5, 3)
+    assert not await db.cr_reserve("another", "2026-01-01", 5, 5, 3, review_mode="automatic")
     await db.cr_settle(first["run_id"], 5.5, "2026-01-01", "complete", "")
-    assert not await db.cr_reserve("another", "2026-01-01", 5, 5, 3)
+    assert not await db.cr_reserve("another", "2026-01-01", 5, 5, 3, review_mode="automatic")
     assert await db.cr_day_spend("2026-01-01") == 5.5
 
 
 async def test_result_for_old_sha_never_becomes_current(db):
     old = await db.cr_observe("example", pr(), snapshot())
-    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     new = pr(head={"sha": "d" * 40})
     await db.cr_observe("example", new, snapshot(new))
     await db.cr_settle(claim["run_id"], 1, "2026-01-01", "complete", "old-result.json", severity="high")
@@ -204,7 +204,7 @@ async def test_artifact_validation_and_immutability(tmp_path):
 
 async def test_recovery_partial_and_missing_outbox_run(service, db):
     await service.observe(service.profile("example"), 1)
-    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     directory = service.root / claim["pr_id"] / claim["id"] / "attempts" / claim["run_id"] / "work"
     directory.mkdir(parents=True)
     (directory / "description.md").write_text("Saved partial")
@@ -218,7 +218,7 @@ async def test_recovery_partial_and_missing_outbox_run(service, db):
 
 async def test_complete_run_then_draft_is_not_admitted(service, db):
     await service.observe(service.profile("example"), 1)
-    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     directory = service.root / claim["pr_id"] / claim["id"] / "attempts" / claim["run_id"] / "work"
     directory.mkdir(parents=True)
     for name, content in complete_output().items():
@@ -247,7 +247,7 @@ async def test_config_rejects_unmeterable_budget():
 
 async def test_reopen_completed_same_input_restores_current(db):
     row = await db.cr_observe("example", pr(), snapshot())
-    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     await db.cr_settle(claim["run_id"], 1, "2026-01-01", "complete", "result.json")
     await db.cr_observe("example", pr(state="closed"))
     reopened = await db.cr_observe("example", pr(), snapshot())
@@ -257,11 +257,11 @@ async def test_reopen_completed_same_input_restores_current(db):
 
 async def test_stale_draft_result_ready_requeues_same_budget(db):
     await db.cr_observe("example", pr(), snapshot())
-    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     await db.cr_observe("example", pr(draft=True))
     await db.cr_settle(claim["run_id"], 2, "2026-01-01", "stale", "result.json")
     await db.cr_observe("example", pr(), snapshot())
-    new = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    new = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     assert new["id"] == claim["id"] and new["budget"] == 3
 
 
@@ -306,7 +306,7 @@ async def test_ci_recovery_and_repeated_failure_context_do_not_reaudit(db):
 
 async def test_finished_audit_retries_admission_without_new_workflow(service, db):
     await service.observe(service.profile("example"), 1)
-    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     directory = service.root / claim["pr_id"] / claim["id"] / "attempts" / claim["run_id"] / "work"
     directory.mkdir(parents=True)
     for name, content in complete_output().items():
@@ -326,7 +326,7 @@ async def test_finished_audit_retries_admission_without_new_workflow(service, db
 
 async def test_active_review_skips_queue_github_reads(service, db):
     await service.observe(service.profile("example"), 1)
-    await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     service.github.pr.reset_mock()
     await service.dispatch(service.profile("example"))
     service.github.pr.assert_not_called()
@@ -360,14 +360,14 @@ async def test_notification_digest_and_serious_finding_dedup(service, db):
     service.notifications = SimpleNamespace(send_notification=AsyncMock())
     await service.observe(service.profile("example"), 1)
     await service.notify()  # one initial discovery summary
-    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     await db.cr_settle(claim["run_id"], 1, "2026-01-01", "complete", "result.json", severity="high", serious_keys=["problem"])
     await service.notify()
     assert service.notifications.send_notification.call_count == 2
     assert service.notifications.send_notification.call_args.kwargs["priority"] == "high"
     changed = pr(head={"sha": "d" * 40})
     await db.cr_observe("example", changed, snapshot(changed))
-    next_claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    next_claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     await db.cr_settle(next_claim["run_id"], 1, "2026-01-01", "complete", "next.json", severity="high", serious_keys=["problem"])
     await service.notify()
     assert service.notifications.send_notification.call_count == 2  # held for digest
@@ -420,31 +420,31 @@ async def test_snapshot_directories_are_private(service):
 async def test_base_churn_preserves_waiting_pr_fairness(db):
     for number in (1, 2):
         await db.cr_observe("example", pr(number), snapshot(pr(number)))
-    first = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    first = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     assert first["number"] == 1
     await db.cr_settle(first["run_id"], 1, "2026-01-01", "complete", "result.json")
     for number in (1, 2):
         changed = pr(number)
         changed["base"]["sha"] = "d" * 40
         await db.cr_observe("example", changed, snapshot(changed))
-    second = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    second = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     assert second["number"] == 2
 
 
 async def test_pending_workflow_restart_does_not_consume_review_budget(service, db):
     await service.observe(service.profile("example"), 1)
-    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     service.runs.get_run.return_value = {"status": "failed", "error": "interrupted by nerve restart", "started_at": None}
     await service.reconcile()
     assert (await db.cr_one("SELECT * FROM code_review_attempts"))["spent"] == 0
     await db._write("UPDATE code_review_versions SET retry_at=''")
-    next_claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    next_claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     assert next_claim["id"] == claim["id"] and next_claim["budget"] == 5
 
 
 async def test_shutdown_waits_for_inflight_dispatch_guard(service, db):
     await service.observe(service.profile("example"), 1)
-    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     entered = asyncio.Event()
     cancelled = asyncio.Event()
     async def blocked_get(*args):
@@ -465,10 +465,10 @@ async def test_shutdown_waits_for_inflight_dispatch_guard(service, db):
 
 async def test_awaiting_admission_does_not_hold_other_prs(service, db):
     await service.observe(service.profile("example"), 1)
-    first = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    first = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     await db.cr_settle(first["run_id"], 1, "2026-01-01", "awaiting_validation", "result.json", error="403")
     await db.cr_observe("example", pr(2), snapshot(pr(2)))
-    second = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    second = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     assert second["number"] == 2
 
 
@@ -513,7 +513,7 @@ async def test_authenticated_board_pagination_and_history(service, db, monkeypat
 
 async def test_interrupted_started_run_keeps_uncertainty_separate(service, db):
     await service.observe(service.profile("example"), 1)
-    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     service.runs.get_run.return_value = {"status": "failed", "error": "interrupted by nerve restart", "started_at": "2026-01-01T00:00:00Z"}
     service.runs.settled_spend.return_value = 1.5
     await service.reconcile()
@@ -522,19 +522,19 @@ async def test_interrupted_started_run_keeps_uncertainty_separate(service, db):
     assert attempt["uncertain"] == 3.5
     assert await db.cr_day_spend(service.day(service.profile("example"))) == 5
     await db._write("UPDATE code_review_versions SET retry_at=''")
-    assert not await db.cr_reserve("example", service.day(service.profile("example")), 5, 30, 3)
+    assert not await db.cr_reserve("example", service.day(service.profile("example")), 5, 30, 3, review_mode="automatic")
 
 
 async def test_pause_resume_preserves_spend_and_disabled_config(service, db):
     await service.observe(service.profile("example"), 1)
-    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    claim = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     await db.cr_settle(claim["run_id"], 2, "2026-01-01", "retry", "")
     await service.pause("example")
-    assert not await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    assert not await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     service.started = True
     await service.resume("example")
     await asyncio.gather(*list(service._tasks))
-    new = await db.cr_reserve("example", "2026-01-01", 5, 30, 3)
+    new = await db.cr_reserve("example", "2026-01-01", 5, 30, 3, review_mode="automatic")
     assert new["budget"] == 3
     service.profile("example").enabled = False
     with pytest.raises(ValueError, match="reviewed configuration"):

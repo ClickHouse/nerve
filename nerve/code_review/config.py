@@ -18,6 +18,7 @@ class ReviewProfile:
     version_budget_usd: float = 5.0
     daily_budget_usd: float = 30.0
     max_attempts: int = 3
+    review_mode: str = "manual"
 
     def __post_init__(self):
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", self.id):
@@ -28,6 +29,8 @@ class ReviewProfile:
             raise ValueError("code_review query is required")
         if not isinstance(self.enabled, bool):
             raise ValueError("code_review enabled must be a boolean")
+        if self.review_mode not in ("manual", "automatic"):
+            raise ValueError("code_review review_mode must be manual or automatic")
         ZoneInfo(self.timezone)
         from nerve.cron.service import _crontab_to_trigger
         _crontab_to_trigger(self.schedule, timezone=ZoneInfo(self.timezone))

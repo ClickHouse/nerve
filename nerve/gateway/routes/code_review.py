@@ -5,12 +5,43 @@ from pathlib import Path
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from nerve.code_review import get_service
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.identity import Actor
 
 router = APIRouter(dependencies=[Depends(require_auth)])
+
+
+class ReviewRequest(BaseModel):
+    expected_version: str = Field(min_length=1, max_length=100)
+    idempotency_key: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
+
+
+@router.post("/api/code-review/prs/{pr_id}/requests", status_code=202)
+async def request_review(pr_id: str, body: ReviewRequest, actor: Actor = Depends(require_auth)):
+    service = get_service()
+    if not service:
+        raise HTTPException(503, "Исполнитель проверок недоступен")
+    try:
+        result = await service.request_review(pr_id, body.expected_version, body.idempotency_key, actor)
+    except KeyError:
+        raise HTTPException(404, "Review PR not found") from None
+    except ValueError as error:
+        raise HTTPException(409, str(error)) from None
+    if result["state"] in ("cancelled", "rejected"):
+        raise HTTPException(409, result["reason"])
+    return {"request": result}
+
+
+async def with_action(pr):
+    service = get_service()
+    action = await service.review_action(pr) if service else {
+        "enabled": False, "state": "unavailable", "reason": "Исполнитель проверок недоступен",
+    }
+    return {**pr, "review_action": action}
 
 
 @router.get("/api/code-review/status")
@@ -63,7 +94,7 @@ async def board(column: Literal["active", "archive"] = "active", profile: str = 
             f"SELECT * FROM code_review_prs WHERE {clause} ORDER BY content_updated_at DESC,id LIMIT ? OFFSET ?",
             [*args, limit, offset],
         )
-    return {"items": rows, "total": total["total"], "offset": offset}
+    return {"items": [await with_action(row) for row in rows], "total": total["total"], "offset": offset}
 
 
 @router.get("/api/code-review/prs/{pr_id}")
@@ -78,7 +109,7 @@ async def detail(pr_id: str, limit: int = Query(50, ge=1, le=100), offset: int =
         FROM code_review_versions v WHERE pr_id=? ORDER BY created_at DESC,id LIMIT ? OFFSET ?""", (pr_id, limit, offset),
     )
     count = await db.cr_one("SELECT COUNT(*) total FROM code_review_versions WHERE pr_id=?", (pr_id,))
-    return {"pr": pr, "versions": versions, "total": count["total"]}
+    return {"pr": await with_action(pr), "versions": versions, "total": count["total"]}
 
 
 @router.get("/api/code-review/prs/{pr_id}/versions/{version_id}")
