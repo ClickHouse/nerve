@@ -1,6 +1,6 @@
 import { authUrl, hostedSessionActive, isHosted, probeSession } from './hosted';
 import type { ReviewLoop, Task, WorkflowRun } from './client';
-import type { WorkflowSnapshot } from '../types/chat';
+import type { SessionWorkspace, WorkflowSnapshot } from '../types/chat';
 import type { AgentSnapshot, AgentWSMessage, AutoTurnTrigger, InteractionAgentRef } from '../types/agents';
 
 export type WSMessage =
@@ -17,6 +17,7 @@ export type WSMessage =
   | { type: 'error'; session_id: string; error: string; client_msg_id?: string | null }
   | { type: 'session_switched'; session_id: string }
   | { type: 'session_updated'; session_id: string; title: string }
+  | { type: 'session_workspaces'; session_id: string; workspaces: SessionWorkspace[] }
   // `agents` is the roster snapshot, sent on every bind and switch (also when
   // the session is idle); `buffered_events` only while a turn runs.
   | { type: 'session_status'; session_id: string; is_running: boolean; status?: string; buffered_events?: WSMessage[]; agents?: AgentSnapshot }

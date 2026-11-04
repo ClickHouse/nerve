@@ -22,7 +22,7 @@ import { onViewerStorageChange } from './helpers/viewerStorage';
 import { registerSessionsLoader, reloadSessionsSoon } from './helpers/sessionsReload';
 // Handlers
 import { discardStreamDeltas, flushStreamDeltas, handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
-import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate, exitStreaming } from './handlers/sessionHandlers';
+import { handleSessionUpdated, handleSessionWorkspaces, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate, exitStreaming } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleWorkflowProgress } from './handlers/panelHandlers';
 import { handleInteraction, handleInteractionResolved, handlePlanSummary, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired, handleNotificationDismissed } from './handlers/auxiliaryHandlers';
 
@@ -1644,6 +1644,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         return handleError(msg, get, set);
       // Sessions
       case 'session_updated':  return handleSessionUpdated(msg, get, set);
+      case 'session_workspaces': return handleSessionWorkspaces(msg, get, set);
       case 'session_status':   return handleSessionStatus(msg, get, set);
       case 'session_switched': return handleSessionSwitched(msg, get, set);
       case 'session_forked':   return handleSessionForked(msg, get, set);

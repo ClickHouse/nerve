@@ -405,6 +405,20 @@ describe('agent events in the dispatcher', () => {
     expect(useChatStore.getState().sessions.find(x => x.id === SID)!.background_count).toBeUndefined();
   });
 
+  it('applies session_workspaces to any listed session (a global event)', () => {
+    useChatStore.setState({ searchResults: [row('s-other')], archivedSessions: [row('s-arch')], systemSessions: null });
+    const workspaces = [{ path: '/r/proj-wt-topic', branch: 'topic', current_branch: 'topic', exists: true }];
+
+    dispatch({ type: 'session_workspaces', session_id: 's-other', workspaces });
+    dispatch({ type: 'session_workspaces', session_id: 's-arch', workspaces });
+
+    expect(useChatStore.getState().sessions.find(x => x.id === 's-other')!.workspaces).toEqual(workspaces);
+    expect(useChatStore.getState().searchResults![0].workspaces).toEqual(workspaces);
+    expect(useChatStore.getState().archivedSessions![0].workspaces).toEqual(workspaces);
+    expect(useChatStore.getState().systemSessions).toBeNull();
+    expect(useChatStore.getState().sessions.find(x => x.id === SID)!.workspaces).toBeUndefined();
+  });
+
   it('ignores the superseded subagent and background-task events', () => {
     dispatch({ type: 'subagent_start', session_id: SID, tool_use_id: 'toolu_a', subagent_type: 'Explore', description: 'x' });
     dispatch({ type: 'subagent_complete', session_id: SID, tool_use_id: 'toolu_a', duration_ms: 1 });

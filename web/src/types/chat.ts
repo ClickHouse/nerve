@@ -203,6 +203,8 @@ export interface Session {
   };
   /** What waits for the user in this session (GET /api/sessions). */
   attention?: SessionAttention;
+  // Git checkouts the session wrote to, most recent first.
+  workspaces?: SessionWorkspace[];
 }
 
 /** The pending items of a session that need the user. The two booleans
@@ -219,6 +221,13 @@ export interface SessionAttention {
   awaiting_input: boolean;
   /** The newest review loop waits for a decision. */
   review: boolean;
+}
+
+export interface SessionWorkspace {
+  path: string;
+  branch: string | null;
+  current_branch: string | null;
+  exists: boolean;
 }
 
 export type AgentStatus =
