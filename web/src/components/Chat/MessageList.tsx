@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback, memo } from 'react';
+import { useEffect, useLayoutEffect, useRef, useCallback, useState, memo } from 'react';
 import { Link } from 'react-router-dom';
 import type { ChatMessage } from '../../types/chat';
 import { useVisibleActorIds } from '../../stores/actorStore';
@@ -14,6 +14,7 @@ import { SelectionToolbar } from './SelectionToolbar';
 import { MessageActions } from './MessageActions';
 import { GitBranch } from '../ui/icons';
 import { followScrollEnd } from '../../utils/followScrollEnd';
+import { recentMessageStart } from '../../utils/recentMessageWindow';
 
 function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }: {
   messages: ChatMessage[];
@@ -32,6 +33,16 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
   // The count only: the blocks change for each streamed token, and
   // StreamingMessage subscribes to them itself.
   const streamingBlockCount = useChatStore(s => s.streamingBlocks.length);
+  const activeSession = useChatStore(s => s.activeSession);
+
+  // A turn can contain thousands of blocks. Mount only a bounded tail on
+  // first load; earlier messages are already fetched, just not yet rendered.
+  const [revealed, setRevealed] = useState<{ session: string; start: number } | null>(null);
+  const initialStart = recentMessageStart(messages);
+  const visibleStart = revealed?.session === activeSession
+    ? Math.min(revealed.start, initialStart) : initialStart;
+  const visibleMessages = messages.slice(visibleStart);
+  const prependAnchor = useRef<{ height: number; top: number } | null>(null);
 
   // A message-anchored fork resolves to a backend-native turn; sessions
   // predating turn recording can only be forked whole (header action).
@@ -58,6 +69,26 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
   // Stops the follow of the end that starts after the first load, while it runs.
   const stopFollow = useRef<(() => void) | null>(null);
   useEffect(() => () => stopFollow.current?.(), []);
+
+  const showEarlier = useCallback(() => {
+    const nextStart = recentMessageStart(messages, visibleStart);
+    if (nextStart === visibleStart) return;
+    stopFollow.current?.();
+    const el = containerRef.current;
+    if (el) prependAnchor.current = { height: el.scrollHeight, top: el.scrollTop };
+    setRevealed({ session: activeSession, start: nextStart });
+  }, [messages, visibleStart, activeSession]);
+
+  // Prepending older rows must leave the previously visible message in place,
+  // rather than jumping the reader up by the height of the inserted rows.
+  useLayoutEffect(() => {
+    const anchor = prependAnchor.current;
+    prependAnchor.current = null;
+    const el = containerRef.current;
+    if (anchor && el) {
+      el.scrollTop = anchor.top + (el.scrollHeight - anchor.height);
+    }
+  }, [visibleStart]);
 
   useEffect(() => {
     // While the end is followed after the first load, the follow scrolls.
@@ -107,7 +138,19 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
         )
       )}
 
-      {messages.map((msg, i) => {
+      {visibleStart > 0 && (
+        <div className="flex justify-center py-3">
+          <button
+            type="button"
+            onClick={showEarlier}
+            className="rounded-md border border-border px-3 py-1.5 text-sm text-text-secondary hover:bg-surface-hover"
+          >
+            Show earlier messages ({visibleStart} loaded)
+          </button>
+        </div>
+      )}
+
+      {visibleMessages.map((msg, i) => {
         // "Fork from here" needs a persisted row id (live-streamed messages
         // gain one on the next reload) and at least one native turn mapping
         // in the transcript to anchor the branch to.
@@ -121,7 +164,7 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
         );
         const forks = msg.id != null ? messageForks?.get(String(msg.id)) : undefined;
         return (
-          <div key={msg.id ?? i} className="chat-row">
+          <div key={msg.id ?? i + visibleStart} className="chat-row">
             {msg.role === 'user'
               ? <UserMessage
                   message={msg}
