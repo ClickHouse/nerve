@@ -42,7 +42,7 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
   const visibleStart = revealed?.session === activeSession
     ? Math.min(revealed.start, initialStart) : initialStart;
   const visibleMessages = messages.slice(visibleStart);
-  const prependAnchor = useRef<{ height: number; top: number } | null>(null);
+  const prependAnchor = useRef<{ node: HTMLElement; top: number } | null>(null);
 
   // A message-anchored fork resolves to a backend-native turn; sessions
   // predating turn recording can only be forked whole (header action).
@@ -74,8 +74,10 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
     const nextStart = recentMessageStart(messages, visibleStart);
     if (nextStart === visibleStart) return;
     stopFollow.current?.();
-    const el = containerRef.current;
-    if (el) prependAnchor.current = { height: el.scrollHeight, top: el.scrollTop };
+    const firstRow = containerRef.current?.querySelector<HTMLElement>('.chat-row');
+    if (firstRow) {
+      prependAnchor.current = { node: firstRow, top: firstRow.getBoundingClientRect().top };
+    }
     setRevealed({ session: activeSession, start: nextStart });
   }, [messages, visibleStart, activeSession]);
 
@@ -86,7 +88,9 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
     prependAnchor.current = null;
     const el = containerRef.current;
     if (anchor && el) {
-      el.scrollTop = anchor.top + (el.scrollHeight - anchor.height);
+      // Measure the same existing row before/after. This also avoids double
+      // adjustment when the browser performs native scroll anchoring.
+      el.scrollTop += anchor.node.getBoundingClientRect().top - anchor.top;
     }
   }, [visibleStart]);
 
