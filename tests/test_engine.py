@@ -1713,6 +1713,64 @@ async def test_sidechain_only_user_turn_still_crash_retries(tmp_path, db):
     assert [r["content"] for r in rows if r["role"] == "assistant"] == ["recovered"]
 
 
+@pytest.mark.asyncio
+async def test_successful_writes_record_session_workspaces(tmp_path, db):
+    from claude_agent_sdk import ToolResultBlock, ToolUseBlock
+
+    from nerve.agent.streaming import broadcaster
+
+    def _checkout(name: str, branch: str) -> Path:
+        (tmp_path / name / ".git").mkdir(parents=True)
+        (tmp_path / name / ".git" / "HEAD").write_text(f"ref: refs/heads/{branch}\n")
+        return (tmp_path / name).resolve()
+
+    edited, committed, failed = _checkout("a", "main"), _checkout("b", "topic"), _checkout("c", "x")
+    entered, nerve_ws = _checkout("e", "worktree-e"), _checkout("ws", "main")
+    calls = [
+        ("t1", "Edit", {"file_path": str(edited / "f.py")}, "ok", False),
+        ("t2", "Bash", {"command": f"git -C {committed} commit -m x"}, "ok", False),
+        ("t3", "Edit", {"file_path": str(failed / "f.py")}, "ok", True),
+        ("t4", "Read", {"file_path": str(failed / "f.py")}, "ok", False),
+        ("t5", "Write", {"file_path": str(nerve_ws / "MEMORY.md")}, "ok", False),
+        ("t6", "EnterWorktree", {"name": "e"}, f"Created worktree at: {entered} on branch worktree-e.", False),
+    ]
+    script = [
+        msg
+        for tid, name, tool_input, result, is_error in calls
+        for msg in (
+            AssistantMessage(content=[ToolUseBlock(id=tid, name=name, input=tool_input)], model="claude-test"),
+            UserMessage(content=[ToolResultBlock(tool_use_id=tid, content=result, is_error=is_error)]),
+        )
+    ] + [
+        AssistantMessage(content=[TextBlock(text="Done.")], model="claude-test"),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="native-0", total_cost_usd=0.01,
+            usage={"input_tokens": 1},
+        ),
+    ]
+    engine, _ = _sdk_script_engine(tmp_path, db, [(script, False)])
+    events: list[dict] = []
+
+    async def _collect(_channel, message):
+        if message.get("type") == "session_workspaces":
+            events.append(message)
+
+    await broadcaster.register("__global__", "workspaces-test", _collect)
+    try:
+        await engine.run("s-ws", "go", source="web", channel="web", actor=None)
+    finally:
+        await broadcaster.unregister("__global__", "workspaces-test")
+
+    rows = (await db.list_session_workspaces(["s-ws"]))["s-ws"]
+    assert {(r["toplevel"], r["branch"]) for r in rows} == {
+        (str(edited), "main"), (str(committed), "topic"), (str(entered), "worktree-e"),
+    }
+    assert [[w["path"] for w in e["workspaces"]] for e in events] == [
+        [str(edited)], [str(committed), str(edited)], [str(entered), str(committed), str(edited)],
+    ]
+
+
 def _thinking_script(first: list) -> list:
     """Thinking, then ``first`` (the turn's first text or tool call), then
     more thinking and a closing text."""

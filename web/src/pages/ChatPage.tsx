@@ -17,6 +17,7 @@ import { StopAllDialog } from '../components/Chat/agents/StopAllDialog';
 import { StopEscalationBanner } from '../components/Chat/agents/StopEscalationBanner';
 import { ReviewLoopCard } from '../components/Chat/ReviewLoopCard';
 import { SessionCreator } from '../components/Chat/ActorLabel';
+import { WorkspaceChip } from '../components/Chat/WorkspaceChip';
 import { Loader2, Files, ExternalLink, GitBranch } from '../components/ui/icons';
 import { Button, PaneToggle } from '../components/ui';
 import { api } from '../api/client';
@@ -455,6 +456,9 @@ export function ChatPage() {
                   <GitBranch size={14} />
                   <span className="hidden lg:inline">Fork</span>
                 </Button>
+              )}
+              {activeSessionRow?.workspaces && activeSessionRow.workspaces.length > 0 && (
+                <WorkspaceChip key={activeSessionRow.id} workspaces={activeSessionRow.workspaces} />
               )}
               {/* House convention for a tinted action: the identity hue rides
                   the icon and the label stays neutral, so nothing competes

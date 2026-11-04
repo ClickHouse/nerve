@@ -134,3 +134,14 @@ class TestSidebarListRoutes:
                 break
             offset = page["next_offset"]
         assert len(seen) == len(set(seen)) == total
+
+    async def test_rows_carry_workspaces_without_the_nerve_workspace(self, setup, tmp_path):
+        setup.cfg.workspace = tmp_path / "ws"
+        await self._seed(setup.sm, setup.db, chats=1)
+        await setup.db.touch_session_workspace("chat-000", str(tmp_path / "ws"), "main")
+        await setup.db.touch_session_workspace("chat-000", "/r/gone", "topic")
+
+        (row,) = setup.client.get("/api/sessions").json()["sessions"]
+        assert row["workspaces"] == [
+            {"path": "/r/gone", "branch": "topic", "current_branch": None, "exists": False},
+        ]
