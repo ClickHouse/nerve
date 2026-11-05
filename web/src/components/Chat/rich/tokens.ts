@@ -35,7 +35,7 @@ const FALLBACK: Record<ResolvedTheme, ThemeTokens> = {
     textMuted: '#a3a9b3',
     textFaint: '#6b7280',
     accent: '#f6d53f',
-    palette: ['#437eef', '#ff9457', '#66ff73', '#33e4ff', '#faff69', '#cc66ff', '#6df8e1', '#ff7575', '#dd99ff', '#6d9bf3'],
+    palette: ['#437eef', '#ff9457', '#33e4ff', '#66ff73', '#cc66ff', '#faff69', '#dd99ff', '#6df8e1', '#ff7575', '#6d9bf3'],
     fontFamily: FONT_FAMILY,
   },
   light: {
@@ -48,7 +48,7 @@ const FALLBACK: Record<ResolvedTheme, ThemeTokens> = {
     textMuted: '#5b6472',
     textFaint: '#9aa1ad',
     accent: '#b58900',
-    palette: ['#104ec6', '#a33c00', '#007109', '#006170', '#8a6900', '#660099', '#067462', '#c10000', '#8800cc', '#1d64ec'],
+    palette: ['#104ec6', '#a33c00', '#006170', '#007109', '#660099', '#8a6900', '#8800cc', '#067462', '#c10000', '#1d64ec'],
     fontFamily: FONT_FAMILY,
   },
 };
@@ -66,14 +66,17 @@ const TOKEN_VARS: Record<Exclude<keyof ThemeTokens, 'theme' | 'palette' | 'fontF
 
 /** Hue tokens in the order series take them: alternating hue families, high contrast between neighbours. */
 const PALETTE_VARS = [
-  // Farthest-point order by CIEDE2000 over the app's real values in both
-  // themes (blue first: the single-series colour; orange second: the warm
-  // pole of diverging ramps): every pair among the first six is ΔE ≥ 20,
-  // neighbours ≥ 34. The near-twins — sky of blue, violet of purple, red of
-  // orange — come last. The fallbacks below ARE those values, so the test
-  // measures the real palette; mermaid.ts's HUE map indexes this order.
-  '--theme-hue-blue', '--theme-hue-orange', '--theme-hue-emerald', '--theme-hue-cyan', '--theme-hue-yellow',
-  '--theme-hue-purple', '--theme-hue-teal', '--theme-hue-red', '--theme-hue-violet', '--theme-hue-sky',
+  // Ordered over the app's real values in both themes: blue first (the
+  // single-series colour), orange second (the warm pole of diverging ramps),
+  // then so that every pair among the first six is CIEDE2000 ≥ 20 and
+  // neighbours ≥ 34 — and, since ΔE sees normal vision only, so that
+  // neighbours also stay apart under deuteranopia and protanopia (orange
+  // next to emerald does not, in light mode). The near-twins — sky of blue,
+  // violet of purple, red of orange — come last. The fallbacks below ARE
+  // those values, so the test measures the real palette; mermaid.ts's HUE
+  // map indexes this order.
+  '--theme-hue-blue', '--theme-hue-orange', '--theme-hue-cyan', '--theme-hue-emerald', '--theme-hue-purple',
+  '--theme-hue-yellow', '--theme-hue-violet', '--theme-hue-teal', '--theme-hue-red', '--theme-hue-sky',
 ];
 
 let context2d: CanvasRenderingContext2D | null | undefined;
