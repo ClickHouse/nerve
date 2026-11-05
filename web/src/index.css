@@ -578,6 +578,139 @@ body {
   font-family: var(--typography-font-families-mono, "Inconsolata", ui-monospace, "SFMono-Regular", Consolas, monospace);
 }
 
+/* Rendered code blocks — mermaid diagrams, Vega charts, inline SVG (Chat/rich).
+   A rendered block is a figure, not a code block: a quiet frame on the
+   surface colour, no header. Its tools sit in the top-right corner and show
+   on hover or keyboard focus (`:focus-visible`, not `:focus-within`: a
+   button keeps focus after a mouse click, which would pin the tools over the
+   picture). Where there is no hover, and above a picture too short to share
+   its corner, they are always shown on a row of their own, so they never
+   cover it. The source view keeps the code-block look (the header + `pre`
+   below). */
+.rich-figure {
+  position: relative;
+  margin: 0;
+  padding: 16px;
+  background: var(--theme-surface);
+  border: 1px solid var(--theme-border-subtle);
+  border-radius: 8px;
+}
+/* Nothing to show yet, the source showing, or a failure: the canvas keeps
+   its width (side padding and border stay) because a container-sized chart
+   measures it while it renders, but the figure takes no room and paints
+   nothing. */
+.rich-figure[data-collapsed] {
+  height: 0;
+  padding-top: 0;
+  padding-bottom: 0;
+  border-top-width: 0;
+  border-bottom-width: 0;
+  overflow: hidden;
+  visibility: hidden;
+}
+/* A picture shown at 1:1 that is wider than the column scrolls sideways.
+   `contain: layout paint` makes the canvas the containing block of any
+   positioned descendant and clips to it: a picture written by the model
+   cannot lay a `position: fixed` surface over the page, whatever its CSS. */
+.rich-figure-canvas {
+  position: relative;
+  overflow-x: auto;
+  overflow-y: hidden;
+  contain: layout paint;
+}
+/* One stage per render attempt; the next renders out of sight at full width.
+   Each stage contains its picture the same way. */
+.rich-stage { contain: layout paint; }
+.rich-stage[data-pending] { height: 0; overflow: hidden; visibility: hidden; }
+.rich-stage > svg { display: block; margin: 0 auto; }
+.rich-figure-canvas .vega-embed { display: block; }
+.rich-figure-canvas .vega-embed > svg { display: block; margin: 0 auto; }
+
+.rich-figure-toolbar {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--theme-border-subtle);
+  border-radius: 8px;
+  background: color-mix(in oklab, var(--theme-surface-raised) 94%, transparent);
+  box-shadow: 0 1px 3px rgb(0 0 0 / 0.16);
+  opacity: 0;
+  transition: opacity 0.12s ease-out;
+}
+.rich-figure:hover > .rich-figure-toolbar,
+.rich-figure:has(:focus-visible) > .rich-figure-toolbar { opacity: 1; }
+/* A picture shorter than about two toolbars (RichCodeBlock sets the flag):
+   as much room below it as above, and above enough for the toolbar in its
+   corner (8px in, 34px tall, a 4px gap), so the picture sits in the middle
+   of its frame at rest and nothing covers it when the toolbar shows. */
+.rich-figure[data-short] { padding-top: 46px; padding-bottom: 46px; }
+/* A complete block whose picture is on its way: the frame, holding a place —
+   the height the picture had when it was drawn before (`--rich-hint`, the
+   canvas alone) plus the frame around it: 34px of padding and border, 94px
+   for a short picture. */
+.rich-figure[data-placeholder] { min-height: 120px; }
+.rich-figure[data-placeholder][data-hint] { min-height: calc(var(--rich-hint) + 34px); }
+.rich-figure[data-placeholder][data-hint][data-short] { min-height: calc(var(--rich-hint) + 94px); }
+.rich-figure-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--theme-text-faint);
+  font-size: 0.75rem;
+  line-height: 1rem;
+  pointer-events: none;
+}
+.rich-figure-notice {
+  position: absolute;
+  top: 46px;
+  right: 8px;
+  z-index: 1;
+  max-width: calc(100% - 16px);
+  padding: 4px 8px;
+  border: 1px solid var(--theme-warning-border);
+  border-radius: 6px;
+  background: var(--theme-warning-bg);
+  color: var(--theme-warning);
+  font-size: 0.75rem;
+  line-height: 1rem;
+}
+@media (hover: none) {
+  .rich-figure:not([data-collapsed]) { padding-top: 8px; padding-bottom: 16px; }
+  .rich-figure-toolbar { position: static; width: fit-content; margin: 0 -8px 8px auto; opacity: 1; }
+  .rich-figure-notice { position: static; width: fit-content; margin: 0 0 8px auto; }
+  .rich-figure[data-placeholder][data-hint],
+  .rich-figure[data-placeholder][data-hint][data-short] { min-height: calc(var(--rich-hint) + 68px); }
+}
+.rich-figure-toolbar button:focus-visible,
+.rich-source-bar button:focus-visible,
+.rich-lightbox button:focus-visible,
+.rich-lightbox-viewport:focus-visible {
+  outline: 2px solid color-mix(in oklab, var(--theme-accent) 70%, transparent);
+  outline-offset: -2px;
+}
+
+/* The full-size view (Lightbox.tsx): a viewport the picture pans and zooms
+   in, on the figure's surface colour. */
+.rich-lightbox-viewport {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--theme-surface);
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+.rich-lightbox-viewport[data-dragging] { cursor: grabbing; }
+.rich-lightbox-content { position: absolute; transform-origin: 0 0; }
+
 /* Code blocks */
 .markdown-content pre {
   background: var(--theme-code-bg);

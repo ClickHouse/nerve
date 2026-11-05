@@ -39,6 +39,9 @@ export {
   XCircle, Zap
 } from 'lucide-react';
 
+// The rendered code blocks' figure toolbar and full-size view (Chat/rich).
+export { CodeXml, ZoomIn, ZoomOut } from 'lucide-react';
+
 /**
  * A star with its interior filled, for a session that is starred.
  *

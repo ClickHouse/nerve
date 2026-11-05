@@ -1,8 +1,25 @@
 import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { InlineMarkdown, MarkdownContent } from './MarkdownContent';
+
+// The real diagram renderer measures text in a browser and is a few
+// megabytes; the routing under test only needs to see which block got which
+// source.
+const { mountMermaid } = vi.hoisted(() => ({
+  mountMermaid: vi.fn<(stage: HTMLElement, source: string, context: { theme: string; width: number }) => Promise<{ cleanup: () => void }>>(),
+}));
+vi.mock('./rich/mermaid', () => ({ mountMermaid }));
+
+beforeEach(() => {
+  mountMermaid.mockReset();
+  mountMermaid.mockImplementation(async (stage, source) => {
+    stage.innerHTML = `<svg><text>${source}</text></svg>`;
+    return { cleanup: () => { stage.innerHTML = ''; } };
+  });
+});
 
 const NOTE = '- Plan proposed: [plan-1](/plans/plan-1) (v1)\n- See [the docs](https://example.com/docs)';
 
@@ -58,5 +75,68 @@ describe('InlineMarkdown', () => {
     render(<InlineMarkdown content="See [the docs](https://example.com/docs)" links={false} />);
     expect(screen.queryByRole('link')).toBeNull();
     expect(screen.getByText(/the docs/)).toBeInTheDocument();
+  });
+});
+
+const fence = (lang: string, body: string) => `Intro\n\n\`\`\`${lang}\n${body}\n\`\`\`\n\nOutro`;
+
+describe('MarkdownContent rendered code blocks', () => {
+  it('renders a mermaid fence as a diagram with its source one click away', async () => {
+    render(<MarkdownContent content={fence('mermaid', 'graph TD\n  A-->B')} />);
+    const figure = await screen.findByRole('img', { name: 'Rendered mermaid' });
+    expect(figure.querySelector('svg')).not.toBeNull();
+    expect(mountMermaid).toHaveBeenCalledTimes(1);
+    // The fence's text, without the newline markdown ends a code block with.
+    expect(mountMermaid.mock.calls[0][1]).toBe('graph TD\n  A-->B');
+    expect(document.querySelector('pre')).toBeNull();
+    expect(screen.getByText('Intro')).toBeInTheDocument();
+    expect(screen.getByText('Outro')).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Source' }));
+    expect(figure.hidden).toBe(true);
+    expect(document.querySelector('pre code')?.textContent).toBe('graph TD\n  A-->B');
+
+    await userEvent.click(screen.getByRole('button', { name: 'Rendered' }));
+    expect(figure.hidden).toBe(false);
+    expect(document.querySelector('pre')).toBeNull();
+  });
+
+  it('keeps an ordinary fence as a code block', () => {
+    render(<MarkdownContent content={fence('python', 'print(1)')} />);
+    expect(screen.getByText('python')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Copy' })).toBeInTheDocument();
+    expect(document.querySelector('pre code')?.textContent).toContain('print(1)');
+    expect(screen.queryByRole('button', { name: 'Source' })).toBeNull();
+    expect(mountMermaid).not.toHaveBeenCalled();
+  });
+
+  it('leaves inline code alone', () => {
+    render(<MarkdownContent content="Run `npm test` now" />);
+    expect(screen.getByText('npm test').tagName).toBe('CODE');
+    expect(document.querySelector('pre')).toBeNull();
+    expect(screen.queryByRole('button')).toBeNull();
+  });
+
+  it('draws an svg fence after sanitizing it', async () => {
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10">'
+      + '<script>alert(1)</script><circle cx="5" cy="5" r="4" onclick="alert(1)"/></svg>';
+    render(<MarkdownContent content={fence('svg', svg)} />);
+    const figure = await screen.findByRole('img', { name: 'Rendered svg' });
+    const circle = figure.querySelector('circle');
+    expect(circle).not.toBeNull();
+    expect(circle?.getAttribute('r')).toBe('4');
+    expect(circle?.getAttribute('onclick')).toBeNull();
+    expect(figure.querySelector('script')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Download SVG' })).toBeInTheDocument();
+  });
+
+  it('shows the source and the reason when a chart points outside itself', async () => {
+    const spec = JSON.stringify({ data: { url: 'https://example.invalid/d.json' }, mark: 'bar' });
+    render(<MarkdownContent content={fence('vega-lite', spec)} />);
+    const note = await screen.findByRole('status');
+    expect(note.textContent).toContain("Couldn't render this vega-lite: spec.data.url points outside the spec");
+    expect(screen.getByText("couldn't render")).toBeInTheDocument();
+    expect(document.querySelector('pre code')?.textContent).toContain('example.invalid');
+    expect(screen.queryByRole('button', { name: 'Source' })).toBeNull();
   });
 });

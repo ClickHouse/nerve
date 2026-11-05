@@ -1,0 +1,227 @@
+import DOMPurify from 'dompurify';
+import type { Mount } from './types';
+
+/**
+ * A CSS value that would make the browser fetch something: `url(` not aimed
+ * at a fragment, `@import`, `image-set(`, `src(`. `fill: url(#gradient)` is
+ * fine and common; `background: url(https://…)` on the root `<svg>` would
+ * load that URL — a URL the model wrote, possibly with data from a tool
+ * result in its query string.
+ */
+const EXTERNAL_CSS = /url\(\s*['"]?\s*(?!#)|@import\b|image-set\(|\bsrc\(/i;
+
+/**
+ * CSS escapes spell any of the above a second way (`\75 rl(` is `url(` to
+ * the browser), and a picture's styling has no honest use for a backslash,
+ * so one is treated as the external reference it may hide.
+ */
+function hasExternalCss(value: string | null | undefined): boolean {
+  return !!value && (value.includes('\\') || EXTERNAL_CSS.test(value));
+}
+
+const CONFIG = {
+  USE_PROFILES: { svg: true, svgFilters: true },
+  // DOMPurify leaves `use` out because its `href` may name another document;
+  // here an `href` may only be a `#fragment` (the hook below), which makes
+  // `use` the ordinary way to repeat a symbol.
+  ADD_TAGS: ['use'],
+  // `image` and `feImage` fetch their `href`; `foreignObject` embeds HTML; a
+  // `<style>` element inside an inline SVG is DOCUMENT-scoped, so its rules
+  // would style the whole page (hide the app, lay a fake dialog over it) —
+  // presentation attributes and the `style` attribute stay for the picture.
+  FORBID_TAGS: ['foreignObject', 'image', 'feImage', 'script', 'iframe', 'object', 'embed', 'style'],
+};
+
+/**
+ * A `style` attribute that would take the picture out of its block: CSS
+ * positioning on the root (`position: fixed; inset: 0; z-index: …`) lays an
+ * attacker-drawn surface over the authenticated page. Positioning has no
+ * honest use inside a picture, so the whole attribute goes.
+ */
+const POSITIONING_CSS = /(?:^|[;\s])(?:position|z-index|inset|top|right|bottom|left|transform|translate)\s*:/i;
+
+/** Attributes that name a resource. In a chat picture they may only point inside it. */
+const URL_ATTRIBUTES = new Set(['href', 'xlink:href', 'src']);
+
+let purifier: ReturnType<typeof DOMPurify> | null = null;
+
+/**
+ * DOMPurify's own URI check only rules out `javascript:` and the like, and it
+ * leaves `style` alone, so the routes to the network get their own hook:
+ * references stay inside the picture (gradients, markers, clip paths, `use`d
+ * symbols — `#fragment`s), and no attribute, `style` or `fill` or `filter`,
+ * carries a `url()` aimed anywhere else. An own instance keeps the hooks off
+ * the shared default one.
+ */
+function getPurifier() {
+  if (purifier) return purifier;
+  const instance = DOMPurify();
+  instance.addHook('uponSanitizeAttribute', (_node, data) => {
+    if (URL_ATTRIBUTES.has(data.attrName) && !data.attrValue.trim().startsWith('#')) {
+      data.keepAttr = false;
+      return;
+    }
+    if (hasExternalCss(data.attrValue)) {
+      data.keepAttr = false;
+      return;
+    }
+    if (data.attrName === 'style' && POSITIONING_CSS.test(data.attrValue)) {
+      data.keepAttr = false;
+    }
+  });
+  instance.addHook('uponSanitizeElement', (node, data) => {
+    if (data.tagName === 'style' && hasExternalCss(node.textContent)) {
+      node.textContent = '';
+    }
+  });
+  purifier = instance;
+  return instance;
+}
+
+const SVG_ROOT = /<svg[\s>]/i;
+
+/**
+ * The source reduced to an inline SVG that draws and does nothing else. Throws
+ * when there is no `<svg>` to begin with, or none left after sanitizing.
+ */
+export function sanitizeSvg(source: string): string {
+  const trimmed = source.trim();
+  if (!SVG_ROOT.test(trimmed)) throw new Error('the block holds no <svg> element');
+  const clean = getPurifier().sanitize(trimmed, CONFIG);
+  if (!SVG_ROOT.test(clean)) throw new Error('nothing drawable is left after sanitizing');
+  return clean;
+}
+
+/** CSS pixels per unit, for the absolute units an SVG size may carry; the font-relative ones at the 16px default. */
+const PX_PER_UNIT: Record<string, number> = {
+  '': 1, px: 1, pt: 4 / 3, pc: 16, in: 96, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 101.6, em: 16, rem: 16, ex: 8, ch: 8,
+};
+
+/** A `width`/`height` attribute in CSS pixels; NaN for a percentage, a viewport unit or nothing. */
+function lengthPx(value: string | null): number {
+  const m = /^\s*([0-9]*\.?[0-9]+(?:e[+-]?\d+)?)\s*([a-z]*)\s*$/i.exec(value ?? '');
+  const scale = m ? PX_PER_UNIT[m[2].toLowerCase()] : undefined;
+  return m && scale !== undefined ? parseFloat(m[1]) * scale : NaN;
+}
+
+/**
+ * The size the browser draws the picture at: its `width` and `height`; one
+ * of them and the viewBox's aspect ratio; else the viewBox itself. A
+ * percentage says nothing about the picture (it sizes against the page) and
+ * counts as absent.
+ */
+export function naturalSizeOf(svg: SVGSVGElement): { width: number; height: number } | undefined {
+  const width = lengthPx(svg.getAttribute('width'));
+  const height = lengthPx(svg.getAttribute('height'));
+  const box = (svg.getAttribute('viewBox') ?? '').trim().split(/[\s,]+/).map(Number);
+  const aspect = box.length === 4 && box[2] > 0 && box[3] > 0 ? box[3] / box[2] : NaN;
+  if (width > 0 && height > 0) return { width, height };
+  if (width > 0 && aspect > 0) return { width, height: width * aspect };
+  if (height > 0 && aspect > 0) return { width: height / aspect, height };
+  if (aspect > 0) return { width: box[2], height: box[3] };
+  return undefined;
+}
+
+/**
+ * The picture as a file of its own, at its natural size in place of a
+ * percentage. XML serialization: it declares the SVG (and xlink) namespaces
+ * a standalone document needs and inline SVG does without, and it writes no
+ * `&nbsp;` or unclosed tag that a file cannot hold.
+ */
+function standalone(svg: SVGSVGElement, size: { width: number; height: number } | undefined): string {
+  const copy = svg.cloneNode(true) as SVGSVGElement;
+  if (size) {
+    copy.setAttribute('width', String(size.width));
+    copy.setAttribute('height', String(size.height));
+  }
+  return new XMLSerializer().serializeToString(copy);
+}
+
+/** The font size an element states for itself, in CSS pixels; NaN when it states none (or a percentage). */
+function statedFontPx(element: Element): number {
+  const fromStyle = /(?:^|;)\s*font-size\s*:\s*([^;!]+)/i.exec(element.getAttribute('style') ?? '')?.[1];
+  return lengthPx(fromStyle ?? element.getAttribute('font-size'));
+}
+
+/** What text a picture without any font size of its own is drawn in, as the frame assumes. */
+const DEFAULT_TEXT_PX = 16;
+
+/**
+ * The smallest text in the picture, in CSS pixels at `size`, its natural
+ * size: each text's font size as the browser computes it when the picture
+ * is laid out (a stylesheet inside it counts then), else the size the text
+ * or its nearest ancestor states, 16px where none does; times the picture's
+ * own scale (a viewBox drawn larger or smaller). Undefined without text.
+ */
+function smallestTextPx(svg: SVGSVGElement, size: { width: number; height: number }): number | undefined {
+  const box = (svg.getAttribute('viewBox') ?? '').trim().split(/[\s,]+/).map(Number);
+  const scale = box.length === 4 && box[2] > 0 ? size.width / box[2] : 1;
+  let smallest = Infinity;
+  for (const text of svg.querySelectorAll('text, tspan, textPath')) {
+    // Only text set in this element's own size: a <text> made of <tspan>s is measured by them.
+    if (![...text.childNodes].some(node => node.nodeType === Node.TEXT_NODE && node.textContent?.trim())) continue;
+    let px = text.getClientRects().length > 0 ? parseFloat(getComputedStyle(text).fontSize) : NaN;
+    for (let element: Element | null = text; !(px > 0) && element; element = element === svg ? null : element.parentElement) {
+      px = statedFontPx(element);
+    }
+    smallest = Math.min(smallest, (px > 0 ? px : DEFAULT_TEXT_PX) * scale);
+  }
+  return Number.isFinite(smallest) ? Math.round(smallest * 10) / 10 : undefined;
+}
+
+/**
+ * Below this viewBox width, a picture that states no width or height of its
+ * own is taken as a unit-less drawing (an icon-like `0 0 24 24`), not as a
+ * 24-pixel picture: it takes the column, as an SVG sized by its container
+ * does anywhere else.
+ */
+const UNITLESS_BELOW = 200;
+
+/**
+ * The longest side a picture is drawn at. A stated size beyond it is scaled
+ * down (keeping the aspect ratio): a 100,000 px canvas is a layout denial,
+ * not a picture, and nothing legible needs more than this.
+ */
+const MAX_DRAWN_PX = 8192;
+
+function clampSize(size: { width: number; height: number }): { width: number; height: number } {
+  const longest = Math.max(size.width, size.height);
+  if (longest <= MAX_DRAWN_PX) return size;
+  const k = MAX_DRAWN_PX / longest;
+  return { width: Math.round(size.width * k), height: Math.round(size.height * k) };
+}
+
+export const mountSvg: Mount = async (stage, source) => {
+  const clean = sanitizeSvg(source);
+  stage.innerHTML = clean;
+  const element = stage.querySelector('svg');
+  // The file is made from the picture as drawn, whatever is done to the
+  // element on screen afterwards.
+  const drawn = element?.cloneNode(true) as SVGSVGElement | undefined;
+  let naturalSize = element ? naturalSizeOf(element) : undefined;
+  if (naturalSize) naturalSize = clampSize(naturalSize);
+  if (element && naturalSize) {
+    const declared = lengthPx(element.getAttribute('width')) > 0 || lengthPx(element.getAttribute('height')) > 0;
+    if (!declared && naturalSize.width < UNITLESS_BELOW) {
+      element.removeAttribute('width');
+      element.removeAttribute('height');
+      element.style.width = '100%';
+      element.style.height = 'auto';
+      naturalSize = undefined;
+    } else {
+      // The picture states its own size (`width="100%"` would stretch it to
+      // the column); the frame fits or scrolls it.
+      element.setAttribute('width', String(naturalSize.width));
+      element.setAttribute('height', String(naturalSize.height));
+    }
+  }
+  return {
+    cleanup: () => {
+      stage.innerHTML = '';
+    },
+    naturalSize,
+    // Only a picture with a natural size has a scale for the frame to weigh it against.
+    minTextPx: element && naturalSize ? smallestTextPx(element, naturalSize) : undefined,
+    toSvg: async () => (drawn ? standalone(drawn, naturalSizeOf(drawn)) : null),
+  };
+};

@@ -1045,6 +1045,33 @@ def _format_skills_list(skill_summaries: list[dict] | None = None) -> str | None
 # first user message (see ``prepend_session_preamble``).
 SESSION_CONTEXT_TAG = "session-context"
 
+# The Session Context's "Rendering" line: what the surface a session is read
+# on draws. The web chat renders these fenced-code languages inline
+# (web/src/components/Chat/rich/kinds.ts keeps the matching list), and shows
+# the sessions the REST API creates (``/api/chat`` runs them as web turns);
+# every other channel shows the source text, so the model is told not to
+# draw there. Keyed on the source only, so the prompt stays static per source.
+RENDERING_SOURCES = frozenset({"web", "api"})
+RICH_RENDERING_NOTE = (
+    "- **Rendering:** this chat renders fenced ```mermaid (diagrams), "
+    "```vega-lite (charts — inline `values` only, no `url` data) and ```svg "
+    "code blocks inline, source one click away. Prefer them to ASCII-art "
+    "diagrams; everything else is GitHub-flavoured markdown. Drawing well: "
+    "`flowchart TB` for chains longer than five nodes (LR only for short "
+    "ones), node labels of a few words, one idea per diagram; charts with a "
+    "`title`, no `width` (they fill the column), and typed fields."
+)
+TEXT_RENDERING_NOTE = (
+    "- **Rendering:** this channel shows text and basic markdown only — no "
+    "diagrams or charts. Do not emit ```mermaid, ```vega-lite or ```svg "
+    "blocks here; give the structure as words or a list."
+)
+
+
+def rendering_note(source: str) -> str:
+    """The "Rendering" line for a session read on ``source``."""
+    return RICH_RENDERING_NOTE if source in RENDERING_SOURCES else TEXT_RENDERING_NOTE
+
 
 def build_system_prompt(
     workspace: Path,
@@ -1059,12 +1086,19 @@ def build_system_prompt(
     memory_backend: str = "memu",
     memory_tools: bool = True,
     config_dir: Path | None = None,
+    rendering_source: str | None = None,
 ) -> str:
     """Build the system prompt for the agent.
 
     Loads identity files from the workspace, adds the session-context
     block, the tool list and the skills summary. A ``platform.md`` in
     ``config_dir`` follows ``TOOLS.md`` (see :func:`_read_platform_notes`).
+
+    ``rendering_source`` is the source the session is *read* on, for the
+    context block's "Rendering" line (:func:`rendering_note`); it defaults
+    to ``source``. The two differ when a turn's origin is not the session's
+    surface — a scheduled wakeup (``source="wakeup"``) of a web session is
+    still read in the web chat.
 
     ``static=True`` (default) renders a prompt that is byte-identical for
     every session of the same workspace, source and tool set: the
@@ -1134,6 +1168,7 @@ def build_system_prompt(
         )
         context = f"""# Session Context
 - **Source:** {source}
+{rendering_note(rendering_source or source)}
 - **Current date:** {today}
 - **Workspace:** {workspace}
 
@@ -1147,6 +1182,7 @@ You have access to the following custom tools:
         context = f"""# Session Context
 - **Session ID:** {session_id}
 - **Source:** {source}
+{rendering_note(rendering_source or source)}
 - **Current date:** {today}
 - **Workspace:** {workspace}
 

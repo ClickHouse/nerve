@@ -21,6 +21,7 @@ from nerve.agent.backends.base import config_excluded_tools
 from nerve.agent.backends.codex.backend import _BACKEND_NOTES, _backend_notes
 from nerve.agent.prompts import (
     _ONBOARDING_STEPS,
+    RICH_RENDERING_NOTE,
     build_system_prompt,
     onboarding_prompt,
     worker_onboarding_prompt,
@@ -54,9 +55,12 @@ def _loom_config() -> NerveConfig:
 
 # main's memU system prompt for a workspace holding only `SOUL.md` ("Be kind.")
 # and one tool offered, frozen before the Loom backend: the date, the
-# workspace path and the tool's description are normalized away.
+# workspace path and the tool's description are normalized away. The
+# "Rendering" line came later (the web chat renders diagram blocks) and is
+# the same for both backends.
 MAIN_STATIC_PROMPT = (
-    "Be kind.\n\n---\n\n# Session Context\n- **Source:** web\n- **Current date:** <date>\n"
+    "Be kind.\n\n---\n\n# Session Context\n- **Source:** web\n"
+    f"{RICH_RENDERING_NOTE}\n- **Current date:** <date>\n"
     "- **Workspace:** <workspace>\n\nPer-session details — this session's id and the memories "
     "recalled at session start — are in the `<session-context>` block at the top of this "
     "conversation's first user message. `mcp__nerve__session_context` returns them live if "
@@ -65,8 +69,9 @@ MAIN_STATIC_PROMPT = (
 )
 MAIN_LEGACY_PROMPT = (
     "Be kind.\n\n---\n\n# Session Context\n- **Session ID:** s1\n- **Source:** web\n"
-    "- **Current date:** <date>\n- **Workspace:** <workspace>\n\nYou have access to the "
-    "following custom tools:\n- <tool>\n\n---\n\n# Recalled Memories\n\n- a fact"
+    f"{RICH_RENDERING_NOTE}\n- **Current date:** <date>\n- **Workspace:** <workspace>\n\n"
+    "You have access to the following custom tools:\n- <tool>\n\n---\n\n"
+    "# Recalled Memories\n\n- a fact"
 )
 
 
