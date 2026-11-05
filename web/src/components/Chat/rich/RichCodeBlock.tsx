@@ -1,4 +1,6 @@
-import { useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode, type Ref } from 'react';
+import {
+  useContext, useEffect, useLayoutEffect, useRef, useState, type CSSProperties, type ReactNode, type Ref,
+} from 'react';
 import { useThemeStore, type ResolvedTheme } from '../../../stores/themeStore';
 import { copyToClipboard } from '../../../utils/clipboard';
 import { IconButton } from '../../ui';
@@ -16,15 +18,11 @@ import { useSettledValue } from './useSettledValue';
 
 // Each renderer, with its library, loads the first time a chat shows a block
 // of its kind; a chat without diagrams pays for none of them.
-const MOUNTS: Record<RichKind, Mount> = {
-  mermaid: (stage, source, context) =>
-    import('./mermaid').then(m => m.mountMermaid(stage, source, context)),
-  'vega-lite': (stage, source, context) =>
-    import('./vega').then(m => m.mountVega('vega-lite')(stage, source, context)),
-  vega: (stage, source, context) =>
-    import('./vega').then(m => m.mountVega('vega')(stage, source, context)),
-  svg: (stage, source, context) =>
-    import('./svg').then(m => m.mountSvg(stage, source, context)),
+const RENDERERS: Record<RichKind, () => Promise<Mount>> = {
+  mermaid: () => import('./mermaid').then(m => m.mountMermaid),
+  'vega-lite': () => import('./vega').then(m => m.mountVega('vega-lite')),
+  vega: () => import('./vega').then(m => m.mountVega('vega')),
+  svg: () => import('./svg').then(m => m.mountSvg),
 };
 
 /** What the figure is, for its accessible name and the full-size view's title. */
@@ -46,21 +44,32 @@ const THEMED_KINDS: ReadonlySet<RichKind> = new Set(['mermaid', 'vega-lite', 've
 const SETTLE_MS = 600;
 
 /**
- * A picture wider than the column is scaled down to fit it only while it
- * stays at least this large: 14px labels stay at 11px or more. Below that it
- * is shown at 1:1 and scrolls instead.
+ * A picture wider than the column is scaled down to fit it only while its
+ * smallest text stays at least this large; below that it is shown at 1:1 and
+ * scrolls instead.
  */
-const MIN_FIT_SCALE = 0.8;
+const MIN_READABLE_TEXT_PX = 11;
+
+/** The smallest text assumed in a picture whose renderer did not say. */
+const DEFAULT_TEXT_PX = 14;
 
 /** A width change reaches the renderer once the column has stopped resizing for this long. */
 const RESIZE_DEBOUNCE_MS = 150;
 
 /**
- * A finished block whose first picture is still on its way holds a quiet
- * placeholder this long before it shows its source instead; on a chat's
- * load the renderers draw one block after another.
+ * A complete block whose first picture has started drawing holds a quiet
+ * placeholder this long before it shows its source instead. The time counts
+ * from the block's own render, not from its wait behind other blocks.
  */
 const PLACEHOLDER_MS = 1500;
+
+/**
+ * A block drawn before (its height is known) holds its placeholder until the
+ * picture or a failure arrives, and shows its source only after this long, in
+ * case its renderer never finishes. Also the longest one render keeps the
+ * blocks behind it waiting (see `inLane`).
+ */
+const STALLED_MS = 10_000;
 
 /**
  * Below this height a picture gets the toolbar on a row of its own above it:
@@ -68,12 +77,6 @@ const PLACEHOLDER_MS = 1500;
  * part of it whenever it shows.
  */
 const SHORT_PICTURE_PX = 72;
-
-/** The figure's padding and border around the canvas, top and bottom together. */
-const FRAME_PX = 34;
-
-/** The toolbar's own row, for a short picture (toolbar and the gap under it). */
-const TOOLBAR_ROW_PX = 42;
 
 /** PNG downloads are drawn at this many device pixels per CSS pixel. */
 const PNG_SCALE = 2;
@@ -92,6 +95,8 @@ interface Shown {
   mounted: Mounted;
   /** The picture's natural size, when the renderer reported a usable one. */
   natural: Size | null;
+  /** The smallest text in it at natural size, when the renderer reported it. */
+  minTextPx: number | null;
   /** The theme it was drawn for, whose background its files are painted over. */
   theme: ResolvedTheme;
   /** The canvas width the render was last laid out at. */
@@ -101,6 +106,7 @@ interface Shown {
 /** What the render on screen means for the frame, as state. */
 interface Picture {
   naturalSize: Size | null;
+  minTextPx: number | null;
   /** There is an SVG to open full size and to save. */
   exportable: boolean;
   /** A title the picture carries, for the figure's accessible name. */
@@ -127,14 +133,49 @@ function usableSize(size: Size | undefined): Size | null {
     : null;
 }
 
+/** A reported text size the frame can judge readability by: finite and above zero, else null. */
+function usableTextPx(px: number | undefined): number | null {
+  return typeof px === 'number' && px > 0 && Number.isFinite(px) ? px : null;
+}
+
+/** Where each kind's renders wait their turn; see `inLane`. */
+const lanes = new Map<RichKind, Promise<void>>();
+
+/**
+ * Runs `task` once every render of `kind` asked for before it has finished.
+ * mermaid draws one diagram at a time anyway (its configuration is global);
+ * queueing here as well means `task` starting is this block's own render
+ * starting, which is what the placeholder's patience is measured from. The
+ * lane moves on when a render finishes, is abandoned (its block went, or
+ * asked for another render), or has run for STALLED_MS.
+ */
+function inLane<T>(kind: RichKind, task: () => Promise<T>): { result: Promise<T>; abandon: () => void } {
+  const previous = lanes.get(kind) ?? Promise.resolve();
+  let abandon!: () => void;
+  const abandoned = new Promise<void>(resolve => { abandon = resolve; });
+  const result = previous.then(task);
+  lanes.set(kind, previous.then(() => new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, STALLED_MS);
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    result.then(done, done);
+    abandoned.then(done);
+  })));
+  return { result, abandon };
+}
+
 /**
  * The canvas height each block source was last drawn at, so that a block
- * drawn again — the finished message replacing the streamed one, a chat
- * opened again — holds its place while it renders instead of jumping.
- * Keyed by a hash, so long sources are not kept alive by it.
+ * drawn again — the finished message replacing the streamed one, the page
+ * reloaded, a chat opened again — holds its place while it renders instead of
+ * jumping. Kept in sessionStorage under a hash of the source, the newest
+ * MAX_HEIGHT_HINTS; the in-memory copy serves where storage is unavailable.
  */
-const heightHints = new Map<string, number>();
+const HEIGHT_HINTS_KEY = 'nerve-rich-heights';
 const MAX_HEIGHT_HINTS = 200;
+const memoryHints = new Map<string, number>();
 
 function hintKey(kind: RichKind, source: string): string {
   let hash = 0x811c9dc5;
@@ -145,38 +186,76 @@ function hintKey(kind: RichKind, source: string): string {
   return `${kind}:${source.length}:${(hash >>> 0).toString(36)}`;
 }
 
+/** The stored hints, oldest first; null when this page has no usable storage. */
+function storedHints(): Map<string, number> | null {
+  try {
+    const raw = window.sessionStorage.getItem(HEIGHT_HINTS_KEY);
+    const entries: unknown = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(entries)) return new Map();
+    return new Map(entries.filter((entry): entry is [string, number] =>
+      Array.isArray(entry) && typeof entry[0] === 'string' && typeof entry[1] === 'number' && entry[1] > 0));
+  } catch {
+    return null;
+  }
+}
+
+function newest(hints: Map<string, number>, key: string, height: number) {
+  hints.delete(key);
+  hints.set(key, height);
+  while (hints.size > MAX_HEIGHT_HINTS) hints.delete(hints.keys().next().value!);
+}
+
+function heightHintFor(kind: RichKind, source: string): number {
+  const key = hintKey(kind, source);
+  return memoryHints.get(key) ?? storedHints()?.get(key) ?? 0;
+}
+
 function rememberHeight(kind: RichKind, source: string, height: number) {
   const key = hintKey(kind, source);
-  heightHints.delete(key);
-  heightHints.set(key, height);
-  if (heightHints.size > MAX_HEIGHT_HINTS) heightHints.delete(heightHints.keys().next().value!);
+  newest(memoryHints, key, height);
+  const stored = storedHints();
+  if (!stored) return;
+  newest(stored, key, height);
+  try {
+    window.sessionStorage.setItem(HEIGHT_HINTS_KEY, JSON.stringify([...stored]));
+  } catch {
+    // Storage full or refused: the in-memory hints serve this page.
+  }
 }
+
+/** Labels a renderer gives every picture of its kind, which name none of them (Vega's default description). */
+const DEFAULT_LABEL = /^(vega(-lite)? )?(visualization|chart)$/i;
 
 /**
  * A title the drawn picture carries, if it has one that is cheap to find: an
- * svg's own `<title>` (mermaid's `accTitle`), Vega's `description` (on its
- * container as `aria-label`), or a title drawn as text.
+ * svg's own `<title>` (mermaid's `accTitle`), a title drawn as text (Vega's,
+ * mermaid's), or a Vega spec's `description` (on its container as
+ * `aria-label`) — but not Vega's default description.
  */
 function pictureTitle(stage: HTMLElement): string | null {
   const svg = stage.querySelector('svg');
   const documents = [stage, ...stage.querySelectorAll('[role~="graphics-document"]')];
   const candidates = [
     svg?.querySelector(':scope > title')?.textContent,
-    documents.find(el => el.matches('[role~="graphics-document"][aria-label]'))?.getAttribute('aria-label'),
     stage.querySelector('.role-title-text text, .flowchartTitleText, .pieTitleText, .titleText, .chart-title')?.textContent,
+    documents.find(el => el.matches('[role~="graphics-document"][aria-label]'))?.getAttribute('aria-label'),
   ];
-  const title = candidates.map(text => text?.replace(/\s+/g, ' ').trim()).find(Boolean);
+  const title = candidates
+    .map(text => text?.replace(/\s+/g, ' ').trim())
+    .find(text => text && !DEFAULT_LABEL.test(text));
   return title ? title.slice(0, 120) : null;
 }
 
 /**
  * How a picture sits in a canvas `width` pixels wide: whether it is wider
- * than the column, and if so whether it is scaled to fit. One the renderer
- * gave no size for is left as it was drawn (a container-sized chart).
+ * than the column, and if so whether it is scaled to fit — which it is by
+ * default while its smallest text stays readable. One the renderer gave no
+ * size for is left as it was drawn (a container-sized chart).
  */
-function layoutFor(natural: Size | null | undefined, width: number, choice: Choice | null) {
+function layoutFor(natural: Size | null | undefined, width: number, choice: Choice | null, minTextPx: number | null | undefined) {
   if (!natural || width <= 0 || natural.width <= width + 0.5) return { overflowing: false, fit: false };
-  return { overflowing: true, fit: choice ? choice === 'fit' : width / natural.width >= MIN_FIT_SCALE };
+  const readable = (width / natural.width) * (minTextPx ?? DEFAULT_TEXT_PX) >= MIN_READABLE_TEXT_PX;
+  return { overflowing: true, fit: choice ? choice === 'fit' : readable };
 }
 
 /**
@@ -252,16 +331,17 @@ function ToolButton({ label, onClick, text = false, ref, children }: {
  * The source is rendered once it has settled (a streamed block changes with
  * every token batch), into a stage element of its own, out of sight; the
  * previous stage stays on screen until the new one has rendered, so a theme
- * change or more streamed text never blanks the block. While the text
- * streams the block shows its source until a picture is ready; a block that
- * arrives complete (a chat being opened) holds a quiet placeholder instead,
- * and shows its source only if the picture is slow. A failure after the text
- * has finished shows the source with the renderer's message; during the
- * stream it shows the source quietly, since the text may simply not be
- * complete.
+ * change or more streamed text never blanks the block. Renders of one kind
+ * take turns (`inLane`). While the text streams the block shows its source
+ * until a picture is ready; a block that arrives complete (a chat being
+ * opened) holds a quiet placeholder instead — at its last known height, if
+ * it was drawn before — and shows its source only if its own render is slow.
+ * A failure after the text has finished shows the source with the renderer's
+ * message; during the stream it shows the source quietly, since the text may
+ * simply not be complete.
  *
- * A picture wider than the column is scaled to fit while it stays readable
- * (MIN_FIT_SCALE) and is shown at 1:1 with a scrollbar otherwise; the toolbar
+ * A picture wider than the column is scaled to fit while its smallest text
+ * stays readable and is shown at 1:1 with a scrollbar otherwise; the toolbar
  * switches between the two. Expand opens it full size (Lightbox); Download
  * saves it as SVG or PNG.
  */
@@ -296,7 +376,9 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
   // A block that first appeared mid-stream has shown its source already; it
   // keeps showing it until the picture is ready, rather than a placeholder.
   const [mountedStreaming] = useState(streaming);
-  const [heightHint] = useState(() => heightHints.get(hintKey(kind, source)) ?? 0);
+  const [heightHint] = useState(() => heightHintFor(kind, source));
+  // This block's own render has begun: it is no longer waiting its turn.
+  const [drawing, setDrawing] = useState(false);
   // The placeholder has waited long enough; the source is better than nothing.
   const [slow, setSlow] = useState(false);
 
@@ -309,10 +391,18 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
     stage.setAttribute('data-pending', '');
     canvas.appendChild(stage);
     let cancelled = false;
-    MOUNTS[kind](stage, settled, { theme, width: canvas.clientWidth || widthRef.current }).then(
+    const turn = inLane(kind, async () => {
+      // Asked for something else, or gone, while it waited: nothing to draw.
+      if (cancelled) return null;
+      const mount = await RENDERERS[kind]();
+      if (cancelled) return null;
+      setDrawing(true);
+      return mount(stage, settled, { theme, width: canvas.clientWidth || widthRef.current });
+    });
+    turn.result.then(
       (mounted) => {
-        if (cancelled) {
-          mounted.cleanup();
+        if (cancelled || !mounted) {
+          mounted?.cleanup();
           stage.remove();
           return;
         }
@@ -320,20 +410,25 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
         const width = canvas.clientWidth || widthRef.current;
         widthRef.current = width;
         const natural = usableSize(mounted.naturalSize);
-        applySizing(stage, natural, layoutFor(natural, width, choiceRef.current).fit);
+        const minTextPx = usableTextPx(mounted.minTextPx);
+        applySizing(stage, natural, layoutFor(natural, width, choiceRef.current, minTextPx).fit);
         stage.removeAttribute('data-pending');
         const previous = shownRef.current;
-        shownRef.current = { stage, mounted, natural, theme, width };
+        shownRef.current = { stage, mounted, natural, minTextPx, theme, width };
         previous?.mounted.cleanup();
         previous?.stage.remove();
+        // The picture's height decides the toolbar's row; the hint for the
+        // next time is the canvas's whole height, a 1:1 picture's scrollbar
+        // included.
         const height = canvas.clientHeight;
         if (height > 0) {
-          rememberHeight(kind, settled, height);
+          rememberHeight(kind, settled, canvas.offsetHeight || height);
           setCanvasHeight(height);
         }
         setOutcome({ kind, theme, source: settled, error: null });
         setPicture({
           naturalSize: natural,
+          minTextPx,
           exportable: !!mounted.toSvg || !!stage.querySelector('svg'),
           title: pictureTitle(stage),
         });
@@ -347,6 +442,7 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
     );
     return () => {
       cancelled = true;
+      turn.abandon();
       if (shownRef.current?.stage !== stage) stage.remove();
     };
   }, [kind, settled, theme, tooLarge]);
@@ -371,9 +467,20 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
       clearTimeout(timer);
       timer = setTimeout(() => {
         const shown = shownRef.current;
-        if (!shown || shown.width === widthRef.current) return;
+        if (!shown?.mounted.resize || shown.width === widthRef.current) return;
         shown.width = widthRef.current;
-        Promise.resolve(shown.mounted.resize?.()).catch(() => {});
+        // A chart drawn to the column's width draws itself again, and may now
+        // report another size and text size (on the same Mounted) and a new
+        // svg: size that one, and decide fit and the toolbar again.
+        Promise.resolve(shown.mounted.resize()).then(() => {
+          if (shownRef.current !== shown) return;
+          shown.natural = usableSize(shown.mounted.naturalSize);
+          shown.minTextPx = usableTextPx(shown.mounted.minTextPx);
+          applySizing(shown.stage, shown.natural, layoutFor(shown.natural, widthRef.current, choiceRef.current, shown.minTextPx).fit);
+          setPicture(before => before && { ...before, naturalSize: shown.natural, minTextPx: shown.minTextPx });
+          const height = canvas.clientHeight;
+          if (height > 0) setCanvasHeight(height);
+        }, () => {});
       }, RESIZE_DEBOUNCE_MS);
     });
     observer.observe(canvas);
@@ -383,7 +490,7 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
     };
   }, []);
 
-  const layout = layoutFor(picture?.naturalSize, canvasWidth, choice);
+  const layout = layoutFor(picture?.naturalSize, canvasWidth, choice, picture?.minTextPx);
   useLayoutEffect(() => {
     const shown = shownRef.current;
     if (shown) applySizing(shown.stage, shown.natural, layout.fit);
@@ -401,11 +508,12 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
 
   const hasRender = picture !== null;
   const awaitingFirst = !hasRender && status === 'rendering' && !streaming && !mountedStreaming;
+  // The placeholder's patience runs from the block's own render, not its wait in line.
   useEffect(() => {
-    if (!awaitingFirst) return;
-    const timer = setTimeout(() => setSlow(true), PLACEHOLDER_MS);
+    if (!awaitingFirst || !drawing) return;
+    const timer = setTimeout(() => setSlow(true), heightHint > 0 ? STALLED_MS : PLACEHOLDER_MS);
     return () => clearTimeout(timer);
-  }, [awaitingFirst]);
+  }, [awaitingFirst, drawing, heightHint]);
 
   // After a Source/Rendered switch, focus moves to the control that switches back.
   useEffect(() => {
@@ -497,7 +605,9 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
   const failed = status === 'failed' && !streaming;
   const figureShown = !showSource && hasRender && !failed;
   const placeholder = awaitingFirst && !slow;
-  const short = figureShown && canvasHeight > 0 && canvasHeight < SHORT_PICTURE_PX;
+  const short = figureShown
+    ? canvasHeight > 0 && canvasHeight < SHORT_PICTURE_PX
+    : placeholder && heightHint > 0 && heightHint < SHORT_PICTURE_PX;
   const hint = failed
     ? "couldn't render"
     : streaming && status !== 'rendered'
@@ -509,18 +619,19 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
   return (
     <div className="rich-block my-2" data-rich-kind={kind}>
       {/* The figure stays laid out while it has nothing to show: a chart that
-          sizes to its container measures the canvas as it renders. */}
+          sizes to its container measures the canvas as it renders. A
+          placeholder for a picture drawn before holds the height it had (the
+          stylesheet adds the frame around `--rich-hint`). */}
       <figure
         className="rich-figure"
         data-collapsed={figureShown || placeholder ? undefined : ''}
         data-placeholder={placeholder ? '' : undefined}
+        data-hint={placeholder && heightHint > 0 ? '' : undefined}
         data-short={short ? '' : undefined}
         aria-hidden={figureShown || placeholder ? undefined : true}
         aria-busy={placeholder || undefined}
         aria-label={figureShown || placeholder ? fullName : undefined}
-        style={placeholder && heightHint
-          ? { minHeight: heightHint + FRAME_PX + (heightHint < SHORT_PICTURE_PX ? TOOLBAR_ROW_PX : 0) }
-          : undefined}
+        style={placeholder && heightHint > 0 ? { '--rich-hint': `${heightHint}px` } as CSSProperties : undefined}
       >
         {placeholder && <div className="rich-figure-placeholder">Rendering…</div>}
         {figureShown && (
@@ -560,7 +671,7 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
       </figure>
       {!figureShown && !placeholder && (
         <>
-          <div className="flex items-center justify-between gap-2 bg-surface-raised border border-border rounded-t-md px-3 py-1">
+          <div className="rich-source-bar flex items-center justify-between gap-2 bg-surface-raised border border-border rounded-t-md px-3 py-1">
             <span className="text-xs text-text-dim font-mono truncate">
               {label}
               {hint && (
@@ -573,7 +684,7 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
                   ref={renderedButtonRef}
                   type="button"
                   onClick={() => switchView(false)}
-                  className="text-xs text-text-dim hover:text-text px-1.5 py-0.5 rounded hover:bg-surface-hover"
+                  className="text-xs text-text-dim hover:text-text px-1.5 py-0.5 rounded hover:bg-surface-hover cursor-pointer"
                 >
                   Rendered
                 </button>

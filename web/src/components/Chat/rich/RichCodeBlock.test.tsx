@@ -45,6 +45,8 @@ function drawLater() {
  */
 let columnWidth = 700;
 let pictureHeight = 0;
+/** A horizontal scrollbar under a 1:1 picture: part of the canvas's height, not the picture's. */
+let scrollbarHeight = 0;
 const observers = new Set<{ callback: ResizeObserverCallback; targets: Element[] }>();
 class FakeResizeObserver {
   private entry: { callback: ResizeObserverCallback; targets: Element[] };
@@ -90,9 +92,12 @@ const canvasMeasure = (value: () => number) => ({
 beforeEach(() => {
   columnWidth = 700;
   pictureHeight = 0;
+  scrollbarHeight = 0;
+  sessionStorage.clear();
   vi.stubGlobal('ResizeObserver', FakeResizeObserver);
   Object.defineProperty(HTMLElement.prototype, 'clientWidth', canvasMeasure(() => columnWidth));
   Object.defineProperty(HTMLElement.prototype, 'clientHeight', canvasMeasure(() => pictureHeight));
+  Object.defineProperty(HTMLElement.prototype, 'offsetHeight', canvasMeasure(() => pictureHeight + scrollbarHeight));
   mountMermaid.mockReset();
   mountMermaid.mockImplementation(async (stage, source) => {
     if (source.includes('BAD')) throw new Error('boom on line 1');
@@ -106,6 +111,7 @@ afterEach(() => {
   vi.unstubAllGlobals();
   delete (HTMLElement.prototype as { clientWidth?: number }).clientWidth;
   delete (HTMLElement.prototype as { clientHeight?: number }).clientHeight;
+  delete (HTMLElement.prototype as { offsetHeight?: number }).offsetHeight;
   observers.clear();
 });
 
@@ -251,7 +257,8 @@ describe('RichCodeBlock', () => {
   });
 
   it('holds the place of a picture drawn before at the height it had', async () => {
-    pictureHeight = 240;
+    pictureHeight = 234;
+    scrollbarHeight = 6;
     const first = renderBlock('graph seen before', false);
     await rendered();
     first.unmount();
@@ -260,9 +267,138 @@ describe('RichCodeBlock', () => {
     renderBlock('graph seen before', false);
     await act(async () => {});
     expect(frame()).toHaveAttribute('data-placeholder');
-    expect(frame().style.minHeight).toBe(`${240 + 34}px`);
+    // The stylesheet adds the frame around the canvas height it is given.
+    expect(frame()).toHaveAttribute('data-hint');
+    expect(frame().style.getPropertyValue('--rich-hint')).toBe('240px');
     await act(async () => { finish(); });
-    expect(frame().style.minHeight).toBe('');
+    expect(frame()).not.toHaveAttribute('data-hint');
+    expect(frame().style.getPropertyValue('--rich-hint')).toBe('');
+  });
+
+  it('lets a block waiting its turn keep its placeholder while another one renders', async () => {
+    vi.useFakeTimers();
+    const finishes: Array<() => void> = [];
+    mountMermaid.mockImplementation((stage, source) => new Promise(resolve => {
+      finishes.push(() => resolve(draw(stage, source)));
+    }));
+    render(
+      <MarkdownStreamingContext.Provider value={false}>
+        <RichCodeBlock kind="mermaid" source="graph first" />
+        <RichCodeBlock kind="mermaid" source="graph second" />
+      </MarkdownStreamingContext.Provider>,
+    );
+    await act(async () => {});
+    // One render at a time: the second block has not started.
+    expect(mountMermaid).toHaveBeenCalledTimes(1);
+    const [first, second] = [...document.querySelectorAll<HTMLElement>('[data-rich-kind]')];
+    await act(async () => { vi.advanceTimersByTime(1500); });
+    // The first block's own render is slow: its source shows. The second is
+    // still in line, not slow: it keeps its placeholder.
+    expect(first.querySelector('pre code')?.textContent).toBe('graph first');
+    expect(second.querySelector('figure')).toHaveAttribute('data-placeholder');
+    await act(async () => { vi.advanceTimersByTime(5000); });
+    expect(second.querySelector('figure')).toHaveAttribute('data-placeholder');
+    expect(second.querySelector('pre')).toBeNull();
+
+    // Its turn comes when the first is done, and its patience starts then.
+    await act(async () => { finishes[0](); });
+    expect(first.querySelector('[role="img"]')).not.toBeNull();
+    expect(mountMermaid).toHaveBeenCalledTimes(2);
+    await act(async () => { vi.advanceTimersByTime(1499); });
+    expect(second.querySelector('figure')).toHaveAttribute('data-placeholder');
+    await act(async () => { finishes[1](); });
+    expect(second.querySelector('[role="img"]')).not.toBeNull();
+    expect(document.querySelector('pre')).toBeNull();
+  });
+
+  it('holds a known height until the picture comes, not until a timer runs out', async () => {
+    pictureHeight = 300;
+    const first = renderBlock('graph known height', false);
+    await rendered();
+    first.unmount();
+    vi.useFakeTimers();
+    const finish = drawLater();
+    renderBlock('graph known height', false);
+    await act(async () => {});
+    await act(async () => { vi.advanceTimersByTime(6000); });
+    expect(frame()).toHaveAttribute('data-placeholder');
+    expect(frame().style.getPropertyValue('--rich-hint')).toBe('300px');
+    expect(document.querySelector('pre')).toBeNull();
+    await act(async () => { finish(); });
+    expect(screen.getByRole('img', { name: 'Rendered mermaid' })).toBeInTheDocument();
+  });
+
+  it('shows the source of a block drawn before at once when it fails', async () => {
+    pictureHeight = 120;
+    const seen = renderBlock('graph flaky', false);
+    await rendered();
+    seen.unmount();
+    mountMermaid.mockImplementation(async () => { throw new Error('boom on line 1'); });
+    renderBlock('graph flaky', false);
+    expect((await screen.findByRole('status')).textContent).toContain('boom on line 1');
+    expect(frame()).not.toHaveAttribute('data-placeholder');
+    expect(document.querySelector('pre code')?.textContent).toBe('graph flaky');
+  });
+
+  it('shows the source of a block drawn before if its renderer never finishes', async () => {
+    pictureHeight = 120;
+    const seen = renderBlock('graph stalls', false);
+    await rendered();
+    seen.unmount();
+    vi.useFakeTimers();
+    mountMermaid.mockImplementation(() => new Promise(() => {}));
+    renderBlock('graph stalls', false);
+    await act(async () => {});
+    await act(async () => { vi.advanceTimersByTime(9999); });
+    expect(frame()).toHaveAttribute('data-placeholder');
+    await act(async () => { vi.advanceTimersByTime(1); });
+    expect(document.querySelector('pre code')?.textContent).toBe('graph stalls');
+  });
+
+  it('keeps the heights in sessionStorage, so a reloaded page holds them too', async () => {
+    pictureHeight = 260;
+    const first = renderBlock('graph across reloads', false);
+    await rendered();
+    first.unmount();
+    const stored = JSON.parse(sessionStorage.getItem('nerve-rich-heights')!);
+    expect(stored).toEqual([[expect.stringMatching(/^mermaid:\d+:[0-9a-z]+$/), 260]]);
+
+    // A reload: the module, with its in-memory hints, starts over; the session's storage stays.
+    vi.resetModules();
+    const { RichCodeBlock: Reloaded } = await import('./RichCodeBlock');
+    const finish = drawLater();
+    render(<Reloaded kind="mermaid" source="graph across reloads" />);
+    await act(async () => {});
+    expect(frame()).toHaveAttribute('data-hint');
+    expect(frame().style.getPropertyValue('--rich-hint')).toBe('260px');
+    await act(async () => { finish(); });
+  });
+
+  it('keeps the newest 200 heights', async () => {
+    const old = Array.from({ length: 200 }, (_, i) => [`mermaid:0:old${i}`, 100]);
+    sessionStorage.setItem('nerve-rich-heights', JSON.stringify(old));
+    pictureHeight = 90;
+    renderBlock('graph the newest', false);
+    await rendered();
+    const stored = JSON.parse(sessionStorage.getItem('nerve-rich-heights')!) as Array<[string, number]>;
+    expect(stored).toHaveLength(200);
+    expect(stored[0][0]).toBe('mermaid:0:old1');
+    expect(stored[199]).toEqual([expect.stringMatching(/^mermaid:/), 90]);
+  });
+
+  it('remembers heights for the page when sessionStorage refuses', async () => {
+    vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => { throw new Error('denied'); });
+    vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('denied'); });
+    pictureHeight = 210;
+    const first = renderBlock('graph without storage', false);
+    await rendered();
+    first.unmount();
+    const finish = drawLater();
+    renderBlock('graph without storage', false);
+    await act(async () => {});
+    expect(frame().style.getPropertyValue('--rich-hint')).toBe('210px');
+    await act(async () => { finish(); });
+    expect(screen.getByRole('img', { name: 'Rendered mermaid' })).toBeInTheDocument();
   });
 
   it('keeps the previous picture on screen until the next one is ready', async () => {
@@ -376,6 +512,23 @@ describe('RichCodeBlock', () => {
     expect(await screen.findByRole('figure', { name: 'Diagram: Spend per week' })).toBeInTheDocument();
   });
 
+  it('takes no title from Vega\'s default description, and prefers a drawn title to a description', async () => {
+    mountMermaid.mockImplementationOnce(async (stage) => {
+      stage.innerHTML = '<div role="graphics-document" aria-label="Vega visualization"><svg></svg></div>';
+      return { cleanup: () => { stage.innerHTML = ''; } };
+    });
+    const untitled = renderBlock('graph untitled chart', false);
+    expect(await screen.findByRole('figure', { name: 'Diagram' })).toBeInTheDocument();
+    untitled.unmount();
+    mountMermaid.mockImplementationOnce(async (stage) => {
+      stage.innerHTML = '<div role="graphics-document" aria-label="Weekly spend, in dollars">'
+        + '<svg><g class="mark-text role-title-text"><text>Spend per week</text></g></svg></div>';
+      return { cleanup: () => { stage.innerHTML = ''; } };
+    });
+    renderBlock('graph titled chart', false);
+    expect(await screen.findByRole('figure', { name: 'Diagram: Spend per week' })).toBeInTheDocument();
+  });
+
   describe('toolbar', () => {
     it('shows on hover or keyboard focus only, so a mouse click does not pin it over the picture', async () => {
       const css = await stylesheet();
@@ -384,9 +537,13 @@ describe('RichCodeBlock', () => {
       expect(rich).toMatch(/\.rich-figure-toolbar \{[^}]*opacity: 0;/);
       expect(rich).toContain('.rich-figure:hover > .rich-figure-toolbar,\n.rich-figure:has(:focus-visible) > .rich-figure-toolbar { opacity: 1; }');
       expect(rich).not.toContain(':focus-within');
-      // A short picture, and a screen without hover, give it a row of its own.
-      expect(rich).toMatch(/\.rich-figure\[data-short\] > \.rich-figure-toolbar \{[^}]*position: static;[^}]*opacity: 1;/);
+      // A short picture keeps the toolbar's row free, but the toolbar still
+      // fades for a pointer; a screen without hover shows it on its row always.
+      expect(rich).toMatch(/\.rich-figure\[data-short\] > \.rich-figure-toolbar \{[^}]*position: static;/);
+      expect(rich).not.toMatch(/\.rich-figure\[data-short\] > \.rich-figure-toolbar \{[^}]*opacity/);
       expect(rich).toMatch(/@media \(hover: none\) \{[^@]*\.rich-figure-toolbar \{[^}]*position: static;[^}]*opacity: 1;/);
+      // The source view's buttons take the same focus ring as the toolbar's.
+      expect(rich).toMatch(/\.rich-figure-toolbar button:focus-visible,\n\.rich-source-bar button:focus-visible,/);
     });
 
     it('gets a row of its own above a picture too short to share its corner', async () => {
@@ -425,18 +582,24 @@ describe('RichCodeBlock', () => {
       expect(button('Actual size (1:1)').textContent).toBe('1:1');
     });
 
-    it('fits down to 0.8 and shows anything wider at 1:1, to scroll', async () => {
-      drawSized(875, 300);
-      const first = renderBlock('graph A', false);
-      await rendered();
-      expect(picture().style.width).toBe('100%');
-      first.unmount();
-      drawSized(1000, 300);
-      renderBlock('graph A', false);
-      await rendered();
-      // 700 / 1000 = 0.7 would take 14px labels below 11px.
-      expect([picture().style.width, picture().style.height]).toEqual(['1000px', '300px']);
-      expect(button('Fit to width')).toBeInTheDocument();
+    it('fits while the smallest text stays at 11px or more, and shows anything else at 1:1, to scroll', async () => {
+      const opens = async (width: number, minTextPx?: number) => {
+        drawSized(width, 300, minTextPx ? { minTextPx } : {});
+        const block = renderBlock('graph A', false);
+        await rendered();
+        const fitted = picture().style.width === '100%';
+        block.unmount();
+        return fitted ? 'fit' : '1:1';
+      };
+      // An SVG with 30px text at 700 / 1030 = 0.68: 20px text, readable.
+      expect(await opens(1030, 30)).toBe('fit');
+      // A diagram with 14px labels at 0.7: 9.8px, not.
+      expect(await opens(1000, 14)).toBe('1:1');
+      // Without a word from the renderer, 14px is assumed: 0.8 fits, 0.78 does not.
+      expect(await opens(875)).toBe('fit');
+      expect(await opens(900)).toBe('1:1');
+      // Ignored when it is no size at all.
+      expect(await opens(875, 0)).toBe('fit');
     });
 
     it('gives a picture that fits its natural size, with no toggle', async () => {
@@ -490,6 +653,42 @@ describe('RichCodeBlock', () => {
       resizeColumn(500);
       act(() => { vi.advanceTimersByTime(150); });
       expect(resize).toHaveBeenCalledTimes(2);
+    });
+
+    it('takes the size a chart reports after drawing itself again for a new width', async () => {
+      // Like mermaid's xychart: drawn to the column's width, drawn again by
+      // resize(), which updates the same Mounted and puts in a new svg.
+      let mounted!: Mounted;
+      mountMermaid.mockImplementation(async (stage, source) => {
+        mounted = draw(stage, source, {
+          naturalSize: { width: 900, height: 300 },
+          resize: async () => {
+            stage.innerHTML = `<svg><text>${source}</text></svg>`;
+            mounted.naturalSize = columnWidth >= 600
+              ? { width: columnWidth, height: 280 }
+              : { width: 700, height: 280 };
+            if (columnWidth < 600) mounted.minTextPx = 30;
+          },
+        });
+        return mounted;
+      });
+      renderBlock('xychart-beta', false);
+      await rendered();
+      // 900 in 700, 14px text: 1:1, with the toggle.
+      expect(button('Fit to width')).toBeInTheDocument();
+      vi.useFakeTimers();
+
+      // Drawn again at the column's width: it fits exactly, so no toggle, and the new svg is sized.
+      resizeColumn(650);
+      await act(async () => { vi.advanceTimersByTime(150); });
+      expect(noButton(/Fit to width|Actual size/)).toBeNull();
+      expect([picture().style.width, picture().style.height]).toEqual(['650px', '280px']);
+
+      // Drawn again wider than the column but with 30px text: 500 / 700 keeps it readable, so it fits.
+      resizeColumn(500);
+      await act(async () => { vi.advanceTimersByTime(150); });
+      expect(picture().style.width).toBe('100%');
+      expect(button('Actual size (1:1)')).toBeInTheDocument();
     });
 
     it('keeps the reader\'s choice when the picture is drawn again', async () => {
