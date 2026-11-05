@@ -28,7 +28,7 @@ export interface MermaidTheme {
 const READABLE = 4.5;
 
 /** Where the hues with a meaning sit in `tokens.palette` (the order of `PALETTE_VARS` in tokens.ts). */
-const HUE = { blue: 0, orange: 1, green: 3, violet: 4, yellow: 5, red: 7, teal: 8 } as const;
+const HUE = { blue: 0, orange: 1, green: 2, yellow: 4, teal: 6, red: 7, violet: 8 } as const;
 
 /** How many colours mermaid cycles through for sections and series (its `THEME_COLOR_LIMIT`). */
 const COLOR_SLOTS = 12;

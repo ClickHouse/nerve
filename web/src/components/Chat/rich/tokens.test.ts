@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { contrastRatio, luminance, mix, readThemeTokens, resetThemeTokens, toHex, withAlpha } from './tokens';
+import { contrastRatio, deltaE2000, luminance, mix, readThemeTokens, resetThemeTokens, toHex, withAlpha } from './tokens';
 
 afterEach(() => resetThemeTokens());
 
@@ -72,6 +72,25 @@ describe('tokens', () => {
       getContext.mockRestore();
       computed.mockRestore();
       vi.resetModules();
+    }
+  });
+
+  it('keeps the first six series colours clearly apart, in both themes', () => {
+    expect(deltaE2000('#000000', '#ffffff')).toBeCloseTo(100, 0);
+    expect(deltaE2000('#437eef', '#437eef')).toBe(0);
+    // The twins the order pushes to the end: blue/sky, violet/purple, orange/red.
+    expect(deltaE2000('#437eef', '#6d9bf3')).toBeLessThan(12);
+    for (const theme of ['dark', 'light'] as const) {
+      const { palette } = readThemeTokens(theme);
+      const six = palette.slice(0, 6);
+      let worstPair = Infinity;
+      for (let i = 0; i < six.length; i++) {
+        for (let j = i + 1; j < six.length; j++) worstPair = Math.min(worstPair, deltaE2000(six[i], six[j]));
+      }
+      expect(worstPair, `${theme}: every pair among the first six`).toBeGreaterThanOrEqual(18);
+      for (let i = 0; i < palette.length - 1; i++) {
+        expect(deltaE2000(palette[i], palette[i + 1]), `${theme}: neighbours ${i},${i + 1}`).toBeGreaterThanOrEqual(20);
+      }
     }
   });
 

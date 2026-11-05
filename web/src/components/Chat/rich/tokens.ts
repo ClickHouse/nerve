@@ -35,7 +35,7 @@ const FALLBACK: Record<ResolvedTheme, ThemeTokens> = {
     textMuted: '#a3a9b3',
     textFaint: '#6b7280',
     accent: '#f6d53f',
-    palette: ['#437eef', '#fb923c', '#38bdf8', '#34d399', '#dd99ff', '#facc15', '#a78bfa', '#f87171', '#2dd4bf', '#22d3ee'],
+    palette: ['#437eef', '#ff9457', '#66ff73', '#33e4ff', '#faff69', '#cc66ff', '#6df8e1', '#ff7575', '#dd99ff', '#6d9bf3'],
     fontFamily: FONT_FAMILY,
   },
   light: {
@@ -48,7 +48,7 @@ const FALLBACK: Record<ResolvedTheme, ThemeTokens> = {
     textMuted: '#5b6472',
     textFaint: '#9aa1ad',
     accent: '#b58900',
-    palette: ['#104ec6', '#c2410c', '#0369a1', '#047857', '#8800cc', '#a16207', '#6d28d9', '#b91c1c', '#0f766e', '#0e7490'],
+    palette: ['#104ec6', '#a33c00', '#007109', '#006170', '#8a6900', '#660099', '#067462', '#c10000', '#8800cc', '#1d64ec'],
     fontFamily: FONT_FAMILY,
   },
 };
@@ -66,12 +66,14 @@ const TOKEN_VARS: Record<Exclude<keyof ThemeTokens, 'theme' | 'palette' | 'fontF
 
 /** Hue tokens in the order series take them: alternating hue families, high contrast between neighbours. */
 const PALETTE_VARS = [
-  // Ordered so that neighbouring series stay apart for colour-blind readers
-  // as well (blue next to violet does not, under deuteranopia); the hues
-  // with a meaning — red, yellow, green, orange — keep their positions in
-  // mermaid.ts's HUE map, which must change with this list.
-  '--theme-hue-blue', '--theme-hue-orange', '--theme-hue-sky', '--theme-hue-emerald', '--theme-hue-violet',
-  '--theme-hue-yellow', '--theme-hue-purple', '--theme-hue-red', '--theme-hue-teal', '--theme-hue-cyan',
+  // Farthest-point order by CIEDE2000 over the app's real values in both
+  // themes (blue first: the single-series colour; orange second: the warm
+  // pole of diverging ramps): every pair among the first six is ΔE ≥ 20,
+  // neighbours ≥ 34. The near-twins — sky of blue, violet of purple, red of
+  // orange — come last. The fallbacks below ARE those values, so the test
+  // measures the real palette; mermaid.ts's HUE map indexes this order.
+  '--theme-hue-blue', '--theme-hue-orange', '--theme-hue-emerald', '--theme-hue-cyan', '--theme-hue-yellow',
+  '--theme-hue-purple', '--theme-hue-teal', '--theme-hue-red', '--theme-hue-violet', '--theme-hue-sky',
 ];
 
 let context2d: CanvasRenderingContext2D | null | undefined;
@@ -215,4 +217,59 @@ export function readThemeTokens(theme: ResolvedTheme): ThemeTokens {
 /** Forgets resolved tokens, for tests and for a stylesheet that changed under the app. */
 export function resetThemeTokens(): void {
   cache.clear();
+}
+
+function toLab(hex: string): [number, number, number] {
+  const [r, g, b] = hexToRgb(hex).map(v => {
+    const c = v / 255;
+    return c > 0.04045 ? ((c + 0.055) / 1.055) ** 2.4 : c / 12.92;
+  });
+  const x = (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047;
+  const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  const z = (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883;
+  const f = (t: number) => (t > 0.008856 ? Math.cbrt(t) : 7.787 * t + 16 / 116);
+  return [116 * f(y) - 16, 500 * (f(x) - f(y)), 200 * (f(y) - f(z))];
+}
+
+const rad = (deg: number) => (deg * Math.PI) / 180;
+const deg = (r: number) => (r * 180) / Math.PI;
+
+/**
+ * CIEDE2000 colour difference: ~1 is just noticeable, 100 is black to white.
+ * The palette's order is chosen and tested by it.
+ */
+export function deltaE2000(a: string, b: string): number {
+  const [L1, a1, b1] = toLab(a);
+  const [L2, a2, b2] = toLab(b);
+  const Cavg = (Math.hypot(a1, b1) + Math.hypot(a2, b2)) / 2;
+  const G = 0.5 * (1 - Math.sqrt(Cavg ** 7 / (Cavg ** 7 + 25 ** 7)));
+  const a1p = (1 + G) * a1;
+  const a2p = (1 + G) * a2;
+  const C1p = Math.hypot(a1p, b1);
+  const C2p = Math.hypot(a2p, b2);
+  const h1p = C1p === 0 ? 0 : (deg(Math.atan2(b1, a1p)) + 360) % 360;
+  const h2p = C2p === 0 ? 0 : (deg(Math.atan2(b2, a2p)) + 360) % 360;
+  const dLp = L2 - L1;
+  const dCp = C2p - C1p;
+  let dhp = 0;
+  if (C1p * C2p !== 0) {
+    const dh = h2p - h1p;
+    dhp = Math.abs(dh) <= 180 ? dh : dh > 180 ? dh - 360 : dh + 360;
+  }
+  const dHp = 2 * Math.sqrt(C1p * C2p) * Math.sin(rad(dhp / 2));
+  const Lbp = (L1 + L2) / 2;
+  const Cbp = (C1p + C2p) / 2;
+  let hbp = h1p + h2p;
+  if (C1p * C2p !== 0) {
+    hbp = Math.abs(h1p - h2p) <= 180 ? hbp / 2 : hbp < 360 ? (hbp + 360) / 2 : (hbp - 360) / 2;
+  }
+  const T = 1 - 0.17 * Math.cos(rad(hbp - 30)) + 0.24 * Math.cos(rad(2 * hbp))
+    + 0.32 * Math.cos(rad(3 * hbp + 6)) - 0.20 * Math.cos(rad(4 * hbp - 63));
+  const dTheta = 30 * Math.exp(-(((hbp - 275) / 25) ** 2));
+  const Rc = 2 * Math.sqrt(Cbp ** 7 / (Cbp ** 7 + 25 ** 7));
+  const Sl = 1 + (0.015 * (Lbp - 50) ** 2) / Math.sqrt(20 + (Lbp - 50) ** 2);
+  const Sc = 1 + 0.045 * Cbp;
+  const Sh = 1 + 0.015 * Cbp * T;
+  const Rt = -Math.sin(rad(2 * dTheta)) * Rc;
+  return Math.sqrt((dLp / Sl) ** 2 + (dCp / Sc) ** 2 + (dHp / Sh) ** 2 + Rt * (dCp / Sc) * (dHp / Sh));
 }
