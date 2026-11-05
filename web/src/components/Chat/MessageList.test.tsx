@@ -85,16 +85,36 @@ describe('long history rendering', () => {
       role: 'user',
       blocks: [{ type: 'text', content: `Test turn ${i}` }],
     }));
-    render(
+    const view = (history: ChatMessage[]) => (
       <MemoryRouter>
-        <MessageList messages={messages} isStreaming={false} />
-      </MemoryRouter>,
+        <MessageList messages={history} isStreaming={false} />
+      </MemoryRouter>
     );
+    const { rerender } = render(view(messages));
 
     expect(screen.queryByText('Test turn 0')).not.toBeInTheDocument();
+    expect(screen.getByText('Test turn 5')).toBeInTheDocument();
     expect(screen.getByText('Test turn 34')).toBeInTheDocument();
+
+    // A new turn must not evict an existing row while the reader is scrolled up.
+    const appended: ChatMessage[] = [
+      ...messages, { id: 36, role: 'user', blocks: [{ type: 'text', content: 'Test turn 35' }] },
+    ];
+    rerender(view(appended));
+    expect(screen.getByText('Test turn 5')).toBeInTheDocument();
+    expect(screen.getByText('Test turn 35')).toBeInTheDocument();
+    expect(screen.queryByText('Test turn 4')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Show earlier messages (5 loaded)' })).toBeInTheDocument();
+
     fireEvent.click(screen.getByRole('button', { name: 'Show earlier messages (5 loaded)' }));
     expect(screen.getByText('Test turn 0')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Show earlier messages/ })).not.toBeInTheDocument();
+
+    // Revealed history stays available as more turns arrive too.
+    rerender(view([
+      ...appended, { id: 37, role: 'user', blocks: [{ type: 'text', content: 'Test turn 36' }] },
+    ]));
+    expect(screen.getByText('Test turn 0')).toBeInTheDocument();
+    expect(screen.getByText('Test turn 36')).toBeInTheDocument();
   });
 });
