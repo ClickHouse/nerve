@@ -3,36 +3,47 @@ import { Link, useParams } from 'react-router-dom';
 import { codeReview, type ReviewDetail, type VersionReport } from '../api/codeReview';
 import { MarkdownContent } from '../components/Chat/MarkdownContent';
 import { reviewTime } from '../utils/codeReview';
+import { ReviewLaunch } from '../components/Tasks/ReviewLaunch';
 
 export function CodeReviewHistory({ prId }: { prId: string }) {
+  return <ReviewHistoryContent key={prId} prId={prId} />;
+}
+
+function ReviewHistoryContent({ prId }: { prId: string }) {
   const [detail, setDetail] = useState<ReviewDetail>();
   const [selected, setSelected] = useState('');
   const [offset, setOffset] = useState(0);
   const [report, setReport] = useState<VersionReport>();
   const [error, setError] = useState('');
+  const [refresh, setRefresh] = useState(0);
   useEffect(() => {
     let active = true;
-    codeReview.detail(prId, offset).then(data => {
+    const load = () => codeReview.detail(prId, offset).then(data => {
       if (!active) return;
       setDetail(data);
-      setSelected(offset === 0 ? data.pr.current_version ?? data.versions[0]?.id ?? '' : data.versions[0]?.id ?? '');
+      setSelected(previous => previous || (offset === 0 ? data.pr.current_version ?? data.versions[0]?.id ?? '' : data.versions[0]?.id ?? ''));
     }).catch(e => { if (active) setError(String(e)); });
-    return () => { active = false; };
-  }, [prId, offset]);
+    void load();
+    const timer = setInterval(() => { void load(); }, 30_000);
+    return () => { active = false; clearInterval(timer); };
+  }, [prId, offset, refresh]);
   useEffect(() => {
     if (!selected) return;
     let active = true;
-    codeReview.version(prId, selected).then(data => {
+    const load = () => codeReview.version(prId, selected).then(data => {
       if (active) { setReport(data); setError(''); }
     }).catch(e => { if (active) setError(String(e)); });
-    return () => { active = false; };
-  }, [prId, selected]);
+    void load();
+    const timer = setInterval(() => { void load(); }, 30_000);
+    return () => { active = false; clearInterval(timer); };
+  }, [prId, selected, refresh]);
   const currentReport = report?.version.id === selected ? report : undefined;
   return <section className="space-y-4">
     {error && <p role="alert">{error}</p>}
     {detail && <>
       <p><a href={detail.pr.url} target="_blank" rel="noreferrer">{detail.pr.title}</a> · {detail.pr.review_state}</p>
       <p className="text-sm">Head <code>{detail.pr.head}</code> · Base <code>{detail.pr.base}</code></p>
+      <ReviewLaunch key={`${detail.pr.id}:${detail.pr.current_version}`} pr={detail.pr} onChange={() => setRefresh(n => n + 1)} />
       {detail.pr.reviewed_version !== detail.pr.current_version && <p role="status">Current input version has no completed review. Earlier reports apply to their recorded SHA.</p>}
       {detail.pr.draft !== 0 && <p role="status">Draft: review is paused.</p>}
       <label className="block">Review version
@@ -43,8 +54,8 @@ export function CodeReviewHistory({ prId }: { prId: string }) {
         </select>
       </label>
       {detail.total > 50 && <div className="flex gap-4">
-        <button disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - 50))}>Newer versions</button>
-        <button disabled={offset + 50 >= detail.total} onClick={() => setOffset(offset + 50)}>Older versions</button>
+        <button disabled={offset === 0} onClick={() => { setSelected(''); setOffset(Math.max(0, offset - 50)); }}>Newer versions</button>
+        <button disabled={offset + 50 >= detail.total} onClick={() => { setSelected(''); setOffset(offset + 50); }}>Older versions</button>
       </div>}
       <details><summary>Latest CI evidence</summary><pre className="overflow-auto">{JSON.stringify(JSON.parse(detail.pr.ci), null, 2)}</pre></details>
     </>}
@@ -69,6 +80,6 @@ export function CodeReviewDetailPage() {
   return <div className="h-full overflow-auto p-4 md:p-6">
     <Link to="/tasks-code-review">← Tasks Code Review</Link>
     <h1 className="my-4 text-2xl font-semibold">Pull request review</h1>
-    {prId && <><p className="mb-4"><Link to={`/tasks/${prId}`}>Open task</Link></p><CodeReviewHistory prId={prId} /></>}
+    {prId && <><p className="mb-4"><Link to={`/tasks/${prId}`}>Open task</Link></p><CodeReviewHistory key={prId} prId={prId} /></>}
   </div>;
 }

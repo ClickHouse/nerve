@@ -3,18 +3,20 @@ import { Link } from 'react-router-dom';
 import { codeReview, type ReviewPR, type ReviewStatus } from '../api/codeReview';
 
 import { reviewTime } from '../utils/codeReview';
+import { ReviewLaunch } from '../components/Tasks/ReviewLaunch';
 
-function ReviewColumn({ column, title }: { column: 'active' | 'archive'; title: string }) {
+function ReviewColumn({ column, title, revision }: { column: 'active' | 'archive'; title: string; revision: number }) {
   const [data, setData] = useState<{ items: ReviewPR[]; total: number }>();
   const [offset, setOffset] = useState(0);
   const [error, setError] = useState('');
+  const [refresh, setRefresh] = useState(0);
   useEffect(() => {
     let active = true;
     const load = () => codeReview.board(column, offset).then(value => { if (active) { setData(value); setError(''); } }).catch(e => { if (active) setError(String(e)); });
     void load();
     const timer = setInterval(() => { void load(); }, 30_000);
     return () => { active = false; clearInterval(timer); };
-  }, [column, offset]);
+  }, [column, offset, refresh, revision]);
   return <section className="min-w-0 flex-1 rounded-xl bg-surface-raised p-4">
     <h2 className="mb-3 font-semibold">{title} · {data?.total ?? '…'}</h2>
     {error && <p role="alert">{error}</p>}
@@ -22,11 +24,13 @@ function ReviewColumn({ column, title }: { column: 'active' | 'archive'; title: 
       {data?.items.map(pr => <article key={pr.id} className="rounded-lg border border-border bg-surface p-3">
         <Link className="font-medium text-accent" to={`/tasks-code-review/${pr.id}`}>#{pr.number} {pr.title}</Link>
         <p className="mt-2 text-sm">{pr.repository} · {pr.state}{pr.draft ? ' · draft' : ''}</p>
-        <p className="text-sm">{pr.review_state} · {pr.severity} · <code>{pr.head.slice(0, 12)}</code></p>
+        <p className="text-sm">{pr.review_action?.enabled ? 'Ожидает ручного запуска' : pr.review_state} · {pr.severity} · <code>{pr.head.slice(0, 12)}</code></p>
         <p className="text-xs text-text-muted">Updated {reviewTime(pr.content_updated_at)}</p>
         <p className="text-xs text-text-muted">Polled {reviewTime(pr.last_polled_at)}</p>
         {pr.error && <p role="alert" className="text-sm">Observation error: {pr.error}</p>}
         <a className="text-xs underline" href={pr.url} target="_blank" rel="noreferrer">GitHub PR</a>
+        {pr.reviewed_version && pr.reviewed_version !== pr.current_version && <p className="text-xs text-text-muted">Предыдущий отчёт доступен в истории; текущая версия ещё не проверена.</p>}
+        <ReviewLaunch key={`${pr.id}:${pr.current_version}`} pr={pr} onChange={() => setRefresh(n => n + 1)} />
       </article>)}
       {data?.total === 0 && <p className="text-text-muted">No pull requests.</p>}
     </div>
@@ -41,6 +45,7 @@ function ReviewColumn({ column, title }: { column: 'active' | 'archive'; title: 
 export function TasksCodeReviewPage() {
   const [status, setStatus] = useState<ReviewStatus>();
   const [error, setError] = useState('');
+  const [revision, setRevision] = useState(0);
   useEffect(() => {
     let active = true;
     const load = () => codeReview.status().then(value => {
@@ -51,7 +56,7 @@ export function TasksCodeReviewPage() {
     return () => { active = false; clearInterval(timer); };
   }, []);
   const control = async (id: string, paused: boolean) => {
-    try { setStatus(await (paused ? codeReview.resume(id) : codeReview.pause(id))); } catch (e) { setError(String(e)); }
+    try { setStatus(await (paused ? codeReview.resume(id) : codeReview.pause(id))); setRevision(n => n + 1); } catch (e) { setError(String(e)); }
   };
   return <div className="h-full overflow-auto p-4 md:p-6">
     <h1 className="mb-4 text-2xl font-semibold">{status?.board_name ?? 'Tasks Code Review'}</h1>
@@ -62,6 +67,7 @@ export function TasksCodeReviewPage() {
     <div className="mb-5 space-y-3">
       {status?.profiles.map(p => <div key={p.id} className="rounded-lg border border-border p-3 text-sm">
         <p className="font-medium">{p.id} · {!p.enabled ? 'Disabled' : p.paused ? 'Paused' : p.registered ? 'Scheduled' : 'Schedule unavailable'}</p>
+        <p>{p.review_mode === 'automatic' ? 'Обновление автоматически · Проверка автоматически' : 'Обновление автоматически · Проверка вручную'}</p>
         <p>{p.schedule} · {p.timezone} · Next: {reviewTime(p.next_run_at)}</p>
         <p>Last successful poll: {reviewTime(p.last_success_at)}</p>
         {p.enabled && !p.paused && p.overdue && <p role="alert">Polling is overdue or has not completed.</p>}
@@ -72,8 +78,8 @@ export function TasksCodeReviewPage() {
       </div>)}
     </div>
     <div className="flex flex-col gap-4 lg:flex-row">
-      <ReviewColumn column="active" title="Open PRs" />
-      <ReviewColumn column="archive" title="Archive" />
+      <ReviewColumn column="active" title="Open PRs" revision={revision} />
+      <ReviewColumn column="archive" title="Archive" revision={revision} />
     </div>
   </div>;
 }

@@ -126,6 +126,7 @@ class CodeReviewService:
     async def pause(self, profile_id):
         self.profile(profile_id)  # validate before writing
         await self.db._write("UPDATE code_review_profiles SET paused=1 WHERE id=?", (profile_id,))
+        await self.db.cr_cancel_requests(profile_id, "Профиль приостановлен. Нужен новый ручной запрос")
         # Only runs linked by our durable ledger belong to this controller.
         attempts = await self.db.cr_rows("SELECT * FROM code_review_attempts WHERE profile=? AND settled=0", (profile_id,))
         if self.runs:
@@ -142,6 +143,67 @@ class CodeReviewService:
             raise ValueError("Code Review controller is stopped")
         await self.db._write("UPDATE code_review_profiles SET paused=0 WHERE id=?", (profile_id,))
         self.spawn(self.poll(profile_id))
+
+    async def request_review(self, pr_id, version_id, key, actor):
+        row = await self.db.cr_one("SELECT * FROM code_review_prs WHERE id=?", (pr_id,))
+        if not row:
+            raise KeyError(pr_id)
+        profile = self.profile(row["profile"])
+        await self.db.cr_expire_requests(profile.id, self.day(profile))
+        replay = await self.db.cr_request_replay(pr_id, actor.actor_id, key, version_id)
+        if replay:
+            return replay
+        if profile.review_mode != "manual":
+            raise ValueError("Профиль работает в автоматическом режиме")
+        if not self.started or not self.runs:
+            raise ValueError("Исполнитель проверок недоступен")
+        if not await self.allowed(profile):
+            raise ValueError("Профиль приостановлен или отключён")
+        version = await self.db.cr_one("SELECT id FROM code_review_versions WHERE id=? AND pr_id=?", (version_id, pr_id))
+        if not version:
+            raise ValueError("Версия PR недоступна. Обновите страницу")
+        # Admission and dispatch both refresh. An authorization never follows
+        # a moving head/base/body/failure fingerprint to different inputs.
+        try:
+            await self.observe(profile, row["number"])
+        except Exception as error:
+            raise ValueError("Не удалось обновить PR. Повторите запрос после успешного обновления") from error
+        if not self.started:
+            raise ValueError("Исполнитель проверок остановлен")
+        return await self.db.cr_request_review(
+            profile.id, pr_id, version_id, actor.actor_id, key, self.day(profile),
+            profile.version_budget_usd, profile.daily_budget_usd,
+        )
+
+    async def review_action(self, pr):
+        try:
+            profile = self.profile(pr["profile"])
+        except KeyError:
+            return {"enabled": False, "state": "unavailable", "reason": "Профиль недоступен"}
+        request = await self.db.cr_one(
+            "SELECT id,state,version_id,reason,day,run_id FROM code_review_requests WHERE pr_id=? ORDER BY created_at DESC,id DESC LIMIT 1",
+            (pr["id"],),
+        )
+        reason, state = "", "ready"
+        if not profile.enabled or not self.started or not self.runs:
+            reason = "Исполнитель проверок отключён или недоступен"
+        elif not await self.allowed(profile):
+            reason = "Профиль на полной паузе"
+        elif profile.review_mode != "manual":
+            reason = "Проверка запускается автоматически"
+        elif request and (request["state"] == "claimed" or
+                          (request["state"] == "pending" and request["day"] == self.day(profile))):
+            run = await self.runs.get_run(request["run_id"]) if request["run_id"] else None
+            state = "running" if run and run["status"] == "running" else "queued"
+            reason = "В очереди" if state == "queued" else "Проверяется"
+        else:
+            reason = await self.db.cr_manual_eligibility(
+                pr["id"], pr["current_version"], self.day(profile), profile.version_budget_usd, profile.daily_budget_usd,
+            )
+            if reason == "Проверяется":
+                state = "running"
+        return {"enabled": not reason, "state": state, "reason": reason,
+                "last_request": request, "review_mode": profile.review_mode}
 
     async def observe(self, profile, number):
         # Dispatch guards also observe while the polling/queue lock is held.
@@ -182,6 +244,8 @@ class CodeReviewService:
             known = await self.db.cr_rows("SELECT * FROM code_review_prs WHERE profile=?", (profile_id,))
             numbers.update(row["number"] for row in known)
             for number in sorted(numbers):
+                if not await self.allowed(profile):
+                    return
                 try:
                     await self.observe(profile, number)
                 except Exception as error:
@@ -242,6 +306,11 @@ class CodeReviewService:
         profile = self.profile(attempt["profile"])
         if not await self.allowed(profile):
             return "Code Review profile is paused or disabled"
+        request = await self.db.cr_one("SELECT * FROM code_review_requests WHERE run_id=?", (run["id"],))
+        if profile.review_mode == "manual" or request:
+            if (not request or request["state"] != "claimed" or request["day"] != self.day(profile)
+                    or request["version_id"] != attempt["version_id"]):
+                return "Manual review authorization is unavailable or expired"
         version = await self.db.cr_one("SELECT * FROM code_review_versions WHERE id=?", (attempt["version_id"],))
         snapshot = json.loads(version["snapshot"])
         row = await self.observe(profile, snapshot["number"])
@@ -249,11 +318,55 @@ class CodeReviewService:
             return "Code Review controller is stopped or profile paused"
         if not row or row["draft"] or row["state"] != "open" or row["current_version"] != version["id"]:
             return "PR changed before workflow execution"
+        if request:
+            current_request = await self.db.cr_one("SELECT * FROM code_review_requests WHERE id=?", (request["id"],))
+            if current_request["state"] != "claimed" or current_request["day"] != self.day(profile):
+                return "Manual review authorization was revoked or expired during validation"
+        # This attempt's reservation already counts toward committed spend.
+        # Another profile may have overrun while this run waited for a slot.
+        if await self.db.cr_day_spend(self.day(profile)) > profile.daily_budget_usd + 0.001:
+            return "Code Review daily committed budget exceeds the limit"
         return ""
 
     async def dispatch(self, profile):
         if not self.runs:
             return
+        if profile.review_mode == "manual":
+            claim = await self.manual_claim(profile)
+        else:
+            claim = await self.automatic_claim(profile)
+        if claim:
+            await self.launch(profile, claim)
+
+    async def manual_claim(self, profile):
+        await self.db.cr_expire_requests(profile.id, self.day(profile))
+        request = await self.db.cr_one(
+            "SELECT r.*,p.number FROM code_review_requests r JOIN code_review_prs p ON p.id=r.pr_id "
+            "WHERE r.profile=? AND r.state='pending' ORDER BY r.created_at,r.id LIMIT 1", (profile.id,),
+        )
+        if not request:
+            return None
+        # Cancel an exhausted request even while another review occupies the
+        # worker. It must not silently become runnable on a later day.
+        reason = await self.db.cr_manual_eligibility(
+            request["pr_id"], request["version_id"], self.day(profile), profile.version_budget_usd, profile.daily_budget_usd,
+        )
+        if reason:
+            await self.db.cr_cancel_requests(profile.id, reason, request["id"])
+            return None
+        if await self.db.cr_one("SELECT run_id FROM code_review_attempts WHERE profile=? AND settled=0", (profile.id,)):
+            return None
+        try:
+            await self.observe(profile, request["number"])
+        except Exception:
+            await self.db.cr_cancel_requests(profile.id, "Не удалось обновить PR. Нужен новый ручной запрос", request["id"])
+            return None
+        return await self.db.cr_reserve(
+            profile.id, self.day(profile), profile.version_budget_usd, profile.daily_budget_usd, profile.max_attempts,
+            version_id=request["version_id"], review_mode="manual", request_id=request["id"],
+        )
+
+    async def automatic_claim(self, profile):
         if await self.db.cr_one("SELECT run_id FROM code_review_attempts WHERE profile=? AND settled=0", (profile.id,)):
             return
         if await self.db.cr_day_spend(self.day(profile)) >= profile.daily_budget_usd - 0.001:
@@ -279,7 +392,7 @@ class CodeReviewService:
         )
         if prior_spend["n"] >= profile.max_attempts or prior_spend["used"] >= profile.version_budget_usd - 0.001:
             await self.db.cr_reserve(profile.id, self.day(profile), profile.version_budget_usd,
-                                     profile.daily_budget_usd, profile.max_attempts, candidate["current_version"])
+                                     profile.daily_budget_usd, profile.max_attempts, candidate["current_version"], review_mode="automatic")
             return
         # Refresh full context immediately before reserving; draft transition or
         # new code can never knowingly launch against a stale queued version.
@@ -291,11 +404,11 @@ class CodeReviewService:
         # Claim only after refreshing this FIFO candidate; the store is atomic.
         if not refreshed or refreshed["draft"] or refreshed["state"] != "open":
             return
-        claim = await self.db.cr_reserve(profile.id, self.day(profile), profile.version_budget_usd,
+        return await self.db.cr_reserve(profile.id, self.day(profile), profile.version_budget_usd,
                                          profile.daily_budget_usd, profile.max_attempts,
-                                         version_id=refreshed["current_version"])
-        if not claim:
-            return
+                                         version_id=refreshed["current_version"], review_mode="automatic")
+
+    async def launch(self, profile, claim):
         work = self.root / claim["pr_id"] / claim["id"] / "attempts" / claim["run_id"] / "work"
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root.chmod(0o700)
@@ -327,7 +440,7 @@ class CodeReviewService:
                 "codex-ultracode" if backend == "codex" else "claude-workflow", spec, claim["budget"],
                 title=f"Code Review #{claim['number']} · {claim['head'][:12]}",
                 created_by=f"code-review:{profile.id}", run_id=claim["run_id"],
-                attribution=attribution_for(self.db.system_actor),
+                attribution=attribution_for(self.db.system_actor, claim["actor_id"] or self.db.system_actor),
             )
         except Exception as error:
             # A start call can fail after persisting its run; never release the
@@ -409,6 +522,8 @@ class CodeReviewService:
                     (version["id"], attempt["run_id"]),
                 )
                 status = "review_limit" if previous_spend["total"] + spent >= profile.version_budget_usd else "waiting_budget"
+            if profile.review_mode == "manual" and status in ("retry", "waiting_budget"):
+                status = "error"
             if not artifact.exists():
                 freeze(artifact, {"version": version["id"], "run": attempt["run_id"], "output": output,
                                   "admission": status, "error": error, "spent_usd": spent})
@@ -526,7 +641,7 @@ class CodeReviewService:
             day = self.day(profile)
             if await self.db.cr_day_spend(day) >= profile.daily_budget_usd and state["notified_budget_day"] != day:
                 await self.notifications.send_notification(session_id="system", title="Code Review daily budget reserved or exhausted",
-                                                           body="Reviews remain queued; state polling continues. [Open board](/tasks-code-review)", priority="normal")
+                                                           body="Review budget is unavailable; state polling continues. Manual checks require a new request. [Open board](/tasks-code-review)", priority="normal")
                 await self.db._write("UPDATE code_review_profiles SET notified_budget_day=? WHERE id=?", (day, profile.id))
 
     async def status(self):
@@ -541,6 +656,7 @@ class CodeReviewService:
             ) if last_success else None
             overdue = not expected or datetime.now(timezone.utc) > expected + timedelta(minutes=10)
             profiles.append({**stored, "id": profile.id, "enabled": profile.enabled,
+                             "review_mode": profile.review_mode,
                              "schedule": profile.schedule, "timezone": profile.timezone,
                              "job_id": f"code-review-{profile.id}", "registered": job is not None,
                              "next_run_at": next_run.isoformat() if next_run else None, "overdue": overdue,

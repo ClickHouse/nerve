@@ -16,6 +16,7 @@ code_review:
       repository: alice/example
       query: team-review-requested:alice/reviewers
       enabled: false
+      review_mode: manual
       schedule: '0 */2 * * *'
       timezone: UTC
       version_budget_usd: 5
@@ -37,7 +38,50 @@ The pause button persistently stops the profile and only its owned workflow runs
 tasks and immutable artifacts remain. Resume performs one catch-up and keeps the
 existing budget ledger. A configured disabled profile cannot be resumed from the
 UI and never starts.
-One startup catch-up replaces missed launches. Normal GitHub polling uses no LLM.
+One startup catch-up refreshes observations. GitHub polling, task synchronization,
+CI/lifecycle tracking and notifications use no LLM in either review mode.
+
+## Manual authorization (default)
+
+`review_mode` defaults to `manual`, **including existing profiles that omit the
+key**. Upgrading does not resume a paused profile or authorize its old queued,
+retry or waiting-budget versions. Set `automatic` explicitly only when automatic
+paid dispatch and backoff retries are intended. Full pause stops observation and
+reviews; an enabled, unpaused manual profile keeps observation running.
+
+The board and history offer **Запустить проверку** for the current eligible input
+version. One accepted click authorizes one attempt of that version, recorded with
+the authenticated actor, timestamp, idempotency key, state and workflow ID.
+The authenticated `POST /api/code-review/prs/{pr_id}/requests` accepts:
+
+```json
+{"expected_version":"crv-example","idempotency_key":"unique-click-key"}
+```
+
+It returns 202 and the durable request, or 409 with the reason (404 for an unknown
+PR, 503 for an unavailable controller). Repeating the same actor/PR/key replays
+that request; the key cannot be rebound to a different version. Parallel clicks
+with different keys cannot create concurrent requests for the same PR. Preserve
+the key when retrying an HTTP call whose response was lost. Use a new key only
+for a deliberate new attempt. Admission checks availability and committed budgets;
+a queued request does not reserve money until it is claimed for execution.
+
+Requests wait visibly for the worker. Dispatch refreshes GitHub and atomically
+consumes a request together with the budget reservation. A final execution guard
+checks it again when a global workflow slot becomes available. A changed input,
+draft, closure, full pause, failed refresh or exhausted budget cancels the request.
+An unstarted request expires at the next calendar day in the profile timezone.
+These cases require another click; consent never moves to a newer version.
+Accepted pending requests survive restart within that day; already claimed
+requests are reconciled by their unique run ID and are never launched twice.
+
+Errors and interrupted attempts need a new click and retain all measured and
+uncertain costs. Manual retries are bounded by the remaining version/day budget;
+`max_attempts` caps only automatic retries. A complete current report cannot be
+requested again, and a report awaiting read-only admission is not regenerated.
+New PRs, commits, CI transitions, reopen, resume, startup and midnight grant no
+permission to call a model. Prior reports stay available under their recorded
+versions.
 
 ## Versions and audit
 
@@ -91,8 +135,8 @@ versions remain in history. Draft is rechecked before dispatch and before admiss
 A workflow waiting for a global slot has a dispatch guard, so it checks again when
 it actually starts. Per-profile concurrency is one. The queue keeps a PR-level waiting timestamp
 across superseded versions and moves a claimed PR to the back, so frequent base
-changes cannot repeatedly prioritize the same PRs. Failed attempts back off and
-are capped. Observation errors do not starve other PRs and are retried at the next
+changes cannot repeatedly prioritize the same PRs in automatic mode. Automatic
+failed attempts back off and are capped; manual attempts require a new request. Observation errors do not starve other PRs and are retried at the next
 poll.
 
 ## Budget semantics and recovery
@@ -121,8 +165,9 @@ spend and excess; new runs stop when committed budget reaches the cap. If a run
 actually started but was interrupted by a daemon restart, its unreported remainder
 stays reserved as uncertainty, separately from measured spend. Pending runs that
 never started are not charged. A per-version limit preserves the partial review
-and never completes the PR task. Daily exhaustion keeps versions queued while
-polling continues.
+and never completes the PR task. Daily exhaustion keeps automatic versions queued while polling continues. In
+manual mode it cancels pending requests; another click is required when capacity
+becomes available.
 
 Notifications combine discoveries and lifecycle changes; ordinary results
 accumulate in a ten-minute digest. Unchanged serious findings are deduplicated.
@@ -133,15 +178,22 @@ unchanged polls remain silent.
 
 1. Install the application change through the normal reviewed application path.
    Back up the database/workspace, run migrations and the frontend build. Migration
-   v062 is idempotent and adds tables without rewriting existing task data.
+   v062 originally added review tables. This fork adds `fork/v001_review_requests`
+   on the separate fork track, without reusing v062 or modifying the upstream
+   schema version. It only creates the request table/indexes and is idempotent;
+   existing tasks, versions, artifacts, spend and attempt counters stay intact.
+   Keep the pre-upgrade backup: older code without fork v001 refuses the newer
+   fork schema. A future upstream port must follow `migrations/fork/README.md`
+   and be numbered against upstream at publication time.
 2. Review the disabled workspace profile through the configuration PR path. Keep
    other cron jobs/model settings unchanged. Synchronize explicitly when automatic
    workspace sync is disabled. Validate with the newly installed application version.
-3. Enable the reviewed profile and restart. Check `/api/code-review/status` and the
+3. Select `review_mode: manual`, install and restart before resuming observation. Check `/api/code-review/status` and the
    board for the actual `code-review-<profile>` job, time zone, last success and next
    run. Check that search was complete and unique task count matches eligible PRs.
-4. Inspect one complete workflow (or an explicit budget queue), its SHA, all three
-   stages and previous-version selector. Repeated unchanged polling must preserve
+4. Verify launch/queue/error paths with a test executor. The first real paid
+   review requires a user click; do not launch paid reviews for installation
+   acceptance. Inspect saved reports, SHAs, stages and the previous-version selector. Repeated unchanged polling must preserve
    board order; a new SHA must produce a version. Check draft, close and reopen.
 5. Pause the profile to stop its work without deleting the archive. Disable it in
    reviewed configuration before the next installation if shutdown is permanent.
