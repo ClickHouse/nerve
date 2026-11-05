@@ -1,8 +1,10 @@
+import { parse, View } from 'vega';
 import { compile, type TopLevelSpec } from 'vega-lite';
 import { describe, expect, it } from 'vitest';
 import { luminance, readThemeTokens, type ThemeTokens } from './tokens';
 import {
   contrast,
+  DATE_LABELS,
   DEFAULT_HEIGHT,
   isContainerSized,
   schemaMode,
@@ -14,7 +16,9 @@ import {
 
 const FONT = 'Inter, ui-sans-serif, system-ui, sans-serif';
 
-// The app's tokens as the browser resolves them, in both themes.
+// The app's tokens as the browser resolves them, in both themes, the palette
+// in tokens.ts's order: blue, orange, emerald, cyan, yellow, purple, teal,
+// red, violet, sky.
 const DARK: ThemeTokens = {
   theme: 'dark',
   bg: '#1f1f1c',
@@ -25,7 +29,7 @@ const DARK: ThemeTokens = {
   textMuted: '#bfbfbf',
   textFaint: '#979797',
   accent: '#faff69',
-  palette: ['#437eef', '#dd99ff', '#6df8e1', '#ff9457', '#66ff73', '#ff7575', '#6d9bf3', '#faff69', '#cc66ff', '#33e4ff'],
+  palette: ['#437eef', '#ff9457', '#66ff73', '#33e4ff', '#faff69', '#cc66ff', '#6df8e1', '#ff7575', '#dd99ff', '#6d9bf3'],
   fontFamily: FONT,
 };
 const LIGHT: ThemeTokens = {
@@ -38,7 +42,7 @@ const LIGHT: ThemeTokens = {
   textMuted: '#4b4a4c',
   textFaint: '#686869',
   accent: '#151515',
-  palette: ['#104ec6', '#8800cc', '#067462', '#a33c00', '#006f09', '#c10000', '#1d64ec', '#856500', '#660099', '#006170'],
+  palette: ['#104ec6', '#a33c00', '#007109', '#006170', '#856500', '#660099', '#067462', '#c10000', '#8800cc', '#1d64ec'],
   fontFamily: FONT,
 };
 
@@ -47,6 +51,12 @@ type Block = Record<string, unknown>;
 /** A config section, for reading values the tests pin down. */
 function section(config: object, key: string): Block {
   return ((config as Record<string, unknown>)[key] ?? {}) as Block;
+}
+
+/** Warm reads as more red than blue, cool as more blue than red. */
+function warmth(hex: string): number {
+  const n = parseInt(hex.slice(1), 16);
+  return ((n >> 16) & 255) - (n & 255);
 }
 
 /** Every string in the config that is meant as a colour. */
@@ -129,7 +139,19 @@ describe('vegaConfigFor', () => {
     // An ordinal step is a mark, so even the palest still reads.
     expect(contrast(ordinal[0], tokens.surface)).toBeGreaterThanOrEqual(2);
     expect(contrast((range.heatmap as string[])[0], tokens.surface)).toBeLessThan(contrast(ordinal[0], tokens.surface));
-    expect((range.diverging as string[])[2]).toBe(tokens.palette[0]);
+  });
+
+  it.each([DARK, LIGHT])('diverges in $theme from a warm pole to a cool one through a near-surface neutral', (tokens) => {
+    const [warm, neutral, cool] = section(vegaConfigFor(tokens), 'range').diverging as string[];
+    expect(warm).toBe(tokens.palette[1]);
+    expect(cool).toBe(tokens.palette[0]);
+    // Two poles that read as opposites; blue against cyan would both be cool.
+    expect(warmth(warm)).toBeGreaterThan(0);
+    expect(warmth(cool)).toBeLessThan(0);
+    // Each pole stands clear of the surface, the midpoint barely does.
+    expect(contrast(warm, tokens.surface)).toBeGreaterThanOrEqual(3);
+    expect(contrast(cool, tokens.surface)).toBeGreaterThanOrEqual(3);
+    expect(contrast(neutral, tokens.surface)).toBeLessThan(1.5);
   });
 
   it('gives a full Vega spec its marks\' colours, and Vega-Lite none that would outrank a spec', () => {
@@ -299,6 +321,38 @@ describe('withDefaults', () => {
       expect(parseOf(pinned)).toBeUndefined();
       expect(parseOf({ ...line, encoding: { ...line.encoding, x: { field: 'day', type: 'ordinal' }, tooltip: undefined } })).toBeUndefined();
     });
+
+    const axisOf = (spec: Record<string, unknown>, channel = 'x') =>
+      (((withDefaults(spec, 'vega-lite').encoding as Block)[channel] as Block).axis);
+
+    it('labels a time axis in one style, keeping what else the axis says', () => {
+      expect(axisOf(line)).toEqual({ format: DATE_LABELS });
+      const titled = { ...line, encoding: { ...line.encoding, x: { field: 'day', type: 'temporal', axis: { title: 'Day' } } } };
+      expect(axisOf(titled)).toEqual({ title: 'Day', format: DATE_LABELS });
+      const vertical = { ...line, encoding: { x: { field: 'n', type: 'quantitative' }, y: { field: 'day', type: 'temporal' } } };
+      expect(axisOf(vertical, 'y')).toEqual({ format: DATE_LABELS });
+    });
+
+    it('keeps the labels of a time unit, of an axis the spec labels itself, and of a spec\'s own config', () => {
+      const unit = { ...line, encoding: { ...line.encoding, x: { field: 'day', type: 'temporal', timeUnit: 'day' } } };
+      expect(axisOf(unit)).toBeUndefined();
+      const formatted = { ...line, encoding: { ...line.encoding, x: { field: 'day', type: 'temporal', axis: { format: '%d %b' } } } };
+      expect(axisOf(formatted)).toEqual({ format: '%d %b' });
+      const expressed = { ...line, encoding: { ...line.encoding, x: { field: 'day', type: 'temporal', axis: { labelExpr: 'datum.label' } } } };
+      expect(axisOf(expressed)).toEqual({ labelExpr: 'datum.label' });
+      const hidden = { ...line, encoding: { ...line.encoding, x: { field: 'day', type: 'temporal', axis: null } } };
+      expect(axisOf(hidden)).toBeNull();
+      expect(axisOf({ ...line, config: { axisTemporal: { format: '%b' } } })).toBeUndefined();
+    });
+
+    it('labels time axes inside layers and composite views', () => {
+      const layered = withDefaults({ data: { values: days }, layer: [{ mark: 'line', encoding: line.encoding }] }, 'vega-lite');
+      expect((((layered.layer as Block[])[0].encoding as Block).x as Block).axis).toEqual({ format: DATE_LABELS });
+      const concat = withDefaults({ data: { values: days }, vconcat: [{ mark: 'line', encoding: line.encoding }, plain] }, 'vega-lite');
+      const views = concat.vconcat as Block[];
+      expect(((views[0].encoding as Block).x as Block).axis).toEqual({ format: DATE_LABELS });
+      expect(views[1]).toBe(plain);
+    });
   });
 
   it('tells the libraries apart by the spec when no mode is given', () => {
@@ -345,6 +399,52 @@ describe('compiled by Vega-Lite', () => {
     const json = JSON.stringify(compiled(line).data);
     expect(json).toContain("timeParse(datum[\\\"day\\\"],'%Y-%m-%d')");
     expect(json).not.toMatch(/toDate|utcParse/);
+  });
+
+  it('hands Vega the time axis format as a multi-format, and leaves a time unit\'s labels to Vega-Lite', () => {
+    const line = {
+      data: { values: [{ day: '2026-10-01', n: 1 }, { day: '2026-10-05', n: 3 }] },
+      mark: 'line',
+      encoding: { x: { field: 'day', type: 'temporal' }, y: { field: 'n', type: 'quantitative' } },
+    };
+    const bottom = (compiled(line).axes ?? []).find(a => a.orient === 'bottom' && a.labels !== false);
+    expect(bottom?.format).toEqual(DATE_LABELS);
+    const weekdays = { ...line, encoding: { ...line.encoding, x: { field: 'day', type: 'temporal', timeUnit: 'day' } } };
+    const unitAxis = (compiled(weekdays).axes ?? []).find(a => a.orient === 'bottom' && a.labels !== false);
+    expect(unitAxis?.format).not.toEqual(DATE_LABELS);
+  });
+
+  /** The labels Vega draws along the bottom axis, from a headless render. */
+  async function bottomLabels(days: string[]): Promise<string[]> {
+    const line = {
+      // Wide enough that no label is dropped for overlap: jsdom has no
+      // canvas, so Vega only estimates how wide text is.
+      width: 600,
+      data: { values: days.map((day, i) => ({ day, n: i })) },
+      mark: 'line',
+      encoding: { x: { field: 'day', type: 'temporal' }, y: { field: 'n', type: 'quantitative' } },
+    };
+    const view = new View(parse(compiled(line)), { renderer: 'none' });
+    try {
+      const svg = await view.toSVG();
+      const axis = /<g class="mark-group role-axis"[^>]*aria-label="X-axis[\s\S]*?(?=<g class="mark-group role-axis"|$)/.exec(svg)?.[0] ?? '';
+      const labels = /<g class="mark-text role-axis-label"[^>]*>([\s\S]*?)<\/g>/.exec(axis)?.[1] ?? '';
+      return [...labels.matchAll(/<text[^>]*>([^<]*)<\/text>/g)].map(m => m[1]);
+    } finally {
+      view.finalize();
+    }
+  }
+
+  it('draws a short date axis in one style: "Oct 01 · Oct 02 · Oct 03"', async () => {
+    // Oct 1 starts a month and a quarter and Oct 4 is a Sunday: Vega's own
+    // labels would be "October", "Fri 02", "Sat 03", "Oct 04".
+    const labels = await bottomLabels(['2026-10-01', '2026-10-02', '2026-10-03', '2026-10-04', '2026-10-05']);
+    expect(labels).toEqual(['Oct 01', 'Oct 02', 'Oct 03', 'Oct 04', 'Oct 05']);
+  });
+
+  it('marks the turn of a year on a date axis with the year', async () => {
+    const labels = await bottomLabels(['2026-12-29', '2026-12-30', '2026-12-31', '2027-01-01', '2027-01-02']);
+    expect(labels).toEqual(['Dec 29', 'Dec 30', 'Dec 31', '2027', 'Jan 02']);
   });
 
   it('still lets a spec colour its own marks', () => {

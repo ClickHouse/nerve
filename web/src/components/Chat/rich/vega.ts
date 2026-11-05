@@ -171,11 +171,16 @@ export function mountVega(mode: VegaMode): Mount {
     const narrow = stageWidth > 0 && stageWidth < NARROW_WIDTH;
     // vega + vega-lite + vega-embed are their own chunk, fetched the first
     // time a chat shows a chart.
-    const { default: embed } = await import('vega-embed');
+    const { default: embed, vega } = await import('vega-embed');
     installTooltipStyle(tokens.fontFamily);
     const result = await embed(stage, spec as VisualizationSpec, {
       mode: specMode,
       renderer: 'svg',
+      // Vega and Vega-Lite warn on the console about whatever in a spec they
+      // quietly work around; a chat showing a chart is no place for that.
+      // Errors still log, and a spec that cannot be drawn rejects here and
+      // shows as the block's failure.
+      logLevel: vega.Error,
       // No action menu: the figure around the chart has the downloads, the
       // block has its own source toggle, and "open in editor" would send the
       // spec and its data to another site.

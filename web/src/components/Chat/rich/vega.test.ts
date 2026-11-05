@@ -4,13 +4,15 @@ import { assertSelfContained, mountVega, parseSpec, tooltipHtml } from './vega';
 import { TOOLTIP_THEME, vegaConfigFor } from './vegaTheme';
 
 // vega-embed, stubbed: it records what it is asked to draw and with which
-// options, and draws an empty <svg> of the size Vega would.
+// options, and draws an empty <svg> of the size Vega would. `vega` carries
+// Vega's log levels, as the real module's re-export does.
 const embed = vi.hoisted(() => vi.fn());
-vi.mock('vega-embed', () => ({ default: embed }));
+vi.mock('vega-embed', () => ({ default: embed, vega: { None: 0, Error: 1, Warn: 2 } }));
 
 interface EmbedOptions {
   mode?: string;
   renderer?: string;
+  logLevel?: number;
   actions?: unknown;
   theme?: unknown;
   config?: Record<string, Record<string, unknown>>;
@@ -117,6 +119,8 @@ describe('mountVega', () => {
     expect(options.actions).toBe(false);
     expect(options.mode).toBe('vega-lite');
     expect(options.renderer).toBe('svg');
+    // Errors only: no console warnings for what a spec gets away with.
+    expect(options.logLevel).toBe(1);
     // The app's own config, not a vega-themes theme.
     expect(options.theme).toBeUndefined();
     const tokens = readThemeTokens('dark');

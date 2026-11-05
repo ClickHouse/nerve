@@ -372,6 +372,63 @@ function withLocalDates(spec: Spec): Spec {
   return { ...spec, data: { ...data, format: { ...format, parse: { ...parse, ...local } } } };
 }
 
+/**
+ * A time axis's labels, in one style for the whole axis. Vega picks a format
+ * per tick from what that tick falls on — a Sunday "Oct 04", any other day
+ * "Fri 02", the first of a month or quarter "October" — so a week's axis mixes
+ * three. Here every day, week, month and quarter tick reads "Oct 01"; the
+ * first tick of a year reads "2027", and times of day "18:00". (A Vega
+ * time multi-format: the format for the unit a tick falls on.)
+ */
+export const DATE_LABELS: Readonly<Record<string, string>> = {
+  year: '%Y',
+  quarter: '%b %d',
+  month: '%b %d',
+  week: '%b %d',
+  date: '%b %d',
+  hours: '%H:%M',
+  minutes: '%H:%M',
+};
+
+/** Where views sit inside a Vega-Lite spec. */
+const VIEW_KEYS = ['layer', 'concat', 'hconcat', 'vconcat', 'spec'];
+/** Config blocks where a spec may have set its own time-axis labels. */
+const TIME_LABEL_CONFIGS = ['axis', 'axisX', 'axisY', 'axisTemporal', 'axisXTemporal', 'axisYTemporal'];
+
+function hasOwnLabels(block: unknown): boolean {
+  return isRecord(block) && (block.format !== undefined || block.formatType !== undefined || block.labelExpr !== undefined);
+}
+
+/**
+ * `DATE_LABELS` on every time axis in the spec, axis by axis, where Vega-Lite
+ * would otherwise leave the labels to Vega's per-tick default. A field with a
+ * time unit keeps the labels Vega-Lite gives that unit ("Mon", "Q1 2026"),
+ * and an axis the spec labels itself keeps its own. As config the format
+ * would outrank the time units' formats too, which is why it is set here.
+ */
+function withDateLabels(view: Spec): Spec {
+  let out = view;
+  const encoding = isRecord(view.encoding) ? view.encoding : undefined;
+  for (const channel of ['x', 'y']) {
+    const def = encoding?.[channel];
+    if (!isRecord(def) || def.type !== 'temporal' || def.timeUnit !== undefined) continue;
+    if (def.axis === null || hasOwnLabels(def.axis)) continue;
+    const axis = isRecord(def.axis) ? def.axis : {};
+    out = { ...out, encoding: { ...(out.encoding as Spec), [channel]: { ...def, axis: { ...axis, format: { ...DATE_LABELS } } } } };
+  }
+  for (const key of VIEW_KEYS) {
+    const child = view[key];
+    if (Array.isArray(child)) {
+      const views = child.map(item => (isRecord(item) ? withDateLabels(item) : item));
+      if (views.some((item, i) => item !== child[i])) out = { ...out, [key]: views };
+    } else if (isRecord(child)) {
+      const next = withDateLabels(child);
+      if (next !== child) out = { ...out, [key]: next };
+    }
+  }
+  return out;
+}
+
 function definesSignal(spec: Spec, name: string): boolean {
   return Array.isArray(spec.signals) && spec.signals.some(s => isRecord(s) && s.name === name);
 }
@@ -392,17 +449,24 @@ function guessMode(spec: Spec): VegaMode {
  * The spec with the sizing the chat prefers wherever the spec leaves it open:
  * the column's width, and a 280 px plot. A spec that sizes itself, sets an
  * autosize that cannot fit a container, or draws several views keeps its own
- * layout. A Vega-Lite spec also gets level category labels where they fit
- * and its inline dates read as local dates (see `withLocalDates`). Returns a
- * new object and leaves `spec` as it was.
+ * layout. A Vega-Lite spec also gets level category labels where they fit,
+ * time axes labelled in one style (`DATE_LABELS`) and its inline dates read
+ * as local dates (see `withLocalDates`). Returns a new object and leaves
+ * `spec` as it was.
  *
  * Vega-Lite takes `width: "container"`. A full Vega spec has no such value —
  * its width is a number or a signal — so it gets the signal Vega-Lite would
  * compile that to: the container's width, re-read when the container resizes.
  */
 export function withDefaults(spec: Spec, mode: VegaMode = guessMode(spec)): Spec {
+  let labelled = spec;
+  if (mode === 'vega-lite') {
+    const config = isRecord(spec.config) ? spec.config : {};
+    labelled = withLocalDates(spec);
+    if (!TIME_LABEL_CONFIGS.some(key => hasOwnLabels(config[key]))) labelled = withDateLabels(labelled);
+  }
   // A copy, always: the defaults are set on it, never on the caller's spec.
-  const out: Spec = { ...(mode === 'vega-lite' ? withLocalDates(spec) : spec) };
+  const out: Spec = { ...labelled };
   const fits = spec.autosize === undefined || ['fit', 'fit-x'].includes(autosizeType(spec.autosize) ?? '');
 
   if (mode === 'vega-lite') {
