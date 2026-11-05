@@ -1433,6 +1433,13 @@ export const api = {
       };
       models: { id: string; provider: string; backend: string }[];
       ollama: { enabled: boolean; routable: boolean; available: boolean };
+      /** The server's interactive default effort (`agent.effort`). Absent
+          from an older backend. */
+      effort_default?: string;
+      /** Model id → the effort levels it accepts, low…max. `[]` = effort
+          doesn't apply (e.g. Ollama); a model absent from the map takes all
+          five. Absent from an older backend. */
+      effort_levels?: Record<string, string[]>;
     }>('/models'),
 
   // Sessions
@@ -1446,7 +1453,7 @@ export const api = {
   searchSessions: (q: string) =>
     request<{ sessions: any[] }>(`/sessions/search?q=${encodeURIComponent(q)}`),
   getSession: (id: string) => request<any>(`/sessions/${id}`),
-  createSession: (title?: string, backend?: string | null, cwd?: string | null, reviewLoop?: ReviewLoopCreatePayload | null, model?: string | null, daybreak?: boolean) =>
+  createSession: (title?: string, backend?: string | null, cwd?: string | null, reviewLoop?: ReviewLoopCreatePayload | null, model?: string | null, daybreak?: boolean, effort?: string | null) =>
     request<any>('/sessions', {
       method: 'POST',
       body: JSON.stringify({
@@ -1456,6 +1463,9 @@ export const api = {
         // so the header badge is right from the first render (omitted →
         // the backend's default model).
         ...(model ? { model } : {}),
+        // Composer's effort pick, kept on the session the same way
+        // (omitted → the server's default effort).
+        ...(effort ? { effort } : {}),
         ...(cwd ? { cwd } : {}),
         ...(reviewLoop ? { review_loop: reviewLoop } : {}),
         // The composer's Daybreak switch (Codex), sent only when it is on.
@@ -1505,7 +1515,8 @@ export const api = {
     ),
   deleteSession: (id: string) =>
     request<any>(`/sessions/${id}`, { method: 'DELETE' }),
-  updateSession: (id: string, data: { title?: string; starred?: boolean; model?: string; parent_session_id?: string | null; codex_daybreak?: boolean }) =>
+  /** `effort: null` puts the chat back on the server's default effort. */
+  updateSession: (id: string, data: { title?: string; starred?: boolean; model?: string; parent_session_id?: string | null; codex_daybreak?: boolean; effort?: string | null }) =>
     request<any>(`/sessions/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   regenerateSessionTitle: (id: string) =>
     request<{ title: string }>(`/sessions/${id}/regenerate-title`, { method: 'POST' }),
