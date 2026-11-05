@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { sanitizeSvg } from './svg';
+import { mountSvg, naturalSizeOf, sanitizeSvg } from './svg';
 
 const wrap = (inner: string) =>
   `<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 10 10">${inner}</svg>`;
@@ -59,6 +59,19 @@ describe('sanitizeSvg', () => {
     expect(clean).not.toContain('cursor');
   });
 
+  it('drops styles that spell url() with CSS escapes', () => {
+    const clean = sanitizeSvg(wrap(
+      '<rect width="10" height="10" style="background:\\75 rl(https://example.invalid/a.png)"/>'
+      + '<rect width="10" height="10" style="fill: \\u\\r\\l(https://example.invalid/b.svg#p)"/>'
+      + '<style>rect { cursor: \\75\\72\\6c(https://example.invalid/c.cur) }</style>'
+      + '<text style="fill: green">ok</text>',
+    ));
+    expect(clean).not.toContain('example.invalid');
+    expect(clean).not.toContain('\\75');
+    expect(clean).toContain('style="fill: green"');
+    expect((clean.match(/<rect/g) ?? []).length).toBe(2);
+  });
+
   it('refuses a block that is not an svg', () => {
     expect(() => sanitizeSvg('<div>not a picture</div>')).toThrow(/no <svg>/);
     expect(() => sanitizeSvg('plain text')).toThrow(/no <svg>/);
@@ -68,5 +81,88 @@ describe('sanitizeSvg', () => {
     const clean = sanitizeSvg(`<?xml version="1.0" encoding="UTF-8"?>\n${wrap('<rect width="1" height="1"/>')}`);
     expect(clean).toMatch(/^<svg/);
     expect(clean).toContain('<rect');
+  });
+});
+
+/** An <svg> element with `attributes`, parsed the way the page parses one. */
+function svgWith(attributes: string): SVGSVGElement {
+  const host = document.createElement('div');
+  host.innerHTML = `<svg ${attributes}><rect width="1" height="1"/></svg>`;
+  return host.querySelector('svg')!;
+}
+
+describe('naturalSizeOf', () => {
+  it('reads width and height, in any absolute unit', () => {
+    expect(naturalSizeOf(svgWith('width="400" height="200"'))).toEqual({ width: 400, height: 200 });
+    expect(naturalSizeOf(svgWith('width="400px" height="200px" viewBox="0 0 10 10"'))).toEqual({ width: 400, height: 200 });
+    expect(naturalSizeOf(svgWith('width="72pt" height="1in"'))).toEqual({ width: 96, height: 96 });
+    expect(naturalSizeOf(svgWith('width="2em" height="25.4mm"'))).toEqual({ width: 32, height: 96 });
+  });
+
+  it('falls back to the viewBox, alone or for the missing side', () => {
+    expect(naturalSizeOf(svgWith('viewBox="0 0 800 400"'))).toEqual({ width: 800, height: 400 });
+    expect(naturalSizeOf(svgWith('viewBox="-10,-10,800,400"'))).toEqual({ width: 800, height: 400 });
+    expect(naturalSizeOf(svgWith('width="400" viewBox="0 0 800 400"'))).toEqual({ width: 400, height: 200 });
+    expect(naturalSizeOf(svgWith('height="100" viewBox="0 0 800 400"'))).toEqual({ width: 200, height: 100 });
+  });
+
+  it('takes a percentage as no size at all', () => {
+    expect(naturalSizeOf(svgWith('width="100%" viewBox="0 0 800 400"'))).toEqual({ width: 800, height: 400 });
+    expect(naturalSizeOf(svgWith('width="100%" height="50%" viewBox="0 0 640 480"'))).toEqual({ width: 640, height: 480 });
+    expect(naturalSizeOf(svgWith('width="50vw" height="300" viewBox="0 0 400 300"'))).toEqual({ width: 400, height: 300 });
+    expect(naturalSizeOf(svgWith('width="100%"'))).toBeUndefined();
+    expect(naturalSizeOf(svgWith(''))).toBeUndefined();
+    expect(naturalSizeOf(svgWith('viewBox="0 0 0 10"'))).toBeUndefined();
+  });
+});
+
+describe('mountSvg', () => {
+  it('states the natural size on the picture and in the file', async () => {
+    const stage = document.createElement('div');
+    const mounted = await mountSvg(stage, '<svg width="100%" viewBox="0 0 800 400"><rect width="800" height="400" fill="#0af"/></svg>', { theme: 'dark', width: 600 });
+    expect(mounted.naturalSize).toEqual({ width: 800, height: 400 });
+    const shown = stage.querySelector('svg')!;
+    expect(shown.getAttribute('width')).toBe('800');
+    expect(shown.getAttribute('height')).toBe('400');
+
+    // The frame sizes the picture on screen; the file keeps the natural size.
+    shown.style.width = '300px';
+    shown.setAttribute('width', '300');
+    const file = (await mounted.toSvg!())!;
+    const doc = new DOMParser().parseFromString(file, 'image/svg+xml');
+    expect(doc.querySelector('parsererror')).toBeNull();
+    expect(doc.documentElement.namespaceURI).toBe('http://www.w3.org/2000/svg');
+    expect(doc.documentElement.getAttribute('width')).toBe('800');
+    expect(doc.documentElement.getAttribute('height')).toBe('400');
+    expect(file).not.toContain('300px');
+
+    mounted.cleanup();
+    expect(stage.innerHTML).toBe('');
+  });
+
+  it('writes a file an XML reader accepts, still sanitized', async () => {
+    const stage = document.createElement('div');
+    const mounted = await mountSvg(
+      stage,
+      '<svg viewBox="0 0 10 10"><script>alert(1)</script><use xlink:href="#s"/><symbol id="s"/><text>a&nbsp;b &amp; c</text></svg>',
+      { theme: 'light', width: 600 },
+    );
+    const file = (await mounted.toSvg!())!;
+    const doc = new DOMParser().parseFromString(file, 'image/svg+xml');
+    expect(doc.querySelector('parsererror')).toBeNull();
+    expect(file).not.toContain('script');
+    expect(file).not.toContain('&nbsp;');
+    expect(doc.querySelector('text')?.textContent).toBe('a b & c');
+    // The xlink prefix is declared wherever it is used.
+    expect(doc.querySelector('use')?.getAttributeNS('http://www.w3.org/1999/xlink', 'href')).toBe('#s');
+    expect(doc.documentElement.getAttribute('width')).toBe('10');
+  });
+
+  it('leaves a picture with no size to the frame', async () => {
+    const stage = document.createElement('div');
+    const mounted = await mountSvg(stage, '<svg><circle r="4"/></svg>', { theme: 'dark', width: 600 });
+    expect(mounted.naturalSize).toBeUndefined();
+    expect(stage.querySelector('svg')!.hasAttribute('width')).toBe(false);
+    expect(await mounted.toSvg!()).toMatch(/^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
   });
 });

@@ -10,8 +10,13 @@ import type { Mount } from './types';
  */
 const EXTERNAL_CSS = /url\(\s*['"]?\s*(?!#)|@import\b|image-set\(|\bsrc\(/i;
 
+/**
+ * CSS escapes spell any of the above a second way (`\75 rl(` is `url(` to
+ * the browser), and a picture's styling has no honest use for a backslash,
+ * so one is treated as the external reference it may hide.
+ */
 function hasExternalCss(value: string | null | undefined): boolean {
-  return !!value && EXTERNAL_CSS.test(value);
+  return !!value && (value.includes('\\') || EXTERNAL_CSS.test(value));
 }
 
 const CONFIG = {
@@ -72,27 +77,70 @@ export function sanitizeSvg(source: string): string {
   return clean;
 }
 
-/** The picture's size from its `width`/`height` attributes, else its viewBox. */
-function naturalSizeOf(svg: SVGSVGElement): { width: number; height: number } | undefined {
-  const w = svg.getAttribute('width') ?? '';
-  const h = svg.getAttribute('height') ?? '';
-  const width = parseFloat(w);
-  const height = parseFloat(h);
-  if (width > 0 && height > 0 && !w.endsWith('%') && !h.endsWith('%')) return { width, height };
+/** CSS pixels per unit, for the absolute units an SVG size may carry; the font-relative ones at the 16px default. */
+const PX_PER_UNIT: Record<string, number> = {
+  '': 1, px: 1, pt: 4 / 3, pc: 16, in: 96, cm: 96 / 2.54, mm: 96 / 25.4, q: 96 / 101.6, em: 16, rem: 16, ex: 8, ch: 8,
+};
+
+/** A `width`/`height` attribute in CSS pixels; NaN for a percentage, a viewport unit or nothing. */
+function lengthPx(value: string | null): number {
+  const m = /^\s*([0-9]*\.?[0-9]+(?:e[+-]?\d+)?)\s*([a-z]*)\s*$/i.exec(value ?? '');
+  const scale = m ? PX_PER_UNIT[m[2].toLowerCase()] : undefined;
+  return m && scale !== undefined ? parseFloat(m[1]) * scale : NaN;
+}
+
+/**
+ * The size the browser draws the picture at: its `width` and `height`; one
+ * of them and the viewBox's aspect ratio; else the viewBox itself. A
+ * percentage says nothing about the picture (it sizes against the page) and
+ * counts as absent.
+ */
+export function naturalSizeOf(svg: SVGSVGElement): { width: number; height: number } | undefined {
+  const width = lengthPx(svg.getAttribute('width'));
+  const height = lengthPx(svg.getAttribute('height'));
   const box = (svg.getAttribute('viewBox') ?? '').trim().split(/[\s,]+/).map(Number);
-  if (box.length === 4 && box[2] > 0 && box[3] > 0) return { width: box[2], height: box[3] };
+  const aspect = box.length === 4 && box[2] > 0 && box[3] > 0 ? box[3] / box[2] : NaN;
+  if (width > 0 && height > 0) return { width, height };
+  if (width > 0 && aspect > 0) return { width, height: width * aspect };
+  if (height > 0 && aspect > 0) return { width: height / aspect, height };
+  if (aspect > 0) return { width: box[2], height: box[3] };
   return undefined;
+}
+
+/**
+ * The picture as a file of its own, at its natural size in place of a
+ * percentage. XML serialization: it declares the SVG (and xlink) namespaces
+ * a standalone document needs and inline SVG does without, and it writes no
+ * `&nbsp;` or unclosed tag that a file cannot hold.
+ */
+function standalone(svg: SVGSVGElement, size: { width: number; height: number } | undefined): string {
+  const copy = svg.cloneNode(true) as SVGSVGElement;
+  if (size) {
+    copy.setAttribute('width', String(size.width));
+    copy.setAttribute('height', String(size.height));
+  }
+  return new XMLSerializer().serializeToString(copy);
 }
 
 export const mountSvg: Mount = async (stage, source) => {
   const clean = sanitizeSvg(source);
   stage.innerHTML = clean;
   const element = stage.querySelector('svg');
+  const naturalSize = element ? naturalSizeOf(element) : undefined;
+  if (element && naturalSize) {
+    // The picture states its own size (`width="100%"` would stretch it to
+    // the column); the frame fits or scrolls it.
+    element.setAttribute('width', String(naturalSize.width));
+    element.setAttribute('height', String(naturalSize.height));
+  }
+  // The file is made from the picture as drawn, whatever the frame does to
+  // the element on screen afterwards.
+  const drawn = element?.cloneNode(true) as SVGSVGElement | undefined;
   return {
     cleanup: () => {
       stage.innerHTML = '';
     },
-    naturalSize: element ? naturalSizeOf(element) : undefined,
-    toSvg: async () => clean,
+    naturalSize,
+    toSvg: async () => (drawn ? standalone(drawn, naturalSize) : null),
   };
 };

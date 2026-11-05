@@ -139,6 +139,12 @@ export function luminance(hex: string): number {
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
+/** WCAG contrast ratio of two hex colours, 1 (none) to 21 (black on white); order does not matter. */
+export function contrastRatio(a: string, b: string): number {
+  const [hi, lo] = [luminance(a), luminance(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+
 /**
  * A CSS variable's colour as hex. The variable's value may itself be a
  * `var()` or `color-mix()`, so it is resolved through an element the browser
@@ -159,11 +165,24 @@ function resolveVar(name: string, over: string): string | null {
 
 const cache = new Map<ResolvedTheme, ThemeTokens>();
 
+/**
+ * The theme the page shows, from the attribute themeStore keeps on <html>;
+ * null where nothing has set it (tests, a page without the store).
+ */
+function shownTheme(): string | null {
+  return typeof document === 'undefined' ? null : document.documentElement.getAttribute('data-cui-theme');
+}
+
 /** The tokens for `theme`, resolved once per theme from the stylesheet. */
 export function readThemeTokens(theme: ResolvedTheme): ThemeTokens {
   const cached = cache.get(theme);
   if (cached) return cached;
   const fallback = FALLBACK[theme];
+  // The variables resolve to the theme the page shows. Asked for the other
+  // one (a render that started before a theme switch), they would be that
+  // theme's colours filed under this one's name for the rest of the session.
+  const shown = shownTheme();
+  if (shown && shown !== theme) return fallback;
   const bg = resolveVar(TOKEN_VARS.bg, fallback.bg) ?? fallback.bg;
   let resolvedAny = bg !== fallback.bg;
   const pick = (name: string, fallbackValue: string): string => {
