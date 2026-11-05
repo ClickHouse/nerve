@@ -17,8 +17,8 @@ import {
 const FONT = 'Inter, ui-sans-serif, system-ui, sans-serif';
 
 // The app's tokens as the browser resolves them, in both themes, the palette
-// in tokens.ts's order: blue, orange, emerald, cyan, yellow, purple, teal,
-// red, violet, sky.
+// in tokens.ts's order: blue, orange, cyan, emerald, purple, yellow, violet,
+// teal, red, sky.
 const DARK: ThemeTokens = {
   theme: 'dark',
   bg: '#1f1f1c',
