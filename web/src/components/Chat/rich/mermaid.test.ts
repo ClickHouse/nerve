@@ -450,6 +450,20 @@ describe('mountMermaid', () => {
       expect(chips.map(chip => chip.style.backgroundColor)).toEqual(['rgb(4, 5, 6)', 'rgb(1, 2, 3)', '']);
     });
 
+    it('reports the smallest text it draws, at the picture\'s natural size', async () => {
+      // Drawn text has client rects; hidden text has none.
+      vi.spyOn(Element.prototype, 'getClientRects').mockImplementation(function (this: Element) {
+        const drawn = this.hasAttribute('data-font') && (this as HTMLElement).style.display !== 'none';
+        return (drawn ? [{}] : []) as unknown as DOMRectList;
+      });
+      // Shown at twice its viewBox: 13px text in it is 26px on screen.
+      render('<svg id="ID" width="400" height="200" viewBox="0 0 200 100">'
+        + '<text data-font="13px">a</text><text data-font="17px">b</text>'
+        + '<text data-font="12px" style="display: none">hidden</text><title>accessible name</title></svg>');
+      const mounted = await mountMermaid(stage, 'flowchart LR\n  A --> B', { theme: 'dark', width: 680 });
+      expect(mounted.minTextPx).toBe(26);
+    });
+
     it('lifts text under 11px to 11px, and hides what a treemap shrank to fit a cell', async () => {
       render('<svg id="ID" width="400" height="200" viewBox="0 0 400 200">'
         + '<text data-font="9px">small</text><text data-font="14px">fine</text>'
@@ -460,6 +474,90 @@ describe('mountMermaid', () => {
       expect(fine.style.fontSize).toBe('');
       expect(tiny.style.display).toBe('none');
     });
+  });
+
+  it('reports the smallest text by diagram type where nothing can be measured', async () => {
+    // jsdom lays nothing out: the floor each type is drawn with stands in.
+    const minText = async (type: string) => {
+      fake.getDiagramFromText.mockResolvedValueOnce({ type, db: {} });
+      return (await mountMermaid(stage, 'flowchart LR\n  A --> B', { theme: 'dark', width: 680 })).minTextPx;
+    };
+    expect(await minText('flowchart-v2')).toBe(14);
+    expect(await minText('xychart')).toBe(12);
+    expect(await minText('gantt')).toBe(12);
+    expect(await minText('c4')).toBe(11);
+    expect(await minText('packet')).toBe(11);
+  });
+
+  describe('a chart drawn to the column', () => {
+    let columnWidth = 680;
+    /** The fake draws an xychart as wide as mermaid was told to. */
+    const drawAtConfiguredWidth = async (id: string) => {
+      const w = config().xyChart.width;
+      return { svg: `<svg id="${id}" width="${w}" height="300" viewBox="0 0 ${w} 300"><g/></svg>` };
+    };
+    beforeEach(() => {
+      columnWidth = 680;
+      Object.defineProperty(stage, 'clientWidth', { configurable: true, get: () => columnWidth });
+      fake.getDiagramFromText.mockResolvedValueOnce({ type: 'xychart', db: {} });
+      fake.render.mockImplementationOnce(drawAtConfiguredWidth);
+    });
+
+    it('is drawn again at the column\'s new width, with its size and file following', async () => {
+      const mounted = await mountMermaid(stage, 'xychart-beta\n  bar [1, 2]', { theme: 'dark', width: 680 });
+      expect(mounted.naturalSize).toEqual({ width: 680, height: 300 });
+      expect(mounted.resize).toBeTypeOf('function');
+
+      columnWidth = 500;
+      fake.render.mockImplementationOnce(drawAtConfiguredWidth);
+      await mounted.resize!();
+      expect(fake.render).toHaveBeenCalledTimes(2);
+      expect(config().xyChart.width).toBe(500);
+      expect(stage.querySelector('svg')!.getAttribute('width')).toBe('500');
+      expect(stage.querySelectorAll('svg')).toHaveLength(1);
+      expect(mounted.naturalSize).toEqual({ width: 500, height: 300 });
+      expect(mounted.minTextPx).toBe(12);
+      const file = new DOMParser().parseFromString((await mounted.toSvg!())!, 'image/svg+xml').documentElement;
+      expect(file.getAttribute('width')).toBe('500');
+
+      // The same width again, a hidden column (0) or a block that is gone: nothing to draw.
+      await mounted.resize!();
+      columnWidth = 0;
+      await mounted.resize!();
+      columnWidth = 400;
+      mounted.cleanup();
+      await mounted.resize!();
+      expect(fake.render).toHaveBeenCalledTimes(2);
+      expect(stage.innerHTML).toBe('');
+    });
+
+    it('waits its turn in the one-at-a-time queue', async () => {
+      const mounted = await mountMermaid(stage, 'xychart-beta\n  bar [1, 2]', { theme: 'dark', width: 680 });
+      let release!: () => void;
+      const held = new Promise<void>(resolve => { release = resolve; });
+      fake.render.mockImplementationOnce(async (id: string) => {
+        await held;
+        return { svg: `<svg id="${id}" width="10" height="10"></svg>` };
+      });
+      const other = mountMermaid(document.createElement('div'), 'flowchart LR\n  C --> D', { theme: 'light', width: 680 });
+      await vi.waitFor(() => expect(fake.render).toHaveBeenCalledTimes(2));
+      columnWidth = 500;
+      fake.render.mockImplementationOnce(drawAtConfiguredWidth);
+      const redrawn = mounted.resize!();
+      await Promise.resolve();
+      // The other diagram's settings are not reset under its render.
+      expect(fake.initialize).toHaveBeenCalledTimes(2);
+      release();
+      await Promise.all([other, redrawn]);
+      expect(fake.initialize).toHaveBeenCalledTimes(3);
+      expect(fake.initialize.mock.invocationCallOrder[2]).toBeGreaterThan(fake.render.mock.invocationCallOrder[1]);
+      expect(stage.querySelector('svg')!.getAttribute('width')).toBe('500');
+    });
+  });
+
+  it('draws a diagram with a size of its own once: no resize', async () => {
+    const mounted = await mountMermaid(stage, 'flowchart LR\n  A --> B', { theme: 'dark', width: 680 });
+    expect(mounted.resize).toBeUndefined();
   });
 
   it('draws one diagram at a time, each with its own settings', async () => {

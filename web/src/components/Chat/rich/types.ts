@@ -23,6 +23,12 @@ export interface Mounted {
    */
   naturalSize?: { width: number; height: number };
   /**
+   * The smallest text in the picture, in CSS pixels at natural size, when
+   * the renderer knows it. The frame fits a picture only while that text
+   * stays readable (≥ 11 px); without it, 14 px is assumed.
+   */
+  minTextPx?: number;
+  /**
    * The picture as a standalone SVG document — Download SVG, the full-size
    * view. Resolves to null when the renderer has none.
    */

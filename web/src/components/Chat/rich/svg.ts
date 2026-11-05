@@ -122,6 +122,38 @@ function standalone(svg: SVGSVGElement, size: { width: number; height: number } 
   return new XMLSerializer().serializeToString(copy);
 }
 
+/** The font size an element states for itself, in CSS pixels; NaN when it states none (or a percentage). */
+function statedFontPx(element: Element): number {
+  const fromStyle = /(?:^|;)\s*font-size\s*:\s*([^;!]+)/i.exec(element.getAttribute('style') ?? '')?.[1];
+  return lengthPx(fromStyle ?? element.getAttribute('font-size'));
+}
+
+/** What text a picture without any font size of its own is drawn in, as the frame assumes. */
+const DEFAULT_TEXT_PX = 16;
+
+/**
+ * The smallest text in the picture, in CSS pixels at `size`, its natural
+ * size: each text's font size as the browser computes it when the picture
+ * is laid out (a stylesheet inside it counts then), else the size the text
+ * or its nearest ancestor states, 16px where none does; times the picture's
+ * own scale (a viewBox drawn larger or smaller). Undefined without text.
+ */
+function smallestTextPx(svg: SVGSVGElement, size: { width: number; height: number }): number | undefined {
+  const box = (svg.getAttribute('viewBox') ?? '').trim().split(/[\s,]+/).map(Number);
+  const scale = box.length === 4 && box[2] > 0 ? size.width / box[2] : 1;
+  let smallest = Infinity;
+  for (const text of svg.querySelectorAll('text, tspan, textPath')) {
+    // Only text set in this element's own size: a <text> made of <tspan>s is measured by them.
+    if (![...text.childNodes].some(node => node.nodeType === Node.TEXT_NODE && node.textContent?.trim())) continue;
+    let px = text.getClientRects().length > 0 ? parseFloat(getComputedStyle(text).fontSize) : NaN;
+    for (let element: Element | null = text; !(px > 0) && element; element = element === svg ? null : element.parentElement) {
+      px = statedFontPx(element);
+    }
+    smallest = Math.min(smallest, (px > 0 ? px : DEFAULT_TEXT_PX) * scale);
+  }
+  return Number.isFinite(smallest) ? Math.round(smallest * 10) / 10 : undefined;
+}
+
 /**
  * Below this viewBox width, a picture that states no width or height of its
  * own is taken as a unit-less drawing (an icon-like `0 0 24 24`), not as a
@@ -158,6 +190,8 @@ export const mountSvg: Mount = async (stage, source) => {
       stage.innerHTML = '';
     },
     naturalSize,
+    // Only a picture with a natural size has a scale for the frame to weigh it against.
+    minTextPx: element && naturalSize ? smallestTextPx(element, naturalSize) : undefined,
     toSvg: async () => (drawn ? standalone(drawn, naturalSizeOf(drawn)) : null),
   };
 };

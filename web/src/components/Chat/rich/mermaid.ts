@@ -1,7 +1,7 @@
 import DOMPurify from 'dompurify';
 import type { Mermaid, MermaidConfig } from 'mermaid';
 import { contrastRatio, luminance, mix, readThemeTokens, type ThemeTokens } from './tokens';
-import type { Mount } from './types';
+import type { Mount, Mounted } from './types';
 
 // mermaid is a few megabytes; it is fetched the first time a chat shows a
 // diagram, and never for a chat that shows none.
@@ -788,6 +788,25 @@ function chipFills(svg: SVGSVGElement): Map<number, string> {
   return fills;
 }
 
+/**
+ * The smallest text the laid-out picture shows, in CSS pixels at its natural
+ * size: each drawn text's computed font size, times the picture's own scale.
+ * Undefined where nothing is laid out to measure.
+ */
+function smallestText(svg: SVGSVGElement, scale: number): number | undefined {
+  let smallest = Infinity;
+  const walker = document.createTreeWalker(svg, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const element = node.parentElement;
+    if (!element || !node.textContent?.trim() || element.closest('style, title, desc')) continue;
+    // Not drawn: hidden (display: none, or inside something that is), or nothing laid out at all.
+    if (element.getClientRects().length === 0) continue;
+    const size = parseFloat(getComputedStyle(element).fontSize) * scale;
+    if (size > 0) smallest = Math.min(smallest, size);
+  }
+  return Number.isFinite(smallest) ? Math.round(smallest * 10) / 10 : undefined;
+}
+
 /** Text under the floor, by index among the picture's `text` and `tspan` elements. */
 function smallText(svg: SVGSVGElement, scale: number): Map<number, 'hide' | 'grow'> {
   const found = new Map<number, 'hide' | 'grow'>();
@@ -808,11 +827,11 @@ function smallText(svg: SVGSVGElement, scale: number): Map<number, 'hide' | 'gro
  * bounds include stays, every label among it. Measured in place when the
  * stage is laid out — the frame draws into one that is hidden but laid out —
  * else on a copy out of sight; nothing changes where nothing can be measured.
- * Returns the picture's size afterwards.
+ * Returns the picture's size afterwards, and its smallest text if measured.
  */
-function finish(svg: SVGSVGElement, size: Size): Size {
+function finish(svg: SVGSVGElement, size: Size): { size: Size; minText?: number } {
   const box = (svg.getAttribute('viewBox') ?? '').trim().split(/[\s,]+/).map(Number);
-  if (typeof svg.getBBox !== 'function' || box.length !== 4 || !box.every(Number.isFinite) || box[2] <= 0) return size;
+  if (typeof svg.getBBox !== 'function' || box.length !== 4 || !box.every(Number.isFinite) || box[2] <= 0) return { size };
   const [x0, y0, w0, h0] = box;
   const scale = size.width / w0;
   let measured = svg;
@@ -851,22 +870,42 @@ function finish(svg: SVGSVGElement, size: Size): Size {
         else Object.assign(chip.style, { fill, stroke: fill });
       }
     }
+    const minText = smallestText(measured, scale);
     const content = measured.getBBox();
-    if (!(content.width > 0 && content.height > 0)) return size;
+    if (!(content.width > 0 && content.height > 0)) return { size, minText };
     const left = Math.max(x0, content.x - MARGIN);
     const top = Math.max(y0, content.y - MARGIN);
     const right = Math.min(x0 + w0, content.x + content.width + MARGIN);
     const bottom = Math.min(y0 + h0, content.y + content.height + MARGIN);
-    if (right - left >= w0 - 0.5 && bottom - top >= h0 - 0.5) return size;
+    if (right - left >= w0 - 0.5 && bottom - top >= h0 - 0.5) return { size, minText };
     svg.setAttribute('viewBox', [left, top, right - left, bottom - top].map(round2).join(' '));
-    return { width: round2((right - left) * scale), height: round2((bottom - top) * scale) };
+    return { size: { width: round2((right - left) * scale), height: round2((bottom - top) * scale) }, minText };
   } catch {
     // Measuring improves a picture; it never stops one from showing.
-    return size;
+    return { size };
   } finally {
     host?.remove();
   }
 }
+
+/**
+ * The diagram types drawn to the column's width (configFor): drawn again
+ * when the column changes width. Every other type has a size of its own.
+ */
+const COLUMN_WIDE = new Set(['gantt', 'xychart']);
+
+/**
+ * The smallest text a diagram type holds once the floors above apply, for a
+ * picture that could not be measured: 11px C4 type lines, packet bytes,
+ * treemap totals, gitGraph commit ids and class multiplicities; 12px axis
+ * labels and sequence numbers; 13px pie slice labels; else 14px labels.
+ */
+const SMALLEST_TEXT_BY_TYPE: Record<string, number> = {
+  c4: 11, packet: 11, treemap: 11, gitGraph: 11, classDiagram: 11, class: 11,
+  xychart: 12, gantt: 12, quadrantChart: 12, radar: 12, sequence: 12,
+  pie: 13,
+};
+const SMALLEST_TEXT_DEFAULT = 14;
 
 // `initialize` resets mermaid's one global configuration, so a render states
 // all of it and runs alone: two diagrams in flight at once (a theme switch,
@@ -886,9 +925,10 @@ export const mountMermaid: Mount = async (stage, source, { theme, width }) => {
   if (reason) throw new Error(`${reason}, and pictures here load nothing from the network`);
   const mermaid = await loadMermaid();
   guardSanitizer();
-  const svg = await exclusive(async () => {
+  let type = '';
+  const firstSvg = await exclusive(async () => {
     mermaid.initialize(configFor(tokens, width));
-    let parsed: { db: unknown };
+    let parsed: { type: string; db: unknown };
     try {
       // A syntax error is reported here, with the diagram's own message.
       await mermaid.parse(source);
@@ -900,31 +940,61 @@ export const mountMermaid: Mount = async (stage, source, { theme, width }) => {
     if (url) {
       throw new Error(`it draws an image from ${url.slice(0, 80)}, and pictures here load nothing from the network`);
     }
+    type = parsed.type;
     return (await mermaid.render(`nerve-mermaid-${++renderSeq}`, source)).svg;
   });
-  stage.replaceChildren(inertPicture(svg));
-  const element = stage.querySelector('svg');
-  let naturalSize = element ? naturalSizeOf(element) : undefined;
-  if (element && naturalSize) {
-    // The picture states its own size (a few diagram types ask for
-    // `width="100%"` whatever `useMaxWidth` says); the frame fits or scrolls it.
-    const state = (size: Size) => {
-      element.setAttribute('width', String(size.width));
-      element.setAttribute('height', String(size.height));
-    };
-    state(naturalSize);
-    element.style.removeProperty('max-width');
-    naturalSize = finish(element, naturalSize);
-    state(naturalSize);
-  }
+
+  let live = true;
+  let drawnWidth = width;
   // The file is made from the picture as drawn, whatever the frame does to
   // the element on screen afterwards.
-  const drawn = element?.cloneNode(true) as SVGSVGElement | undefined;
-  return {
+  let drawn: SVGSVGElement | undefined;
+  const mounted: Mounted = {
     cleanup: () => {
+      live = false;
       stage.innerHTML = '';
     },
-    naturalSize,
-    toSvg: async () => (drawn ? standalone(drawn, naturalSize) : null),
+    toSvg: async () => (drawn ? standalone(drawn, mounted.naturalSize) : null),
   };
+
+  /** Puts a rendered SVG on the stage and says what it is: its size, its smallest text, its file. */
+  const show = (svg: string, columnWidth: number) => {
+    stage.replaceChildren(inertPicture(svg));
+    const element = stage.querySelector('svg');
+    let naturalSize = element ? naturalSizeOf(element) : undefined;
+    let minText: number | undefined;
+    if (element && naturalSize) {
+      // The picture states its own size (a few diagram types ask for
+      // `width="100%"` whatever `useMaxWidth` says); the frame fits or scrolls it.
+      const state = (size: Size) => {
+        element.setAttribute('width', String(size.width));
+        element.setAttribute('height', String(size.height));
+      };
+      state(naturalSize);
+      element.style.removeProperty('max-width');
+      ({ size: naturalSize, minText } = finish(element, naturalSize));
+      state(naturalSize);
+    }
+    drawn = element?.cloneNode(true) as SVGSVGElement | undefined;
+    drawnWidth = columnWidth;
+    mounted.naturalSize = naturalSize;
+    mounted.minTextPx = minText ?? SMALLEST_TEXT_BY_TYPE[type] ?? SMALLEST_TEXT_DEFAULT;
+  };
+  show(firstSvg, width);
+
+  if (COLUMN_WIDE.has(type)) {
+    // Drawn again at the column's new width (the frame calls this once a
+    // resize has settled), in the queue like any render. `naturalSize`,
+    // `minTextPx` and the file follow the new drawing.
+    mounted.resize = () => exclusive(async () => {
+      const columnWidth = Math.round(stage.clientWidth);
+      // Gone, hidden (the source is showing), or already drawn at this width
+      // by an earlier call in the queue.
+      if (!live || columnWidth <= 0 || columnWidth === Math.round(drawnWidth)) return;
+      mermaid.initialize(configFor(tokens, columnWidth));
+      const { svg } = await mermaid.render(`nerve-mermaid-${++renderSeq}`, source);
+      if (live) show(svg, columnWidth);
+    });
+  }
+  return mounted;
 };

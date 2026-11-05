@@ -179,3 +179,28 @@ describe('mountSvg', () => {
     expect(await mounted.toSvg!()).toMatch(/^<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
   });
 });
+
+describe('minTextPx', () => {
+  const minText = async (source: string) => (await mountSvg(document.createElement('div'), source, { theme: 'dark', width: 600 })).minTextPx;
+
+  it('takes the smallest stated font size, inherited or not, at the picture\'s own scale', async () => {
+    // Drawn at twice its viewBox: 8 units of text are 16 pixels.
+    expect(await minText(
+      '<svg width="200" height="100" viewBox="0 0 100 50"><text font-size="8">a</text>'
+      + '<g font-size="12"><text>b</text></g><text>c</text></svg>',
+    )).toBe(16);
+    expect(await minText(
+      '<svg width="100" height="100"><text style="fill: red; font-size: 6px">a</text><text font-size="9pt">b</text></svg>',
+    )).toBe(6);
+  });
+
+  it('measures a <text> by its <tspan>s, and takes 16px where nothing is stated', async () => {
+    expect(await minText('<svg width="100" height="100"><text font-size="20"><tspan font-size="10">x</tspan></text></svg>')).toBe(10);
+    expect(await minText('<svg width="100" height="100"><text>plain</text></svg>')).toBe(16);
+  });
+
+  it('says nothing for a picture without text, or one that takes the column', async () => {
+    expect(await minText('<svg width="100" height="100"><rect width="10" height="10"/></svg>')).toBeUndefined();
+    expect(await minText('<svg viewBox="0 0 24 24"><text font-size="4">x</text></svg>')).toBeUndefined();
+  });
+});
