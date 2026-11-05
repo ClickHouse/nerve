@@ -1,5 +1,5 @@
-import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent } from 'react';
-import { Send, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat, MoreHorizontal, Clock, ChevronRight } from '../ui/icons';
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent, type MouseEvent as ReactMouseEvent } from 'react';
+import { ArrowUp, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat, MoreHorizontal, Clock, ChevronRight } from '../ui/icons';
 import { Button, IconButton, Select, TextField } from '../ui';
 import { useChatStore, EMPTY_REVIEW_LOOP, registerComposerFlush } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
@@ -9,6 +9,7 @@ import { dockLine } from '../../stores/helpers/agentSelectors';
 import { api } from '../../api/client';
 import { randomUUID } from '../../utils/uuid';
 import { findSessionById } from '../../utils/findSession';
+import { FOCUS_COMPOSER_COMBO, formatCombo } from '../../utils/keyboard';
 import { PromptRewriteCard } from './PromptRewriteCard';
 import { BackendSelector } from './BackendSelector';
 import { ReviewLoopPanel } from './ReviewLoopPanel';
@@ -25,6 +26,14 @@ const ACTION_CONFIG: Record<QuoteAction, { icon: typeof Plus; label: string; col
 
 // Actions that auto-focus the instruction input (need user input)
 const FOCUS_ACTIONS = new Set<QuoteAction>(['add', 'question', 'note']);
+
+const FOCUS_HINT = `${formatCombo(FOCUS_COMPOSER_COMBO)} to focus`;
+
+// The composer's controls sit on its own surface (`bg-surface-raised`), where
+// the ghost hover colour is that same surface and would not show. The hover
+// goes one step lighter, and the icon is `text-muted` so it stays visible at
+// rest.
+const ROW_ICON = 'rounded-lg text-text-muted hover:text-text hover:bg-surface-hover';
 
 // "Run later" submenu — exactly these four, in this order. The three timed
 // delays schedule a one-shot wakeup; "none" ("Just accept it") saves the
@@ -76,6 +85,7 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
   const seedRef = useRef<string | null>(seed);
   const [attachments, setAttachments] = useState<AttachmentFile[]>([]);
   const [isDragging, setIsDragging] = useState(false);
+  const [textFocused, setTextFocused] = useState(false);
   // "Run later" kebab menu (mirrors the SessionSidebar three-dots menu).
   const [menuOpen, setMenuOpen] = useState(false);
   const [runLaterOpen, setRunLaterOpen] = useState(false);
@@ -646,9 +656,19 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
     }
   };
 
+  // The box reads as one text field: a press on its padding or between the
+  // controls puts the caret in the message text. A press on a control or a
+  // card does what that element does.
+  const focusFromBlank = (e: ReactMouseEvent<HTMLDivElement>) => {
+    if (e.target instanceof HTMLElement && e.target.hasAttribute('data-composer-blank')) {
+      e.preventDefault();
+      textareaRef.current?.focus();
+    }
+  };
+
   return (
     <div
-      className="border-t border-border-subtle bg-bg shrink-0 relative"
+      className="bg-bg shrink-0 relative"
       onDragEnter={handleDragEnter}
       onDragLeave={handleDragLeave}
       onDragOver={handleDragOver}
@@ -686,294 +706,301 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
         </div>
       )}
 
-      {/* Quote cards */}
-      {quotes.length > 0 && (
-        <div className="px-4 pt-3 pb-1">
-          <div className="space-y-2">
-            {quotes.map((quote, idx) => (
-              <QuoteCard
-                key={quote.id}
-                quote={quote}
-                instructionRef={idx === quotes.length - 1 ? lastInstructionRef : undefined}
-                onRemove={() => removeQuote(quote.id)}
-                onUpdateInstruction={(v) => updateQuoteInstruction(quote.id, v)}
-                onSend={canSend ? handleSend : undefined}
-              />
-            ))}
-          </div>
-        </div>
-      )}
+      {/* The composer is one rounded box. From top to bottom it holds the
+          quote cards, the attachment previews, the message text and one row
+          of controls. The text has the full width of the box at all viewport
+          widths, and the controls take no width from it.
 
-      {/* Attachment previews */}
-      {attachments.length > 0 && (
-        <div className="px-4 pt-3 pb-1">
-          <div className="flex gap-2 flex-wrap">
-            {attachments.map(a => (
-              <AttachmentPreview key={a.id} attachment={a} onRemove={() => removeAttachment(a.id)} />
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* Main input.
-
-          One row on desktop. On a phone the controls alone can run to six
-          buttons plus the model picker, which left the textarea a ~90px
-          stub, so the row wraps instead: controls stay on the first line and
-          the textarea takes a full-width line of its own below them (see the
-          `basis-full`/`order-1` pair on it).
-
-          The composer stack — this row and the rewrite / quote / attachment
-          strips above it — does not carry `max-w-[var(--chat-width)]`, which
-          everything on the transcript side does. One cap cannot serve both: a
-          reading column stays narrow for prose, while the composer is a control
-          surface that only gets narrower as the model picker and five buttons
-          take their fixed share out of it. Capped at the default 768 the
-          textarea gets 430px, and widening the reading column to suit the
-          composer would make the transcript worse, so the composer fills the
-          pane instead. */}
-      <div className="px-4 py-3">
+          The composer does not carry `max-w-[var(--chat-width)]`, which
+          everything on the transcript side does. A reading column stays
+          narrow for prose. The composer is a control surface: a narrow cap
+          leaves the control row less room for the model picker and the send
+          controls, so the composer fills the pane. */}
+      <div className="px-4 pt-2 pb-3">
         {/* Messages waiting for the running turn, and this tab's unconfirmed sends. */}
         <QueuedMessages />
-        {/* `relative` is the anchor for the run-later popup below. It hangs off
-            this row rather than off its own 40px trigger so that it is aligned
-            to the composer and cannot leave the viewport, wherever the trigger
-            happens to have wrapped to. */}
-        <div className="relative flex flex-wrap md:flex-nowrap gap-2 md:gap-3 items-end">
-          {/* File attach button */}
-          <IconButton
-            size="md"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={disabled || isStreaming || rewriteActive
-              || (isVirtualChat && !!(newChatReviewLoop && (newChatReviewLoop.goal.trim() || newChatReviewLoop.verifier.trim())))}
-            label={isVirtualChat && newChatReviewLoop && (newChatReviewLoop.goal.trim() || newChatReviewLoop.verifier.trim())
-              ? 'Attaching files would start the review loop — start it or clear the form first'
-              : 'Attach files'}
-          >
-            <Paperclip size={18} />
-          </IconButton>
-
-          {/* Prompt rewrite toggle — only on a fresh chat, where it applies */}
-          {rewriteAvailable && isNewChat && (
-            <button
-              onClick={() => setRewriteEnabled(v => !v)}
-              disabled={disabled || isStreaming || rewriteActive}
-              className={`w-10 h-10 rounded-xl flex items-center justify-center cursor-pointer transition-all shrink-0 disabled:opacity-30 ${
-                rewriteEnabled
-                  ? 'text-hue-purple bg-hue-purple/10 hover:bg-hue-purple/15 ring-1 ring-inset ring-hue-purple/25'
-                  : 'text-text-muted hover:text-text-secondary'
-              }`}
-              title={rewriteEnabled
-                ? 'Prompt rewrite on — your first message will be refined for approval before sending'
-                : 'Prompt rewrite off — click to refine your first message with AI before sending'}
-            >
-              <Sparkles size={18} />
-            </button>
-          )}
-          {/* Review-loop toggle — new chats only. Opens the Goal/Verifier
-              panel; the loop binds at session creation. */}
-          {isVirtualChat && (
-            <button
-              onClick={() => setNewChatReviewLoop(newChatReviewLoop ? null : { ...EMPTY_REVIEW_LOOP })}
-              disabled={disabled || isStreaming || rewriteActive}
-              className={`w-10 h-10 rounded-xl flex items-center justify-center cursor-pointer transition-all shrink-0 disabled:opacity-30 ${
-                newChatReviewLoop
-                  ? 'text-hue-emerald bg-hue-emerald/10 hover:bg-hue-emerald/15 ring-1 ring-inset ring-hue-emerald/25'
-                  : 'text-text-muted hover:text-text-secondary'
-              }`}
-              title={newChatReviewLoop
-                ? 'Review loop on — configure Goal + Verifier criteria; an implementer/verifier agent pair iterates until the criteria pass'
-                : 'Review loop — set a Goal and Verifier criteria; an implementer/verifier agent pair iterates until the criteria pass'}
-            >
-              <Repeat size={18} />
-            </button>
-          )}
-          {/* Agent backend selector — Claude vs Codex, new chats only.
-              Binds at session creation; sticky afterwards (the header's
-              model badge shows what a running session uses). Picks the
-              OBSERVER session's backend — loop legs use the panel config. */}
-          {isVirtualChat && (
-            <BackendSelector disabled={disabled || isStreaming || rewriteActive} />
-          )}
-          {/* Backend-scoped, PER-CHAT model picker. A pick here re-points
-              only this chat: virtual chats bind it at creation, real
-              sessions PATCH their own row — never a global preference. */}
-          {scopedModels.length > 1 && (
-            <Select
-              value={currentModel ?? ''}
-              onChange={(e) => {
-                const picked = e.target.value;
-                if (isVirtualChat) {
-                  setNewChatModel(activeBackend, picked === modelsDefault ? null : picked);
-                } else {
-                  setSessionModel(activeSession, picked);
-                }
-              }}
-              disabled={disabled || isStreaming || rewriteActive || liveAgents > 0}
-              title={liveAgents > 0
-                ? `Switching model restarts the runtime and would stop ${liveAgents} running agent${liveAgents === 1 ? '' : 's'}`
-                : 'Model for this chat (other chats keep theirs)'}
-              // While a turn streams the picker is disabled and Queue plus the
-              // split Stop replace Send: on a phone it gives up the width they
-              // need, so the controls stay on one line.
-              className={`h-10 px-2.5 rounded-xl shrink-0 truncate ${
-                isStreaming ? 'max-w-[96px] md:max-w-[170px]' : 'max-w-[170px]'
-              }`}
-            >
-              {/* A session may run on a model the picker no longer offers
-                  (retired id, uninstalled Ollama model) — keep it visible
-                  instead of silently snapping to the first option. */}
-              {currentModel && !scopedModels.some(m => m.id === currentModel) && (
-                <option value={currentModel}>{currentModel}</option>
-              )}
-              {scopedModels.some(m => m.provider === 'anthropic') && (
-                <optgroup label="Anthropic">
-                  {scopedModels.filter(m => m.provider === 'anthropic').map(m => (
-                    <option key={m.id} value={m.id}>{m.id}</option>
-                  ))}
-                </optgroup>
-              )}
-              {scopedModels.some(m => m.provider === 'ollama') && (
-                <optgroup label="Ollama (local)">
-                  {scopedModels.filter(m => m.provider === 'ollama').map(m => (
-                    <option key={m.id} value={m.id}>{m.id}</option>
-                  ))}
-                </optgroup>
-              )}
-              {scopedModels.some(m => m.provider === 'openai') && (
-                <optgroup label="OpenAI Codex">
-                  {scopedModels.filter(m => m.provider === 'openai').map(m => (
-                    <option key={m.id} value={m.id}>{m.id}</option>
-                  ))}
-                </optgroup>
-              )}
-            </Select>
+        {/* `relative` is the anchor for the run-later popup. The popup aligns
+            to the right edge of the box and opens above it, so it stays in
+            the viewport. */}
+        <div
+          data-composer-blank=""
+          onMouseDown={focusFromBlank}
+          className="relative cursor-text rounded-2xl border border-border bg-surface-raised transition-colors has-[textarea:focus]:border-accent/50"
+        >
+          {quotes.length > 0 && (
+            <div data-composer-blank="" className="px-3 pt-3 space-y-2">
+              {quotes.map((quote, idx) => (
+                <QuoteCard
+                  key={quote.id}
+                  quote={quote}
+                  instructionRef={idx === quotes.length - 1 ? lastInstructionRef : undefined}
+                  onRemove={() => removeQuote(quote.id)}
+                  onUpdateInstruction={(v) => updateQuoteInstruction(quote.id, v)}
+                  onSend={canSend ? handleSend : undefined}
+                />
+              ))}
+            </div>
           )}
 
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            className="hidden"
-            onChange={(e) => {
-              const files = Array.from(e.target.files || []);
-              if (files.length > 0) addFiles(files);
-              e.target.value = '';
-            }}
-          />
+          {attachments.length > 0 && (
+            <div data-composer-blank="" className="px-3 pt-3 flex gap-2 flex-wrap">
+              {attachments.map(a => (
+                <AttachmentPreview key={a.id} attachment={a} onRemove={() => removeAttachment(a.id)} />
+              ))}
+            </div>
+          )}
 
-          <textarea
-            id="nerve-chat-input"
-            ref={textareaRef}
-            value={input}
-            onChange={(e) => { const v = e.target.value; setInput(v); historyIndexRef.current = -1; scheduleDraft(activeSession, v); }}
-            onBlur={() => { cancelDraftFlush(); setDraft(activeSession, input); }}
-            onKeyDown={handleKeyDown}
-            // The label of the Enter key on an on-screen keyboard. It agrees
-            // with what Enter does.
-            enterKeyHint={enterSends ? 'send' : 'enter'}
-            onPaste={handlePaste}
-            placeholder={
-              quotes.length > 0 ? 'Add context (optional)...'
-              : attachments.length > 0 ? 'Add a message (optional)...'
-              : isStreaming ? 'Queue a message — it runs after this turn...'
-              : rewriteAvailable && rewriteEnabled && isNewChat ? 'Send a message — it will be refined before sending...'
-              : 'Send a message...'
-            }
-            rows={1}
-            disabled={disabled || rewriteActive}
-            // basis-full makes the textarea claim a whole flex line on its
-            // own; order-1 puts that line under the controls rather than
-            // above them. Both are undone at `md`, back to a single row.
-            // `text-sm` matches every other input in the app (`FIELD_SIZES.md`
-            // is `text-sm` too). `text-base` — 16px — reads oversized next to
-            // the transcript and fits noticeably less text on a line.
-            className="flex-1 basis-full order-1 md:basis-0 md:order-none px-4 py-3 bg-surface-raised border border-border rounded-xl text-sm text-text outline-none focus:border-accent/50 resize-none disabled:opacity-50 placeholder:text-text-faint"
-          />
-          {/* Run-later kebab — three-dots menu next to Send. Its submenu
-              defers the composed prompt into a new session without spending
-              tokens now (opens upward; the composer sits at the bottom).
-
-              No `order`: it belongs on the controls line with everything else.
-              Anything sorted after the `order-1` textarea wraps onto a line of
-              its own under the message box, at the left margin, where a popup
-              right-aligned to a 40px trigger opens off the left of the screen.
-              Desktop never shows this: that row is `md:flex-nowrap`, so nothing
-              wraps and `order` is inert. */}
-          <div className="shrink-0" ref={menuRef}>
-            <IconButton
-              label="More options"
-              size="md"
-              onClick={() => { setMenuOpen(v => !v); setRunLaterOpen(false); }}
-              disabled={disabled || isStreaming || rewriteActive}
-              // `aria-expanded` only. `aria-haspopup="menu"` would promise the
-              // ARIA menu pattern — `menu`/`menuitem` roles, focus moving into
-              // the popup, arrow-key navigation, Escape to close — but the popup
-              // below is a `div` of ordinary buttons. It is a disclosure, so it
-              // says so rather than announcing a keyboard model that is not
-              // there.
-              aria-expanded={menuOpen}
-              className="rounded-xl"
-            >
-              <MoreHorizontal size={18} />
-            </IconButton>
-            {menuOpen && (
-              // A fixed width, not a minimum. The popup is anchored to the
-              // composer, so it has ~500px to shrink-to-fit against and would
-              // take all of it for four short labels. `w-max` does not help:
-              // Chrome's max-content for these `w-full` children lands in the
-              // same place.
-              <div className="absolute right-0 bottom-full mb-1 z-50 w-[170px] bg-surface-raised border border-border-subtle rounded-lg shadow-xl py-1">
-                <Button
-                  variant="subtle"
-                  size="sm"
-                  fullWidth
-                  onClick={() => setRunLaterOpen(v => !v)}
-                  aria-expanded={runLaterOpen}
-                  className="justify-between gap-2.5 px-3 py-1.5 rounded-none text-left"
-                >
-                  <span className="flex items-center gap-2.5"><Clock size={14} /> Run later</span>
-                  <ChevronRight size={14} className={`transition-transform ${runLaterOpen ? 'rotate-90' : ''}`} />
-                </Button>
-                {runLaterOpen && (
-                  <div className="border-t border-border mt-1 pt-1">
-                    {RUN_LATER_OPTIONS.map(opt => (
-                      <Button
-                        key={opt.delay}
-                        variant="subtle"
-                        size="sm"
-                        fullWidth
-                        onClick={() => handleRunLater(opt.delay)}
-                        disabled={!canSend}
-                        className="justify-start px-3 py-1.5 pl-8 rounded-none text-left"
-                      >
-                        {opt.label}
-                      </Button>
-                    ))}
-                  </div>
-                )}
-              </div>
+          <div className="relative">
+            <textarea
+              id="nerve-chat-input"
+              ref={textareaRef}
+              value={input}
+              onChange={(e) => { const v = e.target.value; setInput(v); historyIndexRef.current = -1; scheduleDraft(activeSession, v); }}
+              onFocus={() => setTextFocused(true)}
+              onBlur={() => { setTextFocused(false); cancelDraftFlush(); setDraft(activeSession, input); }}
+              onKeyDown={handleKeyDown}
+              onPaste={handlePaste}
+              // The label of the Enter key on an on-screen keyboard. It agrees
+              // with what Enter does.
+              enterKeyHint={enterSends ? 'send' : 'enter'}
+              placeholder={
+                quotes.length > 0 ? 'Add context (optional)...'
+                : attachments.length > 0 ? 'Add a message (optional)...'
+                : isStreaming ? 'Queue a message — it runs after this turn...'
+                : rewriteAvailable && rewriteEnabled && isNewChat ? 'Send a message — it will be refined before sending...'
+                : 'Send a message...'
+              }
+              rows={1}
+              disabled={disabled || rewriteActive}
+              // `text-sm` matches the other inputs in the app (`FIELD_SIZES.md`
+              // is `text-sm` too). At `text-base` (16px) the text looks too
+              // large next to the transcript, and a line holds less of it.
+              // The minimum height gives an empty box room to type into; the
+              // layout effect above grows it with the text, up to 200px.
+              className="block w-full min-h-14 md:min-h-[4.5rem] px-4 pt-3 pb-1 bg-transparent text-sm text-text outline-none resize-none disabled:opacity-50 placeholder:text-text-faint"
+            />
+            {/* Shows only while the box is empty and has no focus, so it
+                cannot cover text. Not on a phone, which has no shortcut keys.
+                It lets pointer presses through to the text below it. */}
+            {!textFocused && !input && !disabled && (
+              <span
+                aria-hidden="true"
+                className="hidden md:block absolute top-3 right-4 text-xs text-text-muted pointer-events-none select-none"
+              >
+                {FOCUS_HINT}
+              </span>
             )}
           </div>
 
-          {isStreaming ? (
-            <>
-              <IconButton label="Queue message" variant="primary" size="md" onClick={handleSend} disabled={!canSend}>
-                <Clock size={18} />
+          {/* One row of controls: the settings for this chat, then the
+              actions on the message at the right edge. On a phone a new chat
+              has more controls than one line holds. The row then wraps, and
+              the actions move to the next line as one group. */}
+          <div data-composer-blank="" className="flex flex-wrap items-center gap-1 px-2 pb-2">
+            {/* Agent backend selector, Claude or Codex, new chats only.
+                Binds at session creation and is fixed after that (the
+                header's model badge shows what a running session uses).
+                Picks the OBSERVER session's backend; loop legs use the
+                panel config. */}
+            {isVirtualChat && (
+              <BackendSelector disabled={disabled || isStreaming || rewriteActive} />
+            )}
+            {/* Backend-scoped, PER-CHAT model picker. A pick here re-points
+                only this chat: virtual chats bind it at creation, real
+                sessions PATCH their own row, never a global preference.
+                `field-sizing-content` makes it as wide as the chosen name,
+                where the browser supports it. It has no shrink limit, so on
+                a narrow line the name is cut short rather than pushing the
+                send controls out of the box. */}
+            {scopedModels.length > 1 && (
+              <Select
+                value={currentModel ?? ''}
+                onChange={(e) => {
+                  const picked = e.target.value;
+                  if (isVirtualChat) {
+                    setNewChatModel(activeBackend, picked === modelsDefault ? null : picked);
+                  } else {
+                    setSessionModel(activeSession, picked);
+                  }
+                }}
+                disabled={disabled || isStreaming || rewriteActive || liveAgents > 0}
+                title={liveAgents > 0
+                  ? `Switching model restarts the runtime and would stop ${liveAgents} running agent${liveAgents === 1 ? '' : 's'}`
+                  : 'Model for this chat (other chats keep theirs)'}
+                className="h-8 min-w-0 max-w-[170px] field-sizing-content px-2 py-0 rounded-lg bg-transparent border-transparent text-text-secondary hover:bg-surface-hover truncate"
+              >
+                {/* A session may run on a model the picker no longer offers
+                    (retired id, uninstalled Ollama model). Keep it visible
+                    rather than silently snapping to the first option. */}
+                {currentModel && !scopedModels.some(m => m.id === currentModel) && (
+                  <option value={currentModel}>{currentModel}</option>
+                )}
+                {scopedModels.some(m => m.provider === 'anthropic') && (
+                  <optgroup label="Anthropic">
+                    {scopedModels.filter(m => m.provider === 'anthropic').map(m => (
+                      <option key={m.id} value={m.id}>{m.id}</option>
+                    ))}
+                  </optgroup>
+                )}
+                {scopedModels.some(m => m.provider === 'ollama') && (
+                  <optgroup label="Ollama (local)">
+                    {scopedModels.filter(m => m.provider === 'ollama').map(m => (
+                      <option key={m.id} value={m.id}>{m.id}</option>
+                    ))}
+                  </optgroup>
+                )}
+                {scopedModels.some(m => m.provider === 'openai') && (
+                  <optgroup label="OpenAI Codex">
+                    {scopedModels.filter(m => m.provider === 'openai').map(m => (
+                      <option key={m.id} value={m.id}>{m.id}</option>
+                    ))}
+                  </optgroup>
+                )}
+              </Select>
+            )}
+            {/* Prompt rewrite toggle, only on a fresh chat, where it applies */}
+            {rewriteAvailable && isNewChat && (
+              <button
+                onClick={() => setRewriteEnabled(v => !v)}
+                disabled={disabled || isStreaming || rewriteActive}
+                className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all shrink-0 disabled:opacity-30 ${
+                  rewriteEnabled
+                    ? 'text-hue-purple bg-hue-purple/10 hover:bg-hue-purple/15 ring-1 ring-inset ring-hue-purple/25'
+                    : 'text-text-muted hover:text-text-secondary hover:bg-surface-hover'
+                }`}
+                title={rewriteEnabled
+                  ? 'Prompt rewrite on — your first message will be refined for approval before sending'
+                  : 'Prompt rewrite off — click to refine your first message with AI before sending'}
+              >
+                <Sparkles size={16} />
+              </button>
+            )}
+            {/* Review-loop toggle, new chats only. Opens the Goal/Verifier
+                panel; the loop binds at session creation. */}
+            {isVirtualChat && (
+              <button
+                onClick={() => setNewChatReviewLoop(newChatReviewLoop ? null : { ...EMPTY_REVIEW_LOOP })}
+                disabled={disabled || isStreaming || rewriteActive}
+                className={`w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer transition-all shrink-0 disabled:opacity-30 ${
+                  newChatReviewLoop
+                    ? 'text-hue-emerald bg-hue-emerald/10 hover:bg-hue-emerald/15 ring-1 ring-inset ring-hue-emerald/25'
+                    : 'text-text-muted hover:text-text-secondary hover:bg-surface-hover'
+                }`}
+                title={newChatReviewLoop
+                  ? 'Review loop on — configure Goal + Verifier criteria; an implementer/verifier agent pair iterates until the criteria pass'
+                  : 'Review loop — set a Goal and Verifier criteria; an implementer/verifier agent pair iterates until the criteria pass'}
+              >
+                <Repeat size={16} />
+              </button>
+            )}
+
+            {/* Actions on the message: more options, attach, send. */}
+            <div data-composer-blank="" className="ml-auto flex shrink-0 items-center gap-1">
+              {/* Run-later kebab. Its submenu defers the composed prompt into
+                  a new session without spending tokens now. It opens upward,
+                  because the composer sits at the bottom of the page. */}
+              <div className="shrink-0" ref={menuRef}>
+                <IconButton
+                  label="More options"
+                  size="sm"
+                  onClick={() => { setMenuOpen(v => !v); setRunLaterOpen(false); }}
+                  disabled={disabled || isStreaming || rewriteActive}
+                  // `aria-expanded` only. `aria-haspopup="menu"` would promise the
+                  // ARIA menu pattern — `menu`/`menuitem` roles, focus moving into
+                  // the popup, arrow-key navigation, Escape to close — but the popup
+                  // below is a `div` of ordinary buttons. It is a disclosure, so it
+                  // says so rather than announcing a keyboard model that is not
+                  // there.
+                  aria-expanded={menuOpen}
+                  className={ROW_ICON}
+                >
+                  <MoreHorizontal size={16} />
+                </IconButton>
+                {menuOpen && (
+                  // A fixed width, not a minimum. The popup is anchored to the
+                  // composer, so it has ~500px to shrink-to-fit against and would
+                  // take all of it for four short labels. `w-max` does not help:
+                  // Chrome's max-content for these `w-full` children lands in the
+                  // same place.
+                  <div className="absolute right-0 bottom-full mb-1 z-50 w-[170px] bg-surface-raised border border-border-subtle rounded-lg shadow-xl py-1">
+                    <Button
+                      variant="subtle"
+                      size="sm"
+                      fullWidth
+                      onClick={() => setRunLaterOpen(v => !v)}
+                      aria-expanded={runLaterOpen}
+                      className="justify-between gap-2.5 px-3 py-1.5 rounded-none text-left"
+                    >
+                      <span className="flex items-center gap-2.5"><Clock size={14} /> Run later</span>
+                      <ChevronRight size={14} className={`transition-transform ${runLaterOpen ? 'rotate-90' : ''}`} />
+                    </Button>
+                    {runLaterOpen && (
+                      <div className="border-t border-border mt-1 pt-1">
+                        {RUN_LATER_OPTIONS.map(opt => (
+                          <Button
+                            key={opt.delay}
+                            variant="subtle"
+                            size="sm"
+                            fullWidth
+                            onClick={() => handleRunLater(opt.delay)}
+                            disabled={!canSend}
+                            className="justify-start px-3 py-1.5 pl-8 rounded-none text-left"
+                          >
+                            {opt.label}
+                          </Button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* File attach button */}
+              <IconButton
+                size="sm"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={disabled || isStreaming || rewriteActive
+                  || (isVirtualChat && !!(newChatReviewLoop && (newChatReviewLoop.goal.trim() || newChatReviewLoop.verifier.trim())))}
+                label={isVirtualChat && newChatReviewLoop && (newChatReviewLoop.goal.trim() || newChatReviewLoop.verifier.trim())
+                  ? 'Attaching files would start the review loop — start it or clear the form first'
+                  : 'Attach files'}
+                className={ROW_ICON}
+              >
+                <Paperclip size={16} />
               </IconButton>
-              <StopSplitButton
-                onStopTurn={() => { void onStop(); }}
-                hasContent={canSend}
-                onStopAndSend={() => { void handleStopAndSend(); }}
-              />
-            </>
-          ) : (
-            <IconButton label="Send" variant="primary" size="md" onClick={handleSend} disabled={!canSend}>
-              <Send size={18} />
-            </IconButton>
-          )}
+
+              {isStreaming ? (
+                <>
+                  <IconButton label="Queue message" variant="primary" size="sm" onClick={handleSend} disabled={!canSend} className="rounded-lg">
+                    <Clock size={16} />
+                  </IconButton>
+                  <StopSplitButton
+                    onStopTurn={() => { void onStop(); }}
+                    hasContent={canSend}
+                    onStopAndSend={() => { void handleStopAndSend(); }}
+                  />
+                </>
+              ) : (
+                <IconButton label="Send" variant="primary" size="sm" onClick={handleSend} disabled={!canSend} className="rounded-lg">
+                  <ArrowUp size={16} />
+                </IconButton>
+              )}
+            </div>
+          </div>
         </div>
       </div>
+
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          const files = Array.from(e.target.files || []);
+          if (files.length > 0) addFiles(files);
+          e.target.value = '';
+        }}
+      />
     </div>
   );
 }

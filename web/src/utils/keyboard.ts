@@ -52,6 +52,12 @@ export interface ShortcutCombo {
   key: string;
 }
 
+/**
+ * Moves focus to the chat composer. The chat page binds it, and the composer
+ * shows it as a hint while it does not have focus.
+ */
+export const FOCUS_COMPOSER_COMBO: ShortcutCombo = { mod: true, shift: true, key: ';' };
+
 export interface ShortcutDef {
   id: string;
   combo: ShortcutCombo;

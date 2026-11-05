@@ -40,8 +40,11 @@ export function BackendSelector({ disabled }: { disabled?: boolean }) {
   const selected = newChatBackend ?? backendDefault ?? backendOptions[0].id;
 
   return (
+    // It sits in the composer's control row, on the composer's own surface,
+    // so it has no box of its own. On a phone only the icons show: the row
+    // must leave room for the model picker and the send controls.
     <div
-      className="h-10 flex items-center gap-0.5 p-1 bg-surface-raised border border-border rounded-xl shrink-0"
+      className="h-8 flex items-center gap-0.5 shrink-0"
       role="radiogroup"
       aria-label="Agent backend for this chat"
     >
@@ -54,19 +57,20 @@ export function BackendSelector({ disabled }: { disabled?: boolean }) {
             key={opt.id}
             role="radio"
             aria-checked={isActive}
+            aria-label={opt.label}
             disabled={disabled || opt.available === false}
             onClick={() => setNewChatBackend(opt.id === backendDefault ? null : opt.id)}
             title={opt.available === false
               ? `${opt.label} unavailable — ${opt.reason ?? 'preflight failed'}`
               : `${opt.label} — ${opt.model}${opt.id === backendDefault ? ' (default)' : ''}. Applies to this new chat; the choice is fixed once the conversation starts.`}
-            className={`h-8 px-2.5 rounded-lg flex items-center gap-1.5 text-sm font-medium transition-all cursor-pointer disabled:opacity-30 disabled:cursor-default ${
+            className={`h-8 px-2 rounded-lg flex items-center gap-1.5 text-sm font-medium transition-all cursor-pointer disabled:opacity-30 disabled:cursor-default ${
               isActive
                 ? style.active
-                : 'text-text-muted hover:text-text-secondary hover:bg-surface'
+                : 'text-text-muted hover:text-text-secondary hover:bg-surface-hover'
             }`}
           >
             <Icon size={14} />
-            <span>{opt.label}</span>
+            <span className="hidden md:inline">{opt.label}</span>
             {isActive && (
               <span className={`w-1 h-1 rounded-full ${style.dot}`} />
             )}

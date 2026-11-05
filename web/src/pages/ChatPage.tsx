@@ -22,7 +22,7 @@ import { Button, PaneToggle } from '../components/ui';
 import { api } from '../api/client';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useIsMobile } from '../hooks/useMediaQuery';
-import type { ShortcutDef } from '../utils/keyboard';
+import { FOCUS_COMPOSER_COMBO, type ShortcutDef } from '../utils/keyboard';
 import { copyToClipboard } from '../utils/clipboard';
 import { forkChat } from '../utils/forkChat';
 import { findSessionById } from '../utils/findSession';
@@ -192,7 +192,7 @@ export function ChatPage() {
     },
     {
       id: 'chat-focus-input',
-      combo: { mod: true, shift: true, key: ';' },
+      combo: FOCUS_COMPOSER_COMBO,
       description: 'Focus message input',
       section: 'chat',
       allowInInput: true,
