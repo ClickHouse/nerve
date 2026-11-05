@@ -7,7 +7,7 @@ import { contrastRatio, readThemeTokens, resetThemeTokens, type ThemeTokens } fr
 const fake = vi.hoisted(() => ({
   initialize: vi.fn(),
   parse: vi.fn(async () => ({ diagramType: 'flowchart-v2' })),
-  render: vi.fn(async (id: string) => ({
+  render: vi.fn<(id: string, source: string, container?: HTMLElement) => Promise<{ svg: string }>>(async (id: string) => ({
     svg: `<svg id="${id}" xmlns="http://www.w3.org/2000/svg" width="320" height="120" viewBox="0 0 320 120">`
       + `<style>#${id} .node rect{fill:#2d2d2d;}</style><g class="node"><rect width="10" height="10"/></g></svg>`,
   })),
@@ -211,6 +211,30 @@ describe('mountMermaid', () => {
     expect(clean).toContain('style="color: red"');
     expect(clean).not.toContain('<image');
     expect(clean).not.toContain('<use');
+  });
+
+  it('draws in a scratch element of its own, out of the page\'s flow, gone after every render', async () => {
+    const before = { children: document.body.children.length, height: document.body.scrollHeight };
+    let during: { attached: boolean; style: string } | undefined;
+    fake.render.mockImplementationOnce(async (id: string, _source: string, container?: HTMLElement) => {
+      during = { attached: container?.parentElement === document.body, style: container?.style.cssText ?? '' };
+      return { svg: `<svg id="${id}" width="320" height="120" viewBox="0 0 320 120"><g/></svg>` };
+    });
+    await mountMermaid(stage, 'flowchart LR\n  A --> B', { theme: 'dark', width: 584 });
+    const container = fake.render.mock.calls[0][2];
+    expect(container).toBeInstanceOf(HTMLElement);
+    // Attached for the render, fixed off the page and hidden (laid out, so measured), as wide as the column.
+    expect(during?.attached).toBe(true);
+    for (const rule of ['position: fixed', 'left: -10000px', 'visibility: hidden', 'width: 584px']) expect(during?.style).toContain(rule);
+    expect(container!.isConnected).toBe(false);
+    expect(document.body.children.length).toBe(before.children);
+    expect(document.body.scrollHeight).toBe(before.height);
+
+    // Also when mermaid fails.
+    fake.render.mockRejectedValueOnce(new Error('draw failed'));
+    await expect(mountMermaid(stage, 'flowchart LR\n  A --> B', { theme: 'dark', width: 584 })).rejects.toThrow('draw failed');
+    expect(fake.render.mock.calls[1][2]!.isConnected).toBe(false);
+    expect(document.body.children.length).toBe(before.children);
   });
 
   it('hands back the natural size and a standalone SVG', async () => {

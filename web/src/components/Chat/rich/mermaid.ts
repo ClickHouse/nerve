@@ -907,6 +907,27 @@ const SMALLEST_TEXT_BY_TYPE: Record<string, number> = {
 };
 const SMALLEST_TEXT_DEFAULT = 14;
 
+/**
+ * Renders `source` where mermaid draws its scratch copy: an element of our
+ * own, out of sight and out of the page's flow, there for this render only.
+ * mermaid's default is a div appended to <body> in normal flow, which grows
+ * the page while it is there — a scrollbar comes and goes, the column
+ * narrows by its width, and every chart sized to the column lays itself out
+ * again. `visibility: hidden` keeps layout, so labels are measured as they
+ * will be drawn (`display: none` would measure nothing).
+ */
+async function renderOffPage(mermaid: Mermaid, source: string, width: number): Promise<string> {
+  const scratch = document.createElement('div');
+  scratch.setAttribute('aria-hidden', 'true');
+  scratch.style.cssText = `position: fixed; left: -10000px; top: 0; width: ${width > 0 ? Math.round(width) : 1200}px; visibility: hidden; pointer-events: none;`;
+  document.body.appendChild(scratch);
+  try {
+    return (await mermaid.render(`nerve-mermaid-${++renderSeq}`, source, scratch)).svg;
+  } finally {
+    scratch.remove();
+  }
+}
+
 // `initialize` resets mermaid's one global configuration, so a render states
 // all of it and runs alone: two diagrams in flight at once (a theme switch,
 // two blocks settling together) must not draw with each other's settings.
@@ -941,7 +962,7 @@ export const mountMermaid: Mount = async (stage, source, { theme, width }) => {
       throw new Error(`it draws an image from ${url.slice(0, 80)}, and pictures here load nothing from the network`);
     }
     type = parsed.type;
-    return (await mermaid.render(`nerve-mermaid-${++renderSeq}`, source)).svg;
+    return renderOffPage(mermaid, source, width);
   });
 
   let live = true;
@@ -992,7 +1013,7 @@ export const mountMermaid: Mount = async (stage, source, { theme, width }) => {
       // by an earlier call in the queue.
       if (!live || columnWidth <= 0 || columnWidth === Math.round(drawnWidth)) return;
       mermaid.initialize(configFor(tokens, columnWidth));
-      const { svg } = await mermaid.render(`nerve-mermaid-${++renderSeq}`, source);
+      const svg = await renderOffPage(mermaid, source, columnWidth);
       if (live) show(svg, columnWidth);
     });
   }
