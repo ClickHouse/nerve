@@ -44,6 +44,19 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
   const visibleMessages = messages.slice(visibleStart);
   const prependAnchor = useRef<{ node: HTMLElement; top: number } | null>(null);
 
+  // Pin the initial window for this session. Recomputing the tail on every
+  // append used to unmount the oldest visible message while someone read it.
+  // Once pinned, only "Show earlier messages" may move the start backward.
+  useLayoutEffect(() => {
+    if (messages.length === 0) {
+      setRevealed(current => current?.session === activeSession ? null : current);
+    } else {
+      setRevealed(current => current?.session === activeSession
+        ? current
+        : { session: activeSession, start: initialStart });
+    }
+  }, [activeSession, messages.length, initialStart]);
+
   // A message-anchored fork resolves to a backend-native turn; sessions
   // predating turn recording can only be forked whole (header action).
   const hasForkAnchors = messages.some(m => m.native_turn_id != null);
