@@ -1056,7 +1056,10 @@ RICH_RENDERING_NOTE = (
     "- **Rendering:** this chat renders fenced ```mermaid (diagrams), "
     "```vega-lite (charts — inline `values` only, no `url` data) and ```svg "
     "code blocks inline, source one click away. Prefer them to ASCII-art "
-    "diagrams; everything else is GitHub-flavoured markdown."
+    "diagrams; everything else is GitHub-flavoured markdown. Drawing well: "
+    "`flowchart TB` for chains longer than five nodes (LR only for short "
+    "ones), node labels of a few words, one idea per diagram; charts with a "
+    "`title`, no `width` (they fill the column), and typed fields."
 )
 TEXT_RENDERING_NOTE = (
     "- **Rendering:** this channel shows text and basic markdown only — no "
