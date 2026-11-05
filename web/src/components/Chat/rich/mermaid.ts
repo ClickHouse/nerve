@@ -1,3 +1,4 @@
+import DOMPurify from 'dompurify';
 import type { Mermaid, MermaidConfig } from 'mermaid';
 import { contrastRatio, luminance, mix, readThemeTokens, type ThemeTokens } from './tokens';
 import type { Mount } from './types';
@@ -28,7 +29,7 @@ export interface MermaidTheme {
 const READABLE = 4.5;
 
 /** Where the hues with a meaning sit in `tokens.palette` (the order of `PALETTE_VARS` in tokens.ts). */
-const HUE = { blue: 0, orange: 1, green: 2, yellow: 4, teal: 6, red: 7, violet: 8 } as const;
+const HUE = { blue: 0, orange: 1, green: 3, yellow: 5, violet: 6, teal: 7, red: 8 } as const;
 
 /** How many colours mermaid cycles through for sections and series (its `THEME_COLOR_LIMIT`). */
 const COLOR_SLOTS = 12;
@@ -207,7 +208,7 @@ export function mermaidThemeFor(tokens: ThemeTokens): MermaidTheme {
     transitionLabelColor: text,
     labelBackgroundColor: paper,
     compositeBackground: clusterFill,
-    compositeTitleBackground: node,
+    compositeTitleBackground: clusterFill,
     compositeBorder: nodeBorder,
     altBackground: mix(paper, text, 0.04),
     specialStateColor: line,
@@ -366,6 +367,7 @@ export function mermaidThemeFor(tokens: ThemeTokens): MermaidTheme {
       annotationFill: paper,
     },
     packet: {
+      byteFontSize: '11px',
       startByteColor: muted,
       endByteColor: muted,
       labelColor: text,
@@ -409,7 +411,7 @@ export function mermaidThemeFor(tokens: ThemeTokens): MermaidTheme {
  * output; mermaid prefixes each rule with the diagram's `#id`, which keeps
  * them off the rest of the page and on the picture when it is saved alone.
  */
-function themeCssFor({ paper, muted, line, guide, hue, tint, rim }: Roles): string {
+function themeCssFor({ paper, muted, line, guide, clusterFill, hue, tint, rim }: Roles): string {
   const rules = [
     // "neo" shapes carry a drop-shadow filter as an attribute.
     '[filter*="drop-shadow"] { filter: none; }',
@@ -436,6 +438,22 @@ function themeCssFor({ paper, muted, line, guide, hue, tint, rim }: Roles): stri
     // C4 draws relations and boundaries in a fixed #444444, unreadable on a dark figure.
     `[stroke="#444444"] { stroke: ${line}; }`,
     `text[fill="#444444"] { fill: ${muted}; }`,
+    // Sequence half-arrows (-\\ -//) and async heads: black strokes or the
+    // text colour by default; lines like the rest.
+    `[id$="-stickTopArrowHead"] path, [id$="-stickBottomArrowHead"] path { stroke: ${line}; }`,
+    `[id$="-solidTopArrowHead"] path, [id$="-solidBottomArrowHead"] path, [id$="-filled-head"] path { fill: ${line}; stroke: none; }`,
+    // A composite state is one tinted container, like a subgraph: the title
+    // on the tint, and no outline round the body (whose bottom stops 4px
+    // short of the container's and showed as a lip).
+    `[data-look="neo"].statediagram-cluster rect.outer, .statediagram-cluster rect.outer { fill: ${clusterFill}; }`,
+    '.statediagram-cluster rect.inner { stroke: none; }',
+    // The xychart's title, weighted like every other title.
+    '.chart-title text { font-weight: 600; }',
+    // Text floor: 12px for axis labels (d3's axes say 10), 11px for anything else.
+    '.grid .tick text { font-size: 12px; }',
+    '.c4-shape .label .c4-type { font-size: 11px; }',
+    // A treemap writes its section totals as an inline 10px.
+    '.treemapSectionValue { font-size: 11px !important; }',
   ];
   // Gantt: each section's bars in their own hue (mermaid styles four).
   for (let i = 0; i < 4; i++) {
@@ -457,7 +475,7 @@ const DIAGRAM_KEYS = [
   'wardley-beta', 'cynefin', 'railroad', 'treemap',
 ] as const;
 
-/** Everything mermaid is told before a render; `width` is the column a gantt chart spans. */
+/** Everything mermaid is told before a render; `width` is the column a gantt chart or an xychart spans. */
 function configFor(tokens: ThemeTokens, width: number): MermaidConfig {
   const { themeVariables, themeCSS } = mermaidThemeFor(tokens);
   const font = tokens.fontFamily;
@@ -471,10 +489,25 @@ function configFor(tokens: ThemeTokens, width: number): MermaidConfig {
   Object.assign(diagrams.timeline, { taskFontFamily: font });
   // A gantt chart is as wide as the element it is drawn in, which during a
   // render is a scratch element on the page body; it spans the column instead.
-  Object.assign(diagrams.gantt, { fontSize: 12, sectionFontSize: 12, useWidth: width > 0 ? Math.round(width) : 720 });
-  // Chart sizes in line with the Vega charts: a 16px title, 12px axis labels, hairline axes.
+  // Its axis labels are 12px; mermaid's default date format (2026-01-05) is
+  // too long for that at d3's ten-odd ticks a column, "Jan 5" is not. A
+  // diagram's own `axisFormat` still wins.
+  Object.assign(diagrams.gantt, {
+    fontSize: 12, sectionFontSize: 12, useWidth: width > 0 ? Math.round(width) : 720, axisFormat: '%b %-d',
+  });
+  // An xychart, like a Vega chart, spans the column (it would otherwise be
+  // drawn at 700px and shrunk, small text and all, into a narrower one): a
+  // 16px title, 12px axis labels, hairline axes.
+  const chartWidth = width > 0 ? Math.round(width) : 700;
   const axis = { labelFontSize: 12, titleFontSize: 13, tickWidth: 1, axisLineWidth: 1 };
-  Object.assign(diagrams.xyChart, { height: 400, titleFontSize: 16, legendFontSize: 12, xAxis: axis, yAxis: { ...axis } });
+  Object.assign(diagrams.xyChart, {
+    width: chartWidth,
+    height: Math.round(Math.min(400, Math.max(240, chartWidth * 0.57))),
+    titleFontSize: 16,
+    legendFontSize: 12,
+    xAxis: axis,
+    yAxis: { ...axis },
+  });
   // Radar axis labels sit just outside the circle and clip at mermaid's 50px margins.
   Object.assign(diagrams.radar, { marginLeft: 90, marginRight: 90 });
   Object.assign(diagrams.quadrantChart, {
@@ -510,13 +543,19 @@ function configFor(tokens: ThemeTokens, width: number): MermaidConfig {
 // the stylesheet. The source is model output, and model output can carry a
 // URL with something from a tool result in its query string.
 
-/** Label HTML keeps text formatting and links; nothing that loads or embeds. */
+/**
+ * Label HTML keeps text formatting and links; nothing that loads or embeds.
+ * mermaid sanitizes its own icons (architecture services, icon shapes) with
+ * the same settings, and they are inline <svg> coloured by `style`
+ * attributes: those stay, and the hook below takes any attribute, a style
+ * among them, that reaches out of the picture.
+ */
 const LABEL_PURIFY = {
   FORBID_TAGS: [
-    'style', 'img', 'image', 'svg', 'math', 'picture', 'source', 'video', 'audio', 'track',
-    'iframe', 'frame', 'object', 'embed', 'link', 'meta', 'base', 'form', 'input',
+    'style', 'img', 'image', 'feImage', 'use', 'foreignObject', 'math', 'picture', 'source', 'video', 'audio',
+    'track', 'iframe', 'frame', 'object', 'embed', 'link', 'meta', 'base', 'form', 'input',
   ],
-  FORBID_ATTR: ['style', 'src', 'srcset', 'background', 'poster'],
+  FORBID_ATTR: ['src', 'srcset', 'background', 'poster'],
 };
 
 /** Keys a diagram's front matter or %%{init}%% directive may not set: mermaid's own, and those that reach the stylesheet. */
@@ -582,6 +621,23 @@ function inertCss(css: string): string {
     .replace(/\b(image-set|src)\(/gi, '-nerve-blocked-$1(');
 }
 
+let sanitizerGuarded = false;
+
+/**
+ * Attributes that reach out of the picture (`fill="url(https://…)"`, an
+ * escape that spells one) go wherever mermaid sanitizes label HTML. The hook
+ * is on DOMPurify's default instance, the one mermaid uses: nothing else in
+ * the app does (svg.ts keeps an instance of its own), and no attribute of
+ * mermaid's own output looks like this.
+ */
+function guardSanitizer(): void {
+  if (sanitizerGuarded) return;
+  sanitizerGuarded = true;
+  DOMPurify.addHook('uponSanitizeAttribute', (_node, data) => {
+    if (EXTERNAL_CSS.test(data.attrValue)) data.keepAttr = false;
+  });
+}
+
 /** Elements that fetch or embed by nature; no diagram is made of them. */
 const FETCHING_TAGS = new Set([
   'img', 'picture', 'source', 'video', 'audio', 'track', 'iframe', 'frame', 'object', 'embed',
@@ -595,8 +651,8 @@ const URL_ATTRIBUTES = new Set(['src', 'srcset', 'poster', 'background', 'lowsrc
  * mermaid's SVG, parsed where nothing loads (a template's content is inert),
  * with everything that would fetch once on the page taken out: fetching
  * elements, URL attributes, references that leave the picture (a link's
- * `href` stays: following it takes a click), inline styles that reach out,
- * and external `url()`s in the stylesheet.
+ * `href` stays: following it takes a click), attributes that reach out (a
+ * style, a fill), and external `url()`s in the stylesheet.
  * The last line of defence; the measures above keep them out of the render.
  */
 function inertPicture(svg: string): DocumentFragment {
@@ -613,8 +669,9 @@ function inertPicture(svg: string): DocumentFragment {
       if (
         URL_ATTRIBUTES.has(name)
         || (name === 'href' && tag !== 'a' && !LOCAL_REF.test(attribute.value))
-        // mermaid's own inline styles never look like this; a classDef's might.
-        || (name === 'style' && EXTERNAL_CSS.test(attribute.value))
+        // No attribute of mermaid's own looks like this (a style, a fill);
+        // a classDef's might, or an entity-encoded url() in label HTML.
+        || EXTERNAL_CSS.test(attribute.value)
       ) {
         element.removeAttributeNode(attribute);
       }
@@ -628,11 +685,27 @@ function inertPicture(svg: string): DocumentFragment {
 
 let renderSeq = 0;
 
-/** The first lines of a mermaid parse error; the full text quotes the grammar. */
+/** How long a reason may be in the frame's one-line notice. */
+const MESSAGE_LENGTH = 240;
+
+/**
+ * A mermaid parse error in one line: where it is, the code it quotes, and
+ * why ("Expecting 'NODE_STRING', got ';'") — the caret line under the code
+ * goes, and a long list of what was expected is cut to its first few.
+ */
 function describe(err: unknown): string {
   const message = err instanceof Error ? err.message : String(err);
-  const lines = message.split('\n').map(line => line.trim()).filter(Boolean);
-  return lines.slice(0, 2).join(' ').slice(0, 240) || 'the diagram could not be parsed';
+  const lines = message.split('\n').map(line => line.trim()).filter(line => line && !/^-*\^$/.test(line));
+  const why = lines.findIndex(line => /^Expecting\b/i.test(line));
+  const head = lines.slice(0, why > 0 ? Math.min(why, 2) : 2);
+  let reason = why >= 0 ? lines[why] : '';
+  const expecting = /^Expecting (.+), got (.+)$/i.exec(reason);
+  if (expecting) {
+    const options = expecting[1].split(/,\s*/);
+    reason = `Expecting ${options.slice(0, 4).join(', ')}${options.length > 4 ? ', …' : ''}; got ${expecting[2]}`;
+  }
+  const text = [...head, reason].filter(Boolean).join(' ');
+  return (text.length > MESSAGE_LENGTH ? `${text.slice(0, MESSAGE_LENGTH - 1)}…` : text) || 'the diagram could not be parsed';
 }
 
 function viewBoxOf(svg: SVGSVGElement): { width: number; height: number } | undefined {
@@ -657,14 +730,15 @@ function naturalSizeOf(svg: SVGSVGElement): { width: number; height: number } | 
 }
 
 /**
- * The SVG as a file of its own: the size it is drawn at, and the figure's
- * background behind it — a dark diagram's light text must stay readable
- * wherever the file is opened. The `<style>` mermaid inlined travels with
- * it, scoped by the root's own id. XML serialization declares the SVG and
- * xlink namespaces a standalone document needs, and turns the labels'
- * `<br>` and `&nbsp;` into what a file can hold.
+ * The SVG as a file of its own, at the size it is drawn at. The `<style>`
+ * mermaid inlined travels with it, scoped by the root's own id. Nothing is
+ * added: the background is the business of whoever shows or saves the file
+ * (and mermaid puts some pictures' content before its `<style>`, where
+ * anything inserted would cover it). XML serialization declares the SVG and
+ * xlink namespaces a standalone document needs, and turns the labels' `<br>`
+ * and `&nbsp;` into what a file can hold.
  */
-function standalone(svg: SVGSVGElement, size: { width: number; height: number } | undefined, background: string): string {
+function standalone(svg: SVGSVGElement, size: { width: number; height: number } | undefined): string {
   const copy = svg.cloneNode(true) as SVGSVGElement;
   // Sizing on the page (fit, zoom) is the page's business, not the file's.
   copy.removeAttribute('style');
@@ -672,22 +746,126 @@ function standalone(svg: SVGSVGElement, size: { width: number; height: number } 
     copy.setAttribute('width', String(size.width));
     copy.setAttribute('height', String(size.height));
   }
-  const box = (copy.getAttribute('viewBox') ?? '').trim().split(/[\s,]+/).map(Number);
-  const backdrop = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
-  if (box.length === 4 && box.every(Number.isFinite)) {
-    backdrop.setAttribute('x', String(box[0]));
-    backdrop.setAttribute('y', String(box[1]));
-    backdrop.setAttribute('width', String(box[2]));
-    backdrop.setAttribute('height', String(box[3]));
-  } else {
-    backdrop.setAttribute('width', '100%');
-    backdrop.setAttribute('height', '100%');
-  }
-  backdrop.setAttribute('fill', background);
-  const style = [...copy.children].find(child => child.localName === 'style');
-  copy.insertBefore(backdrop, style ? style.nextSibling : copy.firstChild);
-  // XML, not HTML: the labels' <br> and &nbsp; must survive as a file.
   return new XMLSerializer().serializeToString(copy);
+}
+
+type Size = { width: number; height: number };
+
+/** Room left round a drawing trimmed to its content, the same on every side. */
+const MARGIN = 8;
+
+/** The smallest text a picture may hold, in CSS pixels at its natural size. */
+const SMALLEST_TEXT = 11;
+
+/** What an edge label can sit on other than the figure: a subgraph, a composite state. */
+const AREAS = '.cluster > rect, .statediagram-cluster rect.inner, .statediagram-cluster rect.outer';
+
+/** The chip behind an edge label: its HTML paragraph, or the rect behind SVG text. */
+const CHIPS = '.edgeLabel p, .edgeLabel rect.background';
+
+/** Text a treemap shrank to fit its cell: below the floor it goes, rather than overflowing the cell. */
+const SHRUNK_TO_FIT = '.treemapLabel, .treemapValue';
+
+const round2 = (n: number) => Math.round(n * 100) / 100;
+
+/** For each edge-label chip that sits on a subgraph or composite state, that area's fill. */
+function chipFills(svg: SVGSVGElement): Map<number, string> {
+  const areas = [...svg.querySelectorAll(AREAS)]
+    .map(area => ({ box: area.getBoundingClientRect(), fill: getComputedStyle(area).fill }))
+    .filter(area => area.box.width > 0 && area.box.height > 0 && /^rgba?\(/.test(area.fill));
+  const fills = new Map<number, string>();
+  if (areas.length === 0) return fills;
+  [...svg.querySelectorAll(CHIPS)].forEach((chip, index) => {
+    const box = chip.getBoundingClientRect();
+    const x = box.left + box.width / 2;
+    const y = box.top + box.height / 2;
+    // The innermost area under the chip's centre: nested subgraphs, a state in a state.
+    const under = areas
+      .filter(area => x >= area.box.left && x <= area.box.right && y >= area.box.top && y <= area.box.bottom)
+      .sort((a, b) => a.box.width * a.box.height - b.box.width * b.box.height)[0];
+    if (under) fills.set(index, under.fill);
+  });
+  return fills;
+}
+
+/** Text under the floor, by index among the picture's `text` and `tspan` elements. */
+function smallText(svg: SVGSVGElement, scale: number): Map<number, 'hide' | 'grow'> {
+  const found = new Map<number, 'hide' | 'grow'>();
+  [...svg.querySelectorAll('text, tspan')].forEach((element, index) => {
+    const style = getComputedStyle(element);
+    if (style.display === 'none' || !element.textContent?.trim()) return;
+    if (parseFloat(style.fontSize) * scale < SMALLEST_TEXT) found.set(index, element.closest(SHRUNK_TO_FIT) ? 'hide' : 'grow');
+  });
+  return found;
+}
+
+/**
+ * What only the laid-out picture can tell, put right on `svg`: no text under
+ * the 11px floor; edge-label chips in the colour of the subgraph or state
+ * they sit on, not boxes of figure colour on its tint; and bounds trimmed to
+ * the drawing with an even margin (mermaid leaves sequence diagrams and pies
+ * twice the room at the bottom). Trimming only shrinks: what mermaid's own
+ * bounds include stays, every label among it. Measured in place when the
+ * stage is laid out — the frame draws into one that is hidden but laid out —
+ * else on a copy out of sight; nothing changes where nothing can be measured.
+ * Returns the picture's size afterwards.
+ */
+function finish(svg: SVGSVGElement, size: Size): Size {
+  const box = (svg.getAttribute('viewBox') ?? '').trim().split(/[\s,]+/).map(Number);
+  if (typeof svg.getBBox !== 'function' || box.length !== 4 || !box.every(Number.isFinite) || box[2] <= 0) return size;
+  const [x0, y0, w0, h0] = box;
+  const scale = size.width / w0;
+  let measured = svg;
+  let host: HTMLElement | null = null;
+  if (!(svg.getBoundingClientRect().width > 0)) {
+    host = document.createElement('div');
+    host.style.cssText = 'position: fixed; left: -100000px; top: 0; visibility: hidden; pointer-events: none;';
+    measured = svg.cloneNode(true) as SVGSVGElement;
+    host.appendChild(measured);
+    document.body.appendChild(host);
+  }
+  const pairs = (selector: string) => {
+    const real = [...svg.querySelectorAll<SVGElement | HTMLElement>(selector)];
+    const copy = measured === svg ? real : [...measured.querySelectorAll<SVGElement | HTMLElement>(selector)];
+    return { real, copy };
+  };
+  try {
+    const small = smallText(measured, scale);
+    if (small.size) {
+      const text = pairs('text, tspan');
+      for (const [index, action] of small) {
+        for (const element of [text.real[index], text.copy[index]]) {
+          if (!element) continue;
+          if (action === 'hide') element.style.display = 'none';
+          else element.style.fontSize = `${SMALLEST_TEXT / scale}px`;
+        }
+      }
+    }
+    const fills = chipFills(measured);
+    if (fills.size) {
+      const chips = pairs(CHIPS).real;
+      for (const [index, fill] of fills) {
+        const chip = chips[index];
+        if (!chip) continue;
+        if (chip.localName === 'p') chip.style.backgroundColor = fill;
+        else Object.assign(chip.style, { fill, stroke: fill });
+      }
+    }
+    const content = measured.getBBox();
+    if (!(content.width > 0 && content.height > 0)) return size;
+    const left = Math.max(x0, content.x - MARGIN);
+    const top = Math.max(y0, content.y - MARGIN);
+    const right = Math.min(x0 + w0, content.x + content.width + MARGIN);
+    const bottom = Math.min(y0 + h0, content.y + content.height + MARGIN);
+    if (right - left >= w0 - 0.5 && bottom - top >= h0 - 0.5) return size;
+    svg.setAttribute('viewBox', [left, top, right - left, bottom - top].map(round2).join(' '));
+    return { width: round2((right - left) * scale), height: round2((bottom - top) * scale) };
+  } catch {
+    // Measuring improves a picture; it never stops one from showing.
+    return size;
+  } finally {
+    host?.remove();
+  }
 }
 
 // `initialize` resets mermaid's one global configuration, so a render states
@@ -707,6 +885,7 @@ export const mountMermaid: Mount = async (stage, source, { theme, width }) => {
   const reason = reachesOut(source);
   if (reason) throw new Error(`${reason}, and pictures here load nothing from the network`);
   const mermaid = await loadMermaid();
+  guardSanitizer();
   const svg = await exclusive(async () => {
     mermaid.initialize(configFor(tokens, width));
     let parsed: { db: unknown };
@@ -725,13 +904,18 @@ export const mountMermaid: Mount = async (stage, source, { theme, width }) => {
   });
   stage.replaceChildren(inertPicture(svg));
   const element = stage.querySelector('svg');
-  const naturalSize = element ? naturalSizeOf(element) : undefined;
+  let naturalSize = element ? naturalSizeOf(element) : undefined;
   if (element && naturalSize) {
     // The picture states its own size (a few diagram types ask for
     // `width="100%"` whatever `useMaxWidth` says); the frame fits or scrolls it.
-    element.setAttribute('width', String(naturalSize.width));
-    element.setAttribute('height', String(naturalSize.height));
+    const state = (size: Size) => {
+      element.setAttribute('width', String(size.width));
+      element.setAttribute('height', String(size.height));
+    };
+    state(naturalSize);
     element.style.removeProperty('max-width');
+    naturalSize = finish(element, naturalSize);
+    state(naturalSize);
   }
   // The file is made from the picture as drawn, whatever the frame does to
   // the element on screen afterwards.
@@ -741,6 +925,6 @@ export const mountMermaid: Mount = async (stage, source, { theme, width }) => {
       stage.innerHTML = '';
     },
     naturalSize,
-    toSvg: async () => (drawn ? standalone(drawn, naturalSize, tokens.surface) : null),
+    toSvg: async () => (drawn ? standalone(drawn, naturalSize) : null),
   };
 };
