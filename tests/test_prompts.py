@@ -179,3 +179,41 @@ def test_platform_md_over_16_kib_is_cut_with_a_marker(tmp_path: Path):
     prompt = build_system_prompt(workspace=ws, config_dir=config_dir)
     assert f"\n\n---\n\n{kept}\n[platform notes truncated at 16 KiB]\n\n---\n\n# MEMORY" in prompt
     assert "dropped" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# The "Rendering" line: what the surface a session is read on draws.
+# ---------------------------------------------------------------------------
+
+
+def _rendering_line(prompt: str) -> str:
+    return next(ln for ln in prompt.splitlines() if ln.startswith("- **Rendering:**"))
+
+
+def test_web_prompt_names_the_fence_languages_the_chat_renders(tmp_path: Path):
+    prompts._PROMPT_TOOL_REGISTRY = None
+    line = _rendering_line(build_system_prompt(workspace=tmp_path, source="web"))
+    assert "renders" in line
+    for fence in ("```mermaid", "```vega-lite", "```svg"):
+        assert fence in line
+
+
+def test_text_channels_are_told_not_to_draw(tmp_path: Path):
+    prompts._PROMPT_TOOL_REGISTRY = None
+    for source in ("telegram", "slack", "cron"):
+        prompt = build_system_prompt(workspace=tmp_path, source=source)
+        assert f"- **Source:** {source}" in prompt
+        assert "Do not emit ```mermaid" in _rendering_line(prompt), source
+
+
+def test_rendering_follows_the_session_surface_not_the_turn(tmp_path: Path):
+    """A wakeup turn of a web session is still read in the web chat."""
+    prompts._PROMPT_TOOL_REGISTRY = None
+    prompt = build_system_prompt(workspace=tmp_path, source="wakeup", rendering_source="web")
+    assert "- **Source:** wakeup" in prompt
+    assert "renders fenced ```mermaid" in _rendering_line(prompt)
+    legacy = build_system_prompt(
+        workspace=tmp_path, source="wakeup", rendering_source="web", static=False,
+    )
+    assert "renders fenced ```mermaid" in _rendering_line(legacy)
+    assert "Do not emit" in _rendering_line(build_system_prompt(workspace=tmp_path, source="wakeup"))

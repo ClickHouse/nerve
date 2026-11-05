@@ -578,6 +578,24 @@ body {
   font-family: var(--typography-font-families-mono, "Inconsolata", ui-monospace, "SFMono-Regular", Consolas, monospace);
 }
 
+/* Rendered code blocks — mermaid diagrams, Vega charts, inline SVG (Chat/rich).
+   The canvas continues the block's header the way `pre` does below. */
+.rich-block-canvas {
+  background: var(--theme-code-bg);
+  border: 1px solid var(--theme-border);
+  border-top: 0;
+  border-radius: 0 0 6px 6px;
+  padding: 0.75em;
+  overflow-x: auto;
+}
+.rich-block-canvas svg { max-width: 100%; height: auto; display: block; margin: 0 auto; }
+/* vega-embed sizes its own svg and puts its export menu in the block's corner. */
+.rich-block-canvas .vega-embed { display: block; }
+.rich-block-canvas .vega-embed svg { margin: 0; }
+/* The full-size dialog: the picture at its natural width, scrolled, not shrunk. */
+.rich-block-expanded { overflow: auto; }
+.rich-block-expanded svg { display: block; }
+
 /* Code blocks */
 .markdown-content pre {
   background: var(--theme-code-bg);
