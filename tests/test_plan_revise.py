@@ -28,7 +28,8 @@ from nerve.agent.plan_service import (
 from nerve.db import Database
 from nerve.identity import Actor
 
-from tests.actor_rows import ensure_system_principal
+from tests.actor_rows import ensure_actor_row, ensure_system_principal
+from tests.conftest import TEST_ACTOR
 
 
 @pytest_asyncio.fixture
@@ -52,18 +53,22 @@ class FakeSessionManager:
         metadata: dict | None = None,
         *,
         actor: Actor | None,
+        cause=None,
     ) -> dict:
         self.calls.append({
             "session_id": session_id,
             "title": title,
             "source": source,
             "actor": actor,
+            "cause": cause,
         })
         return {"id": session_id, "title": title or session_id, "source": source}
 
 
 class FakeEngine:
     """Mimics AgentEngine.run + .sessions for revision dispatch tests."""
+
+    accepting_turns = True
 
     def __init__(self, db: Database | None = None) -> None:
         self.sessions = FakeSessionManager()
@@ -82,12 +87,14 @@ class FakeEngine:
         source: str = "web",
         *,
         actor: Actor | None,
+        cause=None,
     ) -> None:
         self.runs.append({
             "session_id": session_id,
             "user_message": user_message,
             "source": source,
             "actor": actor,
+            "cause": cause,
         })
         self.run_event.set()
 
@@ -124,6 +131,7 @@ class TestRequestPlanRevision:
         result = await request_plan_revision(
             db=db, engine=engine,
             plan_id="plan-orig", feedback="be more specific about edge cases",
+            actor=None, cause=None,
         )
 
         # Wait for the background dispatch task to actually call engine.run.
@@ -147,6 +155,7 @@ class TestRequestPlanRevision:
         await request_plan_revision(
             db=db, engine=engine,
             plan_id="plan-orig", feedback="needs more tests",
+            actor=None, cause=None,
         )
         await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
 
@@ -160,7 +169,7 @@ class TestRequestPlanRevision:
         task = await db.get_task(task_id)
         task_md = tmp_path / task["file_path"]
         body = task_md.read_text(encoding="utf-8")
-        assert "Revision requested for plan-orig" in body
+        assert "Revision requested for [plan-orig](/plans/plan-orig)" in body
         assert "needs more tests" in body
 
     async def test_routes_to_proposer_session(self, db: Database, tmp_path):
@@ -169,6 +178,7 @@ class TestRequestPlanRevision:
         await request_plan_revision(
             db=db, engine=engine,
             plan_id="plan-orig", feedback="rev",
+            actor=None, cause=None,
         )
         await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
 
@@ -191,6 +201,7 @@ class TestRequestPlanRevision:
         await request_plan_revision(
             db=db, engine=engine,
             plan_id="plan-orig", feedback="rev",
+            actor=None, cause=None,
         )
         await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
 
@@ -206,6 +217,7 @@ class TestRequestPlanRevision:
             await request_plan_revision(
                 db=db, engine=engine,
                 plan_id="plan-orig", feedback="rev",
+                actor=None, cause=None,
             )
         # Nothing should have been dispatched.
         assert engine.runs == []
@@ -219,6 +231,7 @@ class TestRequestPlanRevision:
             await request_plan_revision(
                 db=db, engine=engine,
                 plan_id="plan-orig", feedback="rev",
+                actor=None, cause=None,
             )
 
     async def test_raises_plan_not_found(self, db: Database, tmp_path):
@@ -228,6 +241,7 @@ class TestRequestPlanRevision:
             await request_plan_revision(
                 db=db, engine=engine,
                 plan_id="plan-does-not-exist", feedback="rev",
+                actor=None, cause=None,
             )
         assert engine.runs == []
 
@@ -242,6 +256,7 @@ class TestRequestPlanRevision:
             await request_plan_revision(
                 db=db, engine=engine,
                 plan_id="plan-orig", feedback="rev",
+                actor=None, cause=None,
             )
         assert engine.runs == []
 
@@ -252,6 +267,7 @@ class TestRequestPlanRevision:
             await request_plan_revision(
                 db=db, engine=engine,
                 plan_id="plan-orig", feedback="   ",
+                actor=None, cause=None,
             )
 
 
@@ -344,6 +360,9 @@ class TestHttpReviseRoute:
 
         engine, task_id = await _setup(db, tmp_path)
         init_deps(engine=engine, db=db)  # type: ignore[arg-type]
+        # The route stores the request's actor as the plan's reviewer, and
+        # the foreign key needs its row.
+        await ensure_actor_row(db, TEST_ACTOR)
 
         app = FastAPI()
         app.include_router(plans_router)

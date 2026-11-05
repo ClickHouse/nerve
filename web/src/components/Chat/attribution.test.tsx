@@ -95,7 +95,7 @@ function said(text: string, actor_id: string | null, id = 1): ChatMessage {
 }
 
 function renderTranscript(messages: ChatMessage[]) {
-  return render(<MessageList messages={messages} streamingBlocks={[]} isStreaming={false} />);
+  return render(<MessageList messages={messages} isStreaming={false} />);
 }
 
 function labels(): string[] {
@@ -174,15 +174,36 @@ describe('viewer-relative transcript labels', () => {
     expect(container.querySelector('[data-attribution] svg')).toHaveAttribute('aria-hidden', 'true');
   });
 
-  it('renders a missing human name neutrally without exposing the id as text', async () => {
+  it('names a person without a name by a short id and keeps the full id in the title', async () => {
     listActors.mockResolvedValue({ actors: [alice(null), bob()] });
     signInAs(BOB);
     renderTranscript([said('still readable', ALICE)]);
 
-    expect(await screen.findByText('Unnamed account')).toBeInTheDocument();
+    expect(await screen.findByText(ALICE.slice(0, 8))).toBeInTheDocument();
     expect(screen.queryByText(ALICE)).toBeNull();
+    expect(screen.queryByText('Unnamed account')).toBeNull();
     expect(screen.getByTitle(`Sent by actor ${ALICE}`)).toBeInTheDocument();
     expect(screen.getByText('still readable')).toBeInTheDocument();
+  });
+
+  it('names a hosted person by the gateway display name, without a login name', async () => {
+    const carol = '3f2a9c1e-7b4d-4e8a-9c2f-1a2b3c4d5e6f';
+    listActors.mockResolvedValue({ actors: [actorRef(carol, { display_name: 'Carol' }), bob()] });
+    signInAs(BOB);
+    renderTranscript([said('from the gateway', carol)]);
+
+    expect(await screen.findByText('Carol')).toBeInTheDocument();
+    expect(screen.getByTitle('Sent by Carol')).toBeInTheDocument();
+  });
+
+  it('names a person that the directory does not know by a short id', async () => {
+    const stranger = '9b1c2d3e-0000-4000-8000-000000000042';
+    listActors.mockResolvedValue({ actors: [bob()] });
+    signInAs(BOB);
+    renderTranscript([said('from somebody new', stranger)]);
+
+    expect(await screen.findByText('9b1c2d3e')).toBeInTheDocument();
+    expect(screen.getByTitle(`Sent by actor ${stranger}`)).toBeInTheDocument();
   });
 
   it('falls back to the login name when a person has no display name', async () => {
@@ -229,7 +250,9 @@ describe('live and optimistic attribution', () => {
   });
 
   it('still sends through the null legacy path when no account identity exists', async () => {
-    useChatStore.setState({ messages: [], activeSession: 's1', virtualSession: null });
+    // Not streaming: the previous case leaves a turn running, and a message
+    // sent during a turn is queued rather than shown as a bubble.
+    useChatStore.setState({ messages: [], activeSession: 's1', virtualSession: null, isStreaming: false });
     await act(async () => { await useChatStore.getState().sendMessage('ship it?'); });
 
     expect(useChatStore.getState().messages[0].actor_id).toBeNull();

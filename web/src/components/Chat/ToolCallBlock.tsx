@@ -3,7 +3,7 @@ import { ChevronRight, ChevronDown, Terminal, FileText, Search, Globe, Loader2, 
 import { Button } from '../ui';
 import { getToolSummary } from '../../utils/toolSummary';
 import type { ToolCallBlockData } from '../../types/chat';
-import { getToken } from '../../api/client';
+import { authUrl } from '../../api/hosted';
 import { EditToolBlock } from './tools/EditToolBlock';
 import { BashToolBlock } from './tools/BashToolBlock';
 import { FileToolBlock } from './tools/FileToolBlock';
@@ -12,9 +12,11 @@ import { TaskToolBlock } from './tools/TaskToolBlock';
 import { CCTaskToolBlock } from './tools/CCTaskToolBlock';
 import { ScheduleWakeupBlock } from './tools/ScheduleWakeupBlock';
 import { SourceToolBlock } from './tools/SourceToolBlock';
-import { SubagentToolBlock } from './tools/SubagentToolBlock';
+import { AgentLine } from './agents/AgentLine';
 import { WorkflowToolBlock } from './tools/WorkflowToolBlock';
 import { QuestionBlock } from './tools/QuestionBlock';
+import { FormBlock } from './tools/FormBlock';
+import { isAskFormTool } from './tools/formQuestions';
 import { PlanApprovalBlock } from './tools/PlanApprovalBlock';
 import { PlanToolBlock } from './tools/PlanToolBlock';
 import { SkillToolBlock } from './tools/SkillToolBlock';
@@ -53,11 +55,12 @@ export function ToolCallBlock({
     case 'Read':
     case 'Write':
       return <FileToolBlock block={block} />;
-    // Sub-agent spawn: Claude Code 2.1.x renamed "Task" → "Agent". Match both
-    // so old chat history keeps rendering with the sub-agent card.
+    // Sub-agent spawn: Claude Code 2.1.x renamed "Task" → "Agent". Match both.
+    // The live line of the agent record; old history without a record keeps
+    // the legacy sub-agent card.
     case 'Agent':
     case 'Task':
-      return <SubagentToolBlock block={block} />;
+      return <AgentLine block={block} />;
     // Dynamic workflow: compact card in chat; live phase/agent tree in panel.
     case 'Workflow':
       return <WorkflowToolBlock block={block} />;
@@ -79,6 +82,12 @@ export function ToolCallBlock({
     case 'ExitPlanMode':
     case 'EnterPlanMode':
       return <PlanApprovalBlock block={block} />;
+  }
+
+  // Nerve's ask_form (`mcp__nerve__ask_form`) — the form card; a call with
+  // no question to show stays a plain tool call.
+  if (isAskFormTool(block.tool)) {
+    return <FormBlock block={block} fallback={<GenericToolBlock block={block} />} />;
   }
 
   // send_file — render as inline download card, no tool chrome
@@ -150,7 +159,7 @@ function SendFileBlock({ block }: { block: ToolCallBlockData }) {
   return (
     <div className="my-2">
       <a
-        href={`${downloadUrl}&token=${getToken()}`}
+        href={authUrl(downloadUrl)}
         download={filename}
         className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-surface hover:bg-surface-hover transition-colors text-sm text-text-secondary"
       >

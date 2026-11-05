@@ -1,19 +1,11 @@
 import { useEffect, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Check, X, MessageSquare, ExternalLink } from '../components/ui/icons';
-import { Badge, type BadgeTone, Button, IconButton, TextArea } from '../components/ui';
+import { Badge, Button, IconButton, TextArea } from '../components/ui';
+import { PlanStatusBadge } from '../components/Plans/PlanStatusBadge';
 import { usePlanStore } from '../stores/planStore';
 import { MarkdownContent } from '../components/Chat/MarkdownContent';
-
-/** A plan's lifecycle state, as a `Badge` tone. `superseded` is the fallback. */
-const STATUS_TONES: Record<string, BadgeTone> = {
-  pending: 'warning',
-  approved: 'success',
-  implementing: 'info',
-  declined: 'danger',
-  superseded: 'neutral',
-  failed: 'danger',
-};
+import { ActorAttribution } from '../components/Chat/ActorLabel';
 
 /** Plan type is identity, not status — hence `purple` rather than a feedback tone. */
 const TYPE_LABELS: Record<string, string> = {
@@ -90,9 +82,7 @@ export function PlanDetailPage() {
           <h1 className="text-lg font-semibold text-text">
             {plan.task_title || plan.task_id}
           </h1>
-          <Badge size="sm" pill outline tone={STATUS_TONES[plan.status] ?? 'neutral'}>
-            {plan.status}
-          </Badge>
+          <PlanStatusBadge status={plan.status} />
           {plan.plan_type && plan.plan_type !== 'generic' && TYPE_LABELS[plan.plan_type] && (
             <Badge size="sm" pill outline tone="purple">
               {TYPE_LABELS[plan.plan_type]}
@@ -102,7 +92,30 @@ export function PlanDetailPage() {
         </div>
         <div className="flex items-center gap-4 text-xs text-text-faint ml-7">
           <span>{plan.created_at?.slice(0, 16).replace('T', ' ')}</span>
+          {plan.created_by_actor_id && (
+            <span data-testid="plan-author" className="inline-flex items-center gap-1 min-w-0">
+              Proposed by{' '}
+              <ActorAttribution
+                actorId={plan.created_by_actor_id}
+                causeId={plan.caused_by_actor_id}
+                verb="Proposed by"
+              />
+            </span>
+          )}
           {plan.model && <span>{plan.model}</span>}
+          {plan.reviewed_by_actor_id && (
+            <span data-testid="plan-reviewer" className="inline-flex items-center gap-1 min-w-0">
+              Reviewed by{' '}
+              <ActorAttribution
+                actorId={plan.reviewed_by_actor_id}
+                causeId={plan.reviewed_caused_by_actor_id}
+                verb="Reviewed by"
+              />
+              {plan.reviewed_at && (
+                <span>{plan.reviewed_at.slice(0, 16).replace('T', ' ')}</span>
+              )}
+            </span>
+          )}
           <Button variant="link" size="xs" onClick={() => navigate(`/tasks/${plan.task_id}`)}>
             <ExternalLink size={11} /> View task
           </Button>

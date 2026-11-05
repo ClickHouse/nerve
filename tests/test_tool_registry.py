@@ -149,7 +149,7 @@ class TestDefaultRegistry:
         expected = {
             # tasks
             "task_search", "task_create", "task_list", "task_update",
-            "task_read", "task_write", "task_done",
+            "task_read", "task_write", "task_done", "task_comment",
             # memory
             "memory_recall", "conversation_history", "memorize",
             # plans
@@ -161,6 +161,9 @@ class TestDefaultRegistry:
             "list_sources", "poll_source",
             # notifications
             "notify", "ask_user", "react", "send_sticker", "send_file",
+            "send_channel_message",
+            # forms
+            "ask_form",
             # mcp admin
             "nerve_api", "mcp_reload",
             # workflow runs

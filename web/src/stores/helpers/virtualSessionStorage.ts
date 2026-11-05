@@ -10,6 +10,8 @@
 // Only the id and creation time are stored. The rest of the row is cosmetic
 // and rebuilt on load.
 
+import { viewerStorageKey } from './viewerStorage';
+
 const KEY = 'nerve_virtual_session';
 
 export interface StoredVirtualSession {
@@ -20,14 +22,14 @@ export interface StoredVirtualSession {
 /** Remember the current unsent chat so a reload can restore it. */
 export function persistVirtualSession(id: string, created: string): void {
   try {
-    localStorage.setItem(KEY, JSON.stringify({ id, created }));
+    localStorage.setItem(viewerStorageKey(KEY), JSON.stringify({ id, created }));
   } catch { /* quota / disabled — the chat simply won't survive a reload */ }
 }
 
 /** Read back the unsent chat, if any. */
 export function loadVirtualSession(): StoredVirtualSession | null {
   try {
-    const raw = localStorage.getItem(KEY);
+    const raw = localStorage.getItem(viewerStorageKey(KEY));
     if (!raw) return null;
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed.id === 'string' && parsed.id) {
@@ -39,5 +41,5 @@ export function loadVirtualSession(): StoredVirtualSession | null {
 
 /** Forget it — the chat was sent (and adopted a real id) or discarded. */
 export function clearVirtualSession(): void {
-  try { localStorage.removeItem(KEY); } catch { /* ignore */ }
+  try { localStorage.removeItem(viewerStorageKey(KEY)); } catch { /* ignore */ }
 }

@@ -228,6 +228,33 @@ class TestMultiSourceMerge:
         assert str(settings) in str(excinfo.value)
         assert "Permission denied" in str(excinfo.value)
 
+    @pytest.mark.skipif(
+        not hasattr(os, "geteuid") or os.geteuid() == 0,
+        reason="root (or a platform without POSIX uids) ignores directory permissions",
+    )
+    def test_unreachable_workspace_settings_count_as_absent(self, tmp_path):
+        """A settings path under a directory we may not traverse is not there.
+
+        The host side of a Docker deployment: config.yaml names the container's
+        workspace (``/root/nerve-workspace``), and on a Linux host the user
+        cannot look inside ``/root``, so ``exists()`` itself raises
+        PermissionError before anything is opened. That is "no settings layer
+        here", the same as a missing file — not the unreadable-file error
+        above, which is about a file we can see but cannot open.
+        """
+        config_dir, workspace = _setup(tmp_path)
+        _write(config_dir / "config.yaml", f"workspace: {workspace}\n")
+        settings = workspace_settings_file(workspace)
+        _write(settings, "timezone: Europe/Amsterdam\n")
+        workspace.chmod(0o000)
+        try:
+            with pytest.raises(PermissionError):
+                settings.exists()  # the condition this test is about
+            config = load_config(config_dir)
+        finally:
+            workspace.chmod(0o700)
+        assert config.timezone != "Europe/Amsterdam"
+
     def test_non_utf8_settings_is_a_config_error(self, tmp_path):
         """Latin-1 bytes in a UTF-8 file: still a report, not a traceback."""
         config_dir, workspace = _setup(tmp_path)

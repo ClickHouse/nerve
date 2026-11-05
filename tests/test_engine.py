@@ -2,8 +2,13 @@
 helpers (no SDK subprocess)."""
 
 import asyncio
+import contextlib
 import json
+import logging
+import math
 import os
+import re
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -15,7 +20,8 @@ from nerve.agent.backends import events as ev
 from nerve.agent.backends.base import SessionSpec, TransportDiedError
 from nerve.agent.backends.claude import ClaudeBackend, ClaudeClient, translate_message
 from nerve.agent.engine import AgentEngine, _TurnState, _model_family
-from nerve.config import AgentConfig, NerveConfig
+from nerve.config import DEFAULT_EFFORT, AgentConfig, NerveConfig
+from tests.rate_limited_upstream import RateLimitedUpstream
 
 
 @pytest.mark.parametrize(
@@ -36,6 +42,14 @@ from nerve.config import AgentConfig, NerveConfig
         # Sonnet 5 supports the full ladder (unlike Sonnet 4.6's high cap)
         ("max",    "claude-sonnet-5",           "max"),
         ("xhigh",  "claude-sonnet-5",           "xhigh"),
+        # Sonnet 5.5 supports the full ladder (verified via Models API 2026-09-28)
+        ("max",    "claude-sonnet-5-5",         "max"),
+        ("xhigh",  "claude-sonnet-5-5",         "xhigh"),
+        ("low",    "claude-sonnet-5-5",         "low"),
+        # Haiku 5.5 supports the full ladder
+        ("max",    "claude-haiku-5-5",          "max"),
+        ("xhigh",  "claude-haiku-5-5",          "xhigh"),
+        ("low",    "claude-haiku-5-5",          "low"),
         # Opus 4.8 supports every level (same ladder as 4.7)
         ("max",    "claude-opus-4-8",           "max"),
         ("xhigh",  "claude-opus-4-8",           "xhigh"),
@@ -80,16 +94,35 @@ def test_effective_effort_model_default_none():
 @pytest.mark.parametrize(
     "model, expected",
     [
-        # Opus 5.5 rejects thinking.type="disabled"; send adaptive.
+        # Opus 5.5 and Sonnet 5.5 reject thinking.type="disabled"; send adaptive.
         ("claude-opus-5-5",              {"type": "adaptive"}),
         ("us.anthropic.claude-opus-5-5", {"type": "adaptive"}),
+        ("claude-sonnet-5-5",            {"type": "adaptive"}),
         ("claude-opus-5",                {"type": "disabled"}),
+        ("claude-sonnet-5",              {"type": "disabled"}),
         ("claude-opus-4-8",              {"type": "disabled"}),
         (None,                           {"type": "disabled"}),
     ],
 )
 def test_parse_thinking_config_disabled(model, expected):
     assert ClaudeBackend._parse_thinking_config("disabled", model) == expected
+
+
+@pytest.mark.parametrize(
+    "effort, expected",
+    [
+        # Haiku 5.5 accepts thinking.type="disabled" at high effort or below.
+        ("low",    {"type": "disabled"}),
+        ("medium", {"type": "disabled"}),
+        ("high",   {"type": "disabled"}),
+        ("xhigh",  {"type": "adaptive"}),
+        ("max",    {"type": "adaptive"}),
+        (None,     {"type": "adaptive"}),
+    ],
+)
+@pytest.mark.parametrize("model", ["claude-haiku-5-5", "us.anthropic.claude-haiku-5-5"])
+def test_parse_thinking_config_disabled_haiku_5_5(model, effort, expected):
+    assert ClaudeBackend._parse_thinking_config("disabled", model, effort) == expected
 
 
 @pytest.mark.parametrize(
@@ -130,7 +163,7 @@ def test_agent_config_cron_effort_default_and_override():
     # Explicit value is respected, and interactive effort stays independent.
     cfg = AgentConfig.from_dict({"cron_effort": "low"})
     assert cfg.cron_effort == "low"
-    assert cfg.effort == "max"
+    assert cfg.effort == DEFAULT_EFFORT
 
 
 def test_claude_system_prompt_excludes_codex_runbook_policy(tmp_path):
@@ -139,6 +172,7 @@ def test_claude_system_prompt_excludes_codex_runbook_policy(tmp_path):
     backend = ClaudeBackend(SimpleNamespace(
         config=lambda: cfg,
         claude_plugins=lambda: [],
+        managed_mcp=False,
     ))
     marker = "exact claude system prompt"
     spec = SessionSpec(
@@ -160,6 +194,37 @@ def test_claude_system_prompt_excludes_codex_runbook_policy(tmp_path):
     assert rendered == marker
     assert "Nerve runbooks" not in rendered
     assert "Codex-native skills" not in rendered
+
+
+def test_max_turns_default_and_zero_means_no_cap(tmp_path):
+    """The default cap is a loop guard, not a budget, and 0 (or any non-positive
+    value) lifts it: the CLI options then carry None, which the SDK turns into
+    *no* --max-turns flag."""
+    assert AgentConfig.from_dict({}).max_turns == 1000
+
+    cfg = NerveConfig.from_dict({"workspace": str(tmp_path)})
+    backend = ClaudeBackend(SimpleNamespace(
+        config=lambda: cfg,
+        claude_plugins=lambda: [],
+        managed_mcp=False,
+    ))
+    base = dict(
+        session_id="max-turns-cap",
+        source="web",
+        model=cfg.agent.model,
+        effort="high",
+        system_prompt="cap check",
+        cwd=str(tmp_path),
+    )
+    with patch.object(backend, "_build_mcp_servers", return_value={}), \
+         patch.object(backend, "_build_hooks", return_value={}):
+        capped = backend._build_options(SessionSpec(**base, max_turns=1000))
+        uncapped = [
+            backend._build_options(SessionSpec(**base, max_turns=n)).max_turns
+            for n in (0, -1)
+        ]
+    assert capped.max_turns == 1000
+    assert uncapped == [None, None]
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +382,7 @@ def test_claude_options_pass_resume_session_at_only_for_forks(tmp_path):
     backend = ClaudeBackend(SimpleNamespace(
         config=lambda: cfg,
         claude_plugins=lambda: [],
+        managed_mcp=False,
     ))
     base = dict(
         session_id="fork-opts", source="web", model=cfg.agent.model,
@@ -339,6 +405,7 @@ def test_claude_options_set_stdout_buffer_from_config(tmp_path):
         backend = ClaudeBackend(SimpleNamespace(
             config=lambda: cfg,
             claude_plugins=lambda: [],
+            managed_mcp=False,
         ))
         spec = SessionSpec(
             session_id="buf-opts", source="web", model=cfg.agent.model,
@@ -561,6 +628,135 @@ async def test_receive_turn_closes_the_iterator_on_a_completed_turn():
 
 
 # ---------------------------------------------------------------------------
+# ClaudeClient.receive_turn — silence while the person decides is no hang
+# ---------------------------------------------------------------------------
+
+
+class _Hub:
+    """The session's interaction hub, as ``receive_turn`` reads it."""
+
+    def __init__(self, *pending: str):
+        self.pending = list(pending)
+
+    @property
+    def has_pending(self) -> bool:
+        return bool(self.pending)
+
+    def pending_interaction_types(self) -> list[str]:
+        return list(self.pending)
+
+
+class _AskingClient:
+    """SDK double for a CLI that asked the person through ``can_use_tool``:
+    it streams ``before``, is silent until ``answer()``, then streams
+    ``after``. The pause is over before the CLI speaks again, so the hub
+    clears in the same step as the next message.
+
+    ``receive_response`` is a real async generator, like the SDK's: a
+    cancelled ``__anext__()`` finalizes it, and waiting on it again would
+    report a dead runtime.
+    """
+
+    def __init__(self, hub: _Hub, before: list, after: list):
+        self._hub, self._before, self._after = hub, before, after
+        self._answered = asyncio.Event()
+
+    def answer(self) -> None:
+        self._answered.set()
+
+    def receive_response(self):
+        async def _gen():
+            for msg in self._before:
+                yield msg
+            await self._answered.wait()
+            self._hub.pending.clear()
+            for msg in self._after:
+                yield msg
+
+        return _gen()
+
+
+def _deferrals(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if "idle timeout deferred" in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_waits_for_the_person_past_the_idle_timeout(caplog):
+    """A CLI paused on a plan decision is silent because it waits for Nerve's
+    answer, which waits for the person. Past the idle timeout the turn keeps
+    waiting (no TimeoutError), and after the decision the rest of the stream
+    arrives on the same iterator. The deferral is logged once."""
+    hub = _Hub("plan_exit")
+    before = [_text_msg("Here is the plan.")]
+    after = [_text_msg("Approved, building."), _result_msg()]
+    sdk = _AskingClient(hub, before, after)
+    client = _turn_client(sdk, "sess-plan", idle_timeout=0.05)
+    client._spec.interactive = hub
+    seen: list = []
+
+    async def _consume():
+        async for event in client.receive_turn():
+            seen.append(event)
+
+    with caplog.at_level(logging.INFO, logger="nerve.agent.interactive"):
+        turn = asyncio.create_task(_consume())
+        try:
+            await asyncio.sleep(0.4)  # eight idle timeouts of silence
+            assert not turn.done()
+            sdk.answer()
+            await asyncio.wait_for(turn, timeout=2)
+        finally:
+            turn.cancel()
+
+    assert seen == _translated(before + after)
+    assert _deferrals(caplog) == [
+        "idle timeout deferred for session sess-plan: waiting for the person "
+        "(plan_exit pending)",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_times_out_when_nothing_waits_for_the_person():
+    """With a hub but nothing pending, silence past the idle timeout is a
+    hang as before: TimeoutError, and the SDK iterator is closed."""
+    sdk = _StubClient([_text_msg("a")], hang=True, hang_seconds=2.0)
+    client = _turn_client(sdk, "sess-idle", idle_timeout=0.05)
+    client._spec.interactive = _Hub()
+    with pytest.raises(asyncio.TimeoutError):
+        async for _event in client.receive_turn():
+            pass
+    assert sdk.aclose_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_times_out_once_the_interaction_is_over():
+    """The wait lasts only while the interaction is pending: once it is
+    over, silence past the idle timeout is a hang again."""
+    hub = _Hub("question")
+    sdk = _StubClient([_text_msg("a")], hang=True, hang_seconds=5.0)
+    client = _turn_client(sdk, "sess-q", idle_timeout=0.05)
+    client._spec.interactive = hub
+
+    async def _consume():
+        async for _event in client.receive_turn():
+            pass
+
+    turn = asyncio.create_task(_consume())
+    try:
+        await asyncio.sleep(0.2)
+        assert not turn.done()
+        hub.pending.clear()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(turn, timeout=2)
+    finally:
+        turn.cancel()
+    assert sdk.aclose_calls == 1
+
+
+# ---------------------------------------------------------------------------
 # Engine receive loop: what a pre-result EOF does to a turn.
 #
 # These drive the REAL retry loop (engine.py) with a scripted client, so they
@@ -572,7 +768,9 @@ class _ScriptedClient:
     """Minimal AgentClient whose receive_turn follows a script.
 
     Script items: ``("text", str)``, ``("result", session_id)``,
-    ``("raise",)`` -> TransportDiedError, as a pre-result EOF produces.
+    ``("result", session_id, overrides)`` -> ``_result_msg(session_id,
+    **overrides)``, ``("raise",)`` -> TransportDiedError, as a pre-result
+    EOF produces, ``("hang",)`` -> waits forever (a turn still in flight).
     """
 
     def __init__(self, script: list[tuple], label: str):
@@ -595,7 +793,12 @@ class _ScriptedClient:
         for item in self._script:
             if item[0] == "raise":
                 raise TransportDiedError("claude runtime ended the turn without a result")
-            msg = _text_msg(item[1]) if item[0] == "text" else _result_msg(item[1])
+            if item[0] == "hang":
+                await asyncio.Event().wait()
+            if item[0] == "text":
+                msg = _text_msg(item[1])
+            else:
+                msg = _result_msg(item[1], **(item[2] if len(item) > 2 else {}))
             for event in translate_message(msg):
                 yield event
 
@@ -743,6 +946,12 @@ def _make_backend() -> ClaudeBackend:
     return ClaudeBackend(SimpleNamespace(config=lambda: SimpleNamespace()))
 
 
+def _cli_project_dir(path: str) -> str:
+    """The CLI's project directory name for an ASCII *path* of up to 200
+    encoded characters."""
+    return re.sub(r"[^a-zA-Z0-9]", "-", path)
+
+
 class TestValidateResumeTarget:
     WORKSPACE = "/root/nerve-workspace"
 
@@ -825,7 +1034,7 @@ class TestValidateResumeTarget:
         monkeypatch.setenv("HOME", str(fake_home))
 
         sid = "11111111-2222-3333-4444-555555555555"
-        encoded = os.path.realpath(str(link_ws)).replace("/", "-")
+        encoded = _cli_project_dir(os.path.realpath(str(link_ws)))
         proj_dir = fake_home / ".claude" / "projects" / encoded
         proj_dir.mkdir(parents=True)
         (proj_dir / f"{sid}.jsonl").write_text("{}")
@@ -844,7 +1053,7 @@ class TestValidateResumeTarget:
         fake_home = tmp_path / "home"
         monkeypatch.setenv("HOME", str(fake_home))
 
-        encoded = os.path.realpath(str(link_ws)).replace("/", "-")
+        encoded = _cli_project_dir(os.path.realpath(str(link_ws)))
         (fake_home / ".claude" / "projects" / encoded).mkdir(parents=True)
 
         backend = _make_backend()
@@ -863,13 +1072,106 @@ class TestValidateResumeTarget:
         monkeypatch.setenv("HOME", str(fake_home))
 
         sid = "abcd"
-        encoded_unresolved = str(link_ws).replace("/", "-")
+        encoded_unresolved = _cli_project_dir(str(link_ws))
         proj_dir = fake_home / ".claude" / "projects" / encoded_unresolved
         proj_dir.mkdir(parents=True)
         (proj_dir / f"{sid}.jsonl").write_text("{}")
 
         backend = _make_backend()
         assert backend.validate_resume_target(sid, str(link_ws)) is True
+
+    def test_path_encodes_non_alphanumerics(self):
+        """Every character outside [a-zA-Z0-9] becomes '-', as in the CLI."""
+        backend = _make_backend()
+        captured: dict = {}
+
+        def _capture(path: str) -> bool:
+            captured["path"] = path
+            return True
+
+        with patch("nerve.agent.backends.claude.os.path.realpath",
+                   side_effect=lambda p: p), \
+             patch("nerve.agent.backends.claude.os.path.isfile",
+                   side_effect=_capture):
+            backend.validate_resume_target("sid-abc", "/srv/my_agent/ws.v1")
+
+        assert captured["path"].endswith("/-srv-my-agent-ws-v1/sid-abc.jsonl")
+
+    def test_path_encodes_astral_character_as_two_dashes(self):
+        """The CLI replaces per UTF-16 code unit, so a character outside
+        the Basic Multilingual Plane becomes two '-'."""
+        backend = _make_backend()
+        captured: dict = {}
+
+        def _capture(path: str) -> bool:
+            captured["path"] = path
+            return True
+
+        with patch("nerve.agent.backends.claude.os.path.realpath",
+                   side_effect=lambda p: p), \
+             patch("nerve.agent.backends.claude.os.path.isfile",
+                   side_effect=_capture):
+            backend.validate_resume_target("sid-abc", "/srv/ws-\U0001F600")
+
+        assert captured["path"].endswith("/-srv-ws---/sid-abc.jsonl")
+
+    def test_workspace_with_underscore_and_dot(self, tmp_path, monkeypatch):
+        """A workspace path with '_' and '.' finds its history under the
+        directory name the CLI writes."""
+        ws = tmp_path / "my_agent" / "ws.v1"
+        ws.mkdir(parents=True)
+
+        fake_home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(fake_home))
+
+        sid = "11111111-2222-3333-4444-555555555555"
+        encoded = _cli_project_dir(os.path.realpath(str(ws)))
+        assert "-my-agent-ws-v1" in encoded
+        proj_dir = fake_home / ".claude" / "projects" / encoded
+        proj_dir.mkdir(parents=True)
+        (proj_dir / f"{sid}.jsonl").write_text("{}")
+
+        backend = _make_backend()
+        assert backend.validate_resume_target(sid, str(ws)) is True
+        assert backend.validate_resume_target("does-not-exist", str(ws)) is False
+
+    def test_long_path_matches_cut_name_prefix(self, tmp_path, monkeypatch):
+        """An encoded name over 200 characters is cut to 200 and gets a
+        hash suffix. The lookup matches on the cut name plus '-'."""
+        ws = tmp_path / ("w" * 220)
+        ws.mkdir()
+
+        fake_home = tmp_path / "home"
+        monkeypatch.setenv("HOME", str(fake_home))
+        projects = fake_home / ".claude" / "projects"
+
+        encoded = _cli_project_dir(os.path.realpath(str(ws)))
+        assert len(encoded) > 200
+        sid = "11111111-2222-3333-4444-555555555555"
+        (projects / (encoded[:200] + "-other")).mkdir(parents=True)
+        proj_dir = projects / (encoded[:200] + "-1a2b3c")
+        proj_dir.mkdir()
+        (proj_dir / f"{sid}.jsonl").write_text("{}")
+        # Differs from the cut name in its last character: not this cwd.
+        decoy = projects / (encoded[:199] + "x-1a2b3c")
+        decoy.mkdir()
+        (decoy / "decoy.jsonl").write_text("{}")
+
+        backend = _make_backend()
+        assert backend.validate_resume_target(sid, str(ws)) is True
+        assert backend.validate_resume_target("does-not-exist", str(ws)) is False
+        assert backend.validate_resume_target("decoy", str(ws)) is False
+
+    def test_long_path_without_projects_dir_returns_false(
+        self, tmp_path, monkeypatch,
+    ):
+        """No projects directory at all means no history, not an error."""
+        ws = tmp_path / ("w" * 220)
+        ws.mkdir()
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+
+        backend = _make_backend()
+        assert backend.validate_resume_target("some-session-id", str(ws)) is False
 
 
 # ---------------------------------------------------------------------------
@@ -1171,3 +1473,576 @@ class TestServingModelTracking:
         assert st.ordered_blocks == []
         bc.broadcast_model_changed.assert_not_awaited()
         assert engine._observed_models["s1"] == "claude-opus-4-8-20260115"
+
+
+# ------------------------------------------------------------------ #
+#  Title generation                                                   #
+# ------------------------------------------------------------------ #
+
+
+async def _title_engine(db, tmp_path, port: int) -> AgentEngine:
+    """An engine whose Anthropic clients go through a proxy at ``port``."""
+    workspace = tmp_path / "ws-title"
+    workspace.mkdir(parents=True, exist_ok=True)
+    cfg = NerveConfig.from_dict({
+        "workspace": str(workspace),
+        "proxy": {"enabled": True, "port": port, "api_key": "sk-local"},
+    })
+    engine = AgentEngine(cfg, db)
+    await engine.sessions.get_or_create(
+        "title-1", source="web", backend="claude", actor=None,
+    )
+    return engine
+
+
+@pytest.mark.asyncio
+async def test_title_generation_keeps_the_event_loop_running(db, tmp_path):
+    """Against an upstream that always answers 429 the title call uses the
+    whole proxy retry budget. The event loop must keep running through every
+    backoff: the heartbeat ticks between each two requests. The backoff is
+    shortened to keep the test fast; a blocking time.sleep would stop the
+    loop for it all the same."""
+    import anthropic._base_client as base_client
+
+    from nerve.config import PROXY_CLIENT_MAX_RETRIES
+
+    ticks: list[float] = []
+
+    async def heartbeat() -> None:
+        while True:
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.005)
+
+    upstream = RateLimitedUpstream(failures=math.inf)
+    engine = await _title_engine(db, tmp_path, upstream.port)
+    beat = asyncio.create_task(heartbeat())
+    try:
+        with patch.object(
+            base_client.BaseClient, "_calculate_retry_timeout", return_value=0.1,
+        ):
+            await engine._generate_session_title("title-1", "hello")
+    finally:
+        beat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await beat
+        upstream.close()
+
+    requests = upstream.request_times
+    assert len(requests) == PROXY_CLIENT_MAX_RETRIES + 1
+    for before, after in zip(requests, requests[1:]):
+        assert any(before < t < after for t in ticks), (
+            "the event loop was blocked during a retry backoff"
+        )
+
+
+@pytest.mark.asyncio
+async def test_title_generation_saves_the_title(db, tmp_path):
+    upstream = RateLimitedUpstream(failures=0)
+    try:
+        engine = await _title_engine(db, tmp_path, upstream.port)
+        await engine._generate_session_title("title-1", "hello")
+    finally:
+        upstream.close()
+    assert (await db.get_session("title-1"))["title"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Sidechain routing in a user turn: sub-agent frames streamed inside run()
+# never reach the orchestrator's persisted message (content or blocks) and
+# never count as the turn's content.
+# ---------------------------------------------------------------------------
+
+
+class _SdkScriptClient:
+    """AgentClient stub whose turn replays a scripted SDK message list through
+    the real translation; optionally the runtime crashes after the script."""
+
+    def __init__(self, native_id: str, script: list, crash: bool = False):
+        self._native_id = native_id
+        self._script = script
+        self._crash = crash
+        self.model = "claude-test"
+        self.turns: list[str] = []
+
+    @property
+    def native_session_id(self) -> str:
+        return self._native_id
+
+    async def connect(self) -> None:
+        pass
+
+    async def start_turn(self, turn) -> None:
+        self.turns.append(turn.text)
+
+    async def receive_turn(self):
+        for msg in self._script:
+            for event in translate_message(msg):
+                yield event
+        if self._crash:
+            raise RuntimeError("runtime crashed mid-turn")
+
+    async def interrupt(self) -> None:
+        pass
+
+    def is_alive(self) -> bool:
+        return True
+
+    async def disconnect(self, timeout: float = 5.0) -> None:
+        pass
+
+    def try_receive_idle_events(self):
+        return None
+
+    def buffer_used(self) -> int:
+        return 0
+
+
+class _SdkScriptBackend:
+    name = "claude"
+
+    def __init__(self, scripts: list[tuple[list, bool]]):
+        from nerve.agent.backends.base import BackendCapabilities
+
+        self.capabilities = BackendCapabilities(
+            supports_idle_stream=False, supports_cache_ttl=False,
+        )
+        self._scripts = list(scripts)
+        self.clients: list[_SdkScriptClient] = []
+
+    def default_model(self, source):
+        return "claude-test"
+
+    def excluded_tools(self):
+        return set()
+
+    def validate_resume_target(self, native_id, cwd):
+        return True
+
+    async def create_client(self, spec):
+        script, crash = self._scripts.pop(0)
+        client = _SdkScriptClient(f"native-{len(self.clients)}", script, crash)
+        self.clients.append(client)
+        return client
+
+
+def _sdk_script_engine(tmp_path, db, scripts) -> tuple[AgentEngine, _SdkScriptBackend]:
+    ws = tmp_path / "ws"
+    ws.mkdir(exist_ok=True)
+    cfg = NerveConfig.from_dict({"workspace": str(ws), "agent": {"backend": "claude"}})
+    engine = AgentEngine(cfg, db)
+    backend = _SdkScriptBackend(scripts)
+    engine._backends["claude"] = backend
+    return engine, backend
+
+
+def _sub_assistant(blocks: list, parent: str = "toolu_agent") -> AssistantMessage:
+    return AssistantMessage(
+        content=blocks, model="claude-sub", parent_tool_use_id=parent,
+        usage={"input_tokens": 4, "output_tokens": 6}, message_id="msg_sub",
+    )
+
+
+@pytest.mark.asyncio
+async def test_user_turn_excludes_sidechain_text_and_blocks(tmp_path, db):
+    from claude_agent_sdk import ToolResultBlock, ToolUseBlock
+
+    script = [
+        AssistantMessage(content=[TextBlock(text="Launching the builder.")], model="claude-test"),
+        AssistantMessage(content=[ToolUseBlock(
+            id="toolu_agent", name="Agent",
+            input={"description": "build-api", "prompt": "Build it", "run_in_background": False},
+        )], model="claude-test"),
+        # The sub-agent works inside the turn (foreground): its frames are
+        # forwarded tagged with the spawn's tool_use_id.
+        _sub_assistant([TextBlock(text="SUBAGENT-NARRATION")]),
+        _sub_assistant([ToolUseBlock(
+            id="toolu_bash", name="Bash", input={"command": "pytest -q"},
+        )]),
+        UserMessage(
+            content=[ToolResultBlock(tool_use_id="toolu_bash", content="SUBAGENT-RESULT")],
+            parent_tool_use_id="toolu_agent",
+        ),
+        UserMessage(
+            content=[ToolResultBlock(tool_use_id="toolu_agent", content="Report: done")],
+            tool_use_result={"status": "completed", "agentId": "a1b2c3d4e5f6a7b8c"},
+        ),
+        AssistantMessage(content=[TextBlock(text="It is built.")], model="claude-test"),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="native-0", total_cost_usd=0.01,
+            usage={"input_tokens": 1},
+        ),
+    ]
+    engine, backend = _sdk_script_engine(tmp_path, db, [(script, False)])
+    with patch("nerve.agent.engine._maybe_broadcast_file_changed"), \
+            patch("nerve.agent.engine._maybe_broadcast_plan_update"):
+        reply = await engine.run("s-side", "build it", source="web", channel="web", actor=None)
+
+    assert reply == "Launching the builder.It is built."
+    rows = await db.get_messages("s-side")
+    (assistant,) = [r for r in rows if r["role"] == "assistant"]
+    assert "SUBAGENT" not in assistant["content"]
+    blocks = assistant["blocks"]
+    assert [b["type"] for b in blocks] == ["text", "tool_call", "text"]
+    assert blocks[1]["tool"] == "Agent"
+    assert blocks[1]["result"] == "Report: done"
+    assert "SUBAGENT" not in json.dumps(blocks)
+    assert all(b.get("tool") != "Bash" for b in blocks)
+
+
+@pytest.mark.asyncio
+async def test_sidechain_only_user_turn_still_crash_retries(tmp_path, db):
+    """Sub-agent frames are not the turn's content: when the runtime dies
+    after only those arrived, the user's turn retries on a fresh client
+    (before, they set got_content and the turn failed instead)."""
+    first = [_sub_assistant([TextBlock(text="sub chatter")])]
+    second = [
+        AssistantMessage(content=[TextBlock(text="recovered")], model="claude-test"),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="native-1", total_cost_usd=0.01,
+            usage={"input_tokens": 1},
+        ),
+    ]
+    engine, backend = _sdk_script_engine(tmp_path, db, [(first, True), (second, False)])
+    reply = await engine.run("s-retry", "go", source="web", channel="web", actor=None)
+
+    assert reply == "recovered"
+    assert len(backend.clients) == 2  # retried on a fresh client
+    rows = await db.get_messages("s-retry")
+    assert [r["content"] for r in rows if r["role"] == "assistant"] == ["recovered"]
+
+
+def _thinking_script(first: list) -> list:
+    """Thinking, then ``first`` (the turn's first text or tool call), then
+    more thinking and a closing text."""
+    from claude_agent_sdk import ThinkingBlock
+
+    def _think(text: str) -> AssistantMessage:
+        return AssistantMessage(content=[ThinkingBlock(thinking=text, signature="sig")], model="claude-test")
+
+    return [
+        _think("LEADING-1 "),
+        _think("LEADING-2"),
+        *first,
+        _think("AFTER"),
+        AssistantMessage(content=[TextBlock(text="Done.")], model="claude-test"),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="native-0", total_cost_usd=0.01,
+            usage={"input_tokens": 1},
+        ),
+    ]
+
+
+def _first_tool_call() -> list:
+    from claude_agent_sdk import ToolResultBlock, ToolUseBlock
+
+    return [
+        AssistantMessage(content=[ToolUseBlock(
+            id="toolu_read", name="Read", input={"file_path": "/tmp/notes.md"},
+        )], model="claude-test"),
+        UserMessage(content=[ToolResultBlock(tool_use_id="toolu_read", content="notes")]),
+    ]
+
+
+_FIRST_TEXT = [AssistantMessage(content=[TextBlock(text="Hello.")], model="claude-test")]
+
+
+async def _run_with_thinking(tmp_path, db, sid, first, **run_kwargs):
+    """Run :func:`_thinking_script`; the stored reply and the thinking sent to the chat."""
+    from nerve.agent.streaming import broadcaster
+
+    engine, _backend = _sdk_script_engine(tmp_path, db, [(_thinking_script(first), False)])
+    sent = AsyncMock()
+    with patch.object(broadcaster, "broadcast_thinking", sent), \
+            patch("nerve.agent.engine._maybe_broadcast_file_changed"), \
+            patch("nerve.agent.engine._maybe_broadcast_plan_update"):
+        await engine.run(sid, "go", source="web", channel="web", actor=None, **run_kwargs)
+    (assistant,) = [r for r in await db.get_messages(sid) if r["role"] == "assistant"]
+    return assistant, [call.args[1] for call in sent.await_args_list]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first, first_type", [(_FIRST_TEXT, "text"), (_first_tool_call(), "tool_call")])
+async def test_drop_leading_thinking_drops_only_the_thinking_before_the_first_output(
+    tmp_path, db, first, first_type,
+):
+    """The onboarding conversation's first turn: the thinking before the
+    first text or tool call is neither sent to the chat nor stored with the
+    reply; the thinking after it is both."""
+    assistant, sent = await _run_with_thinking(tmp_path, db, "s-drop", first, drop_leading_thinking=True)
+    assert sent == ["AFTER"]
+    assert assistant["thinking"] == "AFTER"
+    assert [b["type"] for b in assistant["blocks"]] == [first_type, "thinking", "text"]
+    assert "LEADING" not in json.dumps(assistant["blocks"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first, first_type", [(_FIRST_TEXT, "text"), (_first_tool_call(), "tool_call")])
+async def test_a_normal_turn_sends_and_stores_all_of_its_thinking(tmp_path, db, first, first_type):
+    assistant, sent = await _run_with_thinking(tmp_path, db, "s-keep", first)
+    assert sent == ["LEADING-1 ", "LEADING-2", "AFTER"]
+    assert assistant["thinking"] == "LEADING-1 LEADING-2AFTER"
+    assert [b["type"] for b in assistant["blocks"]] == ["thinking", first_type, "thinking", "text"]
+    assert assistant["blocks"][0]["content"] == "LEADING-1 LEADING-2"
+
+
+@pytest.mark.asyncio
+async def test_process_agent_event_routes_sidechain_to_registry():
+    """Every event carrying parent_tool_use_id (and every SubagentUsage) is
+    handed to the agent registry and leaves the turn state untouched."""
+    from nerve.agent.agents import AgentRegistry
+
+    engine = AgentEngine.__new__(AgentEngine)
+    engine.agents = AgentRegistry.for_tests()
+    st = _TurnState()
+    sidechain = [
+        ev.TextDelta(text="t", parent_tool_use_id="p"),
+        ev.ThinkingDelta(text="th", parent_tool_use_id="p"),
+        ev.ToolUse(tool_use_id="c1", name="Read", input={}, parent_tool_use_id="p"),
+        ev.ToolResult(tool_use_id="c1", content="r", parent_tool_use_id="p"),
+        ev.ToolOutputDelta(tool_use_id="c1", content="o", parent_tool_use_id="p"),
+        ev.SubagentStarted(
+            tool_use_id="c2", subagent_type="x", description="d",
+            parent_tool_use_id="p",
+        ),
+        ev.SubagentUsage(parent_tool_use_id="p", message_id="m", model=None, usage={}),
+    ]
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        for event in sidechain:
+            assert await engine._process_agent_event("s1", event, st) is False
+        assert not bc.method_calls  # nothing on the session channel
+    assert st == _TurnState()  # no blocks, no text, got_content still False
+    # Everything landed on the agent the route "p" names (unknown here, so a
+    # placeholder record): its transcript and usage.
+    (rec,) = engine.agents._sessions["s1"].records.values()
+    page = await engine.agents.transcript("s1", rec.id)
+    assert [i["kind"] for i in page["items"]] == [
+        "text", "thinking", "tool_call", "tool_result",
+    ]
+    assert rec.spawn_tool_use_id == "p"
+
+
+# ---------------------------------------------------------------------------
+# Sub-agents' tool results keep the shared side effects (file_changed,
+# plan_update, MCP usage) through the agent registry, and spawn blocks link
+# to their agent records.
+# ---------------------------------------------------------------------------
+
+
+def _sidechain_engine(tmp_path, db) -> AgentEngine:
+    ws = tmp_path / "ws-side"
+    ws.mkdir(exist_ok=True)
+    cfg = NerveConfig.from_dict({"workspace": str(ws), "agent": {"backend": "claude"}})
+    return AgentEngine(cfg, db)
+
+
+async def _sub_tool(engine, sid, name, tool_input, result="ok", *, is_error=False):
+    await engine.agents.ingest_sidechain(sid, ev.ToolUse(
+        tool_use_id=f"toolu_{name}", name=name, input=tool_input,
+        parent_tool_use_id="toolu_agent",
+    ))
+    await engine.agents.ingest_sidechain(sid, ev.ToolResult(
+        tool_use_id=f"toolu_{name}", content=result, is_error=is_error,
+        parent_tool_use_id="toolu_agent",
+    ))
+    await asyncio.sleep(0)  # the broadcasts are scheduled as tasks
+
+
+@pytest.mark.asyncio
+async def test_sidechain_edit_result_emits_file_changed(tmp_path, db):
+    engine = _sidechain_engine(tmp_path, db)
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast_file_changed = AsyncMock()
+        await _sub_tool(engine, "s-fc", "Edit", {"file_path": "/tmp/app.py", "old_string": "a"})
+        await asyncio.sleep(0)
+    bc.broadcast_file_changed.assert_awaited_once_with(
+        "s-fc", path="/tmp/app.py", operation="edit", tool_use_id="toolu_Edit",
+    )
+
+
+@pytest.mark.asyncio
+async def test_sidechain_failed_edit_emits_nothing(tmp_path, db):
+    engine = _sidechain_engine(tmp_path, db)
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast_file_changed = AsyncMock()
+        await _sub_tool(engine, "s-fc2", "Edit", {"file_path": "/tmp/app.py"}, is_error=True)
+        await asyncio.sleep(0)
+    bc.broadcast_file_changed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sidechain_plan_write_emits_plan_update(tmp_path, db):
+    engine = _sidechain_engine(tmp_path, db)
+    plan = tmp_path / "home" / ".claude" / "plans" / "plan.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# The plan\n1. Build it")
+    with patch("nerve.agent.engine.broadcaster") as bc:
+        bc.broadcast_plan_update = AsyncMock()
+        bc.broadcast_file_changed = AsyncMock()
+        await _sub_tool(engine, "s-plan", "Write", {"file_path": str(plan), "content": "x"})
+        await asyncio.sleep(0)
+    bc.broadcast_plan_update.assert_awaited_once_with("s-plan", "# The plan\n1. Build it")
+
+
+@pytest.mark.asyncio
+async def test_sidechain_mcp_tool_result_records_usage(tmp_path, db):
+    engine = _sidechain_engine(tmp_path, db)
+    await db.create_session("s-mcp", source="web", actor=None)
+    await _sub_tool(engine, "s-mcp", "mcp__extsrv__lookup", {"q": "x"}, result="boom", is_error=True)
+    async with db.db.execute(
+        "SELECT server_name, tool_name, session_id, success, error FROM mcp_tool_usage",
+    ) as cur:
+        rows = [tuple(r) for r in await cur.fetchall()]
+    assert rows == [("extsrv", "lookup", "s-mcp", 0, "boom")]
+
+
+@pytest.mark.asyncio
+async def test_spawn_blocks_carry_agent_id_and_records_settle(tmp_path, db):
+    from claude_agent_sdk import ToolResultBlock, ToolUseBlock
+
+    script = [
+        AssistantMessage(content=[ToolUseBlock(
+            id="toolu_agent", name="Agent",
+            input={"description": "build-api", "prompt": "Build it", "run_in_background": False},
+        )], model="claude-test"),
+        UserMessage(
+            content=[ToolResultBlock(tool_use_id="toolu_agent", content="Report: done")],
+            tool_use_result={
+                "status": "completed", "agentId": "a1b2c3d4e5f6a7b8c",
+                "content": [{"type": "text", "text": "Report: done"}],
+                "totalTokens": 1200, "totalToolUseCount": 3,
+            },
+        ),
+        AssistantMessage(content=[ToolUseBlock(
+            id="toolu_read", name="Read", input={"file_path": "/tmp/x"},
+        )], model="claude-test"),
+        AssistantMessage(content=[TextBlock(text="Built.")], model="claude-test"),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="native-0", total_cost_usd=0.01,
+            usage={"input_tokens": 1},
+        ),
+    ]
+    engine, _backend = _sdk_script_engine(tmp_path, db, [(script, False)])
+    await engine.run("s-stamp", "build it", source="web", channel="web", actor=None)
+
+    agent_id = engine.agents.agent_id_for_spawn("s-stamp", "toolu_agent")
+    assert agent_id and agent_id.startswith("ag_")
+    rows = await db.get_messages("s-stamp")
+    (assistant,) = [r for r in rows if r["role"] == "assistant"]
+    calls = [b for b in assistant["blocks"] if b["type"] == "tool_call"]
+    assert calls[0]["agent_id"] == agent_id  # the spawn links to its record
+    assert "agent_id" not in calls[1]  # an ordinary tool call does not
+    rec = engine.agents.get("s-stamp", agent_id)
+    assert (rec.status, rec.tokens, rec.tool_uses) == ("completed", 1200, 3)
+    assert rec.result_text == "Report: done"
+    # The client generation is stamped, so the finished agent is resumable.
+    assert engine.agents.to_view(rec)["resumable"] is True
+
+
+@pytest.mark.asyncio
+async def test_agent_snapshot_has_every_contract_key(tmp_path, db):
+    engine = _sidechain_engine(tmp_path, db)
+    snap = await engine.agent_snapshot("s-fresh")
+    assert list(snap) == ["session_id", "agents", "summary", "capabilities", "queue", "generated_at"]
+    assert snap["session_id"] == "s-fresh" and snap["agents"] == [] and snap["queue"] == []
+    assert snap["summary"] == {
+        "total": 0, "live": 0, "starting": 0, "running": 0, "stopping": 0,
+        "completed": 0, "failed": 0, "stopped": 0, "interrupted": 0, "lost": 0,
+        "attention": 0, "shells_live": 0, "tokens": 0, "cost_usd": 0.0,
+        "oldest_live_started_at": None,
+    }
+    assert set(snap["capabilities"]) == {
+        "stop_task", "transcript", "output", "interrupt_spares_background",
+        "quiet_after_minutes",
+    }
+    assert snap["capabilities"]["quiet_after_minutes"] == 10
+    assert snap["generated_at"].endswith("Z")
+
+
+def test_subagents_config_defaults_and_parsing():
+    defaults = AgentConfig().subagents
+    assert (
+        defaults.per_task_stop_affordance, defaults.progress_summaries,
+        defaults.forward_subagent_text, defaults.quiet_after_minutes,
+        defaults.lost_grace_seconds, defaults.stop_confirm_seconds,
+        defaults.transcript_item_max_bytes,
+    ) == (True, True, True, 10, 30, 10, 16384)
+    parsed = AgentConfig.from_dict({"subagents": {
+        "per_task_stop_affordance": "false", "quiet_after_minutes": "20",
+        "transcript_item_max_bytes": 4096,
+    }})
+    assert parsed.subagents.per_task_stop_affordance is False
+    assert parsed.subagents.quiet_after_minutes == 20
+    assert parsed.subagents.transcript_item_max_bytes == 4096
+    assert parsed.subagents.progress_summaries is True
+
+
+def test_build_options_forwards_subagent_text(tmp_path):
+    ws = tmp_path / "ws-opts"
+    ws.mkdir()
+    for flag in (True, False):
+        cfg = NerveConfig.from_dict({
+            "workspace": str(ws),
+            "agent": {"subagents": {"forward_subagent_text": flag}},
+        })
+        backend = ClaudeBackend(SimpleNamespace(
+            config=lambda cfg=cfg: cfg,
+            registry=SimpleNamespace(),
+            tool_ctx_factory=lambda sid: None,
+            external_mcp_servers=lambda: [],
+            claude_plugins=lambda: [],
+            managed_mcp=False,
+        ))
+        backend._build_mcp_servers = lambda sid: {}
+        spec = SessionSpec(
+            session_id="s-opts", source="web", model="claude-test", effort="high",
+            system_prompt="", cwd=str(ws),
+        )
+        assert backend._build_options(spec).forward_subagent_text is flag
+
+
+# ---------------------------------------------------------------------------
+# Plan files: where the CLI's plan mode writes them, and the plan_update
+# broadcast that streams them into the side panel
+# ---------------------------------------------------------------------------
+
+
+def test_plan_files_live_in_the_clis_plans_directory(tmp_path, monkeypatch):
+    from nerve.agent.engine import _is_plan_file
+
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    assert _is_plan_file("/home/someone/.claude/plans/quiet-blue-river.md")
+    assert not _is_plan_file(str(tmp_path / "plans" / "quiet-blue-river.md"))
+    assert not _is_plan_file(str(tmp_path / "notes.md")) and not _is_plan_file("")
+
+    # CLAUDE_CONFIG_DIR moves the CLI's config directory, plans included.
+    config_dir = tmp_path / "cli-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    assert _is_plan_file(str(config_dir / "plans" / "quiet-blue-river.md"))
+    assert _is_plan_file(str(config_dir / "plans" / "quiet-blue-river-agent-a1b2.md"))
+    assert not _is_plan_file(str(config_dir / "plans-old" / "x.md"))
+    assert not _is_plan_file(str(config_dir / "settings.json"))
+    assert _is_plan_file("/home/someone/.claude/plans/quiet-blue-river.md")
+
+
+@pytest.mark.asyncio
+async def test_a_plan_written_under_a_moved_config_dir_reaches_the_panel(tmp_path, monkeypatch):
+    from nerve.agent import engine as engine_module
+
+    config_dir = tmp_path / "cli-config"
+    plan = config_dir / "plans" / "quiet-blue-river.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# Setup proposal — review PRs in org/repo-a\n", encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    sent = AsyncMock()
+    monkeypatch.setattr(engine_module.broadcaster, "broadcast_plan_update", sent)
+
+    log = [{"tool": "Write", "tool_use_id": "tu-1", "input": {"file_path": str(plan)}}]
+    engine_module._maybe_broadcast_plan_update("s-plan", "tu-1", log)
+    other = [{"tool": "Write", "tool_use_id": "tu-2", "input": {"file_path": str(tmp_path / "x.md")}}]
+    engine_module._maybe_broadcast_plan_update("s-plan", "tu-2", other)
+    await asyncio.sleep(0)
+    sent.assert_awaited_once_with("s-plan", "# Setup proposal — review PRs in org/repo-a\n")

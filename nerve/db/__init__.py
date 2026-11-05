@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from nerve import paths
-from nerve.db.base import SCHEMA_VERSION, Database
+from nerve.db.base import FORK_SCHEMA_VERSION, SCHEMA_VERSION, Database
 
 # Global database instance
 _db: Database | None = None
@@ -51,12 +51,30 @@ async def close_db() -> None:
         _db = None
 
 
+def global_system_actor_id() -> str | None:
+    """The system actor ID of the global database.
+
+    ``None`` before :func:`init_db` and after the database closes. Reads the
+    connection's cache, so a system actor that startup re-keyed gives its
+    new ID.
+    """
+    db = _db
+    if db is None:
+        return None
+    try:
+        return db.system_actor_id
+    except RuntimeError:  # closed without close_db()
+        return None
+
+
 __all__ = [
     "Database",
     "SCHEMA_VERSION",
+    "FORK_SCHEMA_VERSION",
     "get_db",
     "init_db",
     "close_db",
+    "global_system_actor_id",
 ]
 
 

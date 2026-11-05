@@ -399,20 +399,20 @@ class TestStatusDescriptor:
     async def test_setup_required(self, install):
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
-        assert body == {"auth_required": True, "login": "setup"}
+        assert body == {"mode": "local", "auth_required": True, "login": "setup"}
 
     async def test_passwordless(self, install):
         assert await install.db.complete_passwordless_setup()
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
-        assert body == {"auth_required": False, "login": "none"}
+        assert body == {"mode": "local", "auth_required": False, "login": "none"}
 
     async def test_naming_the_account_stays_passwordless(self, install):
         """A username alone does not complete setup and is not a credential."""
         await install.db.update_account_login(install.owner_id, username="alice")
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
-        assert body == {"auth_required": True, "login": "setup"}
+        assert body == {"mode": "local", "auth_required": True, "login": "setup"}
 
     async def test_only_a_password_ends_passwordless_login(self, install):
         await install.db.update_account_login(install.owner_id, username="alice")
@@ -421,20 +421,20 @@ class TestStatusDescriptor:
         )
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
-        assert body == {"auth_required": True, "login": "password"}
+        assert body == {"mode": "local", "auth_required": True, "login": "password"}
 
     async def test_password_only(self, install):
         await install.secure_the_owner("alice")
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
-        assert body == {"auth_required": True, "login": "password"}
+        assert body == {"mode": "local", "auth_required": True, "login": "password"}
 
     async def test_username_and_password(self, install):
         await install.secure_the_owner("alice")
         await install.add_account("bob")
         async with _client(install.app) as client:
             body = (await client.get("/api/auth/status")).json()
-        assert body == {"auth_required": True, "login": "username_password"}
+        assert body == {"mode": "local", "auth_required": True, "login": "username_password"}
 
     async def test_a_configured_password_is_not_passwordless(self, install):
         """The row still says `none` — a reload added the hash and no restart

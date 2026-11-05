@@ -11,12 +11,13 @@ Cron (every 4h) → persistent "task-planner" job
   → agent browses tasks, checks memory, picks one worth planning
   → explores codebase with Read, Glob, Grep, Bash, etc.
   → calls plan_propose(task_id, content) to store the proposal
+  → the task moves to plan_review, and one notification links to the plan
   → plan appears in /plans UI for review
 
 User reviews (via /plans UI or chat tools)
   → approve → spawns implementation session (visible in Chat)
   → decline → marks plan declined
-  → request revision → sends feedback to same persistent planner session
+  → request revision → sends feedback to the session that proposed the plan
 ```
 
 ## Agent Tools
@@ -29,7 +30,7 @@ User reviews (via /plans UI or chat tools)
 | `plan_read` | Read full plan content. Used to review details before approving/declining. |
 | `plan_approve` | Approve a pending plan and spawn an implementation session. |
 | `plan_decline` | Decline a pending plan with optional feedback. Moves the related task to `done` (declining is treated as abandoning the effort, not pausing it). |
-| `plan_revise` | Request revision of a pending plan — sends feedback to the planner session, which calls `plan_update` to produce v+1. |
+| `plan_revise` | Request revision of a pending plan — sends feedback to the session that proposed it (the planner session for cron-made plans; `cron:task-planner` when the plan records no session), which calls `plan_update` to produce v+1. |
 
 ### `plan_propose(task_id, content, plan_type?)`
 
@@ -38,6 +39,9 @@ User reviews (via /plans UI or chat tools)
 - Auto-detects `plan_type` from task source (`skill-extractor` → `skill-create`, etc.)
 - Auto-increments version if previous plans exist for the same task
 - Supersedes any prior pending plan for the same task
+- Moves the task to `plan_review` when its status is `pending`, `backlog` or `in_progress`. A task in any other status keeps it. The move names the task revision that was read, so a status that another writer set in the meantime stays.
+- Writes a task note with a markdown link to the plan: `Plan proposed: [plan-…](/plans/plan-…) (v1)`
+- Sends one notification, "Plan ready for review: <task title>", with priority `high`. Its metadata holds `plan_id` and `task_id`. The web UI shows "Open plan" and "Open task" for it, and Telegram shows an "Open plan" button that opens the plan in the chat. During quiet hours it is sent without sound. It dismisses the task's earlier plan notifications, and approve and decline dismiss the last one. Agents do not send their own `notify` about the plan.
 - Returns `{ plan_id, task_id, version }`
 
 ### `plan_list(status?)`
@@ -66,14 +70,14 @@ User reviews (via /plans UI or chat tools)
 - Guards: only pending plans can be updated
 - Marks the old plan as `superseded` (and stores optional `feedback` on it explaining the change)
 - Creates a new plan record: `version = old.version + 1`, `parent_plan_id = old.id`, same `task_id`/`plan_type`, fresh `session_id` from the updating agent
-- Writes a "Plan updated: …" note to task history
-- Task status is untouched — the plan is just being refined
+- Writes a "Plan updated: …" note to task history, with links to both versions
+- Moves the task to `plan_review` and sends a notification for the new version, by the same rules as `plan_propose`
 - Returns `{ new_plan_id, version }`
 
 **When to use which:**
 - `plan_update` — you (or the planner) want to refine your own pending plan. The task stays open, history is linked. **Default choice for revisions.**
 - `plan_decline` — the user truly rejects the plan and abandons the effort. The task moves to `done`.
-- `plan_revise` — the user wants the original planner agent to rethink the plan. Sends feedback to the planner session, which then calls `plan_update`.
+- `plan_revise` — the user wants the agent that proposed the plan to rethink it. Sends feedback to the proposing session (the planner session for cron-made plans), which then calls `plan_update`.
 
 ### `plan_decline(plan_id, feedback?)`
 
@@ -88,7 +92,7 @@ User reviews (via /plans UI or chat tools)
 - Guards: only pending plans can be revised; feedback is required
 - Stores feedback on the plan record
 - Writes revision note to task history
-- Sends feedback as a message to the persistent `cron:task-planner` session
+- Sends feedback as a message to the session that proposed the plan (`cron:task-planner` for the planner's own plans)
 - Planner agent sees prior context + feedback, calls `plan_update` to produce v+1 linked to the existing plan
 - The current pending plan is automatically superseded by the update
 
@@ -118,7 +122,7 @@ The planner is a standard persistent cron job — no special service or engine c
 When the user requests a revision:
 
 1. User writes feedback in the plan detail page
-2. API sends feedback as a new message to the persistent `cron:task-planner` session
+2. API sends feedback as a new message to the session that proposed the plan (the persistent `cron:task-planner` session for its plans)
 3. The agent sees its prior planning context + the feedback
 4. Agent calls `plan_update(plan_id, content, feedback)` — old version becomes `superseded`, new version (v+1) is pending review
 5. The two plans stay linked via `parent_plan_id` so reviewers can see what changed
@@ -139,14 +143,13 @@ The user can monitor, stop, or interact with the implementation session from the
 
 ### Skill Proposals
 
-Plans from the `skill-extractor` and `skill-reviser` cron jobs follow a different approval path. When approved:
+Plans from the `skill-extractor` and `skill-reviser` cron jobs (`plan_type` `skill-create` / `skill-update`, auto-detected from the task's `source` field) go through the same approval path as any other plan — an `impl-<id>` session is spawned — with a skill-specific prompt:
 
-1. Plan content is parsed as a full SKILL.md file (YAML frontmatter + body)
-2. If the skill already exists → updated; otherwise → created
-3. Plan status → `completed`; task status → `done`
-4. No implementation session is spawned — the plan *is* the deliverable
+1. The session reads the approved plan as a full SKILL.md file (YAML frontmatter + body)
+2. `skill-create` → it calls `skill_create` with the name, description and body; `skill-update` → it calls `skill_update` with the full SKILL.md content
+3. It then calls `task_done` with a note describing what was done
 
-This is handled automatically by the plan approval handler based on the task's `source` field (`skill-extractor` or `skill-reviser`).
+The plan is marked `implementing` on approval and `failed` if the session raises.
 
 ## Database
 
@@ -164,6 +167,33 @@ Plans are stored in the `plans` SQLite table (schema v12):
 | `version` | INTEGER | Version number (increments on revision) |
 | `parent_plan_id` | TEXT | Previous version's ID |
 | `model` | TEXT | Model used to generate |
+| `reviewed_at` | TIMESTAMP | Time of the approve or decline decision |
+| `reviewed_by_actor_id` | TEXT | Who made the last review decision (approve, decline, revision request, or a status or feedback change through `PATCH`) |
+| `reviewed_caused_by_actor_id` | TEXT | On whose behalf that decision was made |
+| `created_by_actor_id` | TEXT | Who wrote this version |
+| `caused_by_actor_id` | TEXT | On whose behalf this version was written |
+
+A review through the web UI or the REST API records the signed-in person in
+both reviewer columns. A review through a plan tool records the system actor
+and the cause of the session that called the tool, so a plan that the agent
+approves in a session that Alice started shows "Nerve for Alice".
+`plan_propose` and `plan_update` record the system actor and the session's
+cause as the writer of the version they create. The implementation session
+of an approval gets the approver (REST) or the approving session's cause
+(tool) as its cause, and a planner session that a revision request creates
+gets the person who asked. `plan_update` records no reviewer on the version it
+replaces, because the planner replacing its own plan is not a review. All
+four columns are actor IDs; see [Accounts and identity](accounts.md#attribution).
+
+A decision on a plan (approve, decline, `PATCH`, and `plan_update`
+superseding the old version) applies only while the plan still has the
+status that the decision read. Of two concurrent decisions that change the
+status, one wins; the other changes nothing and gets HTTP 409 (REST) or a
+"no longer pending" answer (tools). Only the winner starts an
+implementation or changes the task. A decision that keeps the status (a
+`PATCH` with only feedback, a revision request) does not exclude another
+decision: two such requests can both apply, and a revision and an approval
+of the same plan can both proceed.
 
 ## Web UI
 
@@ -177,11 +207,32 @@ Plans are stored in the `plans` SQLite table (schema v12):
 
 - Rendered markdown plan content
 - Task link + implementation session link (when applicable)
+- Who proposed this version and who reviewed the plan, from the writer and
+  reviewer columns
 - Action bar for pending plans:
   - **Approve & Implement** — spawns implementation session, redirects to Chat
   - **Decline** — marks plan as declined
   - **Request Revision** — quote-style feedback input, sends to planner session
 - Previous feedback shown as blockquote
+
+## Telegram
+
+`/plans` shows the pending and implementing plans as an inline keyboard, one
+button per plan, with paging and a refresh button. Opening a plan shows its
+content and, while it is pending, three actions:
+
+- **Approve**, then **Yes, approve & implement**: the same approval as the web
+  UI, which spawns the implementation session.
+- **Decline**, then **Yes, decline & close**: marks the plan declined and
+  closes its task.
+- **Revise**: asks for feedback in a reply. Only a reply to that prompt, from
+  the user who tapped it, is taken as the feedback; it goes to the planner
+  session as with `plan_revise`.
+
+Every button and the revision reply are checked against the bot's allowed
+users. Telegram users are not mapped to local identities, so a decision made
+from Telegram records no reviewer (both reviewer columns stay empty), and its
+task updates and sessions have no actor or cause.
 
 ## API Endpoints
 
@@ -193,3 +244,10 @@ Plans are stored in the `plans` SQLite table (schema v12):
 | POST | `/api/plans/:id/approve` | Approve + spawn implementation |
 | POST | `/api/plans/:id/revise` | Send revision feedback to planner |
 | GET | `/api/tasks/:id/plans` | Plans for a specific task |
+
+Plan rows include `reviewed_by_actor_id`, `reviewed_caused_by_actor_id`,
+`created_by_actor_id` and `caused_by_actor_id`. Approve, `PATCH` and revise
+record the signed-in person as the reviewer, and return 409 when another
+decision changed the plan first. The
+task status change of an approval or a decline records the person too, with
+origin `web`.

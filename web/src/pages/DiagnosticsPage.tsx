@@ -1,10 +1,15 @@
 import { useEffect, useState } from 'react';
 // import { useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
-import { Server, HardDrive, RefreshCw, Clock, CheckCircle2, XCircle, Database, Activity, Brain, Play, Loader2, DollarSign, Zap, BarChart3 } from '../components/ui/icons';
+import { Server, HardDrive, RefreshCw, Clock, CheckCircle2, XCircle, Database, Activity, Brain, Play, Loader2, DollarSign, Zap, BarChart3, ExternalLink } from '../components/ui/icons';
 import { Button, IconButton } from '../components/ui';
 import { ExternalAgentsSection } from '../components/ExternalAgents/ExternalAgentsSection';
 import { StatusBadge } from '../components/Cron/controls';
+import { httpLink } from '../utils/httpLink';
+import { totalInputTokens, type UsageTokens } from '../utils/usageTokens';
+import { langfuseProjectUrl } from '../utils/langfuseLinks';
+
+const INPUT_HEADER_TITLE = 'Uncached input + cache reads + cache writes';
 
 function formatUptime(isoDate: string): string {
   const diff = Date.now() - new Date(isoDate).getTime();
@@ -18,9 +23,16 @@ function formatUptime(isoDate: string): string {
 }
 
 function formatTokens(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
+}
+
+/** Hover text for an Input cell: the parts that make up the total. */
+function inputTitle(row: UsageTokens): string {
+  return `${formatTokens(row.input_tokens || 0)} uncached + ${formatTokens(row.cache_read || 0)} cache read`
+    + ` + ${formatTokens(row.cache_creation || 0)} cache write`;
 }
 
 /** Shorten model identifiers for display (e.g. "claude-opus-4-8-20260528" → "Opus 4.8") */
@@ -125,7 +137,7 @@ export function DiagnosticsPage() {
             </span>
             {data.langfuse.host && (
               <a
-                href={data.langfuse.host}
+                href={langfuseProjectUrl(data.langfuse) ?? data.langfuse.host}
                 target="_blank"
                 rel="noopener noreferrer"
                 className="text-text-faint hover:text-text-secondary underline-offset-2 hover:underline"
@@ -151,7 +163,11 @@ export function DiagnosticsPage() {
             {/* Summary cards */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-3">
               <InfoCard icon={BarChart3} label="Tokens (in/out)"
-                value={`${formatTokens(usage.last_7d.total_input)} / ${formatTokens(usage.last_7d.total_output)}`} />
+                value={`${formatTokens(totalInputTokens({
+                  input_tokens: usage.last_7d.total_input,
+                  cache_read: usage.last_7d.total_cache_read,
+                  cache_creation: usage.last_7d.total_cache_creation,
+                }))} / ${formatTokens(usage.last_7d.total_output)}`} />
               <InfoCard icon={DollarSign} label="Cost"
                 value={`$${usage.last_7d.total_cost_usd?.toFixed(2) ?? '0.00'}`} />
               <InfoCard icon={Zap} label="Cache Hit Rate"
@@ -183,7 +199,7 @@ export function DiagnosticsPage() {
                           >
                             <div className="absolute -top-6 left-1/2 -translate-x-1/2 hidden group-hover:block z-10
                               bg-surface-raised border border-border-subtle rounded px-1.5 py-0.5 text-2xs text-text-secondary whitespace-nowrap shadow-lg">
-                              {formatTokens((day.input_tokens || 0) + (day.output_tokens || 0))} &middot; ${cost.toFixed(2)}
+                              {formatTokens(totalInputTokens(day) + (day.output_tokens || 0))} &middot; ${cost.toFixed(2)}
                             </div>
                           </div>
                         </div>
@@ -203,7 +219,7 @@ export function DiagnosticsPage() {
                     <tr className="bg-surface text-text-muted">
                       <th className="text-left px-4 py-2 font-medium">Model</th>
                       <th className="text-right px-4 py-2 font-medium">Turns</th>
-                      <th className="text-right px-4 py-2 font-medium">Input</th>
+                      <th className="text-right px-4 py-2 font-medium" title={INPUT_HEADER_TITLE}>Input</th>
                       <th className="text-right px-4 py-2 font-medium">Output</th>
                       <th className="text-right px-4 py-2 font-medium">Cost</th>
                     </tr>
@@ -213,7 +229,7 @@ export function DiagnosticsPage() {
                       <tr key={m.model} className="border-t border-border-subtle hover:bg-surface">
                         <td className="px-4 py-2 font-mono text-text-secondary text-xs">{formatModelName(m.model)}</td>
                         <td className="px-4 py-2 text-right text-text-dim tabular-nums">{m.turns}</td>
-                        <td className="px-4 py-2 text-right text-text-secondary tabular-nums">{formatTokens(m.input_tokens || 0)}</td>
+                        <td className="px-4 py-2 text-right text-text-secondary tabular-nums" title={inputTitle(m)}>{formatTokens(totalInputTokens(m))}</td>
                         <td className="px-4 py-2 text-right text-text-secondary tabular-nums">{formatTokens(m.output_tokens || 0)}</td>
                         <td className="px-4 py-2 text-right text-text-secondary tabular-nums">${(m.cost_usd || 0).toFixed(2)}</td>
                       </tr>
@@ -232,7 +248,7 @@ export function DiagnosticsPage() {
                       <th className="text-left px-4 py-2 font-medium">Source</th>
                       <th className="text-right px-4 py-2 font-medium">Sessions</th>
                       <th className="text-right px-4 py-2 font-medium">Turns</th>
-                      <th className="text-right px-4 py-2 font-medium">Input</th>
+                      <th className="text-right px-4 py-2 font-medium" title={INPUT_HEADER_TITLE}>Input</th>
                       <th className="text-right px-4 py-2 font-medium">Output</th>
                       <th className="text-right px-4 py-2 font-medium">Cost</th>
                     </tr>
@@ -243,7 +259,7 @@ export function DiagnosticsPage() {
                         <td className="px-4 py-2 font-mono text-text-secondary">{src.source}</td>
                         <td className="px-4 py-2 text-right text-text-dim tabular-nums">{src.sessions}</td>
                         <td className="px-4 py-2 text-right text-text-dim tabular-nums">{src.turns}</td>
-                        <td className="px-4 py-2 text-right text-text-secondary tabular-nums">{formatTokens(src.input_tokens || 0)}</td>
+                        <td className="px-4 py-2 text-right text-text-secondary tabular-nums" title={inputTitle(src)}>{formatTokens(totalInputTokens(src))}</td>
                         <td className="px-4 py-2 text-right text-text-secondary tabular-nums">{formatTokens(src.output_tokens || 0)}</td>
                         <td className="px-4 py-2 text-right text-text-secondary tabular-nums">${(src.cost_usd || 0).toFixed(2)}</td>
                       </tr>
@@ -252,14 +268,61 @@ export function DiagnosticsPage() {
                 </table>
               </div>
             )}
+
+            {/* By cron job breakdown */}
+            {usage.by_cron_job?.length > 0 && (
+              <div className="border border-border-subtle rounded-lg overflow-x-auto mt-3">
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="bg-surface text-text-muted">
+                      <th className="text-left px-4 py-2 font-medium">Cron job</th>
+                      <th className="text-right px-4 py-2 font-medium">Runs</th>
+                      <th className="text-right px-4 py-2 font-medium">Turns</th>
+                      <th className="text-right px-4 py-2 font-medium" title={INPUT_HEADER_TITLE}>Input</th>
+                      <th className="text-right px-4 py-2 font-medium">Output</th>
+                      <th className="text-right px-4 py-2 font-medium">Cost</th>
+                      <th className="text-right px-4 py-2 font-medium" title="Average cost per run that started agent work">Per run</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {usage.by_cron_job.map((job: any) => {
+                      const cost = job.cost_usd || 0;
+                      return (
+                        <tr key={job.job_id} className="border-t border-border-subtle hover:bg-surface">
+                          <td className="px-4 py-2 font-mono text-text-secondary text-xs break-all">{job.job_id}</td>
+                          <td className="px-4 py-2 text-right text-text-dim tabular-nums">{job.runs}</td>
+                          <td className="px-4 py-2 text-right text-text-dim tabular-nums">{job.turns}</td>
+                          <td className="px-4 py-2 text-right text-text-secondary tabular-nums" title={inputTitle(job)}>{formatTokens(totalInputTokens(job))}</td>
+                          <td className="px-4 py-2 text-right text-text-secondary tabular-nums">{formatTokens(job.output_tokens || 0)}</td>
+                          <td className="px-4 py-2 text-right text-text-secondary tabular-nums">${cost.toFixed(2)}</td>
+                          <td className="px-4 py-2 text-right text-text-dim tabular-nums">
+                            {job.runs > 0 ? `$${(cost / job.runs).toFixed(2)}` : '-'}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </section>
         )}
 
-        {/* memU Health */}
+        {/* Memory backend health (memU, or Loom through the MCP gateway) */}
         {memuHealth && (
           <section>
             <h2 className="text-sm font-medium text-text-muted mb-3 flex items-center gap-2">
-              <Database size={14} /> memU Memory Service
+              <Database size={14} /> {memuHealth.backend === 'loom' ? 'Loom Memory Service' : 'memU Memory Service'}
+              {memuHealth.backend === 'loom' && httpLink(memuHealth.dashboard_url) && (
+                <a
+                  href={httpLink(memuHealth.dashboard_url) ?? undefined}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="ml-auto inline-flex items-center gap-1 text-xs font-normal text-text-faint hover:text-text-secondary underline-offset-2 hover:underline"
+                >
+                  Open dashboard <ExternalLink size={11} />
+                </a>
+              )}
             </h2>
 
             {/* Summary cards */}
@@ -270,9 +333,31 @@ export function DiagnosticsPage() {
                 value={memuHealth.initialized_at ? formatUptime(memuHealth.initialized_at) : 'N/A'} />
               <InfoCard icon={Database} label="Total Items"
                 value={String(memuHealth.database?.total_items ?? 0)} />
-              <InfoCard icon={HardDrive} label="DB Size"
-                value={`${memuHealth.database?.db_size_mb ?? 0} MB`} />
+              {memuHealth.backend === 'loom' ? (
+                <InfoCard icon={HardDrive} label="Namespace"
+                  value={memuHealth.loom?.namespace || 'not resolved'} />
+              ) : (
+                <InfoCard icon={HardDrive} label="DB Size"
+                  value={`${memuHealth.database?.db_size_mb ?? 0} MB`} />
+              )}
             </div>
+
+            {memuHealth.backend === 'loom' && memuHealth.loom && (
+              <div className="mb-3 text-xs text-text-faint break-words">
+                Through the MCP gateway at {memuHealth.loom.gateway_url || 'no address'}
+                {memuHealth.loom.org && <> · org {memuHealth.loom.org}</>}
+                {memuHealth.loom.identity_source && (
+                  <> · namespace from {memuHealth.loom.identity_source === 'config' ? 'the settings' : 'Loom'}</>
+                )}
+                {memuHealth.loom.checked_at && <> · checked {new Date(memuHealth.loom.checked_at).toLocaleTimeString()}</>}
+              </div>
+            )}
+
+            {memuHealth.backend === 'loom' && memuHealth.loom?.error && (
+              <div className="mb-3 p-3 bg-warning-bg border border-warning-border rounded-lg text-xs text-warning break-words">
+                {memuHealth.loom.error}
+              </div>
+            )}
 
             {/* Type distribution badges */}
             {memuHealth.database?.type_distribution && (

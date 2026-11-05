@@ -18,6 +18,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from nerve.agent.tools import ToolResult
+from nerve.identity import UNATTRIBUTED
 
 if TYPE_CHECKING:
     from nerve.db import Database
@@ -75,12 +76,17 @@ def build_audit_writer(db: "Database"):
         runtime_metadata = getattr(session_id, "runtime_metadata", None) or {}
         if runtime_metadata:
             details["runtime"] = runtime_metadata
-        session_id = getattr(session_id, "session_id", session_id)
+        ctx = session_id
+        session_id = getattr(ctx, "session_id", ctx)
         try:
+            # The tool context names the system actor and the cause of the
+            # call.
+            attribution = getattr(ctx, "attribution", UNATTRIBUTED)
             await db.log_session_event(
                 session_id=session_id,
                 event_type="external_tool_call",
                 details=details,
+                attribution=attribution,
             )
         except Exception:
             logger.exception(

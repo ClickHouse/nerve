@@ -1,0 +1,6 @@
+# Nerve — Secrets (gitignored)
+# API keys, tokens, and other sensitive configuration.
+
+claude_oauth_token: claude-oauth-token-placeholder
+auth:
+  jwt_secret: <generated>

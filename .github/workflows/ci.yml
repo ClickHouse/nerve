@@ -33,7 +33,7 @@ jobs:
         python-version: ["3.13"]
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
@@ -123,6 +123,7 @@ jobs:
           SQL
       - name: Exercise storage with a DML-only role
         env:
+          NERVE_TEST_POSTGRES_OWNER_DSN: postgresql://postgres:owner-test-only@localhost:5432/nerve_test
           NERVE_TEST_POSTGRES_DSN: postgresql://nerve_runtime:runtime-test-only@localhost:5432/nerve_test
         run: .venv/bin/pytest tests/postgres -v
 
@@ -135,10 +136,10 @@ jobs:
         working-directory: web
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
           # Not pinned to web/package.json's `engines` floor of 22.12.0 — the
           # `frontend-floor` job below covers that. The *test* toolchain needs
@@ -185,10 +186,10 @@ jobs:
         working-directory: web
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
       - name: Set up Node.js at the declared floor
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v7
         with:
           # Exact, and it has to stay in step with `engines.node` in
           # web/package.json and MIN_NODE_VERSION in install.sh.

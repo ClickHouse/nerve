@@ -138,13 +138,19 @@ describe('actor directory reads', () => {
 });
 
 describe('actor presentation helpers', () => {
-  it('uses current names, then the login name, then the neutral and Nerve fallbacks', () => {
+  it('uses current names, then the login name, then Nerve or a short id', () => {
+    const hosted = '3f2a9c1e-7b4d-4e8a-9c2f-1a2b3c4d5e6f';
     expect(actorName(alice())).toBe('Alice');
-    expect(actorName(alice('  '))).toBe(UNNAMED_ACTOR);
+    expect(actorName(alice('  '))).toBe(ALICE.slice(0, 8));
     expect(actorName(actor(ALICE, { display_name: null, username: 'alice' }))).toBe('alice');
     expect(actorName(actor(ALICE, { display_name: '  ', username: 'alice' }))).toBe('alice');
     expect(actorName(actor(ALICE, { display_name: 'Alice', username: 'alice' }))).toBe('Alice');
-    expect(actorName(actor(ALICE, { display_name: null, username: '  ' }))).toBe(UNNAMED_ACTOR);
+    expect(actorName(actor(ALICE, { display_name: null, username: '  ' }))).toBe(ALICE.slice(0, 8));
+    // A hosted actor has no account and so no login name.
+    expect(actorName(actor(hosted, { display_name: 'Carol' }))).toBe('Carol');
+    expect(actorName(actor(hosted))).toBe('3f2a9c1e');
+    // An id that the directory does not have yet.
+    expect(actorName(undefined, hosted)).toBe('3f2a9c1e');
     expect(actorName(undefined)).toBe(UNNAMED_ACTOR);
     expect(actorName(system())).toBe(SYSTEM_ACTOR_NAME);
   });
@@ -163,15 +169,28 @@ describe('actor presentation helpers', () => {
     expect(byId.has(BOB)).toBe(false);
   });
 
-  it('also discriminates equal fallback names and short ids', () => {
-    const byId = actorDiscriminators({
+  it('also discriminates equal short-id names and ids shorter than the suffix', () => {
+    // No names, and the ids start with the same eight characters.
+    const nameless = actorDiscriminators({
+      'abcdefgh-1': actor('abcdefgh-1'),
+      'abcdefgh-2': actor('abcdefgh-2'),
       short: actor('short'),
-      'long-short': actor('long-short'),
     });
 
-    expect(byId.get('short')).not.toBe(byId.get('long-short'));
-    expect('short'.endsWith(byId.get('short')!)).toBe(true);
-    expect('long-short'.endsWith(byId.get('long-short')!)).toBe(true);
+    expect(nameless.get('abcdefgh-1')).not.toBe(nameless.get('abcdefgh-2'));
+    expect('abcdefgh-1'.endsWith(nameless.get('abcdefgh-1')!)).toBe(true);
+    expect('abcdefgh-2'.endsWith(nameless.get('abcdefgh-2')!)).toBe(true);
+    expect(nameless.has('short')).toBe(false);
+
+    // Equal names, and ids shorter than the shortest suffix.
+    const tiny = actorDiscriminators({
+      ab: actor('ab', { display_name: 'Sam' }),
+      xab: actor('xab', { display_name: 'Sam' }),
+    });
+
+    expect(tiny.get('ab')).not.toBe(tiny.get('xab'));
+    expect('ab'.endsWith(tiny.get('ab')!)).toBe(true);
+    expect('xab'.endsWith(tiny.get('xab')!)).toBe(true);
   });
 
   it('labels Nerve and other humans, but not the viewer or null history', () => {

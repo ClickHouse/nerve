@@ -1,0 +1,24 @@
+# Nerve — Shared configuration
+# Git-tracked and portable: this is the layer that syncs between machines and
+# the one lockdown mode trusts. Machine-specific values belong in config.yaml,
+# which overrides this file. Secrets belong in config.local.yaml or behind an
+# ${ENV_VAR} reference — never here.
+#
+# `nerve init` owns the keys it generates and rewrites them on re-run. Keys it
+# does not generate are left alone.
+
+gateway:
+  host: 127.0.0.1
+  port: 8977
+sync:
+  telegram:
+    enabled: false
+  gmail:
+    enabled: false
+  github:
+    enabled: false
+  github_events:
+    enabled: false
+  github_repos:
+    enabled: false
+    repos: []

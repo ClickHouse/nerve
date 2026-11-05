@@ -1,4 +1,4 @@
--- Operational schema, version 1 (SQLite model v49). Apply with an owner role.
+-- Fresh bootstrap: storage version 1 (SQLite v49), followed by owner upgrades.
 
 BEGIN;
 
@@ -962,3 +962,6 @@ CREATE FUNCTION instr(value jsonb, needle text) RETURNS integer LANGUAGE sql IMM
     SELECT strpos(value::text,needle)
 $$;
 COMMIT;
+
+-- New installations use the same upgrade path as existing databases.
+\ir migrations/002_operational_v061.sql

@@ -14,6 +14,7 @@ from pathlib import Path
 
 from nerve.db.base import Database, StatePermissions, WriteResult
 from nerve.db.postgres.connection import Connection
+from nerve.db.postgres.version import SCHEMA_VERSION
 
 
 class PostgresDatabase(Database):
@@ -34,6 +35,8 @@ class PostgresDatabase(Database):
         self._active = ContextVar(f"postgres_transaction_{id(self)}", default=None)
         self._connected = False
         self._system_actor = None
+        self._session_causes = {}
+        self._external_actor_names = {}
         self.state_permissions = StatePermissions()
         self._write_lock = asyncio.Lock()
         self._db = Connection(self)
@@ -45,7 +48,7 @@ class PostgresDatabase(Database):
         return self._db
 
     @asynccontextmanager
-    async def connection(self):
+    async def connection(self, *, snapshot=False):
         import psycopg
 
         if not self._connected:
@@ -61,6 +64,10 @@ class PostgresDatabase(Database):
         async with await psycopg.AsyncConnection.connect(
             self._dsn, connect_timeout=5
         ) as conn:
+            if snapshot:
+                await conn.execute(
+                    "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
+                )
             await conn.execute("SET LOCAL search_path = nerve_pg, public")
             await conn.execute("SET LOCAL statement_timeout = '30s'")
             await conn.execute("SET LOCAL lock_timeout = '10s'")
@@ -83,7 +90,7 @@ class PostgresDatabase(Database):
                 rows = await (
                     await conn.execute("SELECT version FROM storage_version")
                 ).fetchall()
-                if rows != [(1,)]:
+                if rows != [(SCHEMA_VERSION,)]:
                     raise RuntimeError(
                         "Unsupported PostgreSQL schema; apply owner migrations first"
                     )
@@ -104,7 +111,12 @@ class PostgresDatabase(Database):
                         "VALUES (?,?,?,?,?,?)",
                         values,
                     )
+                if initialized.rowcount:
+                    from nerve.db.migrations.v059_backlog_plan_review_statuses import up
+
+                    await up(self.db)
             await self._cache_system_actor()
+            await self._cache_session_causes()
         except BaseException:
             self._connected = False
             raise
@@ -112,6 +124,8 @@ class PostgresDatabase(Database):
     async def close(self):
         self._connected = False
         self._system_actor = None
+        self._session_causes.clear()
+        self._external_actor_names.clear()
 
     @asynccontextmanager
     async def _atomic(self):
@@ -127,6 +141,38 @@ class PostgresDatabase(Database):
                 yield
             finally:
                 self._active.reset(token)
+
+    @asynccontextmanager
+    async def _read_snapshot(self):
+        if self._active.get() is not None:
+            raise RuntimeError("Nested transaction")
+        async with self.connection(snapshot=True) as conn:
+            token = self._active.set((asyncio.current_task(), conn))
+            try:
+                yield
+            finally:
+                self._active.reset(token)
+
+    async def _rekey_system_actor(self, new_id):
+        from nerve.db.accounts import SYSTEM_PRINCIPAL_CLAIM_NAME, SystemActorRekey
+
+        async with self._atomic():
+            previous_id, blocker = await self._decide_system_actor_rekey(new_id)
+            changed = previous_id != new_id and blocker is None
+            if changed:
+                # The owner-installed trigger permits only the recorded claim.
+                await self.db.execute(
+                    "INSERT INTO instance_secrets (name,value) VALUES (?,?)",
+                    (SYSTEM_PRINCIPAL_CLAIM_NAME, new_id),
+                )
+                await self.db.execute(
+                    "UPDATE actor_refs SET id=? WHERE id=? AND kind='system'",
+                    (new_id, previous_id),
+                )
+        await self._cache_system_actor()
+        return SystemActorRekey(
+            previous_id, new_id if changed else previous_id, blocker
+        )
 
     async def _write(self, sql, params=()):
         async with self._atomic():

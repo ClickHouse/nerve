@@ -1,4 +1,10 @@
-"""Memory file and memU routes."""
+"""Memory file and memory-backend routes.
+
+The ``/api/memory/memu*`` paths predate the Loom backend and keep their names.
+Under ``memory.backend: loom`` there is no memU store to browse or edit: the
+snapshot answers "not available" with the backend and Loom's dashboard link,
+the edits answer 409, and the health route returns the Loom backend's note.
+"""
 
 from __future__ import annotations
 
@@ -19,6 +25,7 @@ from nerve.config import (
 )
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.memory.manager import memory_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -72,18 +79,28 @@ async def list_memory_files():
     return {"files": files}
 
 
+_NOT_A_MEMORY_FILE = (
+    "Access denied: only markdown files at the workspace root or under memory/ "
+    "can be read or written here"
+)
+
+
+def _memory_file(workspace: Path, file_path: str) -> Path:
+    """The memory file that the request names, or a 403 (see memory_file_path)."""
+    path = memory_file_path(workspace, file_path)
+    if path is None:
+        raise HTTPException(status_code=403, detail=_NOT_A_MEMORY_FILE)
+    return path
+
+
 @router.get("/api/memory/file/{file_path:path}")
 async def read_memory_file(file_path: str):
     config = get_config()
     full_path = config.workspace / file_path
-    # Prevent path traversal
-    try:
-        full_path.resolve().relative_to(config.workspace.resolve())
-    except ValueError:
-        raise HTTPException(status_code=403, detail="Access denied")
-    if not full_path.exists() or not full_path.is_file():
+    path = _memory_file(config.workspace, file_path)
+    if not path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
-    content = await asyncio.to_thread(full_path.read_text, encoding="utf-8")
+    content = await asyncio.to_thread(path.read_text, encoding="utf-8")
     # An editor that opened this file needs the same answer the listing gave, or
     # it re-offers the edit the PUT below refuses.
     return {
@@ -101,18 +118,16 @@ class FileWriteRequest(BaseModel):
 async def write_memory_file(file_path: str, req: FileWriteRequest):
     config = get_config()
     full_path = config.workspace / file_path
-    try:
-        full_path.resolve().relative_to(config.workspace.resolve())
-    except ValueError:
-        raise HTTPException(status_code=403, detail="Access denied")
-    # This endpoint writes anywhere under the workspace, which includes the
-    # tracked config subtree — settings.yaml and the gate plugins the daemon
-    # executes. A locked instance must not be editable through it.
+    # The root markdown files include SOUL.md and AGENTS.md, which are part of
+    # the reviewed surface. A locked instance must not be editable through this
+    # route. This check comes first because its refusal tells the caller what
+    # to do instead.
     ensure_path_not_tracked_config(full_path, "write")
+    path = _memory_file(config.workspace, file_path)
 
     def _write() -> None:
-        full_path.parent.mkdir(parents=True, exist_ok=True)
-        full_path.write_text(req.content, encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(req.content, encoding="utf-8")
 
     await asyncio.to_thread(_write)
     return {"path": file_path, "saved": True}
@@ -120,8 +135,23 @@ async def write_memory_file(file_path: str, req: FileWriteRequest):
 
 # --- memU semantic memory ---
 
+_LOOM_EDIT_REFUSAL = (
+    "Memory is kept in Loom on this instance: change it with Loom's tools or in "
+    "Loom's dashboard."
+)
+
+
+def _loom_bridge():
+    """The Loom backend when it is the engine's memory, else None."""
+    deps = get_deps()
+    bridge = getattr(deps.engine, "_memory_bridge", None) if deps.engine else None
+    return bridge if getattr(bridge, "backend", "") == "loom" else None
+
+
 def _require_memu():
     deps = get_deps()
+    if _loom_bridge() is not None:
+        raise HTTPException(status_code=409, detail=_LOOM_EDIT_REFUSAL)
     if not deps.engine or not hasattr(deps.engine, '_memory_bridge') or not deps.engine._memory_bridge or not deps.engine._memory_bridge.available:
         raise HTTPException(status_code=503, detail="Memory service not available")
     return deps.engine._memory_bridge
@@ -188,6 +218,18 @@ def _read_memu_snapshot_sync(db_path: str, config=None) -> str:
 async def get_memu_data():
     """Get memU categories and items for the memory UI."""
     deps = get_deps()
+    loom = _loom_bridge()
+    if loom is not None:
+        # memU's store is not used; Loom's own dashboard browses its memory.
+        return {
+            "available": False,
+            "backend": "loom",
+            "dashboard_url": loom.dashboard_url,
+            "categories": [],
+            "items": [],
+            "resources": [],
+            "category_items": {},
+        }
     if not deps.engine or not hasattr(deps.engine, '_memory_bridge') or not deps.engine._memory_bridge or not deps.engine._memory_bridge.available:
         return {"available": False, "categories": [], "items": [], "resources": []}
 
@@ -288,8 +330,11 @@ async def get_memu_audit_log(
 
 @router.get("/api/memory/memu/health")
 async def memu_health():
-    """memU memory service health and metrics."""
+    """Memory backend health and metrics; ``backend`` says which (memU or Loom)."""
     deps = get_deps()
     if not deps.engine or not deps.engine._memory_bridge:
         return {"service_available": False}
-    return await deps.engine._memory_bridge.get_health()
+    health = await deps.engine._memory_bridge.get_health()
+    if isinstance(health, dict):
+        health.setdefault("backend", "memu")
+    return health

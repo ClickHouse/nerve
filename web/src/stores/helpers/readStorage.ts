@@ -12,10 +12,12 @@
 // access is quota-/disabled-safe — an unread marker is a convenience, never a
 // blocker.
 
+import { viewerStorageKey } from './viewerStorage';
+
 const PREFIX = 'nerve_read_';
 const BASELINE_KEY = 'nerve_reads_baseline';
 
-const keyFor = (sessionId: string) => `${PREFIX}${sessionId}`;
+const keyFor = (sessionId: string) => viewerStorageKey(`${PREFIX}${sessionId}`);
 
 /** Collect the keys of all persisted read stamps (safe if storage is off). */
 function readKeys(): string[] {
@@ -23,7 +25,7 @@ function readKeys(): string[] {
   try {
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
-      if (k && k.startsWith(PREFIX)) keys.push(k);
+      if (k && k.startsWith(viewerStorageKey(PREFIX))) keys.push(k);
     }
   } catch { /* storage unavailable */ }
   return keys;
@@ -36,7 +38,7 @@ export function loadReads(): Record<string, number> {
     try {
       const raw = localStorage.getItem(k);
       const ts = raw ? parseInt(raw, 10) : NaN;
-      if (Number.isFinite(ts)) out[k.slice(PREFIX.length)] = ts;
+      if (Number.isFinite(ts)) out[k.slice(viewerStorageKey(PREFIX).length)] = ts;
     } catch { /* ignore a single unreadable key */ }
   }
   return out;
@@ -62,12 +64,12 @@ export function removeRead(sessionId: string): void {
  */
 export function loadBaseline(): number {
   try {
-    const raw = localStorage.getItem(BASELINE_KEY);
+    const raw = localStorage.getItem(viewerStorageKey(BASELINE_KEY));
     const ts = raw ? parseInt(raw, 10) : NaN;
     if (Number.isFinite(ts)) return ts;
   } catch { /* fall through to (re)initialise */ }
   const now = Date.now();
-  try { localStorage.setItem(BASELINE_KEY, String(now)); } catch { /* best-effort */ }
+  try { localStorage.setItem(viewerStorageKey(BASELINE_KEY), String(now)); } catch { /* best-effort */ }
   return now;
 }
 
@@ -76,5 +78,5 @@ export function clearAllReads(): void {
   for (const k of readKeys()) {
     try { localStorage.removeItem(k); } catch { /* ignore */ }
   }
-  try { localStorage.removeItem(BASELINE_KEY); } catch { /* ignore */ }
+  try { localStorage.removeItem(viewerStorageKey(BASELINE_KEY)); } catch { /* ignore */ }
 }

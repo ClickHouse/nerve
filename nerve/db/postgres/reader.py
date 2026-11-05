@@ -74,6 +74,8 @@ class SyncConnection:
                 "category_items",
             ):
                 sql = sql.replace(f"memu_{table}", table)
+        if sql.strip().upper() == "BEGIN":
+            sql = "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY"
         sql, _ = translate(sql)
         return SyncCursor(self._conn.execute(sql, params))
 

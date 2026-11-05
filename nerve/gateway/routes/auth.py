@@ -12,13 +12,16 @@ from pydantic import BaseModel
 
 from nerve.config import get_config
 from nerve.gateway.auth import (
+    AUTH_MODE_EXTERNAL,
     BCRYPT_COST,
     NO_IDENTITY_DETAIL,
+    auth_mode,
     bcrypt_cost,
     create_session_token,
     effective_jwt_secret,
     hash_password,
     identity_store,
+    is_external_mode,
     needs_rehash,
     password_length_problem,
     require_auth,
@@ -190,7 +193,22 @@ class LoginResponse(BaseModel):
     token: str
 
 
-@router.post("/api/auth/login", response_model=LoginResponse)
+async def _local_login_only() -> None:
+    """Answer 404 in external mode, where the gateway signs people in.
+
+    FastAPI runs this dependency before it validates the login fields, so a
+    JSON body with missing or wrong fields also gets 404. A body that is not
+    valid JSON gets 422.
+    """
+    if is_external_mode():
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+@router.post(
+    "/api/auth/login",
+    response_model=LoginResponse,
+    dependencies=[Depends(_local_login_only)],
+)
 async def login(req: LoginRequest):
     """Authenticate a local account and return a session token."""
     config = get_config()
@@ -257,14 +275,22 @@ async def login(req: LoginRequest):
 async def auth_status():
     """Describe the login form without identifying accounts.
 
-    ``auth_required`` is the legacy spelling of ``login != 'none'``. Missing
-    startup state fails closed to username and password. ``setup`` means that
-    only the setup-token claim is permitted.
+    ``mode`` is the authentication mode. ``auth_required`` is the legacy
+    spelling of ``login != 'none'``. Missing startup state fails closed to
+    username and password. ``setup`` means that only the setup-token claim is
+    permitted.
+
+    In external mode, the gateway signs people in. The response does not read
+    local login state, and ``login`` keeps the fail-closed value.
     """
+    mode = auth_mode()
+    if mode == AUTH_MODE_EXTERNAL:
+        return {"mode": mode, **_UNKNOWN_STATUS}
+
     config = get_config()
     store = identity_store()
     if store is None or not effective_jwt_secret(config):
-        return dict(_UNKNOWN_STATUS)
+        return {"mode": mode, **_UNKNOWN_STATUS}
 
     state = await store.login_state()
     if setup_required(state, config):
@@ -277,6 +303,7 @@ async def auth_status():
         login_kind = LOGIN_USERNAME_PASSWORD
 
     return {
+        "mode": mode,
         "auth_required": login_kind != LOGIN_NONE,
         "login": login_kind,
     }

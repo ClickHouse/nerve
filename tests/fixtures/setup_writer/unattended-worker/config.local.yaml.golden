@@ -1,0 +1,6 @@
+# Nerve — Secrets (gitignored)
+# API keys, tokens, and other sensitive configuration.
+
+anthropic_api_key: sk-ant-REPLACE
+auth:
+  jwt_secret: <generated>

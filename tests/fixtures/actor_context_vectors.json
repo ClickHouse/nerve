@@ -1,0 +1,227 @@
+{
+  "now": 1800000000,
+  "tenant_id": "11111111-1111-4111-8111-111111111111",
+  "agent_id": "22222222-2222-4222-8222-222222222222",
+  "key_set": {
+    "keys": [
+      {
+        "use": "sig",
+        "kty": "OKP",
+        "kid": "test-2026-10",
+        "crv": "Ed25519",
+        "alg": "EdDSA",
+        "x": "vHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaU"
+      },
+      {
+        "use": "sig",
+        "kty": "OKP",
+        "kid": "test-2026-11",
+        "crv": "Ed25519",
+        "alg": "EdDSA",
+        "x": "VRVPQgZepaG-oFRjgmviaE65LfksEAAnqrquV8pVQgc"
+      }
+    ]
+  },
+  "ring": {
+    "schema": "nerve.actor-verifier-ring.v1",
+    "generation": 1,
+    "tenant_id": "11111111-1111-4111-8111-111111111111",
+    "agent_id": "22222222-2222-4222-8222-222222222222",
+    "signer_id": "urn:nerve:gateway:actor:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222",
+    "audience": "urn:nerve:runtime:11111111-1111-4111-8111-111111111111:22222222-2222-4222-8222-222222222222",
+    "keys": [
+      {
+        "use": "sig",
+        "kty": "OKP",
+        "kid": "test-2026-10",
+        "crv": "Ed25519",
+        "alg": "EdDSA",
+        "x": "vHy8tWNjdfodgkNNRmck2SN39TuYBpXdSdJtDOEiBaU"
+      },
+      {
+        "use": "sig",
+        "kty": "OKP",
+        "kid": "test-2026-11",
+        "crv": "Ed25519",
+        "alg": "EdDSA",
+        "x": "VRVPQgZepaG-oFRjgmviaE65LfksEAAnqrquV8pVQgc"
+      }
+    ]
+  },
+  "vectors": [
+    {
+      "name": "http_get_query_key_a",
+      "valid": true,
+      "now": 1800000005,
+      "method": "GET",
+      "target": "/api/sessions?limit=20",
+      "websocket": false,
+      "principal_id": "55555555-5555-4555-8555-555555555555",
+      "display_name": "Test Person",
+      "assertion": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6Im5lcnZlLWFjdG9yLWNvbnRleHQrandzIn0.eyJ2ZXJzaW9uIjoiMSIsInNpZ25lcl9pZCI6InVybjpuZXJ2ZTpnYXRld2F5OmFjdG9yOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhdWRpZW5jZSI6InVybjpuZXJ2ZTpydW50aW1lOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJ0ZW5hbnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ2VudF9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsInByaW5jaXBhbF9pZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsImFjdG9yX2tpbmQiOiJodW1hbiIsInByb2ZpbGUiOnsiZGlzcGxheV9uYW1lIjoiVGVzdCBQZXJzb24iLCJwcmltYXJ5X2VtYWlsIjoicGVyc29uQGV4YW1wbGUuY29tIiwidmVyc2lvbiI6M30sInNvdXJjZSI6IndlYiIsImF1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImdhdGV3YXlfc2Vzc2lvbiIsInJlcXVlc3RfaWQiOiJyZXEtR0VUIiwiYXNzZXJ0aW9uX2lkIjoiOF85TlJSNUNuaGdpRmFydUJxTFdTdyIsImFkbWl0dGVkX2F0IjoxODAwMDAwMDAwLCJpc3N1ZWRfYXQiOjE4MDAwMDAwMDAsImV4cGlyZXNfYXQiOjE4MDAwMDAwMzAsInJlcXVlc3RfYmluZGluZyI6eyJraW5kIjoiaHR0cCIsIm1ldGhvZCI6IkdFVCIsInRhcmdldCI6Ii9hcGkvc2Vzc2lvbnM_bGltaXQ9MjAifSwiYXV0aG9yaXphdGlvbiI6eyJraW5kIjoicHJvamVjdGlvbiIsInJlZmVyZW5jZSI6N319.4tEXBdHlIMgiAIkBfS77qjTC_1O49a5BFsfLozPxRM3F_Q07XsBemkois6v2OD7ksalCsvBv2I1Rw_wtueZjCw"
+    },
+    {
+      "name": "http_post_key_b_rotation_overlap",
+      "valid": true,
+      "now": 1800000000,
+      "method": "POST",
+      "target": "/api/chat",
+      "websocket": false,
+      "principal_id": "55555555-5555-4555-8555-555555555555",
+      "display_name": "Test Person",
+      "assertion": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMSIsInR5cCI6Im5lcnZlLWFjdG9yLWNvbnRleHQrandzIn0.eyJ2ZXJzaW9uIjoiMSIsInNpZ25lcl9pZCI6InVybjpuZXJ2ZTpnYXRld2F5OmFjdG9yOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhdWRpZW5jZSI6InVybjpuZXJ2ZTpydW50aW1lOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJ0ZW5hbnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ2VudF9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsInByaW5jaXBhbF9pZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsImFjdG9yX2tpbmQiOiJodW1hbiIsInByb2ZpbGUiOnsiZGlzcGxheV9uYW1lIjoiVGVzdCBQZXJzb24iLCJwcmltYXJ5X2VtYWlsIjoicGVyc29uQGV4YW1wbGUuY29tIiwidmVyc2lvbiI6M30sInNvdXJjZSI6IndlYiIsImF1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImdhdGV3YXlfc2Vzc2lvbiIsInJlcXVlc3RfaWQiOiJyZXEtUE9TVCIsImFzc2VydGlvbl9pZCI6ImJScXR5ZVVESGt1WnZ4R3VDbmx1dkEiLCJhZG1pdHRlZF9hdCI6MTgwMDAwMDAwMCwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwMDMwLCJyZXF1ZXN0X2JpbmRpbmciOnsia2luZCI6Imh0dHAiLCJtZXRob2QiOiJQT1NUIiwidGFyZ2V0IjoiL2FwaS9jaGF0In0sImF1dGhvcml6YXRpb24iOnsia2luZCI6InByb2plY3Rpb24iLCJyZWZlcmVuY2UiOjd9fQ.q799baLoqS_2i2hUW2_YLmsAQXxR762mcCRyFDHOgpLvYJ8yMmgINFWzwqosOwhNE01Ttb-SOdNMsjAX4kxdBQ"
+    },
+    {
+      "name": "websocket_upgrade",
+      "valid": true,
+      "now": 1800000001,
+      "method": "GET",
+      "target": "/ws",
+      "websocket": true,
+      "principal_id": "55555555-5555-4555-8555-555555555555",
+      "display_name": "Test Person",
+      "assertion": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6Im5lcnZlLWFjdG9yLWNvbnRleHQrandzIn0.eyJ2ZXJzaW9uIjoiMSIsInNpZ25lcl9pZCI6InVybjpuZXJ2ZTpnYXRld2F5OmFjdG9yOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhdWRpZW5jZSI6InVybjpuZXJ2ZTpydW50aW1lOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJ0ZW5hbnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ2VudF9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsInByaW5jaXBhbF9pZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsImFjdG9yX2tpbmQiOiJodW1hbiIsInByb2ZpbGUiOnsiZGlzcGxheV9uYW1lIjoiVGVzdCBQZXJzb24iLCJwcmltYXJ5X2VtYWlsIjoicGVyc29uQGV4YW1wbGUuY29tIiwidmVyc2lvbiI6M30sInNvdXJjZSI6IndlYiIsImF1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImdhdGV3YXlfc2Vzc2lvbiIsInJlcXVlc3RfaWQiOiJyZXEtR0VUIiwiYXNzZXJ0aW9uX2lkIjoiUk1oZjBYU196UFE4dGZWaHpRQkE2QSIsImdhdGV3YXlfY29ubmVjdGlvbl9pZCI6IlZtSUpPRnhtQWQyel9CUnl1SUhabkEiLCJhZG1pdHRlZF9hdCI6MTgwMDAwMDAwMCwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwMDMwLCJyZXF1ZXN0X2JpbmRpbmciOnsia2luZCI6IndlYnNvY2tldCIsIm1ldGhvZCI6IkdFVCIsInRhcmdldCI6Ii93cyJ9LCJhdXRob3JpemF0aW9uIjp7ImtpbmQiOiJwcm9qZWN0aW9uIiwicmVmZXJlbmNlIjo3fX0.goWsLas5df62N_u1w5TWOejdKPiiEy32lOUVhJ9m_RB_mmXRDkTkJfnvmTh_r9wRLHgTIp5G7oFlXwwMuZfsCA"
+    },
+    {
+      "name": "http_bare_trailing_question_mark",
+      "valid": true,
+      "now": 1800000000,
+      "method": "GET",
+      "target": "/api/plans?",
+      "websocket": false,
+      "principal_id": "55555555-5555-4555-8555-555555555555",
+      "display_name": "Test Person",
+      "assertion": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6Im5lcnZlLWFjdG9yLWNvbnRleHQrandzIn0.eyJ2ZXJzaW9uIjoiMSIsInNpZ25lcl9pZCI6InVybjpuZXJ2ZTpnYXRld2F5OmFjdG9yOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhdWRpZW5jZSI6InVybjpuZXJ2ZTpydW50aW1lOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJ0ZW5hbnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ2VudF9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsInByaW5jaXBhbF9pZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsImFjdG9yX2tpbmQiOiJodW1hbiIsInByb2ZpbGUiOnsiZGlzcGxheV9uYW1lIjoiVGVzdCBQZXJzb24iLCJwcmltYXJ5X2VtYWlsIjoicGVyc29uQGV4YW1wbGUuY29tIiwidmVyc2lvbiI6M30sInNvdXJjZSI6IndlYiIsImF1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImdhdGV3YXlfc2Vzc2lvbiIsInJlcXVlc3RfaWQiOiJyZXEtR0VUIiwiYXNzZXJ0aW9uX2lkIjoiaENnWVBELXVjV2Jzdlh6RHVpYkZYZyIsImFkbWl0dGVkX2F0IjoxODAwMDAwMDAwLCJpc3N1ZWRfYXQiOjE4MDAwMDAwMDAsImV4cGlyZXNfYXQiOjE4MDAwMDAwMzAsInJlcXVlc3RfYmluZGluZyI6eyJraW5kIjoiaHR0cCIsIm1ldGhvZCI6IkdFVCIsInRhcmdldCI6Ii9hcGkvcGxhbnM_In0sImF1dGhvcml6YXRpb24iOnsia2luZCI6InByb2plY3Rpb24iLCJyZWZlcmVuY2UiOjd9fQ.1VhzYGjQEepbwFkFXigFhqEHRGFr4u0vrBVWtD6FQK0VK8esvKx5FMUnLHT8DT3qWpMkAdkFyr_bq1A7gKIFBw"
+    },
+    {
+      "name": "api_token_source",
+      "valid": true,
+      "now": 1800000000,
+      "method": "GET",
+      "target": "/api/tasks",
+      "websocket": false,
+      "principal_id": "55555555-5555-4555-8555-555555555555",
+      "display_name": "Test Person",
+      "assertion": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6Im5lcnZlLWFjdG9yLWNvbnRleHQrandzIn0.eyJ2ZXJzaW9uIjoiMSIsInNpZ25lcl9pZCI6InVybjpuZXJ2ZTpnYXRld2F5OmFjdG9yOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhdWRpZW5jZSI6InVybjpuZXJ2ZTpydW50aW1lOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJ0ZW5hbnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ2VudF9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsInByaW5jaXBhbF9pZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsImFjdG9yX2tpbmQiOiJodW1hbiIsInByb2ZpbGUiOnsiZGlzcGxheV9uYW1lIjoiVGVzdCBQZXJzb24iLCJwcmltYXJ5X2VtYWlsIjoicGVyc29uQGV4YW1wbGUuY29tIiwidmVyc2lvbiI6M30sInNvdXJjZSI6ImFwaSIsImF1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImFwaV90b2tlbiIsInJlcXVlc3RfaWQiOiJyZXEtR0VUIiwiYXNzZXJ0aW9uX2lkIjoiTDFGcHlTOHZScEg2NG8wQTkwN0s4ZyIsImFkbWl0dGVkX2F0IjoxODAwMDAwMDAwLCJpc3N1ZWRfYXQiOjE4MDAwMDAwMDAsImV4cGlyZXNfYXQiOjE4MDAwMDAwMzAsInJlcXVlc3RfYmluZGluZyI6eyJraW5kIjoiaHR0cCIsIm1ldGhvZCI6IkdFVCIsInRhcmdldCI6Ii9hcGkvdGFza3MifSwiYXV0aG9yaXphdGlvbiI6eyJraW5kIjoicHJvamVjdGlvbiIsInJlZmVyZW5jZSI6N319.uJihjgKTRKWqW0AKA400ba506kbb8HJptmuCJ31MBZV-EFnp0uivjpVN78NmmqEvCK9796auE3WZgnGeuvJtBw"
+    },
+    {
+      "name": "at_expiry_edge_within_skew",
+      "valid": true,
+      "now": 1800000059,
+      "method": "GET",
+      "target": "/api/sessions?limit=20",
+      "websocket": false,
+      "principal_id": "55555555-5555-4555-8555-555555555555",
+      "display_name": "Test Person",
+      "assertion": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6Im5lcnZlLWFjdG9yLWNvbnRleHQrandzIn0.eyJ2ZXJzaW9uIjoiMSIsInNpZ25lcl9pZCI6InVybjpuZXJ2ZTpnYXRld2F5OmFjdG9yOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhdWRpZW5jZSI6InVybjpuZXJ2ZTpydW50aW1lOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJ0ZW5hbnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ2VudF9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsInByaW5jaXBhbF9pZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsImFjdG9yX2tpbmQiOiJodW1hbiIsInByb2ZpbGUiOnsiZGlzcGxheV9uYW1lIjoiVGVzdCBQZXJzb24iLCJwcmltYXJ5X2VtYWlsIjoicGVyc29uQGV4YW1wbGUuY29tIiwidmVyc2lvbiI6M30sInNvdXJjZSI6IndlYiIsImF1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImdhdGV3YXlfc2Vzc2lvbiIsInJlcXVlc3RfaWQiOiJyZXEtR0VUIiwiYXNzZXJ0aW9uX2lkIjoiVEtRY0RWZDBkOFN5WVZwN0I5amRDZyIsImFkbWl0dGVkX2F0IjoxODAwMDAwMDAwLCJpc3N1ZWRfYXQiOjE4MDAwMDAwMDAsImV4cGlyZXNfYXQiOjE4MDAwMDAwMzAsInJlcXVlc3RfYmluZGluZyI6eyJraW5kIjoiaHR0cCIsIm1ldGhvZCI6IkdFVCIsInRhcmdldCI6Ii9hcGkvc2Vzc2lvbnM_bGltaXQ9MjAifSwiYXV0aG9yaXphdGlvbiI6eyJraW5kIjoicHJvamVjdGlvbiIsInJlZmVyZW5jZSI6N319.Ot3bHBtbT_A01MqsI_h-W-w1IwY2QDHMXyHtV7UlhgnAiBtbqNPGn6odVBktYXpkSCLHXzbqMxff7wbuq7_kCg"
+    },
+    {
+      "name": "unknown_kid",
+      "valid": false,
+      "reason": "kid test-unpublished is not in the key set",
+      "now": 1800000000,
+      "method": "GET",
+      "target": "/api/sessions",
+      "websocket": false,
+      "principal_id": "55555555-5555-4555-8555-555555555555",
+      "display_name": "",
+      "assertion": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtdW5wdWJsaXNoZWQiLCJ0eXAiOiJuZXJ2ZS1hY3Rvci1jb250ZXh0K2p3cyJ9.eyJ2ZXJzaW9uIjoiMSIsInNpZ25lcl9pZCI6InVybjpuZXJ2ZTpnYXRld2F5OmFjdG9yOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhdWRpZW5jZSI6InVybjpuZXJ2ZTpydW50aW1lOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJ0ZW5hbnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ2VudF9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsInByaW5jaXBhbF9pZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsImFjdG9yX2tpbmQiOiJodW1hbiIsInByb2ZpbGUiOnsiZGlzcGxheV9uYW1lIjoiVGVzdCBQZXJzb24iLCJwcmltYXJ5X2VtYWlsIjoicGVyc29uQGV4YW1wbGUuY29tIiwidmVyc2lvbiI6M30sInNvdXJjZSI6IndlYiIsImF1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImdhdGV3YXlfc2Vzc2lvbiIsInJlcXVlc3RfaWQiOiJyZXEtR0VUIiwiYXNzZXJ0aW9uX2lkIjoidTQ5Z0p2QldESXZuTlFrdWI5RXlKZyIsImFkbWl0dGVkX2F0IjoxODAwMDAwMDAwLCJpc3N1ZWRfYXQiOjE4MDAwMDAwMDAsImV4cGlyZXNfYXQiOjE4MDAwMDAwMzAsInJlcXVlc3RfYmluZGluZyI6eyJraW5kIjoiaHR0cCIsIm1ldGhvZCI6IkdFVCIsInRhcmdldCI6Ii9hcGkvc2Vzc2lvbnMifSwiYXV0aG9yaXphdGlvbiI6eyJraW5kIjoicHJvamVjdGlvbiIsInJlZmVyZW5jZSI6N319.8UOUEr-pR9IJX6QIEhDObIkrToVPIBksdl6fyE-n2Wm2-2sj7gzhdIDrM7xjkKhzeJ0RhrCN2GXroMuz8F-2DQ"
+    },
+    {
+      "name": "other_agent_scope",
+      "valid": false,
+      "reason": "agent_id, signer_id and audience name another agent",
+      "now": 1800000000,
+      "method": "GET",
+      "target": "/api/sessions",
+      "websocket": false,
+      "principal_id": "55555555-5555-4555-8555-555555555555",
+      "display_name": "",
+      "assertion": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6Im5lcnZlLWFjdG9yLWNvbnRleHQrandzIn0.eyJ2ZXJzaW9uIjoiMSIsInNpZ25lcl9pZCI6InVybjpuZXJ2ZTpnYXRld2F5OmFjdG9yOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMTozMzMzMzMzMy0zMzMzLTQzMzMtODMzMy0zMzMzMzMzMzMzMzMiLCJhdWRpZW5jZSI6InVybjpuZXJ2ZTpydW50aW1lOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMTozMzMzMzMzMy0zMzMzLTQzMzMtODMzMy0zMzMzMzMzMzMzMzMiLCJ0ZW5hbnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ2VudF9pZCI6IjMzMzMzMzMzLTMzMzMtNDMzMy04MzMzLTMzMzMzMzMzMzMzMyIsInByaW5jaXBhbF9pZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsImFjdG9yX2tpbmQiOiJodW1hbiIsInByb2ZpbGUiOnsiZGlzcGxheV9uYW1lIjoiVGVzdCBQZXJzb24iLCJwcmltYXJ5X2VtYWlsIjoicGVyc29uQGV4YW1wbGUuY29tIiwidmVyc2lvbiI6M30sInNvdXJjZSI6IndlYiIsImF1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImdhdGV3YXlfc2Vzc2lvbiIsInJlcXVlc3RfaWQiOiJyZXEtR0VUIiwiYXNzZXJ0aW9uX2lkIjoiYU45TmF4WEZKQ0pWVGl5blh5d3dVdyIsImFkbWl0dGVkX2F0IjoxODAwMDAwMDAwLCJpc3N1ZWRfYXQiOjE4MDAwMDAwMDAsImV4cGlyZXNfYXQiOjE4MDAwMDAwMzAsInJlcXVlc3RfYmluZGluZyI6eyJraW5kIjoiaHR0cCIsIm1ldGhvZCI6IkdFVCIsInRhcmdldCI6Ii9hcGkvc2Vzc2lvbnMifSwiYXV0aG9yaXphdGlvbiI6eyJraW5kIjoicHJvamVjdGlvbiIsInJlZmVyZW5jZSI6N319.Lh8YVj8E-nQHtY74yxRZf_SunEeiXvE5vVdUX_IfQF4DJCofBse93B3srKgJ7MZRmqxumD20aqfoUtFAoZCyAg"
+    },
+    {
+      "name": "other_tenant_scope",
+      "valid": false,
+      "reason": "tenant_id, signer_id and audience name another tenant",
+      "now": 1800000000,
+      "method": "GET",
+      "target": "/api/sessions",
+      "websocket": false,
+      "principal_id": "55555555-5555-4555-8555-555555555555",
+      "display_name": "",
+      "assertion": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6Im5lcnZlLWFjdG9yLWNvbnRleHQrandzIn0.eyJ2ZXJzaW9uIjoiMSIsInNpZ25lcl9pZCI6InVybjpuZXJ2ZTpnYXRld2F5OmFjdG9yOjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NDoyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhdWRpZW5jZSI6InVybjpuZXJ2ZTpydW50aW1lOjQ0NDQ0NDQ0LTQ0NDQtNDQ0NC04NDQ0LTQ0NDQ0NDQ0NDQ0NDoyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJ0ZW5hbnRfaWQiOiI0NDQ0NDQ0NC00NDQ0LTQ0NDQtODQ0NC00NDQ0NDQ0NDQ0NDQiLCJhZ2VudF9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsInByaW5jaXBhbF9pZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsImFjdG9yX2tpbmQiOiJodW1hbiIsInByb2ZpbGUiOnsiZGlzcGxheV9uYW1lIjoiVGVzdCBQZXJzb24iLCJwcmltYXJ5X2VtYWlsIjoicGVyc29uQGV4YW1wbGUuY29tIiwidmVyc2lvbiI6M30sInNvdXJjZSI6IndlYiIsImF1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImdhdGV3YXlfc2Vzc2lvbiIsInJlcXVlc3RfaWQiOiJyZXEtR0VUIiwiYXNzZXJ0aW9uX2lkIjoiSEFEZGt0VG4xYkxFbE5GUXJRVVRjUSIsImFkbWl0dGVkX2F0IjoxODAwMDAwMDAwLCJpc3N1ZWRfYXQiOjE4MDAwMDAwMDAsImV4cGlyZXNfYXQiOjE4MDAwMDAwMzAsInJlcXVlc3RfYmluZGluZyI6eyJraW5kIjoiaHR0cCIsIm1ldGhvZCI6IkdFVCIsInRhcmdldCI6Ii9hcGkvc2Vzc2lvbnMifSwiYXV0aG9yaXphdGlvbiI6eyJraW5kIjoicHJvamVjdGlvbiIsInJlZmVyZW5jZSI6N319.Y3n19RuN06buBDE2YUW-NIEzS6yxweTnv1bPiBZUpKB6hgVW1ZoWPzmuC_sKCtI_ToBpdn54j-M_Do5OUegKDA"
+    },
+    {
+      "name": "expired_beyond_skew",
+      "valid": false,
+      "reason": "expires_at + skew is before now",
+      "now": 1800000061,
+      "method": "GET",
+      "target": "/api/sessions",
+      "websocket": false,
+      "principal_id": "55555555-5555-4555-8555-555555555555",
+      "display_name": "",
+      "assertion": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6Im5lcnZlLWFjdG9yLWNvbnRleHQrandzIn0.eyJ2ZXJzaW9uIjoiMSIsInNpZ25lcl9pZCI6InVybjpuZXJ2ZTpnYXRld2F5OmFjdG9yOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhdWRpZW5jZSI6InVybjpuZXJ2ZTpydW50aW1lOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJ0ZW5hbnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ2VudF9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsInByaW5jaXBhbF9pZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsImFjdG9yX2tpbmQiOiJodW1hbiIsInByb2ZpbGUiOnsiZGlzcGxheV9uYW1lIjoiVGVzdCBQZXJzb24iLCJwcmltYXJ5X2VtYWlsIjoicGVyc29uQGV4YW1wbGUuY29tIiwidmVyc2lvbiI6M30sInNvdXJjZSI6IndlYiIsImF1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImdhdGV3YXlfc2Vzc2lvbiIsInJlcXVlc3RfaWQiOiJyZXEtR0VUIiwiYXNzZXJ0aW9uX2lkIjoicnRhdzZ1R25janhWTHlvVnRXLVJLUSIsImFkbWl0dGVkX2F0IjoxODAwMDAwMDAwLCJpc3N1ZWRfYXQiOjE4MDAwMDAwMDAsImV4cGlyZXNfYXQiOjE4MDAwMDAwMzAsInJlcXVlc3RfYmluZGluZyI6eyJraW5kIjoiaHR0cCIsIm1ldGhvZCI6IkdFVCIsInRhcmdldCI6Ii9hcGkvc2Vzc2lvbnMifSwiYXV0aG9yaXphdGlvbiI6eyJraW5kIjoicHJvamVjdGlvbiIsInJlZmVyZW5jZSI6N319.LUQ-nzUQmDNlzT-EWDdFxejcnjKFtYOwhjc8lCxidv6K_HGxnY-Eujocot9SU3EnBI5DUIaMuM6VLV8MI77BDA"
+    },
+    {
+      "name": "issued_in_the_future_beyond_skew",
+      "valid": false,
+      "reason": "issued_at - skew is after now",
+      "now": 1799999969,
+      "method": "GET",
+      "target": "/api/sessions",
+      "websocket": false,
+      "principal_id": "55555555-5555-4555-8555-555555555555",
+      "display_name": "",
+      "assertion": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6Im5lcnZlLWFjdG9yLWNvbnRleHQrandzIn0.eyJ2ZXJzaW9uIjoiMSIsInNpZ25lcl9pZCI6InVybjpuZXJ2ZTpnYXRld2F5OmFjdG9yOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhdWRpZW5jZSI6InVybjpuZXJ2ZTpydW50aW1lOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJ0ZW5hbnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ2VudF9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsInByaW5jaXBhbF9pZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsImFjdG9yX2tpbmQiOiJodW1hbiIsInByb2ZpbGUiOnsiZGlzcGxheV9uYW1lIjoiVGVzdCBQZXJzb24iLCJwcmltYXJ5X2VtYWlsIjoicGVyc29uQGV4YW1wbGUuY29tIiwidmVyc2lvbiI6M30sInNvdXJjZSI6IndlYiIsImF1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImdhdGV3YXlfc2Vzc2lvbiIsInJlcXVlc3RfaWQiOiJyZXEtR0VUIiwiYXNzZXJ0aW9uX2lkIjoiMmVNUlhaQ2VCYXg0ajBfZTZNLUIzZyIsImFkbWl0dGVkX2F0IjoxODAwMDAwMDAwLCJpc3N1ZWRfYXQiOjE4MDAwMDAwMDAsImV4cGlyZXNfYXQiOjE4MDAwMDAwMzAsInJlcXVlc3RfYmluZGluZyI6eyJraW5kIjoiaHR0cCIsIm1ldGhvZCI6IkdFVCIsInRhcmdldCI6Ii9hcGkvc2Vzc2lvbnMifSwiYXV0aG9yaXphdGlvbiI6eyJraW5kIjoicHJvamVjdGlvbiIsInJlZmVyZW5jZSI6N319.m68xliBfH5fgg1BI2wmrvW96drXnCwi4NuQMxsrGxsMikDWo5RhGEjDFH4K-nM5Dm8rNGU81H8Q_jXH8vfmOAA"
+    },
+    {
+      "name": "method_mismatch",
+      "valid": false,
+      "reason": "assertion binds POST, request is GET",
+      "now": 1800000000,
+      "method": "GET",
+      "target": "/api/chat",
+      "websocket": false,
+      "principal_id": "55555555-5555-4555-8555-555555555555",
+      "display_name": "",
+      "assertion": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6Im5lcnZlLWFjdG9yLWNvbnRleHQrandzIn0.eyJ2ZXJzaW9uIjoiMSIsInNpZ25lcl9pZCI6InVybjpuZXJ2ZTpnYXRld2F5OmFjdG9yOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhdWRpZW5jZSI6InVybjpuZXJ2ZTpydW50aW1lOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJ0ZW5hbnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ2VudF9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsInByaW5jaXBhbF9pZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsImFjdG9yX2tpbmQiOiJodW1hbiIsInByb2ZpbGUiOnsiZGlzcGxheV9uYW1lIjoiVGVzdCBQZXJzb24iLCJwcmltYXJ5X2VtYWlsIjoicGVyc29uQGV4YW1wbGUuY29tIiwidmVyc2lvbiI6M30sInNvdXJjZSI6IndlYiIsImF1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImdhdGV3YXlfc2Vzc2lvbiIsInJlcXVlc3RfaWQiOiJyZXEtUE9TVCIsImFzc2VydGlvbl9pZCI6Ii1PSDZrRHNUTmo1Ri1RM1hyNjNxM3ciLCJhZG1pdHRlZF9hdCI6MTgwMDAwMDAwMCwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwMDMwLCJyZXF1ZXN0X2JpbmRpbmciOnsia2luZCI6Imh0dHAiLCJtZXRob2QiOiJQT1NUIiwidGFyZ2V0IjoiL2FwaS9jaGF0In0sImF1dGhvcml6YXRpb24iOnsia2luZCI6InByb2plY3Rpb24iLCJyZWZlcmVuY2UiOjd9fQ.vkZPMFnI4lpBPn53nAdl4Nvy3qUuA_N3FdRcCbzmRlavvgi_BjGUzIiTW9bZQBA7zR8A03jFo9mqwoM8McVmBA"
+    },
+    {
+      "name": "target_mismatch",
+      "valid": false,
+      "reason": "assertion binds /api/sessions?limit=20, request is /api/sessions?limit=21",
+      "now": 1800000000,
+      "method": "GET",
+      "target": "/api/sessions?limit=21",
+      "websocket": false,
+      "principal_id": "55555555-5555-4555-8555-555555555555",
+      "display_name": "",
+      "assertion": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6Im5lcnZlLWFjdG9yLWNvbnRleHQrandzIn0.eyJ2ZXJzaW9uIjoiMSIsInNpZ25lcl9pZCI6InVybjpuZXJ2ZTpnYXRld2F5OmFjdG9yOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhdWRpZW5jZSI6InVybjpuZXJ2ZTpydW50aW1lOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJ0ZW5hbnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ2VudF9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsInByaW5jaXBhbF9pZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsImFjdG9yX2tpbmQiOiJodW1hbiIsInByb2ZpbGUiOnsiZGlzcGxheV9uYW1lIjoiVGVzdCBQZXJzb24iLCJwcmltYXJ5X2VtYWlsIjoicGVyc29uQGV4YW1wbGUuY29tIiwidmVyc2lvbiI6M30sInNvdXJjZSI6IndlYiIsImF1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImdhdGV3YXlfc2Vzc2lvbiIsInJlcXVlc3RfaWQiOiJyZXEtR0VUIiwiYXNzZXJ0aW9uX2lkIjoiSURUMG05V005RzZmYnA2RmlUV3BoQSIsImFkbWl0dGVkX2F0IjoxODAwMDAwMDAwLCJpc3N1ZWRfYXQiOjE4MDAwMDAwMDAsImV4cGlyZXNfYXQiOjE4MDAwMDAwMzAsInJlcXVlc3RfYmluZGluZyI6eyJraW5kIjoiaHR0cCIsIm1ldGhvZCI6IkdFVCIsInRhcmdldCI6Ii9hcGkvc2Vzc2lvbnM_bGltaXQ9MjAifSwiYXV0aG9yaXphdGlvbiI6eyJraW5kIjoicHJvamVjdGlvbiIsInJlZmVyZW5jZSI6N319.6dgaLHzSbzh8XZODoRprqWg9CaP2mNe9KR7G2v07Zek8o-cTK0z4o0jxe2YzyE-4v4_jjotoxhZ7fquQ1c8qCA"
+    },
+    {
+      "name": "kind_mismatch_websocket_assertion_on_http",
+      "valid": false,
+      "reason": "assertion kind websocket, request is http",
+      "now": 1800000000,
+      "method": "GET",
+      "target": "/ws",
+      "websocket": false,
+      "principal_id": "55555555-5555-4555-8555-555555555555",
+      "display_name": "",
+      "assertion": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6Im5lcnZlLWFjdG9yLWNvbnRleHQrandzIn0.eyJ2ZXJzaW9uIjoiMSIsInNpZ25lcl9pZCI6InVybjpuZXJ2ZTpnYXRld2F5OmFjdG9yOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhdWRpZW5jZSI6InVybjpuZXJ2ZTpydW50aW1lOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJ0ZW5hbnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ2VudF9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsInByaW5jaXBhbF9pZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsImFjdG9yX2tpbmQiOiJodW1hbiIsInByb2ZpbGUiOnsiZGlzcGxheV9uYW1lIjoiVGVzdCBQZXJzb24iLCJwcmltYXJ5X2VtYWlsIjoicGVyc29uQGV4YW1wbGUuY29tIiwidmVyc2lvbiI6M30sInNvdXJjZSI6IndlYiIsImF1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImdhdGV3YXlfc2Vzc2lvbiIsInJlcXVlc3RfaWQiOiJyZXEtR0VUIiwiYXNzZXJ0aW9uX2lkIjoiSTdsSWhOaEVZWkFCOG52N0VCOEhOdyIsImdhdGV3YXlfY29ubmVjdGlvbl9pZCI6InRyZVRwWGlRMVFWc2hhTFBhejBseFEiLCJhZG1pdHRlZF9hdCI6MTgwMDAwMDAwMCwiaXNzdWVkX2F0IjoxODAwMDAwMDAwLCJleHBpcmVzX2F0IjoxODAwMDAwMDMwLCJyZXF1ZXN0X2JpbmRpbmciOnsia2luZCI6IndlYnNvY2tldCIsIm1ldGhvZCI6IkdFVCIsInRhcmdldCI6Ii93cyJ9LCJhdXRob3JpemF0aW9uIjp7ImtpbmQiOiJwcm9qZWN0aW9uIiwicmVmZXJlbmNlIjo3fX0.7dWWbuUtwmSsjBAGc10ktLEVOlYbfxm2InflM4Mm0YfoZhp-1SXgHYI6aBQzozCl5z_aW9euV8iYm1NFOH8DAg"
+    },
+    {
+      "name": "kind_mismatch_http_assertion_on_websocket",
+      "valid": false,
+      "reason": "assertion kind http, request is a websocket upgrade",
+      "now": 1800000000,
+      "method": "GET",
+      "target": "/ws",
+      "websocket": true,
+      "principal_id": "55555555-5555-4555-8555-555555555555",
+      "display_name": "",
+      "assertion": "eyJhbGciOiJFZERTQSIsImtpZCI6InRlc3QtMjAyNi0xMCIsInR5cCI6Im5lcnZlLWFjdG9yLWNvbnRleHQrandzIn0.eyJ2ZXJzaW9uIjoiMSIsInNpZ25lcl9pZCI6InVybjpuZXJ2ZTpnYXRld2F5OmFjdG9yOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJhdWRpZW5jZSI6InVybjpuZXJ2ZTpydW50aW1lOjExMTExMTExLTExMTEtNDExMS04MTExLTExMTExMTExMTExMToyMjIyMjIyMi0yMjIyLTQyMjItODIyMi0yMjIyMjIyMjIyMjIiLCJ0ZW5hbnRfaWQiOiIxMTExMTExMS0xMTExLTQxMTEtODExMS0xMTExMTExMTExMTEiLCJhZ2VudF9pZCI6IjIyMjIyMjIyLTIyMjItNDIyMi04MjIyLTIyMjIyMjIyMjIyMiIsInByaW5jaXBhbF9pZCI6IjU1NTU1NTU1LTU1NTUtNDU1NS04NTU1LTU1NTU1NTU1NTU1NSIsImFjdG9yX2tpbmQiOiJodW1hbiIsInByb2ZpbGUiOnsiZGlzcGxheV9uYW1lIjoiVGVzdCBQZXJzb24iLCJwcmltYXJ5X2VtYWlsIjoicGVyc29uQGV4YW1wbGUuY29tIiwidmVyc2lvbiI6M30sInNvdXJjZSI6IndlYiIsImF1dGhlbnRpY2F0aW9uX21ldGhvZCI6ImdhdGV3YXlfc2Vzc2lvbiIsInJlcXVlc3RfaWQiOiJyZXEtR0VUIiwiYXNzZXJ0aW9uX2lkIjoiTkdjaXJOSkFSTTNNYzRUVjBud1lXUSIsImFkbWl0dGVkX2F0IjoxODAwMDAwMDAwLCJpc3N1ZWRfYXQiOjE4MDAwMDAwMDAsImV4cGlyZXNfYXQiOjE4MDAwMDAwMzAsInJlcXVlc3RfYmluZGluZyI6eyJraW5kIjoiaHR0cCIsIm1ldGhvZCI6IkdFVCIsInRhcmdldCI6Ii93cyJ9LCJhdXRob3JpemF0aW9uIjp7ImtpbmQiOiJwcm9qZWN0aW9uIiwicmVmZXJlbmNlIjo3fX0.oO2kyuXldPt7dG8EUULsSTW3lWRzCAsZgV3E2fTvl1PLszofiJfB-wh61jb-eEesLomkN-PkIKwACPHT4yyyBA"
+    }
+  ]
+}

@@ -62,6 +62,14 @@ export function formatSchedule(schedule: string): string {
   return schedule;
 }
 
+/** What the job's next run is forecast to do: "run", "skip — <reason>", or "—"
+ *  when there is no forecast (no next run). */
+export function formatForecast(job: Pick<CronJob, 'forecast' | 'forecast_reason'>): string {
+  if (job.forecast === 'run') return 'run';
+  if (job.forecast === 'skip') return job.forecast_reason ? `skip — ${job.forecast_reason}` : 'skip';
+  return '—';
+}
+
 /** Display label: always the job name (id) — descriptions go in tooltips. */
 export function jobLabel(job: CronJob): string {
   // Source runner ids are prefixed (e.g. "source:gmail:user@x") — strip it.

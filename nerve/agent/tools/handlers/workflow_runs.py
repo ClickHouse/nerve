@@ -200,6 +200,8 @@ async def workflow_run_start_handler(ctx: ToolContext, args: dict) -> ToolResult
             budget_usd=args.get("budget_usd"),
             title=str(args.get("title") or ""),
             created_by=f"session:{ctx.session_id}",
+            # The system actor, for the calling session's cause.
+            attribution=ctx.attribution,
         )
     except WorkflowRunError as e:
         return ToolResult.text(str(e), is_error=True)
@@ -245,6 +247,7 @@ async def workflow_run_kill_handler(ctx: ToolContext, args: dict) -> ToolResult:
             str(args.get("run_id") or ""),
             reason=str(args.get("reason") or ""),
             killed_by=f"session:{ctx.session_id}",
+            attribution=ctx.attribution,
         )
     except WorkflowRunError as e:
         return ToolResult.text(str(e), is_error=True)

@@ -100,12 +100,20 @@ class ToolUse:
 @dataclass
 class ToolResult:
     """A tool finished; ``content`` mirrors the SDK's content shape
-    (string, list of content blocks, or None)."""
+    (string, list of content blocks, or None).
+
+    ``structured`` is the tool's structured output when the backend has one
+    (Claude: ``UserMessage.tool_use_result``, set only when the message
+    carried exactly one tool result). For the Agent tool it is the launch
+    receipt (``status``, ``agentId``, ``outputFile``) or the foreground
+    completion (``content``, ``totalTokens``, ``totalToolUseCount``).
+    """
 
     tool_use_id: str | None
     content: Any
     is_error: bool = False
     parent_tool_use_id: str | None = None
+    structured: dict[str, Any] | None = None
 
 
 @dataclass
@@ -119,12 +127,33 @@ class ToolOutputDelta:
 
 @dataclass
 class SubagentStarted:
-    """A backend-native sub-agent began (Claude Task or Codex collab item)."""
+    """A backend-native sub-agent began (Claude Task or Codex collab item).
+
+    ``parent_tool_use_id`` is set for a nested spawn (an agent launched by
+    another agent); ``None`` when the orchestrator spawned it.
+    """
 
     tool_use_id: str
     subagent_type: str
     description: str
     model: str | None = None
+    parent_tool_use_id: str | None = None
+
+
+@dataclass
+class SubagentUsage:
+    """Token usage of one sidechain (sub-agent) model call.
+
+    One per sidechain assistant message that carries usage. The same
+    ``message_id`` can repeat across frames of one call (output tokens grow),
+    so consumers keep the last frame per id. Always routed to the agent
+    registry, never into the parent turn.
+    """
+
+    parent_tool_use_id: str
+    message_id: str | None
+    model: str | None
+    usage: dict[str, Any]
 
 
 @dataclass
@@ -188,6 +217,7 @@ AgentEvent = (
     | ToolResult
     | ToolOutputDelta
     | SubagentStarted
+    | SubagentUsage
     | ModelObserved
     | SystemEvent
     | TurnCompleted

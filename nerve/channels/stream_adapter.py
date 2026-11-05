@@ -3,7 +3,8 @@
 Each inbound message gets a StreamAdapter that handles the response lifecycle:
 - For channels with STREAMING + edit support (Telegram): sends a placeholder,
   accumulates tokens, edits periodically, sends final edit on "done".
-- For channels without STREAMING: accumulates everything, sends once on "done".
+- For all other channels, and when no placeholder was created: accumulates
+  everything, sends once on "done".
 """
 
 from __future__ import annotations
@@ -75,6 +76,17 @@ class StreamAdapter:
         """Handle a broadcaster event. Registered as a broadcaster callback."""
         msg_type = message.get("type")
 
+        # Sub-agent work and agent/queue state are not part of the reply: a
+        # channel shows the orchestrator's answer only. (The session channel
+        # no longer carries sidechain frames; this guards a mixed deploy.)
+        if message.get("parent_tool_use_id"):
+            return
+        if isinstance(msg_type, str) and (
+            msg_type.startswith("agent_")
+            or msg_type in ("queue_update", "session_agents")
+        ):
+            return
+
         if msg_type == "token":
             await self._handle_token(message.get("content", ""))
 
@@ -102,9 +114,9 @@ class StreamAdapter:
         elif msg_type == "interaction":
             await self._handle_interaction(message)
 
-        # Other event types (thinking, tool_result, subagent_*, session_*,
-        # file_changed, plan_update) are silently consumed for non-web channels.
-        # The web channel handles those via its direct broadcaster callback.
+        # Other event types (thinking, tool_result, session_*, file_changed,
+        # plan_update) are silently consumed for non-web channels. The web
+        # channel handles those via its direct broadcaster callback.
 
     # ------------------------------------------------------------------ #
     #  Event handlers                                                      #
@@ -132,13 +144,17 @@ class StreamAdapter:
             return
 
         async with self._edit_lock:
+            # Stamped before the attempt. A failed edit still has to hold the
+            # interval, or every later token retries at once and each retry
+            # can sleep on a rate limit inside the agent's token loop.
+            self._last_edit = asyncio.get_event_loop().time()
             try:
                 indicator = STREAMING_INDICATOR
                 display = self._truncate(display, reserve=len(indicator))
                 await self.channel.edit_message(
                     self.target, self._placeholder_id, display + indicator,
+                    throttle=True,
                 )
-                self._last_edit = now
             except Exception:
                 pass  # Edit failures are non-fatal
 
@@ -170,8 +186,10 @@ class StreamAdapter:
                     await self.channel.delete_message(self.target, placeholder_id)
                 except Exception:
                     pass  # Duplicate is better than lost response
-        elif not self._supports_streaming:
-            # Non-streaming channel: send the accumulated response as one message
+        else:
+            # No placeholder exists: the channel does not stream, it cannot
+            # edit, or the placeholder was not created. Nothing has shown the
+            # response yet, so send it as one message.
             text = self._normalize_text(self._buffer)
             if text:
                 formatted = self.channel.format_response(text)

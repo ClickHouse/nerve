@@ -1,0 +1,160 @@
+import type { SetupState, SetupStep, SetupStepId } from '../../api/client';
+
+/** The route segment of the review screen; a frontend route, not a server step. */
+export const REVIEW = 'review';
+
+export type WizardStop = SetupStepId | typeof REVIEW;
+
+/** The ordered stops: the server's steps, then Review. */
+function wizardStops(state: SetupState): WizardStop[] {
+  return [...state.steps.map((s) => s.id), REVIEW];
+}
+
+/**
+ * Where the setup page shows a step.
+ *
+ * - `own`: a step that the person can take here. The rail, the Overview
+ *   list and its count, the Review, Back/Continue and the phone's position
+ *   line use these steps only.
+ * - `operator`: a done step that the person cannot change here. The server
+ *   makes a done step read-only under lockdown and, on an instance that
+ *   keeps no credentials, when the operator provided it. The Overview lists
+ *   it under "Your operator has configured", with no Change link.
+ * - `hidden`: a step that a lockdown or the instance's policy closed and
+ *   that is not done. The page does not show it.
+ *
+ * The Mode step and the claim (the Account) are never the operator's: a
+ * person chose the mode and created the account. The Mode step is read-only
+ * once chosen and stays `own`; under a lockdown that closed it before a mode
+ * was chosen, it is `hidden` like any closed step.
+ */
+export type StepPlace = 'own' | 'operator' | 'hidden';
+
+/** The steps whose value a person gave on this page, whatever `read_only` says. */
+const PERSON_STEPS: ReadonlySet<SetupStepId> = new Set<SetupStepId>(['mode', 'claim']);
+
+export function stepPlace(step: SetupStep): StepPlace {
+  if (!appliesHere(step)) return 'hidden';
+  if (step.status === 'done' && step.read_only && !PERSON_STEPS.has(step.id)) return 'operator';
+  return 'own';
+}
+
+/** The steps that the person can take here, in the server's order. */
+export function ownSteps(state: SetupState): SetupStep[] {
+  return state.steps.filter((s) => stepPlace(s) === 'own');
+}
+
+/** The done steps that the operator configured, in the server's order. */
+export function operatorSteps(state: SetupState): SetupStep[] {
+  return state.steps.filter((s) => stepPlace(s) === 'operator');
+}
+
+export function stepOf(state: SetupState, id: string): SetupStep | undefined {
+  return state.steps.find((s) => s.id === id);
+}
+
+/**
+ * Display titles that differ from the wire `title`. The wire says "Claim"
+ * (the action); once a person is signed in, the rail, the Overview, the
+ * Review and the step page all call it what it now is: their account. One
+ * table, so the four surfaces never disagree.
+ */
+const DISPLAY_TITLES: Partial<Record<SetupStepId, string>> = { claim: 'Account' };
+
+export function stepTitle(step: Pick<SetupStep, 'id' | 'title'>): string {
+  return DISPLAY_TITLES[step.id] ?? step.title;
+}
+
+/**
+ * Whether Back/Continue pass through a step. A step that is not one of
+ * the person's own is skipped, a blocked step is skipped, and
+ * so is the claim once it is done: it is a read-only card, and Back from
+ * Mode — the first step a local first-time user sees — should land on the
+ * Overview, exactly as it does in external mode. The rail still lists it.
+ */
+function passesThrough(step: SetupStep): boolean {
+  if (stepPlace(step) !== 'own') return false;
+  if (step.status === 'blocked') return false;
+  if (step.id === 'claim' && step.status === 'done') return false;
+  return true;
+}
+
+/** The next stop after `id` that Continue passes through; Review when none is left. */
+export function nextStop(state: SetupState, id: WizardStop): WizardStop {
+  const stops = wizardStops(state);
+  const from = stops.indexOf(id);
+  for (let i = from + 1; i < stops.length; i++) {
+    const stop = stops[i];
+    if (stop === REVIEW) return REVIEW;
+    const step = stepOf(state, stop);
+    if (step && passesThrough(step)) return stop;
+  }
+  return REVIEW;
+}
+
+/** The previous stop before `id` that Back passes through; `null` means the Overview. */
+export function previousStop(state: SetupState, id: WizardStop): WizardStop | null {
+  const stops = wizardStops(state);
+  const from = stops.indexOf(id);
+  for (let i = from - 1; i >= 0; i--) {
+    const stop = stops[i];
+    const step = stepOf(state, stop);
+    if (step && passesThrough(step)) return stop;
+  }
+  return null;
+}
+
+/** Where "Continue" on the Overview goes: the first pending step of the person's own, else Review. */
+export function firstPendingStop(state: SetupState): WizardStop {
+  const pending = ownSteps(state).find((s) => s.status === 'pending');
+  return pending ? pending.id : REVIEW;
+}
+
+/**
+ * One-based position of a *step* among the person's own steps, for "Step 3
+ * of 9". Review is not a step (it is a frontend route), so it has no position.
+ */
+export function stopPosition(state: SetupState, id: WizardStop): { index: number; total: number } | null {
+  const steps = ownSteps(state);
+  const index = steps.findIndex((s) => s.id === id);
+  return index < 0 ? null : { index: index + 1, total: steps.length };
+}
+
+/** The prefix the server uses for "this step waits on the Mode step". */
+const SEQUENCING_PREFIX = 'Choose a mode first';
+
+/**
+ * A step that is `blocked` only because Mode has not been chosen yet. That
+ * is sequencing, not a permissions problem, and the UI says "After Mode"
+ * rather than "Blocked" with a lock.
+ */
+export function waitsForMode(step: Pick<SetupStep, 'status' | 'blocked_reason'>): boolean {
+  return step.status === 'blocked' && (step.blocked_reason ?? '').startsWith(SEQUENCING_PREFIX);
+}
+
+/**
+ * A step that a person can complete on this instance, now or after the
+ * Mode step. A step that the instance closed by policy or by a lockdown
+ * does not apply: the server never counts it as left to do, and the page
+ * does not show it. On a locked instance a step can wait for Mode and
+ * still be `lockdown`: nothing on the page can answer Mode there, so that
+ * step does not apply either. Any other `blocked` step, also from a
+ * backend that sends no `blocked_kind`, does not apply.
+ */
+function appliesHere(step: Pick<SetupStep, 'status' | 'blocked_reason' | 'blocked_kind'>): boolean {
+  return step.status !== 'blocked' || (waitsForMode(step) && step.blocked_kind !== 'lockdown');
+}
+
+/** Whether the setup page may store a credential here; an older backend says nothing, which means yes. */
+export function keepsLocalSecrets(state: Pick<SetupState, 'local_secrets'>): boolean {
+  return state.local_secrets !== false;
+}
+
+export function providerDone(state: SetupState): boolean {
+  return stepOf(state, 'provider')?.status === 'done';
+}
+
+/** The route of a stop. */
+export function stopPath(id: WizardStop): string {
+  return `/setup/${id}`;
+}

@@ -605,11 +605,23 @@ offer_start() {
         info "Not starting Nerve (set NERVE_START=1 to start it here)"
         return
     fi
+    local nerve_bin="$INSTALL_DIR/.venv/bin/nerve"
+    # The interactive `nerve init` starts the daemon itself and prints the
+    # setup page and token. Starting it a second time here would only print
+    # "already running" and read as a failure. Capture the whole report before
+    # searching it: while setup is incomplete it opens with the setup-page
+    # block, and piping it straight into `grep -q` under `pipefail` fails
+    # whenever grep stops reading before `nerve status` has finished writing.
+    local status_report
+    status_report=$("$nerve_bin" -c "$CONFIG_DIR" status 2>/dev/null || true)
+    if printf '%s\n' "$status_report" | grep -q 'Nerve is running'; then
+        NERVE_STARTED=1
+        return
+    fi
     printf "\n"
     if [ "$NON_INTERACTIVE" != "1" ] && ! confirm "Start Nerve now?"; then
         return
     fi
-    local nerve_bin="$INSTALL_DIR/.venv/bin/nerve"
     if "$nerve_bin" -c "$CONFIG_DIR" start; then
         NERVE_STARTED=1
     else
@@ -631,7 +643,9 @@ print_summary() {
         printf "    ${CYAN}nerve restart${NC}\n"
     elif [ "${NERVE_STARTED:-0}" = "1" ]; then
         printf "  ${BOLD}Nerve is running.${NC}\n"
-        printf "    ${CYAN}http://localhost:8900${NC}     Open the web UI\n"
+        # The real port, and the setup page plus token while the instance is
+        # unclaimed — `nerve status` is the one place that prints them.
+        "$INSTALL_DIR/.venv/bin/nerve" -c "$CONFIG_DIR" status 2>/dev/null | sed 's/^/    /' || true
         printf "    ${CYAN}nerve logs${NC}            Follow daemon logs\n"
     elif [ "$INIT_SKIPPED" = "1" ]; then
         printf "  ${BOLD}Finish setup, then start:${NC}\n"
@@ -652,9 +666,9 @@ print_summary() {
     printf "\n"
     printf "  ${DIM}Install dir : $INSTALL_DIR${NC}\n"
     printf "  ${DIM}Config      : $CONFIG_DIR/config.local.yaml${NC}\n"
-    printf "  ${DIM}Data        : ~/.nerve/${NC}\n"
+    printf "  ${DIM}Data        : ${NERVE_HOME:-~/.nerve}/${NC}\n"
     printf "\n"
-    printf "  ${DIM}To uninstall: rm -rf $INSTALL_DIR ~/.nerve ~/.local/bin/nerve${NC}\n"
+    printf "  ${DIM}To uninstall: rm -rf $INSTALL_DIR ${NERVE_HOME:-~/.nerve} ~/.local/bin/nerve${NC}\n"
     printf "\n"
 
     if ! command_exists nerve; then

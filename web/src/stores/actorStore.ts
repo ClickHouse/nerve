@@ -11,7 +11,7 @@ export interface ActorState {
   reset: () => void;
 }
 
-export const UNNAMED_ACTOR = 'Unnamed account';
+export const UNNAMED_ACTOR = 'Unknown';
 export const SYSTEM_ACTOR_NAME = 'Nerve';
 
 let inFlight: Promise<void> | null = null;
@@ -80,11 +80,20 @@ export const useActorStore = create<ActorState>((set, get) => {
   };
 });
 
-/** The display name, else the login name, else a neutral placeholder. */
-export function actorName(actor: ActorRef | undefined): string {
+/** The number of id characters that name an actor without a name. */
+const SHORT_ID_LENGTH = 8;
+
+/**
+ * The display name, else the login name, else `Nerve` for the system actor,
+ * else a short id. A hosted actor has no account, so it often has no login
+ * name. `id` names an actor that the directory does not have yet. Without an
+ * actor or an id, the result is a neutral placeholder.
+ */
+export function actorName(actor: ActorRef | undefined, id: string | null = actor?.id ?? null): string {
   const name = actor?.display_name?.trim() || actor?.username?.trim();
   if (name) return name;
-  return actor?.kind === 'system' ? SYSTEM_ACTOR_NAME : UNNAMED_ACTOR;
+  if (actor?.kind === 'system') return SYSTEM_ACTOR_NAME;
+  return id ? id.slice(0, SHORT_ID_LENGTH) : UNNAMED_ACTOR;
 }
 
 export function isSystemActor(actor: ActorRef | undefined): boolean {

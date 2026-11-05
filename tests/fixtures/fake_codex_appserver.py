@@ -315,8 +315,17 @@ def main() -> None:
             pass  # notification, no response
         elif method == "account/read":
             account_type = "apiKey" if MODE == "account_api_key" else "chatgpt"
-            respond(req_id, {"account": {"type": account_type, "email": "fake@example.com"}})
+            if any(o.startswith("model_provider=") for o in _config_overrides()):
+                # A custom model provider: codex-cli 0.164 reports no
+                # account, also with a login in CODEX_HOME.
+                respond(req_id, {"account": None, "requiresOpenaiAuth": False})
+            else:
+                respond(req_id, {"account": {"type": account_type, "email": "fake@example.com"}})
         elif method == "account/login/start":
+            home = os.environ.get("CODEX_HOME")
+            if home:
+                with open(os.path.join(home, "login_calls"), "a") as fh:
+                    fh.write("login\n")
             respond(req_id, {"loginId": "fake-login"})
         elif method == "model/list":
             # Mirrors the real codex-cli 0.153 catalog shape: GPT-5.6 Sol

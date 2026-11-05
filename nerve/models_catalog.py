@@ -66,15 +66,29 @@ _cache: dict[str, Any] = {
 # collected mid-flight.
 _refresh_task: asyncio.Task[Any] | None = None
 
+# Catalogs fetched for a *candidate* credential — the setup page's "Test
+# connection" warms the catalog for the key it just tested, so the picker is
+# complete the moment that key is saved. Keyed by the candidate's fingerprint;
+# :func:`get_models` promotes the entry into ``_cache`` when the saved
+# configuration first asks for it. Bounded; a warm fetch that failed is not
+# remembered (the saved configuration fetches again on its own terms).
+_warm: dict[tuple[str, str, str], dict[str, Any]] = {}
+_warm_tasks: dict[tuple[str, str, str], asyncio.Task[Any]] = {}
+_MAX_WARM = 4
+
 
 def reset_cache() -> None:
     """Drop the cached catalog (used by tests and config reloads)."""
     _cache.update({"fingerprint": None, "models": [], "checked_at": 0.0, "ok": False})
+    _warm.clear()
+    for task in _warm_tasks.values():
+        task.cancel()
+    _warm_tasks.clear()
 
 
 def _fingerprint(config: NerveConfig) -> tuple[str, str, str]:
     """Identity of the credentials/endpoint a cached catalog belongs to."""
-    key = config.effective_api_key or ""
+    key = config.resolve_anthropic_api_key() or ""
     return (
         "bedrock" if config.provider.is_bedrock else "anthropic",
         config.anthropic_api_base_url,
@@ -98,7 +112,7 @@ def fetch_models(
         # The Bedrock client has no `.models` resource, and Bedrock IDs are
         # region-prefixed — configured models are the only sane source there.
         return []
-    if not config.effective_api_key:
+    if not config.resolve_anthropic_api_key():
         logger.debug("Claude model discovery skipped: no API key configured")
         return []
 
@@ -160,12 +174,81 @@ def _schedule_refresh(config: NerveConfig, fingerprint: tuple[str, str, str]) ->
         pass
 
 
+async def warm(config: NerveConfig) -> list[str]:
+    """Fetch the catalog for ``config``'s credentials and keep it for later.
+
+    For a candidate credential (the setup page tests a key before it is
+    saved): the result is stored under the candidate's fingerprint and served
+    by :func:`get_models` once the saved configuration carries that key, so
+    the picker is complete right after the save. Never raises; an empty or
+    failed fetch is not remembered.
+    """
+    fingerprint = _fingerprint(config)
+    try:
+        models = await asyncio.to_thread(fetch_models, config)
+    except Exception as e:  # pragma: no cover - to_thread itself failing
+        logger.warning("Claude model discovery (warm-up) failed: %s", e)
+        models = []
+    if not models:
+        return []
+    entry = {"fingerprint": fingerprint, "models": models, "checked_at": time.monotonic(), "ok": True}
+    if _cache["fingerprint"] == fingerprint:
+        _cache.update(entry)
+    else:
+        _warm[fingerprint] = entry
+        while len(_warm) > _MAX_WARM:
+            oldest = min(_warm, key=lambda key: float(_warm[key]["checked_at"]))
+            _warm.pop(oldest, None)
+    return list(models)
+
+
+def schedule_warm(config: NerveConfig) -> asyncio.Task[Any] | None:
+    """Start :func:`warm` in the background (one per fingerprint at a time)."""
+    fingerprint = _fingerprint(config)
+    running = _warm_tasks.get(fingerprint)
+    if running is not None and not running.done():
+        return running
+    try:
+        task = asyncio.create_task(warm(config))
+    except RuntimeError:  # pragma: no cover - no running loop
+        return None
+    _warm_tasks[fingerprint] = task
+
+    def _forget(done: asyncio.Task[Any]) -> None:
+        if _warm_tasks.get(fingerprint) is done:
+            _warm_tasks.pop(fingerprint, None)
+
+    task.add_done_callback(_forget)
+    return task
+
+
+async def _await_warm(fingerprint: tuple[str, str, str]) -> None:
+    """Wait for an in-flight warm-up of ``fingerprint`` (bounded), if any.
+
+    The caller's own cancellation still propagates; only the warm-up's
+    failure or slowness is ignored (the caller then fetches for itself).
+    """
+    task = _warm_tasks.get(fingerprint)
+    if task is None or task.done():
+        return
+    try:
+        await asyncio.wait_for(asyncio.shield(task), _DISCOVERY_TIMEOUT + 2.0)
+    except Exception:  # noqa: BLE001 — a failed or slow warm-up is not an error here
+        return
+
+
 async def get_models(config: NerveConfig) -> list[str]:
     """Cached Claude catalog for the model picker (``[]`` when unavailable).
 
     A usable entry is served immediately, refreshing in the background once
     stale. Only a cold cache waits on the network, and a recent failure is
     remembered so a down API is not retried on every request.
+
+    The cache is keyed by the credentials' fingerprint (provider, base URL,
+    key tail), so a failure recorded while no key was configured is never
+    served for the configuration that now carries one — it misses the
+    fingerprint and fetches afresh. A catalog warmed for that key by
+    :func:`warm` is promoted instead of fetched again.
 
     Two concurrent cold callers may both fetch — the request is an idempotent
     GET and startup priming makes it rare, so this is left unsynchronized on
@@ -181,6 +264,11 @@ async def get_models(config: NerveConfig) -> list[str]:
             return list(_cache["models"])  # stale but usable
         if age < _FAILURE_BACKOFF_SECONDS:
             return []
+    await _await_warm(fingerprint)
+    warmed = _warm.pop(fingerprint, None)
+    if warmed is not None and warmed["ok"] and time.monotonic() - float(warmed["checked_at"]) < _TTL_SECONDS:
+        _cache.update(warmed)
+        return list(warmed["models"])
     return await _refresh(config, fingerprint)
 
 

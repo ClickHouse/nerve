@@ -148,7 +148,7 @@ async def test_fetch_populates_actors_metadata(monkeypatch):
     }]
 
     async def fake_exec(*args, **kwargs):
-        return _FakeProc(json.dumps(notifications).encode())
+        return _FakeProc("\n".join(json.dumps(n) for n in notifications).encode())
 
     monkeypatch.setattr(
         "nerve.sources.github.asyncio.create_subprocess_exec", fake_exec,
@@ -438,7 +438,7 @@ async def test_maintainer_assignment_on_self_filed_issue_passes_guardrail(
     }]
 
     async def fake_exec(*args, **kwargs):
-        return _FakeProc(json.dumps(notifications).encode())
+        return _FakeProc("\n".join(json.dumps(n) for n in notifications).encode())
 
     monkeypatch.setattr(
         "nerve.sources.github.asyncio.create_subprocess_exec", fake_exec,
@@ -502,7 +502,7 @@ async def test_fetch_actors_empty_when_enrichment_fails(monkeypatch):
     }]
 
     async def fake_exec(*args, **kwargs):
-        return _FakeProc(json.dumps(notifications).encode())
+        return _FakeProc("\n".join(json.dumps(n) for n in notifications).encode())
 
     monkeypatch.setattr(
         "nerve.sources.github.asyncio.create_subprocess_exec", fake_exec,

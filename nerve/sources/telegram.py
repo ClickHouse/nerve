@@ -67,13 +67,14 @@ class TelegramSource(Source):
 
         session_path = self._session_path()
 
-        # Check if session file exists — Telethon requires interactive auth
-        # on first use, which can't happen in a cron context.
+        # Check if session file exists — the sign-in (phone, code, optional
+        # password) cannot happen in a cron context. It is done once, on the
+        # setup page (Sources → Telegram) or with `nerve setup-telegram`.
         session_file = session_path + ".session"
         if not os.path.exists(session_file):
             logger.warning(
-                "Telegram source: no session file at %s. "
-                "Run `nerve sync telegram` interactively first to authenticate.",
+                "Telegram source: no signed-in session at %s. Sign in on the setup "
+                "page (Sources → Telegram) or run `nerve setup-telegram` on the server.",
                 session_file,
             )
             return False
@@ -83,8 +84,10 @@ class TelegramSource(Source):
 
         if not await self._client.is_user_authorized():
             logger.warning(
-                "Telegram source: session exists but not authorized. "
-                "Run `nerve sync telegram` interactively to re-authenticate."
+                "Telegram source: the session at %s is not signed in any more. Sign in "
+                "again on the setup page (Sources → Telegram) or run `nerve setup-telegram` "
+                "on the server.",
+                session_file,
             )
             await self._client.disconnect()
             self._client = None

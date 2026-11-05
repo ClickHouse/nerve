@@ -1,6 +1,8 @@
 # Accounts and actor identity
 
-Nerve uses local accounts for login and stable actor IDs for attribution.
+Nerve uses local accounts for login and stable actor IDs for attribution. In
+[external mode](#external-mode), a gateway names the person behind each request
+and Nerve does not use local accounts.
 
 | Table | Purpose |
 |---|---|
@@ -74,12 +76,14 @@ A password cannot be removed.
 
 An installation becomes passwordless only by an explicit choice:
 
-- `nerve init` asks for a password. An empty answer asks you to confirm
-  "Keep this installation passwordless".
+- The default `nerve init` asks nothing about accounts: it prints the setup
+  token and leaves the choice to the browser setup page, whose first step
+  has a "Keep this installation passwordless" option.
+- `nerve init --terminal` asks for a password. An empty answer asks you to
+  confirm "Keep this installation passwordless".
 - `nerve init --non-interactive` reads `NERVE_PASSWORDLESS=1`. It refuses
   `NERVE_PASSWORD` and `NERVE_PASSWORDLESS=1` together. With neither, setup
   stays incomplete, and you complete it in the browser.
-- The browser setup page has a "Keep this installation passwordless" option.
 
 The installer reads these values once. Setup completion is persistent, so
 changing the environment later has no effect.
@@ -87,10 +91,12 @@ changing the environment later has no effect.
 ### Claiming the first account
 
 While setup is not complete, login is refused. Open `/setup`, enter the setup
-token that `nerve status` shows, and set a username and password or keep the
-installation passwordless. The claim updates the existing account, records
-setup as complete and deletes the token, in one transaction. See
-[Setup](setup.md#claiming-an-instance-from-a-browser).
+token that `nerve init` printed (`nerve status` shows it again), and set a
+username and password or keep the installation passwordless. The claim
+updates the existing account, records setup as complete and deletes the
+token, in one transaction. It is the first step of the setup wizard: on
+success you are signed in and the wizard continues with the Mode step. See
+[Setup](setup.md#the-setup-token).
 
 Passwords must be non-empty and no longer than 72 UTF-8 bytes. Nerve stores
 passwords as bcrypt hashes. Unknown usernames and incorrect passwords return the
@@ -116,24 +122,267 @@ Disabling an account blocks its next HTTP or MCP request and any new WebSocket
 connection, and closes its open WebSocket connections. Autonomous work, including cron jobs and background agents, uses the
 system actor rather than a human account.
 
+### External mode
+
+With `NERVE_AUTH_MODE=external`, a gateway in front of Nerve signs people in
+and names the person behind each request. See
+[Authentication mode](config.md#authentication-mode).
+
+| Credential | Acts as |
+|---|---|
+| `X-Nerve-Actor-Context` header | The human actor that the header names |
+| Login session | Refused with `401` |
+| Nerve CLI and internal API token | The system actor |
+| Backend and external MCP token | The system actor |
+
+The header is a compact JWS. Nerve reads `principal_id` and
+`profile.display_name` from its payload. With `auth.external.gateway_jwks_file`
+set, Nerve first checks the gateway's signature with a key from that file, and
+the claims: this tenant and agent, the method and target of this request, the
+issue and expiry times, and that the assertion was not used before. It checks
+a request when the request arrives, before it reads the body. A failed check
+gives `401`, and a missing key set gives `503`. See
+[Actor context verification](config.md#actor-context-verification). Without
+that setting, Nerve does not check the signature or any other claim.
+`principal_id` must be a UUID, and Nerve uses its lowercase
+form as the actor ID. `profile.display_name` must be a string, `null`, or
+absent. A header that Nerve cannot read, a header that names the system actor,
+and a request with more than one header give `401`. When the header is
+present, Nerve does not read `Authorization`, the `nerve_token` cookie or
+`?token=`. The gateway also sends the header on the WebSocket upgrade request.
+The connection keeps the actor of that request until it closes.
+
+Nerve adds an `actor_refs` row of kind `human` when it sees a principal for the
+first time, and writes the display name again when it changes. The row has no
+`accounts` row. Nerve does not check the access of the person; the gateway
+does.
+
+A hosted channel event that invokes the agent (a message, a reaction, or a
+button press) names the person that the channel gateway resolved from the
+provider user. Nerve adds the `actor_refs` row of that person when it is
+absent. When the event also gives the display name of that person, Nerve
+writes it only to a row that has no name, so it keeps the display name that a
+web request stored. A message or a reaction runs its turn as that person, and
+a button press answers its notification as that person. An event that names no
+person or the system actor has no actor. In local mode, hosted channel events
+have no actor.
+
+A hosted channel observation can name the person that the channel gateway
+linked to the provider user. Nerve shows that person in the inbox record only.
+It adds no `actor_refs` row and authorizes nothing with it.
+
+In external mode:
+
+- `POST /api/auth/login` returns `404`. The account routes (`/api/accounts`)
+  and the setup claim (`/api/setup/claim`) are not available. The setup
+  checklist (`/api/setup`, the `/setup` page) is: any person the gateway
+  names may run it, and it never reads local-account state. See
+  [Instances with external authentication](setup.md#instances-with-external-authentication).
+- Startup creates no account and deletes a setup token from an earlier local
+  mode. It still makes the signing secret, because system and MCP tokens need
+  it.
+- Startup can give the system actor the ID of the agent's system principal.
+  See [The system actor in external mode](#the-system-actor-in-external-mode).
+- Accounts and history from an earlier local mode stay in `nerve.db`.
+- Each model request names the principal that caused the work, in the
+  `X-Nerve-Inference-Principal` header: the session's cause, or the system
+  actor for Nerve's own model calls. See
+  [Inference principal header](config.md#inference-principal-header).
+
+> **Warning:** Without `auth.external.gateway_jwks_file`, Nerve trusts the
+> header. Then use external mode only when the gateway is the only caller that
+> can reach Nerve. A caller that can send the header can act as any person,
+> also as the actor of an account from an earlier local mode.
+
+### The system actor in external mode
+
+Each database has one system actor. The schema migration gives it a random
+ID. In external mode, the environment can give the ID of the agent's system
+principal in `NERVE_SYSTEM_PRINCIPAL_ID` (see
+[System principal ID](config.md#system-principal-id)). The identity bootstrap
+of `nerve init` and of each server start then gives the system actor that ID
+when these conditions are true:
+
+- No row refers to the system actor. Nerve finds each column that has a
+  foreign key to `actor_refs` in the schema, for example `accounts.actor_id`,
+  `sessions.created_by_actor_id` and `messages.actor_id`, and checks all of
+  them. A check that cannot run counts as a row.
+- No other actor has the new ID.
+- The system actor did not take an ID from the variable before. Nerve records
+  the ID it took in `nerve.db`, in the same transaction as the change, so the
+  ID changes at most once, also when two processes start with different
+  values. A backup made with `--no-secrets` keeps that record, because it is
+  not secret.
+
+Thus a new installation gets the ID before it attributes work to the system
+actor. After the change, system and MCP tokens act as the new ID, and
+autonomous work is attributed to it.
+
+When a condition is false, the system actor keeps its current ID and Nerve
+logs a warning at each start. Nerve does not change rows that refer to that
+ID. `nerve doctor` shows the difference. A value that is not a canonical
+lower-case UUID also keeps the current ID and gives a warning. Local mode
+ignores the variable.
+
+The schema trigger `system_actor_id_cannot_change` prevents all other changes
+to the ID. The bootstrap removes the trigger, changes the ID and creates the
+trigger again in one transaction.
+
 ## Attribution
 
-Sessions store who created them in `created_by_actor_id`. User messages store
-who supplied the content in `actor_id`. Both columns contain stable actor IDs;
-clients resolve names through `GET /api/actors` — the display name, or the
-username when none is set.
+Nerve can record two actor IDs for a change:
 
-| Event | Stored actor |
+- The **actor** made the change: a person through the web UI, the REST API or
+  the browser WebSocket, or the system actor when the agent or Nerve did it (a
+  tool call, a cron job, any internal process).
+- The **cause** is the principal on whose behalf the change was made. For a
+  change that a person made directly, the cause is that person. For work by
+  the agent, the cause is the cause of its session.
+
+These columns store actor IDs:
+
+| Column | What it records |
 |---|---|
-| A person creates a session or sends a message | That person's actor |
-| Nerve creates a session or prompt, including MCP and Codex sessions | The system actor |
-| Telegram, Slack, or imported Codex input | None until a local identity mapping exists |
-| Assistant and tool output | None |
+| `sessions.created_by_actor_id` | Who created the session |
+| `sessions.caused_by_actor_id` | The session's cause: on whose behalf all agent work in the session runs |
+| `messages.actor_id` | Who supplied the content of a user message |
+| `task_events.actor_id`, `task_events.caused_by_actor_id` | Actor and cause of a task status change |
+| `task_status_events.actor_id`, `task_status_events.caused_by_actor_id` | Actor and cause of a change to the set of task statuses |
+| `session_events.actor_id`, `session_events.caused_by_actor_id` | Actor and cause of a session change (see [Session changes](#session-changes)) |
+| `session_deletions.actor_id`, `session_deletions.caused_by_actor_id` | Actor and cause of a session delete |
+| `notifications.answered_by_actor_id` | Who answered a question or decided an approval, also when the approval expired while the decision ran; on a snoozed approval that is still pending, who snoozed it |
+| `notifications.dismissed_by_actor_id` | Who dismissed a notification |
+| `notification_silences.created_by_actor_id`, `notification_silences.caused_by_actor_id` | Actor and cause of a silence rule |
+| `plans.reviewed_by_actor_id`, `plans.reviewed_caused_by_actor_id` | Actor and cause of the last review decision on a plan: approve, decline, a revision request, or a status or feedback change through the REST API |
+| `plans.created_by_actor_id`, `plans.caused_by_actor_id` | Actor and cause of the plan version: who wrote it |
+| `workflow_runs.created_by_actor_id`, `workflow_runs.caused_by_actor_id` | Actor and cause of a workflow run. The run's session is created with this cause |
+| `workflow_runs.killed_by_actor_id`, `workflow_runs.killed_caused_by_actor_id` | Actor and cause of the kill of a workflow run |
+| `review_loops.created_by_actor_id`, `review_loops.caused_by_actor_id` | Actor and cause of a review loop. Each leg session of the loop is created with this cause |
+| `review_loops.killed_by_actor_id`, `review_loops.killed_caused_by_actor_id` | Actor and cause of the kill of a review loop |
+| `review_loop_decisions.actor_id`, `review_loop_decisions.caused_by_actor_id` | Actor and cause of one decision on a parked review loop |
+| `session_wakeups.created_by_actor_id`, `session_wakeups.caused_by_actor_id` | Who scheduled a wakeup or a deferred message, and on whose behalf. The turn that it fires runs in its session, for the session's cause |
+| `cron_logs.actor_id`, `cron_logs.caused_by_actor_id` | Who started a cron or source run, and on whose behalf |
+| `task_comments.actor_id`, `task_comments.caused_by_actor_id` | Who wrote a task comment, and on whose behalf |
 
-Existing records remain unattributed. Nerve does not infer identity from channel
-or source metadata. Account and session administration actions are not yet
-recorded as audit events. Missing attribution means legacy history, unidentified
-external input, or assistant/tool output; autonomous work uses the system actor.
+`nerve/db/actor_columns.py` lists every attribution column. Clients resolve
+names through `GET /api/actors`, which returns every actor that these columns
+can name: the display name, or the username when none is set. The web UI shows
+the system actor with a person as cause as "Nerve for <person>".
+
+### The session's cause
+
+Every session has one cause. Nerve stores it when it creates the session and
+never changes it:
+
+| Session | Cause |
+|---|---|
+| A person creates or forks a session (web UI, REST API, browser WebSocket) | That person |
+| A cron job or a hook session | The system actor |
+| A cron job session that a person's "Run now" creates (an isolated run, or a new generation of a persistent job) | That person. A persistent job's current generation keeps its cause |
+| A plan implementation session after an approval through the REST API | The person who approved |
+| A plan implementation session after the agent approved the plan | The cause of the session in which the agent approved it |
+| A planner session that a revision request creates | The person who asked for the revision |
+| A workflow run's session, and each leg session of a review loop | The cause of the run or the loop: its creator, or the cause of the session whose tool call started it. A loop leg keeps the loop's cause, also after a decision by another person |
+| A session that a hosted channel message or reaction starts, in external mode | The person that the channel gateway resolved |
+| Another Telegram, Slack or other channel session, or an imported Codex session | None until a local identity mapping exists |
+| An external MCP client's session | None |
+
+Everything the agent does in a session (a tool call, a task it changes, a plan
+it approves, a session it starts) records the system actor as actor and the
+session's cause as cause. A change that a person makes directly records that
+person as both. `messages.actor_id` keeps naming who wrote each message; there
+is no cause per message or per turn.
+
+This is an approximation in three places:
+
+- In a session that several people use, the agent's work in every turn is
+  attributed to the person who started the session, also in turns that
+  another person sent.
+- A deferred message ("run later") or a wakeup that runs in an existing session
+  is attributed to that session's cause, also when another person deferred
+  the message.
+- A persistent cron job reuses its current session. When a person's "Run
+  now" started that session, the later scheduled runs in it are attributed
+  to that person until the session rotates.
+
+In external mode, the model requests of a session name the session's cause
+in the same way, so the same approximation applies to model usage. See
+[Inference principal header](config.md#inference-principal-header).
+
+| Work | Actor | Cause |
+|---|---|---|
+| A person sends a message, or changes a task through the web UI or the REST API | The person | The person |
+| The agent works in a session (tool calls, task changes, sessions it starts) | The system actor | The session's cause |
+| The agent writes or reviews a plan, or creates a silence | The system actor | The session's cause |
+| Nerve sets a session title (the placeholder and the generated title) | The system actor | The session's cause |
+| An automatic archive, the archive of a Codex session by the sync | The system actor | The system actor |
+| A person answers, dismisses, or silences notifications, or reviews a plan, through the web UI or the REST API | The person | The person |
+| A person starts or kills a workflow run or a review loop through the web UI or the REST API, or decides on a parked loop through the REST API or its decision card in the web UI | The person | The person |
+| The agent starts or kills a workflow run or a review loop | The system actor | The session's cause |
+| The message that relays a web answer into the session that asked, also a hosted channel answer in external mode | The person who answered | Not recorded (the agent's work in that turn has the session's cause) |
+| A scheduled cron or source run (also a catch-up or missed run, and `nerve cron <id>`) | The system actor on the run log | The system actor |
+| A person starts a cron or source run from the web UI or with `POST /api/cron/jobs/{job_id}/trigger` | The person on the run log; the system actor for the workflow run that a workflow-run job starts | The person |
+| A person defers a message with "Run later" | The person on the wakeup row | The person |
+| The agent schedules a wakeup (`ScheduleWakeup`, `schedule_wakeup`) | The system actor | The session's cause |
+| A message or a reaction through a hosted channel, in external mode | The person that the channel gateway resolved | The person |
+| An answer through a hosted channel (also a decision on a review-loop card), in external mode | The person that the channel gateway resolved | The person |
+| Other Telegram, Slack, or imported Codex input, and channel commands (`/new`, `/stop`, `/star`) | None until a local identity mapping exists | None |
+| Another answer through Telegram, Slack, or a hosted channel (also a decision on a review-loop card), and the message that relays it | None | None |
+| Assistant and tool output | None | None |
+
+Existing records remain unattributed: Nerve does not backfill these columns.
+Nerve does not infer identity from channel or source metadata. The free-text
+origin fields, such as `task_events.actor`, `notifications.answered_by`,
+`notification_silences.created_by`, `workflow_runs.created_by`,
+`review_loops.created_by` and `review_loop_decisions.decided_by`, stay as they
+are; they record where a change came from, not who made it.
+`workflow_runs.created_by` also links a run to the session that started it.
+A chat-channel answer keeps the provider user ID in the notification's
+`metadata.answered_by_actor`; it is not an actor ID. Account administration
+actions are not yet recorded as audit events. Missing attribution means legacy
+history, unidentified external input, or assistant/tool output; autonomous
+work uses the system actor.
+
+### Session changes
+
+`session_events` records the changes to a session with their actor and cause:
+
+| Event | Change | Details |
+|---|---|---|
+| `created` | The session is created (actor: the creator; cause: the session's cause); also a resume (`reason: "resume"`) | `source`, `parent`, or `reason` |
+| `title_changed` | The title changes | `title`, `previous`; `reason` is `placeholder` or `generated` for a title that Nerve makes from the first message, `cron_rotation` for a rotated cron session |
+| `starred`, `unstarred` | The session is starred or unstarred | |
+| `model_changed` | The model changes | `model`, `previous` |
+| `parent_changed` | The session moves under another session, or back to the top level | `parent_session_id`, `previous` |
+| `archived`, `unarchived` | The session is archived or restored | `cascade_root` for a session that an archive of an ancestor archives; `reason` for an automatic archive (`idle_interactive`, `stale`, `overflow`, `codex_thread_archived`) |
+| `stop_requested` | A stop request reaches a running turn; each request is one event | `scope` (`turn`), `outcome` (`stopped`, `killed`, `not_stopped`, …), `live_agents` |
+| `agent_stop_requested` | One agent is stopped (with the agents it started) | `agent_ids`, `task_ids`, `cascade` |
+| `agents_stop_all_requested` | Every live agent of the session is stopped | `agent_ids`, `include_shells` |
+| `force_stop_requested` | The session's runtime is stopped by force | `ended_agent_ids` |
+| `external_tool_call` | An external MCP client calls a tool | The tool call |
+
+A change through the web UI, the REST API or the browser WebSocket records the
+person as actor and cause. A change that has no effect records no event: a
+field that keeps its value, an archive of an archived session (also in a
+cascade), a restore of a session that is not archived, a resume of a session
+that is resumed already, a create of a session ID that exists, a stop when no
+turn runs. Of two people who make the same change at the same time, only the
+one whose change has an effect is recorded; the session event and the change
+are one transaction.
+
+A change that the agent or Nerve makes in a session (a title, the title of a
+rotated cron session, the stop of a workflow run) records the system actor
+and the session's cause, also when another person sent the message. An
+automatic archive and the archive of a Codex session by the sync record the
+system actor as actor and cause: they are housekeeping across sessions, not
+work in one session. Events that record the state of the runtime (`started`,
+`idle`, `error`, and a `stopped` status after a cancel) have no actor and no
+cause.
+
+A delete removes the session's events. Nerve writes a row to
+`session_deletions` (the session ID, its last title, the time, the actor and
+the cause) in the same transaction as the delete. A later delete of a session
+with the same ID replaces that row.
 
 ## Session-signing secret
 
@@ -167,9 +416,12 @@ password hashes, and the generated signing secret. Treat the archive as a
 secret.
 
 `--no-secrets` removes account passwords, the signing secret and the setup
-completion record from the database snapshot, omits `config.local.yaml`, and
-replaces credential values in workspace configuration with environment-variable
-placeholders. It fails if a configuration file cannot be parsed safely.
+completion record from the database snapshot, and keeps the record of the
+system principal ID that the system actor took (see
+[The system actor in external mode](#the-system-actor-in-external-mode)). It
+omits `config.local.yaml`, and replaces credential values in workspace
+configuration with environment-variable placeholders. It fails if a
+configuration file cannot be parsed safely.
 
 After restoring a `--no-secrets` backup:
 

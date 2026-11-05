@@ -248,6 +248,9 @@ async def test_identity_bootstrap_reuses_owner_and_secret(db, tmp_path):
         }
     )
     await bootstrap_identity(db, config)
+    from nerve.cli import _setup_unclaimed
+
+    assert _setup_unclaimed(config, external=False)
     accounts = await db.list_accounts()
     secret = read_instance_secret(
         tmp_path / "absent.db", JWT_SECRET_NAME, config=config
@@ -268,7 +271,9 @@ async def test_identity_bootstrap_reuses_owner_and_secret(db, tmp_path):
 async def test_schema_tracks_sqlite_columns(db, tmp_path):
     from nerve.db import Database, SCHEMA_VERSION
 
-    assert SCHEMA_VERSION == 49, (
+    from nerve.db.postgres.version import SQLITE_MODEL_VERSION
+
+    assert SCHEMA_VERSION == SQLITE_MODEL_VERSION, (
         "Review the PostgreSQL schema when adding an operational migration"
     )
     sqlite = Database(tmp_path / "schema.db")
@@ -279,7 +284,10 @@ async def test_schema_tracks_sqlite_columns(db, tmp_path):
         ) as cursor:
             names = [row[0] async for row in cursor]
         for name in names:
-            if name.startswith(("sqlite_", "tasks_fts")) or name == "schema_version":
+            if name.startswith(("sqlite_", "tasks_fts")) or name in {
+                "schema_version",
+                "fork_schema_version",
+            }:
                 continue
             async with sqlite.db.execute(f'PRAGMA table_info("{name}")') as cursor:
                 expected = {row[1] async for row in cursor}

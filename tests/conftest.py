@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
-import nerve.config  # noqa: F401  — imported so its constants can be re-pointed
+import nerve.config  # imported so its constants can be re-pointed
 from nerve import paths
 from nerve.db import Database
 from nerve.identity import Actor
@@ -78,7 +78,88 @@ def _isolate_nerve_state_files(tmp_path, monkeypatch):
     """
     state_dir = tmp_path / "_nerve_state"
     monkeypatch.setenv("NERVE_HOME", str(state_dir))
+    # A hosted VM seeds the agent's display name into the environment; the
+    # suite must not inherit it as the profile step's prefill.
+    monkeypatch.delenv("NERVE_DISPLAY_NAME", raising=False)
     _repoint_import_time_state_paths(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_platform_activity_socket(monkeypatch):
+    """Keep the gateway's activity reporter off the machine's real socket.
+
+    On a machine that runs on a platform with a local activity socket, the
+    default ``platform.activity_socket`` exists, and every test that starts
+    the gateway lifespan would report its fake turns and connections there.
+    The default is resolved when a config is built, so pointing it at nothing
+    here covers every config a test builds. Tests about the reporter name
+    their own socket.
+    """
+    monkeypatch.setattr(nerve.config, "DEFAULT_PLATFORM_ACTIVITY_SOCKET", "")
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_provider_credential(monkeypatch):
+    """Strip the developer shell's model credentials from every test.
+
+    ``NerveConfig.credential_available()`` and ``resolve_anthropic_api_key()``
+    read ``ANTHROPIC_API_KEY`` / ``CLAUDE_CODE_OAUTH_TOKEN`` so that an
+    environment-provisioned instance works. A test that means "no credential"
+    must therefore not inherit one from whoever runs the suite; tests about
+    the environment set the variables themselves.
+    """
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+
+#: What the stand-in GitHub CLI probe below answers: no ``gh`` on the machine.
+NO_GITHUB_CLI = {"cli": False, "authenticated": False, "login": None, "hint": None}
+
+
+@pytest.fixture(autouse=True)
+def _no_real_github_cli(monkeypatch):
+    """Never run the developer's GitHub CLI for the onboarding's facts.
+
+    Every onboarding start gathers facts about the instance, ``gh auth
+    status`` included (:mod:`nerve.onboarding_environment`). A test that opens
+    the conversation (directly, or through Finish) must neither wait for nor
+    depend on whoever is signed in on the machine running the suite: the probe
+    answers "not installed" unless a test replaces it.
+    """
+    from nerve import onboarding_environment
+
+    monkeypatch.setattr(onboarding_environment, "_github_cli", lambda timeout: dict(NO_GITHUB_CLI))
+
+
+@pytest.fixture(autouse=True)
+def _reset_setup_process_state(monkeypatch):
+    """The setup modules keep per-process memory (detection caches, the last
+    provider test, the restart flag, the startup-config snapshot). None of it
+    may leak from one test into the next, whichever file the tests live in.
+    """
+    from nerve import config_reload, setup_checks
+
+    setup_checks.reset_caches()
+    monkeypatch.setattr(config_reload, "_startup_config", None)
+    catalog = sys.modules.get("nerve.models_catalog")
+    if catalog is not None:
+        catalog.reset_cache()  # the fingerprint-keyed catalog and any warm-up
+    routes = sys.modules.get("nerve.gateway.routes.setup")
+    if routes is not None:
+        routes._bot_usernames.clear()
+        monkeypatch.setattr(routes, "_restart_requested", False)
+        monkeypatch.setattr(routes, "_last_provider_test", None)
+        # One pending Telegram sign-in per process: never one left by another test.
+        from nerve import setup_telegram_login
+
+        monkeypatch.setattr(routes, "_telegram_login", setup_telegram_login.TelegramLogin())
+    yield
+    setup_checks.reset_caches()
+    if catalog is not None:
+        catalog.reset_cache()
+    routes = sys.modules.get("nerve.gateway.routes.setup")
+    if routes is not None:
+        routes._bot_usernames.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -93,6 +174,44 @@ def _unpin_jwt_secret():
     unpin_jwt_secret()
     yield
     unpin_jwt_secret()
+
+
+@pytest.fixture(autouse=True)
+def _unpin_auth_mode(monkeypatch):
+    """Clear the authentication mode before and after each test.
+
+    ``create_app()`` pins the mode once per process, and before a pin the mode
+    comes from ``NERVE_AUTH_MODE``. Each test starts in local mode, whatever
+    the shell sets, and a test that pins a mode does not leave it in force.
+    """
+    from nerve.gateway.auth import AUTH_MODE_ENV, unpin_auth_mode
+
+    monkeypatch.delenv(AUTH_MODE_ENV, raising=False)
+    unpin_auth_mode()
+    yield
+    unpin_auth_mode()
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_system_principal(monkeypatch):
+    """Strip ``NERVE_SYSTEM_PRINCIPAL_ID`` from the developer shell.
+
+    In external mode, the identity bootstrap gives the system actor the ID in
+    that variable. Tests about it set the variable themselves.
+    """
+    from nerve.identity import SYSTEM_PRINCIPAL_ENV
+
+    monkeypatch.delenv(SYSTEM_PRINCIPAL_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_timezone(monkeypatch):
+    """Strip ``NERVE_TIMEZONE`` from the developer shell.
+
+    Nerve uses it as the default time zone when no settings layer names one.
+    Tests about it set the variable themselves.
+    """
+    monkeypatch.delenv(nerve.config.TIMEZONE_ENV, raising=False)
 
 
 @pytest.fixture(scope="session", autouse=True)

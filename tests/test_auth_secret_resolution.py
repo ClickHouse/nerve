@@ -181,7 +181,7 @@ class TestLoginRoute:
         assert claims["sub"] == client.account_id
         assert claims[TOKEN_TYPE_CLAIM] == TOKEN_TYPE_SESSION
         assert client.get("/api/auth/status").json() == {
-            "auth_required": True, "login": "password",
+            "mode": "local", "auth_required": True, "login": "password",
         }
 
     def test_password_checked_and_token_signed_with_the_generated_secret(self, client, config):
@@ -201,7 +201,7 @@ class TestLoginRoute:
             with pytest.raises(jwt.InvalidSignatureError):
                 _claims(token, "dev-secret")
         assert client.get("/api/auth/status").json() == {
-            "auth_required": True, "login": "password",
+            "mode": "local", "auth_required": True, "login": "password",
         }
 
     def test_passwordless_admits_any_password_with_a_real_secret(self, client, config):
@@ -210,7 +210,7 @@ class TestLoginRoute:
         pin_jwt_secret(_GENERATED)
         assert client.portal.call(client.db.complete_passwordless_setup)
         assert client.get("/api/auth/status").json() == {
-            "auth_required": False, "login": "none",
+            "mode": "local", "auth_required": False, "login": "none",
         }
         res = client.post("/api/auth/login", json={"password": "anything at all"})
         assert res.status_code == 200

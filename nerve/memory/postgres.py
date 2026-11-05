@@ -18,6 +18,8 @@ from memu.database.state import DatabaseState
 from sqlalchemy import create_engine, text
 from sqlmodel import Session
 
+from nerve.db.postgres.version import SCHEMA_VERSION
+
 
 class DurableResourceRepo(PostgresResourceRepo):
     """Commit source bytes and their resource row in one transaction."""
@@ -170,7 +172,10 @@ class MemoryStore(PostgresStore):
         self.categories = self._state.categories
         self.relations = self._state.relations
         with self._sessions.session() as session:
-            if session.exec(text("SELECT version FROM storage_version")).scalar() != 1:
+            if (
+                session.exec(text("SELECT version FROM storage_version")).scalar()
+                != SCHEMA_VERSION
+            ):
                 raise RuntimeError("Unsupported PostgreSQL memory schema")
         self.refresh()
 
@@ -201,25 +206,6 @@ class MemoryStore(PostgresStore):
 
     @asynccontextmanager
     async def guard(self):
+        """Serialize local memU writers; retrieval never waits for extraction."""
         async with self._guard_lock:
-            with self._sessions.engine.connect() as conn:
-                acquired = False
-                try:
-                    while not acquired:
-                        acquired = conn.execute(
-                            text(
-                                "SELECT pg_try_advisory_lock(hashtextextended(:scope,1))"
-                            ),
-                            {"scope": self._scope},
-                        ).scalar()
-                        if not acquired:
-                            await asyncio.sleep(0.1)
-                    yield
-                finally:
-                    if acquired:
-                        conn.execute(
-                            text(
-                                "SELECT pg_advisory_unlock(hashtextextended(:scope,1))"
-                            ),
-                            {"scope": self._scope},
-                        )
+            yield

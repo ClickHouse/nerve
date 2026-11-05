@@ -175,6 +175,8 @@ class TestWakeupSweep:
         # A self-scheduled loop tick is the session continuing its own work —
         # it must not re-sort the sidebar.
         assert kwargs["bump_updated_at"] is False
+        # The turn runs in its session and takes the session's cause.
+        assert "cause" not in kwargs
         # Claimed — no longer pending.
         assert await svc.db.list_pending_wakeups("s1") == []
 
@@ -197,6 +199,7 @@ class TestWakeupSweep:
         # The user wrote this message and asked for it to land now, so unlike
         # a model-scheduled tick it DOES move the session up the sidebar.
         assert kwargs["bump_updated_at"] is True
+        assert "cause" not in kwargs
 
     @pytest.mark.asyncio
     async def test_skips_running_session(self, svc):

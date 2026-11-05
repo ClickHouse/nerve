@@ -23,6 +23,9 @@ import pytest_asyncio
 from nerve.agent.backends.base import BackendError
 from nerve.db import Database
 
+from tests.actor_rows import ensure_actor_row
+from tests.conftest import TEST_ACTOR
+
 
 class FakeClaudeBackend:
     """Accepts any model — no validate_model, like the real claude backend."""
@@ -76,6 +79,8 @@ async def setup(db: Database, tmp_path, bypass_auth):
     cfg = NerveConfig()
     cfg.workspace = tmp_path
     cfg_mod._config = cfg
+    # The routes record the signed-in actor on session events.
+    await ensure_actor_row(db, TEST_ACTOR)
 
     engine = SimpleNamespace(
         _backends={

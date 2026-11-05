@@ -120,10 +120,9 @@ class TestSendSessionStatus:
 # ---------------------------------------------------------------------------
 # Initial-bind handshake (AC15)
 #
-# The actual handler is a closure inside ``create_app`` so it can't be unit-
-# tested without spinning a full FastAPI app + lifespan. We re-exercise the
-# *same logic* it runs (``is_buffering`` gate + helper invocation) so that a
-# regression in either guard or call shape fails this test.
+# The handshake always sends ``session_status`` now: the agent roster
+# hydrates from it even when no turn runs (the real handler is exercised end
+# to end in tests/test_ws_agents.py). These re-run the helper call it makes.
 # ---------------------------------------------------------------------------
 
 
@@ -137,11 +136,10 @@ class TestInitialBindReplay:
         is_running: bool,
         session_record: dict | None,
     ) -> None:
-        """Mirror the gate + helper call from the WS handshake."""
-        if _global_broadcaster.is_buffering(session_id):
-            await _send_session_status(
-                ws, session_id, is_running, session_record,
-            )
+        """Mirror the helper call from the WS handshake (no gate)."""
+        await _send_session_status(
+            ws, session_id, is_running, session_record,
+        )
 
     async def test_replays_when_turn_in_flight(self):
         ws = FakeWebSocket()
@@ -163,15 +161,20 @@ class TestInitialBindReplay:
         assert msg["is_running"] is True
         assert msg["buffered_events"][0]["tool"] == "Read"
 
-    async def test_no_replay_when_session_idle(self):
+    async def test_idle_session_gets_status_with_agents_and_no_replay(self):
         ws = FakeWebSocket()
-        # No start_buffering: handshake guard must short-circuit.
+        # No start_buffering: nothing to replay, but the status still goes
+        # out so the client hydrates the agent roster.
         await self._simulate_initial_bind(
             ws, "sess-idle", is_running=False,
             session_record={"status": "active"},
         )
 
-        assert ws.sent == []
+        (msg,) = ws.sent
+        assert msg["type"] == "session_status"
+        assert "buffered_events" not in msg
+        assert msg["agents"]["session_id"] == "sess-idle"
+        assert msg["agents"]["agents"] == []
 
 
 # ---------------------------------------------------------------------------

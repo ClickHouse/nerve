@@ -11,7 +11,7 @@ git-syncable workspace subtree):
 
 | File | Purpose | Managed by |
 |------|---------|------------|
-| `system.yaml` | Built-in crons (core + productivity) | `nerve init` — safe to regenerate |
+| `system.yaml` | Built-in crons (core + productivity) | The Mode step of setup writes it (or `nerve init --terminal`); the Automation step flips its `enabled` flags — safe to regenerate with `nerve init --terminal` |
 | `jobs.yaml` | Your custom crons | You — Nerve never touches this file |
 
 > **Location & migration.** New installs write cron config to
@@ -28,7 +28,7 @@ Both files use the same format. On startup, CronService loads and merges both:
 - If a job ID appears in both files, the **user version wins** (with a warning in the log).
 - Old installs with everything in `jobs.yaml` still work — if `system.yaml` doesn't exist, all jobs load from `jobs.yaml`.
 
-Running `nerve init` on an existing install regenerates `system.yaml` (e.g., to pick up updated prompts from a Nerve update) without touching `jobs.yaml`.
+Running `nerve init --terminal` on an existing install regenerates `system.yaml` (e.g., to pick up updated prompts from a Nerve update) without touching `jobs.yaml`. The default `nerve init` leaves it alone, and the setup page's Automation step only changes which optional jobs are enabled.
 
 ### Hot-reload (no restart)
 
@@ -78,7 +78,7 @@ jobs:
     schedule: "30 11 * * *"        # 11:30 AM daily
     prompt: "Give me a morning briefing..."
     description: "Daily morning summary"
-    model: claude-sonnet-4-6       # Optional model override
+    model: claude-sonnet-5-5       # Optional model override
     target: telegram               # Delivery channel
     session_mode: isolated         # "isolated", "persistent", or "main"
     enabled: true
@@ -138,9 +138,9 @@ prompt definition.
 | `context_rotate_hours` | int | no | Hours before a persistent job rotates to a fresh chat (default: 24, 0 = never). The old chat is preserved |
 | `context_rotate_at` | string | no | Time of day to rotate (e.g. `"04:00"`, in the configured timezone). Overrides the hours-based rotation |
 | `reminder_mode` | bool | no | Persistent only: send short reminder instead of full prompt on subsequent runs (default: false) |
-| `catchup` | bool | no | Fire once on startup if the job missed a run while the server was down (default: true) |
+| `catchup` | bool | no | Fire once if the job missed a run while the server was down (on startup) or while the machine was paused (on resume — see [After a pause](#after-a-pause-sleep-suspend-snapshot-restore)) (default: true) |
 | `enabled` | bool | no | Whether the job is active (default: true) |
-| `lock` | bool | no | Prevent concurrent runs of this job — the next fire waits for the previous one (default: false) |
+| `lock` | bool | no | Serialize this job's runs inside the daemon: a web-triggered run waits for the previous one to finish, and so does a scheduled fire that comes while a run for delivered source records goes on (see [Runs on delivery](#runs-on-delivery)). Any other overlapping scheduled fire or catch-up run is skipped either way, and `nerve cron <id>` runs outside the lock (default: false) |
 | `run_if` | list | no | Run gates — preconditions that must all hold for the job to fire. See [Run Gates](#run-gates) |
 | `workflow` | map | yes* | Launch a budget-capped [workflow run](workflow-runs.md) instead of a prompt: `{engine, prompt, budget_usd[, title, model, effort, cwd]}`. Takes precedence over `prompt`/`prompt_file`; the cron job only launches the run (fire-and-forget) — the run notifies on its own |
 
@@ -253,6 +253,13 @@ run_if:
     consumer: inbox
 ```
 
+Checking the gate keeps the consumer's cursors from expiring: each check renews
+the TTL (`sync.consumer_cursor_ttl_days`) of the live cursors it reads. A cursor
+expires when nothing reads it for that long, and an expired cursor starts again at
+the source's newest message. So without the renewal, a source that stayed quiet
+for a few days would lose its first new message to the restart. A cursor that has
+already expired still starts again at the newest message, as a new one does.
+
 > **Legacy shorthand.** The older `skip_when_idle: [<sources>]` /
 > `idle_consumer: <name>` fields still work — they are translated into an
 > equivalent `messages` gate at load time. Prefer `run_if` for new jobs.
@@ -292,12 +299,54 @@ rather than bot autodetection, because bots are not reliably identifiable here:
 direction: an unlisted bot costs one extra wake, whereas a wrong autodetect
 would silently drop human feedback.
 
+With `sync.github.mode: hosted` the gate always passes and runs no `gh`: the
+channel gateway watches the agent's own open pull requests (`sync.github.pr_watch`)
+and delivers a `github_pr_activity` record for each change. A record does not
+start a job by itself. It starts a job gated on `messages` with
+`sources: [github]` at once (see [Runs on delivery](#runs-on-delivery)), so gate
+pull request monitors that way. A job gated on `github_pr_activity` alone is
+never started by a delivery, and since the gate always passes, it runs, in full,
+on every scheduled tick; `nerve doctor` names the jobs that still use this gate.
+
+### Forecasts
+
+A gate can also say ahead of time what it will decide. `forecast(ctx, at)`
+answers "would this gate let the job run at `at`?" from what is known now. Nerve
+asks it to show what each job's next run will do — `GET /api/cron/schedule`,
+`nerve cron next`, and the **Forecast** column on the Cron page — and to work out
+when the instance next has work of its own (see [What runs next](#what-runs-next)).
+The gate is still checked for real when the run comes; a forecast only predicts
+that check.
+
+- A forecast has no side effects and never reaches the network: it may be asked
+  often.
+- By default a gate forecasts by evaluating itself now. For a gate over local
+  state that answer holds until something changes the state: mostly work the
+  instance schedules itself, after which the forecast is read afresh, but also a
+  task created or moved from a chat, the web UI or the API, which is only seen
+  the next time the schedule is read (see [What runs next](#what-runs-next)).
+  `tasks` forecasts this way. `messages` reads the consumer's cursors
+  without starting one, and takes a cursor that will have expired by `at` as
+  expired, since the check will find it so then.
+- `github_pr_activity` always forecasts a run: whether a PR moved is only known
+  by polling GitHub, which a forecast must not do.
+- A gate whose answer changes with elapsed time — an age threshold, a cooldown —
+  overrides `forecast` and reasons about `at`. So does a gate whose check writes
+  anything.
+
+A forecast that raises counts as the run going ahead, just as a check that
+raises lets the run proceed. Forecasts are read often, so a job whose forecast
+keeps raising is logged as a warning once every 10 minutes, and at DEBUG in
+between.
+
 ### Adding a built-in gate type
 
 Built-in gates live in `nerve/cron/gates.py`. To add one: subclass `CronGate`,
-set its `type`, implement `is_satisfied`, `describe`, and `from_config`, then
-register the class in `GATE_REGISTRY`. It becomes usable from `run_if`
-immediately. This is the right path for gates that ship with Nerve.
+set its `type`, implement `is_satisfied`, `describe`, and `from_config` (and
+`forecast`, when evaluating the gate now is not a side-effect-free, offline
+answer for a later run — see [Forecasts](#forecasts)), then register the class
+in `GATE_REGISTRY`. It becomes usable from `run_if` immediately. This is the
+right path for gates that ship with Nerve.
 
 ### Custom gate plugins (drop-in)
 
@@ -311,6 +360,8 @@ don't conflict when you pull Nerve upstream.
 
 ```python
 # <workspace>/config/cron/gates/stale_tasks.py
+from datetime import datetime
+
 from nerve.cron.gates import CronGate, GateContext
 
 
@@ -322,6 +373,10 @@ class StaleTasksGate(CronGate):
 
     async def is_satisfied(self, ctx: GateContext) -> bool:
         # ctx exposes {job_id, db} — DB-only (see note below).
+        ...
+
+    async def forecast(self, ctx: GateContext, at: datetime) -> bool:
+        # Tasks age: one too young now may be old enough at `at`.
         ...
 
     def describe(self) -> str:
@@ -341,6 +396,18 @@ run_if:
 
 A gate must implement the same three methods as a built-in (`is_satisfied`,
 `describe`, `from_config`).
+
+> **A gate that does not define `forecast` has its check run on every schedule
+> read.** The inherited `forecast` calls `is_satisfied` there and then, and
+> Nerve asks for forecasts on every Cron page load, every `nerve cron next` and
+> every `GET /api/cron/schedule` (see [Forecasts](#forecasts)). Either keep
+> `is_satisfied` free of side effects — it writes nothing (no fingerprint it
+> saves, no cursor it moves), never reaches the network, and is cheap — or
+> override `forecast`, as the example does. A check that uses up what it finds
+> would otherwise have it used up by a page load, and the run that comes later
+> would skip. Override it too when the answer depends on elapsed time. Nerve
+> logs a warning when it loads a plugin gate that keeps the inherited
+> `forecast`.
 
 **Rules** (a bad plugin never crashes the daemon — though it does cost the jobs
 that name its gate, see below):
@@ -375,15 +442,15 @@ that name its gate, see below):
 
 ### Isolated (default)
 
-Each run creates a fresh session (`cron:{job_id}:{timestamp}`). The agent has no in-context memory of previous runs. This is best for self-contained jobs like daily briefings or cleanup tasks.
+Each run creates a fresh session (`cron:{job_id}:{run_id}`; the run ID is the UTC start time `YYYYmmdd-HHMMSS` and eight random hex digits, so two runs that start in the same second get two sessions). The agent has no in-context memory of previous runs. This is best for self-contained jobs like daily briefings or cleanup tasks.
 
 ### Persistent
 
 Jobs with `session_mode: persistent` maintain SDK conversation context across runs. Each job owns a **generation chat** — one session that is reused run after run until rotation:
 
-- **First trigger**: Creates a fresh generation session (`cron:{job_id}:{timestamp}`) and runs the prompt.
+- **First trigger**: Creates a fresh generation session (`cron:{job_id}:{run_id}`, the same ID form as an isolated run) and runs the prompt.
 - **Subsequent triggers**: Resumes the same SDK session and sends the prompt as a new message. The agent sees all prior runs of this generation in-context.
-- **Context rotation**: Every `context_rotate_hours` (default: 24) — or daily at `context_rotate_at` — the current chat is **retired and a brand-new chat is started**. The old chat is preserved exactly as it was: it keeps its full message history, stays browsable (and resumable) in the UI like any other session, and ages out via the normal session archival policy. Retiring also indexes the old context into memU, cancels the old session's pending wakeups (so a retired thread can't resurrect itself alongside the new one), and retitles it with its end date (`Cron: {job_id} (until 2026-07-05)`).
+- **Context rotation**: Every `context_rotate_hours` (default: 24) — or daily at `context_rotate_at` — the current chat is **retired and a brand-new chat is started**. The old chat is preserved exactly as it was: it keeps its full message history, stays browsable (and resumable) in the UI like any other session, and ages out via the normal session archival policy. Retiring also indexes the old context into memory (memU, or Loom with `memory.backend: loom`), cancels the old session's pending wakeups (so a retired thread can't resurrect itself alongside the new one), and retitles it with its end date (`Cron: {job_id} (until 2026-07-05)`).
 
 > **Upgrade note.** Installs that predate generation chats used the stable id
 > `cron:{job_id}`. That session is adopted as the current generation on the
@@ -426,6 +493,15 @@ nerve cron
 # Run a specific job manually
 nerve cron morning-briefing
 
+# What the running daemon will run next (see "What runs next"). A job that is
+# itself called "next" is run from the Cron page, or with
+# POST /api/cron/jobs/next/trigger.
+nerve cron next
+#   Next: 2026-03-02 09:00:00 UTC — digest (cron)
+#     JOB      NEXT RUN                 FORECAST
+#     planner  2026-03-02 08:00:00 UTC  skip — gate 'tasks' not satisfied (pending tasks exist)
+#     digest   2026-03-02 09:00:00 UTC  run
+
 # Check cron status
 nerve doctor
 #   [OK] Cron jobs: 3/5 enabled, 1 overridden in jobs.yaml
@@ -437,21 +513,24 @@ nerve doctor
 
 ## Built-in System Crons
 
-These ship in `<workspace>/config/cron/system.yaml` and are managed by `nerve init`. Running `nerve init` regenerates this file (e.g., to pick up updated prompts from a Nerve update) without touching your custom `jobs.yaml`.
+These ship in `<workspace>/config/cron/system.yaml`, written when the mode is chosen (the setup page's Mode step, or `nerve init --terminal`). Running `nerve init --terminal` regenerates this file (e.g., to pick up updated prompts from a Nerve update) without touching your custom `jobs.yaml`.
 
 | Job | Schedule | Session Mode | Description | Personal | Worker |
 |-----|----------|-------------|-------------|:--------:|:------:|
-| `memory-maintenance` | Daily 5 AM | isolated | Dedup, prune stale entries, improve memory wording. Runs silently. | ✅ always | ✅ always |
+| `memory-maintenance` | Daily 5 AM | isolated | Dedup, prune stale entries, improve memory wording. Runs silently. On an install set up with `memory.backend: loom`: runs Loom's integrity report (`loom_namespace_validate`) on the home namespace and fixes what is its own, leaving deduplication to Loom; a `system.yaml` written for memU runs in this wording while its prompt is the shipped one. | ✅ always | ✅ always |
 | `inbox-processor` | Every 30 min | persistent (24h rotation, reminder mode) | Polls all sync sources (email, GitHub, Telegram). Triages, creates tasks, memorizes facts, sends notifications for urgent items. | ✅ default | — |
-| `task-planner` | Every 4 hours | persistent (168h rotation) | Reviews open tasks, explores codebases, proposes implementation plans via plan-approve workflow. Gated on `tasks` (status `pending`) — stays idle when there's nothing to plan. | ✅ default | ✅ default |
+| `task-planner` | Every 4 hours | persistent (168h rotation) | Reviews open tasks, explores codebases, proposes implementation plans via plan-approve workflow. Gated on `tasks` (status `pending`) — stays idle when there's nothing to plan. | ✅ default | off; onboarding enables it |
 | `skill-extractor` | Every 12 hours | persistent | Identifies repeated workflows from recent conversations, memory, and completed tasks. Proposes new skills via task+plan system. | ✅ optional | ✅ default |
 | `skill-reviser` | Weekly (Sun 3 AM) | persistent | Reviews existing skills for accuracy (outdated paths, credentials), completeness (missing steps), and quality (trigger phrases, examples). Proposes revisions via task+plan. | ✅ optional | ✅ default |
+| `machine-maintenance` | Weekly (Sun 4 AM) | isolated | Cleans up the machine Nerve runs on. The agent first finds out what this machine has (disk use, repositories and worktrees, build and package caches, Docker, services that listen on a port), then looks only at items that are old and that nothing uses. It removes items that hold no data without asking: caches, dangling Docker images and build cache, a worktree whose pull request is merged and that has no local changes. It sends one `ask_user` for anything that can hold data (Docker volumes, stopped containers, worktrees with local work, leftover dev servers or test containers on open ports) and acts only on what the answer approves. It never touches Nerve itself, system services or anything in use. Sends a low-priority `notify` with the space freed when it changed something. | ✅ default | ✅ default |
 
 **Mode defaults:**
-- **Personal** — `memory-maintenance` (always on) + `inbox-processor` + `task-planner` enabled by default. `skill-extractor` and `skill-reviser` are presented as optional during `nerve init`.
-- **Worker** — `memory-maintenance` (always on) + `task-planner` + `skill-extractor` + `skill-reviser` enabled by default. `inbox-processor` is not included (workers don't have sync sources).
+- **Personal**: `memory-maintenance` (always on) + `inbox-processor` + `task-planner` + `machine-maintenance` enabled by default. `skill-extractor` and `skill-reviser` are offered as toggles on the Automation step of the setup page (and in `nerve init --terminal`).
+- **Worker**: `memory-maintenance` (always on) + `skill-extractor` + `skill-reviser` + `machine-maintenance` enabled by default when the mode is chosen on the setup page or by `NERVE_MODE=worker nerve init --non-interactive`. `task-planner` is written with `enabled: false` on every path: whether the worker plans through the approval loop is decided during onboarding (the onboarding conversation, or the session in which a worker set up without the browser sets itself up), which enables it by overriding the job by id in `jobs.yaml` with a prompt and a `tasks` gate scoped to the worker's tag (the Automation step of the setup page can also switch it on). `nerve init --terminal` has no cron step for workers and writes the two skill jobs and `machine-maintenance` with `enabled: false` as well; set `enabled: true` in `system.yaml` (or override the job by id in `jobs.yaml`), then `nerve reload`. `inbox-processor` is not included (workers don't have sync sources).
 
-Both skill jobs use `source="skill-extractor"` or `source="skill-reviser"` on created tasks. When their plans are approved, the plan approval handler creates/updates the skill directly from the plan content (which is a full SKILL.md file) instead of spawning an implementation session.
+`machine-maintenance` is on by default and optional in both modes: switch it off on the Automation step of the setup page, or with a job of the same id in `jobs.yaml`. Its prompt is general on purpose: the agent learns what each machine has on each run. To keep an item out of its reach, write it in `TOOLS.md` or ask the agent to remember it; the job reads both before it acts.
+
+Both skill jobs use `source="skill-extractor"` or `source="skill-reviser"` on created tasks. When their plans are approved, an `impl-<id>` session is spawned like for any plan; its prompt tells it to apply the plan (a full SKILL.md file) with `skill_create` or `skill_update` and then close the task with `task_done`.
 
 ## Persistent Timers
 
@@ -479,7 +558,54 @@ Set `catchup: false` on jobs where a late run doesn't make sense:
     catchup: false        # no point running a morning briefing at 3pm
 ```
 
-Interval alignment still applies even with `catchup: false` — only the startup catch-up fire is skipped.
+Interval alignment still applies even with `catchup: false` — only the catch-up fire (at startup, or after a pause) is skipped.
+
+### After a pause (sleep, suspend, snapshot restore)
+
+When the whole machine stops — a laptop sleeps, a host suspends, a virtual
+machine is restored from a snapshot — the scheduler stops with it, and a run
+that comes due in the meantime cannot start on time. On resume Nerve treats
+those runs like the ones missed while the server was down, instead of letting
+them start late or be dropped as [late runs](#late-runs):
+
+- Every 5 seconds the cron service compares the wall clock with the monotonic
+  clock, which stands still while the machine does. A wall clock that got
+  5 seconds or more ahead means a pause (a forward step of the system clock
+  counts too; a clock set back does not).
+- A run that came due less than 30 seconds before the resume stays where it is:
+  the scheduler starts it late, as it does any run up to 30 seconds late (see
+  [Late runs](#late-runs)), whether or not the job has `catchup`.
+- Every other scheduled job whose next run came due during the pause moves to
+  its next regular time after the pause, so the scheduler neither runs it late
+  nor drops it as a late run. An interval job keeps its cadence: its next run is
+  the next one on the grid it is anchored to (see
+  [Interval alignment](#interval-alignment)), not a full interval after the
+  resume.
+- Jobs with `catchup: true` (the default), source runners and the daily cleanup
+  then run **once**, however many runs the pause swallowed, concurrently. They
+  start 15 seconds after the resume is noticed, because the network is often not
+  back yet the moment a laptop wakes, and a run that starts without it fails.
+  Run gates and `lock` apply as for a scheduled run, and the run is logged as
+  usual.
+- Jobs with `catchup: false` only move on; the run each one skipped is recorded
+  in `cron_logs` with status `missed`. A run that the job's gates would have
+  skipped, going by their [forecast](#forecasts) for the time it came due, is
+  not missed: it is skipped like a scheduled run that its gates skip, with no
+  row. The wakeup sweep only moves on too:
+  session wakeups (`ScheduleWakeup`) that came due fire on its next pass, within
+  20 seconds.
+- The daemon log gets one INFO line per pause, with the size of the jump, the
+  window and the number of jobs caught up.
+
+A catch-up waits for one that is still running — at startup or after an earlier
+pause — instead of overlapping it, and then runs each job as it is at that
+moment: a job a reload removed meanwhile is skipped, a changed one runs in its
+new form, one that has run since is not run again, and one that came due in
+several pauses runs once. A job whose run is still going when the
+machine resumes is not caught up, just as the scheduler skips a fire that finds
+the job's previous run still going; and a scheduled fire that comes while the
+job's catch-up run is going is skipped. Both are logged. Jumps under 5 seconds
+are ignored.
 
 ### Late runs
 
@@ -490,7 +616,81 @@ when the scheduler is built, so changing it needs a restart).
 A run delayed beyond that is dropped rather than run very late, and recorded in
 `cron_logs` with status `missed` so the gap is visible next to the runs around it.
 A `missed` row never counts as a successful run, so it does not affect interval
-alignment or startup catch-up.
+alignment or startup catch-up. A run that came due during a pause of the whole
+machine, more than 30 seconds before it ended, is not a late run: see
+[After a pause](#after-a-pause-sleep-suspend-snapshot-restore).
+
+## What runs next
+
+`GET /api/cron/schedule` reports the next moment the instance will start work on
+its own, and what each job's next run is forecast to do. `nerve cron next` prints
+the same from the running daemon, and the Cron page shows each job's forecast in
+its card. The page lists the jobs without waiting for the forecasts, fills them
+in when they arrive, and goes on without them after 10 seconds.
+
+```json
+{
+  "next": {"at": "2026-03-02T09:00:00+00:00", "name": "digest", "kind": "cron"},
+  "jobs": [
+    {"id": "planner", "next_run": "2026-03-02T08:00:00+00:00", "forecast": "skip",
+     "reason": "gate 'tasks' not satisfied (pending tasks exist)"},
+    {"id": "digest", "next_run": "2026-03-02T09:00:00+00:00", "forecast": "run", "reason": null},
+    {"id": "source:mail", "next_run": "2026-03-02T09:15:00+00:00", "forecast": "run", "reason": null}
+  ]
+}
+```
+
+`next` is the earliest of these, within the next 7 days:
+
+- the next run of each enabled cron job whose gates forecast that the run will
+  happen (see [Forecasts](#forecasts)). When a job's next run is forecast to
+  skip, Nerve tries up to 8 more of its fire times within the 7 days, asking
+  again only the gates that define their own forecast (an age threshold that
+  will be reached, say), and counts the first one forecast to happen. A gate on
+  the default forecast is asked once: it answers the same for any time, so if it
+  says no, so does every later run;
+- the next run of each source runner, except a source whose buffer only the
+  running instance writes, as records are delivered to it (the hosted GitHub
+  source and the channel drains `<channel>:observed`, `Source.push_fed`), while
+  nothing delivered waits in that buffer: nothing is added to it while the
+  machine is parked, so the scheduled run is not counted; a run with delivered
+  records waiting counts;
+- the earliest pending session wakeup (`ScheduleWakeup`, or a message deferred
+  with "Run later").
+
+Cleanup and the wakeup sweep are housekeeping and never count. `at` is in UTC;
+`kind` is `cron`, `source` or `wakeup`; `name` is the job id, `source:<name>`, or
+`wakeup:` with the first 8 characters of the session id — limited to letters,
+digits and `._:-` (anything else becomes `_`) and to 64 characters. `next` is
+`null` when nothing is due within 7 days. `at` can be a little in the past: a
+session wakeup that came due but has not fired yet (the sweep runs every 20
+seconds, and waits while the session is in a turn) is reported at the time it
+came due.
+
+In code, `CronService.next_scheduled(now=None, horizon=...)` returns `next` as a
+`ScheduledTick` (`at`, `name`, `kind`); a `now` you pass must be
+timezone-aware, or it raises `ValueError`.
+
+`jobs` lists the jobs `GET /api/cron/jobs` lists. `forecast` is `run` or `skip`
+for a job's next run and `null` for a job without one (a disabled job, say);
+`reason` says why a run is forecast to be skipped. For a `Source.push_fed`
+source (the hosted GitHub source, the channel drains), `skip` means the
+scheduled run is not counted in `next` because nothing delivered waits in its
+buffer; the run itself still fires.
+
+Forecasts are judged from what is known when you ask. Code that keeps the answer
+around can register a schedule listener (`CronService.add_schedule_listener`) to
+recompute it when it may have changed: after a start, a reload or a source
+reload; when a job or source run ends, including one a gate skipped; when a
+session wakeup is claimed; when triggers move past a pause; and when a source is
+synced by hand (`POST /api/sources/{name}/sync`, `POST /api/sources/sync-all`).
+
+Not every change is announced. A wakeup that a session records during its turn,
+tasks created, moved or edited from a chat turn, the web UI or the API (which
+can change what a `tasks` gate forecasts), and a message a channel buffers for
+its `<channel>:observed` drain (which makes that drain count) count only from
+the next time the schedule is read. Code that keeps the answer should therefore
+also refresh it periodically, and when a turn ends.
 
 ## Source Runners
 
@@ -504,14 +704,60 @@ Source runners:
 
 See [sources.md](sources.md) for full documentation.
 
+### Runs on delivery
+
+A hosted source — GitHub with `sync.github.mode: hosted`, see
+[Hosted GitHub source](sources.md#hosted-github-source) — does not wait for its
+schedule. When the channel gateway delivers records, the source's runner runs
+at once, after any run of it already in progress (which may have fetched
+before the records arrived); deliveries during that drain make it run once
+more. Then every enabled job on the schedule (a job whose schedule did not
+parse is not) whose gates include a `messages` gate naming that source, or
+naming no source, runs once `cron.delivery_debounce_seconds` after the first
+delivery of a burst. Later deliveries in that window add nothing: one burst,
+one run.
+
+```yaml
+cron:
+  delivery_debounce_seconds: 60   # default; 0 runs the jobs as soon as the records are in, at most 600 applies
+```
+
+Such a run goes through the job's gates, `lock` and run log like a scheduled
+run, and the schedule listeners hear of it. It waits for a run of the job that
+is already in flight. While it runs, a scheduled fire of the job is skipped, as
+an overlapping scheduled fire is, or waits for it when the job has `lock`; a
+catch-up is skipped, as it is while any run of the job goes on; and a run
+started by hand starts as it always does. A catch-up queued before the run does
+not run the job again, since the job has run since. The drain counts as a run
+of the source's runner in the same way. Jobs without such a gate keep to their
+schedule, and the schedules stay the fallback for everything. The setting is
+read for each delivery, so a reload applies it. A scheduled run of a source
+that runs on delivery is not counted as the next scheduled task while nothing
+waits in its buffer (see [What runs next](#what-runs-next)): it normally finds
+nothing, so a platform that parks the machine is not told to wake it for that
+run. The channel drains (`<channel>:observed`) are not counted in `next` either
+while nothing waits in their buffer: only the running instance writes it, so
+nothing is added while the machine is parked, and what arrives meanwhile is
+delivered after the next wake. They are not run on delivery: messages buffered
+since the last drain are taken by the next scheduled drain, and from the next
+forecast on (at most one activity report interval later) that drain counts, so
+a platform keeps the machine up, or wakes it, for them.
+
 ## Logging
 
 Every cron and source run is logged in the `cron_logs` SQLite table:
 - `job_id` — Which job ran (e.g., `morning-briefing` or `source:gmail`)
 - `started_at` / `finished_at` — Timestamps
-- `status` — `success`, `error`, or `missed` (see [Late runs](#late-runs))
+- `status` — `success`, `error`, or `missed` (see [Late runs](#late-runs)); a run whose agent turn failed or was interrupted is logged as `error`, with the reason in `error` (for example `turn failed: max turns (50) exhausted`).
 - `output` — First 2000 chars of response / summary
 - `error` — Error message if failed
+- `actor_id` / `caused_by_actor_id`: who started the run, and on whose
+  behalf: the system actor for a scheduled, catch-up or missed run, or for
+  `nerve cron <id>`; the person who triggered the run through the web UI or
+  `POST /api/cron/jobs/{job_id}/trigger`. A session that a person's run
+  creates has that person as its cause, so the agent's work in it is the
+  system actor's for that person. See
+  [Attribution](accounts.md#attribution).
 
 Source runs also log to `source_run_log` with per-source diagnostics (records fetched/processed, errors).
 

@@ -33,6 +33,7 @@ from mcp.server.context import ServerRequestContext
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.types import Receive, Scope, Send
 
+from nerve.agent.backends.base import config_excluded_tools
 from nerve.agent.tools import ToolContext, ToolRegistry
 from nerve.gateway.auth import (
     MCP_WORKER_CLAIM,
@@ -187,7 +188,6 @@ def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver
         session_id, runtime_metadata = _bound_identity_from_request(
             engine.config, rctx
         )
-
         if session_id is None:
             client_name, mcp_session_id, _ = _resolve_client_info(rctx)
 
@@ -205,6 +205,9 @@ def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver
                 "mcp_session_id": mcp_session_id,
             }
 
+        # The call is the agent's change for the session's stored cause. A
+        # satellite session stores none: its agent runs outside this instance.
+        session = await engine.db.get_session(session_id)
         return ToolContext(
             session_id=session_id,
             workspace=engine.config.workspace,
@@ -216,6 +219,8 @@ def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver
             engine=engine,
             notification_service=engine.notification_service,
             runtime_metadata=runtime_metadata,
+            actor=engine.db.system_actor,
+            cause=(session or {}).get("caused_by_actor_id"),
         )
 
     return _resolve
@@ -241,6 +246,11 @@ def build_manager(
         ctx_resolver=ctx_resolver,
         audit_writer=audit_writer,
         include_hoa=config.mcp_endpoint.include_hoa,
+        # Read off the engine's live config, not the snapshot above: a
+        # Codex session takes its nerve tools from this endpoint, and its
+        # tool list has to agree with the system prompt the same config
+        # builds. Satellite clients read one list per connection.
+        excluded=lambda: config_excluded_tools(engine.config),
     )
     return StreamableHTTPSessionManager(
         app=server,
@@ -282,7 +292,8 @@ def mount_deferred(
         # credentials are the agent acting on its own behalf, so they resolve
         # to the system principal; a person's own session token resolves to
         # them — and is refused here once their account is disabled, which a
-        # signature check alone would never notice.
+        # signature check alone would never notice. In external mode, every
+        # session token is refused here.
         store = identity_store()
         if store is None:
             await _send_status(send, 503, "MCP server is starting up")

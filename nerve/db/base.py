@@ -19,14 +19,24 @@ from typing import AsyncIterator, NamedTuple
 import aiosqlite
 
 from nerve.db.accounts import AccountStore
+from nerve.db.agents import AgentStore
 from nerve.db.audit import AuditStore
 from nerve.db.cron import CronStore
 from nerve.db.files import FileStore
 from nerve.db.maintenance import MaintenanceStore
 from nerve.db.mcp import McpStore
 from nerve.db.messages import MessageStore
-from nerve.db.migrations.runner import discover_migrations, run_migrations
+from nerve.db.migrations.runner import (
+    FORK_TRACK,
+    check_schema,
+    code_version,
+    discover_migrations,
+    newer_schema_allowed,
+    run_migrations,
+)
 from nerve.db.notifications import NotificationStore
+from nerve.db.observations import ObservationStore
+from nerve.db.onboarding import OnboardingStore
 from nerve.db.plans import PlanStore
 from nerve.db.review_loops import ReviewLoopStore
 from nerve.db.sessions import SessionStore
@@ -44,6 +54,9 @@ logger = logging.getLogger(__name__)
 # SCHEMA_VERSION is derived from the highest migration file number.
 # This keeps a single source of truth (the migration files themselves).
 SCHEMA_VERSION = max(v for v, _ in discover_migrations()) if discover_migrations() else 0
+# The same for the fork track (migrations/fork/), which is numbered on its own.
+# It is 0 upstream, which ships no fork migration.
+FORK_SCHEMA_VERSION = code_version(FORK_TRACK)
 
 
 class WriteResult(NamedTuple):
@@ -300,6 +313,34 @@ def _refusal_message(db_path: Path, perms: StatePermissions) -> str:
     )
 
 
+async def check_database_file(db_path: Path) -> None:
+    """The newer-schema guard (:func:`check_schema`) on the database file at
+    ``db_path``, read-only and without migrating it.
+
+    The gateway calls this to refuse before uvicorn starts. Step 1 of the
+    state-file policy (:meth:`Database.connect`) comes first: when another user
+    can write to a database file, a sidecar or the state directory, or a mode
+    cannot be read, nothing in the files is trusted. Then this reads nothing,
+    and the real open refuses the storage. A database that is missing or
+    cannot be read is left to the real open as well, which reports the
+    problem itself. With the override set, there is nothing to refuse, and
+    the real open logs the warning.
+    """
+    if newer_schema_allowed() or not db_path.is_file():
+        return
+    pre = _inspect_state_permissions(db_path)
+    if pre.writable or pre.uninspectable:
+        return
+    try:
+        db = await aiosqlite.connect(f"{db_path.resolve().as_uri()}?mode=ro", uri=True)
+    except Exception:  # noqa: BLE001 — the real open reports it
+        return
+    try:
+        await check_schema(db)
+    finally:
+        await db.close()
+
+
 class Database(
     SessionStore,
     MessageStore,
@@ -307,6 +348,7 @@ class Database(
     TaskStatusStore,
     PlanStore,
     NotificationStore,
+    ObservationStore,
     SourceStore,
     CronStore,
     SkillStore,
@@ -319,6 +361,8 @@ class Database(
     ReviewLoopStore,
     AccountStore,
     MaintenanceStore,
+    AgentStore,
+    OnboardingStore,
 ):
     """Async SQLite database wrapper.
 
@@ -339,6 +383,12 @@ class Database(
         # a caller or test can tune them before connect() (e.g. busy_timeout=0).
         self._pragmas: dict[str, object] = dict(_DEFAULT_PRAGMAS)
         self._system_actor: Actor | None = None
+        # Each session's stored cause (sessions.caused_by_actor_id). Loaded at
+        # connect and kept by create_session, get_session and delete_session;
+        # a session's cause never changes. Read through session_cause().
+        self._session_causes: dict[str, str | None] = {}
+        # Actor ID to the last display name upsert_external_actor() wrote.
+        self._external_actor_names: dict[str, str | None] = {}
         # The state-file modes connect() found after its repair. The identity
         # bootstrap reads this before it stores a signing secret in the
         # database (nerve.migrate._refuse_insecure_secret_storage).
@@ -413,6 +463,7 @@ class Database(
                 )
             await run_migrations(self._db)
             await self._cache_system_actor()
+            await self._cache_session_causes()
             # After migrations, so the table exists. A key that other users
             # could read is compromised.
             if exposed:
@@ -421,6 +472,7 @@ class Database(
         except BaseException:
             db, self._db = self._db, None
             self._system_actor = None
+            self._session_causes = {}
             try:
                 await db.close()
             except Exception as e:  # noqa: BLE001 — never mask the real failure
@@ -430,7 +482,11 @@ class Database(
             raise
 
     async def _cache_system_actor(self) -> None:
-        """Validate and cache the one system actor created by migrations."""
+        """Validate and cache the one system actor created by migrations.
+
+        Called at connect, and again after the identity bootstrap changes the
+        ID (:meth:`AccountStore._rekey_system_actor`).
+        """
         async with self.db.execute(
             "SELECT id, display_name FROM actor_refs WHERE kind = 'system'"
         ) as cursor:
@@ -455,8 +511,11 @@ class Database(
     def system_actor(self) -> Actor:
         """The actor for autonomous work, validated and cached at connect.
 
-        Schema triggers prevent a change to its id or kind, so no caller has to
-        read the row again.
+        Schema triggers prevent a change to its id or kind. The one exception
+        is the identity bootstrap at startup, which can give the system actor
+        the ID of the agent's system principal before anything refers to it,
+        and which then refreshes this cache. So no other caller has to read
+        the row again.
         """
         if self._system_actor is None:
             raise RuntimeError("Database not connected. Call connect() first.")
@@ -511,6 +570,8 @@ class Database(
             await self._db.close()
             self._db = None
             self._system_actor = None
+            self._session_causes = {}
+            self._external_actor_names.clear()
 
     @property
     def db(self) -> aiosqlite.Connection:
@@ -543,7 +604,9 @@ class Database(
         """Serialize a multi-statement write and make it a real transaction.
 
         Once a coroutine begins a multi-statement write, no other coroutine
-        can interleave writes before the commit. The body's statements are
+        can interleave writes before the commit. The transaction begins before
+        the body runs, so its reads and the writes based on them are one
+        transaction against other connections too. The body's statements are
         committed on success and rolled back on any exception — including
         task cancellation — so a failed body neither half-commits nor leaves
         the shared connection inside an open (poisoned) transaction.
@@ -554,6 +617,10 @@ class Database(
         async with self._write_lock:
             await self._heal_leaked_txn()
             try:
+                # IMMEDIATE takes the database write lock before the first read.
+                # A deferred BEGIN would pin a read snapshot that another
+                # connection's commit turns into SQLITE_BUSY_SNAPSHOT.
+                await self.db.execute("BEGIN IMMEDIATE")
                 yield
                 # Shield so a cancellation arriving mid-commit cannot abandon
                 # a half-finished transaction: the inner task runs to
@@ -562,6 +629,23 @@ class Database(
             except BaseException:
                 await self._rollback_quietly()
                 raise
+
+    @asynccontextmanager
+    async def _read_snapshot(self) -> AsyncIterator[None]:
+        """Run several reads against one snapshot of the database.
+
+        A deferred BEGIN takes no write lock: the snapshot starts at the first
+        read and lasts until the rollback at the end. The body must not write.
+        The write lock of this connection is held, so no write on this
+        connection can commit or end the transaction while the body runs.
+        """
+        async with self._write_lock:
+            await self._heal_leaked_txn()
+            try:
+                await self.db.execute("BEGIN")
+                yield
+            finally:
+                await self._rollback_quietly()
 
     async def _write(self, sql: str, params: tuple | list = ()) -> WriteResult:
         """Execute one write statement and commit, under the write lock.

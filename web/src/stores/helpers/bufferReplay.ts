@@ -12,10 +12,10 @@ import {
 
 /**
  * Apply a single stream event to a blocks array (pure function for replay).
- * Skips events with parent_tool_use_id — those belong to panels, not main chat.
+ * Skips events with parent_tool_use_id — a subagent's work belongs to its
+ * transcript, never to the main chat (mirrors the live handlers).
  */
 export function applyStreamEvent(blocks: MessageBlock[], event: WSMessage): MessageBlock[] {
-  // Sub-agent child events go to panels, not main chat
   if ('parent_tool_use_id' in event && event.parent_tool_use_id) return blocks;
 
   const result = [...blocks];
@@ -76,7 +76,11 @@ export function applyStreamEvent(blocks: MessageBlock[], event: WSMessage): Mess
     }
     case 'auto_turn': {
       if (!result.some((b) => b.type === 'auto')) {
-        result.unshift({ type: 'auto' });
+        result.unshift({
+          type: 'auto',
+          ...(event.triggers ? { triggers: event.triggers } : {}),
+          ...(typeof event.more === 'number' ? { more: event.more } : {}),
+        });
       }
       break;
     }
@@ -93,114 +97,41 @@ export function applyStreamEvent(blocks: MessageBlock[], event: WSMessage): Mess
   return result;
 }
 
-/** Rebuild panel tabs from buffered WS events (for reconnect replay). */
+/**
+ * Rebuild panel tabs from buffered WS events (for reconnect replay): the
+ * Workflow tabs, settled by their progress snapshots. Agent and Task spawns
+ * open no tab (agent records drive the Agents panel), and a subagent's own
+ * events are skipped, as live (handleToolUse / handleToolResult).
+ */
 export function rebuildPanelTabsFromBuffer(
   events: WSMessage[],
-  blocks: MessageBlock[],
 ): { panels: PanelTab[]; activePanelId: string | null } {
   const panels: PanelTab[] = [];
   const panelMap = new Map<string, PanelTab>();
 
-  // First pass: create panel tabs for subagent-spawning tool_use events.
-  // Claude Code 2.1.x renamed the subagent tool from "Task" → "Agent"; we
-  // match both so old chat history still rebuilds panels correctly.
+  // First pass: a tab per dynamic-workflow launch (settled below).
   for (const event of events) {
-    // Dynamic-workflow launch — open a workflow tab (settled later by the
-    // workflow_progress pass below).
-    if (event.type === 'tool_use' && event.tool === 'Workflow') {
-      const toolUseId = event.tool_use_id || '';
-      const tab: PanelTab = {
-        id: toolUseId,
-        type: 'workflow',
-        label: String(event.input?.name || 'Workflow'),
-        subagentType: 'Workflow',
-        description: '',
-        content: null,
-        prompt: '',
-        streaming: true,
-        status: 'running',
-        startedAt: Date.now(),
-        blocks: [],
-      };
-      panels.push(tab);
-      panelMap.set(toolUseId, tab);
-      continue;
-    }
-    if (event.type === 'tool_use' && (event.tool === 'Agent' || event.tool === 'Task')) {
-      const subagentType = String(event.input?.subagent_type || event.input?.model || 'agent');
-      const toolUseId = event.tool_use_id || '';
-      const isBackground = event.input?.run_in_background === true;
-      const block = blocks.find(
-        b => b.type === 'tool_call' && b.toolUseId === toolUseId,
-      );
-      const isComplete = block?.type === 'tool_call' && block.status === 'complete';
-      const tab: PanelTab = {
-        id: toolUseId,
-        type: subagentType === 'Plan' ? 'plan' : 'subagent',
-        label: subagentType,
-        subagentType,
-        description: String(event.input?.description || ''),
-        model: event.input?.model ? String(event.input.model) : undefined,
-        content: isComplete && block?.type === 'tool_call'
-          ? extractResultText(block.result || '')
-          : null,
-        prompt: String(event.input?.prompt || ''),
-        streaming: !isComplete,
-        status: isComplete
-          ? (block?.type === 'tool_call' && block.isError ? 'error' : 'complete')
-          : 'running',
-        startedAt: Date.now(),
-        completedAt: isComplete ? Date.now() : undefined,
-        isError: block?.type === 'tool_call' ? block.isError : false,
-        blocks: [],
-        background: isBackground,
-      };
-      panels.push(tab);
-      panelMap.set(toolUseId, tab);
-    }
+    if (event.type !== 'tool_use' || event.tool !== 'Workflow') continue;
+    if (event.parent_tool_use_id) continue;
+    const toolUseId = event.tool_use_id || '';
+    const tab: PanelTab = {
+      id: toolUseId,
+      type: 'workflow',
+      label: String(event.input?.name || 'Workflow'),
+      subagentType: 'Workflow',
+      description: '',
+      content: null,
+      prompt: '',
+      streaming: true,
+      status: 'running',
+      startedAt: Date.now(),
+      blocks: [],
+    };
+    panels.push(tab);
+    panelMap.set(toolUseId, tab);
   }
 
-  // Second pass: collect child events into their parent panel's blocks
-  for (const event of events) {
-    if (!('parent_tool_use_id' in event) || !event.parent_tool_use_id) continue;
-    const panel = panelMap.get(event.parent_tool_use_id);
-    if (!panel) continue;
-
-    if (event.type === 'thinking') {
-      const last = panel.blocks[panel.blocks.length - 1];
-      if (last?.type === 'thinking') {
-        last.content += event.content;
-      } else {
-        panel.blocks.push({ type: 'thinking', content: event.content });
-      }
-    } else if (event.type === 'token') {
-      const last = panel.blocks[panel.blocks.length - 1];
-      if (last?.type === 'text') {
-        last.content += event.content;
-      } else {
-        panel.blocks.push({ type: 'text', content: event.content });
-      }
-    } else if (event.type === 'tool_use') {
-      panel.blocks.push({
-        type: 'tool_call',
-        toolUseId: event.tool_use_id || '',
-        tool: event.tool,
-        input: event.input,
-        status: 'running',
-      });
-    } else if (event.type === 'tool_result') {
-      for (const b of panel.blocks) {
-        if (b.type === 'tool_call' && b.toolUseId === event.tool_use_id) {
-          b.result = event.result;
-          b.isError = event.is_error;
-          b.status = 'complete';
-          break;
-        }
-      }
-    }
-  }
-
-  // Third pass: settle workflow tabs from their progress snapshots (last wins).
+  // Second pass: settle workflow tabs from their progress snapshots (last wins).
   for (const event of events) {
     if (event.type !== 'workflow_progress') continue;
     const panel = panelMap.get(event.tool_use_id);

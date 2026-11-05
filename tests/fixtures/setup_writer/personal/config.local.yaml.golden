@@ -1,0 +1,17 @@
+# Nerve — Secrets (gitignored)
+# API keys, tokens, and other sensitive configuration.
+
+anthropic_api_key: anthropic-key-placeholder
+github_token: github-token-placeholder
+openai_api_key: openai-key-placeholder
+telegram:
+  bot_token: 0000000000:telegram-bot-token-placeholder
+  allowed_users:
+  - 111111
+  - 222222
+sync:
+  telegram:
+    api_id: 1234567
+    api_hash: telegram-api-hash-placeholder
+auth:
+  jwt_secret: <generated>

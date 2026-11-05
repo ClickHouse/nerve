@@ -19,8 +19,10 @@ Design notes:
   passed as a function arg, not part of the key, so adding a new
   decision doesn't need a new registry entry.
 - Dispatchers receive the raw notification dict, the target id, the
-  decision string, and the live ``NerveConfig`` (for the workspace
-  path; see ``mechanical-action`` below). The service-side caller is
+  decision string, the live ``NerveConfig`` (for the workspace
+  path; see ``mechanical-action`` below), and the keyword argument
+  ``actor``: the person who answered, or ``None`` when the answer came
+  through a channel that names no person. The service-side caller is
   responsible for committing the DB-level status flip, so dispatchers
   can stay pure-side-effect-only against the target system.
 - Dispatchers should be deterministic in their audit_event keys so the
@@ -36,10 +38,11 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Protocol
 
 if TYPE_CHECKING:
     from nerve.config import NerveConfig
+    from nerve.identity import Actor
 
 logger = logging.getLogger(__name__)
 
@@ -69,11 +72,18 @@ class DispatchResult:
       the row's ``redeliver_at`` (and pushes ``expires_at`` past it) so
       the periodic maintenance tick re-surfaces the card. None for
       approve / decline.
+    - ``after_snooze``: for a result that asks for a snooze, an async
+      callable that the service awaits with the result of its snooze write:
+      True when the row was snoozed, False when it was no longer pending
+      (for example, the expiry sweep took it during the dispatch). A
+      dispatcher that records the snooze uses it, because the snooze is the
+      service's write and comes after the dispatcher returns.
     """
 
     ok: bool
     audit_event: dict[str, Any] = field(default_factory=dict)
     snooze_until: str | None = None
+    after_snooze: Callable[[bool], Awaitable[None]] | None = None
 
 
 # ----------------------------------------------------------------------
@@ -81,14 +91,31 @@ class DispatchResult:
 # ----------------------------------------------------------------------
 
 
-# Sync dispatchers run in a worker thread (asyncio.to_thread); ASYNC
-# dispatchers (coroutine functions) are awaited directly on the event
-# loop — required when the dispatcher touches loop-bound services (e.g.
-# the review-loop decision handler CASes rows via aiosqlite).
-Dispatcher = Callable[
-    [dict[str, Any], str, str, "NerveConfig | None"],
-    "DispatchResult | Any",
-]
+class Dispatcher(Protocol):
+    """Acts on one approval decision.
+
+    Sync dispatchers run in a worker thread (asyncio.to_thread). ASYNC
+    dispatchers (coroutine functions) are awaited directly on the event
+    loop. A dispatcher that touches loop-bound services must be async (e.g.
+    the review-loop decision handler CASes rows via aiosqlite).
+
+    The service always passes ``actor`` as a keyword argument: the
+    person who answered (the signed-in actor of the web answer route), or
+    ``None`` for an answer through Telegram, Slack or a hosted channel,
+    which names a provider user and no person. A decision is the
+    answerer's own change, so its cause is the same actor. A dispatcher
+    that records the decision on its target passes this actor on.
+    """
+
+    def __call__(
+        self,
+        notification: dict[str, Any],
+        target_id: str,
+        decision: str,
+        config: "NerveConfig | None",
+        *,
+        actor: "Actor | None",
+    ) -> "DispatchResult | Awaitable[DispatchResult]": ...
 
 
 _DISPATCHERS: dict[str, Dispatcher] = {}
@@ -148,6 +175,8 @@ def _dispatch_mechanical_action(
     target_id: str,
     decision: str,
     config: "NerveConfig | None",
+    *,
+    actor: "Actor | None" = None,
 ) -> DispatchResult:
     """Approve / decline / snooze a queued mechanical-action proposal.
 
@@ -164,6 +193,10 @@ def _dispatch_mechanical_action(
     entry's ``not_before`` field. The returned ``snooze_until`` makes
     the service stamp the notification row's ``redeliver_at``, and the
     periodic maintenance tick re-delivers the card at that time.
+
+    ``actor`` is not given to the script, which takes no argument for it.
+    The service writes the actor ID into the ``approval-acted`` audit
+    record (``answered_by_actor_id``).
     """
     notif_id = notification.get("id", "")
     base_event: dict[str, Any] = {

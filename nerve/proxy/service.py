@@ -70,8 +70,9 @@ def _detect_asset_suffix() -> str:
 # documented as unsafe in a process that has threads (which the daemon does).
 # The shell sets the umask and then ``exec``s the proxy, so the pid Nerve tracks
 # and signals is unchanged. The native ``umask=`` / ``process_group=`` subprocess
-# kwargs are deliberately NOT used: the daemon runs its event loop on uvloop,
-# whose subprocess support rejects them (``ValueError: unexpected kwargs``).
+# kwargs are deliberately NOT used: the gateway can run on uvloop
+# (``gateway.loop``), whose subprocess support rejects them (``ValueError:
+# unexpected kwargs``).
 # ``start_new_session`` is accepted by both uvloop and the stdlib loop and gives
 # the proxy its own session/process group so signals aimed at Nerve miss it.
 
@@ -235,7 +236,21 @@ class ProxyService:
             "auth-dir": str(auth_dir),
             "api-keys": [self.config.proxy.api_key],
             "debug": False,
-            "request-retry": 3,
+            # Nerve drives the proxy with a single Claude credential, so its
+            # cooldown scheduler has nothing to fail over to: benching that
+            # credential takes the whole daemon offline. The scheduler also
+            # sizes the cooldown from the reset in Anthropic's rate-limit
+            # headers, which on a usage-based account is the monthly overage
+            # boundary, and because the cooldown is enforced locally no later
+            # request reaches Anthropic to see the limit lift. So cooldowns are
+            # off and the 429 goes back to the caller.
+            "disable-cooling": True,
+            # With cooldowns off a retry round re-sends to the same credential
+            # with no delay, so a 429 would cost several upstream requests per
+            # client attempt. The callers back off between attempts instead:
+            # the Claude CLI by itself, Nerve's own Anthropic clients via
+            # PROXY_CLIENT_MAX_RETRIES.
+            "request-retry": 0,
         }
 
         # Register a local Ollama server as an OpenAI-compatible upstream so
@@ -314,7 +329,7 @@ class ProxyService:
                 # its pid (the one stop() signals) is unchanged. Keeps the token
                 # JSON and per-request error logs the proxy creates owner-only
                 # (0600) without a preexec_fn callback or the native
-                # umask=/process_group= kwargs the daemon's uvloop loop rejects.
+                # umask=/process_group= kwargs that uvloop (gateway.loop) rejects.
                 # start_new_session detaches it into its own session/process
                 # group so signals aimed at Nerve's group miss the proxy.
                 "/bin/sh", "-c", 'umask 077 && exec "$0" "$@"',

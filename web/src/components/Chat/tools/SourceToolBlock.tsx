@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, Inbox, Radio, BookOpen, Loader2, Mail, Github, MessageCircle } from '../../ui/icons';
+import { ChevronRight, ChevronDown, Inbox, Radio, BookOpen, Loader2, Mail, Github, MessageCircle, Slack } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 
 /** Extract readable text from MCP content blocks or plain text. */
@@ -18,8 +18,8 @@ function extractText(result: string): string {
   return result;
 }
 
-/** Per-source identity hues — gmail red, github purple, telegram blue.
- *  Not status: a Gmail row is not an error because it is red. */
+/** Per-source identity hues — gmail red, github purple, telegram blue,
+ *  slack emerald. Not status: a Gmail row is not an error because it is red. */
 function sourceIcon(source: string) {
   const type = source.split(':')[0];
   switch (type) {
@@ -27,6 +27,7 @@ function sourceIcon(source: string) {
     case 'github': return <Github size={12} className="text-hue-purple" />;
     case 'github_repos': return <Github size={12} className="text-hue-purple" />;
     case 'telegram': return <MessageCircle size={12} className="text-hue-blue" />;
+    case 'slack': return <Slack size={12} className="text-hue-emerald" />;
     default: return <Inbox size={12} className="text-text-dim" />;
   }
 }

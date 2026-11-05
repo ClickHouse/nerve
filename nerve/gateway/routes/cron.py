@@ -6,6 +6,8 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.identity import Actor, attribution_for
+
 router = APIRouter(dependencies=[Depends(require_auth)])
 
 
@@ -19,6 +21,18 @@ async def list_cron_jobs():
 
     jobs = await _cron_service.list_jobs()
     return {"jobs": jobs}
+
+
+@router.get("/api/cron/schedule")
+async def cron_schedule():
+    """The next work the instance will start on its own, and what each job's
+    gates forecast for its next run (see ``CronService.schedule_report``)."""
+    from nerve.gateway.server import _cron_service
+
+    if not _cron_service:
+        return {"next": None, "jobs": []}
+
+    return await _cron_service.schedule_report()
 
 
 @router.post("/api/cron/reload")
@@ -38,23 +52,28 @@ async def reload_cron_jobs():
 
 
 @router.post("/api/cron/jobs/{job_id}/trigger")
-async def trigger_cron_job(job_id: str):
-    """Manually trigger a specific cron job or source runner."""
+async def trigger_cron_job(job_id: str, actor: Actor = Depends(require_auth)):
+    """Manually trigger a specific cron job or source runner.
+
+    The run log records the person as actor and cause. A job's turn runs as
+    the system actor on their behalf.
+    """
     from nerve.gateway.server import _cron_service
 
     if not _cron_service:
         raise HTTPException(status_code=503, detail="Cron service not available")
 
+    attribution = attribution_for(actor)
     # Source runner
     runners = getattr(_cron_service, "_source_runners", [])
     runner = next((r for r in runners if r.job_id == job_id), None)
     if runner:
-        await _cron_service._run_source_wrapper(runner)
+        await _cron_service._run_source_wrapper(runner, attribution, origin="manual")
         return {"job_id": job_id, "triggered": True}
 
     # Regular cron job
     try:
-        await _cron_service.run_job(job_id)
+        await _cron_service.run_job(job_id, attribution=attribution)
         return {"job_id": job_id, "triggered": True}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

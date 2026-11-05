@@ -1,15 +1,11 @@
 import type { ReactNode } from 'react';
 import type { ChatMessage, ImageBlockData, FileBlockData } from '../../types/chat';
 import { ActorLabel } from './ActorLabel';
-import { Download, FileText } from '../ui/icons';
-import { getToken } from '../../api/client';
+import { Clock, Download, FileText } from '../ui/icons';
+import { Badge } from '../ui';
+import { authUrl } from '../../api/hosted';
 import { formatMessageTime } from '../../utils/messageTime';
-
-function authUrl(url: string): string {
-  const token = getToken();
-  if (!token) return url;
-  return `${url}${url.includes('?') ? '&' : '?'}token=${token}`;
-}
+import { useAgentStore } from '../../stores/agentStore';
 
 export function UserMessage({ message, actions, showActor = false }: {
   message: ChatMessage;
@@ -19,6 +15,10 @@ export function UserMessage({ message, actions, showActor = false }: {
   showActor?: boolean;
 }) {
   const text = message.blocks.find(b => b.type === 'text')?.content || '';
+  // Sent from this tab while the server's run lock was held: it waits in the
+  // turn queue (and runs after the current turn).
+  const queued = useAgentStore(s => !!message.client_msg_id
+    && s.queue.some(q => q.client_msg_id === message.client_msg_id));
   const images = message.blocks.filter(b => b.type === 'image') as ImageBlockData[];
   const files = message.blocks.filter(b => b.type === 'file') as FileBlockData[];
 
@@ -65,7 +65,7 @@ export function UserMessage({ message, actions, showActor = false }: {
                 {files.map((file, idx) => (
                   <a
                     key={idx}
-                    href={`${file.url}${file.url.includes('?') ? '&' : '?'}token=${getToken()}`}
+                    href={authUrl(file.url)}
                     download={file.filename}
                     className="flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-surface hover:bg-surface-hover transition-colors text-sm text-text-secondary"
                   >
@@ -78,12 +78,18 @@ export function UserMessage({ message, actions, showActor = false }: {
             )}
           </div>
         </div>
-        {message.created_at && (
-          <div
-            className="mt-1 text-right text-2xs text-text-faint tabular-nums"
-            title={new Date(message.created_at).toLocaleString()}
-          >
-            {formatMessageTime(message.created_at)}
+        {(message.created_at || queued) && (
+          <div className="mt-1 flex items-center justify-end gap-2 text-2xs text-text-faint tabular-nums">
+            {queued && (
+              <Badge tone="neutral" size="xs" title="Waiting for the running turn to end">
+                <Clock size={10} aria-hidden="true" /> Queued
+              </Badge>
+            )}
+            {message.created_at && (
+              <span title={new Date(message.created_at).toLocaleString()}>
+                {formatMessageTime(message.created_at)}
+              </span>
+            )}
           </div>
         )}
       </div>

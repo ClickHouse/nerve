@@ -2,21 +2,45 @@
 
 Signing uses the secret pinned at startup. Verified tokens are resolved against
 the database on every request; a valid signature alone is not an identity.
+
+The authentication mode is pinned at startup from ``NERVE_AUTH_MODE``. In
+``external`` mode, the gateway names the person behind a request in the
+``X-Nerve-Actor-Context`` header (see :func:`read_actor_context`), and local
+logins and session tokens are not accepted.
 """
 
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import logging
+import os
+import re
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import bcrypt
 import jwt
 from fastapi import Depends, HTTPException, Request, WebSocket
+from starlette.types import ASGIApp, Receive, Scope, Send
 
-from nerve.config import NerveConfig, get_config
+from nerve.config import (
+    EXTERNAL_VERIFICATION_LOG,
+    ConfigError,
+    ExternalAuthConfig,
+    NerveConfig,
+    get_config,
+)
+from nerve.gateway.actor_context import (
+    ActorContextVerifier,
+    AssertionRejected,
+    KeysUnavailable,
+)
 from nerve.identity import (
+    ACTOR_KIND_HUMAN,
     Actor,
     ActorResolutionError,
     actor_for_account,
@@ -185,6 +209,84 @@ def effective_jwt_secret(config: NerveConfig | None = None) -> str:
     return cfg.auth.jwt_secret or ""
 
 
+# How this instance learns who makes a request. ``local``: local accounts and
+# session tokens. ``external``: the gateway names the person in the actor
+# context header. Only the environment sets the mode, and only at startup.
+AUTH_MODE_ENV = "NERVE_AUTH_MODE"
+AUTH_MODE_LOCAL = "local"
+AUTH_MODE_EXTERNAL = "external"
+AUTH_MODES = (AUTH_MODE_LOCAL, AUTH_MODE_EXTERNAL)
+
+
+def parse_auth_mode(value: str | None) -> str:
+    """Parse an authentication mode, and refuse a mode that does not exist.
+
+    Unset or blank is ``local``. An unknown value is an error and does not
+    fall back to ``local``: an operator who asks for one mode must not get a
+    different mode without notice.
+    """
+    if value is None:
+        return AUTH_MODE_LOCAL
+    text = str(value).strip().lower()
+    if not text:
+        return AUTH_MODE_LOCAL
+    if text in AUTH_MODES:
+        return text
+    accepted = ", ".join(repr(mode) for mode in AUTH_MODES)
+    raise ConfigError(
+        f"{AUTH_MODE_ENV} must be one of {accepted}, got {value!r}. "
+        f"Unset {AUTH_MODE_ENV} to run in local mode."
+    )
+
+
+def auth_mode_from_env() -> str:
+    """Read and parse ``NERVE_AUTH_MODE``."""
+    return parse_auth_mode(os.environ.get(AUTH_MODE_ENV))
+
+
+# Pinned once by create_app(). A configuration reload does not read it.
+_pinned_auth_mode: str | None = None
+
+
+def pin_auth_mode(mode: str) -> None:
+    """Pin the authentication mode for this process.
+
+    A second pin of the same mode has no effect. A different mode raises
+    :class:`ConfigError`, because the mode changes only with a restart.
+    """
+    global _pinned_auth_mode
+    if mode not in AUTH_MODES:
+        raise ValueError(f"unknown authentication mode {mode!r}")
+    if _pinned_auth_mode is not None and _pinned_auth_mode != mode:
+        raise ConfigError(
+            f"The authentication mode {_pinned_auth_mode!r} is already pinned for "
+            f"this process; {mode!r} was offered. Restart to change {AUTH_MODE_ENV}."
+        )
+    _pinned_auth_mode = mode
+
+
+def unpin_auth_mode() -> None:
+    """Clear the pinned authentication mode for tests."""
+    global _pinned_auth_mode
+    _pinned_auth_mode = None
+
+
+def auth_mode() -> str:
+    """Return the pinned mode, or the mode in the environment before startup.
+
+    CLI commands such as ``nerve init`` and ``nerve doctor`` do not start the
+    gateway, so they read the environment.
+    """
+    if _pinned_auth_mode is not None:
+        return _pinned_auth_mode
+    return auth_mode_from_env()
+
+
+def is_external_mode() -> bool:
+    """Whether the gateway names the person behind each request."""
+    return auth_mode() == AUTH_MODE_EXTERNAL
+
+
 def create_session_token(
     jwt_secret: str, account_id: str, expiry_hours: int | None = None,
 ) -> str:
@@ -333,14 +435,27 @@ def identity_store() -> "Database | None":
     return getattr(deps, "db", None)
 
 
+EXTERNAL_SESSION_DETAIL = (
+    "Session tokens are not accepted in external mode; the gateway names the "
+    "person behind each request"
+)
+
+
 async def resolve_actor_from_claims(store: "Database", claims: dict) -> Actor:
-    """Resolve verified token claims to their current actor."""
+    """Resolve verified token claims to their current actor.
+
+    In external mode, session tokens name no actor: only system and MCP
+    tokens are accepted, and they give the system actor.
+    """
     if claims.get("aud") == MCP_AUDIENCE:
         return store.system_actor
 
     token_type = claims.get(TOKEN_TYPE_CLAIM)
     if token_type == TOKEN_TYPE_SYSTEM:
         return store.system_actor
+    is_session = token_type == TOKEN_TYPE_SESSION or is_legacy_session_token(claims)
+    if is_session and is_external_mode():
+        raise ActorResolutionError(EXTERNAL_SESSION_DETAIL)
     if token_type == TOKEN_TYPE_SESSION:
         return await actor_for_account(store, claims.get("sub"))
     if is_legacy_session_token(claims):
@@ -349,11 +464,282 @@ async def resolve_actor_from_claims(store: "Database", claims: dict) -> Actor:
     raise ActorResolutionError("This credential names no actor")
 
 
+# In external mode, the gateway sends the person behind a request in this
+# header, as a compact JWS.
+ACTOR_CONTEXT_HEADER = "X-Nerve-Actor-Context"
+
+_BASE64URL = re.compile(r"[A-Za-z0-9_-]*")
+
+
+class ActorContextError(ValueError):
+    """The actor context header cannot be read."""
+
+
+def decode_actor_context(value: str) -> tuple[str, str | None]:
+    """Return the principal ID and display name in an actor context header.
+
+    The value is a compact JWS. This function decodes the payload and does
+    not check the signature. Every reader of the header calls
+    :func:`read_actor_context`, which checks the signature and the claims
+    first when ``auth.external.gateway_jwks_file`` is set. Without it, Nerve
+    trusts every caller that can reach it, and external mode needs the
+    gateway to be the only caller.
+
+    The principal ID is returned as a canonical lower-case UUID string.
+    Raises :class:`ActorContextError` when the value cannot be read.
+    """
+    parts = value.split(".")
+    if len(parts) != 3:
+        raise ActorContextError("The actor context is not a compact JWS")
+    segment = parts[1]
+    if not _BASE64URL.fullmatch(segment):
+        raise ActorContextError("The actor context payload is not base64url")
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(segment + "=" * (-len(segment) % 4)))
+    except (binascii.Error, ValueError, RecursionError) as e:
+        # RecursionError: JSON that is nested too deeply to parse.
+        raise ActorContextError("The actor context payload is not base64url JSON") from e
+    if not isinstance(claims, dict):
+        raise ActorContextError("The actor context payload is not a JSON object")
+
+    principal = claims.get("principal_id")
+    if not isinstance(principal, str):
+        raise ActorContextError("The actor context names no principal")
+    try:
+        principal_id = str(UUID(principal))
+    except ValueError as e:
+        raise ActorContextError("The actor context principal is not a UUID") from e
+
+    profile = claims.get("profile")
+    if profile is None:
+        return principal_id, None
+    if not isinstance(profile, dict):
+        raise ActorContextError("The actor context profile is not a JSON object")
+    display_name = profile.get("display_name")
+    if display_name is None:
+        return principal_id, None
+    if not isinstance(display_name, str):
+        raise ActorContextError("The actor context display name is not a string")
+    try:
+        # JSON can carry a lone UTF-16 surrogate, which SQLite cannot store.
+        display_name.encode("utf-8")
+    except UnicodeEncodeError as e:
+        raise ActorContextError("The actor context display name is not valid UTF-8") from e
+    return principal_id, display_name
+
+
+NO_ACTOR_KEYS_DETAIL = (
+    "The gateway's actor signing keys are not available; see the server log"
+)
+
+
+class ActorKeysUnavailable(ActorResolutionError):
+    """No usable key set is loaded to check the actor context with."""
+
+
+# The verifier of auth.external, made on first use and again when its key
+# file, tenant or agent changes. Its replay cache lives as long as it does.
+_actor_verifier: ActorContextVerifier | None = None
+
+
+def actor_context_verifier(settings: ExternalAuthConfig) -> ActorContextVerifier:
+    """Return the verifier for *settings*, which name a key file.
+
+    Raises :class:`~nerve.gateway.actor_context.KeysUnavailable` when the
+    settings cannot be used.
+    """
+    global _actor_verifier
+    problems = settings.problems()
+    if problems:
+        raise KeysUnavailable("; ".join(problems))
+    wanted = (settings.gateway_jwks_file, settings.tenant_id, settings.agent_id)
+    verifier = _actor_verifier
+    if verifier is None or (verifier.key_file, verifier.tenant_id, verifier.agent_id) != wanted:
+        verifier = _actor_verifier = ActorContextVerifier(*wanted)
+    return verifier
+
+
+def reload_actor_context_keys() -> str | None:
+    """Read the gateway key file of the actor context check again, for a reload.
+
+    ``None`` in local mode or without ``auth.external.gateway_jwks_file``.
+    Raises and keeps the current keys when the file cannot be used. Changed
+    settings make a new verifier, which reads the file itself.
+    """
+    settings = get_config().auth.external
+    if not is_external_mode() or settings.gateway_jwks_file is None:
+        return None
+    previous = _actor_verifier
+    verifier = actor_context_verifier(settings)
+    if verifier is previous:
+        return f"{verifier.reload_keys()} gateway key(s)"
+    if not verifier.key_count:
+        raise KeysUnavailable(f"no usable key set was read from {verifier.key_file}")
+    return f"{verifier.key_count} gateway key(s)"
+
+
+def _request_target(scope: Scope) -> str:
+    """The request-target that Nerve received: the raw path, and ``?`` and
+    the query when the query is not empty."""
+    raw_path = scope.get("raw_path") or scope["path"].encode("utf-8")
+    target = raw_path.decode("latin-1")
+    query = scope.get("query_string") or b""
+    return f"{target}?{query.decode('latin-1')}" if query else target
+
+
+def _check_actor_context(
+    value: str, scope: Scope, settings: ExternalAuthConfig,
+) -> tuple[str, str | None]:
+    """Verify *value* against the request in *scope*, then decode it."""
+    websocket = scope["type"] == "websocket"
+    try:
+        actor_context_verifier(settings).verify(
+            value,
+            method="GET" if websocket else scope["method"],
+            target=_request_target(scope),
+            websocket=websocket,
+        )
+    except (AssertionRejected, KeysUnavailable) as e:
+        if settings.verification != EXTERNAL_VERIFICATION_LOG:
+            logger.warning("%s refused: %s", ACTOR_CONTEXT_HEADER, e)
+            if isinstance(e, KeysUnavailable):
+                raise ActorKeysUnavailable(NO_ACTOR_KEYS_DETAIL) from None
+            raise ActorContextError("The actor context failed verification") from None
+        logger.warning(
+            "%s check failed; it is used anyway, because "
+            "auth.external.verification is log: %s", ACTOR_CONTEXT_HEADER, e,
+        )
+    return decode_actor_context(value)
+
+
+# Where ActorContextMiddleware leaves the outcome of the check in the scope
+# state: the principal ID and display name, or the error to raise.
+ACTOR_CONTEXT_STATE = "nerve_actor_context"
+
+
+class ActorContextMiddleware:
+    """Check the actor context of each HTTP request when the request arrives.
+
+    FastAPI reads the request body before it runs :func:`require_auth`, so a
+    check there would see a slow upload only after its assertion expired.
+    This check runs before the body is read, once, and leaves its outcome in
+    the scope state for :func:`read_actor_context`. A request without
+    exactly one header is left to :func:`require_auth`. A WebSocket upgrade
+    has no body, and is checked when it is accepted.
+    """
+
+    _HEADER = ACTOR_CONTEXT_HEADER.lower().encode("latin-1")
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            self._check(scope)
+        await self.app(scope, receive, send)
+
+    def _check(self, scope: Scope) -> None:
+        settings = get_config().auth.external
+        if settings.gateway_jwks_file is None:
+            return
+        values = [value for key, value in scope["headers"] if key == self._HEADER]
+        if len(values) != 1:
+            return
+        try:
+            outcome = _check_actor_context(values[0].decode("latin-1"), scope, settings)
+        except (ActorContextError, ActorKeysUnavailable) as e:
+            outcome = e
+        scope.setdefault("state", {})[ACTOR_CONTEXT_STATE] = outcome
+
+
+def read_actor_context(
+    value: str, connection: Request | WebSocket,
+) -> tuple[str, str | None]:
+    """Return the principal ID and display name in a request's actor context.
+
+    Without ``auth.external.gateway_jwks_file`` this is
+    :func:`decode_actor_context`. With it, the gateway's signature and the
+    claims are checked first, against *connection*, the request or the
+    WebSocket upgrade (see :mod:`nerve.gateway.actor_context`):
+    :class:`ActorContextMiddleware` checks an HTTP request when it arrives,
+    and this function takes that outcome, or checks now. A failed check
+    raises :class:`ActorContextError`, and a missing key set raises
+    :class:`ActorKeysUnavailable`; the reason goes to the log only. With
+    ``verification: log``, the failure is logged and the header is decoded
+    without the check.
+    """
+    settings = get_config().auth.external
+    if settings.gateway_jwks_file is None:
+        return decode_actor_context(value)
+    state = connection.scope.get("state") or {}
+    if ACTOR_CONTEXT_STATE not in state:
+        return _check_actor_context(value, connection.scope, settings)
+    outcome = state[ACTOR_CONTEXT_STATE]
+    if isinstance(outcome, Exception):
+        raise outcome
+    return outcome
+
+
+async def resolve_external_actor(
+    store: "Database", values: list[str], connection: Request | WebSocket,
+) -> Actor:
+    """Resolve the actor context header of a request to a human actor.
+
+    ``values`` holds each actor context header of ``connection``, the
+    request or the WebSocket upgrade. A request must have exactly one, so
+    that no reader can take a different value.
+
+    Adds the ``actor_refs`` row on first sight and writes a changed display
+    name, before the request can write anything that refers to the actor.
+    The actor has no local account.
+    """
+    if len(values) != 1:
+        raise ActorResolutionError(
+            f"The request must have one {ACTOR_CONTEXT_HEADER} header, "
+            f"not {len(values)}"
+        )
+    try:
+        actor_id, display_name = read_actor_context(values[0], connection)
+    except ActorContextError as e:
+        raise ActorResolutionError(str(e)) from e
+    try:
+        await store.upsert_external_actor(actor_id, display_name)
+    except sqlite3.IntegrityError as e:
+        # A schema trigger refuses the system actor's ID.
+        raise ActorResolutionError(
+            "The actor context names an actor that cannot act as a person"
+        ) from e
+    return Actor(
+        actor_id=actor_id,
+        kind=ACTOR_KIND_HUMAN,
+        account_id=None,
+        display_name=display_name,
+    )
+
+
 async def require_auth(request: Request) -> Actor:
-    """Authenticate an HTTP request and return its request-local actor."""
+    """Authenticate an HTTP request and return its request-local actor.
+
+    In external mode, a request with the actor context header acts as the
+    person it names, and its tokens and cookies are ignored. A request
+    without the header can authenticate only with a system or MCP token.
+    """
     secret = effective_jwt_secret(get_config())
     if not secret:
         raise HTTPException(status_code=503, detail=NO_SECRET_DETAIL)
+
+    external = is_external_mode()
+    contexts = request.headers.getlist(ACTOR_CONTEXT_HEADER) if external else []
+    if contexts:
+        store = identity_store()
+        if store is None:
+            raise HTTPException(status_code=503, detail=NO_IDENTITY_DETAIL)
+        try:
+            return await resolve_external_actor(store, contexts, request)
+        except ActorKeysUnavailable as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        except ActorResolutionError as e:
+            raise HTTPException(status_code=401, detail=str(e)) from e
 
     token = get_token_from_request(request)
     payload = decode_token(token, secret)
@@ -366,6 +752,10 @@ async def require_auth(request: Request) -> Actor:
     except ActorResolutionError as e:
         raise HTTPException(status_code=401, detail=str(e)) from e
 
+    if external:
+        # External mode accepts no session tokens, so it has none to refresh.
+        return actor
+
     # Middleware emits this without changing route response models.
     if is_legacy_session_token(payload) and actor.account_id:
         request.state.refreshed_token = create_session_token(secret, actor.account_id)
@@ -377,10 +767,28 @@ async def require_auth(request: Request) -> Actor:
 
 
 async def authenticate_websocket(websocket: WebSocket) -> Actor | None:
-    """Resolve a WebSocket actor when the connection is admitted."""
+    """Resolve a WebSocket actor when the connection is admitted.
+
+    In external mode, the gateway signs the upgrade request, so the actor
+    context header names the person, as for HTTP requests. The socket is
+    accepted before this runs, so a failed check and a missing key set both
+    refuse it in the same way.
+    """
     secret = effective_jwt_secret(get_config())
     if not secret:
         return None  # fail closed, as require_auth does
+
+    if is_external_mode():
+        contexts = websocket.headers.getlist(ACTOR_CONTEXT_HEADER)
+        if contexts:
+            store = identity_store()
+            if store is None:
+                return None
+            try:
+                return await resolve_external_actor(store, contexts, websocket)
+            except ActorResolutionError as e:
+                logger.info("WebSocket refused: %s", e)
+                return None
 
     token = websocket.query_params.get("token") or websocket.cookies.get("nerve_token")
     if not token:

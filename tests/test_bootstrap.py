@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import stat
 import subprocess
 from pathlib import Path
@@ -25,7 +26,9 @@ from nerve.bootstrap import (
     _DOCKER_ENTRYPOINT_TEMPLATE,
     _DOCKERIGNORE_TEMPLATE,
 )
+from nerve import paths
 from nerve.cli import main
+from nerve.config import DEFAULT_MODEL
 
 
 @pytest.fixture
@@ -131,6 +134,27 @@ class TestNonInteractiveSetup:
         assert (ws / "config" / "cron" / "jobs.yaml").exists()
         assert (ws / "config" / "cron" / "gates").is_dir()
 
+    @pytest.mark.parametrize(("value", "written"), [
+        ("", "America/New_York"),
+        ("Local", "America/New_York"),
+        (" Europe/Berlin ", "Europe/Berlin"),
+    ])
+    def test_time_zone_follows_the_default_time_zone_rules(self, tmp_path: Path, value: str, written: str) -> None:
+        """The installer reads ``NERVE_TIMEZONE`` as the config does: an empty
+        or refused value gives the fallback, and spaces are removed."""
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-testkey123",
+            "NERVE_MODE": "personal",
+            "NERVE_WORKSPACE": str(tmp_path / "workspace"),
+            "NERVE_TIMEZONE": value,
+        }
+        with patch.dict(os.environ, env, clear=False):
+            run_non_interactive(tmp_path)
+        settings = yaml.safe_load(
+            (tmp_path / "workspace" / "config" / "settings.yaml").read_text()
+        )
+        assert settings["timezone"] == written
+
     def test_worker_mode(self, tmp_path: Path) -> None:
         """Worker mode should create minimal workspace."""
         env = {
@@ -202,6 +226,39 @@ class TestNonInteractiveSetup:
         assert "inbox-processor" in choices.enabled_crons
         assert "task-planner" in choices.enabled_crons
 
+    def test_worker_mode_defaults(self, tmp_path: Path) -> None:
+        """Worker non-interactive: the two skill jobs and machine maintenance
+        on, task-planner written but off (the onboarding conversation decides), quiet hours none."""
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-REPLACE",
+            "NERVE_MODE": "worker",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_TASK": "Watch the nightly build for example/repo and propose fixes.",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            choices = run_non_interactive(tmp_path)
+
+        assert choices.enabled_crons == ["skill-reviser", "skill-extractor", "machine-maintenance"]
+        ws = tmp_path / "ws"
+        system = yaml.safe_load((ws / "config" / "cron" / "system.yaml").read_text())
+        assert {job["id"]: job["enabled"] for job in system["jobs"]} == {
+            "memory-maintenance": True, "task-planner": False,
+            "skill-extractor": True, "skill-reviser": True, "machine-maintenance": True,
+        }
+        settings = yaml.safe_load((ws / "config" / "settings.yaml").read_text())
+        assert (settings["quiet_start"], settings["quiet_end"]) == ("", "")
+
+    def test_personal_mode_keeps_its_quiet_hours(self, tmp_path: Path) -> None:
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-REPLACE",
+            "NERVE_MODE": "personal",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+        }
+        with patch.dict(os.environ, env, clear=False):
+            run_non_interactive(tmp_path)
+        settings = yaml.safe_load((tmp_path / "ws" / "config" / "settings.yaml").read_text())
+        assert (settings["quiet_start"], settings["quiet_end"]) == ("02:00", "08:00")
+
     def test_inbox_processor_default_has_idle_gate(self) -> None:
         """The default inbox-processor ships gated so idle polls are skipped."""
         from nerve.bootstrap import PRODUCTIVITY_CRONS
@@ -215,6 +272,23 @@ class TestNonInteractiveSetup:
         # No hard-coded sources → the generic "any source" form.
         assert "sources" not in spec
         assert isinstance(build_gate(spec), MessagesGate)
+
+
+class TestTerminalWizardTimeZone:
+    def test_the_prompt_offers_the_default_time_zone(self, tmp_path: Path, monkeypatch) -> None:
+        monkeypatch.setenv("NERVE_TIMEZONE", "Europe/Berlin")
+        defaults: dict[str, str] = {}
+
+        def prompt(text, default=None, **kwargs):
+            defaults[text] = default
+            return default
+
+        monkeypatch.setattr(click, "prompt", prompt)
+        monkeypatch.setattr(click, "clear", lambda: None)
+        wizard = SetupWizard(tmp_path)
+        wizard._step_identity()
+        assert defaults["Your timezone"] == "Europe/Berlin"
+        assert wizard.choices.timezone == "Europe/Berlin"
 
 
 class TestDeferredWrites:
@@ -292,6 +366,29 @@ class TestCliInit:
         assert result.exit_code == 0
         assert (tmp_path / "config.local.yaml").exists()
 
+    @pytest.mark.parametrize("task, rows", [
+        ("Monitor CI and fix flaky tests", [("requested", "autonomous", None)]),
+        ("", []),
+    ])
+    def test_a_worker_with_a_task_sets_itself_up_at_the_next_start(
+        self, tmp_path: Path, task: str, rows: list,
+    ) -> None:
+        """With a task description, the next start runs the autonomous
+        onboarding; without one, the worker waits for the conversation in
+        the web UI (no onboarding row)."""
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-api03-clitest",
+            "NERVE_MODE": "worker",
+            "NERVE_TASK": task,
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+        }
+        result = CliRunner().invoke(main, ["-c", str(tmp_path), "init", "--non-interactive"], env=env)
+        assert result.exit_code == 0, result.output
+        with sqlite3.connect(paths.db_path()) as conn:
+            found = conn.execute("SELECT status, kind, session_id FROM onboarding").fetchall()
+        assert found == rows
+        assert ("sets itself up" in result.output) is bool(rows)
+
     def test_reinit_prompt_describes_the_backups_it_actually_makes(
         self, configured_dir: Path
     ) -> None:
@@ -302,9 +399,13 @@ class TestCliInit:
         lose and lives in a git-tracked directory. So a flat "all three are
         backed up" is a promise the code does not keep, exactly where being
         misled costs the most.
+
+        The regenerate-with-backup prompt belongs to the full terminal wizard
+        (``--terminal``); the default ``nerve init`` on a configured install
+        prints the status and exits without touching anything.
         """
         result = CliRunner().invoke(
-            main, ["-c", str(configured_dir), "init"], input="n\n"
+            main, ["-c", str(configured_dir), "init", "--terminal"], input="n\n"
         )
         assert result.exit_code == 0
         assert "*.bak" in result.output
@@ -1393,7 +1494,7 @@ class TestPortableSettingsSplit:
         assert after["provider"]["type"] == "anthropic"
         assert "aws_region" not in after.get("provider", {})
         # The non-prefixed names overwrite rather than needing deletion.
-        assert after["agent"]["model"] == "claude-opus-5"
+        assert after["agent"]["model"] == DEFAULT_MODEL
 
     def test_gateway_host_and_port_are_shared(self, tmp_path: Path) -> None:
         """The tracked layer has to be able to state the bind address.
@@ -1448,9 +1549,7 @@ class TestPortableSettingsSplit:
         """
         self._wizard(tmp_path)._apply()
         settings_path = tmp_path / "workspace" / "config" / "settings.yaml"
-        assert yaml.safe_load(settings_path.read_text())["agent"]["model"] == (
-            "claude-opus-5"
-        )
+        assert yaml.safe_load(settings_path.read_text())["agent"]["model"] == DEFAULT_MODEL
 
         self._wizard(
             tmp_path, provider_type="bedrock", aws_region="eu-west-1"
@@ -1533,6 +1632,34 @@ class TestPortableSettingsSplit:
         assert cfg.gateway.port == 8900                     # from config.yaml
         assert cfg.agent.thinking == "max"                  # from settings.yaml
         assert cfg.sessions.max_sessions == 500             # from settings.yaml
+
+
+class TestWizardWorkerStep:
+    """The task description is optional: without one, the worker is set up
+    in the onboarding conversation in the web UI."""
+
+    def _run(self, tmp_path: Path, answer: str, capsys) -> tuple[SetupChoices, dict, str]:
+        wizard = SetupWizard(tmp_path)
+        wizard._next_step = lambda title: title
+        asked: dict = {}
+
+        def prompt(text, **kwargs):
+            asked.update(kwargs, text=text)
+            return answer
+
+        with patch("click.clear"), patch("click.prompt", side_effect=prompt):
+            wizard._step_worker_setup()
+        return wizard.choices, asked, capsys.readouterr().out
+
+    def test_an_empty_answer_leaves_the_setup_to_the_conversation(self, tmp_path: Path, capsys) -> None:
+        choices, asked, out = self._run(tmp_path, "  ", capsys)
+        assert asked["default"] == "" and choices.task_description == ""
+        assert "onboarding conversation" in out and "setup agent" not in out
+
+    def test_a_description_gets_the_setup_agent(self, tmp_path: Path, capsys) -> None:
+        choices, _, out = self._run(tmp_path, "Monitor CI and fix flaky tests", capsys)
+        assert choices.task_description == "Monitor CI and fix flaky tests"
+        assert "setup agent" in out
 
 
 class TestWizardPasswordStep:

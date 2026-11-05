@@ -13,6 +13,11 @@ from collections.abc import Mapping
 
 _SERIAL_TABLES = {
     "cron_logs",
+    "channel_observations",
+    "task_status_events",
+    "review_loop_decisions",
+    "session_agent_events",
+    "task_comments",
     "mcp_tool_usage",
     "memu_audit_log",
     "messages",
@@ -26,23 +31,45 @@ _SERIAL_TABLES = {
 _TOKENS = re.compile(r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|--[^\n]*|/\*.*?\*/|\?", re.S)
 
 
+ACTOR_REF_COLUMNS_QUERY = """
+SELECT t.relname, a.attname
+FROM pg_constraint c
+JOIN pg_class t ON t.oid=c.conrelid
+JOIN pg_namespace n ON n.oid=t.relnamespace
+JOIN LATERAL unnest(c.conkey,c.confkey) AS k(src,dst) ON true
+JOIN pg_attribute a ON a.attrelid=c.conrelid AND a.attnum=k.src
+JOIN pg_attribute ref ON ref.attrelid=c.confrelid AND ref.attnum=k.dst
+WHERE c.contype='f' AND c.confrelid='nerve_pg.actor_refs'::regclass
+  AND n.nspname='nerve_pg' AND ref.attname='id'
+ORDER BY t.relname,a.attname
+"""
+
+
 def translate(sql):
     """Translate the finite SQL dialect used by the operational stores."""
+    from nerve.db.accounts import ACTOR_REF_COLUMNS_SQL
+
+    if sql == ACTOR_REF_COLUMNS_SQL:
+        return ACTOR_REF_COLUMNS_QUERY, False
     sql = sql.strip().rstrip(";")
     if sql in ("PRAGMA secure_delete=ON", "PRAGMA secure_delete=OFF"):
         return "SELECT 1", False
     if re.search(r"\b(?:PRAGMA|sqlite_master|sqlite_sequence)\b", sql, re.I):
         raise NotImplementedError("SQLite administration is unavailable on PostgreSQL")
+    sql = sql.replace("COLLATE BINARY", 'COLLATE "C"')
     sql = re.sub(r"(\w+) = \? COLLATE NOCASE", r"lower(\1) = lower(?)", sql)
     sql = sql.replace(
         "CAST(strftime('%s', u.created_at) AS REAL)",
         "EXTRACT(EPOCH FROM u.created_at::timestamptz)",
     )
     sql = re.sub(r"\bLIKE\b", "ILIKE", sql)
+    sql = sql.replace("MAX(rev + 1, ?)", "GREATEST(rev + 1, ?)")
+    sql = sql.replace("IS NOT excluded.", "IS DISTINCT FROM excluded.")
     replace = re.match(r"INSERT OR REPLACE INTO (\w+)\s*\(([^)]+)\)", sql, re.I)
     if replace:
         keys = {
             "sync_cursors": "source",
+            "session_deletions": "session_id",
             "channel_sessions": "channel_key",
             "consumer_cursors": "consumer, source",
         }
@@ -156,7 +183,10 @@ class Execute:
                 )
         except psycopg.IntegrityError as exc:
             # The existing domain methods catch this portable constraint error.
-            raise sqlite3.IntegrityError(str(exc)) from exc
+            kind = {"23503": "FOREIGN KEY", "23505": "UNIQUE"}.get(
+                exc.sqlstate, "Constraint"
+            )
+            raise sqlite3.IntegrityError(f"{kind}: {exc}") from exc
 
     def __await__(self):
         return self._run().__await__()

@@ -31,7 +31,7 @@ export function TasksPage() {
     tasks, filter, searchQuery, sort, page, total, loading, showCreateDialog,
     viewMode, loadTasks, loadBoard, loadTags, setViewMode,
     setFilter, setSearch, setSort, setPage,
-    updateStatus, createTask, setShowCreateDialog,
+    updateStatus, createTask, setShowCreateDialog, createInStatus,
   } = useTaskStore();
 
   const loadStatuses = useTaskStatusStore((s) => s.load);
@@ -287,6 +287,7 @@ export function TasksPage() {
         <TaskCreateDialog
           onClose={() => setShowCreateDialog(false)}
           onCreate={createTask}
+          initialStatus={createInStatus}
         />
       )}
 

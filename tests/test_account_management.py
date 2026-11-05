@@ -699,8 +699,12 @@ class TestTheRouteSurface:
             prompt_rewrite, review_loops, sessions, setup, skills, sources,
             tasks, workflow_runs,
         ]
-        for module in modules:
-            for route in module.router.routes:
+        routers = [module.router for module in modules]
+        # The first-account claim lives on its own router (registered only in
+        # local mode); it is part of the surface this surveys.
+        routers.append(setup.claim_router)
+        for router in routers:
+            for route in router.routes:
                 endpoint = getattr(route, "endpoint", None)
                 if endpoint is None:
                     continue
@@ -725,6 +729,9 @@ class TestTheRouteSurface:
             if path.startswith("/api")
             and "require_auth" not in gates
             and "require_account" not in gates
+            # The setup checklist's gate: require_auth plus "is a person"
+            # (tests/test_setup_hygiene.py pins that dependency).
+            and "require_person" not in gates
         }
         assert open_endpoints == {
             (("POST",), "/api/auth/login"),

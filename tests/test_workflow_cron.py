@@ -8,8 +8,12 @@ import pytest
 import pytest_asyncio
 
 import nerve.workflows
+from nerve.agent.engine import TurnOutcome, TurnResult
 from nerve.cron.jobs import CronJob, load_jobs, save_jobs
 from nerve.cron.service import CronService
+from nerve.identity import Attribution
+
+from tests.actor_rows import FAKE_SYSTEM_ACTOR, mock_system_principal
 
 
 # ---------------------------------------------------------------------------
@@ -43,8 +47,8 @@ def _make_cron_service() -> CronService:
     config.sessions.cron_session_mode = "per_run"
 
     engine = AsyncMock()
-    engine.run_cron = AsyncMock(return_value="ok")
-    engine.run_persistent_cron = AsyncMock(return_value="ok")
+    engine.run_cron = AsyncMock(return_value=TurnResult("ok", TurnOutcome()))
+    engine.run_persistent_cron = AsyncMock(return_value=TurnResult("ok", TurnOutcome()))
 
     db = AsyncMock()
     db.log_cron_start = AsyncMock(return_value=1)
@@ -54,6 +58,9 @@ def _make_cron_service() -> CronService:
     db.get_channel_session = AsyncMock(return_value=None)
     db.get_session = AsyncMock(return_value=None)
     db.set_channel_session = AsyncMock()
+    # A scheduled workflow run and its run log are attributed to the
+    # agent's system actor.
+    mock_system_principal(db)
 
     return CronService(config, engine, db)
 
@@ -199,6 +206,25 @@ class TestRunWorkflowJob:
             budget_usd=5.0,
             title="Nightly audit",
             created_by="cron:wf-job",
+            # Scheduled work: the system actor, for itself.
+            attribution=Attribution(
+                actor_id=FAKE_SYSTEM_ACTOR.actor_id,
+                caused_by_actor_id=FAKE_SYSTEM_ACTOR.actor_id,
+            ),
+        )
+
+    async def test_a_run_that_a_person_started_runs_for_that_person(
+        self, cron_service, workflow_service,
+    ):
+        alice = "00000000-0000-4000-8000-0000000a11ce"
+
+        await cron_service._run_job_inner(
+            _workflow_job(), Attribution(actor_id=alice, caused_by_actor_id=alice),
+        )
+
+        # The cron service starts the run on Alice's behalf.
+        assert workflow_service.start_run.await_args.kwargs["attribution"] == (
+            Attribution(actor_id=FAKE_SYSTEM_ACTOR.actor_id, caused_by_actor_id=alice)
         )
 
     async def test_links_run_session_and_logs_success(

@@ -5,11 +5,20 @@ from __future__ import annotations
 import importlib.resources
 import logging
 import shutil
+from collections.abc import Collection
 from pathlib import Path
+
+import nerve
 
 logger = logging.getLogger(__name__)
 
 VALID_MODES = ("personal", "worker")
+
+# The worker guide the onboarding conversation of a worker is given in full. The
+# checkout's ``docs/`` copy is the source of truth; the copy under
+# ``templates/guides/`` ships in the wheel for installs without the repository
+# and must stay byte-identical (``tests/test_worker_onboarding.py`` says so).
+WORKER_GUIDE = "worker-best-practices.md"
 
 
 def _get_template_dir(mode: str) -> Path:
@@ -33,6 +42,44 @@ def _get_template_dir(mode: str) -> Path:
         return template_path
 
     raise FileNotFoundError(f"Template directory not found for mode '{mode}'")
+
+
+def template_file(mode: str, filename: str) -> Path:
+    """The packaged template ``filename`` for ``mode``.
+
+    For writers that render a template rather than copy it (a worker's
+    ``TASK.md`` gets the task description substituted in). Raises
+    :class:`FileNotFoundError` when the file is not shipped.
+    """
+    path = _get_template_dir(mode) / filename
+    if not path.is_file():
+        raise FileNotFoundError(f"Template file not found: {path}")
+    return path
+
+
+def worker_guide_paths() -> tuple[Path, Path]:
+    """Where :data:`WORKER_GUIDE` is read from, in order of preference.
+
+    The source root's ``docs/`` first (a checkout, the editable install the
+    Docker image runs), then the packaged copy for a wheel install, where no
+    ``docs/`` directory exists next to the package.
+    """
+    package = Path(nerve.__file__).resolve().parent
+    return (
+        package.parent / "docs" / WORKER_GUIDE,
+        package / "templates" / "guides" / WORKER_GUIDE,
+    )
+
+
+def read_worker_guide() -> str:
+    """The full text of the worker guide, or ``""`` when neither copy is readable."""
+    for path in worker_guide_paths():
+        try:
+            return path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+    logger.warning("Worker guide not found at any of %s", [str(p) for p in worker_guide_paths()])
+    return ""
 
 
 def read_manifest(mode: str) -> list[tuple[str, str]]:
@@ -83,7 +130,22 @@ def _get_bundled_skills_dir() -> Path | None:
     return None
 
 
-def install_bundled_skills(workspace_path: Path) -> list[str]:
+def _write_template(src: Path, dst: Path, relative: str, memory_backend: str) -> None:
+    """Copy one template file to ``dst``. Under the Loom backend a template
+    that names Nerve's memory tools gets Loom's wording instead
+    (:func:`nerve.memory.loom_prompts.template_text`)."""
+    if memory_backend == "loom":
+        from nerve.memory.loom_prompts import template_text
+
+        text = src.read_text(encoding="utf-8")
+        loom_text = template_text(relative, text)
+        if loom_text != text:
+            dst.write_text(loom_text, encoding="utf-8")
+            return
+    shutil.copy2(src, dst)
+
+
+def install_bundled_skills(workspace_path: Path, *, memory_backend: str = "memu") -> list[str]:
     """Copy bundled skills into the workspace skills directory.
 
     Only copies skills that don't already exist — never overwrites.
@@ -92,6 +154,8 @@ def install_bundled_skills(workspace_path: Path) -> list[str]:
 
     Args:
         workspace_path: Target workspace directory.
+        memory_backend: ``memory.backend``; under ``loom`` a skill that
+            names Nerve's memory tools names Loom's instead.
 
     Returns:
         List of skill IDs that were installed.
@@ -119,6 +183,11 @@ def install_bundled_skills(workspace_path: Path) -> list[str]:
             continue
 
         shutil.copytree(skill_src, skill_dst)
+        if memory_backend == "loom":
+            _write_template(
+                skill_src / "SKILL.md", skill_dst / "SKILL.md", f"skills/{skill_id}/SKILL.md",
+                memory_backend,
+            )
         logger.info("Installed bundled skill: %s", skill_id)
         installed.append(skill_id)
 
@@ -177,7 +246,9 @@ def install_config_scaffold(workspace_path: Path) -> list[str]:
     return created
 
 
-def initialize_workspace(workspace_path: Path, mode: str) -> list[str]:
+def initialize_workspace(
+    workspace_path: Path, mode: str, *, skip: Collection[str] = (), memory_backend: str = "memu",
+) -> list[str]:
     """Copy mode-appropriate template files into a workspace directory.
 
     Only copies files that don't already exist — never overwrites.
@@ -185,6 +256,14 @@ def initialize_workspace(workspace_path: Path, mode: str) -> list[str]:
     Args:
         workspace_path: Target workspace directory.
         mode: Deployment mode ("personal" or "worker").
+        skip: MANIFEST entries not to copy. The installers pass ``TASK.md``:
+            they write it themselves from the template with the description
+            in place (:func:`nerve.setup_writer.apply_task_md`), and a bare
+            copy would put the literal ``{{TASK_DESCRIPTION}}`` token into
+            every prompt of a worker that was given no description.
+        memory_backend: ``memory.backend``; under ``loom`` the templates that
+            name Nerve's memory tools (``AGENTS.md``, ``TOOLS.md``,
+            ``MEMORY.md``) are written with Loom's instead.
 
     Returns:
         List of filenames that were created.
@@ -200,6 +279,8 @@ def initialize_workspace(workspace_path: Path, mode: str) -> list[str]:
 
     created = []
     for filename, description in manifest:
+        if filename in skip:
+            continue
         src = template_dir / filename
         dst = workspace_path / filename
 
@@ -211,7 +292,7 @@ def initialize_workspace(workspace_path: Path, mode: str) -> list[str]:
             logger.warning("Template file missing: %s", src)
             continue
 
-        shutil.copy2(src, dst)
+        _write_template(src, dst, f"{mode}/{filename}", memory_backend)
         logger.info("Created %s (%s)", filename, description)
         created.append(filename)
 

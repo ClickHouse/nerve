@@ -32,7 +32,7 @@ import type { ReactNode } from 'react';
  * takes a `TextField`, and `actions` takes `Button`/`IconButton` — the
  * primitives beside this file.
  */
-export function PageHeader({ leading, icon, title, filters, search, actions }: {
+export function PageHeader({ leading, icon, title, titleAs: Title = 'h1', filters, search, actions }: {
   /**
    * Sits ahead of the icon. For pages whose side pane collapses into a
    * drawer on mobile, this is where its toggle goes — mirroring the chat
@@ -41,6 +41,12 @@ export function PageHeader({ leading, icon, title, filters, search, actions }: {
   leading?: ReactNode;
   icon?: ReactNode;
   title: ReactNode;
+  /**
+   * The title's element. `h1` on a list page, where the header *is* the
+   * page heading; `p` on a page whose body owns the `<h1>` (the setup
+   * wizard focuses its step heading), so the document never has two.
+   */
+  titleAs?: 'h1' | 'p';
   /** Filter pills. Laid out by the caller; scrolled horizontally here. */
   filters?: ReactNode;
   search?: ReactNode;
@@ -59,7 +65,7 @@ export function PageHeader({ leading, icon, title, filters, search, actions }: {
         ${icon ? 'lg:gap-4 lg:mr-2' : ''}`}>
         {leading}
         {icon}
-        <h1 className="text-lg font-semibold truncate">{title}</h1>
+        <Title className="text-lg font-semibold truncate">{title}</Title>
         {actions && (
           <div className="ml-auto flex shrink-0 items-center gap-2 lg:hidden">{actions}</div>
         )}

@@ -2,15 +2,25 @@
 
 from __future__ import annotations
 
+from nerve.identity import UNATTRIBUTED, Attribution
 from nerve.utils.time import utc_now_iso
 
 
 class CronStore:
-    """Mixin providing cron job logging operations."""
+    """Mixin providing cron job logging operations.
 
-    async def log_cron_start(self, job_id: str) -> int:
+    Each run row records who started the run (``actor_id``) and on whose
+    behalf it happens (``caused_by_actor_id``): the system actor for a
+    scheduled run, the person for a run that they started through the API.
+    """
+
+    async def log_cron_start(
+        self, job_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> int:
         result = await self._write(
-            "INSERT INTO cron_logs (job_id) VALUES (?)", (job_id,)
+            "INSERT INTO cron_logs (job_id, actor_id, caused_by_actor_id) "
+            "VALUES (?, ?, ?)",
+            (job_id, attribution.actor_id, attribution.caused_by_actor_id),
         )
         return result.lastrowid
 
@@ -42,6 +52,7 @@ class CronStore:
 
     async def log_cron_missed(
         self, job_id: str, scheduled_run_time: str, error: str | None = None,
+        *, attribution: Attribution = UNATTRIBUTED,
     ) -> int:
         """Record a run the scheduler dropped for starting too late.
 
@@ -53,9 +64,12 @@ class CronStore:
         """
         now = utc_now_iso()
         result = await self._write(
-            "INSERT INTO cron_logs (job_id, started_at, finished_at, status, error) "
-            "VALUES (?, ?, ?, 'missed', ?)",
-            (job_id, scheduled_run_time, now, error),
+            "INSERT INTO cron_logs (job_id, started_at, finished_at, status, error, "
+            "actor_id, caused_by_actor_id) VALUES (?, ?, ?, 'missed', ?, ?, ?)",
+            (
+                job_id, scheduled_run_time, now, error,
+                attribution.actor_id, attribution.caused_by_actor_id,
+            ),
         )
         return result.lastrowid
 
