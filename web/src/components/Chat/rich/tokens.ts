@@ -35,7 +35,7 @@ const FALLBACK: Record<ResolvedTheme, ThemeTokens> = {
     textMuted: '#a3a9b3',
     textFaint: '#6b7280',
     accent: '#f6d53f',
-    palette: ['#437eef', '#dd99ff', '#2dd4bf', '#fb923c', '#34d399', '#f87171', '#38bdf8', '#facc15', '#a78bfa', '#22d3ee'],
+    palette: ['#437eef', '#fb923c', '#38bdf8', '#34d399', '#dd99ff', '#facc15', '#a78bfa', '#f87171', '#2dd4bf', '#22d3ee'],
     fontFamily: FONT_FAMILY,
   },
   light: {
@@ -48,7 +48,7 @@ const FALLBACK: Record<ResolvedTheme, ThemeTokens> = {
     textMuted: '#5b6472',
     textFaint: '#9aa1ad',
     accent: '#b58900',
-    palette: ['#104ec6', '#8800cc', '#0f766e', '#c2410c', '#047857', '#b91c1c', '#0369a1', '#a16207', '#6d28d9', '#0e7490'],
+    palette: ['#104ec6', '#c2410c', '#0369a1', '#047857', '#8800cc', '#a16207', '#6d28d9', '#b91c1c', '#0f766e', '#0e7490'],
     fontFamily: FONT_FAMILY,
   },
 };
@@ -66,8 +66,12 @@ const TOKEN_VARS: Record<Exclude<keyof ThemeTokens, 'theme' | 'palette' | 'fontF
 
 /** Hue tokens in the order series take them: alternating hue families, high contrast between neighbours. */
 const PALETTE_VARS = [
-  '--theme-hue-blue', '--theme-hue-violet', '--theme-hue-teal', '--theme-hue-orange', '--theme-hue-emerald',
-  '--theme-hue-red', '--theme-hue-sky', '--theme-hue-yellow', '--theme-hue-purple', '--theme-hue-cyan',
+  // Ordered so that neighbouring series stay apart for colour-blind readers
+  // as well (blue next to violet does not, under deuteranopia); the hues
+  // with a meaning — red, yellow, green, orange — keep their positions in
+  // mermaid.ts's HUE map, which must change with this list.
+  '--theme-hue-blue', '--theme-hue-orange', '--theme-hue-sky', '--theme-hue-emerald', '--theme-hue-violet',
+  '--theme-hue-yellow', '--theme-hue-purple', '--theme-hue-red', '--theme-hue-teal', '--theme-hue-cyan',
 ];
 
 let context2d: CanvasRenderingContext2D | null | undefined;

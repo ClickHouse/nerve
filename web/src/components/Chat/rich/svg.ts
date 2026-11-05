@@ -122,25 +122,42 @@ function standalone(svg: SVGSVGElement, size: { width: number; height: number } 
   return new XMLSerializer().serializeToString(copy);
 }
 
+/**
+ * Below this viewBox width, a picture that states no width or height of its
+ * own is taken as a unit-less drawing (an icon-like `0 0 24 24`), not as a
+ * 24-pixel picture: it takes the column, as an SVG sized by its container
+ * does anywhere else.
+ */
+const UNITLESS_BELOW = 200;
+
 export const mountSvg: Mount = async (stage, source) => {
   const clean = sanitizeSvg(source);
   stage.innerHTML = clean;
   const element = stage.querySelector('svg');
-  const naturalSize = element ? naturalSizeOf(element) : undefined;
-  if (element && naturalSize) {
-    // The picture states its own size (`width="100%"` would stretch it to
-    // the column); the frame fits or scrolls it.
-    element.setAttribute('width', String(naturalSize.width));
-    element.setAttribute('height', String(naturalSize.height));
-  }
-  // The file is made from the picture as drawn, whatever the frame does to
-  // the element on screen afterwards.
+  // The file is made from the picture as drawn, whatever is done to the
+  // element on screen afterwards.
   const drawn = element?.cloneNode(true) as SVGSVGElement | undefined;
+  let naturalSize = element ? naturalSizeOf(element) : undefined;
+  if (element && naturalSize) {
+    const declared = lengthPx(element.getAttribute('width')) > 0 || lengthPx(element.getAttribute('height')) > 0;
+    if (!declared && naturalSize.width < UNITLESS_BELOW) {
+      element.removeAttribute('width');
+      element.removeAttribute('height');
+      element.style.width = '100%';
+      element.style.height = 'auto';
+      naturalSize = undefined;
+    } else {
+      // The picture states its own size (`width="100%"` would stretch it to
+      // the column); the frame fits or scrolls it.
+      element.setAttribute('width', String(naturalSize.width));
+      element.setAttribute('height', String(naturalSize.height));
+    }
+  }
   return {
     cleanup: () => {
       stage.innerHTML = '';
     },
     naturalSize,
-    toSvg: async () => (drawn ? standalone(drawn, naturalSize) : null),
+    toSvg: async () => (drawn ? standalone(drawn, naturalSizeOf(drawn)) : null),
   };
 };

@@ -97,8 +97,8 @@ export function vegaConfigFor(
   const ordinalStart = furthest(series, surface, c => contrast(c, surface) >= ORDINAL_FLOOR);
   const heatmapStart = furthest(series, surface, c => contrast(c, surface) >= HEATMAP_FLOOR);
   // Diverging: a warm pole opposite the blue, through a neutral that reads
-  // as "nothing" (the palette's fourth hue is its orange).
-  const warm = palette[3] ?? rampEnd;
+  // as "nothing" (the palette's second hue is its orange).
+  const warm = palette[1] ?? rampEnd;
   const neutral = mix(surface, text, 0.1);
   const stroke = { strokeWidth: 2, strokeCap: 'round', strokeJoin: 'round' } as const;
   // Slices are told apart by a gap of the surface, not by an outline.

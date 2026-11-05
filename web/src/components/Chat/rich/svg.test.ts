@@ -158,6 +158,19 @@ describe('mountSvg', () => {
     expect(doc.documentElement.getAttribute('width')).toBe('10');
   });
 
+  it('lets a small viewBox-only drawing take the column, and keeps its own size in the file', async () => {
+    const stage = document.createElement('div');
+    const mounted = await mountSvg(stage, '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/></svg>', { theme: 'dark', width: 600 });
+    expect(mounted.naturalSize).toBeUndefined();
+    const shown = stage.querySelector('svg')!;
+    expect(shown.hasAttribute('width')).toBe(false);
+    expect(shown.style.width).toBe('100%');
+    const file = (await mounted.toSvg!())!;
+    const doc = new DOMParser().parseFromString(file, 'image/svg+xml');
+    expect(doc.documentElement.getAttribute('width')).toBe('24');
+    expect(doc.documentElement.getAttribute('height')).toBe('24');
+  });
+
   it('leaves a picture with no size to the frame', async () => {
     const stage = document.createElement('div');
     const mounted = await mountSvg(stage, '<svg><circle r="4"/></svg>', { theme: 'dark', width: 600 });
