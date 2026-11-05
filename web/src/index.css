@@ -608,13 +608,19 @@ body {
   overflow: hidden;
   visibility: hidden;
 }
-/* A picture shown at 1:1 that is wider than the column scrolls sideways. */
+/* A picture shown at 1:1 that is wider than the column scrolls sideways.
+   `contain: layout paint` makes the canvas the containing block of any
+   positioned descendant and clips to it: a picture written by the model
+   cannot lay a `position: fixed` surface over the page, whatever its CSS. */
 .rich-figure-canvas {
   position: relative;
   overflow-x: auto;
   overflow-y: hidden;
+  contain: layout paint;
 }
-/* One stage per render attempt; the next renders out of sight at full width. */
+/* One stage per render attempt; the next renders out of sight at full width.
+   Each stage contains its picture the same way. */
+.rich-stage { contain: layout paint; }
 .rich-stage[data-pending] { height: 0; overflow: hidden; visibility: hidden; }
 .rich-stage > svg { display: block; margin: 0 auto; }
 .rich-figure-canvas .vega-embed { display: block; }

@@ -679,6 +679,15 @@ function inertPicture(svg: string): DocumentFragment {
     if (tag === 'style' && EXTERNAL_CSS.test(element.textContent ?? '')) {
       element.textContent = inertCss(element.textContent ?? '');
     }
+    // A link in a diagram opens like a link in the markdown around it: a new
+    // tab, with no opener. Left alone it would navigate the chat itself.
+    if (tag === 'a') {
+      const href = element.getAttribute('href') ?? element.getAttribute('xlink:href') ?? '';
+      if (href && !LOCAL_REF.test(href)) {
+        element.setAttribute('target', '_blank');
+        element.setAttribute('rel', 'noopener noreferrer');
+      }
+    }
   }
   return template.content;
 }

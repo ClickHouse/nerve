@@ -52,7 +52,9 @@ describe('sanitizeSvg', () => {
     ));
     expect(clean).not.toContain('example.invalid');
     expect(clean).not.toContain('@import');
-    expect(clean).toContain('font-weight: bold');
+    // No <style> element survives at all: inline SVG stylesheets are document-scoped.
+    expect(clean).not.toContain('<style');
+    expect(clean).not.toContain('font-weight: bold');
     expect(clean).toContain('style="fill: green"');
     expect((clean.match(/<rect/g) ?? []).length).toBe(2);
     expect(clean).not.toContain('background');
@@ -70,6 +72,26 @@ describe('sanitizeSvg', () => {
     expect(clean).not.toContain('\\75');
     expect(clean).toContain('style="fill: green"');
     expect((clean.match(/<rect/g) ?? []).length).toBe(2);
+  });
+
+  it('keeps the picture inside its block: no <style> element, no positioning in style attributes', () => {
+    const clean = sanitizeSvg(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="4000" height="4000" style="position:fixed;top:0;left:0;z-index:2147483647;background:rgba(255,0,0,0.3)">'
+      + '<style>body *{display:none!important} [data-x]{outline:7px solid red}</style>'
+      + '<rect width="10" height="10" style="fill: green; stroke-width: 2"/>'
+      + '<rect width="10" height="10" style="fill: blue; transform: translate(10px, 0)"/>'
+      + '<g style="inset: 0; position: absolute"><circle r="1"/></g>'
+      + '</svg>',
+    );
+    expect(clean).not.toContain('<style');
+    expect(clean).not.toContain('display:none');
+    expect(clean).not.toContain('position');
+    expect(clean).not.toContain('z-index');
+    expect(clean).not.toContain('inset');
+    expect(clean).toContain('style="fill: green; stroke-width: 2"');
+    expect(clean).not.toContain('translate(');
+    expect(clean).toContain('<circle');
+    expect(clean).toMatch(/^<svg[^>]*width="4000"/);
   });
 
   it('refuses a block that is not an svg', () => {
@@ -169,6 +191,15 @@ describe('mountSvg', () => {
     const doc = new DOMParser().parseFromString(file, 'image/svg+xml');
     expect(doc.documentElement.getAttribute('width')).toBe('24');
     expect(doc.documentElement.getAttribute('height')).toBe('24');
+  });
+
+  it('scales an absurdly large picture down to a drawable size', async () => {
+    const stage = document.createElement('div');
+    const mounted = await mountSvg(stage, '<svg width="100000" height="50000" viewBox="0 0 100000 50000"><rect width="100000" height="50000"/></svg>', { theme: 'dark', width: 600 });
+    expect(mounted.naturalSize).toEqual({ width: 8192, height: 4096 });
+    const shown = stage.querySelector('svg')!;
+    expect(shown.getAttribute('width')).toBe('8192');
+    expect(shown.getAttribute('height')).toBe('4096');
   });
 
   it('leaves a picture with no size to the frame', async () => {

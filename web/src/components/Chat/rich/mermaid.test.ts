@@ -604,3 +604,23 @@ describe('mountMermaid', () => {
     expect(config().themeVariables.darkMode).toBe(false);
   });
 });
+
+describe('links in a diagram', () => {
+  it('open in a new tab without an opener; references inside the picture are left alone', async () => {
+    fake.render.mockResolvedValueOnce({
+      svg: '<svg id="x" xmlns="http://www.w3.org/2000/svg" width="320" height="120" viewBox="0 0 320 120">'
+        + '<a href="https://example.invalid/docs"><text>docs</text></a><a href="#node-1"><text>here</text></a></svg>',
+    });
+    const stage = document.createElement('div');
+    document.body.appendChild(stage);
+    try {
+      await mountMermaid(stage, 'flowchart LR\n  A --> B', { theme: 'dark', width: 680 });
+      const [external, local] = [...stage.querySelectorAll('a')];
+      expect(external.getAttribute('target')).toBe('_blank');
+      expect(external.getAttribute('rel')).toBe('noopener noreferrer');
+      expect(local.hasAttribute('target')).toBe(false);
+    } finally {
+      stage.remove();
+    }
+  });
+});

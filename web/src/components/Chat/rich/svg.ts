@@ -25,9 +25,20 @@ const CONFIG = {
   // here an `href` may only be a `#fragment` (the hook below), which makes
   // `use` the ordinary way to repeat a symbol.
   ADD_TAGS: ['use'],
-  // `image` and `feImage` fetch their `href`; `foreignObject` embeds HTML.
-  FORBID_TAGS: ['foreignObject', 'image', 'feImage', 'script', 'iframe', 'object', 'embed'],
+  // `image` and `feImage` fetch their `href`; `foreignObject` embeds HTML; a
+  // `<style>` element inside an inline SVG is DOCUMENT-scoped, so its rules
+  // would style the whole page (hide the app, lay a fake dialog over it) —
+  // presentation attributes and the `style` attribute stay for the picture.
+  FORBID_TAGS: ['foreignObject', 'image', 'feImage', 'script', 'iframe', 'object', 'embed', 'style'],
 };
+
+/**
+ * A `style` attribute that would take the picture out of its block: CSS
+ * positioning on the root (`position: fixed; inset: 0; z-index: …`) lays an
+ * attacker-drawn surface over the authenticated page. Positioning has no
+ * honest use inside a picture, so the whole attribute goes.
+ */
+const POSITIONING_CSS = /(?:^|[;\s])(?:position|z-index|inset|top|right|bottom|left|transform|translate)\s*:/i;
 
 /** Attributes that name a resource. In a chat picture they may only point inside it. */
 const URL_ATTRIBUTES = new Set(['href', 'xlink:href', 'src']);
@@ -51,6 +62,10 @@ function getPurifier() {
       return;
     }
     if (hasExternalCss(data.attrValue)) {
+      data.keepAttr = false;
+      return;
+    }
+    if (data.attrName === 'style' && POSITIONING_CSS.test(data.attrValue)) {
       data.keepAttr = false;
     }
   });
@@ -162,6 +177,20 @@ function smallestTextPx(svg: SVGSVGElement, size: { width: number; height: numbe
  */
 const UNITLESS_BELOW = 200;
 
+/**
+ * The longest side a picture is drawn at. A stated size beyond it is scaled
+ * down (keeping the aspect ratio): a 100,000 px canvas is a layout denial,
+ * not a picture, and nothing legible needs more than this.
+ */
+const MAX_DRAWN_PX = 8192;
+
+function clampSize(size: { width: number; height: number }): { width: number; height: number } {
+  const longest = Math.max(size.width, size.height);
+  if (longest <= MAX_DRAWN_PX) return size;
+  const k = MAX_DRAWN_PX / longest;
+  return { width: Math.round(size.width * k), height: Math.round(size.height * k) };
+}
+
 export const mountSvg: Mount = async (stage, source) => {
   const clean = sanitizeSvg(source);
   stage.innerHTML = clean;
@@ -170,6 +199,7 @@ export const mountSvg: Mount = async (stage, source) => {
   // element on screen afterwards.
   const drawn = element?.cloneNode(true) as SVGSVGElement | undefined;
   let naturalSize = element ? naturalSizeOf(element) : undefined;
+  if (naturalSize) naturalSize = clampSize(naturalSize);
   if (element && naturalSize) {
     const declared = lengthPx(element.getAttribute('width')) > 0 || lengthPx(element.getAttribute('height')) > 0;
     if (!declared && naturalSize.width < UNITLESS_BELOW) {
