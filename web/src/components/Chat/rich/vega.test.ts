@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { readThemeTokens } from './tokens';
-import { assertSelfContained, mountVega, parseSpec, tooltipHtml } from './vega';
+import { assertSelfContained, chartLabel, mountVega, parseSpec, tooltipHtml } from './vega';
 import { TOOLTIP_THEME, vegaConfigFor } from './vegaTheme';
 
 // vega-embed, stubbed: it records what it is asked to draw and with which
-// options, and draws an empty <svg> of the size Vega would. `vega` carries
-// Vega's log levels, as the real module's re-export does.
+// options, and draws an empty <svg> of the size Vega would. Like Vega, it
+// labels its container with the spec's description or "Vega visualization",
+// and the view's description() relabels it. `vega` carries Vega's log
+// levels, as the real module's re-export does.
 const embed = vi.hoisted(() => vi.fn());
 vi.mock('vega-embed', () => ({ default: embed, vega: { None: 0, Error: 1, Warn: 2 } }));
 
@@ -28,6 +30,7 @@ function stubView() {
     width: vi.fn(() => view),
     resize: vi.fn(() => view),
     runAsync: vi.fn(async () => view),
+    description: vi.fn((): unknown => view),
   };
   return view;
 }
@@ -44,6 +47,12 @@ beforeEach(() => {
     svg.setAttribute('width', String(typeof spec.width === 'number' ? spec.width + 66 : 600));
     svg.setAttribute('height', String(typeof spec.height === 'number' ? spec.height + 27 : 300));
     el.appendChild(svg);
+    el.setAttribute('role', 'graphics-document');
+    el.setAttribute('aria-label', typeof spec.description === 'string' ? spec.description : 'Vega visualization');
+    view.description.mockImplementation((text?: unknown) => {
+      el.setAttribute('aria-label', String(text));
+      return view;
+    });
     return { view, finalize };
   });
 });
@@ -223,6 +232,35 @@ describe('mountVega', () => {
     mounted.cleanup();
     expect(finalize).toHaveBeenCalled();
     expect(stage.childElementCount).toBe(0);
+  });
+
+  describe('the name on the chart\'s container', () => {
+    it('is the spec\'s description when it has one', async () => {
+      const { stage } = await mount({ ...BAR, title: 'Spend', description: '  Inference spend\n per week ' });
+      expect(stage.getAttribute('aria-label')).toBe('Inference spend per week');
+    });
+
+    it('is the drawn title when there is no description', async () => {
+      const { stage } = await mount({ ...BAR, title: 'Requests per day' });
+      expect(stage.getAttribute('aria-label')).toBe('Requests per day');
+      const lines = await mount({ ...BAR, title: { text: ['Requests', 'per day'], subtitle: 'Three services' } });
+      expect(lines.stage.getAttribute('aria-label')).toBe('Requests per day');
+    });
+
+    it('is not "Vega visualization": without either, the figure\'s own name is the only one', async () => {
+      const { stage } = await mount(BAR);
+      expect(stage.hasAttribute('aria-label')).toBe(false);
+      expect(view.description).not.toHaveBeenCalled();
+      // Vega's role stays: the chart is still a graphics document inside the figure.
+      expect(stage.getAttribute('role')).toBe('graphics-document');
+    });
+
+    it('takes no title a signal computes, and no blank description', () => {
+      expect(chartLabel({ title: { text: { signal: 'heading' } } })).toBeNull();
+      expect(chartLabel({ description: '   ', title: 'Builds' })).toBe('Builds');
+      expect(chartLabel({ description: 42, title: ['Builds', 7] })).toBe('Builds');
+      expect(chartLabel({})).toBeNull();
+    });
   });
 
   it('installs the tooltip style once', async () => {

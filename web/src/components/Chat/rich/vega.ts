@@ -148,6 +148,22 @@ async function rasterize(view: View, scale: number, background: string): Promise
   return new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
 }
 
+/** The words of a title the spec states outright — a string, its lines, or `{text}` — not one a signal computes. */
+function titleText(title: unknown): string {
+  const text = title && typeof title === 'object' && !Array.isArray(title) ? (title as Record<string, unknown>).text : title;
+  return (Array.isArray(text) ? text : [text]).filter((line): line is string => typeof line === 'string').join(' ');
+}
+
+/**
+ * What the chart's own container is called for a screen reader: the spec's
+ * description, else the title it draws. Null when the spec states neither.
+ */
+export function chartLabel(spec: Record<string, unknown>): string | null {
+  const description = typeof spec.description === 'string' ? spec.description : '';
+  const label = (description.trim() ? description : titleText(spec.title)).replace(/\s+/g, ' ').trim();
+  return label || null;
+}
+
 /** The drawn chart's size: Vega gives its root <svg> the full width and height, axes and legends included. */
 function drawnSize(stage: HTMLElement): { width: number; height: number } | undefined {
   const svg = stage.querySelector('svg');
@@ -197,6 +213,13 @@ export function mountVega(mode: VegaMode): Mount {
       view.width(width);
       await view.runAsync();
     }
+    // Vega labels its container (the stage) with the spec's description, and
+    // with "Vega visualization" when there is none: a name that names nothing,
+    // read out inside the figure's own. Here it is the description or the
+    // title, or no label at all, and the figure's name is the chart's name.
+    const label = chartLabel(spec);
+    if (label) view.description(label);
+    else stage.removeAttribute('aria-label');
     return {
       // finalize() also takes down a tooltip the chart is showing.
       cleanup: () => {
