@@ -1047,10 +1047,11 @@ SESSION_CONTEXT_TAG = "session-context"
 
 # The Session Context's "Rendering" line: what the surface a session is read
 # on draws. The web chat renders these fenced-code languages inline
-# (web/src/components/Chat/rich/kinds.ts keeps the matching list); every
-# other channel shows the source text, so the model is told not to draw
-# there. Keyed on the source only, so the prompt stays static per source.
-RENDERING_SOURCES = frozenset({"web"})
+# (web/src/components/Chat/rich/kinds.ts keeps the matching list), and shows
+# the sessions the REST API creates (``/api/chat`` runs them as web turns);
+# every other channel shows the source text, so the model is told not to
+# draw there. Keyed on the source only, so the prompt stays static per source.
+RENDERING_SOURCES = frozenset({"web", "api"})
 RICH_RENDERING_NOTE = (
     "- **Rendering:** this chat renders fenced ```mermaid (diagrams), "
     "```vega-lite (charts — inline `values` only, no `url` data) and ```svg "

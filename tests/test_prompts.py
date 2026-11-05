@@ -191,11 +191,13 @@ def _rendering_line(prompt: str) -> str:
 
 
 def test_web_prompt_names_the_fence_languages_the_chat_renders(tmp_path: Path):
+    """``web`` sessions, and the ``api`` sessions the web UI shows as well."""
     prompts._PROMPT_TOOL_REGISTRY = None
-    line = _rendering_line(build_system_prompt(workspace=tmp_path, source="web"))
-    assert "renders" in line
-    for fence in ("```mermaid", "```vega-lite", "```svg"):
-        assert fence in line
+    for source in ("web", "api"):
+        line = _rendering_line(build_system_prompt(workspace=tmp_path, source=source))
+        assert "renders" in line, source
+        for fence in ("```mermaid", "```vega-lite", "```svg"):
+            assert fence in line, source
 
 
 def test_text_channels_are_told_not_to_draw(tmp_path: Path):
