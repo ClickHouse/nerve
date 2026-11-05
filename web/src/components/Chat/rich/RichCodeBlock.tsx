@@ -1,4 +1,4 @@
-import { useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from 'react';
+import { useContext, useEffect, useLayoutEffect, useRef, useState, type ReactNode, type Ref } from 'react';
 import { useThemeStore, type ResolvedTheme } from '../../../stores/themeStore';
 import { copyToClipboard } from '../../../utils/clipboard';
 import { IconButton } from '../../ui';
@@ -47,13 +47,33 @@ const SETTLE_MS = 600;
 
 /**
  * A picture wider than the column is scaled down to fit it only while it
- * stays at least this large; below that the text is too small to read, so
- * it is shown at 1:1 and scrolls instead.
+ * stays at least this large: 14px labels stay at 11px or more. Below that it
+ * is shown at 1:1 and scrolls instead.
  */
-const MIN_FIT_SCALE = 0.6;
+const MIN_FIT_SCALE = 0.8;
 
 /** A width change reaches the renderer once the column has stopped resizing for this long. */
 const RESIZE_DEBOUNCE_MS = 150;
+
+/**
+ * A finished block whose first picture is still on its way holds a quiet
+ * placeholder this long before it shows its source instead; on a chat's
+ * load the renderers draw one block after another.
+ */
+const PLACEHOLDER_MS = 1500;
+
+/**
+ * Below this height a picture gets the toolbar on a row of its own above it:
+ * the toolbar (34px, 8px in from the corner) would otherwise cover a good
+ * part of it whenever it shows.
+ */
+const SHORT_PICTURE_PX = 72;
+
+/** The figure's padding and border around the canvas, top and bottom together. */
+const FRAME_PX = 34;
+
+/** The toolbar's own row, for a short picture (toolbar and the gap under it). */
+const TOOLBAR_ROW_PX = 42;
 
 /** PNG downloads are drawn at this many device pixels per CSS pixel. */
 const PNG_SCALE = 2;
@@ -83,6 +103,8 @@ interface Picture {
   naturalSize: Size | null;
   /** There is an SVG to open full size and to save. */
   exportable: boolean;
+  /** A title the picture carries, for the figure's accessible name. */
+  title: string | null;
 }
 
 /** How the last attempt went, and what it was an attempt at. */
@@ -103,6 +125,48 @@ function usableSize(size: Size | undefined): Size | null {
   return size && size.width > 0 && size.height > 0 && Number.isFinite(size.width) && Number.isFinite(size.height)
     ? size
     : null;
+}
+
+/**
+ * The canvas height each block source was last drawn at, so that a block
+ * drawn again — the finished message replacing the streamed one, a chat
+ * opened again — holds its place while it renders instead of jumping.
+ * Keyed by a hash, so long sources are not kept alive by it.
+ */
+const heightHints = new Map<string, number>();
+const MAX_HEIGHT_HINTS = 200;
+
+function hintKey(kind: RichKind, source: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < source.length; i++) {
+    hash ^= source.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return `${kind}:${source.length}:${(hash >>> 0).toString(36)}`;
+}
+
+function rememberHeight(kind: RichKind, source: string, height: number) {
+  const key = hintKey(kind, source);
+  heightHints.delete(key);
+  heightHints.set(key, height);
+  if (heightHints.size > MAX_HEIGHT_HINTS) heightHints.delete(heightHints.keys().next().value!);
+}
+
+/**
+ * A title the drawn picture carries, if it has one that is cheap to find: an
+ * svg's own `<title>` (mermaid's `accTitle`), Vega's `description` (on its
+ * container as `aria-label`), or a title drawn as text.
+ */
+function pictureTitle(stage: HTMLElement): string | null {
+  const svg = stage.querySelector('svg');
+  const documents = [stage, ...stage.querySelectorAll('[role~="graphics-document"]')];
+  const candidates = [
+    svg?.querySelector(':scope > title')?.textContent,
+    documents.find(el => el.matches('[role~="graphics-document"][aria-label]'))?.getAttribute('aria-label'),
+    stage.querySelector('.role-title-text text, .flowchartTitleText, .pieTitleText, .titleText, .chart-title')?.textContent,
+  ];
+  const title = candidates.map(text => text?.replace(/\s+/g, ' ').trim()).find(Boolean);
+  return title ? title.slice(0, 120) : null;
 }
 
 /**
@@ -158,14 +222,16 @@ async function pictureMarkup({ stage, mounted }: Shown): Promise<string | null> 
 }
 
 /** A button of the figure's toolbar: an icon, or a short word ("1:1", "SVG"). */
-function ToolButton({ label, onClick, text = false, children }: {
+function ToolButton({ label, onClick, text = false, ref, children }: {
   label: string;
   onClick: () => void;
   text?: boolean;
+  ref?: Ref<HTMLButtonElement>;
   children: ReactNode;
 }) {
   return (
     <button
+      ref={ref}
       type="button"
       onClick={onClick}
       title={label}
@@ -186,8 +252,11 @@ function ToolButton({ label, onClick, text = false, children }: {
  * The source is rendered once it has settled (a streamed block changes with
  * every token batch), into a stage element of its own, out of sight; the
  * previous stage stays on screen until the new one has rendered, so a theme
- * change or more streamed text never blanks the block. A failure after the
- * text has finished shows the source with the renderer's message; during the
+ * change or more streamed text never blanks the block. While the text
+ * streams the block shows its source until a picture is ready; a block that
+ * arrives complete (a chat being opened) holds a quiet placeholder instead,
+ * and shows its source only if the picture is slow. A failure after the text
+ * has finished shows the source with the renderer's message; during the
  * stream it shows the source quietly, since the text may simply not be
  * complete.
  *
@@ -210,15 +279,26 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
   const choiceRef = useRef<Choice | null>(null);
   const busyRef = useRef(false);
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // The control a Source/Rendered switch hands focus to: the other one.
+  const sourceButtonRef = useRef<HTMLButtonElement>(null);
+  const renderedButtonRef = useRef<HTMLButtonElement>(null);
+  const switchedRef = useRef(false);
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const [picture, setPicture] = useState<Picture | null>(null);
   const [canvasWidth, setCanvasWidth] = useState(0);
+  const [canvasHeight, setCanvasHeight] = useState(0);
   const [choice, setChoice] = useState<Choice | null>(null);
   const [showSource, setShowSource] = useState(false);
   const [copied, setCopied] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   // The full-size view while it is open.
   const [lightbox, setLightbox] = useState<{ markup: string; size: Size } | null>(null);
+  // A block that first appeared mid-stream has shown its source already; it
+  // keeps showing it until the picture is ready, rather than a placeholder.
+  const [mountedStreaming] = useState(streaming);
+  const [heightHint] = useState(() => heightHints.get(hintKey(kind, source)) ?? 0);
+  // The placeholder has waited long enough; the source is better than nothing.
+  const [slow, setSlow] = useState(false);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -246,10 +326,16 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
         shownRef.current = { stage, mounted, natural, theme, width };
         previous?.mounted.cleanup();
         previous?.stage.remove();
+        const height = canvas.clientHeight;
+        if (height > 0) {
+          rememberHeight(kind, settled, height);
+          setCanvasHeight(height);
+        }
         setOutcome({ kind, theme, source: settled, error: null });
         setPicture({
           naturalSize: natural,
           exportable: !!mounted.toSvg || !!stage.querySelector('svg'),
+          title: pictureTitle(stage),
         });
         setCanvasWidth(width);
       },
@@ -266,14 +352,20 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
   }, [kind, settled, theme, tooLarge]);
 
   // The column's width decides fit or 1:1, and a container-sized chart lays
-  // itself out again for it once the resizing has stopped.
+  // itself out again for it once the resizing has stopped. The picture's
+  // height decides whether the toolbar needs a row of its own.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || typeof ResizeObserver === 'undefined') return;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const observer = new ResizeObserver((entries) => {
-      const width = Math.round(entries[entries.length - 1].contentRect.width);
-      if (width <= 0 || width === widthRef.current) return;
+      const box = entries[entries.length - 1].contentRect;
+      const width = Math.round(box.width);
+      const height = Math.round(box.height);
+      // A hidden canvas (the source is showing) measures 0 both ways; what it measured last stands.
+      if (width <= 0) return;
+      if (height > 0) setCanvasHeight(height);
+      if (width === widthRef.current) return;
       widthRef.current = width;
       setCanvasWidth(width);
       clearTimeout(timer);
@@ -307,6 +399,21 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
     ? `too large to render (${settled.length.toLocaleString()} characters)`
     : current?.error ?? null;
 
+  const hasRender = picture !== null;
+  const awaitingFirst = !hasRender && status === 'rendering' && !streaming && !mountedStreaming;
+  useEffect(() => {
+    if (!awaitingFirst) return;
+    const timer = setTimeout(() => setSlow(true), PLACEHOLDER_MS);
+    return () => clearTimeout(timer);
+  }, [awaitingFirst]);
+
+  // After a Source/Rendered switch, focus moves to the control that switches back.
+  useEffect(() => {
+    if (!switchedRef.current) return;
+    switchedRef.current = false;
+    (showSource ? renderedButtonRef : sourceButtonRef).current?.focus();
+  }, [showSource]);
+
   // The render on screen outlives the effect that made it; it goes with the block.
   useEffect(() => () => {
     shownRef.current?.mounted.cleanup();
@@ -321,6 +428,11 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
     noticeTimerRef.current = setTimeout(() => setNotice(null), NOTICE_MS);
   };
 
+  const switchView = (toSource: boolean) => {
+    switchedRef.current = true;
+    setShowSource(toSource);
+  };
+
   const handleCopy = async () => {
     if (!(await copyToClipboard(source))) return;
     setCopied(true);
@@ -332,6 +444,10 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
     choiceRef.current = next;
     setChoice(next);
   };
+
+  const label = KIND_LABEL[kind];
+  const name = FIGURE_NAME[kind];
+  const fullName = picture?.title ? `${name}: ${picture.title}` : name;
 
   const openFullSize = async () => {
     const shown = shownRef.current;
@@ -378,11 +494,10 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
     }
   };
 
-  const label = KIND_LABEL[kind];
-  const name = FIGURE_NAME[kind];
-  const hasRender = picture !== null;
   const failed = status === 'failed' && !streaming;
   const figureShown = !showSource && hasRender && !failed;
+  const placeholder = awaitingFirst && !slow;
+  const short = figureShown && canvasHeight > 0 && canvasHeight < SHORT_PICTURE_PX;
   const hint = failed
     ? "couldn't render"
     : streaming && status !== 'rendered'
@@ -397,10 +512,17 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
           sizes to its container measures the canvas as it renders. */}
       <figure
         className="rich-figure"
-        data-collapsed={figureShown ? undefined : ''}
-        aria-hidden={figureShown ? undefined : true}
-        aria-label={figureShown ? name : undefined}
+        data-collapsed={figureShown || placeholder ? undefined : ''}
+        data-placeholder={placeholder ? '' : undefined}
+        data-short={short ? '' : undefined}
+        aria-hidden={figureShown || placeholder ? undefined : true}
+        aria-busy={placeholder || undefined}
+        aria-label={figureShown || placeholder ? fullName : undefined}
+        style={placeholder && heightHint
+          ? { minHeight: heightHint + FRAME_PX + (heightHint < SHORT_PICTURE_PX ? TOOLBAR_ROW_PX : 0) }
+          : undefined}
       >
+        {placeholder && <div className="rich-figure-placeholder">Rendering…</div>}
         {figureShown && (
           <div className="rich-figure-toolbar" role="group" aria-label={`${name} tools`}>
             {layout.overflowing && (
@@ -420,7 +542,7 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
                 <span aria-hidden="true" className="mx-0.5 h-4 w-px bg-border" />
               </>
             )}
-            <ToolButton label="Source" onClick={() => setShowSource(true)}>
+            <ToolButton ref={sourceButtonRef} label="Source" onClick={() => switchView(true)}>
               <CodeXml size={14} />
             </ToolButton>
           </div>
@@ -436,7 +558,7 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
           <div role="status" className="rich-figure-notice">{notice}</div>
         )}
       </figure>
-      {!figureShown && (
+      {!figureShown && !placeholder && (
         <>
           <div className="flex items-center justify-between gap-2 bg-surface-raised border border-border rounded-t-md px-3 py-1">
             <span className="text-xs text-text-dim font-mono truncate">
@@ -448,8 +570,9 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
             <span className="flex items-center gap-1">
               {hasRender && !failed && (
                 <button
+                  ref={renderedButtonRef}
                   type="button"
-                  onClick={() => setShowSource(false)}
+                  onClick={() => switchView(false)}
                   className="text-xs text-text-dim hover:text-text px-1.5 py-0.5 rounded hover:bg-surface-hover"
                 >
                   Rendered
@@ -475,7 +598,7 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
         <Lightbox
           open
           onClose={() => setLightbox(null)}
-          title={name}
+          title={fullName}
           label={label}
           markup={lightbox.markup}
           size={lightbox.size}

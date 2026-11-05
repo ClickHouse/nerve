@@ -581,9 +581,12 @@ body {
 /* Rendered code blocks — mermaid diagrams, Vega charts, inline SVG (Chat/rich).
    A rendered block is a figure, not a code block: a quiet frame on the
    surface colour, no header. Its tools sit in the top-right corner and show
-   on hover or keyboard focus; where there is no hover they are always shown,
-   on a row of their own, so they never cover the picture. The source view
-   keeps the code-block look (the header + `pre` below). */
+   on hover or keyboard focus (`:focus-visible`, not `:focus-within`: a
+   button keeps focus after a mouse click, which would pin the tools over the
+   picture). Where there is no hover, and above a picture too short to share
+   its corner, they are always shown on a row of their own, so they never
+   cover it. The source view keeps the code-block look (the header + `pre`
+   below). */
 .rich-figure {
   position: relative;
   margin: 0;
@@ -634,7 +637,28 @@ body {
   transition: opacity 0.12s ease-out;
 }
 .rich-figure:hover > .rich-figure-toolbar,
-.rich-figure:focus-within > .rich-figure-toolbar { opacity: 1; }
+.rich-figure:has(:focus-visible) > .rich-figure-toolbar { opacity: 1; }
+/* A picture shorter than about two toolbars (RichCodeBlock sets the flag). */
+.rich-figure[data-short] { padding-top: 8px; }
+.rich-figure[data-short] > .rich-figure-toolbar {
+  position: static;
+  width: fit-content;
+  margin: 0 -8px 8px auto;
+  opacity: 1;
+}
+/* A complete block whose picture is on its way: the frame, holding a place. */
+.rich-figure[data-placeholder] { min-height: 120px; }
+.rich-figure-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--theme-text-faint);
+  font-size: 0.75rem;
+  line-height: 1rem;
+  pointer-events: none;
+}
 .rich-figure-notice {
   position: absolute;
   top: 46px;

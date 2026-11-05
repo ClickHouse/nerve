@@ -29,12 +29,22 @@ function drawSized(width: number, height: number, extra: Partial<Mounted> = {}) 
     draw(stage, source, { naturalSize: { width, height }, ...extra }));
 }
 
+/** A renderer that draws only when the test says so. */
+function drawLater() {
+  let finish!: () => void;
+  mountMermaid.mockImplementationOnce((stage, source) => new Promise(resolve => {
+    finish = () => resolve(draw(stage, source));
+  }));
+  return () => finish();
+}
+
 /**
  * jsdom lays nothing out and has no ResizeObserver: the canvas reports the
- * column width set here (0 while hidden, as a browser would), and `resize`
- * plays the observer's part.
+ * column width and picture height set here (0 while hidden, as a browser
+ * would), and `resizeColumn` plays the observer's part.
  */
 let columnWidth = 700;
+let pictureHeight = 0;
 const observers = new Set<{ callback: ResizeObserverCallback; targets: Element[] }>();
 class FakeResizeObserver {
   private entry: { callback: ResizeObserverCallback; targets: Element[] };
@@ -46,25 +56,43 @@ class FakeResizeObserver {
   unobserve() {}
   disconnect() { observers.delete(this.entry); }
 }
-function resizeColumn(width: number) {
+function resizeColumn(width: number, height = pictureHeight) {
   columnWidth = width;
+  pictureHeight = height;
   act(() => {
     for (const { callback, targets } of observers) {
-      const entries = targets.map(target => ({ target, contentRect: { width, height: 300 } }));
+      const entries = targets.map(target => ({ target, contentRect: { width, height } }));
       callback(entries as unknown as ResizeObserverEntry[], {} as ResizeObserver);
     }
   });
 }
 
+/**
+ * The app stylesheet's text. vitest stubs out CSS imports here (`css: false`),
+ * `?raw` ones included, so it is read from disk. The specifier is built so
+ * that the app's type-check, which has no Node types, does not look for it,
+ * and the base goes through a variable because Vite rewrites a literal
+ * `new URL('…', import.meta.url)` into a served asset's URL.
+ */
+async function stylesheet(): Promise<string> {
+  const fs: { readFileSync(path: string, encoding: 'utf8'): string } = await import(/* @vite-ignore */ `node:${'fs'}`);
+  const here = import.meta.url;
+  return fs.readFileSync(decodeURIComponent(new URL('../../../index.css', here).pathname), 'utf8');
+}
+
+const canvasMeasure = (value: () => number) => ({
+  configurable: true,
+  get(this: HTMLElement) {
+    return this.classList.contains('rich-figure-canvas') && !this.hidden ? value() : 0;
+  },
+});
+
 beforeEach(() => {
   columnWidth = 700;
+  pictureHeight = 0;
   vi.stubGlobal('ResizeObserver', FakeResizeObserver);
-  Object.defineProperty(HTMLElement.prototype, 'clientWidth', {
-    configurable: true,
-    get(this: HTMLElement) {
-      return this.classList.contains('rich-figure-canvas') && !this.hidden ? columnWidth : 0;
-    },
-  });
+  Object.defineProperty(HTMLElement.prototype, 'clientWidth', canvasMeasure(() => columnWidth));
+  Object.defineProperty(HTMLElement.prototype, 'clientHeight', canvasMeasure(() => pictureHeight));
   mountMermaid.mockReset();
   mountMermaid.mockImplementation(async (stage, source) => {
     if (source.includes('BAD')) throw new Error('boom on line 1');
@@ -77,6 +105,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   delete (HTMLElement.prototype as { clientWidth?: number }).clientWidth;
+  delete (HTMLElement.prototype as { clientHeight?: number }).clientHeight;
   observers.clear();
 });
 
@@ -87,10 +116,14 @@ function renderBlock(source: string, streaming: boolean) {
     </MarkdownStreamingContext.Provider>
   );
   const result = render(ui(source, streaming));
-  return { update: (text: string, live: boolean) => result.rerender(ui(text, live)) };
+  return {
+    update: (text: string, live: boolean) => result.rerender(ui(text, live)),
+    unmount: () => result.unmount(),
+  };
 }
 
 const canvas = () => document.querySelector<HTMLElement>('.rich-figure-canvas')!;
+const frame = () => document.querySelector<HTMLElement>('figure.rich-figure')!;
 const shown = () => canvas().querySelector('.rich-stage:not([data-pending]) text')?.textContent;
 const picture = () => canvas().querySelector<SVGSVGElement>('.rich-stage:not([data-pending]) svg')!;
 const rendered = () => screen.findByRole('img', { name: 'Rendered mermaid' });
@@ -156,11 +189,8 @@ function fakeDrawing({ encodes = true } = {}) {
 }
 
 describe('RichCodeBlock', () => {
-  it('shows the source until the picture is ready, then a figure with no code header', async () => {
-    let finish!: () => void;
-    mountMermaid.mockImplementationOnce((stage, source) => new Promise(resolve => {
-      finish = () => resolve(draw(stage, source));
-    }));
+  it('holds a quiet placeholder while a complete block renders, then shows a figure with no code header', async () => {
+    const finish = drawLater();
     renderBlock('graph A', false);
     // The renderer module loads first; the mount itself is a microtask later.
     await act(async () => {});
@@ -168,17 +198,24 @@ describe('RichCodeBlock', () => {
     // It renders out of sight, at the column's width.
     expect(mountMermaid.mock.calls[0][2].width).toBe(700);
     expect(canvas().querySelector('.rich-stage[data-pending]')).not.toBeNull();
+    // No source flashing by: the frame, holding a place, says what is coming.
+    const placeholder = screen.getByRole('figure', { name: 'Diagram' });
+    expect(placeholder).toHaveAttribute('data-placeholder');
+    expect(placeholder).toHaveAttribute('aria-busy', 'true');
+    expect(placeholder).toHaveTextContent('Rendering…');
+    expect(document.querySelector('pre')).toBeNull();
     expect(screen.queryByRole('img', { name: 'Rendered mermaid' })).toBeNull();
-    expect(screen.queryByRole('figure')).toBeNull();
-    expect(document.querySelector('pre code')?.textContent).toBe('graph A');
-    expect(screen.getByText('rendering…')).toBeInTheDocument();
+    expect(screen.queryByRole('status')).toBeNull();
 
     await act(async () => { finish(); });
-    expect(screen.getByRole('figure', { name: 'Diagram' })).toContainElement(screen.getByRole('img', { name: 'Rendered mermaid' }));
+    const figure = screen.getByRole('figure', { name: 'Diagram' });
+    expect(figure).not.toHaveAttribute('data-placeholder');
+    expect(figure).not.toHaveAttribute('aria-busy');
+    expect(figure).toContainElement(screen.getByRole('img', { name: 'Rendered mermaid' }));
     expect(shown()).toBe('graph A');
     expect(canvas().querySelector('[data-pending]')).toBeNull();
     expect(document.querySelector('pre')).toBeNull();
-    expect(screen.queryByText('rendering…')).toBeNull();
+    expect(screen.queryByText('Rendering…')).toBeNull();
     // No header: the language label goes with the source view.
     expect(screen.queryByText('mermaid')).toBeNull();
     const tools = screen.getByRole('group', { name: 'Diagram tools' });
@@ -186,15 +223,54 @@ describe('RichCodeBlock', () => {
       .toEqual(['Expand', 'Download SVG', 'Download PNG', 'Source']);
   });
 
+  it('shows the source when the picture is slow to come, and the picture when it does', async () => {
+    vi.useFakeTimers();
+    const finish = drawLater();
+    renderBlock('graph slow', false);
+    await act(async () => {});
+    await act(async () => { vi.advanceTimersByTime(1499); });
+    expect(frame()).toHaveAttribute('data-placeholder');
+    expect(document.querySelector('pre')).toBeNull();
+    await act(async () => { vi.advanceTimersByTime(1); });
+    expect(frame()).not.toHaveAttribute('data-placeholder');
+    expect(screen.queryByRole('figure')).toBeNull();
+    expect(document.querySelector('pre code')?.textContent).toBe('graph slow');
+    expect(screen.getByText('rendering…')).toBeInTheDocument();
+
+    await act(async () => { finish(); });
+    expect(screen.getByRole('img', { name: 'Rendered mermaid' })).toBeInTheDocument();
+    expect(document.querySelector('pre')).toBeNull();
+  });
+
+  it('shows the source of a failed block at once, without waiting', async () => {
+    renderBlock('BAD', false);
+    const note = await screen.findByRole('status');
+    expect(note.textContent).toContain("Couldn't render this mermaid: boom on line 1");
+    expect(frame()).not.toHaveAttribute('data-placeholder');
+    expect(document.querySelector('pre code')?.textContent).toBe('BAD');
+  });
+
+  it('holds the place of a picture drawn before at the height it had', async () => {
+    pictureHeight = 240;
+    const first = renderBlock('graph seen before', false);
+    await rendered();
+    first.unmount();
+    // Drawn again — the finished message replacing the streamed one.
+    const finish = drawLater();
+    renderBlock('graph seen before', false);
+    await act(async () => {});
+    expect(frame()).toHaveAttribute('data-placeholder');
+    expect(frame().style.minHeight).toBe(`${240 + 34}px`);
+    await act(async () => { finish(); });
+    expect(frame().style.minHeight).toBe('');
+  });
+
   it('keeps the previous picture on screen until the next one is ready', async () => {
     const { update } = renderBlock('graph A', false);
     await rendered();
     expect(shown()).toBe('graph A');
 
-    let finish!: () => void;
-    mountMermaid.mockImplementationOnce((stage, source) => new Promise(resolve => {
-      finish = () => resolve(draw(stage, source));
-    }));
+    const finish = drawLater();
     update('graph B', false);
     await act(async () => {});
     expect(mountMermaid).toHaveBeenCalledTimes(2);
@@ -216,12 +292,23 @@ describe('RichCodeBlock', () => {
     update('graph TD', true);
     await act(async () => { vi.advanceTimersByTime(400); });
     expect(mountMermaid).toHaveBeenCalledTimes(1);
+    expect(frame()).not.toHaveAttribute('data-placeholder');
     update('graph TD\n  A-->B', true);
     await act(async () => { vi.advanceTimersByTime(400); });
     expect(mountMermaid).toHaveBeenCalledTimes(1);
     await act(async () => { vi.advanceTimersByTime(300); });
     expect(mountMermaid).toHaveBeenCalledTimes(2);
     expect(mountMermaid.mock.calls[1][1]).toBe('graph TD\n  A-->B');
+  });
+
+  it('keeps showing the source of a streamed block once the stream ends, until the picture is ready', async () => {
+    mountMermaid.mockImplementation(() => new Promise(() => {}));
+    const { update } = renderBlock('graph TD\n  A-->B', true);
+    await act(async () => {});
+    update('graph TD\n  A-->B', false);
+    await act(async () => {});
+    expect(frame()).not.toHaveAttribute('data-placeholder');
+    expect(document.querySelector('pre code')?.textContent).toBe('graph TD\n  A-->B');
   });
 
   it('keeps quiet about a failure while streaming, and explains it after', async () => {
@@ -251,7 +338,7 @@ describe('RichCodeBlock', () => {
     await act(async () => { useThemeStore.setState({ resolved: before }); });
   });
 
-  it('switches between the figure and its source in the code-block look', async () => {
+  it('switches between the figure and its source, handing focus to the way back', async () => {
     renderBlock('graph A', false);
     const img = await rendered();
     await userEvent.click(button('Source'));
@@ -261,35 +348,94 @@ describe('RichCodeBlock', () => {
     expect(button('Copy source')).toBeInTheDocument();
     expect(noButton('Expand')).toBeNull();
     expect(document.querySelector('pre code')?.textContent).toBe('graph A');
+    expect(button('Rendered')).toHaveFocus();
 
-    await userEvent.click(button('Rendered'));
+    await userEvent.keyboard('{Enter}');
     expect(img.hidden).toBe(false);
     expect(screen.getByRole('figure', { name: 'Diagram' })).toBeInTheDocument();
     expect(document.querySelector('pre')).toBeNull();
+    expect(button('Source')).toHaveFocus();
+    await userEvent.keyboard('{Enter}');
+    expect(button('Rendered')).toHaveFocus();
+  });
+
+  it('names the figure after the title its picture carries', async () => {
+    mountMermaid.mockImplementationOnce(async (stage) => {
+      stage.innerHTML = '<svg><title>Request flow</title><text>A</text></svg>';
+      return { cleanup: () => { stage.innerHTML = ''; } };
+    });
+    const first = renderBlock('graph titled', false);
+    expect(await screen.findByRole('figure', { name: 'Diagram: Request flow' })).toBeInTheDocument();
+    first.unmount();
+    // Vega puts a spec's description on its container.
+    mountMermaid.mockImplementationOnce(async (stage) => {
+      stage.innerHTML = '<div role="graphics-document" aria-label="Spend per week"><svg></svg></div>';
+      return { cleanup: () => { stage.innerHTML = ''; } };
+    });
+    renderBlock('graph described', false);
+    expect(await screen.findByRole('figure', { name: 'Diagram: Spend per week' })).toBeInTheDocument();
+  });
+
+  describe('toolbar', () => {
+    it('shows on hover or keyboard focus only, so a mouse click does not pin it over the picture', async () => {
+      const css = await stylesheet();
+      const rich = css.slice(css.indexOf('.rich-figure {'), css.indexOf('/* Code blocks */'));
+      expect(rich.length).toBeGreaterThan(1000);
+      expect(rich).toMatch(/\.rich-figure-toolbar \{[^}]*opacity: 0;/);
+      expect(rich).toContain('.rich-figure:hover > .rich-figure-toolbar,\n.rich-figure:has(:focus-visible) > .rich-figure-toolbar { opacity: 1; }');
+      expect(rich).not.toContain(':focus-within');
+      // A short picture, and a screen without hover, give it a row of its own.
+      expect(rich).toMatch(/\.rich-figure\[data-short\] > \.rich-figure-toolbar \{[^}]*position: static;[^}]*opacity: 1;/);
+      expect(rich).toMatch(/@media \(hover: none\) \{[^@]*\.rich-figure-toolbar \{[^}]*position: static;[^}]*opacity: 1;/);
+    });
+
+    it('gets a row of its own above a picture too short to share its corner', async () => {
+      pictureHeight = 49;
+      renderBlock('graph short', false);
+      await rendered();
+      expect(frame()).toHaveAttribute('data-short');
+      // Taller, as at 1:1: it overlays the corner again, on hover.
+      resizeColumn(700, 180);
+      expect(frame()).not.toHaveAttribute('data-short');
+      resizeColumn(700, 60);
+      expect(frame()).toHaveAttribute('data-short');
+      // Clicking a tool leaves no mark that would keep the toolbar up.
+      resizeColumn(700, 180);
+      await userEvent.click(button('Expand'));
+      await userEvent.keyboard('{Escape}');
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+      expect(frame()).not.toHaveAttribute('data-short');
+      expect(frame().getAttributeNames().filter(n => n.startsWith('data-'))).toEqual([]);
+    });
   });
 
   describe('sizing', () => {
     it('fits a picture a little wider than the column, and offers 1:1', async () => {
-      drawSized(1000, 400);
+      drawSized(800, 400);
       renderBlock('graph A', false);
       await rendered();
-      // 700 / 1000 = 0.7 keeps the text readable: scaled to the column.
+      // 700 / 800 keeps 14px text above 11px: scaled to the column.
       expect([picture().style.width, picture().style.height, picture().style.maxWidth]).toEqual(['100%', 'auto', '100%']);
       expect(noButton('Fit to width')).toBeNull();
       await userEvent.click(button('Actual size (1:1)'));
-      expect([picture().style.width, picture().style.height, picture().style.maxWidth]).toEqual(['1000px', '400px', 'none']);
+      expect([picture().style.width, picture().style.height, picture().style.maxWidth]).toEqual(['800px', '400px', 'none']);
       expect(button('Fit to width').textContent).toBe('Fit');
       await userEvent.click(button('Fit to width'));
       expect(picture().style.width).toBe('100%');
       expect(button('Actual size (1:1)').textContent).toBe('1:1');
     });
 
-    it('shows a picture far wider than the column at 1:1, to scroll', async () => {
-      drawSized(1400, 300);
+    it('fits down to 0.8 and shows anything wider at 1:1, to scroll', async () => {
+      drawSized(875, 300);
+      const first = renderBlock('graph A', false);
+      await rendered();
+      expect(picture().style.width).toBe('100%');
+      first.unmount();
+      drawSized(1000, 300);
       renderBlock('graph A', false);
       await rendered();
-      // 700 / 1400 = 0.5 would shrink the text past reading.
-      expect([picture().style.width, picture().style.height]).toEqual(['1400px', '300px']);
+      // 700 / 1000 = 0.7 would take 14px labels below 11px.
+      expect([picture().style.width, picture().style.height]).toEqual(['1000px', '300px']);
       expect(button('Fit to width')).toBeInTheDocument();
     });
 
@@ -317,7 +463,7 @@ describe('RichCodeBlock', () => {
 
     it('follows the column, and lays a chart out again once the resizing stops', async () => {
       const resize = vi.fn();
-      drawSized(1000, 400, { resize });
+      drawSized(800, 400, { resize });
       renderBlock('graph A', false);
       await rendered();
       expect(picture().style.width).toBe('100%');
@@ -325,7 +471,7 @@ describe('RichCodeBlock', () => {
 
       // Wide enough now: the picture fits at its own size, and the toggle goes.
       resizeColumn(1200);
-      expect(picture().style.width).toBe('1000px');
+      expect(picture().style.width).toBe('800px');
       expect(noButton(/Fit to width|Actual size/)).toBeNull();
       act(() => { vi.advanceTimersByTime(100); });
       resizeColumn(1250);
@@ -334,9 +480,9 @@ describe('RichCodeBlock', () => {
       act(() => { vi.advanceTimersByTime(1); });
       expect(resize).toHaveBeenCalledTimes(1);
 
-      // Narrow again: below 0.6 it goes to 1:1.
+      // Narrow again: below 0.8 it goes to 1:1.
       resizeColumn(500);
-      expect(picture().style.width).toBe('1000px');
+      expect(picture().style.width).toBe('800px');
       expect(button('Fit to width')).toBeInTheDocument();
       act(() => { vi.advanceTimersByTime(150); });
       expect(resize).toHaveBeenCalledTimes(2);
@@ -347,14 +493,14 @@ describe('RichCodeBlock', () => {
     });
 
     it('keeps the reader\'s choice when the picture is drawn again', async () => {
-      drawSized(1000, 400);
+      drawSized(800, 400);
       renderBlock('graph A', false);
       await rendered();
       await userEvent.click(button('Actual size (1:1)'));
       const before = useThemeStore.getState().resolved;
       await act(async () => { useThemeStore.setState({ resolved: before === 'dark' ? 'light' : 'dark' }); });
       expect(mountMermaid).toHaveBeenCalledTimes(2);
-      expect(picture().style.width).toBe('1000px');
+      expect(picture().style.width).toBe('800px');
       expect(button('Fit to width')).toBeInTheDocument();
       await act(async () => { useThemeStore.setState({ resolved: before }); });
     });
