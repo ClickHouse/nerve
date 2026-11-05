@@ -77,6 +77,9 @@ CLIENT_GONE_END_REASONS = {
     "idle_reap": "process_ended",
     "deleted": "process_ended",
     "model_switch": "model_switch",
+    # The engine defers an effort switch while agents run, so this only
+    # labels a record that slipped through: a generic runtime end.
+    "effort_switch": "process_ended",
     "force_stop": "force_stop",
     "archived": "archived",
     "gateway_restart": "gateway_restart",
