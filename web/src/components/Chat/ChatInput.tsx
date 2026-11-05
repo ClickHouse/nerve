@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent, type MouseEvent as ReactMouseEvent } from 'react';
 import { ArrowUp, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat, MoreHorizontal, Clock, ChevronRight } from '../ui/icons';
-import { Button, IconButton, Select, TextField } from '../ui';
+import { Button, IconButton, TextField } from '../ui';
 import { useChatStore, EMPTY_REVIEW_LOOP, registerComposerFlush } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { useAgentStore } from '../../stores/agentStore';
@@ -11,7 +11,7 @@ import { randomUUID } from '../../utils/uuid';
 import { findSessionById } from '../../utils/findSession';
 import { FOCUS_COMPOSER_COMBO, formatCombo } from '../../utils/keyboard';
 import { PromptRewriteCard } from './PromptRewriteCard';
-import { BackendSelector } from './BackendSelector';
+import { ModelSelector } from './ModelSelector';
 import { ReviewLoopPanel } from './ReviewLoopPanel';
 import { QueuedMessages } from './agents/QueuedMessages';
 import { StopSplitButton } from './agents/StopSplitButton';
@@ -164,11 +164,26 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
   const setNewChatModel = useChatStore(s => s.setNewChatModel);
   const setSessionModel = useChatStore(s => s.setSessionModel);
   const loadModels = useChatStore(s => s.loadModels);
-  const scopedModels = availableModels.filter(m => m.backend === activeBackend);
+  const backendOptions = useChatStore(s => s.backendOptions);
+  const setNewChatBackend = useChatStore(s => s.setNewChatBackend);
   const modelsDefault = modelDefaults[activeBackend] ?? null;
   const currentModel = isVirtualChat
     ? (newChatModels[activeBackend] ?? modelsDefault)
     : (activeSessionRow?.model ?? modelsDefault);
+  // What the model menu can switch to. A new chat can take a model of any
+  // available backend, and the backend comes with it. A chat that exists
+  // keeps its backend.
+  const pickableModels = availableModels.filter(m => m.backend === activeBackend
+    || (isVirtualChat && backendOptions.some(o => o.id === m.backend && o.available !== false)));
+  const pickModel = (backend: string, id: string) => {
+    if (isVirtualChat) {
+      if (backend !== activeBackend) setNewChatBackend(backend === backendDefault ? null : backend);
+      setNewChatModel(backend, id === (modelDefaults[backend] ?? null) ? null : id);
+    } else if (backend === activeBackend) {
+      void setSessionModel(activeSession, id);
+    }
+    setTimeout(() => textareaRef.current?.focus(), 0);
+  };
   // Switching the model recreates the runtime, which would end every live
   // agent of this session (the server refuses it too).
   const liveAgents = useAgentStore(s => (s.sessionId === activeSession ? s.summary.live : 0));
@@ -797,66 +812,26 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
               has more controls than one line holds. The row then wraps, and
               the actions move to the next line as one group. */}
           <div data-composer-blank="" className="flex flex-wrap items-center gap-1 px-2 pb-2">
-            {/* Agent backend selector, Claude or Codex, new chats only.
-                Binds at session creation and is fixed after that (the
-                header's model badge shows what a running session uses).
-                Picks the OBSERVER session's backend; loop legs use the
-                panel config. */}
-            {isVirtualChat && (
-              <BackendSelector disabled={disabled || isStreaming || rewriteActive} />
-            )}
-            {/* Backend-scoped, PER-CHAT model picker. A pick here re-points
-                only this chat: virtual chats bind it at creation, real
-                sessions PATCH their own row, never a global preference.
-                `field-sizing-content` makes it as wide as the chosen name,
-                where the browser supports it. It has no shrink limit, so on
-                a narrow line the name is cut short rather than pushing the
-                send controls out of the box. */}
-            {scopedModels.length > 1 && (
-              <Select
-                value={currentModel ?? ''}
-                onChange={(e) => {
-                  const picked = e.target.value;
-                  if (isVirtualChat) {
-                    setNewChatModel(activeBackend, picked === modelsDefault ? null : picked);
-                  } else {
-                    setSessionModel(activeSession, picked);
-                  }
-                }}
+            {/* PER-CHAT model menu. A pick here re-points only this chat:
+                virtual chats bind it at creation, real sessions PATCH their
+                own row, never a global preference. In a new chat a model of
+                the other backend also picks that backend (Claude or Codex),
+                which binds at session creation and is fixed after that. It
+                picks the OBSERVER session's backend; loop legs use the panel
+                config. */}
+            {pickableModels.length > 1 && (
+              <ModelSelector
+                models={availableModels}
+                backends={backendOptions}
+                activeBackend={activeBackend}
+                currentModel={currentModel}
+                backendFixed={!isVirtualChat}
+                onPick={pickModel}
                 disabled={disabled || isStreaming || rewriteActive || liveAgents > 0}
                 title={liveAgents > 0
                   ? `Switching model restarts the runtime and would stop ${liveAgents} running agent${liveAgents === 1 ? '' : 's'}`
                   : 'Model for this chat (other chats keep theirs)'}
-                className="h-8 min-w-0 max-w-[170px] field-sizing-content px-2 py-0 rounded-lg bg-transparent border-transparent text-text-secondary hover:bg-surface-hover truncate"
-              >
-                {/* A session may run on a model the picker no longer offers
-                    (retired id, uninstalled Ollama model). Keep it visible
-                    rather than silently snapping to the first option. */}
-                {currentModel && !scopedModels.some(m => m.id === currentModel) && (
-                  <option value={currentModel}>{currentModel}</option>
-                )}
-                {scopedModels.some(m => m.provider === 'anthropic') && (
-                  <optgroup label="Anthropic">
-                    {scopedModels.filter(m => m.provider === 'anthropic').map(m => (
-                      <option key={m.id} value={m.id}>{m.id}</option>
-                    ))}
-                  </optgroup>
-                )}
-                {scopedModels.some(m => m.provider === 'ollama') && (
-                  <optgroup label="Ollama (local)">
-                    {scopedModels.filter(m => m.provider === 'ollama').map(m => (
-                      <option key={m.id} value={m.id}>{m.id}</option>
-                    ))}
-                  </optgroup>
-                )}
-                {scopedModels.some(m => m.provider === 'openai') && (
-                  <optgroup label="OpenAI Codex">
-                    {scopedModels.filter(m => m.provider === 'openai').map(m => (
-                      <option key={m.id} value={m.id}>{m.id}</option>
-                    ))}
-                  </optgroup>
-                )}
-              </Select>
+              />
             )}
             {/* Prompt rewrite toggle, only on a fresh chat, where it applies */}
             {rewriteAvailable && isNewChat && (

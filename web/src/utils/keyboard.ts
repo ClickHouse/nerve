@@ -50,13 +50,19 @@ export interface ShortcutCombo {
    * so Mac and Linux bindings coexist.
    */
   key: string;
+  /**
+   * `event.code` of the physical key, for a symbol key that Shift changes.
+   * With Shift held, the `;` key types `:` on a US layout, so `key` alone
+   * does not match. The combo matches when `key` or `code` matches.
+   */
+  code?: string;
 }
 
 /**
  * Moves focus to the chat composer. The chat page binds it, and the composer
  * shows it as a hint while it does not have focus.
  */
-export const FOCUS_COMPOSER_COMBO: ShortcutCombo = { mod: true, shift: true, key: ';' };
+export const FOCUS_COMPOSER_COMBO: ShortcutCombo = { mod: true, shift: true, key: ';', code: 'Semicolon' };
 
 export interface ShortcutDef {
   id: string;
@@ -81,6 +87,7 @@ export function matchesCombo(e: KeyboardEvent, combo: ShortcutCombo): boolean {
   if (!!combo.mod !== isMod(e)) return false;
   if (!!combo.shift !== e.shiftKey) return false;
   if (!!combo.alt !== e.altKey) return false;
+  if (combo.code && e.code === combo.code) return true;
 
   const eventKey = e.key;
   const wanted = combo.key;
