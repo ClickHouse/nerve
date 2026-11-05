@@ -5,20 +5,20 @@ import { IconButton, Modal } from '../../ui';
 import { Check, Copy, Download, Maximize2 } from '../../ui/icons';
 import { MarkdownStreamingContext } from '../streamingContext';
 import { KIND_LABEL, MAX_RICH_SOURCE_CHARS, type RichKind } from './kinds';
-import type { Cleanup, Mount } from './types';
+import type { Mount, Mounted } from './types';
 import { useSettledValue } from './useSettledValue';
 
 // Each renderer, with its library, loads the first time a chat shows a block
 // of its kind; a chat without diagrams pays for none of them.
 const MOUNTS: Record<RichKind, Mount> = {
-  mermaid: (stage, source, theme) =>
-    import('./mermaid').then(m => m.mountMermaid(stage, source, theme)),
-  'vega-lite': (stage, source, theme) =>
-    import('./vega').then(m => m.mountVega('vega-lite')(stage, source, theme)),
-  vega: (stage, source, theme) =>
-    import('./vega').then(m => m.mountVega('vega')(stage, source, theme)),
-  svg: (stage, source, theme) =>
-    import('./svg').then(m => m.mountSvg(stage, source, theme)),
+  mermaid: (stage, source, context) =>
+    import('./mermaid').then(m => m.mountMermaid(stage, source, context)),
+  'vega-lite': (stage, source, context) =>
+    import('./vega').then(m => m.mountVega('vega-lite')(stage, source, context)),
+  vega: (stage, source, context) =>
+    import('./vega').then(m => m.mountVega('vega')(stage, source, context)),
+  svg: (stage, source, context) =>
+    import('./svg').then(m => m.mountSvg(stage, source, context)),
 };
 
 /**
@@ -35,7 +35,7 @@ type Status = 'rendering' | 'rendered' | 'failed';
 /** The render on screen. It is replaced only by the next successful one. */
 interface Shown {
   stage: HTMLElement;
-  cleanup: Cleanup;
+  mounted: Mounted;
 }
 
 /** How the last attempt went, and what it was an attempt at. */
@@ -118,16 +118,16 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
     stage.className = 'rich-stage';
     canvas.appendChild(stage);
     let cancelled = false;
-    MOUNTS[kind](stage, settled, theme).then(
-      (cleanup) => {
+    MOUNTS[kind](stage, settled, { theme, width: canvas.clientWidth }).then(
+      (mounted) => {
         if (cancelled) {
-          cleanup();
+          mounted.cleanup();
           stage.remove();
           return;
         }
         const previous = shownRef.current;
-        shownRef.current = { stage, cleanup };
-        previous?.cleanup();
+        shownRef.current = { stage, mounted };
+        previous?.mounted.cleanup();
         previous?.stage.remove();
         setOutcome({ kind, theme, source: settled, error: null });
         setHasRender(true);
@@ -156,7 +156,7 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
 
   // The render on screen outlives the effect that made it; it goes with the block.
   useEffect(() => () => {
-    shownRef.current?.cleanup();
+    shownRef.current?.mounted.cleanup();
     shownRef.current?.stage.remove();
     shownRef.current = null;
   }, []);

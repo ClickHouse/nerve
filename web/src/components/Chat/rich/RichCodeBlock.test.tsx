@@ -5,14 +5,16 @@ import { useThemeStore } from '../../../stores/themeStore';
 import { MarkdownStreamingContext } from '../streamingContext';
 import { RichCodeBlock } from './RichCodeBlock';
 
+import type { Mount, Mounted } from './types';
+
 const { mountMermaid } = vi.hoisted(() => ({
-  mountMermaid: vi.fn<(stage: HTMLElement, source: string, theme: string) => Promise<() => void>>(),
+  mountMermaid: vi.fn<(...args: Parameters<Mount>) => Promise<Mounted>>(),
 }));
 vi.mock('./mermaid', () => ({ mountMermaid }));
 
-function draw(stage: HTMLElement, source: string) {
+function draw(stage: HTMLElement, source: string): Mounted {
   stage.innerHTML = `<svg><text>${source}</text></svg>`;
-  return () => { stage.innerHTML = ''; };
+  return { cleanup: () => { stage.innerHTML = ''; } };
 }
 
 beforeEach(() => {
@@ -116,11 +118,11 @@ describe('RichCodeBlock', () => {
     renderBlock('graph A', false);
     await screen.findByRole('img', { name: 'Rendered mermaid' });
     const before = useThemeStore.getState().resolved;
-    expect(mountMermaid.mock.calls[0][2]).toBe(before);
+    expect(mountMermaid.mock.calls[0][2].theme).toBe(before);
     const other = before === 'dark' ? 'light' : 'dark';
     await act(async () => { useThemeStore.setState({ resolved: other }); });
     expect(mountMermaid).toHaveBeenCalledTimes(2);
-    expect(mountMermaid.mock.calls[1][2]).toBe(other);
+    expect(mountMermaid.mock.calls[1][2].theme).toBe(other);
     useThemeStore.setState({ resolved: before });
   });
 

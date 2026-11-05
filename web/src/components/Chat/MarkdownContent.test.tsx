@@ -9,7 +9,7 @@ import { InlineMarkdown, MarkdownContent } from './MarkdownContent';
 // megabytes; the routing under test only needs to see which block got which
 // source.
 const { mountMermaid } = vi.hoisted(() => ({
-  mountMermaid: vi.fn<(stage: HTMLElement, source: string, theme: string) => Promise<() => void>>(),
+  mountMermaid: vi.fn<(stage: HTMLElement, source: string, context: { theme: string; width: number }) => Promise<{ cleanup: () => void }>>(),
 }));
 vi.mock('./rich/mermaid', () => ({ mountMermaid }));
 
@@ -17,7 +17,7 @@ beforeEach(() => {
   mountMermaid.mockReset();
   mountMermaid.mockImplementation(async (stage, source) => {
     stage.innerHTML = `<svg><text>${source}</text></svg>`;
-    return () => { stage.innerHTML = ''; };
+    return { cleanup: () => { stage.innerHTML = ''; } };
   });
 });
 

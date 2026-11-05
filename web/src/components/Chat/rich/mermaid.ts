@@ -19,7 +19,19 @@ function describe(err: unknown): string {
   return lines.slice(0, 2).join(' ').slice(0, 240) || 'the diagram could not be parsed';
 }
 
-export const mountMermaid: Mount = async (stage, source, theme) => {
+/** The rendered SVG's size in CSS pixels: its width/height, else its viewBox. */
+function naturalSizeOf(svg: SVGSVGElement): { width: number; height: number } | undefined {
+  const width = parseFloat(svg.getAttribute('width') ?? '');
+  const height = parseFloat(svg.getAttribute('height') ?? '');
+  if (width > 0 && height > 0 && !svg.getAttribute('width')?.endsWith('%')) return { width, height };
+  const box = svg.viewBox?.baseVal;
+  if (box && box.width > 0 && box.height > 0) return { width: box.width, height: box.height };
+  const max = parseFloat(svg.style.maxWidth);
+  if (max > 0 && box?.height) return { width: max, height: box.height };
+  return undefined;
+}
+
+export const mountMermaid: Mount = async (stage, source, { theme }) => {
   const mermaid = await loadMermaid();
   // `initialize` resets the global configuration, so every render states all
   // of it. Strict security: labels are sanitized, and `click` callbacks and
@@ -39,7 +51,12 @@ export const mountMermaid: Mount = async (stage, source, theme) => {
   const id = `nerve-mermaid-${++renderSeq}`;
   const { svg } = await mermaid.render(id, source);
   stage.innerHTML = svg;
-  return () => {
-    stage.innerHTML = '';
+  const element = stage.querySelector('svg');
+  return {
+    cleanup: () => {
+      stage.innerHTML = '';
+    },
+    naturalSize: element ? naturalSizeOf(element) : undefined,
+    toSvg: async () => stage.querySelector('svg')?.outerHTML ?? null,
   };
 };

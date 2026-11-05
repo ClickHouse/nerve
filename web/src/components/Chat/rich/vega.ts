@@ -56,7 +56,7 @@ export function parseSpec(source: string): Record<string, unknown> {
 }
 
 export function mountVega(mode: VegaMode): Mount {
-  return async (stage, source, theme) => {
+  return async (stage, source, { theme }) => {
     const spec = parseSpec(source);
     // vega + vega-lite + vega-embed are their own chunk, fetched the first
     // time a chat shows a chart.
@@ -76,6 +76,16 @@ export function mountVega(mode: VegaMode): Mount {
       tooltip: { theme },
       downloadFileName: 'chart',
     });
-    return () => result.finalize();
+    return {
+      cleanup: () => result.finalize(),
+      toSvg: () => result.view.toSVG(),
+      toPng: async (scale) => {
+        const url = await result.view.toImageURL('png', scale);
+        return (await fetch(url)).blob();
+      },
+      resize: async () => {
+        await result.view.resize().runAsync();
+      },
+    };
   };
 }

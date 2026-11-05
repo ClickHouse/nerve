@@ -72,9 +72,27 @@ export function sanitizeSvg(source: string): string {
   return clean;
 }
 
+/** The picture's size from its `width`/`height` attributes, else its viewBox. */
+function naturalSizeOf(svg: SVGSVGElement): { width: number; height: number } | undefined {
+  const w = svg.getAttribute('width') ?? '';
+  const h = svg.getAttribute('height') ?? '';
+  const width = parseFloat(w);
+  const height = parseFloat(h);
+  if (width > 0 && height > 0 && !w.endsWith('%') && !h.endsWith('%')) return { width, height };
+  const box = (svg.getAttribute('viewBox') ?? '').trim().split(/[\s,]+/).map(Number);
+  if (box.length === 4 && box[2] > 0 && box[3] > 0) return { width: box[2], height: box[3] };
+  return undefined;
+}
+
 export const mountSvg: Mount = async (stage, source) => {
-  stage.innerHTML = sanitizeSvg(source);
-  return () => {
-    stage.innerHTML = '';
+  const clean = sanitizeSvg(source);
+  stage.innerHTML = clean;
+  const element = stage.querySelector('svg');
+  return {
+    cleanup: () => {
+      stage.innerHTML = '';
+    },
+    naturalSize: element ? naturalSizeOf(element) : undefined,
+    toSvg: async () => clean,
   };
 };
