@@ -1043,9 +1043,19 @@ Response: { "unarchived": true }
 Create a new session.
 
 ```json
-Request:  { "title": "My Session" }
-Response: { "id": "a1b2c3d4", "title": "My Session", "source": "web", "created_by_actor_id": "…", "caused_by_actor_id": "…" }
+Request:  { "title": "My Session", "model": "claude-opus-5-5", "effort": "medium" }
+Response: { "id": "a1b2c3d4", "title": "My Session", "source": "web", "effort": "medium", "created_by_actor_id": "…", "caused_by_actor_id": "…" }
 ```
+
+`effort` is the session's reasoning effort: `low`, `medium`, `high`, `xhigh`
+or `max`. Omitted or `null` means Default: `agent.effort`, or
+`agent.cron_effort` for cron and hook turns. An unknown level answers `400`.
+Every session payload carries `effort` (`null` for Default). The runtime gets
+it when the session's client is built (Claude: `--effort`), and the
+sub-agents and workflow agents it starts inherit it unless a call or an agent
+definition asks for its own level (see
+[Sub-agents](agents.md#effort)). A per-run effort (a workflow run's, a cron
+job's `effort` in jobs.yaml) still wins over the session's.
 
 `created_by_actor_id` is an actor id for [`GET /api/actors`](#actors), not an
 account id. It is `null` for legacy rows and sessions caused by an unidentified
@@ -1138,8 +1148,11 @@ session's pending questions; the notification rows stay. A turn never creates
 a deleted session again: a run in it is refused.
 
 #### `PATCH /api/sessions/{id}`
-Update `title`, `starred`, `model`, `parent_session_id` or `codex_daybreak`.
-A `model` change recreates the session's runtime, which would end its live
+Update `title`, `starred`, `model`, `effort`, `parent_session_id` or
+`codex_daybreak`. `effort` takes a level, or `null` (or `""`) to go back to
+Default; an unknown level answers `400`. A `model` or `effort` change
+recreates the session's runtime on its next turn (the conversation resumes),
+which would end its live
 background agents: while any run it answers `409` with
 `{"detail": {"code": "live_background_agents", "message": "…", "live": 2}}`.
 A `title` sets the session's `title_source` to `manual`, so Nerve no longer

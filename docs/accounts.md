@@ -363,6 +363,7 @@ work uses the system actor.
 | `title_changed` | The title changes | `title`, `previous`; `reason` is `placeholder` or `generated` for a title that Nerve makes from the first message, `outcome` for one it makes when a turn ends (`agent.outcome_titles`), `regenerated` for Regenerate name (actor: the person), `cron_rotation` for a rotated cron session |
 | `starred`, `unstarred` | The session is starred or unstarred | |
 | `model_changed` | The model changes | `model`, `previous` |
+| `effort_changed` | The session's effort changes | `effort`, `previous` (`null` for Default) |
 | `parent_changed` | The session moves under another session, or back to the top level | `parent_session_id`, `previous` |
 | `compacted` | A Compact compacts the conversation. A Compact that stops, fails or has nothing to compact records no event | |
 | `archived`, `unarchived` | The session is archived or restored | `cascade_root` for a session that an archive of an ancestor archives; `reason` for an automatic archive (`idle_interactive`, `stale`, `overflow`, `codex_thread_archived`) |
