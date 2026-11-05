@@ -639,21 +639,17 @@ body {
 .rich-figure:hover > .rich-figure-toolbar,
 .rich-figure:has(:focus-visible) > .rich-figure-toolbar { opacity: 1; }
 /* A picture shorter than about two toolbars (RichCodeBlock sets the flag):
-   the toolbar's row is kept free above it, and the toolbar still only shows
-   on hover or keyboard focus. */
-.rich-figure[data-short] { padding-top: 8px; }
-.rich-figure[data-short] > .rich-figure-toolbar {
-  position: static;
-  width: fit-content;
-  margin: 0 -8px 8px auto;
-}
+   as much room below it as above, and above enough for the toolbar in its
+   corner (8px in, 34px tall, a 4px gap), so the picture sits in the middle
+   of its frame at rest and nothing covers it when the toolbar shows. */
+.rich-figure[data-short] { padding-top: 46px; padding-bottom: 46px; }
 /* A complete block whose picture is on its way: the frame, holding a place —
    the height the picture had when it was drawn before (`--rich-hint`, the
-   canvas alone) plus the frame around it: 34px of padding and border, 68px
-   with the toolbar's own row. */
+   canvas alone) plus the frame around it: 34px of padding and border, 94px
+   for a short picture. */
 .rich-figure[data-placeholder] { min-height: 120px; }
 .rich-figure[data-placeholder][data-hint] { min-height: calc(var(--rich-hint) + 34px); }
-.rich-figure[data-placeholder][data-hint][data-short] { min-height: calc(var(--rich-hint) + 68px); }
+.rich-figure[data-placeholder][data-hint][data-short] { min-height: calc(var(--rich-hint) + 94px); }
 .rich-figure-placeholder {
   position: absolute;
   inset: 0;
@@ -680,10 +676,11 @@ body {
   line-height: 1rem;
 }
 @media (hover: none) {
-  .rich-figure:not([data-collapsed]) { padding-top: 8px; }
+  .rich-figure:not([data-collapsed]) { padding-top: 8px; padding-bottom: 16px; }
   .rich-figure-toolbar { position: static; width: fit-content; margin: 0 -8px 8px auto; opacity: 1; }
   .rich-figure-notice { position: static; width: fit-content; margin: 0 0 8px auto; }
-  .rich-figure[data-placeholder][data-hint] { min-height: calc(var(--rich-hint) + 68px); }
+  .rich-figure[data-placeholder][data-hint],
+  .rich-figure[data-placeholder][data-hint][data-short] { min-height: calc(var(--rich-hint) + 68px); }
 }
 .rich-figure-toolbar button:focus-visible,
 .rich-source-bar button:focus-visible,

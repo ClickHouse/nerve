@@ -259,9 +259,9 @@ function layoutFor(natural: Size | null | undefined, width: number, choice: Choi
 }
 
 /**
- * Sizes the picture in `stage`: scaled to the column, or at its natural size,
- * which scrolls when it is wider than the column. The svg's own width and
- * height attributes are not trusted to say either (`width="100%"`).
+ * Sizes the picture in `stage`: scaled down to the column, or at its natural
+ * size, which scrolls when it is wider than the column. The svg's own width
+ * and height attributes are not trusted to say either (`width="100%"`).
  */
 function applySizing(stage: HTMLElement, natural: Size | null, fit: boolean) {
   const svg = stage.querySelector('svg');
@@ -270,7 +270,8 @@ function applySizing(stage: HTMLElement, natural: Size | null, fit: boolean) {
     ensureViewBox(svg, natural);
     svg.style.width = '100%';
     svg.style.height = 'auto';
-    svg.style.maxWidth = '100%';
+    // Scaled down to the column, never up past its own size.
+    svg.style.maxWidth = `${natural.width}px`;
   } else {
     svg.style.width = `${natural.width}px`;
     svg.style.height = `${natural.height}px`;
@@ -366,6 +367,10 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
   const [outcome, setOutcome] = useState<Outcome | null>(null);
   const [picture, setPicture] = useState<Picture | null>(null);
   const [canvasWidth, setCanvasWidth] = useState(0);
+  // The width the fit decision and the toolbar go by. It follows the canvas
+  // at once, except for a picture that draws itself again for a new width:
+  // that one keeps its decision until the new drawing is there.
+  const [layoutWidth, setLayoutWidth] = useState(0);
   const [canvasHeight, setCanvasHeight] = useState(0);
   const [choice, setChoice] = useState<Choice | null>(null);
   const [showSource, setShowSource] = useState(false);
@@ -394,9 +399,11 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
     const turn = inLane(kind, async () => {
       // Asked for something else, or gone, while it waited: nothing to draw.
       if (cancelled) return null;
+      // Its turn: from here the placeholder's patience runs, the renderer's
+      // download included (a stalled chunk still ends in the source).
+      setDrawing(true);
       const mount = await RENDERERS[kind]();
       if (cancelled) return null;
-      setDrawing(true);
       return mount(stage, settled, { theme, width: canvas.clientWidth || widthRef.current });
     });
     turn.result.then(
@@ -433,6 +440,7 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
           title: pictureTitle(stage),
         });
         setCanvasWidth(width);
+        setLayoutWidth(width);
       },
       (err: unknown) => {
         stage.remove();
@@ -464,23 +472,32 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
       if (width === widthRef.current) return;
       widthRef.current = width;
       setCanvasWidth(width);
+      // A picture that will not draw itself again is decided for the new width now.
+      if (!shownRef.current?.mounted.resize) setLayoutWidth(width);
       clearTimeout(timer);
       timer = setTimeout(() => {
         const shown = shownRef.current;
-        if (!shown?.mounted.resize || shown.width === widthRef.current) return;
-        shown.width = widthRef.current;
-        // A chart drawn to the column's width draws itself again, and may now
+        if (!shown) return;
+        // A chart drawn to the column's width has drawn itself again, and may
         // report another size and text size (on the same Mounted) and a new
-        // svg: size that one, and decide fit and the toolbar again.
-        Promise.resolve(shown.mounted.resize()).then(() => {
+        // svg: size that one, and decide fit and the toolbar for the width.
+        const settle = () => {
           if (shownRef.current !== shown) return;
           shown.natural = usableSize(shown.mounted.naturalSize);
           shown.minTextPx = usableTextPx(shown.mounted.minTextPx);
-          applySizing(shown.stage, shown.natural, layoutFor(shown.natural, widthRef.current, choiceRef.current, shown.minTextPx).fit);
+          const settledWidth = widthRef.current;
+          applySizing(shown.stage, shown.natural, layoutFor(shown.natural, settledWidth, choiceRef.current, shown.minTextPx).fit);
           setPicture(before => before && { ...before, naturalSize: shown.natural, minTextPx: shown.minTextPx });
+          setLayoutWidth(settledWidth);
           const height = canvas.clientHeight;
           if (height > 0) setCanvasHeight(height);
-        }, () => {});
+        };
+        if (!shown.mounted.resize || shown.width === widthRef.current) {
+          settle();
+          return;
+        }
+        shown.width = widthRef.current;
+        Promise.resolve(shown.mounted.resize()).then(settle, settle);
       }, RESIZE_DEBOUNCE_MS);
     });
     observer.observe(canvas);
@@ -490,11 +507,17 @@ export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string
     };
   }, []);
 
-  const layout = layoutFor(picture?.naturalSize, canvasWidth, choice, picture?.minTextPx);
+  const layout = layoutFor(picture?.naturalSize, layoutWidth, choice, picture?.minTextPx);
+  // While a picture draws itself again for a new width, it keeps the decision
+  // it had; one shown at its own size that would now stick out of a narrower
+  // column is scaled into it meanwhile rather than given a scrollbar.
+  const redrawing = layoutWidth !== canvasWidth;
+  const sticksOut = !!picture?.naturalSize && canvasWidth > 0 && picture.naturalSize.width > canvasWidth + 0.5;
+  const sizedToFit = layout.fit || (redrawing && !layout.overflowing && sticksOut);
   useLayoutEffect(() => {
     const shown = shownRef.current;
-    if (shown) applySizing(shown.stage, shown.natural, layout.fit);
-  }, [layout.fit, picture]);
+    if (shown) applySizing(shown.stage, shown.natural, sizedToFit);
+  }, [sizedToFit, picture]);
 
   // The outcome counts only for the attempt it came from; until the current
   // one reports, the block is rendering (and keeps the previous picture).

@@ -355,6 +355,41 @@ describe('RichCodeBlock', () => {
     expect(document.querySelector('pre code')?.textContent).toBe('graph stalls');
   });
 
+  it('falls back to the source when its renderer module never arrives', async () => {
+    // A height known from before, for the second block.
+    pictureHeight = 150;
+    const seen = renderBlock('graph known, then stalled', false);
+    await rendered();
+    seen.unmount();
+    pictureHeight = 0;
+    // A fresh page whose mermaid chunk never finishes downloading.
+    vi.doMock('./mermaid', () => new Promise(() => {}));
+    vi.resetModules();
+    try {
+      const { RichCodeBlock: Stalled } = await import('./RichCodeBlock');
+      vi.useFakeTimers();
+      const unknown = render(<Stalled kind="mermaid" source="graph never drawn" />);
+      await act(async () => {});
+      await act(async () => { vi.advanceTimersByTime(1499); });
+      expect(frame()).toHaveAttribute('data-placeholder');
+      await act(async () => { vi.advanceTimersByTime(1); });
+      expect(document.querySelector('pre code')?.textContent).toBe('graph never drawn');
+      unknown.unmount();
+
+      render(<Stalled kind="mermaid" source="graph known, then stalled" />);
+      await act(async () => {});
+      expect(frame()).toHaveAttribute('data-hint');
+      await act(async () => { vi.advanceTimersByTime(9999); });
+      expect(frame()).toHaveAttribute('data-placeholder');
+      await act(async () => { vi.advanceTimersByTime(1); });
+      expect(document.querySelector('pre code')?.textContent).toBe('graph known, then stalled');
+      expect(mountMermaid).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.doMock('./mermaid', () => ({ mountMermaid }));
+      vi.resetModules();
+    }
+  });
+
   it('keeps the heights in sessionStorage, so a reloaded page holds them too', async () => {
     pictureHeight = 260;
     const first = renderBlock('graph across reloads', false);
@@ -537,16 +572,17 @@ describe('RichCodeBlock', () => {
       expect(rich).toMatch(/\.rich-figure-toolbar \{[^}]*opacity: 0;/);
       expect(rich).toContain('.rich-figure:hover > .rich-figure-toolbar,\n.rich-figure:has(:focus-visible) > .rich-figure-toolbar { opacity: 1; }');
       expect(rich).not.toContain(':focus-within');
-      // A short picture keeps the toolbar's row free, but the toolbar still
-      // fades for a pointer; a screen without hover shows it on its row always.
-      expect(rich).toMatch(/\.rich-figure\[data-short\] > \.rich-figure-toolbar \{[^}]*position: static;/);
-      expect(rich).not.toMatch(/\.rich-figure\[data-short\] > \.rich-figure-toolbar \{[^}]*opacity/);
+      // A short picture gets as much room below as above, where the toolbar
+      // keeps its corner and its fade; a screen without hover shows the
+      // toolbar on a row of its own, always.
+      expect(rich).toContain('.rich-figure[data-short] { padding-top: 46px; padding-bottom: 46px; }');
+      expect(rich).not.toMatch(/\.rich-figure\[data-short\] > \.rich-figure-toolbar/);
       expect(rich).toMatch(/@media \(hover: none\) \{[^@]*\.rich-figure-toolbar \{[^}]*position: static;[^}]*opacity: 1;/);
       // The source view's buttons take the same focus ring as the toolbar's.
       expect(rich).toMatch(/\.rich-figure-toolbar button:focus-visible,\n\.rich-source-bar button:focus-visible,/);
     });
 
-    it('gets a row of its own above a picture too short to share its corner', async () => {
+    it('leaves room above and below a picture too short to share its corner', async () => {
       pictureHeight = 49;
       renderBlock('graph short', false);
       await rendered();
@@ -572,7 +608,7 @@ describe('RichCodeBlock', () => {
       renderBlock('graph A', false);
       await rendered();
       // 700 / 800 keeps 14px text above 11px: scaled to the column.
-      expect([picture().style.width, picture().style.height, picture().style.maxWidth]).toEqual(['100%', 'auto', '100%']);
+      expect([picture().style.width, picture().style.height, picture().style.maxWidth]).toEqual(['100%', 'auto', '800px']);
       expect(noButton('Fit to width')).toBeNull();
       await userEvent.click(button('Actual size (1:1)'));
       expect([picture().style.width, picture().style.height, picture().style.maxWidth]).toEqual(['800px', '400px', 'none']);
@@ -632,27 +668,65 @@ describe('RichCodeBlock', () => {
       expect(picture().style.width).toBe('100%');
       vi.useFakeTimers();
 
-      // Wide enough now: the picture fits at its own size, and the toggle goes.
+      // Wide enough now. Until the chart has caught up with the width, it
+      // keeps its toolbar; fitted, it does not grow past its own size.
       resizeColumn(1200);
+      expect(button('Actual size (1:1)')).toBeInTheDocument();
+      expect(picture().style.maxWidth).toBe('800px');
+      await act(async () => { vi.advanceTimersByTime(100); });
+      resizeColumn(1250);
+      await act(async () => { vi.advanceTimersByTime(149); });
+      expect(resize).not.toHaveBeenCalled();
+      await act(async () => { vi.advanceTimersByTime(1); });
+      expect(resize).toHaveBeenCalledTimes(1);
+      // Caught up: it fits at its own size, and the toggle goes.
       expect(picture().style.width).toBe('800px');
       expect(noButton(/Fit to width|Actual size/)).toBeNull();
-      act(() => { vi.advanceTimersByTime(100); });
-      resizeColumn(1250);
-      act(() => { vi.advanceTimersByTime(149); });
-      expect(resize).not.toHaveBeenCalled();
-      act(() => { vi.advanceTimersByTime(1); });
-      expect(resize).toHaveBeenCalledTimes(1);
 
-      // Narrow again: below 0.8 it goes to 1:1.
+      // Narrow again: below the readable size it goes to 1:1, once caught up.
       resizeColumn(500);
+      await act(async () => { vi.advanceTimersByTime(150); });
+      expect(resize).toHaveBeenCalledTimes(2);
       expect(picture().style.width).toBe('800px');
       expect(button('Fit to width')).toBeInTheDocument();
-      act(() => { vi.advanceTimersByTime(150); });
-      expect(resize).toHaveBeenCalledTimes(2);
       // The same width again is no change.
       resizeColumn(500);
-      act(() => { vi.advanceTimersByTime(150); });
+      await act(async () => { vi.advanceTimersByTime(150); });
       expect(resize).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps the toolbar and sizing it had while a chart draws itself again for a new width', async () => {
+      let mounted!: Mounted;
+      let redraw!: () => void;
+      mountMermaid.mockImplementation(async (stage, source) => {
+        mounted = draw(stage, source, {
+          naturalSize: { width: 700, height: 300 },
+          resize: () => new Promise<void>(resolve => {
+            redraw = () => {
+              stage.innerHTML = `<svg><text>${source}</text></svg>`;
+              mounted.naturalSize = { width: columnWidth, height: 300 };
+              resolve();
+            };
+          }),
+        });
+        return mounted;
+      });
+      renderBlock('gantt', false);
+      await rendered();
+      expect(picture().style.width).toBe('700px');
+      expect(noButton(/Fit to width|Actual size/)).toBeNull();
+      vi.useFakeTimers();
+
+      // 500 / 700 would take 14px text below 11px: decided now, that would be
+      // 1:1 with a scrollbar and a Fit button, for as long as the redraw takes.
+      resizeColumn(500);
+      await act(async () => { vi.advanceTimersByTime(150); });
+      expect(noButton(/Fit to width|Actual size/)).toBeNull();
+      expect([picture().style.width, picture().style.maxWidth]).toEqual(['100%', '700px']);
+      // Drawn again for 500: it fits at its new size.
+      await act(async () => { redraw(); });
+      expect([picture().style.width, picture().style.height]).toEqual(['500px', '300px']);
+      expect(noButton(/Fit to width|Actual size/)).toBeNull();
     });
 
     it('takes the size a chart reports after drawing itself again for a new width', async () => {
