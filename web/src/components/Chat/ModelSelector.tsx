@@ -68,6 +68,12 @@ export function ModelSelector({
     () => groupModelFamilies(models, backends.map(b => b.id)),
     [models, backends],
   );
+  // A backend that fails its preflight lists no models, so it has no
+  // family. It gets a greyed-out row of its own that says why.
+  const unavailable = useMemo(
+    () => backends.filter(b => b.available === false && !models.some(m => m.backend === b.id)),
+    [backends, models],
+  );
   const starredModels = useMemo(
     () => starred
       .map(key => models.find(m => starKey(m.backend, m.id) === key))
@@ -230,6 +236,31 @@ export function ModelSelector({
               </div>
             );
           })}
+
+          {/* Greyed out like a family that cannot open; the tooltip says
+              why. `aria-disabled` rather than `disabled`, so that the row
+              still gets the pointer and focus that show the tooltip. */}
+          {unavailable.map(backend => (
+            <Button
+              key={`unavailable:${backend.id}`}
+              variant="subtle"
+              size="sm"
+              fullWidth
+              aria-disabled="true"
+              title={`${backend.label} unavailable: ${backend.reason ?? 'preflight failed'}`}
+              className="justify-between gap-2.5 px-3 py-1.5 rounded-none text-left opacity-50 cursor-not-allowed hover:text-text-secondary hover:bg-transparent"
+            >
+              <span className="flex items-center gap-2.5 min-w-0">
+                <BackendIcon backend={backend.id} />
+                <span className="truncate">{backend.label}</span>
+              </span>
+              {' '}
+              <span className="flex items-center gap-1.5 shrink-0">
+                <span className="text-2xs">Unavailable</span>
+                <ChevronRight size={14} aria-hidden="true" />
+              </span>
+            </Button>
+          ))}
         </div>
       )}
     </div>

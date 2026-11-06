@@ -91,6 +91,24 @@ describe('ModelSelector', () => {
     expect(onPick).toHaveBeenCalledWith('claude', 'claude-opus-4-8');
   });
 
+  it('says why a backend that lists no models is missing', async () => {
+    const { user } = renderSelector({
+      models: MODELS.filter(m => m.backend === 'claude'),
+      backends: [BACKENDS[0], { id: 'codex', label: 'Codex', available: false, reason: 'codex binary not found' }],
+    });
+    await user.click(trigger());
+    const codex = family('Codex');
+    expect(codex).toHaveAttribute('aria-disabled', 'true');
+    expect(codex).toHaveAttribute('title', 'Codex unavailable: codex binary not found');
+    expect(codex).toHaveAccessibleDescription('Codex unavailable: codex binary not found');
+    expect(screen.queryByRole('button', { name: /^GPT/ })).toBeNull();
+
+    // A press opens nothing.
+    await user.click(codex);
+    expect(codex).not.toHaveAttribute('aria-expanded');
+    expect(trigger()).toHaveAttribute('aria-expanded', 'true');
+  });
+
   it('closes on Escape without letting it reach the page', async () => {
     const pageEscape = vi.fn();
     document.addEventListener('keydown', pageEscape);

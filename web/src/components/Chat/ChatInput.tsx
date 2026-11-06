@@ -818,8 +818,9 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
                 the other backend also picks that backend (Claude or Codex),
                 which binds at session creation and is fixed after that. It
                 picks the OBSERVER session's backend; loop legs use the panel
-                config. */}
-            {pickableModels.length > 1 && (
+                config. A new chat shows it whenever there is more than one
+                backend, so that a backend that is unavailable says why. */}
+            {(pickableModels.length > 1 || (isVirtualChat && backendOptions.length > 1)) && (
               <ModelSelector
                 models={availableModels}
                 backends={backendOptions}
