@@ -27,6 +27,8 @@ FAKE_CODEX_MODE env var:
                  transport)
   big_stderr   — writes one ~2.5 MiB stderr line mid-turn, then
                  completes normally (stderr loop must keep draining)
+  stall        — starts the turn, then emits nothing and ignores
+                 turn/interrupt
   close_stdout_mid_turn — closes stdout mid-turn but KEEPS RUNNING
                  (reader-death liveness: is_alive() must flip False even
                  though the process is still up)
@@ -256,6 +258,12 @@ def run_turn(thread_id: str, turn_id: str) -> None:
                 "delta": "about to die"})
         sys.stdout.flush()
         os._exit(1)
+
+    if MODE == "stall":
+        notify("turn/started", {"threadId": thread_id,
+                                "turn": {"id": turn_id, "status": "inProgress", "items": []}})
+        time.sleep(3600)
+        return
 
     if MODE == "interrupt":
         notify("turn/started", {"threadId": thread_id,
