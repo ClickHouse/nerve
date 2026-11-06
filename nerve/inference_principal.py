@@ -97,9 +97,10 @@ def system_principal_headers() -> dict[str, str]:
     actor_id = global_system_actor_id()
     if actor_id is None:
         from nerve import paths
+        from nerve.config import get_config
         from nerve.db.accounts import read_system_actor_id
 
-        actor_id = read_system_actor_id(paths.db_path())
+        actor_id = read_system_actor_id(paths.db_path(), config=get_config())
     return principal_headers(actor_id)
 
 

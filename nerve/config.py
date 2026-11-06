@@ -3953,6 +3953,10 @@ def default_timezone() -> str:
 class NerveConfig:
     workspace: Path = field(default_factory=paths.default_workspace)
     timezone: str = field(default_factory=default_timezone)
+    use_postgresql: bool = False
+    postgresql_dsn: str = field(default="", repr=False)
+    tenant_id: str = "default"
+    workflow_id: str = "default"
     # Remote-only, read-only mode. When set (in workspace/config/settings.yaml —
     # the tracked file the remote controls), config comes ONLY from the workspace
     # + ${ENV_VAR}; machine config.yaml/config.local.yaml overrides and legacy
@@ -4380,6 +4384,10 @@ class NerveConfig:
             telegram=TelegramConfig.from_dict(d.get("telegram", {}), locked=locked),
             slack=SlackConfig.from_dict(d.get("slack", {}), locked=locked),
             sync=SyncConfig.from_dict(d.get("sync", {})),
+            use_postgresql=d.get("use_postgresql", False),
+            postgresql_dsn=d.get("postgresql_dsn", ""),
+            tenant_id=d.get("tenant_id", "default"),
+            workflow_id=d.get("workflow_id", "default"),
             memory=MemoryConfig.from_dict(d.get("memory", {})),
             cron=CronConfig.from_dict(d.get("cron", {}), workspace=workspace, locked=locked),
             workspace_sync=WorkspaceSyncConfig.from_dict(d.get("workspace_sync", {})),
