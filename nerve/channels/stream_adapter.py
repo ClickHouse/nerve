@@ -76,6 +76,17 @@ class StreamAdapter:
         """Handle a broadcaster event. Registered as a broadcaster callback."""
         msg_type = message.get("type")
 
+        # Sub-agent work and agent/queue state are not part of the reply: a
+        # channel shows the orchestrator's answer only. (The session channel
+        # no longer carries sidechain frames; this guards a mixed deploy.)
+        if message.get("parent_tool_use_id"):
+            return
+        if isinstance(msg_type, str) and (
+            msg_type.startswith("agent_")
+            or msg_type in ("queue_update", "session_agents")
+        ):
+            return
+
         if msg_type == "token":
             await self._handle_token(message.get("content", ""))
 
@@ -103,9 +114,9 @@ class StreamAdapter:
         elif msg_type == "interaction":
             await self._handle_interaction(message)
 
-        # Other event types (thinking, tool_result, subagent_*, session_*,
-        # file_changed, plan_update) are silently consumed for non-web channels.
-        # The web channel handles those via its direct broadcaster callback.
+        # Other event types (thinking, tool_result, session_*, file_changed,
+        # plan_update) are silently consumed for non-web channels. The web
+        # channel handles those via its direct broadcaster callback.
 
     # ------------------------------------------------------------------ #
     #  Event handlers                                                      #

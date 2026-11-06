@@ -20,6 +20,7 @@ from nerve.gateway.routes._deps import (
 from nerve.gateway.routes import (
     accounts,
     actors,
+    agents,
     auth,
     setup,
     sessions,
@@ -68,6 +69,7 @@ def register_all_routes() -> APIRouter:
         router.include_router(setup.claim_router)
     router.include_router(setup.router)
     router.include_router(sessions.router)
+    router.include_router(agents.router)
     router.include_router(tasks.router)
     router.include_router(plans.router)
     router.include_router(skills.router)

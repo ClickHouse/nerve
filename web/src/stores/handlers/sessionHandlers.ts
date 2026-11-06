@@ -2,7 +2,38 @@ import type { WSMessage } from '../../api/websocket';
 import type { PanelTab, Session } from '../../types/chat';
 import { applyStreamEvent, rebuildPanelTabsFromBuffer, deriveStatus, extractTodosFromBuffer, extractCCTasksFromBuffer } from '../helpers/bufferReplay';
 import { hydrateMessage } from '../../utils/hydrateMessage';
+import { useAgentStore } from '../agentStore';
+import type { ChatState } from '../chatStore';
+import { planOpensPanel } from './panelHandlers';
 import type { Get, Set } from './types';
+
+/** Tabs the person opened that a replayed buffer knows nothing about. */
+const KEPT_ON_REPLAY: ReadonlySet<PanelTab['type']> = new Set(['agents', 'agent', 'files']);
+
+/**
+ * Leave streaming mode: running tool calls complete and the streamed blocks
+ * become an assistant message. For a turn the server says is over although
+ * its done/stopped never reached this tab.
+ */
+export function exitStreaming(s: ChatState): Partial<ChatState> {
+  const finalBlocks = s.streamingBlocks.map(b =>
+    b.type === 'tool_call' && b.status === 'running'
+      ? { ...b, status: 'complete' as const }
+      : b,
+  );
+  const keep = finalBlocks.length > 0 && !(finalBlocks.length === 1 && finalBlocks[0].type === 'auto');
+  return {
+    ...(keep ? {
+      messages: [
+        ...s.messages,
+        { role: 'assistant' as const, blocks: finalBlocks, created_at: new Date().toISOString() },
+      ],
+    } : {}),
+    streamingBlocks: [],
+    isStreaming: false,
+    agentStatus: { state: 'idle' },
+  };
+}
 
 // ------------------------------------------------------------------ //
 //  Session management handlers                                        //
@@ -67,6 +98,19 @@ export function handleSessionStatus(
   get: Get,
   set: Set,
 ): void {
+  // The roster snapshot rides on every bind and switch, idle sessions included.
+  if (msg.agents) {
+    useAgentStore.getState().hydrate(msg.agents);
+    // Its live count is this session's sidebar count as well: the row may
+    // have missed the zero while the socket was down.
+    const live = msg.agents.summary?.live;
+    if (typeof live === 'number') {
+      const patch = (sess: Session): Session => sess.id === msg.session_id
+        ? { ...sess, background_count: live, has_background_tasks: live > 0 }
+        : sess;
+      set((s) => ({ sessions: s.sessions.map(patch), searchResults: s.searchResults?.map(patch) ?? null }));
+    }
+  }
   if (!msg.is_running) return;
 
   // Rebuild streaming state from buffered events
@@ -83,7 +127,7 @@ export function handleSessionStatus(
       blocks = applyStreamEvent(blocks, event);
     }
     // Rebuild panel tabs from buffered events
-    const restored = rebuildPanelTabsFromBuffer(bufferedEvents, blocks);
+    const restored = rebuildPanelTabsFromBuffer(bufferedEvents);
 
     // Restore pending interaction from buffer (last interaction event wins),
     // but treat any interaction the buffer later marks resolved as settled so a
@@ -103,7 +147,17 @@ export function handleSessionStatus(
           interactionType: ie.interaction_type,
           toolName: ie.tool_name,
           toolInput: ie.tool_input,
+          agent: ie.agent ?? null,
         };
+      }
+    }
+
+    // Restore the plan summaries of the buffered pauses (their cards read them).
+    const planSummaries = { ...get().planSummaries };
+    for (const event of bufferedEvents) {
+      if (event.type === 'plan_summary') {
+        const ps = event as Extract<WSMessage, { type: 'plan_summary' }>;
+        planSummaries[ps.interaction_id] = { bullets: Array.isArray(ps.bullets) ? ps.bullets : [], status: ps.status };
       }
     }
 
@@ -114,6 +168,9 @@ export function handleSessionStatus(
         lastPlanContent = (event as Extract<WSMessage, { type: 'plan_update' }>).content;
       }
     }
+    // A plan tab kept in the background (see `planOpensPanel`): restored, but
+    // it neither opens the panel nor takes the focus.
+    let quietPlanId: string | null = null;
     if (lastPlanContent !== null) {
       const planTab = restored.panels.find(p => p.type === 'plan');
       if (planTab) {
@@ -136,7 +193,8 @@ export function handleSessionStatus(
           blocks: [],
         };
         restored.panels.push(transientPlan);
-        restored.activePanelId = transientPlan.id;
+        if (planOpensPanel(get())) restored.activePanelId = transientPlan.id;
+        else quietPlanId = transientPlan.id;
       }
     }
 
@@ -148,14 +206,24 @@ export function handleSessionStatus(
     // Same for Claude Code 2.1+ Task* tools.
     const restoredCCTasks = extractCCTasksFromBuffer(bufferedEvents);
 
+    // The buffer rebuilds the workflow / plan tabs. The Agents panel, agent
+    // transcripts and the files tab survive a reconnect mid-turn: they are
+    // not in the buffer, and an open transcript stays subscribed.
+    const restoredIds = new Set(restored.panels.map(p => p.id));
+    const current = get();
+    const kept = current.panels.filter(p => KEPT_ON_REPLAY.has(p.type) && !restoredIds.has(p.id));
+    const panels = [...kept, ...restored.panels];
+    const keepActive = kept.some(p => p.id === current.activePanelId);
+    const shown = restored.panels.filter(p => p.id !== quietPlanId);
     const update: Record<string, unknown> = {
       isStreaming: true,
       streamingBlocks: blocks,
       agentStatus: deriveStatus(blocks),
-      panels: restored.panels,
-      activePanelId: restored.activePanelId,
-      panelVisible: restored.panels.length > 0,
+      panels,
+      activePanelId: keepActive ? current.activePanelId : restored.activePanelId ?? kept[kept.length - 1]?.id ?? null,
+      panelVisible: keepActive ? current.panelVisible : shown.length > 0 || (kept.length > 0 && current.panelVisible),
       pendingInteraction: restoredInteraction,
+      planSummaries,
     };
     if (restoredTodos !== null) {
       update.currentTodos = restoredTodos;
@@ -230,7 +298,11 @@ export function handleSessionRunning(
     ...sess,
     is_running: msg.is_running,
     pending_wakeup_at: msg.pending_wakeup_at ?? null,
+    pending_wakeup_created_by_actor_id: msg.pending_wakeup_created_by_actor_id ?? null,
+    pending_wakeup_caused_by_actor_id: msg.pending_wakeup_caused_by_actor_id ?? null,
     has_background_tasks: !!msg.has_background_tasks,
+    // The live agent count; an older server sends only the flag.
+    background_count: msg.background_count ?? (msg.has_background_tasks ? sess.background_count : 0),
   });
   set(s => {
     const updates: Record<string, unknown> = {
@@ -263,20 +335,7 @@ export function handleSessionRunning(
     // cases; this is belt-and-suspenders for when even that signal is
     // missed.
     if (msg.session_id === s.activeSession && !msg.is_running && s.isStreaming) {
-      const finalBlocks = s.streamingBlocks.map(b =>
-        b.type === 'tool_call' && b.status === 'running'
-          ? { ...b, status: 'complete' as const }
-          : b,
-      );
-      if (finalBlocks.length > 0) {
-        updates.messages = [
-          ...s.messages,
-          { role: 'assistant' as const, blocks: finalBlocks, created_at: new Date().toISOString() },
-        ];
-      }
-      updates.streamingBlocks = [];
-      updates.isStreaming = false;
-      updates.agentStatus = { state: 'idle' };
+      Object.assign(updates, exitStreaming(s));
     }
     return updates;
   });
@@ -319,13 +378,15 @@ export function handleAnswerInjected(
   get: Get,
   set: Set,
 ): void {
-  // Show the injected answer as a user message in the chat
+  // Show the injected answer as a user message in the chat, labelled with
+  // the person who answered, as the stored row is.
   if (msg.session_id === get().activeSession) {
     set(s => ({
       messages: [...s.messages, {
         role: 'user' as const,
         blocks: [{ type: 'text' as const, content: msg.content }],
         created_at: new Date().toISOString(),
+        actor_id: msg.actor_id ?? null,
       }],
     }));
   }
@@ -342,6 +403,12 @@ export function handleUserMessage(
   // and carries the sender's actor id so the bubble is labelled immediately
   // with whoever the event names rather than on the next reload.
   if (msg.session_id !== get().activeSession) return;
+  // A resend carries the same id and is echoed again before the server drops
+  // it as a duplicate: one bubble per id.
+  const clientMsgId = msg.client_msg_id ?? null;
+  if (clientMsgId && get().messages.some(m => m.client_msg_id === clientMsgId)) return;
   const hydrated = hydrateMessage({ role: 'user', content: msg.content, blocks: msg.blocks ?? undefined, created_at: new Date().toISOString(), actor_id: msg.actor_id ?? null });
-  set(s => ({ messages: [...s.messages, hydrated] }));
+  // The sending tab's id: lets this tab mark the bubble "Queued" while the
+  // message waits in the server queue.
+  set(s => ({ messages: [...s.messages, { ...hydrated, client_msg_id: clientMsgId }] }));
 }

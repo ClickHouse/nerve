@@ -1,4 +1,8 @@
-"""Bulk lookup for the actor ids stored on sessions and messages.
+"""Bulk lookup for the actor ids stored in attribution columns.
+
+The attribution columns are listed in :mod:`nerve.db.actor_columns`. The
+endpoint returns every ``actor_refs`` row, so it covers each ID that one of
+those columns holds.
 
 The response is built field by field from ``actor_refs`` plus the login name of
 the account behind a human actor, so credential and access state cannot leak

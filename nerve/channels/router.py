@@ -11,7 +11,9 @@ spread across TelegramChannel and the WebSocket handler in gateway/server.py.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
+import sqlite3
 import uuid
 from dataclasses import asdict
 from typing import Any, TYPE_CHECKING
@@ -29,11 +31,49 @@ from nerve.channels.base import (
 )
 from nerve.channels.stream_adapter import StreamAdapter
 from nerve.db.observations import DEFAULT_MAX_ROWS
+from nerve.gateway.auth import is_external_mode
+from nerve.identity import ACTOR_KIND_HUMAN, UNATTRIBUTED, Actor, actor_id_of
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
 
 logger = logging.getLogger(__name__)
+
+
+def turn_stop_note(result: dict[str, Any], session_id: str) -> str | None:
+    """What a channel answers when ``/stop`` could not stop the turn, or
+    ``None`` when it stopped one (``stopped`` / ``killed``) or nothing ran.
+
+    ``/stop`` stops the turn only. A runtime that cannot spare background
+    agents is never told to stop (``needs_confirmation``): the answer says
+    so instead of "nothing running". A turn that did not end within the
+    graceful wait while agents run is left running (``not_stopped``).
+    """
+    outcome = result.get("turn")
+    if outcome == "needs_confirmation":
+        n = len(result.get("would_end") or [])
+        agents = "1 background agent" if n == 1 else f"{n} background agents"
+        return (
+            f"Couldn't stop `{session_id}` without stopping its {agents}. "
+            f"Stop {'it' if n == 1 else 'them'} from the web UI."
+        )
+    if outcome == "not_stopped":
+        return (
+            f"`{session_id}` didn't stop within 5 s. Force stop it from the "
+            "web UI; that also ends its background agents."
+        )
+    return None
+
+
+def _turns_by_actor(
+    pending: list[tuple[InboundMessage, asyncio.Future[str]]],
+) -> list[list[tuple[InboundMessage, asyncio.Future[str]]]]:
+    """Split pending messages into consecutive runs from one actor, in order.
+
+    Messages without an actor count as one actor.
+    """
+    runs = itertools.groupby(pending, key=lambda item: actor_id_of(item[0].actor))
+    return [list(run) for _, run in runs]
 
 
 class ChannelRouter:
@@ -97,6 +137,50 @@ class ChannelRouter:
     #  Inbound: channel → engine                                           #
     # ------------------------------------------------------------------ #
 
+    @property
+    def accepting_turns(self) -> bool:
+        """False while the engine drains. handle_message then refuses the turn."""
+        return self.engine.accepting_turns
+
+    async def actor_for_principal(
+        self, principal_id: uuid.UUID, display_name: str | None = None,
+    ) -> Actor | None:
+        """The person that a channel gateway resolved for an event, or ``None``.
+
+        Only external mode has gateway principals: in local mode, the ID names
+        no local person. Adds the ``actor_refs`` row when it is absent, before
+        the turn writes anything that refers to it, and keeps the display name
+        that a web request stored. *display_name*, the name that the event
+        gives the person, is written only when the row has no name. The nil
+        UUID, the system actor's ID, and a failed write give ``None``: the
+        event then has no actor.
+        """
+        if not is_external_mode():
+            return None
+        if principal_id.int == 0:
+            logger.warning("A channel event names no person, so it has no actor")
+            return None
+        actor_id = str(principal_id)
+        try:
+            stored_name = await self.engine.db.ensure_external_actor(actor_id, display_name)
+        except sqlite3.IntegrityError:
+            # A schema trigger refuses the system actor's ID.
+            logger.warning(
+                "A channel event names the system actor as its person, so it has no actor",
+            )
+            return None
+        except Exception as e:
+            logger.warning(
+                "The person of a channel event was not resolved, so it has no actor: %s", e,
+            )
+            return None
+        return Actor(
+            actor_id=actor_id,
+            kind=ACTOR_KIND_HUMAN,
+            account_id=None,
+            display_name=stored_name,
+        )
+
     # Debounce window (seconds) for collecting simultaneous messages
     # (e.g. forwarded messages, rapid-fire sends) into a single batch.
     BATCH_DEBOUNCE = 0.60
@@ -109,6 +193,10 @@ class ChannelRouter:
         messages or rapid-fire sends) so they are processed as a single
         batched turn.  Messages that arrive while the engine is busy are
         queued for the next batch.
+
+        A turn runs as one actor. When a batch holds messages from more than
+        one actor, each consecutive run of messages from one actor is a
+        separate turn, in arrival order.
 
         Called by channel implementations when they receive a user message.
         """
@@ -124,17 +212,11 @@ class ChannelRouter:
             )
         else:
             session_id = await self.engine.sessions.get_active_session(
-                msg.channel_key, source=msg.channel_name, actor=None,
+                msg.channel_key, source=msg.channel_name, actor=msg.actor,
             )
 
         # Store message context for reaction support
-        msg_id = msg.metadata.get("message_id") if msg.metadata else None
-        if msg_id is not None:
-            self._message_context[session_id] = {
-                "channel_name": msg.channel_name,
-                "target": msg.sender_id,
-                "message_id": msg_id,
-            }
+        self._note_message_context(session_id, msg)
 
         # Queue the message; a Future carries the result back to the caller.
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
@@ -154,29 +236,30 @@ class ChannelRouter:
             await asyncio.sleep(self.BATCH_DEBOUNCE)
 
             while pending := self._pending_batches.pop(session_id, None):
-                try:
-                    if len(pending) == 1:
-                        response = await self._run_single(
-                            channel, pending[0][0], session_id,
-                        )
+                for turn in _turns_by_actor(pending):
+                    try:
+                        if len(turn) == 1:
+                            response = await self._run_single(
+                                channel, turn[0][0], session_id,
+                            )
+                        else:
+                            response = await self._run_batch(
+                                channel, turn, session_id,
+                            )
+                    except asyncio.CancelledError:
+                        for _, fut in pending:
+                            if not fut.done():
+                                fut.cancel()
+                        self._cancel_pending(session_id)
+                        raise
+                    except Exception as exc:
+                        for _, fut in turn:
+                            if not fut.done():
+                                fut.set_exception(exc)
                     else:
-                        response = await self._run_batch(
-                            channel, pending, session_id,
-                        )
-                except asyncio.CancelledError:
-                    for _, fut in pending:
-                        if not fut.done():
-                            fut.cancel()
-                    self._cancel_pending(session_id)
-                    raise
-                except Exception as exc:
-                    for _, fut in pending:
-                        if not fut.done():
-                            fut.set_exception(exc)
-                else:
-                    for _, fut in pending:
-                        if not fut.done():
-                            fut.set_result(response)
+                        for _, fut in turn:
+                            if not fut.done():
+                                fut.set_result(response)
 
         return await future
 
@@ -191,6 +274,8 @@ class ChannelRouter:
         session_id: str,
     ) -> str:
         """Run the engine for a single message with streaming."""
+        self._note_message_context(session_id, msg)
+
         if ChannelCapability.TYPING_INDICATOR in channel.capabilities:
             try:
                 await channel.send_typing(msg.sender_id)
@@ -211,9 +296,11 @@ class ChannelRouter:
                 source=msg.channel_name,
                 channel=msg.channel_name,
                 images=images,
-                # Provider-person mapping is not available yet, so external
-                # human input remains unidentified rather than guessed.
-                actor=None,
+                # A self-hosted channel has no mapping from a provider user
+                # to a person, so its messages have no actor. A hosted
+                # channel sets the person that the channel gateway resolved.
+                actor=msg.actor,
+                origin=msg.channel_name,
             )
         )
         self.engine.register_task(session_id, task)
@@ -234,7 +321,10 @@ class ChannelRouter:
         pending: list[tuple[InboundMessage, asyncio.Future[str]]],
         session_id: str,
     ) -> str:
-        """Combine pending messages into one turn and run."""
+        """Combine pending messages into one turn and run.
+
+        Every message in *pending* has the same actor.
+        """
         last_msg = pending[-1][0]
         sender_id = last_msg.sender_id
 
@@ -249,13 +339,7 @@ class ChannelRouter:
                 all_images.extend(imgs)
 
         # Update reaction context to the last message in the batch
-        msg_id = last_msg.metadata.get("message_id") if last_msg.metadata else None
-        if msg_id is not None:
-            self._message_context[session_id] = {
-                "channel_name": last_msg.channel_name,
-                "target": sender_id,
-                "message_id": msg_id,
-            }
+        self._note_message_context(session_id, last_msg)
 
         if ChannelCapability.TYPING_INDICATOR in channel.capabilities:
             try:
@@ -275,7 +359,8 @@ class ChannelRouter:
                 source=last_msg.channel_name,
                 channel=last_msg.channel_name,
                 images=all_images or None,
-                actor=None,
+                actor=last_msg.actor,
+                origin=last_msg.channel_name,
             )
         )
         self.engine.register_task(session_id, task)
@@ -289,6 +374,16 @@ class ChannelRouter:
             await self._teardown_streaming(
                 channel.name, sender_id, session_id,
             )
+
+    def _note_message_context(self, session_id: str, msg: InboundMessage) -> None:
+        """Make *msg* the message that the session's reactions go to."""
+        msg_id = msg.metadata.get("message_id") if msg.metadata else None
+        if msg_id is not None:
+            self._message_context[session_id] = {
+                "channel_name": msg.channel_name,
+                "target": msg.sender_id,
+                "message_id": msg_id,
+            }
 
     def _cancel_pending(self, session_id: str) -> None:
         """Cancel all pending futures for a session."""
@@ -507,17 +602,30 @@ class ChannelRouter:
             exclude_statuses=("archived", "stopped"),
         )
 
+    # Channel commands come from a channel user that names no person, so
+    # the session changes that they make are unattributed.
+
     async def stop_session(self, session_id: str) -> bool:
         """Stop a session through the engine lifecycle boundary."""
-        return await self.engine.stop_session(session_id)
+        return await self.engine.stop_session(session_id, attribution=UNATTRIBUTED)
+
+    async def stop_turn(self, session_id: str) -> dict[str, Any]:
+        """Stop the session's turn (background agents keep running) and
+        return the engine's ``StopTurnResult``, so ``/stop`` can say why a
+        turn was left running (see :func:`turn_stop_note`)."""
+        return await self.engine.stop_turn(session_id, attribution=UNATTRIBUTED)
 
     async def set_session_starred(self, session_id: str, starred: bool) -> bool:
         """Star/unstar a session. Starred sessions are never auto-archived."""
-        return await self.engine.sessions.set_starred(session_id, starred)
+        return await self.engine.sessions.set_starred(
+            session_id, starred, attribution=UNATTRIBUTED,
+        )
 
     async def toggle_session_starred(self, session_id: str) -> bool:
         """Toggle a session's starred state."""
-        return await self.engine.sessions.toggle_starred(session_id)
+        return await self.engine.sessions.toggle_starred(
+            session_id, attribution=UNATTRIBUTED,
+        )
 
     async def get_session(self, session_id: str) -> dict[str, Any] | None:
         """Fetch a session row (title/status/…), or None if it is gone."""
@@ -532,6 +640,16 @@ class ChannelRouter:
     async def count_session_messages(self, session_id: str) -> int:
         """Total message count for a session (to know if more history exists)."""
         return await self.engine.db.count_messages(session_id)
+
+    async def list_plans(
+        self, status: str | None = None, limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """List plans (optionally filtered by status), newest first."""
+        return await self.engine.db.list_plans(status=status, limit=limit)
+
+    async def get_plan(self, plan_id: str) -> dict[str, Any] | None:
+        """Fetch a plan row (joined with its task title), or None if gone."""
+        return await self.engine.db.get_plan(plan_id)
 
     # ------------------------------------------------------------------ #
     #  Outbound: engine → channel (cron delivery, etc.)                    #

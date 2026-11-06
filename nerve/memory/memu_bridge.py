@@ -32,17 +32,17 @@ import numpy as np
 
 from nerve import paths
 from nerve.config import NerveConfig
+from nerve.inference_principal import system_principal_headers
+from nerve.memory.backend import MemoryBackendUnavailable
 from nerve.observability.langfuse import attributes as lf_attrs
+from nerve.utils.llm import response_text
 
 logger = logging.getLogger(__name__)
 
-
-class MemoryBackendUnavailable(RuntimeError):
-    """Raised when a memU operation fails because the LLM backend (the shared
-    proxy route) is transiently unavailable — HTTP 429/5xx or an auth blip
-    (``auth_unavailable`` / revoked OAuth) — rather than because the query
-    genuinely had no results. The tool layer surfaces this LOUDLY so a session
-    never mistakes "memory is DOWN" for "no relevant memories"."""
+# MemoryBackendUnavailable is shared with the Loom backend and defined in
+# nerve.memory.backend; importing it from here keeps working. memU raises it
+# when the LLM backend (the shared proxy route) is transiently unavailable —
+# HTTP 429/5xx or an auth blip (``auth_unavailable`` / revoked OAuth).
 
 
 def _llm_error_status(exc: BaseException) -> int | None:
@@ -477,10 +477,13 @@ class _BedrockLLMClient:
 
     def __init__(self, *, chat_model: str, aws_region: str = "", aws_profile: str = "",
                  aws_access_key_id: str = "", aws_secret_access_key: str = "",
-                 timeout: float = 120.0):
+                 timeout: float = 120.0,
+                 default_headers: dict[str, str] | None = None):
         from anthropic import AsyncAnthropicBedrock
 
         kwargs: dict[str, Any] = {"timeout": timeout}
+        if default_headers:
+            kwargs["default_headers"] = default_headers
         if aws_region:
             kwargs["aws_region"] = aws_region
         if aws_profile:
@@ -516,8 +519,7 @@ class _BedrockLLMClient:
         # when Langfuse is disabled.
         with lf_attrs(tags=["component:memu", f"model:{self.chat_model}"]):
             response = await self._bedrock.messages.create(**kwargs)
-        text = response.content[0].text if response.content else ""
-        return text, response
+        return response_text(response), response
 
     async def summarize(
         self,
@@ -1828,10 +1830,13 @@ class MemUBridge:
 
             # ── Bedrock client injection ──
             # Replace the placeholder OpenAISDKClient instances with real
-            # Bedrock-backed clients.  Must happen before any LLM call
+            # Bedrock-backed clients, or give the OpenAI clients the
+            # principal header.  Must happen before any LLM call
             # (warmup, category sync, etc.).
             if is_bedrock:
                 self._inject_bedrock_clients()
+            else:
+                self._name_system_principal()
 
             await self._ensure_categories()
 
@@ -2217,13 +2222,17 @@ class MemUBridge:
     _DATE_SWEEP_COMMIT_EVERY = 500
 
     def _make_bedrock_client(self, chat_model: str) -> _BedrockLLMClient:
-        """Create a _BedrockLLMClient using Nerve's provider config."""
+        """Create a _BedrockLLMClient using Nerve's provider config.
+
+        In external mode its requests name the system actor as principal.
+        """
         return _BedrockLLMClient(
             chat_model=chat_model,
             aws_region=self.config.provider.aws_region,
             aws_profile=self.config.provider.aws_profile,
             aws_access_key_id=self.config.provider.aws_access_key_id,
             aws_secret_access_key=self.config.provider.aws_secret_access_key,
+            default_headers=system_principal_headers(),
         )
 
     def _inject_bedrock_clients(self) -> None:
@@ -2243,6 +2252,25 @@ class MemUBridge:
         for name, model in profiles_to_replace.items():
             self._service._llm_clients[name] = self._make_bedrock_client(model)
             logger.info("Injected Bedrock LLM client for profile '%s' (model=%s)", name, model)
+
+    def _name_system_principal(self) -> None:
+        """Make memU's OpenAI chat clients name the system actor.
+
+        memU makes these clients and gives them no headers. In external mode
+        their requests name the system actor as principal, as the Bedrock
+        clients do. The embedding profile calls the OpenAI API directly and
+        gets no header.
+        """
+        headers = system_principal_headers()
+        if not headers:
+            return
+        for name in self._service.llm_profiles.profiles:
+            if name == "embedding":
+                continue
+            client = self._service._get_llm_base_client(name)
+            inner = getattr(client, "client", None)  # OpenAISDKClient.client = AsyncOpenAI
+            if inner is not None:
+                client.client = inner.with_options(default_headers=headers)
 
     def _instrument_llm_timeouts(self) -> None:
         """Configure per-call timeouts on LLM clients (two layers).
@@ -2507,8 +2535,11 @@ class MemUBridge:
 
         # For Bedrock, re-inject fresh Bedrock clients (memU's default
         # _get_llm_base_client would recreate broken OpenAISDK ones).
+        # memU recreates the OpenAI clients without the principal header.
         if is_bedrock:
             self._inject_bedrock_clients()
+        else:
+            self._name_system_principal()
 
         # Re-apply per-call timeouts on the fresh clients
         self._instrument_llm_timeouts()
@@ -2951,7 +2982,7 @@ class MemUBridge:
         result: dict[str, str | None] = {}
         try:
             import re
-            text = response.content[0].text
+            text = response_text(response)
             json_match = re.search(r"\[.*\]", text, re.DOTALL)
             if json_match:
                 parsed = json.loads(json_match.group())
@@ -3076,12 +3107,14 @@ class MemUBridge:
         client = self._get_anthropic_client()
         response = client.messages.create(
             model=model,
-            max_tokens=512,
+            # Thinking counts toward max_tokens, and the 5.5 models think by
+            # default.
+            max_tokens=2048,
             messages=[{"role": "user", "content": prompt}],
         )
 
         try:
-            text = response.content[0].text
+            text = response_text(response)
             json_match = _re.search(r"\[.*?\]", text, _re.DOTALL)
             if json_match:
                 parsed = json.loads(json_match.group())

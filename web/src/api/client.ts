@@ -2,6 +2,10 @@ import {
   ApiError, csrfHeaders, handleHostedError, isHosted, setTokenReader,
   type AuthMode,
 } from './hosted';
+import type {
+  AgentDetail, AgentOutput, AgentSnapshot, AgentTranscriptPage, ForceStopResult, QueueEntryView,
+  StopAgentResponse, StopAllResult, StopTurnResult,
+} from '../types/agents';
 
 const API_BASE = '/api';
 
@@ -76,11 +80,65 @@ export interface SetupClaimDetail {
 }
 
 /**
- * A worker's onboarding session. `ended` is a session that stopped without
- * writing a plan into TASK.md (a placeholder key, a crash): the page links
- * to it and offers to try again instead of waiting for it.
+ * The onboarding conversation: `pending` until it opens (setup not finished,
+ * or a restart first), `running` while it waits for the person, then `done`
+ * or `skipped`. `not_applicable` before a mode is chosen.
  */
-export type SetupOnboarding = 'not_applicable' | 'pending' | 'running' | 'ended' | 'done';
+export type SetupOnboarding = 'not_applicable' | 'pending' | 'running' | 'done' | 'skipped';
+/**
+ * How the agent is set up: in a web chat with a person, or, for a worker set
+ * up with `nerve init` and a task description, in one session without a person.
+ */
+export type SetupOnboardingKind = 'conversation' | 'autonomous';
+/**
+ * What the onboarding agent waits for in its conversation: an answer to its
+ * question (`AskUserQuestion`), or a decision on its setup proposal (the plan
+ * of `ExitPlanMode`).
+ */
+export type SetupOnboardingAwaiting = 'question' | 'plan';
+
+/** The onboarding at a glance; the Mode step's detail carries the same status, session and kind. */
+export interface SetupOnboardingState {
+  status: SetupOnboarding;
+  session_id: string | null;
+  kind: SetupOnboardingKind;
+  /** `null` unless `status` is `running` and the agent waits for the person. */
+  awaiting: SetupOnboardingAwaiting | null;
+}
+
+/**
+ * One kind of work a worker can take on, from the server's catalog. The Mode
+ * step lists them as checkboxes; the onboarding conversation asks the chosen
+ * items' `follow_ups`.
+ */
+export interface WorkCatalogItem {
+  id: string;
+  /** `code`, `operations`, `communication` or `knowledge`. */
+  group: string;
+  label: string;
+  /** One line. */
+  description: string;
+  /** What the work depends on: `github`, `alerts`, `slack-or-telegram` or `web`. */
+  needs: string;
+  follow_ups: string[];
+  /**
+   * A caveat shown under the description: what the work needs that the
+   * instance may lack (alerts: an alert source). Empty for most items;
+   * absent when the description carries it.
+   */
+  note?: string;
+}
+
+/**
+ * What a worker was set up to do: catalog ids, other work in the person's
+ * own words, and what it must know or never do. All empty when nothing was
+ * chosen.
+ */
+export interface WorkSelection {
+  items: string[];
+  custom: string;
+  rules: string;
+}
 
 export interface SetupModeDetail {
   mode: SetupMode | null;
@@ -88,6 +146,12 @@ export interface SetupModeDetail {
   task_present: boolean;
   onboarding: SetupOnboarding;
   onboarding_session_id: string | null;
+  /** Absent from an older backend: `conversation`. */
+  onboarding_kind?: SetupOnboardingKind;
+  /** The worker work catalog, in display order. Absent from an older backend. */
+  work_catalog?: WorkCatalogItem[];
+  /** The saved selection (from `TASK.md`). Absent from an older backend. */
+  work?: WorkSelection;
 }
 
 export type SetupProviderType = 'anthropic' | 'oauth' | 'host_login' | 'bedrock';
@@ -143,6 +207,13 @@ export interface SetupProfileDetail {
   quiet_is_default: boolean;
   language: string | null;
   agent_name: string | null;
+  /**
+   * The name the environment gives the agent, offered while IDENTITY.md's
+   * name line is still the template's; the form shows it as the field's
+   * value and sends it on Continue like a typed name. Absent from an older
+   * backend.
+   */
+  agent_name_prefill?: string | null;
   agent_emoji: string | null;
   about_set: boolean;
   user_md_pristine: Record<string, boolean>;
@@ -150,6 +221,8 @@ export interface SetupProfileDetail {
 }
 
 export interface SetupMemoryDetail {
+  /** `memory.backend`: under `loom` there is nothing to set up here. */
+  backend?: string;
   openai_api_key: SecretOut;
   embeddings_chosen: boolean;
   embed_model: string;
@@ -209,8 +282,20 @@ export interface TelegramSyncSessionSummary {
   user: TelegramSyncUser | null;
 }
 
+export type SetupSourceId = 'github' | 'gmail' | 'telegram';
+
 export interface SetupSourcesDetail {
-  github: { enabled: boolean; source?: CredentialSource | null };
+  github: {
+    enabled: boolean;
+    source?: CredentialSource | null;
+    /**
+     * `true` while the channel gateway polls GitHub and the operator holds
+     * the source's switch in the machine's configuration: the page shows the
+     * source and offers no switch (`available` leaves it out). Absent
+     * otherwise, and from an older backend.
+     */
+    managed?: boolean;
+  };
   gmail: { enabled: boolean; accounts: string[]; source?: CredentialSource | null };
   telegram: {
     enabled: boolean;
@@ -219,6 +304,17 @@ export interface SetupSourcesDetail {
     /** Absent from an older backend, which knows nothing about the session. */
     session?: TelegramSyncSessionSummary | null;
   };
+  /**
+   * Which of the three the page may switch here. All of them, except on an
+   * instance that keeps no credentials on disk (`local_secrets: false`): a
+   * GitHub token from the environment keeps the GitHub toggle alone on
+   * offer (`['github']`); otherwise nothing is (`[]`, the step is closed).
+   * GitHub is left out either way while the operator holds its switch
+   * (`github.managed`). Absent from an older backend, which offers all three.
+   */
+  available?: SetupSourceId[];
+  /** Why the others are not offered — the server's sentence, shown on the step. */
+  unavailable_reason?: string | null;
 }
 
 export interface SetupCronJob {
@@ -234,10 +330,12 @@ export interface SetupCronJob {
   default?: boolean;
   /**
    * Whether the mode's first-run default turns this optional job on. A
-   * worker's `task-planner` is off until its onboarding session decides.
+   * worker's `task-planner` is off until its onboarding conversation decides.
    * Absent from an older backend.
    */
   default_enabled?: boolean;
+  /** Set in `jobs.yaml`, which replaces the built-in job; `enabled` is that job's. */
+  overridden?: boolean;
 }
 
 export interface SetupAutomationDetail {
@@ -304,6 +402,8 @@ export interface SetupState {
   steps_left: number;
   warning: string | null;
   steps: SetupStep[];
+  /** Absent from an older backend. */
+  onboarding?: SetupOnboardingState;
 }
 
 export interface RestartResponse {
@@ -399,7 +499,8 @@ export interface PairingCode {
 }
 
 export interface SourcesPreflight {
-  github: { cli: boolean; authenticated: boolean; login: string | null; hint: string | null };
+  /** `hosted`: the channel gateway polls GitHub (`sync.github.mode: hosted`), so gh was not checked. */
+  github: { cli: boolean; authenticated: boolean; login: string | null; hint: string | null; hosted?: boolean };
   gmail: { cli: boolean; hint: string | null };
   telegram: { credentials_configured: boolean };
   checked_at: string;
@@ -545,7 +646,24 @@ export interface TaskEvent {
   /** null on the row recording the task's creation. */
   from_status: string | null;
   to_status: string;
+  /** Origin of the change: `web`, a session id, `system` or `backfill`. */
   actor: string;
+  /** Who made the change. `null` on rows written before it was recorded. */
+  actor_id: string | null;
+  /** On whose behalf the change was made. `null` when unknown. */
+  caused_by_actor_id: string | null;
+  created_at: string;
+}
+
+export interface TaskComment {
+  id: number;
+  task_id: string;
+  /** Markdown. */
+  body: string;
+  /** Who wrote the comment: a person, or the system actor for the agent. */
+  actor_id: string | null;
+  /** On whose behalf it was written. `null` when unknown. */
+  caused_by_actor_id: string | null;
   created_at: string;
 }
 
@@ -561,6 +679,8 @@ export interface Task {
   position: number;
   created_at: string;
   updated_at: string;
+  /** Number of comments. Server-maintained. */
+  comment_count?: number;
   content?: string;
 }
 
@@ -660,7 +780,14 @@ export interface WorkflowRun {
   warned_at: string | null;
   session_id: string | null;
   journal_dir: string | null;
+  /** Origin text: `api`, `session:<id>`, `review-loop:<id>`, `cron:<job>`. */
   created_by: string;
+  /** Who created the run, and on whose behalf; null on older runs. */
+  created_by_actor_id?: string | null;
+  caused_by_actor_id?: string | null;
+  /** Who killed the run, and on whose behalf; null when not known. */
+  killed_by_actor_id?: string | null;
+  killed_caused_by_actor_id?: string | null;
   error: string | null;
   result: string | null;
   created_at: string;
@@ -713,9 +840,38 @@ export interface ReviewLoop {
   spent_usd: number;
   iteration: number;
   current_run_id: string | null;
+  created_by_actor_id?: string | null;
+  caused_by_actor_id?: string | null;
+  killed_by_actor_id?: string | null;
+  killed_caused_by_actor_id?: string | null;
   created_at: string;
   updated_at: string;
   ended_at: string | null;
+}
+
+/**
+ * Result of `POST /api/review-loops/{id}/decision`. `applied` is true when
+ * the decision changed the loop; `ok` is false when the leg that it resumes
+ * did not start.
+ */
+export interface ReviewLoopDecisionResult {
+  ok: boolean;
+  applied: boolean;
+  message: string;
+}
+
+/** One decision on a parked loop, oldest first in the loop detail. */
+export interface ReviewLoopDecision {
+  id: number;
+  loop_id: string;
+  decision: string;
+  applied: boolean;
+  message: string;
+  /** Origin text: `api` or `approval-card`. */
+  decided_by: string;
+  actor_id: string | null;
+  caused_by_actor_id: string | null;
+  created_at: string;
 }
 
 export interface ReviewLoopAttempt {
@@ -752,6 +908,29 @@ export interface WorkflowRunJournal {
   events: WorkflowRunJournalEvent[];
   has_result: boolean;
   result: string;
+}
+
+/** The next moment the instance will do work of its own (`GET /api/cron/schedule`). */
+export interface CronScheduledTick {
+  at: string;
+  /** Cron job id, `source:<name>`, or `wakeup:<session id prefix>`. */
+  name: string;
+  kind: 'cron' | 'source' | 'wakeup';
+}
+
+/** What a job's gates say about its next run, judged from what is known now. */
+export interface CronJobForecast {
+  id: string;
+  next_run: string | null;
+  /** `null` when the job has no next run (disabled, or not scheduled). */
+  forecast: 'run' | 'skip' | null;
+  /** Why a `skip`; `null` otherwise. */
+  reason: string | null;
+}
+
+export interface CronSchedule {
+  next: CronScheduledTick | null;
+  jobs: CronJobForecast[];
 }
 
 let authToken: string | null = localStorage.getItem('nerve_token');
@@ -865,6 +1044,49 @@ async function request<T>(path: string, options: RequestInit = {}, authenticate 
     ...(options.headers as Record<string, string> || {}),
   }, authenticate);
   return res.json();
+}
+
+/**
+ * The machine-readable code of a failed request: `detail.code` of a body like
+ * `{"detail": {"code": "no_runtime", "message": "..."}}`, read from the
+ * `"<status>: <body>"` message every `ApiError` carries. Null for any other
+ * error or body (a string `detail`, a gateway error, a network failure).
+ */
+export function apiErrorCode(e: unknown): string | null {
+  const code = apiErrorDetail(e)?.code;
+  return typeof code === 'string' ? code : null;
+}
+
+/**
+ * The `detail` object of an `ApiError` (message `"<status>: <body>"`) whose
+ * body is `{"detail": {...}}`, or null.
+ */
+export function apiErrorDetail(e: unknown): Record<string, unknown> | null {
+  if (!(e instanceof Error)) return null;
+  const raw = e.message;
+  const colon = raw.indexOf(':');
+  if (colon < 0) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw.slice(colon + 1).trim());
+    if (!parsed || typeof parsed !== 'object' || !('detail' in parsed)) return null;
+    const detail: unknown = parsed.detail;
+    return detail && typeof detail === 'object' ? detail as Record<string, unknown> : null;
+  } catch {
+    return null; // not a JSON body
+  }
+}
+
+/** The body of `POST /api/sessions/{id}/stop`, one shape per scope. */
+export type StopSessionBody =
+  | { scope: 'turn'; confirm_kill_background?: boolean }
+  | { scope: 'all'; include_shells?: boolean }
+  | { scope: 'force' };
+
+/** Which session ids an archive took, and which it left (and why). */
+export interface ArchiveSessionResult {
+  archived: boolean;
+  archived_ids: string[];
+  skipped: { id: string; reason: string }[];
 }
 
 /**
@@ -997,6 +1219,9 @@ export const api = {
     request<SetupState>(`/setup/${encodeURIComponent(step)}`, {
       method: 'PUT', body: JSON.stringify(body),
     }),
+
+  setupSkipOnboarding: () =>
+    request<SetupState>('/setup/onboarding/skip', { method: 'POST', body: '{}' }),
 
   setupSkip: (step: SetupStepId, skipped: boolean) =>
     request<SetupState>(
@@ -1170,13 +1395,15 @@ export const api = {
   listReviewLoops: (status?: string) =>
     request<{ loops: ReviewLoop[] }>(`/review-loops${status ? `?status=${status}` : ''}`),
   getReviewLoop: (loopId: string) =>
-    request<{ loop: ReviewLoop; attempts: ReviewLoopAttempt[] }>(`/review-loops/${loopId}`),
+    request<{ loop: ReviewLoop; attempts: ReviewLoopAttempt[]; decisions: ReviewLoopDecision[] }>(
+      `/review-loops/${loopId}`,
+    ),
   killReviewLoop: (loopId: string, reason = '') =>
     request<ReviewLoop>(`/review-loops/${loopId}/kill`, {
       method: 'POST', body: JSON.stringify({ reason }),
     }),
   decideReviewLoop: (loopId: string, decision: string) =>
-    request<{ ok: boolean; message: string }>(`/review-loops/${loopId}/decision`, {
+    request<ReviewLoopDecisionResult>(`/review-loops/${loopId}/decision`, {
       method: 'POST', body: JSON.stringify({ decision }),
     }),
   getReviewLoopState: (loopId: string) =>
@@ -1196,14 +1423,64 @@ export const api = {
     }),
   resumeSession: (id: string) =>
     request<any>(`/sessions/${id}/resume`, { method: 'POST' }),
-  archiveSession: (id: string) =>
-    request<any>(`/sessions/${id}/archive`, { method: 'POST' }),
+  /** `force` archives even while agents run in the session (they are stopped). */
+  archiveSession: (id: string, opts?: { force?: boolean }) =>
+    request<ArchiveSessionResult>(
+      `/sessions/${id}/archive${opts?.force ? '?force=true' : ''}`, { method: 'POST' },
+    ),
   unarchiveSession: (id: string) =>
     request<any>(`/sessions/${id}/unarchive`, { method: 'POST' }),
   getSessionStatus: (id: string) =>
     request<any>(`/sessions/${id}/status`),
   getSessionEvents: (id: string, limit = 50) =>
     request<{ events: any[] }>(`/sessions/${id}/events?limit=${limit}`),
+
+  // Agents — the subagent / background-task records of one session, their
+  // transcripts and output, scoped stops, and the server-visible turn queue.
+  getSessionAgents: (sessionId: string, limit = 200) =>
+    request<AgentSnapshot>(`/sessions/${encodeURIComponent(sessionId)}/agents?limit=${limit}`),
+  getAgentDetail: (sessionId: string, agentId: string) =>
+    request<AgentDetail>(
+      `/sessions/${encodeURIComponent(sessionId)}/agents/${encodeURIComponent(agentId)}`,
+    ),
+  /** At most one cursor; none returns the tail. Items are always ascending. */
+  getAgentTranscript: (
+    sessionId: string, agentId: string,
+    o: { beforeSeq?: number; afterSeq?: number; limit?: number },
+  ) => {
+    const qs = new URLSearchParams();
+    if (o.beforeSeq !== undefined) qs.set('before_seq', String(o.beforeSeq));
+    if (o.afterSeq !== undefined) qs.set('after_seq', String(o.afterSeq));
+    if (o.limit !== undefined) qs.set('limit', String(o.limit));
+    const q = qs.toString();
+    return request<AgentTranscriptPage>(
+      `/sessions/${encodeURIComponent(sessionId)}/agents/${encodeURIComponent(agentId)}/transcript${q ? '?' + q : ''}`,
+    );
+  },
+  getAgentOutput: (sessionId: string, agentId: string, tailBytes = 65536) =>
+    request<AgentOutput>(
+      `/sessions/${encodeURIComponent(sessionId)}/agents/${encodeURIComponent(agentId)}/output?tail_bytes=${tailBytes}`,
+    ),
+  /** Stop one agent (and, with `cascade`, the agents it spawned). */
+  stopAgent: (sessionId: string, agentId: string, cascade = true) =>
+    request<StopAgentResponse>(
+      `/sessions/${encodeURIComponent(sessionId)}/agents/${encodeURIComponent(agentId)}/stop`,
+      { method: 'POST', body: JSON.stringify({ cascade }) },
+    ),
+  /** Stop the turn, every agent, or (force) the session's runtime. */
+  stopSession: (sessionId: string, body: StopSessionBody) =>
+    request<StopTurnResult | StopAllResult | ForceStopResult>(
+      `/sessions/${encodeURIComponent(sessionId)}/stop`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+  getQueue: (sessionId: string) =>
+    request<{ items: QueueEntryView[] }>(`/sessions/${encodeURIComponent(sessionId)}/queue`),
+  /** Cancel one of the caller's queued messages; `content` is its full text. */
+  cancelQueued: (sessionId: string, queueId: string) =>
+    request<{ cancelled: true; content: string | null }>(
+      `/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(queueId)}`,
+      { method: 'DELETE' },
+    ),
 
   // Chat (non-streaming)
   chat: (message: string, sessionId?: string) =>
@@ -1263,6 +1540,16 @@ export const api = {
     }),
   listTaskEvents: (id: string) =>
     request<{ events: TaskEvent[] }>(`/tasks/${id}/events`),
+  listTaskComments: (id: string) =>
+    request<{ comments: TaskComment[] }>(`/tasks/${id}/comments`),
+  addTaskComment: (id: string, body: string) =>
+    request<{ comment: TaskComment }>(`/tasks/${id}/comments`, {
+      method: 'POST', body: JSON.stringify({ body }),
+    }),
+  deleteTaskComment: (id: string, commentId: number) =>
+    request<{ id: number; deleted: boolean }>(`/tasks/${id}/comments/${commentId}`, {
+      method: 'DELETE',
+    }),
   getTask: (id: string) => request<any>(`/tasks/${id}`),
   createTask: (data: {
     title: string; content?: string; deadline?: string;
@@ -1412,8 +1699,10 @@ export const api = {
       langfuse: {
         enabled: boolean;
         host: string | null;
+        project_id: string | null;
         auth_ok: boolean;
         last_flush_at: string | null;
+        usage_rewriter: boolean;
       };
     }>('/observability/status'),
 
@@ -1429,6 +1718,7 @@ export const api = {
 
   // Cron jobs
   listCronJobs: () => request<{ jobs: any[] }>('/cron/jobs'),
+  getCronSchedule: (signal?: AbortSignal) => request<CronSchedule>('/cron/schedule', { signal }),
   triggerCronJob: (jobId: string) =>
     request<any>(`/cron/jobs/${encodeURIComponent(jobId)}/trigger`, { method: 'POST' }),
   rotateCronJob: (jobId: string) =>

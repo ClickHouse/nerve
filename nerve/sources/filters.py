@@ -20,6 +20,8 @@ Per-rule semantics:
   one of its patterns or the record is dropped. An absent field cannot
   satisfy a non-empty allow list (fail-closed).
 * an empty allow list means "allow anything not denied".
+* a rule may exempt record types: a record of such a type passes the rule
+  whatever its value.
 
 A record is kept only if it passes **every** rule (logical AND).
 
@@ -48,8 +50,14 @@ def _norm(value: object) -> str:
     return str(value).strip().lower()
 
 
-def _matches_any(value: str, patterns: list[str]) -> bool:
-    """Case-insensitive shell-glob match of *value* against any pattern."""
+def matches_any(value: object, patterns: list[str]) -> bool:
+    """Case-insensitive shell-glob match of *value* against any pattern.
+
+    The guardrail rules, for a source that applies them itself (the GitHub
+    Repos source's ``deny_authors``): both sides are stripped and lowered,
+    then matched with :func:`fnmatch.fnmatchcase`, so ``[...]`` is a
+    character class.
+    """
     norm_value = _norm(value)
     return any(fnmatch.fnmatchcase(norm_value, _norm(p)) for p in patterns)
 
@@ -64,11 +72,14 @@ class FieldRule:
         allow: If non-empty, the field value must match at least one pattern.
         deny: If the field value matches any pattern, the record is dropped
             (takes precedence over ``allow``).
+        exempt_record_types: Record types the rule does not apply to; a
+            record of one of them passes the rule without being matched.
     """
 
     field: str
     allow: list[str] = dataclasses.field(default_factory=list)
     deny: list[str] = dataclasses.field(default_factory=list)
+    exempt_record_types: tuple[str, ...] = ()
 
     @property
     def active(self) -> bool:
@@ -92,17 +103,19 @@ class FieldRule:
 
     def passes(self, record: SourceRecord) -> bool:
         """Return True if *record* satisfies this rule (should be kept)."""
+        if record.record_type in self.exempt_record_types:
+            return True
         values = self._values(record)
 
         # deny wins — drop on any deny match.
-        if self.deny and any(_matches_any(v, self.deny) for v in values):
+        if self.deny and any(matches_any(v, self.deny) for v in values):
             return False
 
         # allow gate — when set, require a match. An absent field fails closed.
         if self.allow:
             if not values:
                 return False
-            return any(_matches_any(v, self.allow) for v in values)
+            return any(matches_any(v, self.allow) for v in values)
 
         return True
 

@@ -37,8 +37,10 @@ class StyleRenderer(ABC):
     """
 
     @abstractmethod
-    def render(self, target: FileTarget, *, workspace: Path) -> str:
-        """Return the full rendered text for ``target``."""
+    def render(self, target: FileTarget, *, workspace: Path, memory_backend: str = "memu") -> str:
+        """Return the full rendered text for ``target``. ``memory_backend``
+        is the instance's ``memory.backend``: under ``loom`` Nerve's MCP
+        server serves no memory tools, so the bundle must not name them."""
         raise NotImplementedError
 
     # ---- Helpers ---------------------------------------------------

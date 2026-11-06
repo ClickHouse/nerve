@@ -41,6 +41,25 @@ def _uploads_dir() -> Path:
     return config.workspace / ".uploads"
 
 
+def session_upload_dir(session_id: str) -> Path | None:
+    """The directory for a session's uploads, or None if the id cannot name one.
+
+    The session id comes from the client: ``/api/chat`` and the WebSocket
+    create a session with any id that they get. Joined onto the uploads root
+    as it is, ``..`` segments or an absolute path name a directory anywhere on
+    the disk. The directory must resolve inside the uploads root.
+    """
+    root = _uploads_dir().resolve()
+    try:
+        candidate = (root / session_id).resolve()
+    except (OSError, RuntimeError, ValueError):
+        # A name that is too long, a symlink loop, a NUL byte: no directory.
+        return None
+    if candidate == root or not candidate.is_relative_to(root):
+        return None
+    return candidate
+
+
 @router.post("/api/files/upload")
 async def upload_files(
     files: list[UploadFile] = File(...),
@@ -53,6 +72,12 @@ async def upload_files(
     session = await deps.db.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    upload_dir = session_upload_dir(session_id)
+    if upload_dir is None:
+        raise HTTPException(
+            status_code=400,
+            detail="This session id cannot name an upload directory",
+        )
 
     # Read all files and validate sizes
     file_data: list[tuple[UploadFile, bytes]] = []
@@ -73,7 +98,6 @@ async def upload_files(
         file_data.append((f, data))
 
     # Store files on disk and in DB
-    upload_dir = _uploads_dir() / session_id
     upload_dir.mkdir(parents=True, exist_ok=True)
 
     results = []

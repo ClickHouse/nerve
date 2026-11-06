@@ -85,6 +85,35 @@ class TestParsing:
         assert not config.slack.enabled
         assert "slack.mode" in caplog.text
 
+    def test_the_gateway_grant_is_read_in_hosted_mode(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            config = NerveConfig.from_dict({
+                "slack": {"mode": "hosted", "source": {"enabled": True, "gateway_grant": True}},
+            })
+
+        source = config.slack.source
+        assert (source.gateway_grant, source.allow_conversations, source.collects) == (True, [], True)
+        assert "names nothing usable" not in caplog.text
+
+    @pytest.mark.parametrize("section", [
+        {"slack": {"bot_token": "xoxb-1", "app_token": "xapp-1",
+                   "source": {"enabled": True, "gateway_grant": True}}},
+        {"telegram": {"source": {"enabled": True, "gateway_grant": True}}},
+    ])
+    def test_the_gateway_grant_is_ignored_outside_hosted_mode(self, caplog, section):
+        with caplog.at_level(logging.WARNING):
+            config = NerveConfig.from_dict(section)
+
+        source = (config.slack if "slack" in section else config.telegram).source
+        assert (source.gateway_grant, source.collects) == (False, False)
+        assert "source.gateway_grant applies only to a channel in hosted mode" in caplog.text
+        assert "alone decides what is collected, and it names nothing" in caplog.text
+
+    def test_the_gateway_grant_is_a_known_key(self):
+        merged = {"slack": {"mode": "hosted", "source": {"enabled": True, "gateway_grant": True}}}
+
+        assert validate_config_keys(merged) == []
+
     def test_the_hosted_settings_are_read(self):
         config = hosted_config(max_streams="4", audience="nerve-channel")
 
@@ -157,11 +186,43 @@ class TestDoctor:
         assert "[WARN] slack.commands enables restart, but host commands are not available" in report
         assert "[WARN] slack.deny_channels has a rule that is not a conversation id" in report
 
-    def test_hosted_mode_warns_without_a_notification_conversation(self):
-        report = doctor_report(hosted_config())
+    def test_hosted_mode_lets_the_gateway_choose_the_notification_conversation(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            report = doctor_report(hosted_config())
 
         assert "[--] Slack send tool off" in report
-        assert "[WARN] Slack notifications have no conversation" in report
+        assert "[--] Slack notifications: the config names no conversation; the gateway" in report
+        assert "notification channel set in the console" in report
+        assert "[WARN] Slack notifications" not in report
+        assert "No notifications.slack_channel_id is set" not in caplog.text
+
+    def test_hosted_mode_warns_about_a_notification_conversation_that_is_not_an_id(self):
+        config = hosted_config()
+        config.notifications.slack_channel_id = "#deployments"
+
+        report = doctor_report(config)
+
+        assert "[WARN] notifications.slack_channel_id is not a Slack conversation id" in report
+
+    @pytest.mark.parametrize(("source", "line"), [
+        ({}, "[--] Slack channel source off (slack.source.enabled is false)"),
+        ({"enabled": True, "gateway_grant": True},
+         "[OK] Slack channel source on; the gateway decides which channels are observed"),
+        ({"enabled": True, "gateway_grant": True, "allow_channels": ["C0123ABCD"]},
+         "[OK] Slack channel source on, limited to 1 allow rule(s); the gateway decides which channels are observed"),
+        ({"enabled": True, "allow_channels": ["C0123ABCD", "C0456EFGH"]},
+         "[OK] Slack channel source on, 2 allow rule(s); the gateway also decides"),
+        ({"enabled": True},
+         "[WARN] Slack channel source collects nothing: set slack.source.gateway_grant, "
+         "or list channel ids in slack.source.allow_channels"),
+    ])
+    def test_hosted_mode_reports_the_channel_source(self, source, line):
+        config = NerveConfig.from_dict({
+            "slack": {"mode": "hosted", "source": source},
+            "channels": {"hosted": HOSTED},
+        })
+
+        assert line in doctor_report(config)
 
     def test_unusable_hosted_settings_are_errors(self):
         report = doctor_report(hosted_config(agent_id=""))
@@ -221,6 +282,8 @@ class TestKeyReload:
 
 
 class _Router:
+    accepting_turns = True
+
     def __init__(self) -> None:
         self.channels: dict[str, Any] = {}
 

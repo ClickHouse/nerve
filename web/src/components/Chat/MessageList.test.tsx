@@ -30,7 +30,7 @@ const { MessageList } = await import('./MessageList');
 function renderEmpty() {
   return render(
     <MemoryRouter>
-      <MessageList messages={[]} streamingBlocks={[]} isStreaming={false} />
+      <MessageList messages={[]} isStreaming={false} />
     </MemoryRouter>,
   );
 }
@@ -53,6 +53,21 @@ describe('empty transcript', () => {
     expect(status).toHaveTextContent('Connect a model to start a conversation');
     expect(screen.getByRole('link', { name: 'Finish setup' })).toHaveAttribute('href', '/setup/provider');
     expect(screen.queryByText('Start a conversation')).not.toBeInTheDocument();
+  });
+
+  it('gives the reason and no link when a lockdown closed the Model step', () => {
+    const reason = 'Configuration is managed from the config repository on this instance; changes arrive by PR and sync. Configure this step from the config repository.';
+    useSetupStore.setState({
+      state: withStep(makeState({ lockdown: true, writable: false }), step('provider', {
+        status: 'blocked', blocked_kind: 'lockdown', blocked_reason: reason, read_only: true, read_only_reason: reason,
+      })),
+    });
+    renderEmpty();
+    const status = screen.getByRole('status');
+    expect(status).toHaveTextContent('No model is connected');
+    expect(status).toHaveTextContent(reason);
+    expect(screen.queryByRole('link', { name: 'Finish setup' })).not.toBeInTheDocument();
+    expect(screen.queryByText('Connect a model to start a conversation')).not.toBeInTheDocument();
   });
 
   it('goes back to the default once a provider is configured', () => {

@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from nerve.platform.activity import LEASE_CONFIG_SYNC, keep_awake
+
 if TYPE_CHECKING:
     from nerve.config_validate import ValidationResult
 
@@ -637,61 +639,64 @@ async def run_periodic_sync(config, engine, cron_service, stop_event: asyncio.Ev
                 )
             if not enabled:
                 continue
-            result = await asyncio.to_thread(
-                sync_workspace, config.workspace,
-                config.config_dir or config.workspace,
-                branch=cfg.branch, validate=cfg.validate, strict_env=cfg.strict_env,
-                locked=config.lockdown,
-            )
-            for warning in result.validation_warnings:
-                logger.warning("Workspace sync: config warning: %s", warning)
-            failures: dict[str, str] = {}
-            if not result.ok:
-                logger.warning("Workspace sync: %s", result.message)
-                for err in result.validation_errors:
-                    logger.warning("  config error: %s", err)
-            elif result.changed or (result.new_rev and result.new_rev != applied_rev):
-                if result.changed:
-                    logger.info("Workspace sync: %s — applying", result.message)
-                else:
-                    logger.info(
-                        "Workspace sync: %s is on disk but this daemon last "
-                        "applied %s — applying",
-                        result.new_rev[:8], applied_rev[:8] or "nothing",
-                    )
-                summary = await _apply_sync(
-                    engine, cron_service, config.config_dir or config.workspace,
+            # A cycle keeps the machine awake until it has applied what it pulled.
+            with keep_awake(LEASE_CONFIG_SYNC):
+                result = await asyncio.to_thread(
+                    sync_workspace, config.workspace,
+                    config.config_dir or config.workspace,
+                    branch=cfg.branch, validate=cfg.validate, strict_env=cfg.strict_env,
+                    locked=config.lockdown,
                 )
-                failures = reload_failures(summary)
-                if not failures:
-                    # Advanced only when every subsystem took it. A subsystem
-                    # that refused the new config leaves this behind, so the next
-                    # cycle retries rather than the daemon settling on the one
-                    # warning below and never mentioning it again.
-                    applied_rev = result.new_rev
-                # Both branches sit at WARNING beside the INFO line above, which
-                # on its own reads as "applied".
-                if "config" in failures:
-                    # The merge landed but the daemon is still running the old
-                    # config.
-                    logger.warning(
-                        "Workspace sync: merged %s but the new config could not "
-                        "be loaded, so NOTHING was applied and this daemon is "
-                        "still running the previous configuration: %s",
-                        result.new_rev[:8], failures["config"],
+                for warning in result.validation_warnings:
+                    logger.warning("Workspace sync: config warning: %s", warning)
+                failures: dict[str, str] = {}
+                if not result.ok:
+                    logger.warning("Workspace sync: %s", result.message)
+                    for err in result.validation_errors:
+                        logger.warning("  config error: %s", err)
+                elif result.changed or (result.new_rev and result.new_rev != applied_rev):
+                    if result.changed:
+                        logger.info("Workspace sync: %s — applying", result.message)
+                    else:
+                        logger.info(
+                            "Workspace sync: %s is on disk but this daemon last "
+                            "applied %s — applying",
+                            result.new_rev[:8], applied_rev[:8] or "nothing",
+                        )
+                    summary = await _apply_sync(
+                        engine, cron_service, config.config_dir or config.workspace,
                     )
-                elif failures:
-                    # Config loaded, so the merge is partly live — which is the
-                    # state hardest to spot from the outside and so the one that
-                    # has to be named rather than left to the summary line.
-                    logger.warning(
-                        "Workspace sync: merged %s and loaded the new config, but "
-                        "%s did not take it — this daemon is running the merged "
-                        "configuration only in part",
-                        result.new_rev[:8],
-                        "; ".join(f"{k} ({v})" for k, v in sorted(failures.items())),
-                    )
-            await _record_cycle(engine, result, applied_rev, failures)
+                    failures = reload_failures(summary)
+                    if not failures:
+                        # Advanced only when every subsystem took it. A subsystem
+                        # that refused the new config leaves this behind, so the
+                        # next cycle retries rather than the daemon settling on
+                        # the one warning below and never mentioning it again.
+                        applied_rev = result.new_rev
+                    # Both branches sit at WARNING beside the INFO line above,
+                    # which on its own reads as "applied".
+                    if "config" in failures:
+                        # The merge landed but the daemon is still running the
+                        # old config.
+                        logger.warning(
+                            "Workspace sync: merged %s but the new config could not "
+                            "be loaded, so NOTHING was applied and this daemon is "
+                            "still running the previous configuration: %s",
+                            result.new_rev[:8], failures["config"],
+                        )
+                    elif failures:
+                        # Config loaded, so the merge is partly live — which is
+                        # the state hardest to spot from the outside and so the
+                        # one that has to be named rather than left to the
+                        # summary line.
+                        logger.warning(
+                            "Workspace sync: merged %s and loaded the new config, but "
+                            "%s did not take it — this daemon is running the merged "
+                            "configuration only in part",
+                            result.new_rev[:8],
+                            "; ".join(f"{k} ({v})" for k, v in sorted(failures.items())),
+                        )
+                await _record_cycle(engine, result, applied_rev, failures)
         except Exception as e:  # noqa: BLE001 — never let the loop die
             logger.warning("Workspace sync cycle failed: %s", e)
             continue

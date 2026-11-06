@@ -4,6 +4,8 @@ import { Bell, X, CheckCheck, EyeOff, Check, XCircle, Moon, BellOff, Trash2, Plu
 import { Badge, Button, IconButton, TextField, type BadgeTone, type ButtonVariant } from '../components/ui';
 import { useNotificationStore, type Notification, type Silence } from '../stores/notificationStore';
 import { PageHeader } from '../components/ui/PageHeader';
+import { ActorAttribution } from '../components/Chat/ActorLabel';
+import { NotificationBody, NotificationLinks } from '../components/Notifications/NotificationParts';
 
 /** Lifecycle state — a status, so it takes a `Badge` tone. */
 const STATUS_TONES: Record<string, BadgeTone> = {
@@ -209,13 +211,14 @@ function NotificationCard({ notif }: { notif: Notification }) {
             <h3 className="font-medium text-base text-text">{notif.title}</h3>
           </div>
           {notif.body && (
-            <p className="text-sm text-text-muted mt-1 whitespace-pre-wrap">{notif.body}</p>
+            <NotificationBody body={notif.body} className="text-sm text-text-muted mt-1" />
           )}
           {isApproval && notif.target_kind && notif.target_id && (
             <p className="text-xs text-text-faint mt-1 font-mono">
               {notif.target_kind}: {notif.target_id}
             </p>
           )}
+          <NotificationLinks notif={notif} />
         </div>
         <div className="flex flex-wrap items-center gap-2 shrink-0 order-0 sm:order-none">
           {(notif.redelivery_count ?? 0) > 0 && (
@@ -310,12 +313,45 @@ function NotificationCard({ notif }: { notif: Notification }) {
           </span>
         </div>
       )}
+      {notif.status === 'pending' && notif.redeliver_at && notif.answered_by_actor_id && (
+        <div className="mt-1 ml-[18px] text-xs text-text-faint">
+          Snoozed by{' '}
+          <ActorAttribution
+            actorId={notif.answered_by_actor_id}
+            causeId={null}
+            verb="Snoozed by"
+          />
+        </div>
+      )}
 
-      {/* Show answer if answered */}
+      {/* Show answer if answered. The person is known for a web answer; a
+          chat-channel answer names only its transport. */}
       {notif.status === 'answered' && (
         <div className="mt-2 text-sm text-success">
           Answer: {isApproval ? approvalLabel(notif.answer || '', optionLabels) : notif.answer}{' '}
-          <span className="text-text-faint">(via {notif.answered_by})</span>
+          <span className="text-text-faint">
+            ({notif.answered_by_actor_id && (
+              <>
+                by{' '}
+                <ActorAttribution
+                  actorId={notif.answered_by_actor_id}
+                  causeId={null}
+                  verb="Answered by"
+                />{' '}
+              </>
+            )}via {notif.answered_by})
+          </span>
+        </div>
+      )}
+
+      {notif.status === 'dismissed' && notif.dismissed_by_actor_id && (
+        <div className="mt-2 text-xs text-text-dim">
+          Dismissed by{' '}
+          <ActorAttribution
+            actorId={notif.dismissed_by_actor_id}
+            causeId={null}
+            verb="Dismissed by"
+          />
         </div>
       )}
 
@@ -352,6 +388,15 @@ function SilenceRow({ s, onRemove }: { s: Silence; onRemove: () => void }) {
         {overridden ? `, ${s.override_count} override${s.override_count !== 1 ? 's' : ''}` : ''}
       </span>
       <span className="text-text-faint shrink-0">{formatExpiry(s.expires_at)}</span>
+      {s.created_by_actor_id && (
+        <span className="text-text-faint shrink-0 max-w-[10rem] truncate">
+          <ActorAttribution
+            actorId={s.created_by_actor_id}
+            causeId={s.caused_by_actor_id}
+            verb="Created by"
+          />
+        </span>
+      )}
       {s.reason && (
         <span className="text-text-dim truncate hidden md:block max-w-[14rem]" title={s.reason}>
           {s.reason}

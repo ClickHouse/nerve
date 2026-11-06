@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nerve.agent.engine import NotAcceptingTurnsError
 from nerve.channels import slack as slack_module
 from nerve.channels.base import ChannelCapability, OutboundMessage
 from nerve.channels.slack import (
@@ -292,6 +294,17 @@ class TestNotificationDelivery:
         assert delivery == ("D0123ABC", "1.1")
 
     @pytest.mark.asyncio
+    async def test_without_a_target_the_card_is_skipped_with_a_warning(self, caplog):
+        channel = _channel(allow_channels=["engineering-*"])
+
+        with caplog.at_level(logging.WARNING, logger="nerve.channels.slack"):
+            delivery = await channel.post_notification("n1", "Hello")
+
+        assert delivery is None
+        channel._web.chat_postMessage.assert_not_awaited()
+        assert "No notifications.slack_channel_id is set" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_a_quiescing_channel_refuses_external_delivery(self):
         channel = _channel(allow_channels=["C0456DEF"])
         channel._state = "quiescing"
@@ -490,6 +503,18 @@ class TestMessageEvents:
         assert msg.text == "hello"
         assert msg.sender_id == "D1"
         assert msg.metadata["message_id"] == "1.1"
+
+    @pytest.mark.asyncio
+    async def test_a_message_refused_by_a_drain_posts_no_second_error(self):
+        """The stream adapter sends the engine's error. The handler posts nothing."""
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
+        channel.router.handle_message = AsyncMock(side_effect=NotAcceptingTurnsError())
+        await channel._handle_message_event({
+            "type": "message", "channel": "D1", "channel_type": "im",
+            "user": "U1", "ts": "1.1", "text": "hello",
+        })
+        channel.router.handle_message.assert_awaited_once()
+        channel._web.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_an_unauthorized_sender_never_reaches_the_router(self):
@@ -1578,6 +1603,68 @@ class TestAmpersandEscaping:
         assert _md_to_slack("a & b") == "a &amp; b"
 
 
+_STOPPED = {"scope": "turn", "turn": "stopped", "would_end": [], "shell_count": 0}
+
+
+class TestStopAnswersSayWhatHappened:
+    """`/nerve stop` stops the turn only (background agents keep running). A
+    runtime that cannot spare its agents is not stopped, and the answer says
+    so rather than claiming nothing ran."""
+
+    def _ch(self, result):
+        channel = _channel(allow_users=["U1"])
+        channel.router.list_conversation_sessions = AsyncMock(return_value=[
+            {"channel_key": "slack:C1:1.0", "session_id": "s1", "title": "s1"},
+        ])
+        channel.router.stop_turn = AsyncMock(return_value=result)
+        channel._web.chat_postEphemeral = AsyncMock(return_value={"ok": True})
+        return channel
+
+    async def _said(self, result) -> str:
+        channel = self._ch(result)
+        await channel._cmd_stop("C1", "U1", "slack:C1")
+        channel.router.stop_turn.assert_awaited_once_with("s1")
+        return channel._web.chat_postEphemeral.await_args.kwargs["text"]
+
+    @pytest.mark.asyncio
+    async def test_a_stopped_turn(self):
+        assert await self._said(_STOPPED) == "Stopped `s1` in the thread."
+        assert await self._said({**_STOPPED, "turn": "killed"}) == "Stopped `s1` in the thread."
+
+    @pytest.mark.asyncio
+    async def test_nothing_ran(self):
+        said = await self._said({**_STOPPED, "turn": "not_running"})
+        assert said == "`s1` was not running."
+
+    @pytest.mark.asyncio
+    async def test_a_runtime_that_cannot_spare_its_agents(self):
+        brief = {"id": "ag_000000000001", "label": "build-api", "kind": "agent",
+                 "status": "running", "started_at": None, "tokens": 0}
+        said = await self._said({**_STOPPED, "turn": "needs_confirmation", "would_end": [brief, brief]})
+        assert "Couldn't stop `s1`" in said and "2 background agents" in said
+        assert "not running" not in said
+
+    @pytest.mark.asyncio
+    async def test_a_turn_that_did_not_stop(self):
+        said = await self._said({**_STOPPED, "turn": "not_stopped"})
+        assert "didn't stop within 5 s" in said and "Force stop" in said
+
+    @pytest.mark.asyncio
+    async def test_the_picker_button_answers_the_same_way(self):
+        channel = self._ch({**_STOPPED, "turn": "needs_confirmation", "would_end": [{"id": "ag_1"}]})
+        channel._replace_via_url = AsyncMock()
+        await channel._handle_interactive({
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.test/x",
+            "actions": [{"action_id": "sessstop:s2", "value": "s2"}],
+        })
+        channel.router.stop_turn.assert_awaited_once_with("s2")
+        said = channel._replace_via_url.await_args.args[1]
+        assert "Couldn't stop `s2`" in said and "1 background agent." in said
+
+
 class TestSlashCommandsAreThreadBlind:
     """Slack refuses `/nerve` inside a thread — it answers "not supported in
     threads" — so a command never carries thread context and must resolve
@@ -1587,7 +1674,7 @@ class TestSlashCommandsAreThreadBlind:
     def _ch(self, sessions, **kw):
         channel = _channel(allow_users=["U1"], **kw)
         channel.router.list_conversation_sessions = AsyncMock(return_value=sessions)
-        channel.router.stop_session = AsyncMock(return_value=True)
+        channel.router.stop_turn = AsyncMock(return_value=_STOPPED)
         channel._web.chat_postEphemeral = AsyncMock(return_value={"ok": True})
         return channel
 
@@ -1602,7 +1689,7 @@ class TestSlashCommandsAreThreadBlind:
         # beside it is busy, and stop used to report "No active session".
         channel = self._ch([self._row("s1", thread="1.0")])
         await channel._cmd_stop("C1", "U1", "slack:C1")
-        channel.router.stop_session.assert_awaited_once_with("s1")
+        channel.router.stop_turn.assert_awaited_once_with("s1")
         said = channel._web.chat_postEphemeral.await_args.kwargs["text"]
         assert "s1" in said and "thread" in said
 
@@ -1610,7 +1697,7 @@ class TestSlashCommandsAreThreadBlind:
     async def test_nothing_live_says_so_plainly(self):
         channel = self._ch([])
         await channel._cmd_stop("C1", "U1", "slack:C1")
-        channel.router.stop_session.assert_not_called()
+        channel.router.stop_turn.assert_not_called()
         assert (
             "No active session"
             in channel._web.chat_postEphemeral.await_args.kwargs["text"]
@@ -1626,7 +1713,7 @@ class TestSlashCommandsAreThreadBlind:
             ]
         )
         await channel._cmd_stop("C1", "U1", "slack:C1")
-        channel.router.stop_session.assert_not_called()
+        channel.router.stop_turn.assert_not_called()
         blocks = channel._web.chat_postEphemeral.await_args.kwargs["blocks"]
         action_ids = [
             e["action_id"]
@@ -1649,7 +1736,7 @@ class TestSlashCommandsAreThreadBlind:
                 "actions": [{"action_id": "sessstop:s2", "value": "s2"}],
             }
         )
-        channel.router.stop_session.assert_awaited_once_with("s2")
+        channel.router.stop_turn.assert_awaited_once_with("s2")
 
     @pytest.mark.asyncio
     async def test_a_press_from_an_unauthorized_sender_is_refused(self):
@@ -1665,7 +1752,7 @@ class TestSlashCommandsAreThreadBlind:
                 "actions": [{"action_id": "sessstop:s2", "value": "s2"}],
             }
         )
-        channel.router.stop_session.assert_not_called()
+        channel.router.stop_turn.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_a_press_with_no_conversation_is_refused(self):
@@ -1689,7 +1776,7 @@ class TestSlashCommandsAreThreadBlind:
                     "actions": [{"action_id": action_id, "value": value}],
                 }
             )
-        channel.router.stop_session.assert_not_called()
+        channel.router.stop_turn.assert_not_called()
         channel.router.set_session_starred.assert_not_called()
         channel._notification_service.answer_delivered_notification\
             .assert_not_awaited()
@@ -1759,6 +1846,16 @@ class TestCommandExposure:
         said = await self._run(channel, "sessions")
         assert "turned off" in said
         channel.router.list_sessions.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_reply_during_a_drain_says_nerve_is_shutting_down(self):
+        channel = self._ch()
+        channel._notification_service = MagicMock()
+        channel._notification_service.answer_latest_question = AsyncMock(
+            side_effect=NotAcceptingTurnsError(),
+        )
+        said = await self._run(channel, "reply yes")
+        assert said == str(NotAcceptingTurnsError())
 
     @pytest.mark.asyncio
     async def test_reply_is_scoped_to_the_slack_conversation_and_actor(self):
@@ -1879,10 +1976,10 @@ class TestCommandExposure:
     @pytest.mark.asyncio
     async def test_a_disabled_command_is_refused_not_run(self):
         channel = self._ch(commands=["reply"])
-        channel.router.stop_session = AsyncMock()
+        channel.router.stop_turn = AsyncMock()
         said = await self._run(channel, "stop")
         assert "turned off" in said
-        channel.router.stop_session.assert_not_called()
+        channel.router.stop_turn.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_restart_is_refused_by_default(self):
@@ -2263,6 +2360,35 @@ class TestNotificationCardRoundTrip:
             "message": {"blocks": blocks},
         })
         return channel, blocks, posts.bodies[-1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_a_press_during_a_drain_keeps_the_card(self, monkeypatch):
+        import httpx
+
+        posts = _CapturedPosts()
+        monkeypatch.setattr(httpx, "AsyncClient", posts)
+        channel = _channel(allow_users=["U1"])
+        channel._respond_ephemeral = AsyncMock()
+        service = MagicMock()
+        service.answer_delivered_notification = AsyncMock(
+            side_effect=NotAcceptingTurnsError(),
+        )
+        channel._notification_service = service
+
+        await channel._handle_interactive({
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.test/x",
+            "actions": [{"action_id": "notif:n1:approve", "value": "approve"}],
+            "message": {"blocks": build_notification_blocks(self.RAW, "n1", [("Approve", "approve")])},
+        })
+
+        # The card keeps its buttons. Only the person who pressed is told.
+        assert posts.bodies == []
+        channel._respond_ephemeral.assert_awaited_once_with(
+            "C1", "U1", str(NotAcceptingTurnsError()),
+        )
 
     @pytest.mark.asyncio
     async def test_the_card_text_is_carried_across_unchanged(self, monkeypatch):

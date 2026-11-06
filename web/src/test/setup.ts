@@ -2,6 +2,29 @@ import '@testing-library/jest-dom/vitest';
 import { cleanup } from '@testing-library/react';
 import { afterEach, expect, vi } from 'vitest';
 
+// An in-memory `localStorage` for every test file. Node 25 and later define an
+// inert `localStorage` global that shadows jsdom's Storage, and the stores and
+// the API client read localStorage when they are first imported, so without
+// this a test file crashes at import on those Node versions. It is installed
+// on every Node version (also replacing jsdom's Storage), so every run sees
+// the same storage. This file runs before each test file's imports. A test
+// that needs its own storage can still define one over it.
+function installMemoryStorage(): void {
+  const data = new Map<string, string>();
+  const storage: Storage = {
+    getItem: (key: string) => (data.has(key) ? data.get(key)! : null),
+    setItem: (key: string, value: string) => { data.set(key, String(value)); },
+    removeItem: (key: string) => { data.delete(key); },
+    clear: () => data.clear(),
+    key: (index: number) => [...data.keys()][index] ?? null,
+    get length() { return data.size; },
+  };
+  for (const target of [globalThis, globalThis.window]) {
+    if (target) Object.defineProperty(target, 'localStorage', { value: storage, configurable: true, writable: true });
+  }
+}
+installMemoryStorage();
+
 // Unmount between tests. Components here portal into document.body and
 // register document-level listeners, so a leaked mount is not just a
 // memory concern — a stale Modal would keep claiming Escape and quietly

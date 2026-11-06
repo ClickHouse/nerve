@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 import pytest_asyncio
 
-import nerve.config  # noqa: F401  — imported so its constants can be re-pointed
+import nerve.config  # imported so its constants can be re-pointed
 from nerve import paths
 from nerve.db import Database
 from nerve.identity import Actor
@@ -78,7 +78,24 @@ def _isolate_nerve_state_files(tmp_path, monkeypatch):
     """
     state_dir = tmp_path / "_nerve_state"
     monkeypatch.setenv("NERVE_HOME", str(state_dir))
+    # A hosted VM seeds the agent's display name into the environment; the
+    # suite must not inherit it as the profile step's prefill.
+    monkeypatch.delenv("NERVE_DISPLAY_NAME", raising=False)
     _repoint_import_time_state_paths(monkeypatch)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_platform_activity_socket(monkeypatch):
+    """Keep the gateway's activity reporter off the machine's real socket.
+
+    On a machine that runs on a platform with a local activity socket, the
+    default ``platform.activity_socket`` exists, and every test that starts
+    the gateway lifespan would report its fake turns and connections there.
+    The default is resolved when a config is built, so pointing it at nothing
+    here covers every config a test builds. Tests about the reporter name
+    their own socket.
+    """
+    monkeypatch.setattr(nerve.config, "DEFAULT_PLATFORM_ACTIVITY_SOCKET", "")
 
 
 @pytest.fixture(autouse=True)
@@ -93,6 +110,25 @@ def _no_ambient_provider_credential(monkeypatch):
     """
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+
+#: What the stand-in GitHub CLI probe below answers: no ``gh`` on the machine.
+NO_GITHUB_CLI = {"cli": False, "authenticated": False, "login": None, "hint": None}
+
+
+@pytest.fixture(autouse=True)
+def _no_real_github_cli(monkeypatch):
+    """Never run the developer's GitHub CLI for the onboarding's facts.
+
+    Every onboarding start gathers facts about the instance, ``gh auth
+    status`` included (:mod:`nerve.onboarding_environment`). A test that opens
+    the conversation (directly, or through Finish) must neither wait for nor
+    depend on whoever is signed in on the machine running the suite: the probe
+    answers "not installed" unless a test replaces it.
+    """
+    from nerve import onboarding_environment
+
+    monkeypatch.setattr(onboarding_environment, "_github_cli", lambda timeout: dict(NO_GITHUB_CLI))
 
 
 @pytest.fixture(autouse=True)
@@ -154,6 +190,28 @@ def _unpin_auth_mode(monkeypatch):
     unpin_auth_mode()
     yield
     unpin_auth_mode()
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_system_principal(monkeypatch):
+    """Strip ``NERVE_SYSTEM_PRINCIPAL_ID`` from the developer shell.
+
+    In external mode, the identity bootstrap gives the system actor the ID in
+    that variable. Tests about it set the variable themselves.
+    """
+    from nerve.identity import SYSTEM_PRINCIPAL_ENV
+
+    monkeypatch.delenv(SYSTEM_PRINCIPAL_ENV, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_ambient_timezone(monkeypatch):
+    """Strip ``NERVE_TIMEZONE`` from the developer shell.
+
+    Nerve uses it as the default time zone when no settings layer names one.
+    Tests about it set the variable themselves.
+    """
+    monkeypatch.delenv(nerve.config.TIMEZONE_ENV, raising=False)
 
 
 @pytest.fixture(scope="session", autouse=True)

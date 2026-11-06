@@ -4,10 +4,12 @@ import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search
 import { Button, IconButton, TextField } from '../ui';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp, loadCollapsedGroups, saveCollapsedGroups, loadExpandedParents, saveExpandedParents } from '../../utils/dateGroups';
+import { useShallow } from 'zustand/react/shallow';
 import { useChatStore } from '../../stores/chatStore';
 import { useVisibleActorIds } from '../../stores/actorStore';
 import { useAuthStore } from '../../stores/authStore';
 import { SessionCreatorMarker } from './ActorLabel';
+import { useActorAttributionLabel } from '../../hooks/useActorAttribution';
 import { useModalSurface } from '../../hooks/useModalSurface';
 import { safeAreaInsets } from '../../utils/safeArea';
 import { forkChat } from '../../utils/forkChat';
@@ -104,7 +106,36 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, archiveSession, setSessionParent, virtualSession, discardVirtualSession, sidebarWidth, setSidebarWidth, sessionsHasMore, loadMoreSessions, archivedSessions, archivedCount, archivedLoading, archivedHasMore, loadArchivedSessions, clearArchivedSessions, unarchiveSession, starArchivedSession, systemSessions, systemCount, systemLoading, systemHasMore, loadSystemSessions, clearSystemSessions } = useChatStore();
+  const { searchResults, searchLoading, searchSessions, clearSearch, renameSession, toggleStar, archiveSession, setSessionParent, virtualSession, discardVirtualSession, sidebarWidth, setSidebarWidth, sessionsHasMore, loadMoreSessions, archivedSessions, archivedCount, archivedLoading, archivedHasMore, loadArchivedSessions, clearArchivedSessions, unarchiveSession, starArchivedSession, systemSessions, systemCount, systemLoading, systemHasMore, loadSystemSessions, clearSystemSessions } = useChatStore(useShallow(s => ({
+    searchResults: s.searchResults,
+    searchLoading: s.searchLoading,
+    searchSessions: s.searchSessions,
+    clearSearch: s.clearSearch,
+    renameSession: s.renameSession,
+    toggleStar: s.toggleStar,
+    archiveSession: s.archiveSession,
+    setSessionParent: s.setSessionParent,
+    virtualSession: s.virtualSession,
+    discardVirtualSession: s.discardVirtualSession,
+    sidebarWidth: s.sidebarWidth,
+    setSidebarWidth: s.setSidebarWidth,
+    sessionsHasMore: s.sessionsHasMore,
+    loadMoreSessions: s.loadMoreSessions,
+    archivedSessions: s.archivedSessions,
+    archivedCount: s.archivedCount,
+    archivedLoading: s.archivedLoading,
+    archivedHasMore: s.archivedHasMore,
+    loadArchivedSessions: s.loadArchivedSessions,
+    clearArchivedSessions: s.clearArchivedSessions,
+    unarchiveSession: s.unarchiveSession,
+    starArchivedSession: s.starArchivedSession,
+    systemSessions: s.systemSessions,
+    systemCount: s.systemCount,
+    systemLoading: s.systemLoading,
+    systemHasMore: s.systemHasMore,
+    loadSystemSessions: s.loadSystemSessions,
+    clearSystemSessions: s.clearSystemSessions,
+  })));
   const searchFocusNonce = useChatStore(s => s.searchFocusNonce);
 
   const viewerActorId = useAuthStore((s) => s.viewer?.id ?? null);
@@ -871,15 +902,52 @@ function reviewLoopIconTone(status: string): string {
 }
 
 
-/** Tooltip for the parked dot: what exactly the session is waiting on. */
-function parkedTitle(session: Session): string {
+/**
+ * Tooltip for the parked dot: what exactly the session is waiting on.
+ * `scheduledBy` names who scheduled the wake-up ("Alice", "Nerve for Bob"),
+ * or is null when that was not recorded.
+ */
+function parkedTitle(session: Session, scheduledBy: string | null): string {
   const parts: string[] = [];
-  if (session.has_background_tasks) parts.push('Background job running');
+  const agents = session.background_count ?? 0;
+  if (agents > 0) parts.push(`${agents} agent${agents === 1 ? '' : 's'} running`);
+  else if (session.has_background_tasks) parts.push('Background job running');
   if (session.pending_wakeup_at) {
     const at = parseTimestamp(session.pending_wakeup_at);
-    parts.push(`Scheduled wake-up at ${at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`);
+    const time = at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    parts.push(`Scheduled wake-up at ${time}${scheduledBy ? ` by ${scheduledBy}` : ''}`);
   }
   return parts.join(' · ') || 'Waiting on pending work';
+}
+
+
+/**
+ * Parked: no turn in flight, but a wake-up is scheduled or a background job
+ * is still running. Same pulsing dot as running (the session isn't done),
+ * in violet (the one hue that no other indicator uses), so "working right now"
+ * stays distinguishable from "will pick itself back up".
+ */
+function ParkedIndicator({ session }: { session: Session }) {
+  const scheduledBy = useActorAttributionLabel(
+    session.pending_wakeup_at ? session.pending_wakeup_created_by_actor_id : null,
+    session.pending_wakeup_caused_by_actor_id,
+  );
+  const agents = session.background_count ?? 0;
+  const title = parkedTitle(session, scheduledBy);
+  const dot = (
+    <span className="relative flex h-2 w-2 shrink-0" title={title}>
+      <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-violet opacity-75" />
+      <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-violet" />
+    </span>
+  );
+  // How many agents run, once there is more than one to count.
+  if (agents < 2) return dot;
+  return (
+    <span className="flex items-center gap-1 shrink-0" title={title}>
+      {dot}
+      <span className="text-2xs tabular-nums text-hue-violet">{agents}</span>
+    </span>
+  );
 }
 
 
@@ -895,7 +963,7 @@ function StatusIndicator({ session, isActive, isRunning }: {
   if (session.awaiting_input) {
     return (
       <span className="relative flex h-2 w-2 shrink-0" title="Waiting for your input">
-        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-blue opacity-75" />
+        <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-blue opacity-75" />
         <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-blue" />
       </span>
     );
@@ -906,7 +974,7 @@ function StatusIndicator({ session, isActive, isRunning }: {
   if (session.review_loop?.status === 'awaiting_user') {
     return (
       <span className="relative flex h-2 w-2 shrink-0" title="Review loop needs your decision">
-        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-orange opacity-75" />
+        <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-orange opacity-75" />
         <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-orange" />
       </span>
     );
@@ -919,7 +987,7 @@ function StatusIndicator({ session, isActive, isRunning }: {
   if (loopLive && !isRunning) {
     return (
       <span className="relative flex h-2 w-2 shrink-0" title={`Review loop ${session.review_loop!.status}`}>
-        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-emerald opacity-75" />
+        <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-emerald opacity-75" />
         <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-emerald" />
       </span>
     );
@@ -934,7 +1002,7 @@ function StatusIndicator({ session, isActive, isRunning }: {
   if (isRunning) {
     return (
       <span className="relative flex h-2 w-2 shrink-0">
-        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-emerald opacity-75" />
+        <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-emerald opacity-75" />
         <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-emerald" />
       </span>
     );
@@ -946,18 +1014,7 @@ function StatusIndicator({ session, isActive, isRunning }: {
     return <span className="inline-flex rounded-full h-1.5 w-1.5 shrink-0 bg-hue-red" />;
   }
 
-  // Parked: no turn in flight, but a wake-up is scheduled or a background job
-  // is still running. Same pulsing dot as running (the session isn't done),
-  // in violet — the one hue no other indicator uses — so "working right now"
-  // stays distinguishable from "will pick itself back up".
-  if (isParked(session)) {
-    return (
-      <span className="relative flex h-2 w-2 shrink-0" title={parkedTitle(session)}>
-        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-violet opacity-75" />
-        <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-violet" />
-      </span>
-    );
-  }
+  if (isParked(session)) return <ParkedIndicator session={session} />;
 
   // Stopped: solid yellow
   if (session.status === 'stopped') {

@@ -32,6 +32,7 @@ class Task:
     updated_at: str = ""
     escalation_level: int = 0
     last_reminded_at: str = ""
+    revision: int = 1
     content: str = ""
 
     @classmethod
@@ -50,6 +51,7 @@ class Task:
             updated_at=row.get("updated_at", ""),
             escalation_level=row.get("escalation_level", 0),
             last_reminded_at=row.get("last_reminded_at", ""),
+            revision=row.get("revision", 1),
         )
 
     def to_dict(self) -> dict:
@@ -66,6 +68,7 @@ class Task:
             "updated_at": self.updated_at,
             "escalation_level": self.escalation_level,
             "last_reminded_at": self.last_reminded_at,
+            "revision": self.revision,
         }
 
 

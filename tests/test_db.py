@@ -939,6 +939,7 @@ class TestPatchRouteTagCanonicalization:
         monkeypatch.setattr(tasks_route, "get_deps", lambda: type("D", (), {"db": db})())
         await tasks_route.update_task(
             "t1", tasks_route.TaskUpdateRequest(content=content),
+            actor=db.system_actor,
         )
         return await db.get_task("t1")
 
@@ -1100,7 +1101,7 @@ class TestPlanUpdate:
 
         # Task note was appended to the markdown file
         body = task_md.read_text(encoding="utf-8")
-        assert "Plan updated: plan-v1" in body
+        assert "Plan updated: [plan-v1](/plans/plan-v1) → [" in body
         assert "v2" in body
         assert "too vague on edge cases" in body
 

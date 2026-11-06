@@ -14,9 +14,9 @@ A worker has no main loop. Crons wake it, tasks record where each piece of work 
 
 ### Status says where the ball is; tags carry the rest
 
-Nerve ships four statuses ([tasks.md](tasks.md)): `pending` (the default for new tasks), `in_progress`, `done` (the file moves to `done/`) and `deferred`. A worker that waits on other people adds one status per kind of wait with `task_status_create`, once, at setup (names are lowercase letters, digits and underscores, such as `waiting_review`), and lists them in `TASK.md` § Actions; `task_status_list` shows what exists.
+Nerve ships six statuses ([tasks.md](tasks.md)): `backlog`, `pending` (the default for new tasks), `plan_review`, `in_progress`, `done` (the file moves to `done/`) and `deferred`. A worker that waits on other people adds one status per kind of wait with `task_status_create`, once, at setup (names are lowercase letters, digits and underscores, such as `waiting_review`), and lists them in `TASK.md` § Actions; `task_status_list` shows what exists.
 
-Give each status one meaning, the answer to "who holds the ball?". `pending`: this worker, and the work can start now; it is the one actionable queue. `in_progress`: a session is working on it. A waiting status: someone outside, such as a reviewer, CI, or the operator deciding on a plan. `deferred`: nobody, by decision. `done`: finished, with the evidence in the task.
+Give each status one meaning, the answer to "who holds the ball?". `pending`: this worker, and the work can start now; it is the one actionable queue. `in_progress`: a session is working on it. `plan_review`: the operator, who decides on a plan. A waiting status: someone outside, such as a reviewer or CI. `backlog`: the operator, who has not made the task ready yet; no built-in job picks it up. `deferred`: nobody, by decision. `done`: finished, with the evidence in the task.
 
 Everything else goes into tags, which are independent of status and survive every transition: priority (for example `p1` to `p3`), origin (`source:ci`), the attention needed (`needs-response`). `task_update(tags="+needs-response")` adds one tag and keeps the rest. The split lets a job select "pending tasks tagged `source:ci`" without a status for every combination, and a run that lists `pending` sees only work it can do.
 
@@ -31,24 +31,26 @@ Each job plays one role, and each role moves tasks in one direction:
 | Monitor | Watches a waiting status and returns the task when the external event happens | `tasks` on that status, plus `github_pr_activity` for PRs | `persistent` or `isolated` |
 | Planner (`task-planner`) | Proposes a plan for an open task that has none. Ships disabled for workers; onboarding enables it when the worker plans through the approval loop | `tasks` on `pending`, and the worker's tag once overridden | `persistent` |
 | Skills (`skill-extractor`, `skill-reviser`) | Propose new or revised skills, each as a task with a plan | None | `persistent` |
-| Maintenance (`memory-maintenance`) | Tidies long-term memory; moves no tasks | None | `isolated` |
+| Maintenance (`memory-maintenance`, `machine-maintenance`) | Tidies long-term memory, and once a week the machine (old caches, Docker leftovers, worktrees of merged pull requests, leftover services); asks before it removes or stops anything that can hold data; moves no tasks | None | `isolated` |
 
 The last three ship in `system.yaml` ([cron.md](cron.md#built-in-system-crons)); scan, work and monitor jobs are yours, in `config/cron/jobs.yaml`. `task-planner` ships disabled for workers. When the worker should plan through the approval loop (`task-planner` proposes, the operator approves, and an implementation session does the work), onboarding enables it by overriding the job by id in `jobs.yaml`, with a prompt and a `tasks` gate that name the worker's tag; a job in `jobs.yaml` replaces the `system.yaml` job with the same id. Add a work job when `TASK.md` § Approval Required grants autonomy for routine items. When both run, give each its own tasks by tag.
 
 ### How the pieces connect
 
 ```
- scan job           work job claims one                 verified
+ scan job           work job claims one                  verified
  ---------> pending -------------------> in_progress -------------> done
-               ^                              |                      ^
-               |   PR opened, or plan_propose |                      |
-               |                              v                      |
-               +---------------------- waiting_review ---------------+
-                 monitor-prs: changes         |    merged (monitor-prs),
-                 requested, CI red, a         |    or plan declined
-                 human comment                | plan approved
-                                              v
-                           in_progress in a new impl-<id> session
+               ^                         |         |                ^  ^
+               |               PR opened |         | plan_propose   |  |
+               |                         v         v                |  |
+               +------------ waiting_review     plan_review --------+  |
+                 changes requested,      |         |  plan declined    |
+                 CI red, a human comment |         | plan approved     |
+                 (monitor-prs)           |         v                   |
+                                         |   in_progress in a new      |
+                                         |   impl-<id> session         |
+                                         +-----------------------------+
+                                           merged (monitor-prs)
 ```
 
 The same machine as a transition table, in the form `TASK.md` § Actions uses (`waiting_review` is the example custom status; the others are built in):
@@ -56,20 +58,23 @@ The same machine as a transition table, in the form `TASK.md` § Actions uses (`
 | From | Event | To | Who holds the ball |
 |---|---|---|---|
 | (new) | `scan` finds a failure no task covers | `pending` | this worker |
+| `backlog` | the operator makes it ready | `pending` | this worker |
 | `pending` | a `work` run claims it | `in_progress` | this worker |
 | `in_progress` | fixed and verified | `done` | nobody |
-| `in_progress` | PR opened, or a plan proposed for non-trivial work | `waiting_review` | a reviewer, or the operator |
+| `in_progress` | PR opened | `waiting_review` | a reviewer |
+| `pending` or `in_progress` | a plan proposed for non-trivial work (`plan_propose` moves it) | `plan_review` | the operator |
 | `in_progress` | the run ends with work left | `pending` + a resume note | this worker, next run |
 | `waiting_review` | `monitor-prs` sees changes requested, CI red or a human comment | `pending` + `needs-response` | this worker |
-| `waiting_review` | `monitor-prs` sees the merge, or the plan is declined (`plan_decline` moves it) | `done` | nobody |
-| `waiting_review` | plan approved (`plan_approve` moves it) | `in_progress`, in an `impl-<id>` session | the implementation session |
+| `waiting_review` | `monitor-prs` sees the merge | `done` | nobody |
+| `plan_review` | plan declined (`plan_decline` moves it) | `done` | nobody |
+| `plan_review` | plan approved (`plan_approve` moves it) | `in_progress`, in an `impl-<id>` session | the implementation session |
 | any open status | the operator parks it | `deferred` | the operator |
 
 ### Gates keep jobs idle until there is work
 
 A run gate is checked right before a job fires; when it is not satisfied, no session starts ([cron.md](cron.md#run-gates)). Three gate types ship with Nerve:
 
-- `tasks`: enough tasks match a status, or a list of statuses, and an optional tag. A work job gates on the queue it owns, a monitor on the waiting status it watches, the planner on `pending`.
+- `tasks`: enough tasks match a status, or a list of statuses, and an optional tag. A work job gates on the queue it owns, a monitor on the waiting status it watches, the planner on `pending`. No built-in job gates on `backlog`.
 - `messages`: a sync source has unread messages for a consumer. It drives inbox work, if the worker has sources.
 - `github_pr_activity`: something actionable changed on an author's open PRs (a merge or close, a new commit, a review, a CI transition, a human comment); `force_run_after_hours` fires it anyway after a quiet spell.
 
@@ -77,14 +82,14 @@ Gates in one list must all pass and are checked in order, so put the cheap `task
 
 ### Locks, catch-up and session modes
 
-- `lock: true` keeps the daemon's runs of one job from overlapping: a catch-up or web-triggered run waits for the previous run to finish, and a scheduled fire that finds the previous one still going is skipped (lock or not), so two runs never work the same queue at once. `nerve cron <id>` runs in its own process and does not take the lock. Set it on every job that claims or moves tasks.
-- `catchup: false` skips the one catch-up run Nerve fires on startup for a job that missed its schedule; set it where a late run would duplicate the next one.
+- `lock: true` keeps the daemon's runs of one job from overlapping: a web-triggered run waits for the previous run to finish, and a scheduled fire or a catch-up run that finds the previous one still going is skipped (lock or not), so two runs never work the same queue at once. `nerve cron <id>` runs in its own process and does not take the lock. Set it on every job that claims or moves tasks.
+- `catchup: false` skips the one catch-up run Nerve fires on startup, or when the machine resumes from a pause, for a job that missed its schedule; set it where a late run would duplicate the next one.
 - `session_mode: isolated`, the default, starts each run fresh. State comes from the tracker, files and memory, so a run cannot drift on what an earlier run assumed. It suits scan and work jobs.
 - `session_mode: persistent` reuses one chat run after run until it rotates (`context_rotate_hours`, default 24, or a time of day with `context_rotate_at`); the old chat is kept and indexed into long-term memory. It suits jobs that need continuity: a monitor that compares with its last check, and the planner, because `plan_revise` sends the operator's feedback back to the session that proposed the plan. Context grows with every run, so keep rotation on; `reminder_mode: true` sends a short reminder instead of the full prompt after the first run.
 
 ### Plans: the transition for non-trivial work
 
-`plan_propose` stores a plan for human review and leaves the task's status alone, so move the task to your waiting status in the same run. `plan_approve` marks the plan `implementing`, moves the task to `in_progress` and starts a new `impl-<id>` session that receives the task content and the plan, not the proposer's context. `plan_decline` moves the task to `done`: declining abandons the effort. `plan_update` refines your own pending plan as a new version ([plans.md](plans.md)). An approved plan from `skill-extractor` or `skill-reviser` starts an `impl-<id>` session too; its prompt tells it to apply the plan with `skill_create` or `skill_update` and close the task with `task_done`.
+`plan_propose` stores a plan for human review, moves a `pending`, `backlog` or `in_progress` task to `plan_review`, and sends the operator a notification with a link to the plan; a task in a custom status keeps it. `plan_approve` marks the plan `implementing`, moves the task to `in_progress` and starts a new `impl-<id>` session that receives the task content and the plan, not the proposer's context. `plan_decline` moves the task to `done`: declining abandons the effort. `plan_update` refines your own pending plan as a new version and moves and notifies the same way ([plans.md](plans.md)). An approved plan from `skill-extractor` or `skill-reviser` starts an `impl-<id>` session too; its prompt tells it to apply the plan with `skill_create` or `skill_update` and close the task with `task_done`.
 
 - **Write plans to run cold**: files, commands, expected results, the acceptance check, and what must not be touched. The implementation session starts without your context, and a plan assumption that turns out wrong goes back to planning; improvising around it produces work nobody approved.
 - **Write down which work needs a plan**, in `TASK.md` § Approval Required. A common line: one-line fixes and items the approval list already grants go straight through; anything that changes behavior, touches shared state or spans several runs gets a plan.
@@ -229,6 +234,7 @@ Three tiers, each with its own cost ([memory.md](memory.md)). Per-task detail be
 - **Recall before, memorize after.** Before a task and before each meaningful move, run several `memory_recall` queries phrased as full questions ("What do we know about the flaky test `test_join_order`?" tends to retrieve more than `test_join_order flaky`), then `Read` any context file whose stub matches. Before the session ends, `memorize` what the run learned (root causes, repro steps, what did and did not work, decisions and why), or one event line of what was checked.
 - **Put rules that must fire into injected files.** Recall is probabilistic; injected files are read every time. A correction or "remember this" goes into `TASK.md` (procedure) or `MEMORY.md` (facts, lessons) with a provenance tag, editing the existing entry; `memorize` is the backup.
 - **Give the hot file one owner.** Hot files grow through individually reasonable writes. One way to hold the budget: apart from recording human directives, only the maintenance job or a human edits `MEMORY.md`, and a lesson that `memorize` cannot save goes to a holding file such as `memory/contexts/lessons-inbox.md`.
+- **On a Loom instance** (`memory.backend: loom`) long-term memory is Loom, and the worker uses Loom's tools instead of the ones named here: `loom_search` to recall, `loom_memory_set` to save, `loom_memory_update` to correct a fact under its key. Team and org namespaces are shared and read-only for the worker: it proposes a change instead of editing one ([memory.md](memory.md#loom-backend)).
 - **Maintain the files on a schedule.** The built-in `memory-maintenance` cron tends long-term memory only. For `MEMORY.md` and the context files, add your own job (for example weekly and isolated) that reports size against a budget, enforces the stub cap, evicts notes whose PR or issue has closed, never evicts a human directive, and lists candidates rather than forcing cuts.
 
 ## Audit Trail and Escalation
@@ -237,7 +243,7 @@ For every task the chain is task spec → plan → task notes → memory → com
 
 - **Escalate when the machine is stuck, not over quality.** Escalate an unrecoverable transition, lost work, or a guard that refuses everything. A disagreement about quality ends with your best version and the remaining findings disclosed.
 - **Handle errors by kind.** Retry a transient failure a few times, then try another way. Never retry a persistent failure the same way twice: check memory, change approach, then `ask_user` with options. For an impossible task, report why, suggest alternatives and update the task so the context survives.
-- **Notify on transitions a human needs**: plan proposed, task done, blocked, decision needed. A common mapping is `urgent` for blockers and security, `high` for completions and plans ready, `normal` for progress, `low` for FYI. Quiet hours do not hold `notify` back ([config.md](config.md#quiet-hours)), so a worker that should respect them applies them itself.
+- **Notify on transitions a human needs**: task done, blocked, decision needed. `plan_propose` sends its own notification for a plan. A common mapping is `urgent` for blockers and security, `high` for completions, `normal` for progress, `low` for FYI. Quiet hours do not hold `notify` back ([config.md](config.md#quiet-hours)), so a worker that should respect them applies them itself.
 
 ## Running Several Workers
 
@@ -273,7 +279,7 @@ None of these is needed to start. Each solved a problem that appeared at scale; 
 - Hygiene first, then claim exactly one actionable task, `needs-response` items first; keep its tags.
 
 **During the run**
-- One real-work item; builds and tests in the foreground as one call, with the producer's exit code captured. Non-trivial work: `plan_propose`, written to run cold, and the task moved to its waiting status.
+- One real-work item; builds and tests in the foreground as one call, with the producer's exit code captured. Non-trivial work: `plan_propose`, written to run cold; it moves the task to `plan_review`.
 - Kill only a PID you proved is yours; credentials never in argv; nothing you do not own touched unless you are addressed; questions about the work go on the issue or PR.
 
 **Before ending the run**

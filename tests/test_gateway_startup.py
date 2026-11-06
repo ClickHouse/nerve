@@ -269,6 +269,48 @@ async def test_a_failure_after_the_hosted_channels_start_stops_them(harness, mon
 
 
 @pytest.mark.asyncio
+async def test_hosted_source_deliveries_are_handed_to_the_cron_service(harness, monkeypatch):
+    """With GitHub hosted, the runtime's source consumer calls the cron
+    service's delivery hook, which drains the records and runs the jobs
+    gated on them."""
+    import nerve.cron.service as cron_module
+    from nerve.config import GitHubSyncConfig, HostedChannelsConfig
+    from tests.fake_channel_gateway import FakeChannelGateway
+    from tests.test_hosted_channel_config import HOSTED
+
+    class Cron:
+        def __init__(self, config, engine, db):
+            self._jobs = []
+            self.notification_service = None
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+        async def on_source_delivered(self, source):
+            pass
+
+    gateway = FakeChannelGateway(jwks_file=harness["config"].workspace.parent / "gateway-jwks.json")
+    harness["config"].sync.github = GitHubSyncConfig(mode="hosted")
+    harness["config"].channels.hosted = HostedChannelsConfig.from_dict(
+        {**HOSTED, "gateway_jwks_file": str(gateway.jwks_file)},
+    )
+    monkeypatch.setattr(cron_module, "CronService", Cron)
+    monkeypatch.setattr(harness["server"], "_hosted_channels", None)
+
+    async with harness["server"].lifespan(MagicMock()):
+        runtime = harness["server"]._hosted_channels
+        cron = harness["server"]._cron_service
+        # GitHub is hosted as a whole: the repository watch comes with it.
+        assert runtime is not None and set(runtime.sources) == {"github", "github_repos"}
+        assert isinstance(cron, Cron)
+        assert runtime.sources["github"]._listener == cron.on_source_delivered
+        assert runtime.sources["github_repos"]._listener == cron.on_source_delivered
+
+
+@pytest.mark.asyncio
 async def test_hosted_channels_start_while_slack_is_switched_off(harness, monkeypatch):
     """A reload can switch hosted Slack on only if its runtime exists."""
     import nerve.channels.hosted.runtime as hosted_module
@@ -284,3 +326,105 @@ async def test_hosted_channels_start_while_slack_is_switched_off(harness, monkey
         assert harness["server"]._hosted_channels is hosted
 
     assert hosted.stops == 1
+
+
+class _Reporter(_Recorder):
+    """An activity reporter that records how the lifespan drives it."""
+
+    def __init__(self, config, engine, db, cron_service, *, connection_count=None, fail=False):
+        super().__init__(fail=fail)
+        self.cron_service = cron_service
+        self.connection_count = connection_count
+        self.watched: list = []
+
+    async def start(self):
+        await super().start()
+        return True
+
+    def watch_workflow_runs(self, service):
+        self.watched.append(service)
+
+
+@pytest.fixture
+def reporter(harness, monkeypatch):
+    """The reporter the lifespan builds, replaced by a recorder."""
+    import nerve.platform.activity as activity_module
+
+    built: list[_Reporter] = []
+
+    def build(*args, **kwargs):
+        built.append(_Reporter(*args, **kwargs))
+        return built[-1]
+
+    monkeypatch.setattr(activity_module, "ActivityReporter", build)
+    monkeypatch.setattr(harness["server"], "_activity_reporter", None)
+    return built
+
+
+@pytest.mark.asyncio
+async def test_a_reporter_that_fails_to_start_never_stops_the_gateway(harness, monkeypatch):
+    import nerve.platform.activity as activity_module
+
+    def explode(*_args, **_kwargs):
+        return _Reporter(None, None, None, None, fail=True)
+
+    monkeypatch.setattr(activity_module, "ActivityReporter", explode)
+    monkeypatch.setattr(harness["server"], "_activity_reporter", None)
+
+    async with harness["server"].lifespan(MagicMock()):
+        assert harness["server"]._activity_reporter is None
+
+    assert harness["closed"] == ["db"]
+    assert harness["engine"].shutdown.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_the_reporter_runs_for_the_life_of_the_gateway(harness, reporter, monkeypatch):
+    """Started with the client connection count and the workflow-run service,
+    stopped at shutdown."""
+    import nerve.workflows as workflows_module
+
+    runs = _Recorder()
+    monkeypatch.setattr(workflows_module, "init_workflow_run_service", lambda *a, **k: runs)
+    monkeypatch.setattr(harness["server"], "_workflow_run_service", None)
+
+    async with harness["server"].lifespan(MagicMock()):
+        (built,) = reporter
+        assert harness["server"]._activity_reporter is built
+        assert built.starts == 1 and built.stops == 0
+        assert built.watched == [runs]
+        harness["server"]._live_sockets["c1"] = (MagicMock(), MagicMock())
+        try:
+            assert built.connection_count() == 1
+        finally:
+            harness["server"]._live_sockets.pop("c1")
+
+    assert built.stops == 1
+    assert harness["server"]._activity_reporter is None
+
+
+@pytest.mark.asyncio
+async def test_a_failure_after_the_reporter_started_stops_it(harness, reporter):
+    harness["engine"].resume_enrolled_sessions = MagicMock(
+        side_effect=RuntimeError("late failure"),
+    )
+
+    with pytest.raises(RuntimeError, match="late failure"):
+        async with harness["server"].lifespan(MagicMock()):
+            pass  # pragma: no cover
+
+    (built,) = reporter
+    assert built.starts == 1 and built.stops == 1
+
+
+@pytest.mark.asyncio
+async def test_the_gateway_asks_for_the_onboarding_conversation(harness, monkeypatch):
+    """The gateway opens a requested onboarding conversation at start-up;
+    one-shot CLI engines run initialize() only and never do."""
+    import nerve.onboarding as onboarding
+
+    start_on_boot = AsyncMock(return_value=None)
+    monkeypatch.setattr(onboarding, "start_on_boot", start_on_boot)
+    async with harness["server"].lifespan(MagicMock()):
+        await asyncio.sleep(0)
+    start_on_boot.assert_awaited_once_with(harness["engine"], harness["config"].workspace)

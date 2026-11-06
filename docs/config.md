@@ -242,22 +242,24 @@ A reload is always explicit. Two things cause one:
 | Cron jobs (`config/cron/*.yaml`) | ✅ |
 | Custom cron gate plugins (new, edited *and* deleted `.py` files) | ✅ the registry is rebuilt from the directory |
 | Cron file locations (`cron.jobs_file`, `system_file`, `gate_plugins_dir`) | ✅ re-read from the new config |
-| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. **`sync.codex` is not one of these**; see the restart table |
+| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. In hosted mode the GitHub filters, `pr_watch`, `inbox` and the repository watch (`sync.github_repos`) are published to the gateway again. **`sync.codex` and `sync.github.mode` are not among these**; see the restart table |
+| `cron.delivery_debounce_seconds` | ✅ read for each delivery |
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
-| Skills (`skills/`) | ✅ re-scanned |
+| Skills (`skills/`, and the platform skills in `skills/` in the config directory) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
 | `setup.local_secrets` | ✅ read on every request of the setup page |
-| Web gateway auth (`auth.*`) | partly. `auth.jwt_expiry_hours` follows a reload for newly issued or refreshed tokens. The deprecated `auth.password_hash` follows a reload only for accounts without a local password. `auth.jwt_secret` requires a restart (see the restart table) |
+| Web gateway auth (`auth.*`) | partly. `auth.jwt_expiry_hours` follows a reload for newly issued or refreshed tokens. The deprecated `auth.password_hash` follows a reload only for accounts without a local password. `auth.external.*` follows a reload, which also reads the file that `gateway_jwks_file` names again. `auth.jwt_secret` requires a restart (see the restart table) |
+| `gateway.drain_timeout_seconds` | ✅ read when the shutdown signal arrives (see [Shutdown Sequence](architecture.md#shutdown-sequence)) |
 | `notifications.*` | ✅ read per notification |
 | `workspace_sync.*` | ✅ from the next sync cycle |
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
 | `telegram.dm_policy`, `.stream_mode`, `.reply_routes_to_origin_session` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; toggling `reply_routes_to_origin_session` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
-| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
+| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
-| **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`, `codex.models`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
+| **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`, `codex.models`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, `agent.subagents.*`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.base_url`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
 
 All of that is reloaded together, and the response says what happened to each
 piece: `POST /api/config/reload` returns `ok`, a per-subsystem `detail`, and an
@@ -285,17 +287,20 @@ reload cannot inspect, and are documented here only.
 | `timezone` | the cron scheduler and every trigger built from it carry the old zone |
 | `agent.max_concurrent` | its semaphore cannot be resized under in-flight turns |
 | `workspace` | the skill manager, the tool context, the memory bridges and each session's working directory all captured it at startup. Following it in one of them and not the others would be worse than not following it at all |
-| `memory.*`, `xmemory.*` | the bridges hold the config they were constructed with |
+| `memory.*`, `xmemory.*` | the bridges hold the config they were constructed with, and `memory.backend` picks which memory backend is built at all |
 | `anthropic_base_url` | memU builds its model clients once at startup. New sessions and the other direct calls would follow a reload and memory would not, so they would use different endpoints |
 | `codex.home_dir` | half-hot, which is why it is here: new sessions are handed the new `CODEX_HOME`, but the directory is only created when the backend is built, so nothing creates the new one. Change it and restart, rather than leaving sessions pointed somewhere that may not exist |
 | `sync.codex.*` (`enabled`, every `origins[*]` field, `store_encrypted_reasoning`, `workspace_filter.*`) | Codex thread sync is a **different service** from the cron sources above, built once at startup with one polling worker per origin. Adding or editing an origin and reloading reports `ok` and ingests nothing |
-| `langfuse.*` | set up before the engine, caching its host, redaction patterns and `LANGFUSE_*` environment exports in process globals |
+| `langfuse.*` | set up before the engine: the Langfuse client is built once with the keys, host and redaction patterns, and keeps them for the life of the process |
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
+| `mcp_gateway_url` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
 | `slack.mode`, `channels.hosted.*` | the hosted channel, its stream endpoint, and its token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
+| `sync.github.mode` | the GitHub sources (`github` and the repository watch, `github_repos`), and in hosted mode the stream endpoint and the consumers of the gateway's records, are chosen at startup. Until a restart the sources keep the mode they started with, and so does the `github_pr_activity` gate. The filters, `pr_watch`, `inbox` and `sync.github_repos` do follow a reload: in hosted mode the reload publishes them to the gateway again. To go back to `poll`, set `enabled: false` (and `sync.github_repos.enabled: false`) and reload first (see [sources.md](sources.md#hosted-github-source)) |
 | `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
 | `workflows.poll_interval_seconds`, `workflows.review_loop.reconcile_interval_seconds` | both loops were handed their interval when they started. Everything else under `workflows.*` is read per use (see the table above) |
+| `platform.*` | the activity reporter looks for its socket once, at startup, and keeps the interval and lease lifetime it started with. See [Platform activity reporting](platform-activity.md) |
 | `proxy.*` | the proxy process is started at startup, so turning it on, turning it off or moving its port needs one. The backend does read the proxy host and port per session, so those can point somewhere nothing is listening until you restart |
 | Turning `ollama.enabled` **on** while the proxy is not already running | Ollama routes through the proxy as its translation layer, and that process only starts at startup. With the proxy already up, this is read per use and follows a reload |
 | Turning `workspace_sync.enabled` or `retention.enabled` **on** | their loops are only created at startup, so there is nothing running to see the flag change. Turning either **off** is hot |
@@ -729,6 +734,10 @@ Two things to know about `NERVE_LOCKDOWN`:
   the skill index picks up on the next reload, and the root files are the system
   prompt the agent starts every turn from. `memory/`, `tasks/`, `TASK.md` and
   ordinary workspace files are outside it and stay writable.
+- **Platform skills are not read.** The skills in `skills/` in the config
+  directory ([platform skills](architecture.md#platform-skills)) are
+  machine-local, and no reviewer saw them, so a locked instance leaves them out
+  and logs this when the directory exists.
 - **Runtime edits to the reviewed surface are blocked.** Creating, updating,
   deleting or toggling a skill, Telegram pairing, writing a workspace file that
   lands in that surface, and other config mutations fail with a "locked" error
@@ -961,7 +970,7 @@ Backups follow the same rule:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `workspace` | path | `~/nerve-workspace` | Path to workspace directory |
-| `timezone` | string | `America/New_York` | Local timezone for scheduling |
+| `timezone` | string | `$NERVE_TIMEZONE`, else `America/New_York` | Local timezone for scheduling. When no configuration file names it, Nerve uses `NERVE_TIMEZONE` from its environment if that is an IANA time zone name (for example `Europe/Berlin`). An empty variable counts as unset. For any other value (`Local`, a path, an unknown name), Nerve uses `America/New_York` and logs one warning. A hosted platform can set the variable for each agent. The setup page does not count this default as an answer: the About you step stays pending and prefills the browser's time zone |
 | `lockdown` | bool | `false` | [Remote-only, read-only mode](#lockdown-remote-only-read-only). Honored only in `workspace/config/settings.yaml`; an unreadable value is an error, not a default. |
 | `deployment` | string | `server` | `server` (bare metal) or `docker`. Set during `nerve init`; determines whether CLI commands run directly or proxy to `docker compose`. |
 
@@ -972,18 +981,26 @@ Backups follow the same rule:
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `agent.model` | string | `claude-opus-5-5` | Primary model for conversations. The default (and every other default model id) is defined once, in the constants block at the top of `nerve/config.py` |
-| `agent.cron_model` | string | `claude-sonnet-5-5` | Model for cron jobs (cheaper) |
+| `agent.cron_model` | string | `claude-sonnet-5-5` | Model for cron jobs. The setup page's Model step sets it to the model you pick, so scheduled work runs on the chosen model; set a cheaper one here afterwards if you want it |
 | `agent.models` | list | `[]` | Claude models offered in the composer's model picker. `agent.model` always leads; entries extend the list. Empty → the discovered catalog (see `agent.model_discovery`), else a built-in current-generation list (opus / fable / sonnet / haiku); on Bedrock only configured models are offered |
 | `agent.model_discovery` | bool | `true` | Ask the Anthropic Models API (`GET /v1/models`) which models the configured credentials' catalog endpoint advertises, and offer those in the picker — so a newly released model needs no config edit. Catalog membership is not a serving guarantee (an advertised ID can still 404 on send; discovery runs no serving probe — see `agent.model_discovery_excluded_models`). Primed at gateway startup, cached in-process (6h) and refreshed in the background. Best-effort: ignored when `agent.models` is set, on Bedrock (the Bedrock client has no Models API), without an API key, or when the API is unreachable — the built-in list applies |
 | `agent.model_discovery_excluded_models` | list | `[]` | Model-ID substrings pruned from **discovery** results before the picker sees them (case-insensitive; empty/whitespace patterns ignored). A proxy/provider catalog is not a serving guarantee — e.g. a retired ID that `GET /v1/models` still advertises but that 404s on send — so this drops such entries without a code change, and hot-reloads (read at pick time, not baked into the 6h discovery cache). Applied only to discovered entries: `agent.model` and an explicit `agent.models` list are never filtered, so naming a model in config overrides an exclusion. Excluding everything discovery returns just leaves the configured default (not a fallback to the built-in list) |
 | `agent.model_aliases` | map | `{opus: claude-opus-5-5, haiku: claude-haiku-5-5}` | Alias → model ID remapping for the CLI (emitted as `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` env vars). Aliases (`opus`, `sonnet`, `haiku`, `fable`) used in Agent/Workflow tool model options, skill frontmatter, and cron overrides resolve to the mapped ID. Entries merge over the built-in `opus → claude-opus-5-5` and `haiku → claude-haiku-5-5` defaults (the `agent.model` and `memory.fast_model` defaults; not applied on Bedrock — set geo-prefixed IDs explicitly there); `""` unsets an alias. The CLI also uses the `haiku` model for its background calls unless `ANTHROPIC_SMALL_FAST_MODEL` is set |
-| `agent.max_turns` | int | `50` | Max agentic turns per request |
+| `agent.max_turns` | int | `1000` | Max agentic turns (model ↔ tool round-trips) per request on the Claude backend; a request that reaches it fails with "Reached maximum number of turns (N)". A last-resort stop for a looping agent, not a budget — real work routinely passes 50 and 100. `0` = no cap (the CLI gets no `--max-turns` flag). Read when a session's CLI client is built, so a changed value applies to new sessions, and to existing ones once their client is rebuilt |
 | `agent.max_concurrent` | int | `32` | Max concurrent agent sessions |
 | `agent.cache_ttl` | string | `"5m"` | Prompt-cache write TTL policy: `5m` (status quo), `1h` (always request the 1-hour TTL), or `auto` (per session at client-build time: sparse-cadence sessions — persistent crons, wakeup loops, spaced chats — get `1h`; dense sessions stay on `5m`). Per-cron-job override via `cache_ttl` in jobs.yaml. See `nerve/agent/cache_policy.py` |
 | `agent.cache_ttl_excluded_models` | list | `[]` | Model-name substrings that never request the 1h TTL |
 | `agent.static_system_prompt` | bool | `true` | Keep the appended system prompt byte-identical across sessions of the same workspace/source/tool set so Anthropic's exact-prefix prompt cache shares it between sessions (a cache read instead of a full re-write at every session start). The per-session parts — session id and pre-recalled memories — are delivered once, in a `<session-context>` block at the top of the session's first user message; `mcp__nerve__session_context` returns them live. `false` restores the legacy shape (id and recall inline in the system prompt) |
+| `agent.cli_idle_timeout_seconds` | int | `900` | Hung-runtime detection: the longest silence between two messages of a turn before Nerve treats the agent runtime as hung, ends the turn and replaces the runtime (also the default of `codex.turn_idle_timeout_seconds`). It never fires while a question or a plan decision waits for the person: the interaction timeout (one hour) governs that wait. `0` disables it |
 | `agent.cli_max_message_bytes` | int | `67108864` (64 MiB) | Upper bound on one stream-json message read from the Claude CLI subprocess (the Agent SDK's `max_buffer_size`). The SDK's own default is 1 MiB, and a line over the bound aborts the whole turn — image tool results routinely exceed it: the Read tool ships the base64 image twice per line and re-encodes anything over 2000 px, so a 300 KB screenshot can become a 1.3 MB line. The Read image validator also refuses images whose encoded line cannot fit under this bound, so a too-big image fails as a tool error instead of killing the turn |
 | `agent.agent_teams` | bool | `true` | Set `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` for the CLI subprocess, which registers the `SendMessage` tool. The Agent tool advertises `SendMessage` for resuming a sub-agent whether or not the flag is set, so with it off the model reaches for a tool that does not exist. Nerve loads no settings files (`setting_sources=[]`), so the env dict is the flag's only route in. Teammates stay opt-in per turn and cost a full context window each; the CLI cannot restore in-process teammates when a session's client is recycled (idle timeout, restart, crash retry) |
+| `agent.subagents.per_task_stop_affordance` | bool | `true` | Stop (the red button, Esc, channel `/stop`) ends only the orchestrator's turn and spares background agents and workflows. Sent to the Claude CLI as the `perTaskStopAffordance` flag of its first `initialize`, which the Python SDK cannot express (Nerve adds it to that frame). Off, or when the patch cannot apply after an SDK upgrade: an interrupt would end every background agent, so Stop asks first (`needs_confirmation`). Applies to runtimes started after a change. See [agents.md](agents.md#stopping) |
+| `agent.subagents.progress_summaries` | bool | `true` | A one-line, model-written status per running agent (`agentProgressSummaries`; a few small-model calls per agent). Applies to runtimes started after a change |
+| `agent.subagents.forward_subagent_text` | bool | `true` | Stream foreground and nested sub-agents' text and thinking to Nerve too (background agents always stream everything). It goes to the agent's transcript, never into the orchestrator's turn. Applies to runtimes started after a change |
+| `agent.subagents.quiet_after_minutes` | int | `10` | The web UI flags a running agent with no activity for this long as quiet |
+| `agent.subagents.lost_grace_seconds` | int | `30` | A member of the CLI's live background set that disappears with no final status becomes `lost` after this long |
+| `agent.subagents.stop_confirm_seconds` | int | `10` | A stop of one agent with no confirmation from the runtime after this long is flagged "stop not confirmed" |
+| `agent.subagents.transcript_item_max_bytes` | int | `16384` | Cap on each tool input or result stored in (and streamed from) an agent's transcript |
 | `agent.prompt_rewrite.enabled` | bool | `true` | Offer the first-prompt rewrite feature in the web UI (per-user toggle lives in the composer) |
 | `agent.prompt_rewrite.model` | string | `""` | Model for prompt rewriting (empty = `agent.model`, the chat model) |
 | `agent.prompt_rewrite.max_tokens` | int | `1024` | Max tokens for the rewritten prompt |
@@ -991,7 +1008,7 @@ Backups follow the same rule:
 
 **Prompt rewrite:** when the ✨ toggle in the composer is on, the first prompt of a new chat is rewritten by a fast model to better express intent. The result is previewed (editable) and only sent after explicit approval — the user can always send the original instead. Trivial or already-clear prompts are sent unchanged without a preview.
 
-**Note:** The engine uses a `can_use_tool` callback (not `bypassPermissions`) so that interactive tools (`AskUserQuestion`, `ExitPlanMode`, `EnterPlanMode`) can pause mid-turn for user input. All other tools are auto-approved. See [sdk-sessions.md](sdk-sessions.md#permissions--interactive-tools) for details.
+**Note:** The engine uses a `can_use_tool` callback (not `bypassPermissions`) so that interactive tools (`AskUserQuestion`, `ExitPlanMode`) can pause mid-turn for user input; `EnterPlanMode` is allowed without a pause. All other tools are auto-approved. See [sdk-sessions.md](sdk-sessions.md#permissions--interactive-tools) for details.
 
 ## Agent Backends (claude / codex)
 
@@ -1007,15 +1024,16 @@ agent:
   cron_backend: null       # null → backend; new cron/hook sessions only
 
 codex:                     # active when a codex backend is selected
-  bin_path: codex          # tested: >= 0.153.1 and < 0.156.0
+  bin_path: codex          # tested: >= 0.153.1 and < 0.165.0
   min_version: 0.153.1
-  max_version: 0.156.0
+  max_version: 0.165.0
   home_dir: ~/.nerve/codex # isolated CODEX_HOME (auth, config, sessions)
   model: gpt-5.6-sol
   cron_model: null         # null → model
   models: [gpt-6-astra]    # hidden catalog entries to offer when the account serves them
   auth: chatgpt            # chatgpt | api_key
   api_key: null            # config.local.yaml; or api_key_env: OPENAI_API_KEY
+  base_url: ""             # OpenAI-compatible Responses endpoint; empty → Codex's own provider
   sandbox: danger-full-access   # read-only | workspace-write | danger-full-access
   approval_policy: never        # never | on-request | untrusted
   web_search: true
@@ -1065,6 +1083,42 @@ flags a mismatch with `codex.auth`). With ChatGPT authentication, token counts a
 but `cost_usd` is null: any API-price calculation is stored separately as an
 `api_equivalent_estimate`. API-key sessions use `cost_basis: api_billed` when a
 known price is available.
+
+### Codex through an OpenAI-compatible endpoint
+
+Set `codex.base_url` to send Codex to an endpoint that serves the OpenAI
+Responses API, for example a local proxy:
+
+```yaml
+codex:
+  base_url: http://127.0.0.1:4000/v1   # Codex sends POST <base_url>/responses
+  api_key: ${PROXY_API_KEY}            # optional, see below
+```
+
+- The value includes the version path. Nerve removes one trailing `/`. The
+  URL must use http or https and have a host, and it must not have
+  credentials, a query or a fragment. A `${VAR}` reference resolves at load.
+  Nerve checks the value at load also when Codex is not a selected backend,
+  and refuses a config that breaks the rule.
+- Nerve gives Codex a custom model provider (`nerve-endpoint`, wire API
+  `responses`) through `--config` overrides.
+- Credential: only `codex.api_key`. If it is set, Codex sends it as a
+  bearer token. Nerve puts the key in the environment of the Codex process,
+  not in its arguments. Without it, Codex sends no credential. For a key
+  from the environment, write `api_key: ${PROXY_API_KEY}`, or
+  `${PROXY_API_KEY:-}` when the key is optional. In this mode Nerve does not
+  read `codex.api_key_env` or the top-level `openai_api_key`, because they
+  can hold an OpenAI key.
+- Codex needs no login, and `codex.auth` has no effect. Preflight does not
+  require an account and uses the same provider. `nerve codex doctor` and
+  `GET /api/codex/status` show the endpoint in `preflight.base_url`.
+- Turn costs are estimates from `codex.pricing`, with
+  `cost_basis: api_billed`. A model that the Codex catalog does not list
+  must be in `codex.models`.
+- Ultracode is not available in this mode, because the Ultracode workers
+  do not use the endpoint. When `codex.ultracode.enabled` is also set, Nerve
+  logs a config warning and keeps Ultracode off: it does not install the
+  plugin and does not give sessions the worker environment.
 
 Ultracode is installed only into the isolated Nerve Codex home at the exact
 configured revision. A hash-verified Nerve policy overlay hard-enforces the
@@ -1303,15 +1357,39 @@ mention check and, as a thread reply, no local session. `slack.source`
 still decides what reaches the inbox, but only a channel ID can grant: a
 channel or sender name comes from the event, so it can only deny.
 
+The gateway sends an observation only for a channel where the agent's channel
+policy allows observations, so the policy that the control plane keeps is
+already a grant. `slack.source.gateway_grant: true` makes it the local grant
+too: with `slack.source.enabled: true` and no `allow_channels`, Nerve collects
+every observation that the gateway sends. A non-empty `allow_channels` still
+narrows that, and `deny_channels` and `deny_senders` still apply. Outside
+hosted mode the switch is ignored, with a warning.
+
 Nerve accepts events from every Slack connection that the gateway serves
 for this agent. For each conversation, Nerve records the connection of the
 latest accepted event.
+
+Each event that starts a turn or answers a notification names the person that
+the gateway resolved from the Slack user. In external mode, the turn runs as
+that person, and a session that the turn starts has that person as its cause.
+When the event also gives the display name of that person, and Nerve has no
+name for the person, Nerve stores it. See
+[External mode](accounts.md#external-mode). In local mode, these turns and
+answers have no actor.
+
+An observation can name the person that the gateway linked to the Slack user.
+The inbox record shows that person (see
+[Chat channels](sources.md#chat-channels-slack-telegram)). The person grants
+nothing: the `slack.source` sender rules match only the member ID and the
+display name in the event.
 
 `slack.enabled: false` pauses the hosted channel, at startup or after a
 reload. The stream endpoint still accepts streams, and events stay in the
 gateway's inbox until a reload sets `enabled` to `true`. While it is paused,
 Nerve sends no notifications and refuses `send_channel_message`. A turn that
-is already running still sends its reply.
+is already running still sends its reply. Nerve reads nothing from the
+gateway's inbox while Slack is paused, so the records of a hosted GitHub
+source wait there too (see below).
 
 Replies, reactions, and `send_channel_message` go to Slack as operations on
 a gateway stream that advertises them for the connection. A reply goes on the
@@ -1344,13 +1422,43 @@ Notifications go to the same conversation as in Socket Mode
 answers the notification only in the conversation where it was delivered,
 and the card then shows the answer without buttons. A press that answers
 nothing, for example a second press, gets a short notice and the card stays.
-An expired card is edited without buttons. `/nerve` commands, including the host commands
+An expired card is edited without buttons.
+
+When the config names no conversation, Nerve sends the card through the
+gateway's `notify` operation. The gateway posts it in the agent's
+notification channel, which an administrator sets in the hosted platform's
+console. That channel must allow posts in the agent's Slack access rules, and
+the agent's Slack app must be a member of it. A conversation in the config
+takes precedence. Nerve uses `notify` only when exactly one connection
+advertises it. A gateway that does not advertise it gets no card, and Nerve
+logs no warning about the missing `notifications.slack_channel_id`. When the
+console sets no notification channel, the gateway refuses the card, and Nerve
+logs one INFO line for each card. Any other failure logs one warning.
+
+`/nerve` commands, including the host commands
 `doctor` and `restart`, are not available in hosted mode; `nerve doctor`
 reports this and the local settings that still apply.
 
 `slack.mode` and `channels.hosted.*` need a restart; a reload of running
 hosted channels reads the key file again. Changing `mode` from `socket` to
 `hosted` stops the Socket Mode connection at once.
+
+The same streams carry hosted sources. With `sync.github.mode: hosted` the
+gateway polls GitHub for the agent and streams the records: the
+notifications, and with `sync.github_repos` the repositories it watches; the
+`channels.hosted` settings above apply unchanged, and they are enough on their
+own: Slack need not be hosted too. See
+[Hosted GitHub source](sources.md#hosted-github-source) and
+[Hosted repository watch](sources.md#hosted-repository-watch).
+
+When Slack is hosted as well, its switch also holds GitHub back. Nerve reads
+the events of every hosted provider from one ordered inbox, and it reads
+nothing while hosted Slack is switched off (`slack.enabled: false`): the
+GitHub records wait at the gateway until Slack is switched on again, and past
+the gateway's limit of stored records the oldest are dropped. Keep a hosted
+Slack switched on while GitHub is hosted; `nerve doctor` warns when it is off.
+This is a known limitation: a read for each provider on its own, which would
+keep GitHub records arriving while hosted Slack is off, is a follow-up.
 
 ### Setting up the Slack app
 
@@ -1478,6 +1586,7 @@ slack:
 | `slack.source.allow_senders` | list[str] | `[]` | Restrict to these senders |
 | `slack.source.deny_senders` | list[str] | `[]` | Skip these senders |
 | `slack.source.include_handled_messages` | bool | `false` | Also collect messages accepted for live routing |
+| `slack.source.gateway_grant` | bool | `false` | Hosted mode only: collect every channel that the gateway observes for the agent, with no local allow list (see [Hosted mode](#hosted-mode)) |
 | `slack.source.schedule` | cron/interval | `*/5 * * * *` | Drain cadence |
 | `slack.source.batch_size` | int | `50` | Records per drain |
 | `slack.source.condense` | bool | `false` | LLM-condense long messages |
@@ -1588,7 +1697,9 @@ list every transport you want. A name nothing delivers to is skipped with a
 warning. Slack in the list costs nothing while Slack is off.
 
 Names and globs are not resolved for the `slack_channel_id` fallback. Without
-a literal channel ID, delivery is skipped with a warning.
+a literal channel ID, delivery is skipped with a warning. In
+[hosted mode](#hosted-mode), the channel gateway can post the card in the
+notification channel set in the console instead, so there is no warning.
 
 ### Outbound Slack message tool
 
@@ -1705,9 +1816,46 @@ the channel transport, matching messages are written to a local buffer.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `sync.github.schedule` | cron | `*/15 * * * *` | Fetch frequency |
+| `sync.github.enabled` | bool | `true` | Enable/disable the source, as for every source. In hosted mode a value in `config.yaml` or `config.local.yaml` is your operator's switch: the setup page shows GitHub as managed and does not change it, and records arrive while a GitHub credential is connected to the agent (see [sources.md](sources.md#hosted-github-source)) |
+| `sync.github.schedule` | cron | `*/15 * * * *` | Fetch frequency; in hosted mode the fallback cadence of the drain |
+| `sync.github.mode` | string | `poll` | `poll`: fetch notifications here with the gh CLI. `hosted`: the channel gateway polls GitHub, applies the guardrails, and streams the records (needs the `channels.hosted` settings, see [Hosted mode](#hosted-mode)). An unknown value falls back to `poll` with a warning. Restart-only. See [sources.md](sources.md#hosted-github-source) |
+| `sync.github.pr_watch` | bool | `true` | Hosted mode: also deliver a `github_pr_activity` record whenever one of the agent's own open pull requests changes. Its `reason` is always `author`, and only `allow_repos` and `deny_repos` apply to it (see [sources.md](sources.md#github-pull-request-activity-records)) |
+| `sync.github.inbox` | string | `participating` | Which notification threads are listed, in both modes. `participating`: only the threads the account takes part in (GitHub's `participating=true`). `all`: the account's whole GitHub inbox as its watch settings produce it, adding `subscribed` threads of watched repositories (new issues and pull requests), `ci_activity` and `security_alert`; pick within it with the reason guardrails. Case does not matter; any other value refuses to load. Follows a reload. In hosted mode the gateway must support it. See [sources.md](sources.md#watched-repositories-inbox-all) |
 
-## Memory (memU)
+**GitHub Repos-specific** (repositories the agent follows without taking part
+in them; see [sources.md](sources.md#github-repos)). With `sync.github.mode:
+hosted` the channel gateway polls them, and it must know the repository watch
+(see [sources.md](sources.md#hosted-repository-watch)). Everything follows a
+reload:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `sync.github_repos.enabled` | bool | `false` | Enable the repository watch. In hosted mode Nerve publishes it to the gateway only while it is on and `repos` lists a repository |
+| `sync.github_repos.schedule` | cron | `*/15 * * * *` | Poll frequency; in hosted mode the fallback cadence of the drain, which also runs on every delivery |
+| `sync.github_repos.repos` | list | `[]` | `owner/repo` names as GitHub writes them, each once (case does not matter), at most 50. While the watch is on, a name GitHub would not take, a repository named twice, or more than 50 refuses to load; while it is off, a warning names them. Empty = nothing is watched. Nothing older than a day is backfilled: a check more than a day after the last one (a daily schedule, an outage, the watch switched off for longer) reports the last day's items, with an hour of grace; in hosted mode, switching the watch off and on starts fresh |
+| `sync.github_repos.types` | list | `[pull_request, issue]` | What is reported: `pull_request`, `issue`, `release`. Case does not matter; an unknown type or an empty list refuses to load |
+| `sync.github_repos.include_bots` | bool | `false` | Also report the pull requests and issues that a GitHub App or an account whose login ends in `[bot]` opened. A release is reported whoever published it (release automation such as `github-actions[bot]` is the normal case) |
+| `sync.github_repos.include_drafts` | bool | `true` | `false`: a draft pull request is reported when it is marked ready for review (event `ready`), not when it is opened |
+| `sync.github_repos.updates` | bool | `false` | Also report a new head commit, ready for review, and the merge or close of each pull request the watch reported |
+| `sync.github_repos.deny_authors` | list | `[]` | Case-insensitive globs on the author's login, with the guardrail rules; what they match is never reported, releases included |
+
+`cron.delivery_debounce_seconds` (int, default `60`) spaces the job runs that a
+hosted delivery starts; a negative value reads as `0`, and a value above `600`
+waits `600` seconds (`nerve config validate` warns). See
+[cron.md](cron.md#runs-on-delivery).
+
+## Memory
+
+Long-term memory has one backend, chosen with `memory.backend`:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `memory.backend` | string | `memu` | `memu` runs memU inside the Nerve process (the keys in the next table). `loom` keeps memory in a Loom memory service reached through the MCP gateway (see [Loom memory backend](#loom-memory-backend)). Case does not matter; any other value refuses to load. Nerve reads no environment variable for it on its own (a `${VAR:-default}` reference works as in any setting). Restart-only. |
+
+`memory.fast_model` is read whatever the backend: source condensation and IMAP
+vision use it too.
+
+### memU (default)
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
@@ -1717,7 +1865,152 @@ the channel transport, matching messages are written to a local buffer.
 | `memory.embed_model` | string | *(empty)* | Embedding model (only used when `openai_api_key` is set, e.g. `text-embedding-3-small`) |
 | `memory.semantic_dedup_threshold` | float | `0.85` | Cosine similarity threshold for semantic deduplication (0 to disable) |
 | `memory.knowledge_filter` | bool | `false` | Post-extraction LLM filter that deletes generic knowledge items (extra Haiku API call per memorize) |
-| `memory.categories` | list | `[]` | Seed categories — each entry has `name` and `description` fields. Used for semantic routing when memorizing and recalling facts. `nerve init` populates mode-appropriate defaults (personal: relationships, finances, health, etc.; worker: patterns, procedures, approvals, etc.). |
+| `memory.categories` | list | `[]` | Seed categories — each entry has `name` and `description` fields. Used for semantic routing when memorizing and recalling facts. `nerve init` populates mode-appropriate defaults (personal: relationships, finances, health, etc.; worker: patterns, procedures, approvals, etc.). The Loom backend does not use them. |
+
+### Loom memory backend
+
+With `memory.backend: loom`, long-term memory is kept in a Loom memory service,
+and both the agent and Nerve reach it through the MCP gateway
+([MCP servers in external mode](#mcp-servers-in-external-mode)): the gateway's
+catalog lists Loom as the server `loom`. Nerve has no Loom URL or credential of
+its own. The gateway knows the agent from its connection and holds its Loom
+credential, so `memory.backend: loom` and `mcp_gateway_url` are all an
+instance needs.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `memory.loom.org` | string | *(empty)* | The Loom org Nerve's own calls name. Empty: Loom uses the org of the agent's credential. |
+| `memory.loom.namespace` | string | *(empty)* | The namespace Nerve's own calls name. Empty: Loom uses the agent's home namespace. |
+| `memory.loom.dashboard_url` | string | *(empty)* | Where people open Loom's dashboard. The Memory page and the Diagnostics card link `<dashboard_url>/memories?namespace=<home namespace>`. An `http://` or `https://` URL with a host and no credentials, query or fragment; a trailing `/` is dropped; anything else refuses to load. Empty: no link. |
+| `memory.loom.defer_extraction` | bool | `false` | Queue conversation extraction in Loom instead of waiting for it. Loom then tries a failed batch three times within about a minute and gives up, and Nerve cannot see that (Loom keeps `memory.extraction_status` off MCP): leave it off unless a lost window is acceptable. |
+
+The `memory.loom` keys are read only while Loom is the backend, never from an
+environment variable on their own, and need a restart. A namespace name is Loom's: lowercase letters,
+digits and hyphens, starting with a letter or digit, at most 128 characters;
+an org name has no whitespace or slash. Anything else refuses to load.
+
+**Rollout.** Switch an instance to `memory.backend: loom` only once the
+gateway's catalog lists `loom` for its agent. Until then the agent has no
+memory tools at all, and its system prompt says so instead of naming Loom's
+tools. A platform that switches the instance after its first `nerve init`
+writes `memory.backend: loom` into `config.local.yaml` (which outranks the
+tracked settings) and passes `nerve init --memory-backend loom`, so the
+workspace written at that first init is worded for Loom.
+
+**On a locked instance** no machine-local file is read, so the switch lives in
+the tracked `settings.yaml`, as environment references the platform fills:
+
+```yaml
+mcp_gateway_url: ${NERVE_MCP_BASE_URL:-}
+memory:
+  backend: ${NERVE_MEMORY_BACKEND:-memu}
+  loom:
+    dashboard_url: ${LOOM_DASHBOARD_URL:-}
+```
+
+Always the `${VAR:-default}` form: a bare `${VAR}` that is unset refuses to
+load, which would stop a `nerve` command run from a shell without those
+variables. Empty values mean memU, no gateway and no dashboard link. The
+variables must be in the environment of the Nerve service itself (a systemd
+`EnvironmentFile=` on its unit, for example); an interactive shell does not
+need them.
+
+**The agent uses Loom's tools.** Each catalog server reaches the agent as an
+MCP server, so Loom's tools are `mcp__loom__<tool>` (`loom_search`,
+`loom_memory_set`, …; which ones is the gateway's tool policy, by default
+Loom's `core` list). Nerve's nine memory tools (`memorize`, `memory_recall`,
+`memory_update`, `memory_delete`, `conversation_history`,
+`memory_records_by_date`, `memory_expand_category`, `category_update`,
+`session_context`) are not offered: not in the prompt's tool list, not on
+Nerve's MCP server, and not to external MCP clients. When the session gets the
+`loom` server, the system prompt gets a section that names Loom's tools and
+explains home and shared namespaces (shared memories are read-only for the
+agent, which proposes a change instead of editing), write verdicts and
+abstentions; when it does not, a short section says memory cannot be used,
+and the Codex backend's note names no memory tools either.
+A workspace, its bundled skills and its built-in jobs set up while Loom is the
+backend, or by `nerve init --memory-backend loom`, are worded for Loom's
+tools (`nerve/memory/loom_prompts.py`); a `system.yaml` written for memU runs
+`memory-maintenance` and `inbox-processor` in their Loom wording as long as
+their prompts are the ones Nerve shipped. Catalog servers reach the agent only
+in external mode: with the Loom backend in local mode the agent has no memory
+tools, and Nerve says so in its log at startup.
+
+**What Nerve calls itself.** Only the lifecycle calls, as the same agent:
+`tools/call` on the URL the catalog gives for `loom` (`POST
+<mcp_gateway_url>/s/loom/mcp`), without credentials.
+
+| When | Loom op (tool) | What Nerve sends |
+|---|---|---|
+| A new session starts | `context.pack` (`loom_context_pack`) | `mode: startup`, `only_sections: [memories]`, a section budget of 1,000 tokens, `top_k`, `include_decisions: false`, and the query `context for <source> session` |
+| The pack brought no memories | `search.query` (`loom_search`) | the same query and `top_k` |
+| A session closes or rotates, and the indexing sweep | `memory.set_from_messages` (`loom_memory_set_from_messages`) | the window's messages, in batches of at most 100 within 128 KiB, each with its time; `defer: false`, so the call waits while Loom extracts (with `defer_extraction`: `defer: true`, batches of at most 400 within 768 KiB); `session_id`; `extra_tags: [source:nerve]`; the day of the last message as `observation_date`; the previous batch's last ten turns as `last_messages` |
+| Health: every five minutes, and on the Diagnostics page | `namespace.summary` (`loom_namespace_summary`) | `top_entities_limit: 0` |
+
+`memory.loom.org` and `memory.loom.namespace` are added to each call that takes
+them. The startup recall freezes at most 8 memories, 500 characters each and
+4,000 bytes in all, into the session, as memU's does. A memory of another
+namespace is shown as `<namespace>/<key>`. Recalled text is data from whoever
+writes to the namespaces the agent reads, and it lands in the session's
+`<session-context>` block, so each memory is one line and keeps `<` and `>`
+escaped as Loom escapes them (`&lt;`, `&gt;`); the fallback search's text is
+escaped the same way. A startup call has 5 seconds; a pack the gateway's
+policy refuses gets the search as well. `tests/test_loom_contract.py` holds
+these calls, and the tools the agent is told about, to
+`tests/fixtures/loom_lifecycle_ops.json`, which
+`scripts/loom_contract_fixture.py` generates from a Loom checkout.
+
+**Identity.** Loom's MCP has no `whoami`; `namespace.summary` names the org
+and namespace Loom resolved for the agent, and its counts are the Diagnostics
+card's. With both `memory.loom.org` and `memory.loom.namespace` set, those
+are used without a probe.
+
+**When Loom cannot answer.** No `mcp_gateway_url`, no `loom` server in the
+catalog, a refusal by the gateway's policy (JSON-RPC `-32001`: Loom not
+enabled for the agent, no credential), a condition that may pass (`-32002`:
+unavailable, a limit, an open circuit), a server fault, a timeout or HTTP
+429/5xx: memory is unavailable, and nothing crashes. A new session is told in
+its preamble that no memories could be recalled (not that there are none),
+also when the backend did not start at all, and nothing is frozen into it;
+the sweep keeps its watermark, so the window is offered again. Reads are
+tried twice, and wait out a `Retry-After` of up to 2 seconds once (the
+gateway's per-agent limit sends 1); a longer one holds that operation (at
+most 60 seconds). When the gateway is not reached, or a call gets no answer
+in time (a read gives up long before the gateway's call limit, extraction a
+little after it), calls fail at once for 15 seconds, doubling with each such
+failure in a row up to 5 minutes: the gateway's own circuit does not count
+calls Nerve gave up on. The catalog is read at most every 30 seconds, also
+while none could be read; a policy refusal makes the next call read it again,
+and the one HTTP client for Loom's URL is kept until the catalog names
+another. A request Loom refused as invalid is logged, not retried, except a
+batch the gateway refuses as too large (HTTP 413): the budget of a batch
+halves for the rest of the process, down to 10 messages in 16 KiB (the
+context turns shrink with it), and the same messages go again. The
+Diagnostics card shows the last error.
+
+**Extraction waits.** A batch is extracted while the call waits (Loom's model
+pass, typically 10 to 15 seconds), so a batch Loom could not extract fails the
+call and the sweep offers the window again. This depends on the gateway's call
+limit (`MCP_GATEWAY_CALL_TIMEOUT`, two minutes by default; Nerve waits 130
+seconds): when either gives up ("MCP server timed out" from the gateway),
+Loom may still finish the batch, and the window goes again with the next
+sweep in batches half as large; after ten batches in a row go through, the
+budget grows back toward the default. A fault Loom gives a code (its database
+unreachable, a grant busy, an overload) is "not now", as is any other
+failure. Only Loom's uncoded internal error can be about the batch itself: a
+batch failing with it three sweeps in a row is halved until the one message
+it fails on is found. That message is left out of the next batch and of its
+context, and is skipped, with a `conversation_turn_skipped` audit row (its
+role and time, never its text), only when that next batch goes through (for
+the window's last message: when a batch went through since the isolation
+began in that sweep); a failure first skips nothing, so a Loom that fails
+every batch skips nothing. A window offered again sends only the messages
+Loom has not taken yet (in this process). Each `conversation_indexed` row of
+the memory audit log (`GET /api/memory/memu/audit`) counts the batches sent
+and the facts Loom wrote, and names the `queue_ids` of any batch Loom queued
+instead (with `defer_extraction`, or when Loom defers one itself) for a
+lookup in Loom's dashboard: Loom tries a queued batch three times within
+about a minute, then gives up, and how it ended is not on MCP.
 
 ## xmemory (optional, alongside memU)
 
@@ -1796,12 +2089,104 @@ Nerve automatically discovers MCP servers from Claude Code's enabled plugins. An
 - **Auto-registered in UI** — plugin MCP servers appear in the MCP Servers page on first tool invocation (type: `plugin`).
 - **No conflicts** — Nerve-configured MCPs (from `config.yaml`) and Claude Code plugin MCPs coexist; they use separate mechanisms (`--mcp-config` vs `--plugin-dir`).
 
+### MCP servers in external mode
+
+In [external mode](#authentication-mode), an MCP gateway decides which MCP
+servers the agent can use. Nerve takes its MCP servers only from the catalog
+of the gateway, together with its own `nerve` server. Local mode does not
+change.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mcp_gateway_url` | string | `""` | Base URL of the MCP gateway, for example `http://192.0.2.1:8080`. It must be an `http://` or `https://` URL with a host and no credentials, query, fragment or whitespace. A trailing `/` is removed. An invalid value stops startup. It has an effect only in external mode, and for the [Loom memory backend](#loom-memory-backend), which reaches Loom through it in either mode. A change needs a restart. |
+
+Nerve reads `GET <mcp_gateway_url>/catalog` when it starts, before each new
+session, and every 30 seconds. The request has no credential, because the
+gateway identifies the agent from the connection. Nerve does not use the proxy
+environment variables for this request. One request takes at most 5 seconds.
+
+- Nerve reads the members `revision` and `servers` of the catalog, and `id`,
+  `url` and `revision` of each server. The servers must be in `id` order.
+  Nerve ignores other members, for example `displayName` and `description`.
+  Nerve compares revisions for equality only. Nerve resolves each `url`
+  against the URL of the catalog request; the result must have the scheme,
+  the host and the port of that URL, and no user information.
+- Nerve refuses a catalog without these members, or with a member that is
+  not valid, as a whole. When the gateway gives no catalog (it is not
+  reachable, it answers with an error or too slowly, or the catalog is not
+  valid), Nerve keeps the catalog that it read last. After startup there is
+  none until a read succeeds, and sessions start with the `nerve` server
+  only.
+- Nerve reads one catalog at a time. A new session that waits while another
+  read runs, for example the periodic read, uses the result of that read.
+- When the catalog changes, new sessions get the new servers. A running
+  session gets them at its next turn (see
+  [Catalog changes in running sessions](#catalog-changes-in-running-sessions)).
+- A catalog server with the ID `nerve` is not used, because Nerve's own server
+  has that name.
+
+The clients get each gateway server as an HTTP MCP server at its URL, without
+headers:
+
+- **Claude.** The gateway servers and the `nerve` server, with
+  `--strict-mcp-config`, so the CLI reads no other MCP configuration. No
+  Claude Code plugin is loaded.
+- **Codex.** `mcp_servers.<id>.url` and
+  `mcp_servers.<id>.default_tools_approval_mode = "approve"` for each gateway
+  server: the organization approved the tools at the gateway, and with
+  approval policy `never` Codex refuses an MCP tool that it would have to ask
+  about.
+
+In external mode Nerve does not read `mcp_servers` from any configuration
+file. The **Reload** button, the `mcp_reload` tool and a configuration reload
+read the catalog again. The gateway checks the policy on each call.
+
+The Claude CLI and Codex use the proxy environment variables of the Nerve
+service. Put the host of `mcp_gateway_url` in `NO_PROXY` and `no_proxy`.
+
+#### Catalog changes in running sessions
+
+A session keeps its client (the Claude CLI or the Codex app-server) between
+turns. A client gets its MCP servers when Nerve builds it, and neither client
+can add a server while it runs. When the last catalog that Nerve read has
+another `revision` than the catalog of the client's build, Nerve builds the
+client again at the start of the session's next turn, before it sends the
+message. The new client resumes the same conversation (the same Claude
+session or Codex thread) with the same model and working directory.
+
+Nerve keeps the client and its earlier catalog for that turn, and checks
+again at the next turn, when:
+
+- the session runs a background task of the Claude CLI (a background
+  command, agent or monitor),
+- the client has output that Nerve did not read yet, or
+- (Claude only) the conversation file under `~/.claude/projects` is
+  missing, so a new client could not resume the conversation.
+
+If the new client does not start, the turn fails, and the next turn starts a
+new conversation, as after a restart.
+
+A change at the gateway reaches a running session at its first turn after
+Nerve reads the changed catalog: while the gateway is available, at most 30
+seconds and one request after the change. A turn that runs keeps its servers
+until it ends. Work of the Codex app-server that continues after a turn, for
+example a command or a child agent, stops when Nerve builds the client again,
+as for a change of the model.
+
+A session with an earlier catalog gets no access that the policy does not
+allow: the gateway checks each call against the current policy and refuses
+a server or a tool that the organization removed.
+
 ## Auth
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `auth.password_hash` | string | - | Deprecated compatibility setting. Manage passwords from the Accounts page. If neither this setting nor the sole account has a password, anyone who can reach the gateway can act as the owner. See [Accounts and identity](accounts.md) |
 | `auth.jwt_secret` | string | - | JWT signing secret. When unset, Nerve generates one and stores it in `nerve.db`. Changing it requires a restart and signs users out. See [Accounts and identity](accounts.md) |
+| `auth.external.gateway_jwks_file` | path | - | External mode only. An absolute path to the gateway's public actor signing keys, a JWK Set file. When set, Nerve verifies the `X-Nerve-Actor-Context` header. See [Actor context verification](#actor-context-verification) |
+| `auth.external.tenant_id` | string | - | The tenant of this instance, a lower-case UUID. Required with `gateway_jwks_file` |
+| `auth.external.agent_id` | string | - | The agent of this instance, a lower-case UUID. Required with `gateway_jwks_file` |
+| `auth.external.verification` | string | `require` | `require` refuses a header that fails the check. `log` logs the failure and uses the header anyway, for a first rollout |
 
 ### Authentication mode
 
@@ -1821,16 +2206,133 @@ error. `nerve restart` checks the value before it stops the running daemon.
 runs `nerve doctor`. It does not ask the running server, so the mode of a
 daemon that started with a different environment can be different.
 
-> **Warning:** In external mode, Nerve trusts the `X-Nerve-Actor-Context`
-> header and does not check its signature. A caller that can send a request to
-> Nerve can act as any person. Use external mode only when the gateway is the
-> only caller that can reach Nerve.
+#### Actor context verification
+
+The gateway signs the `X-Nerve-Actor-Context` header with an Ed25519 key. To
+check it, give Nerve the gateway's public keys and the identity of this
+instance in `auth.external`. The mode itself still comes only from
+`NERVE_AUTH_MODE`.
+
+```yaml
+auth:
+  external:
+    gateway_jwks_file: /etc/nerve/actor-keys.json   # an absolute path
+    tenant_id: 00000000-0000-0000-0000-000000000000
+    agent_id: 00000000-0000-0000-0000-000000000000
+    verification: require                            # or log
+```
+
+The file is a JWK Set of Ed25519 public keys (`kty` `OKP`, `crv` `Ed25519`,
+`alg` `EdDSA`, `use` `sig`, a unique `kid`, and `x`). Nerve reads only `keys`
+and ignores the other members of the document. A file with a private key
+member is refused. Nerve reads the file at startup and on each reload, and
+again, at most once a minute, when a header names an unknown `kid`. When a
+later read fails, the keys of the last good read stay in use. Nerve never
+fetches keys over the network.
+
+With the file set, Nerve accepts the header of an HTTP request or a WebSocket
+upgrade only when all of these are true:
+
+- The header is a compact JWS. Its protected header has `typ`
+  `nerve-actor-context+jws`, `alg` `EdDSA` and a `kid` from the file, and no
+  `jwk`, `jku`, `x5c`, `x5u` or `crit`. The signature verifies with that key.
+- The payload has `version` `"1"`, the configured `tenant_id` and `agent_id`,
+  `signer_id` `urn:nerve:gateway:actor:<tenant_id>:<agent_id>`, `audience`
+  `urn:nerve:runtime:<tenant_id>:<agent_id>`, `actor_kind` `human`, and a UUID
+  in `principal_id`.
+- `request_binding` names this request. `kind` is `http`, or `websocket` for an
+  upgrade, which also needs a `gateway_connection_id`. `method` is the request
+  method. `target` is the request-target that Nerve received: the raw path, and
+  `?` and the query when there is a query. Without a query, `/path?` also
+  matches.
+- `issued_at` is at most 30 seconds in the future, `expires_at` is at most 30
+  seconds in the past, and `expires_at` is 1 to 30 seconds after `issued_at`.
+- Nerve has not accepted the same `assertion_id` before. Nerve keeps accepted
+  IDs in memory until they expire, at most 10,000; when it is full, it forgets
+  the oldest.
+
+Nerve checks the header of an HTTP request when the request arrives, before it
+reads the body, and the header of a WebSocket upgrade when it accepts the
+socket.
+
+| Result | Response |
+|---|---|
+| All checks pass | The request acts as `principal_id`, with `profile.display_name`, as without the check |
+| A check fails | `401`. The reason, the `kid` and the request ID go to the log, never the header |
+| No usable key set: the file cannot be read or used, or an `auth.external` setting is invalid | `503` |
+| A check fails, or no usable key set, with `verification: log` | Nerve logs the failure and reads the header without the check |
+
+The server accepts a WebSocket before it authenticates it, so a failed check
+and a missing key set both close the socket with `4001`.
+
+A reload applies changed `auth.external` settings and reads the file again.
+In external mode, `nerve doctor` reads the file, reports invalid settings, and
+warns when `verification` is `log`. Startup logs the key file and the
+`verification` value, as a warning when it is `log`.
+
+> **Warning:** Without `auth.external.gateway_jwks_file`, Nerve trusts the
+> `X-Nerve-Actor-Context` header and does not check its signature. A caller
+> that can send a request to Nerve can act as any person. Then use external
+> mode only when the gateway is the only caller that can reach Nerve.
+
+#### Inference principal header
+
+In external mode, Nerve adds one `X-Nerve-Inference-Principal` header to each
+model request that it sends. The value is an actor ID, a lower-case UUID:
+
+| Requests | Principal |
+|---|---|
+| The model requests of an agent session, in every turn, also the turns that another person sends and the turns that the agent starts between turns | The session's cause: the person who started the session, or the system actor for a session that Nerve started (a cron job, a hook). See [Attribution](accounts.md#attribution) |
+| Session titles, prompt rewrite, source condensing, image description, memory, setup checks, the model catalogue, the model check of `nerve doctor` | The system actor (a CLI command such as `nerve sync` or `nerve doctor` reads it from `nerve.db`, and takes the mode from `NERVE_AUTH_MODE` in its own shell) |
+
+A session with no cause, for example a session of a channel without an
+identity mapping, sends no header. Local mode sends no header. In both modes,
+Nerve removes a line for this header from an `ANTHROPIC_CUSTOM_HEADERS` value
+in its own environment, so neither the CLI nor Nerve's own clients send an
+inherited principal.
+
+A proxy in front of the model API can use the header to attribute model usage
+to a person. Nerve does not prove the claim. The proxy must check that the
+principal may be attributed for the agent, and remove the header before it
+forwards the request.
+
+The Claude CLI gets the header through `ANTHROPIC_CUSTOM_HEADERS` in its
+environment. Nerve keeps the other lines of an `ANTHROPIC_CUSTOM_HEADERS` value
+in its own environment, and replaces a line for this header. The CLI reads its
+environment only when it starts. The session's cause never changes, so a CLI
+process keeps its header for its whole life, and a process that Nerve starts
+again for the session (after a model change or a crash) gets the same header.
+
+These requests have no header: memory embedding requests to the OpenAI API,
+and Codex sessions.
+
+### System principal ID
+
+The environment variable `NERVE_SYSTEM_PRINCIPAL_ID` gives the ID of the
+agent's system principal. It has an effect only in external mode. It is not a
+configuration key. `nerve init` and the server read it once, in the identity
+bootstrap.
+
+| Value | Behavior |
+|---|---|
+| Unset or empty | The system actor keeps its ID. |
+| A UUID in canonical lower-case form, for example `00000000-0000-4000-8000-000000000001` | The system actor gets this ID when no row refers to the system actor, no other actor has the ID, and the system actor did not take an ID from this variable before. Otherwise the system actor keeps its current ID and Nerve logs a warning. See [The system actor in external mode](accounts.md#the-system-actor-in-external-mode). |
+| Any other value, also a UUID in upper case | The system actor keeps its ID and Nerve logs a warning. The server starts. |
+
+Set the variable before the first `nerve init` or start, so that the change
+occurs before Nerve attributes work to the system actor. See
+[The system actor in external mode](accounts.md#the-system-actor-in-external-mode).
+
+`nerve doctor` reads the variable in its own shell, as it does for
+`NERVE_AUTH_MODE`. It shows one of these: the system actor has the ID, the
+next start gives it the ID, or the system actor keeps its current ID, with the
+reason.
 
 ## Setup
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `setup.local_secrets` | bool | `true` | Whether the browser setup page may store a credential it is given (an API key, a bot token, a Telegram sign-in) in the files on this machine. `false` on an instance whose connections the operator provides: the Memory, Channels, Sources and Agents steps read "Not available on this instance" and their writes are refused (`409`); the Model step accepts Bedrock or a credential from the environment, never a pasted key; Slack through a channel gateway keeps its switch. Usually set in the tracked `settings.yaml`. `NERVE_SETUP_LOCAL_SECRETS=0` in the service environment forces it off — one-way, like `NERVE_LOCKDOWN`: the variable can turn the storage off, never on. Read per request, so a reload applies it. See [Instances that keep no credentials](setup.md#instances-that-keep-no-credentials). |
+| `setup.local_secrets` | bool | `true` | Whether the browser setup page may store a credential it is given (an API key, a bot token, a Telegram sign-in) in the files on this machine. `false` on an instance whose connections the operator provides: the Memory, Channels, Sources and Agents steps are closed, the setup page does not show them, and their writes are refused (`409`); the Model step accepts Bedrock or a credential from the environment, never a pasted key; Slack through a channel gateway keeps its switch, and so does the GitHub source when its token comes from the environment (`GH_TOKEN` / `GITHUB_TOKEN`, or a `${VAR}` reference); the Sources step then offers that one toggle while Gmail and Telegram stay closed. Usually set in the tracked `settings.yaml`. `NERVE_SETUP_LOCAL_SECRETS=0` in the service environment forces it off, one way only, like `NERVE_LOCKDOWN`: the variable can turn the storage off, never on. Read per request, so a reload applies it. See [Instances that keep no credentials](setup.md#instances-that-keep-no-credentials). |
 
 ## API Keys (config.local.yaml)
 
@@ -1852,7 +2354,8 @@ When set, every model request goes to this endpoint: the Claude CLI (as
 source condensing, image description, `nerve doctor`), memU and model discovery.
 Nerve sends `anthropic_api_key` as the key, or `ANTHROPIC_API_KEY` from the
 daemon's environment when it is unset; the Claude CLI alone also takes
-`claude_oauth_token`.
+`claude_oauth_token`. In external mode, the requests name a principal; see
+[Inference principal header](#inference-principal-header).
 
 Setting `ANTHROPIC_BASE_URL` in Nerve's environment is not the same. The CLI
 inherits it, but the direct calls and memU still go to `api.anthropic.com`.
@@ -1926,6 +2429,12 @@ telemetry and file snapshots older than `retention_days`, and checkpoints the
 WAL. This frees space inside the database but does not shrink the file on disk;
 run `nerve db vacuum` once (with the daemon stopped) to reclaim it.
 
+Sub-agent transcripts (`session_agent_events`: an agent's text, thinking, tool
+calls and results) count as telemetry: they are pruned after `retention_days`,
+starred sessions included, and are not part of the `retention_full_days`
+compaction. Agent records (`session_agents`, including each agent's prompt and
+final report) are kept until their session is deleted.
+
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `retention.enabled` | bool | `false` | Master switch for the background retention pass |
@@ -1967,3 +2476,16 @@ active runs `failed` and notifies. See [workflow-runs.md](workflow-runs.md).
 | `workflows.kill_grace_seconds` | int | `30` | After the graceful stop at 100% budget, how long to wait before force-discarding the session's client (kills its subprocess) |
 | `workflows.max_concurrent_runs` | int | `2` | Runs dispatched concurrently; excess queues in status `pending`. Each running workflow occupies one `agent.max_concurrent` slot for its whole turn — keep this well below that limit |
 | `workflows.allow_unbudgeted` | bool | `false` | Permit starting runs without `budget_usd`. Budget enforcement is the point of this surface, so off by default |
+
+## Platform
+
+Activity reporting to the platform's local activity socket, for a machine that
+a platform parks while it is idle. Reporting is on only when the socket exists
+when the gateway starts, so elsewhere these keys do nothing. All of them need a
+restart. See [Platform activity reporting](platform-activity.md).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `platform.activity_socket` | path | `/run/nerve/guestd.sock` | The platform's local activity socket. `""` switches reporting off |
+| `platform.activity_interval_seconds` | int | `30` | Seconds between reports when nothing changes (held to 5–300) |
+| `platform.lease_ttl_seconds` | int | `120` | Lifetime of a keep-awake lease, renewed every half lifetime (held to 10–3600) |

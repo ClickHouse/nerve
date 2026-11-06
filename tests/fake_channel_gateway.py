@@ -6,8 +6,13 @@ to a Nerve endpoint, negotiates, advertises capabilities, and serves inbox
 pages from an in-memory inbox while it records every read and
 acknowledgement. Switches on the gateway simulate lost frames and outages.
 It records every operation and answers it with the next scripted reply for
-its kind, or with success. It serves ``file_read`` from ``files``, and it
-answers a ``file_send`` after the final chunk and keeps it in ``uploads``.
+its kind, or with success. A ``notify`` posts in
+``notification_conversation``, and without one it is ``forbidden``. It
+serves ``file_read`` from ``files``, and it answers a ``file_send`` after the
+final chunk and keeps it in ``uploads``.
+It keeps every ``subscriptions`` payload that Nerve sends, in arrival order,
+in ``subscriptions``, and ``source_record_event`` builds the records of a
+hosted GitHub source.
 
 ``NerveServer`` runs an ASGI app on a loopback port with uvicorn, so the
 tests exercise real HTTP upgrades and real status codes.
@@ -37,7 +42,11 @@ from websockets.exceptions import ConnectionClosed
 TENANT_ID = "6f1d3a2c-0b4e-4f7a-9c1d-2e5b8a3f7c04"
 AGENT_ID = "b28c5e91-7d4a-4c3b-8f61-0a9e2d4b6c17"
 CONNECTION_ID = "3d9a4f2e-1c7b-4a85-9e60-2f8b7c1d5a43"
+# The connection of the agent's hosted GitHub source records.
+GITHUB_CONNECTION_ID = "7b9e8d6c-5a0f-4e24-93a4-6c2f1a5b9e87"
 AGENT_AUTHOR = "U_FIXTURE_AGENT"
+# The conversation where a notify posts, as the control plane sets it.
+NOTIFICATION_CONVERSATION = "C0NOTICES"
 ISSUER = "nerve-gateway"
 AUDIENCE = "nerve-channel"
 # An upper bound for waits. A loaded machine can be slow; a passing run is not.
@@ -166,6 +175,81 @@ def message_event(
     return event
 
 
+def source_record_event(
+    *,
+    record_id: str = "9000000001",
+    record_type: str = "github_notification",
+    repository: str = "owner/repo",
+    title: str = "Fix the flaky retry test",
+    reason: str = "mention",
+    actors: tuple[str, ...] = ("alice", "bob"),
+    updated_at: str = "2026-09-16T10:00:00Z",
+    version: int = 1789552800,
+    purpose: str = "observe",
+    extra_metadata: list[dict[str, Any]] | None = None,
+    event_id: str | None = None,
+    connection_id: str = GITHUB_CONNECTION_ID,
+) -> dict[str, Any]:
+    """A hosted GitHub record in the shape of the contract samples, without a delivery.
+
+    The content and summary follow the polling source's layout for a mention
+    on a pull request. With the defaults, the record is the one of the
+    contract's notification sample.
+    """
+    summary = f"[{repository}] {title} ({reason})"
+    content = "\n".join([
+        f"Repository: {repository}",
+        "Type: PullRequest",
+        f"Title: {title}",
+        f"Reason: {reason}",
+        "State: open",
+        "Author: alice",
+        f"Updated: {updated_at}",
+        f"URL: https://github.com/{repository}/pull/12",
+        "",
+        "--- Description ---",
+        "The retry test waits on a timer that a busy CI host can starve.",
+        "",
+        "--- Latest Comment (bob, 2026-09-16T09:59:30Z) ---",
+        "@example-agent could you take a look?",
+    ])
+    metadata: list[dict[str, Any]] = [
+        {"key": "reason", "value": reason},
+        {"key": "unread", "value": "true"},
+        {"key": "subject_type", "value": "PullRequest"},
+        {"key": "subject_url", "value": f"https://github.com/{repository}/pull/12"},
+        {"key": "repo_name", "value": repository},
+        {"key": "repo_url", "value": f"https://github.com/{repository}"},
+        {"key": "actors", "values": list(actors)} if actors else {"key": "actors"},
+        {"key": "ci_branch"},
+    ]
+    metadata.extend(extra_metadata or [])
+    admission: dict[str, Any] = {"purpose": purpose}
+    if purpose == "observe":
+        admission["observe"] = {"provenance": {"provider": "github", "issuer": "", "installation_id": ""}}
+    else:
+        admission["invoke"] = {"resolved_principal_id": "1c4a8f30-95d2-4b7e-a6f1-38c0e7b52a49"}
+    return {
+        "event_id": event_id or f"github:{record_type}:{record_id}:{version}",
+        "message_revision_id": f"{record_id}:{version}",
+        "connection_id": connection_id,
+        "provider": "github",
+        "kind": "source_record",
+        "conversation": {"id": repository, "kind": "repository"},
+        "author": {"id": actors[-1] if actors else "bob", "kind": "human"},
+        "admission": admission,
+        "occurred_at": updated_at,
+        "record": {
+            "id": record_id,
+            "record_type": record_type,
+            "summary": summary,
+            "content": content,
+            "timestamp": updated_at,
+            "metadata": metadata,
+        },
+    }
+
+
 def _selected_trigger(
     kind: str, conversation_kind: str, mention_agent: bool, thread: str | None, message_id: str,
 ) -> str:
@@ -235,6 +319,12 @@ class FakeChannelGateway:
         self.uploads: list[dict[str, Any]] = []
         # Largest chunk that file_read sends.
         self.chunk_bytes = 64 * 1024
+        # Every subscriptions payload Nerve sent, on any stream, in arrival order.
+        self.subscriptions: list[dict[str, Any]] = []
+        self.subscriptions_changed = asyncio.Event()
+        # The agent's notification conversation, which the control plane
+        # sets. Without one, a notify is refused as the gateway refuses it.
+        self.notification_conversation = NOTIFICATION_CONVERSATION
 
     # ------------------------------------------------------------------ #
     #  Tokens and keys                                                     #
@@ -320,7 +410,7 @@ class FakeChannelGateway:
                 pass
 
     async def _any_change(self) -> None:
-        events = (self.read_changed, self.ack_changed, self.operation_changed)
+        events = (self.read_changed, self.ack_changed, self.operation_changed, self.subscriptions_changed)
         waits = {asyncio.ensure_future(event.wait()) for event in events}
         try:
             await asyncio.wait(waits, return_when=asyncio.FIRST_COMPLETED)
@@ -337,6 +427,12 @@ class FakeChannelGateway:
     def script(self, kind: str, *replies: Any) -> None:
         """Queue replies for the next operations of *kind*."""
         self.operation_replies.setdefault(kind, []).extend(replies)
+
+    def _default_reply(self, kind: str) -> dict[str, Any]:
+        """Success, except for a notify while the agent has no notification conversation."""
+        if kind == "notify" and not self.notification_conversation:
+            return {"outcome": "forbidden", "reason_code": "invalid_target"}
+        return {"outcome": "succeeded"}
 
     def sent_operations(self, kind: str) -> list[dict[str, Any]]:
         """The payloads of the operations of *kind*, in arrival order."""
@@ -363,7 +459,7 @@ class FakeChannelGateway:
         })
         self.operation_changed.set()
         replies = self.operation_replies.get(kind)
-        reply = replies.pop(0) if replies else {"outcome": "succeeded"}
+        reply = replies.pop(0) if replies else self._default_reply(kind)
         if reply == "hold":
             stream.held.append(frame)
             return
@@ -379,6 +475,8 @@ class FakeChannelGateway:
         body = {"kind": kind, **reply}
         if body["outcome"] == "succeeded" and kind == "send" and "target" not in body:
             body["target"] = self.new_target(operation["send"]["destination"])
+        if body["outcome"] == "succeeded" and kind == "notify" and "target" not in body:
+            body["target"] = self.new_target({"conversation": {"id": self.notification_conversation}})
         if body["outcome"] == "succeeded" and kind == "file_read":
             read = operation["file_read"]
             if data is None:
@@ -543,6 +641,10 @@ class FakeStream:
                     await self.gateway.serve_operation(self, frame)
                 elif frame["kind"] == "transfer":
                     await self.gateway.receive_chunk(self, frame)
+                elif frame["kind"] == "subscriptions":
+                    # One-way, as at the gateway: kept, never answered.
+                    self.gateway.subscriptions.append(frame["payload"]["subscriptions"])
+                    self.gateway.subscriptions_changed.set()
         except ConnectionClosed:
             pass
         finally:

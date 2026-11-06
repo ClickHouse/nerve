@@ -63,9 +63,11 @@ migration that reads configuration. The v047 schema migration creates the
 tables; this step creates the first account, moves ``auth.password_hash`` onto
 the account row and out of the configuration files
 (:func:`_migrate_config_credentials`), and, if ``auth.jwt_secret`` is unset,
-creates a signing secret. Only the gateway, at every start, and ``nerve init``
-run it. :func:`migrate` reports what the gateway will do and writes nothing to
-``nerve.db``. Other CLI commands open the database with
+creates a signing secret. In external mode it creates no account, and it gives
+the system actor the ID in ``NERVE_SYSTEM_PRINCIPAL_ID``
+(:func:`_apply_system_principal`). Only the gateway, at every start, and
+``nerve init`` run it. :func:`migrate` reports what the gateway will do and
+writes nothing to ``nerve.db``. Other CLI commands open the database with
 :func:`open_production_db`, which loads the signing secret and creates no
 account.
 """
@@ -303,6 +305,9 @@ class MigrationReport:
     # `auth.password_hash` was (or would be) removed from the machine-local
     # configuration afterwards, because nothing reads it any more.
     scrubbed_config_password: bool = False
+    # The system actor got (or would get) the ID in NERVE_SYSTEM_PRINCIPAL_ID
+    # (see :func:`_apply_system_principal`).
+    rekeyed_system_actor: bool = False
 
     @property
     def did_anything(self) -> bool:
@@ -319,6 +324,7 @@ class MigrationReport:
             or self.retired_stored_secret
             or self.migrated_config_credential
             or self.scrubbed_config_password
+            or self.rekeyed_system_actor
         )
 
 
@@ -581,6 +587,8 @@ def migrate(
     legacy_cron_dir: Path | None = None,
     report: MigrationReport | None = None,
     config: NerveConfig | None = None,
+    *,
+    preview_system_principal: bool = True,
 ) -> MigrationReport:
     """Perform the migration for ``config_dir``. Idempotent; safe to re-run.
 
@@ -595,7 +603,8 @@ def migrate(
 
     ``config`` is what the identity preview reads (:func:`_preview_identity`).
     If it is omitted, or the layout half moved files, the preview loads it from
-    ``config_dir``.
+    ``config_dir``. ``preview_system_principal`` false leaves the system actor
+    step out of the preview (see :func:`maybe_migrate`).
     """
     config_dir = Path(config_dir)
     workspace = Path(workspace) if workspace is not None else _resolve_workspace(config_dir)
@@ -604,7 +613,9 @@ def migrate(
 
     _migrate_config_yaml(config_dir, workspace, legacy_cron, report)
     _migrate_cron(workspace, legacy_cron, report)
-    _preview_identity(config_dir, config, report)
+    _preview_identity(
+        config_dir, config, report, system_principal=preview_system_principal,
+    )
     return report
 
 
@@ -915,6 +926,8 @@ def maybe_migrate(
     workspace: Path | None = None,
     legacy_cron_dir: Path | None = None,
     config: NerveConfig | None = None,
+    *,
+    preview_system_principal: bool = True,
 ) -> MigrationReport | None:
     """Run migration if needed. Best-effort: never raises (called on startup).
 
@@ -925,6 +938,10 @@ def maybe_migrate(
     renamed away. Callers need that — ``nerve start`` has to reload the config it
     is holding, and ``nerve upgrade`` has to print the review prompt for a
     tracked file that now exists.
+
+    ``nerve start`` passes ``preview_system_principal=False``: the start that
+    follows reads ``NERVE_SYSTEM_PRINCIPAL_ID`` once and logs its result once,
+    so the preview leaves that step out.
     """
     report = MigrationReport(dry_run=False)
     try:
@@ -935,6 +952,7 @@ def maybe_migrate(
             legacy_cron_dir=legacy_cron_dir,
             report=report,
             config=config,
+            preview_system_principal=preview_system_principal,
         )
     except Exception as e:  # noqa: BLE001 — must never break upgrade/startup
         report.error = str(e)
@@ -1394,6 +1412,7 @@ async def bootstrap_identity(
     report: MigrationReport | None = None,
     dry_run: bool = False,
     display_name: str | None = None,
+    system_principal: bool = True,
 ) -> MigrationReport:
     """Create the local owner account and signing secret if they do not exist.
 
@@ -1410,15 +1429,25 @@ async def bootstrap_identity(
     Results go to ``report``. With ``dry_run``, nothing is written.
 
     In external mode, the gateway names people, so no account is created or
-    changed. The signing secret is still made, because system and MCP tokens
-    need it.
+    changed. The system actor gets the ID in ``NERVE_SYSTEM_PRINCIPAL_ID``
+    when it can (:func:`_apply_system_principal`). The signing secret is
+    still made, because system and MCP tokens need it.
+
+    ``system_principal`` false leaves the system actor step, and the read of
+    ``NERVE_SYSTEM_PRINCIPAL_ID``, to a later bootstrap in the same process:
+    ``nerve start --foreground`` on a fresh install runs ``nerve init`` and
+    then the gateway, and only the gateway does the step.
     """
     from nerve.gateway.auth import is_external_mode
 
     report = MigrationReport(dry_run=dry_run) if report is None else report
     if is_external_mode():
+        if system_principal:
+            await _apply_system_principal(db, report, dry_run=dry_run)
         await ensure_jwt_secret(db, config, report=report, dry_run=dry_run)
         return report
+    if system_principal:
+        _note_ignored_system_principal()
 
     source = _credential_source_for(config)
     # Include accounts a dry run would create with the transitional source so
@@ -1480,6 +1509,100 @@ async def bootstrap_identity(
     return report
 
 
+def _rekey_action(previous_id: str | None, new_id: str, *, dry_run: bool) -> str:
+    """``previous_id`` is ``None`` when the system actor does not exist yet."""
+    from nerve.identity import SYSTEM_PRINCIPAL_ENV
+
+    if previous_id is None:
+        return f"give the new system actor the ID {new_id}, the ID in {SYSTEM_PRINCIPAL_ENV}"
+    verb = "change" if dry_run else "changed"
+    return (
+        f"{verb} the system actor ID from {previous_id} to {new_id}, the ID in "
+        f"{SYSTEM_PRINCIPAL_ENV}"
+    )
+
+
+def _warn_kept_system_actor(
+    report: MigrationReport, current_id: str, reason: str, *, dry_run: bool,
+) -> None:
+    warning = (
+        f"the system actor keeps its current ID {current_id}: {reason}. Autonomous "
+        "work is attributed to that ID. 'nerve doctor' shows this."
+    )
+    report.warnings.append(warning)
+    if not dry_run:
+        logger.warning("Identity: %s", warning)
+
+
+def _rekey_blocked_reason(new_id: str, blocker: str) -> str:
+    from nerve.identity import SYSTEM_PRINCIPAL_ENV
+
+    return f"{SYSTEM_PRINCIPAL_ENV} names {new_id}, but {blocker}"
+
+
+def _note_ignored_system_principal() -> None:
+    """Log that ``NERVE_SYSTEM_PRINCIPAL_ID`` has no effect in local mode."""
+    from nerve.identity import SYSTEM_PRINCIPAL_ENV
+
+    if os.environ.get(SYSTEM_PRINCIPAL_ENV, "").strip():
+        logger.info(
+            "Identity: %s is set, but it has no effect in local mode; the system "
+            "actor keeps its current ID", SYSTEM_PRINCIPAL_ENV,
+        )
+
+
+async def _apply_system_principal(
+    db: "Database", report: MigrationReport, *, dry_run: bool,
+) -> None:
+    """Give the system actor the ID of the agent's system principal.
+
+    External mode only. The environment names the ID in
+    ``NERVE_SYSTEM_PRINCIPAL_ID``, which this reads once per bootstrap, so
+    once per start. When the value differs from the stored ID, the ID changes
+    only while no row refers to the system actor and no other actor has the
+    new ID (:meth:`~nerve.db.accounts.AccountStore._rekey_system_actor`). A
+    new installation therefore takes the ID at ``nerve init`` or at its first
+    start, before any work is attributed to it.
+
+    In all other cases the current ID stays: an unset value says nothing, and
+    an invalid value, a referenced system actor, a new ID that another actor
+    has, or an ID that another process changed first gives one warning.
+    ``nerve doctor`` reports the difference.
+    """
+    from nerve.identity import InvalidSystemPrincipalId, system_principal_id_from_env
+
+    current_id = db.system_actor_id
+    try:
+        new_id = system_principal_id_from_env()
+    except InvalidSystemPrincipalId as e:
+        _warn_kept_system_actor(report, current_id, str(e), dry_run=dry_run)
+        return
+    if new_id is None or new_id == current_id:
+        return
+
+    if dry_run:
+        result = await db._preview_system_actor_rekey(new_id)
+    else:
+        result = await db._rekey_system_actor(new_id)
+    if result.changed:
+        report.rekeyed_system_actor = True
+        report.identity_actions.append(
+            _rekey_action(result.previous_id, result.actor_id, dry_run=dry_run)
+        )
+        if not dry_run:
+            logger.info(
+                "Identity: the system actor ID changed from %s to %s",
+                result.previous_id, result.actor_id,
+            )
+    elif result.blocker is not None:
+        _warn_kept_system_actor(
+            report, result.actor_id, _rekey_blocked_reason(new_id, result.blocker),
+            dry_run=dry_run,
+        )
+    # Otherwise the stored ID was already the new ID: another process changed
+    # it after this connection cached the system actor.
+
+
 async def ensure_jwt_secret(
     db: "Database",
     config: NerveConfig,
@@ -1538,14 +1661,18 @@ async def ensure_jwt_secret(
 
 
 def _preview_identity(
-    config_dir: Path, config: NerveConfig | None, report: MigrationReport,
+    config_dir: Path,
+    config: NerveConfig | None,
+    report: MigrationReport,
+    *,
+    system_principal: bool = True,
 ) -> None:
     """Report what the gateway's identity bootstrap will do at its next start.
 
     Only the gateway and ``nerve init`` write identity state, so this reads
     ``nerve.db`` read-only and never creates it. Skipped on a fresh install
     (no ``config.local.yaml``): the wizard has not yet written the password
-    and secret.
+    and secret. ``system_principal`` is passed to :func:`_inspect_identity`.
     """
     from nerve.bootstrap import is_fresh_install
 
@@ -1560,17 +1687,30 @@ def _preview_identity(
                 f"identity bootstrap not shown: the config could not be loaded ({e})"
             )
             return
-    _inspect_identity(config, paths.db_path(), report)
+    _inspect_identity(config, paths.db_path(), report, system_principal=system_principal)
 
 
-def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationReport) -> None:
-    """Report what :func:`bootstrap_identity` would do, reading nerve.db read-only."""
+def _inspect_identity(
+    config: NerveConfig,
+    db_path: Path,
+    report: MigrationReport,
+    *,
+    system_principal: bool = True,
+) -> None:
+    """Report what :func:`bootstrap_identity` would do, reading nerve.db read-only.
+
+    With ``system_principal`` false, the system actor step is not reported and
+    ``NERVE_SYSTEM_PRINCIPAL_ID`` is not read.
+    """
     from nerve.db.accounts import inspect_bootstrap_state
     from nerve.gateway.auth import is_external_mode
 
     state = inspect_bootstrap_state(db_path)
     sources, stored = state if state is not None else ([], False)
-    if not is_external_mode():
+    if is_external_mode():
+        if system_principal:
+            _inspect_system_principal(db_path, report)
+    else:
         _inspect_accounts(config, sources, report)
     if config.auth.jwt_secret:
         if stored:
@@ -1579,6 +1719,36 @@ def _inspect_identity(config: NerveConfig, db_path: Path, report: MigrationRepor
     elif not stored:
         report.generated_jwt_secret = True
         report.identity_actions.append(_secret_action(dry_run=True))
+
+
+def _inspect_system_principal(db_path: Path, report: MigrationReport) -> None:
+    """Report the system actor step of :func:`bootstrap_identity`, read-only."""
+    from nerve.db.accounts import inspect_system_actor
+    from nerve.identity import InvalidSystemPrincipalId, system_principal_id_from_env
+
+    try:
+        new_id = system_principal_id_from_env()
+    except InvalidSystemPrincipalId as e:
+        report.warnings.append(f"the system actor keeps its current ID: {e}")
+        return
+    if new_id is None:
+        return
+    state = inspect_system_actor(db_path, new_id)
+    if state is None:
+        # No system actor yet: the next start creates one and gives it the ID.
+        report.rekeyed_system_actor = True
+        report.identity_actions.append(_rekey_action(None, new_id, dry_run=True))
+        return
+    current_id, blocker = state
+    if current_id == new_id:
+        return
+    if blocker is None:
+        report.rekeyed_system_actor = True
+        report.identity_actions.append(_rekey_action(current_id, new_id, dry_run=True))
+    else:
+        _warn_kept_system_actor(
+            report, current_id, _rekey_blocked_reason(new_id, blocker), dry_run=True,
+        )
 
 
 def _inspect_accounts(
@@ -1621,6 +1791,7 @@ def bootstrap_identity_sync(
     *,
     display_name: str | None = None,
     passwordless: bool = False,
+    system_principal: bool = True,
 ) -> MigrationReport:
     """Run the identity bootstrap on a new connection, for the installer.
 
@@ -1634,7 +1805,9 @@ def bootstrap_identity_sync(
     has a password.
 
     In external mode, no account is created and ``display_name`` and
-    ``passwordless`` have no effect. Only the signing secret is made.
+    ``passwordless`` have no effect. The signing secret is made, and the
+    system actor gets the ID in ``NERVE_SYSTEM_PRINCIPAL_ID`` unless
+    ``system_principal`` is false (see :func:`bootstrap_identity`).
     """
     try:
         asyncio.get_running_loop()
@@ -1649,6 +1822,7 @@ def bootstrap_identity_sync(
     asyncio.run(
         _bootstrap_with_own_connection(
             config, paths.db_path(), report, display_name, passwordless,
+            system_principal=system_principal,
         )
     )
     return report
@@ -1660,6 +1834,8 @@ async def _bootstrap_with_own_connection(
     report: MigrationReport,
     display_name: str | None = None,
     passwordless: bool = False,
+    *,
+    system_principal: bool = True,
 ) -> None:
     from nerve.db import Database
     from nerve.gateway.auth import is_external_mode
@@ -1667,7 +1843,10 @@ async def _bootstrap_with_own_connection(
     db = Database(db_path, workspace=config.workspace)
     await db.connect()
     try:
-        await bootstrap_identity(db, config, report=report, display_name=display_name)
+        await bootstrap_identity(
+            db, config, report=report, display_name=display_name,
+            system_principal=system_principal,
+        )
         if passwordless and not is_external_mode():
             await _confirm_passwordless(db, config, report)
     finally:

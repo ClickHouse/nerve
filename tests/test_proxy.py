@@ -14,6 +14,7 @@ import yaml
 
 from nerve import paths
 from nerve.config import NerveConfig, ProxyConfig, load_config
+from tests.rate_limited_upstream import RateLimitedUpstream
 
 
 # ------------------------------------------------------------------ #
@@ -147,6 +148,64 @@ class TestProxyConfigYAML:
 # ------------------------------------------------------------------ #
 
 
+class TestProxyClientRetries:
+    """Nerve's Anthropic clients ride out a short rate limit behind the proxy."""
+
+    def _config(self, port: int = 8317) -> NerveConfig:
+        return NerveConfig.from_dict({
+            "proxy": {"enabled": True, "port": port, "api_key": "sk-local"},
+        })
+
+    def test_proxy_clients_use_longer_retry_budget(self) -> None:
+        from nerve.config import PROXY_CLIENT_MAX_RETRIES
+
+        cfg = self._config()
+        assert cfg.create_anthropic_client().max_retries == PROXY_CLIENT_MAX_RETRIES
+        assert cfg.create_async_anthropic_client().max_retries == PROXY_CLIENT_MAX_RETRIES
+
+    def test_direct_clients_keep_sdk_default(self) -> None:
+        import anthropic
+
+        cfg = NerveConfig.from_dict({"anthropic_api_key": "sk-ant-real"})
+        assert cfg.create_anthropic_client().max_retries == anthropic.DEFAULT_MAX_RETRIES
+
+    def test_explicit_max_retries_wins(self) -> None:
+        """A caller with a hard time limit sets its own budget, for every
+        provider and both factories."""
+        configs = [
+            self._config(),
+            NerveConfig.from_dict({"anthropic_api_key": "sk-ant-real"}),
+            NerveConfig.from_dict({"provider": {"type": "bedrock", "aws_region": "us-east-1"}}),
+        ]
+        for cfg in configs:
+            assert cfg.create_anthropic_client(max_retries=1).max_retries == 1
+            assert cfg.create_async_anthropic_client(max_retries=1).max_retries == 1
+            assert cfg.create_anthropic_client(max_retries=0).max_retries == 0
+
+    def test_rate_limit_then_recovery_succeeds(self) -> None:
+        """Five 429s without Retry-After, then 200: the client succeeds after
+        backing off for longer than a short limit lasts (sleeps recorded, not
+        slept, to keep the test fast)."""
+        import anthropic._base_client as base_client
+
+        upstream = RateLimitedUpstream(failures=5)
+        sleeps: list[float] = []
+        try:
+            client = self._config(upstream.port).create_anthropic_client(timeout=5.0)
+            with patch.object(base_client.time, "sleep", side_effect=sleeps.append):
+                response = client.messages.create(
+                    model="claude-haiku-4-5", max_tokens=5,
+                    messages=[{"role": "user", "content": "hi"}],
+                )
+        finally:
+            upstream.close()
+
+        assert response.content[0].text == "ok"
+        assert upstream.requests == 6
+        # Exponential backoff from 0.5 s with up to 25% jitter: 0.5+1+2+4+8.
+        assert sum(sleeps) >= 0.75 * 15.5
+
+
 class TestProxyServiceInit:
     """Test ProxyService initialization and config writing."""
 
@@ -174,6 +233,12 @@ class TestProxyServiceInit:
         assert data["api-keys"] == ["sk-test-key"]
         assert data["auth-dir"] == str(tmp_path / "auth")
         assert (tmp_path / "auth").is_dir()  # auth dir was created
+        # Credential cooldowns are off: with one credential a cooldown is a
+        # self-inflicted outage, not a failover.
+        assert data["disable-cooling"] is True
+        # No proxy retry rounds: without cooldowns they re-send immediately,
+        # so a 429 would multiply into a burst against the same credential.
+        assert data["request-retry"] == 0
 
     def test_detect_asset_suffix(self) -> None:
         from nerve.proxy.service import _detect_asset_suffix

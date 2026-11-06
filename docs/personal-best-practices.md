@@ -86,9 +86,11 @@ A session reading a context file cold needs the status, the entry points and how
 - Your own conclusions are hypotheses until the human confirms them. Save them marked that way (`UNCONFIRMED agent analysis, not confirmed by alice: …`) with the source they came from. When the human rejects a claim, find every item it reached with `memory_recall`, fix each with `memory_update` or `memory_delete`, and leave an explicit correction rather than a silent rewording.
 - Volatile facts (prices, quotas, balances, availability) are fetched when needed, never recalled, and quoted with the time you fetched them.
 
+On an instance whose memory is Loom (`memory.backend: loom`), this tier is Loom and the agent uses Loom's tools instead of the ones named in this guide: `loom_search` for every recall, `loom_memory_set` to save, `loom_memory_update` to correct a fact under its key. Memories in team and org namespaces are shared and read-only for the agent: it proposes a change instead of editing one. The system prompt carries the details ([memory.md](memory.md#loom-backend)).
+
 ### Housekeeping
 
-The built-in `memory-maintenance` cron ([cron.md](cron.md#built-in-system-crons)) runs daily and silently over long-term memory: it deduplicates, prunes and rewords with `memory_records_by_date`, `memory_update` and `memory_delete`. It does not touch `MEMORY.md` or the context files. Their housekeeping (stubs over the cap, tag review, eviction, archiving dormant files) is yours: do it by hand in a quiet turn, or add a daily isolated job to `config/cron/jobs.yaml` that notifies only when it needs a ruling. A maintenance job that reports routine work teaches the human to ignore notifications.
+The built-in `memory-maintenance` cron ([cron.md](cron.md#built-in-system-crons)) runs daily and silently over long-term memory: it deduplicates, prunes and rewords with `memory_records_by_date`, `memory_update` and `memory_delete`. On a Loom instance it runs Loom's integrity report on the agent's home namespace instead and leaves deduplication to Loom. It does not touch `MEMORY.md` or the context files. Their housekeeping (stubs over the cap, tag review, eviction, archiving dormant files) is yours: do it by hand in a quiet turn, or add a daily isolated job to `config/cron/jobs.yaml` that notifies only when it needs a ruling. A maintenance job that reports routine work teaches the human to ignore notifications.
 
 ## Working Discipline
 
@@ -159,12 +161,12 @@ Tool calls first, the message last. Make turn-ending calls (`memorize`, `Schedul
 |---|---|---|
 | Payment failure, security alert, deadline today | `notify` | `urgent` |
 | Review requested from the human, approaching deadline | `notify` | `high` |
-| Task created, plan proposed, job finished | `notify` | `normal` |
+| Task created, job finished | `notify` | `normal` |
 | Routine completion, minor observation | `notify` | `low` |
 | Two plausible options, an ambiguous instruction | `ask_user` with `options` | — |
 | Approve, decline or snooze a queued mechanical action (`target_kind: mechanical-action`, carried out by the workspace's `scripts/mechanical-action.sh`) | `propose_action` | — |
 
-- A cron that creates tasks, proposes plans or finds problems notifies, because nobody reads cron output. Housekeeping stays silent.
+- A cron that creates tasks or finds problems notifies, because nobody reads cron output. Housekeeping stays silent. `plan_propose` sends its own notification with a link to the plan, so do not notify about a plan.
 - In monitoring loops and delegated work, notify each decision you made on your own ("restarted the export after a stall, my call"), not only status.
 - When the human is mentioned, assigned or asked for a review anywhere, notify with the full URL.
 - Apply quiet hours yourself. Nerve's `quiet_start` and `quiet_end` ([config.md](config.md#quiet-hours)) gate nothing the agent sends, `notify` included, so hold anything below `urgent` and keep the human's timezone and quiet hours as `[stable]` facts.

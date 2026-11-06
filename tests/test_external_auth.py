@@ -791,11 +791,15 @@ class TestRoutes:
 class _RecordingEngine:
     """Enough engine for ``/ws``; records what each message runs as."""
 
+    accepting_turns = True
+
     def __init__(self):
         self.session_actors: list[Actor] = []
         self.runs: list[dict] = []
         self.router = SimpleNamespace(get_last_session=self._no_session)
         self.sessions = SimpleNamespace(get_active_session=self._session)
+        # Every bind sends the session's status (the agent roster with it).
+        self.db = SimpleNamespace(get_session=self._no_session)
 
     async def _no_session(self, *_args, **_kwargs):
         return None
@@ -877,6 +881,7 @@ class TestWebSocket:
             assert socket.receive_json() == {
                 "type": "session_switched", "session_id": "ws-session",
             }
+            assert socket.receive_json()["type"] == "session_status"
             (connection, _socket), = server._live_sockets.values()
             assert connection.actor == Actor(
                 actor_id=ALICE, kind="human", account_id=None, display_name="Alice",
@@ -942,6 +947,7 @@ class TestWebSocket:
         token = create_system_token(_SECRET)
         with ws_instance.client.websocket_connect(f"/ws?token={token}") as socket:
             assert socket.receive_json()["type"] == "session_switched"
+            assert socket.receive_json()["type"] == "session_status"
             (connection, _socket), = server._live_sockets.values()
             assert connection.actor.is_system
 

@@ -13,8 +13,9 @@ import pytest
 
 from nerve import setup_checklist as checklist
 from nerve.config import NerveConfig
+from nerve.onboarding_catalog import WorkSelection, work_catalog
 from nerve.setup_state import SetupState
-from nerve.setup_writer import apply_mode, apply_profile_templates, set_optional_crons
+from nerve.setup_writer import apply_mode, apply_profile_templates, render_work_description, set_optional_crons
 
 
 _SOURCES_OFF = {
@@ -180,6 +181,18 @@ class TestDoneRules:
         skipped = facts(personal, state=SetupState(skipped={"profile"}))
         assert statuses(skipped)["profile"] == "done", "done beats skipped"
 
+    def test_profile_compares_the_time_zone_with_the_default_it_is_given(self, personal):
+        """The default (``NERVE_TIMEZONE`` or the fallback) is not an answer."""
+        berlin = cfg(personal, timezone="Europe/Berlin")
+        s = step(facts(personal, berlin, default_timezone="Europe/Berlin"), "profile")
+        assert s["status"] == "pending"
+        assert s["detail"]["timezone"] == "Europe/Berlin"
+        assert s["detail"]["timezone_is_default"] is True
+        new_york = cfg(personal, timezone="America/New_York")
+        s = step(facts(personal, new_york, default_timezone="Europe/Berlin"), "profile")
+        assert s["status"] == "done"
+        assert s["detail"]["timezone_is_default"] is False
+
     def test_profile_is_never_derived_from_local_account_facts(self, personal):
         """Only config and workspace facts: a display name on the account changes nothing."""
         with_name = facts(personal, display_name="Alice", account_username="alice")
@@ -191,6 +204,34 @@ class TestDoneRules:
         assert s["detail"]["name"] == "Alice Example"
         assert s["detail"]["name_source"] == "actor_header"
         assert s["detail"]["display_name_editable"] is False
+
+    def test_profile_offers_the_environments_agent_name_while_identity_md_is_pristine(self, personal, tmp_path):
+        offered = step(facts(personal, agent_display_name="Ada"), "profile")["detail"]
+        assert offered["agent_name"] is None and offered["agent_name_prefill"] == "Ada"
+        # Nothing is offered under lockdown, in local or external mode, nor to
+        # a worker, whose step has no agent name; without a name from the
+        # environment there is nothing to offer.
+        assert step(facts(personal, agent_display_name="Ada", lockdown=True), "profile")["detail"]["agent_name_prefill"] is None
+        locked_external = facts(personal, agent_display_name="Ada", lockdown=True, external_auth=True, display_name="Alice Example")
+        assert step(locked_external, "profile")["detail"]["agent_name_prefill"] is None
+        worker = tmp_path / "worker"
+        apply_mode(worker, "worker", "Watch the nightly build for example/repo and propose fixes.")
+        assert step(facts(worker, agent_display_name="Ada"), "profile")["detail"]["agent_name_prefill"] is None
+        assert step(facts(personal), "profile")["detail"]["agent_name_prefill"] is None
+        # Once IDENTITY.md holds a name, the file is the source.
+        apply_profile_templates(personal, agent_name="Lovelace")
+        named = step(facts(personal, agent_display_name="Ada"), "profile")["detail"]
+        assert named["agent_name"] == "Lovelace" and named["agent_name_prefill"] is None
+
+    def test_agent_display_name_from_environment_keeps_the_bounds_of_a_typed_name(self, monkeypatch):
+        for value, want in (
+            ("  Ada  ", "Ada"), ("x" * 40, "x" * 40), ("x" * 41, None), ("", None), ("   ", None),
+            ("Ada\nLovelace", None), ("Ada\x07", None), ("Ada\x7f", None), ("Ada\x85Bot", None),
+        ):
+            monkeypatch.setenv("NERVE_DISPLAY_NAME", value)
+            assert checklist.agent_display_name_from_environment() == want, repr(value)
+        monkeypatch.delenv("NERVE_DISPLAY_NAME")
+        assert checklist.agent_display_name_from_environment() is None
 
     def test_memory(self, personal):
         assert statuses(facts(personal))["memory"] == "pending"
@@ -234,14 +275,38 @@ class TestDoneRules:
         assert d["telegram"]["session"] == {"present": False, "authorized": False, "user": None}
         assert d["github"] == {"enabled": False, "source": None}
         assert d["gmail"] == {"enabled": False, "accounts": [], "source": None}
+        # Where the page may store credentials every source is on offer.
+        assert d["available"] == ["github", "gmail", "telegram"] and d["unavailable_reason"] is None
+
+    def test_sources_show_the_gateway_when_only_github_is_hosted(self, personal):
+        """As the Channels step does for a hosted Slack; volatile, so outside
+        the etag. An open stream is not a connected GitHub: records also need
+        a GitHub credential connected to the agent, which Nerve cannot see."""
+        hosted = cfg(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        live = {"streams": 1, "connected": True, "last_event_at": "2026-10-21T09:00:00+00:00"}
+
+        connected = step(facts(personal, hosted, hosted_gateway=live), "sources")
+        waiting = step(facts(personal, hosted), "sources")
+
+        assert connected["detail"]["github"] == {
+            "enabled": True, "source": None, "mode": "hosted", "gateway": live,
+        }
+        assert connected["summary"] == (
+            "GitHub from the channel gateway · stream connected; records arrive once a GitHub "
+            "credential is connected to this agent"
+        )
+        assert waiting["detail"]["github"]["gateway"] == {"streams": 0, "connected": False, "last_event_at": None}
+        assert waiting["summary"] == "GitHub from the channel gateway · waiting for the gateway"
+        assert connected["etag"] == waiting["etag"]
+        assert step(facts(personal, hosted), "channels")["detail"]["slack"]["gateway"] is None
 
     def test_automation(self, personal):
         s = step(facts(personal), "automation")
         assert s["status"] == "pending"
         assert s["detail"]["file_present"] is True
-        assert s["summary"] == "2 of 4 optional jobs on"
+        assert s["summary"] == "3 of 5 optional jobs on"
         ids = [o["id"] for o in s["detail"]["optional"]]
-        assert ids == ["inbox-processor", "task-planner", "skill-extractor", "skill-reviser"]
+        assert ids == ["inbox-processor", "task-planner", "skill-extractor", "skill-reviser", "machine-maintenance"]
         inbox = s["detail"]["optional"][0]
         assert inbox["requirement_met"] is False and inbox["schedule_text"] == "every 30 minutes"
         assert inbox["default"] is True and inbox["enabled"] is True
@@ -254,23 +319,25 @@ class TestDoneRules:
         detail says so per job, which is what the page's hint keys on."""
         s = step(facts(worker), "automation")
         optional = {o["id"]: o for o in s["detail"]["optional"]}
-        assert list(optional) == ["task-planner", "skill-extractor", "skill-reviser"]
+        assert list(optional) == ["task-planner", "skill-extractor", "skill-reviser", "machine-maintenance"]
         assert {i: (o["enabled"], o["default_enabled"]) for i, o in optional.items()} == {
             "task-planner": (False, False),
             "skill-extractor": (True, True),
             "skill-reviser": (True, True),
+            "machine-maintenance": (True, True),
         }
         assert all(o["default"] == o["default_enabled"] for o in optional.values()), "the older name stays"
         assert s["status"] == "pending", "the file matches the worker defaults"
-        assert s["summary"] == "2 of 3 optional jobs on"
+        assert s["summary"] == "3 of 4 optional jobs on"
         # Turning the planner on is a decision, as any other change is.
-        set_optional_crons(worker, {"task-planner", "skill-extractor", "skill-reviser"})
+        set_optional_crons(worker, {"task-planner", "skill-extractor", "skill-reviser", "machine-maintenance"})
         assert statuses(facts(worker))["automation"] == "done"
 
     def test_automation_personal_defaults_are_unchanged(self, personal):
         optional = {o["id"]: o["default_enabled"] for o in step(facts(personal), "automation")["detail"]["optional"]}
         assert optional == {
             "inbox-processor": True, "task-planner": True, "skill-extractor": False, "skill-reviser": False,
+            "machine-maintenance": True,
         }
 
     def test_quiet_hours_detail_follows_the_mode_default(self, tmp_path):
@@ -310,14 +377,66 @@ class TestDoneRules:
         assert statuses(facts(personal, state=SetupState(answered={"agents"})))["agents"] == "done"
 
     def test_onboarding_flows_into_the_mode_detail(self, worker):
-        s = step(facts(worker, onboarding="running", onboarding_session_id="cron:worker-onboarding:1"), "mode")
+        s = step(facts(worker, onboarding="running", onboarding_session_id="onboarding-1"), "mode")
         assert s["detail"]["onboarding"] == "running"
-        assert s["detail"]["onboarding_session_id"] == "cron:worker-onboarding:1"
+        assert s["detail"]["onboarding_session_id"] == "onboarding-1"
         assert s["detail"]["task_present"] is True
         assert checklist.onboarding_from_task(worker, "worker") == "pending"
         (worker / "TASK.md").write_text("# Task\n\n## Mission\nx\n", encoding="utf-8")
         assert checklist.onboarding_from_task(worker, "worker") == "done"
         assert checklist.onboarding_from_task(worker, "personal") == "not_applicable"
+
+    def test_the_mode_detail_carries_the_work_catalog_and_what_was_chosen(self, tmp_path):
+        """Every body carries the catalog (the Mode step's checkboxes) and the
+        selection read back from a worker's ``TASK.md``; all empty when
+        nothing was chosen, for a personal install and once onboarding
+        completed the file."""
+        nothing = {"items": [], "custom": "", "rules": ""}
+        fresh, personal, worker = tmp_path / "fresh", tmp_path / "personal", tmp_path / "worker"
+        fresh.mkdir()
+        apply_mode(personal, "personal")
+        apply_mode(worker, "worker", "Watch the nightly build for example/repo and propose fixes.")
+        for ws in (fresh, personal):
+            detail = step(facts(ws), "mode")["detail"]
+            assert detail["work_catalog"] == work_catalog() and detail["work"] == nothing
+        # A free-text note (an older page, ``nerve init``) reads as custom work.
+        assert step(facts(worker), "mode")["detail"]["work"] == {
+            "items": [], "custom": "Watch the nightly build for example/repo and propose fixes.", "rules": "",
+        }
+        chosen = tmp_path / "chosen"
+        apply_mode(chosen, "worker", render_work_description(WorkSelection(
+            items=("triage-issues", "review-prs"), custom="also watch the release branch",
+            rules="never merge anything",
+        )))
+        detail = step(facts(chosen), "mode")["detail"]
+        assert detail["work"] == {
+            "items": ["review-prs", "triage-issues"], "custom": "also watch the release branch",
+            "rules": "never merge anything",
+        }
+        # What was chosen is persisted configuration: part of the etag.
+        assert "work" in checklist.ETAG_FIELDS["mode"]
+        assert step(facts(chosen), "mode")["etag"] != step(facts(worker), "mode")["etag"]
+        task = chosen / "TASK.md"
+        task.write_text(
+            "".join(line for line in task.read_text().splitlines(keepends=True) if "nerve:onboarding pending" not in line),
+            encoding="utf-8",
+        )
+        assert step(facts(chosen), "mode")["detail"]["work"] == nothing
+        task.unlink()
+        assert step(facts(chosen), "mode")["detail"]["work"] == nothing
+
+    def test_the_onboarding_block_carries_what_it_waits_for_only_while_running(self, worker):
+        running = checklist.summarize(facts(
+            worker, onboarding="running", onboarding_session_id="onboarding-1",
+            onboarding_kind="conversation", onboarding_awaiting="plan",
+        ))
+        assert running["onboarding"] == {
+            "status": "running", "session_id": "onboarding-1", "kind": "conversation", "awaiting": "plan",
+        }
+        for status in ("pending", "done", "skipped", "not_applicable"):
+            block = checklist.summarize(facts(worker, onboarding=status, onboarding_awaiting="question"))["onboarding"]
+            assert block["status"] == status and block["awaiting"] is None
+        assert checklist.summarize(facts(worker))["onboarding"]["awaiting"] is None
 
     def test_onboarding_is_done_once_the_marker_is_gone(self, worker):
         """The template's marker comment decides, not the headings: a filled
@@ -472,6 +591,11 @@ def keyless(ws: Path, **top) -> NerveConfig:
     return cfg(ws, setup={"local_secrets": False}, **top)
 
 
+# The operator provides the GitHub token from the environment (GH_TOKEN /
+# GITHUB_TOKEN in the service environment, or a ${VAR} reference).
+GITHUB_ENV = {"github_token": "environment"}
+
+
 class TestNoLocalSecrets:
     """``setup.local_secrets: false``: a step whose only purpose is to store a
     credential on this machine is ``blocked`` with ``policy`` — never pending,
@@ -557,6 +681,204 @@ class TestNoLocalSecrets:
 
     def test_the_summary_says_when_secrets_may_be_kept(self, personal):
         assert checklist.summarize(facts(personal))["local_secrets"] is True
+
+    def test_a_github_token_from_the_environment_keeps_that_toggle_open(self, personal):
+        """Switching the GitHub source on stores nothing here — the operator
+        holds the token — so the step stays open for that one decision:
+        pending, counted, skippable; Gmail and Telegram stay closed."""
+        f = facts(personal, keyless(personal), credential_sources=GITHUB_ENV)
+        s = step(f, "sources")
+        assert s["status"] == "pending" and s["blocked_kind"] is None and s["blocked_reason"] is None
+        assert s["read_only"] is False and s["read_only_reason"] is None
+        assert s["detail"]["available"] == ["github"]
+        assert s["detail"]["unavailable_reason"] == checklist.SOURCES_GITHUB_ONLY_TEXT
+        assert s["detail"]["github"] == {"enabled": False, "source": "environment"}
+        summary = checklist.summarize(f)
+        assert summary["steps_left"] == 4  # provider, profile, sources, automation
+        kinds = {x["id"]: x["blocked_kind"] for x in summary["steps"] if x["status"] == "blocked"}
+        assert kinds == {"memory": "policy", "channels": "policy", "agents": "policy"}
+        skipped = facts(personal, keyless(personal), credential_sources=GITHUB_ENV, state=SetupState(skipped={"sources"}))
+        assert step(skipped, "sources")["status"] == "skipped"
+        assert checklist.summarize(skipped)["steps_left"] == 3
+
+    def test_a_hosted_github_keeps_that_toggle_open_without_a_token(self, personal):
+        """The channel gateway polls GitHub, so the switch needs no credential
+        on this machine and stores nothing here."""
+        f = facts(personal, keyless(personal, sync={"github": {"mode": "hosted"}}))
+        s = step(f, "sources")
+        assert s["status"] == "pending" and s["blocked_kind"] is None
+        assert s["read_only"] is False and s["read_only_reason"] is None
+        assert s["detail"]["available"] == ["github"]
+        assert s["detail"]["unavailable_reason"] == checklist.SOURCES_GITHUB_HOSTED_TEXT
+        on = keyless(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        done = step(facts(personal, on), "sources")
+        assert done["status"] == "done" and done["read_only"] is False and done["read_only_reason"] is None
+
+    def test_github_on_with_a_token_from_the_environment_is_done_and_keeps_its_switch(self, personal):
+        """Done like any switched-on source, but not read-only: the switch is
+        the one control, as the hosted Slack's is."""
+        on = keyless(personal, sync={"github": {"enabled": True}})
+        s = step(facts(personal, on, credential_sources=GITHUB_ENV), "sources")
+        assert s["status"] == "done" and s["read_only"] is False and s["read_only_reason"] is None
+        assert s["summary"] == "GitHub" and s["detail"]["available"] == ["github"]
+        # "No" is an answer too, and still open to change.
+        answered = facts(personal, keyless(personal), credential_sources=GITHUB_ENV, state=SetupState(answered={"sources"}))
+        s = step(answered, "sources")
+        assert s["status"] == "done" and s["read_only"] is False and s["summary"] == "None"
+
+    def test_a_source_the_operator_switched_on_is_shown_beside_the_github_toggle(self, personal):
+        config = keyless(personal, sync={"gmail": {"enabled": True, "accounts": ["alice@example.com"]}})
+        sources = {**GITHUB_ENV, "sync.gmail.accounts": "config-repo"}
+        s = step(facts(personal, config, credential_sources=sources), "sources")
+        assert s["status"] == "done" and s["read_only"] is False
+        assert s["detail"]["available"] == ["github"]
+        assert s["detail"]["gmail"] == {"enabled": True, "accounts": ["alice@example.com"], "source": "config-repo"}
+
+    @pytest.mark.parametrize("sources", [{}, {"github_token": "file"}, {"github_token": "config-repo"}])
+    def test_without_a_token_from_the_environment_the_sources_step_stays_closed(self, personal, sources):
+        """No token, or one in a file on this machine or in the repository: the policy as before."""
+        s = step(facts(personal, keyless(personal), credential_sources=sources), "sources")
+        assert s["status"] == "blocked" and s["blocked_kind"] == "policy"
+        assert s["detail"]["available"] == [] and s["detail"]["unavailable_reason"] == checklist.NO_LOCAL_SECRETS_TEXT
+        on = keyless(personal, sync={"github": {"enabled": True}})
+        done = step(facts(personal, on, credential_sources=sources), "sources")
+        assert done["status"] == "done" and done["read_only"] is True
+        assert done["read_only_reason"] == checklist.NO_LOCAL_SECRETS_TEXT and done["detail"]["available"] == []
+
+    def test_the_github_toggle_still_waits_for_a_mode_and_yields_to_lockdown(self, tmp_path, personal):
+        fresh = tmp_path / "fresh"  # a workspace that has never chosen a mode
+        fresh.mkdir()
+        s = step(facts(fresh, keyless(fresh), credential_sources=GITHUB_ENV), "sources")
+        assert s["status"] == "blocked" and s["blocked_kind"] == "sequencing"
+        locked = step(facts(personal, keyless(personal), credential_sources=GITHUB_ENV, lockdown=True), "sources")
+        assert locked["status"] == "blocked" and locked["blocked_kind"] == "lockdown"
+        assert locked["detail"]["available"] == ["github"]
+
+    def test_what_is_on_offer_is_part_of_the_sources_etag(self, personal):
+        """A policy flip changes the set of cards, so the form remounts."""
+        every = step(facts(personal), "sources")["etag"]
+        github_only = step(facts(personal, keyless(personal), credential_sources=GITHUB_ENV), "sources")["etag"]
+        none = step(facts(personal, keyless(personal)), "sources")["etag"]
+        assert len({every, github_only, none}) == 3
+
+
+# The operator states ``sync.github.enabled`` in a machine layer.
+GITHUB_HELD = {"sync.github.enabled": "config.local.yaml"}
+_QUIET_GATEWAY = {"streams": 0, "connected": False, "last_event_at": None}
+_GMAIL_TELEGRAM_CLOSED = " Gmail and Telegram are not available on this instance."
+
+
+class TestGitHubSwitchHeldOnTheMachine:
+    """Hosted GitHub with ``sync.github.enabled`` in config.yaml or
+    config.local.yaml: those outrank the settings.yaml the page writes, so the
+    switch is the operator's. The card is shown and not offered, and the step
+    says that a GitHub credential connected to the agent is what decides."""
+
+    def test_shown_not_offered_beside_the_other_sources(self, personal):
+        """Where the page may store credentials, Gmail and Telegram stay on
+        offer and the step stays open for them."""
+        on = cfg(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        s = step(facts(personal, on, machine_switches=GITHUB_HELD), "sources")
+        assert s["detail"]["available"] == ["gmail", "telegram"]
+        assert s["detail"]["unavailable_reason"] == checklist.SOURCES_GITHUB_MANAGED_TEXT
+        assert s["detail"]["github"] == {
+            "enabled": True, "source": None, "mode": "hosted", "gateway": _QUIET_GATEWAY, "managed": True,
+        }
+        assert s["status"] == "done" and s["read_only"] is False and s["read_only_reason"] is None
+
+    def test_the_summary_never_claims_a_connected_credential(self, personal):
+        """Nerve cannot tell a credential that is not connected from a gateway
+        it cannot reach, so the waiting line names both. Once a stream is open
+        the line names the stream, and the credential stays a condition."""
+        on = cfg(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        waiting = step(facts(personal, on, machine_switches=GITHUB_HELD), "sources")
+        assert waiting["summary"] == (
+            "GitHub · waiting for the channel gateway — if no GitHub credential is connected "
+            "to this agent yet, connect one where your operator manages it"
+        )
+        live = {"streams": 1, "connected": True, "last_event_at": "2026-10-21T09:00:00+00:00"}
+        connected = step(facts(personal, on, machine_switches=GITHUB_HELD, hosted_gateway=live), "sources")
+        assert connected["summary"] == (
+            "GitHub from the channel gateway · stream connected; records arrive once a GitHub "
+            "credential is connected to this agent"
+        )
+        assert connected["etag"] == waiting["etag"], "the gateway's state is volatile: never remounts the form"
+
+    def test_a_stream_a_hosted_slack_opens_is_not_a_connected_github(self, personal):
+        """The gateway's streams carry every hosted provider, so a hosted Slack
+        opens them whether or not a GitHub credential is connected to the
+        agent. The Channels step may say Slack is connected; the Sources step
+        names only the stream."""
+        config = cfg(personal, slack={"mode": "hosted"}, sync={"github": {"enabled": True, "mode": "hosted"}})
+        live = {"streams": 2, "connected": True, "last_event_at": "2026-10-21T09:00:00+00:00"}
+        f = facts(personal, config, machine_switches=GITHUB_HELD, hosted_gateway=live)
+        assert step(f, "channels")["summary"] == "Slack managed by the channel gateway · connected"
+        assert step(f, "sources")["summary"] == (
+            "GitHub from the channel gateway · stream connected; records arrive once a GitHub "
+            "credential is connected to this agent"
+        )
+
+    def test_without_local_secrets_nothing_is_on_offer_and_the_done_step_is_read_only(self, personal):
+        on = keyless(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        f = facts(personal, on, machine_switches=GITHUB_HELD)
+        s = step(f, "sources")
+        reason = checklist.SOURCES_GITHUB_MANAGED_TEXT + _GMAIL_TELEGRAM_CLOSED
+        assert s["detail"]["available"] == [] and s["detail"]["unavailable_reason"] == reason
+        assert s["status"] == "done" and s["blocked_kind"] is None
+        assert s["read_only"] is True and s["read_only_reason"] == reason
+        assert checklist.summarize(f)["steps_left"] == 3  # provider, profile, automation
+
+    def test_held_off_says_so(self, personal):
+        """Not claimed to arrive: the operator switched it off there."""
+        off = keyless(personal, sync={"github": {"enabled": False, "mode": "hosted"}})
+        f = facts(personal, off, machine_switches=GITHUB_HELD)
+        s = step(f, "sources")
+        reason = checklist.SOURCES_GITHUB_MANAGED_OFF_TEXT + _GMAIL_TELEGRAM_CLOSED
+        assert s["status"] == "blocked" and s["blocked_kind"] == "policy" and s["blocked_reason"] == reason
+        assert s["read_only"] is True and s["read_only_reason"] == reason
+        assert s["detail"]["available"] == [] and s["detail"]["github"]["managed"] is True
+        assert checklist.summarize(f)["steps_left"] == 3, "nothing on the page can open it"
+        # Where the page may store credentials, the step stays open for Gmail and Telegram.
+        local = cfg(personal, sync={"github": {"mode": "hosted"}})
+        s = step(facts(personal, local, machine_switches=GITHUB_HELD), "sources")
+        assert s["status"] == "pending" and s["detail"]["available"] == ["gmail", "telegram"]
+        assert s["detail"]["unavailable_reason"] == checklist.SOURCES_GITHUB_MANAGED_OFF_TEXT
+
+    def test_a_hosted_switch_no_machine_layer_states_stays_the_pages(self, personal):
+        """As before: offered and open, with the hosted sentence and no ``managed`` key."""
+        on = keyless(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        s = step(facts(personal, on, machine_switches={}), "sources")
+        assert s["detail"]["available"] == ["github"]
+        assert s["detail"]["unavailable_reason"] == checklist.SOURCES_GITHUB_HOSTED_TEXT
+        assert "managed" not in s["detail"]["github"]
+        assert s["status"] == "done" and s["read_only"] is False
+        assert s["summary"] == "GitHub from the channel gateway · waiting for the gateway"
+
+    def test_poll_mode_is_unchanged_by_a_machine_layer_switch(self, personal):
+        on = cfg(personal, sync={"github": {"enabled": True}})
+        s = step(facts(personal, on, machine_switches=GITHUB_HELD), "sources")
+        assert s["detail"]["available"] == ["github", "gmail", "telegram"] and s["detail"]["unavailable_reason"] is None
+        assert s["detail"]["github"] == {"enabled": True, "source": None}
+        assert s["summary"] == "GitHub" and s["read_only"] is False
+        env = facts(personal, keyless(personal), credential_sources=GITHUB_ENV, machine_switches=GITHUB_HELD)
+        s = step(env, "sources")
+        assert s["detail"]["available"] == ["github"]
+        assert s["detail"]["unavailable_reason"] == checklist.SOURCES_GITHUB_ONLY_TEXT
+
+    def test_the_switch_reason_answers_for_the_held_switch_only(self, personal):
+        hosted = cfg(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        held = facts(personal, hosted, machine_switches=GITHUB_HELD)
+        assert checklist.managed_switch_reason(held, "sync.github.enabled") == checklist.SOURCES_GITHUB_MANAGED_TEXT
+        assert checklist.managed_switch_reason(held, "sync.gmail.enabled") is None
+        assert checklist.managed_switch_reason(facts(personal, hosted), "sync.github.enabled") is None
+        poll = facts(personal, cfg(personal, sync={"github": {"enabled": True}}), machine_switches=GITHUB_HELD)
+        assert checklist.managed_switch_reason(poll, "sync.github.enabled") is None
+
+    def test_holding_the_switch_remounts_the_form(self, personal):
+        on = keyless(personal, sync={"github": {"enabled": True, "mode": "hosted"}})
+        offered = step(facts(personal, on), "sources")["etag"]
+        held = step(facts(personal, on, machine_switches=GITHUB_HELD), "sources")["etag"]
+        assert offered != held
 
 
 class TestMaskingAndEtag:

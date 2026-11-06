@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, type TaskEvent } from '../../api/client';
+import { ActorAttribution } from '../Chat/ActorLabel';
 import { StatusBadge } from './StatusControls';
 import { formatTimeAgo } from '../../utils/dateGroups';
 
@@ -78,8 +79,19 @@ export function TaskTimeline({ taskId, currentStatus }: {
               </div>
               <div className="text-text-faint mt-0.5">
                 <span title={event.created_at}>{formatTimeAgo(event.created_at)}</span>
-                {event.actor && event.actor !== 'system' && (
-                  <span> · {event.actor}</span>
+                {event.actor_id ? (
+                  <span>
+                    {' · '}
+                    <ActorAttribution
+                      actorId={event.actor_id}
+                      causeId={event.caused_by_actor_id}
+                      verb="Changed by"
+                    />
+                  </span>
+                ) : (
+                  // Rows written before the actor columns existed name only
+                  // the origin of the change.
+                  event.actor && event.actor !== 'system' && <span> · {event.actor}</span>
                 )}
               </div>
             </div>

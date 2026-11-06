@@ -8,6 +8,7 @@ running server (the CLI and lifespan task are thin wrappers over this module).
 
 from __future__ import annotations
 
+import fcntl
 import os
 import sqlite3
 import stat
@@ -20,7 +21,8 @@ import pytest
 
 from nerve import backup as backup_mod
 from nerve.backup import BackupError
-from nerve.db import SCHEMA_VERSION
+from nerve.db import FORK_SCHEMA_VERSION, SCHEMA_VERSION
+from nerve.db.migrations.runner import FORK_TRACK
 
 
 # --------------------------------------------------------------------------- #
@@ -29,8 +31,13 @@ from nerve.db import SCHEMA_VERSION
 
 
 def _make_nerve_db(path: Path, *, schema_version: int = SCHEMA_VERSION,
+                   fork_schema_version: int | None = None,
                    sessions: int = 7, messages: int = 11, tasks: int = 3) -> None:
-    """Create a WAL-mode nerve.db with the tables the parity counts read."""
+    """Create a WAL-mode nerve.db with the tables the parity counts read.
+
+    ``fork_schema_version`` adds the fork track's table, as the first fork
+    migration does.
+    """
     for suffix in ("", "-wal", "-shm"):
         p = Path(str(path) + suffix)
         if p.exists():
@@ -40,6 +47,13 @@ def _make_nerve_db(path: Path, *, schema_version: int = SCHEMA_VERSION,
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("CREATE TABLE schema_version (version INTEGER)")
         conn.execute("INSERT INTO schema_version VALUES (?)", (schema_version,))
+        if fork_schema_version is not None:
+            conn.execute(
+                f"CREATE TABLE {FORK_TRACK.table} (version INTEGER PRIMARY KEY)"
+            )
+            conn.execute(
+                f"INSERT INTO {FORK_TRACK.table} VALUES (?)", (fork_schema_version,),
+            )
         conn.execute("CREATE TABLE sessions (id TEXT)")
         conn.execute("CREATE TABLE messages (id TEXT)")
         conn.execute("CREATE TABLE tasks (id TEXT)")
@@ -423,6 +437,41 @@ def test_no_secrets_scrubs_the_stored_signing_secret(nerve_dir, workspace, confi
     staging = tmp_path / "x2"
     backup_mod.verify_bundle(kept.path, extract_to=staging)
     assert _stored_secrets(staging / "state" / "nerve.db") == ["planted-signing-secret"]
+
+
+def test_no_secrets_keeps_the_system_principal_claim(nerve_dir, workspace, config_dir, tmp_path):
+    """The record of the system principal ID is instance state, not a secret:
+    a --no-secrets snapshot keeps it and still deletes every secret row."""
+    from nerve.db.accounts import SYSTEM_PRINCIPAL_CLAIM_NAME
+
+    claim = "00000000-0000-4000-8000-00000000c2c2"
+    _plant_instance_secret(nerve_dir / "nerve.db")
+    conn = sqlite3.connect(str(nerve_dir / "nerve.db"))
+    try:
+        conn.execute(
+            "INSERT INTO instance_secrets VALUES ('setup_token', 'planted-setup-token')"
+        )
+        conn.execute(
+            "INSERT INTO instance_secrets VALUES (?, ?)", (SYSTEM_PRINCIPAL_CLAIM_NAME, claim),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    stripped = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir, include_secrets=False,
+    )
+    staging = tmp_path / "x"
+    report = backup_mod.verify_bundle(stripped.path, extract_to=staging)
+    assert report.ok, report.errors
+    snapshot = staging / "state" / "nerve.db"
+    assert _stored_secrets(snapshot) == [claim]
+    raw = snapshot.read_bytes().decode("latin-1")
+    assert "planted-signing-secret" not in raw
+    assert "planted-setup-token" not in raw
+    assert sorted(_stored_secrets(nerve_dir / "nerve.db")) == sorted(
+        ["planted-signing-secret", "planted-setup-token", claim]
+    )
 
 
 # Obviously synthetic, and long enough to be found in the raw file bytes.
@@ -1192,6 +1241,23 @@ def test_restore_refuses_on_live_pidfile(nerve_dir, workspace, config_dir, tmp_p
         backup_mod.restore_bundle(result.path, target, tmp_path / "ws_x")
 
 
+def test_restore_refuses_on_held_lock(nerve_dir, workspace, config_dir, tmp_path):
+    out = tmp_path / "out"
+    result = backup_mod.create_backup(nerve_dir, workspace, out, config_dir=config_dir)
+
+    target = tmp_path / "live_nerve"
+    target.mkdir()
+    (target / "nerve.pid").write_text("12345")
+    # Lock through a new descriptor, as the live daemon does.
+    fd = os.open(target / "nerve.lock", os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        with pytest.raises(BackupError, match="running"):
+            backup_mod.restore_bundle(result.path, target, tmp_path / "ws_x")
+    finally:
+        os.close(fd)
+
+
 def test_restore_refuses_nonempty_without_force(nerve_dir, workspace, config_dir, tmp_path):
     out = tmp_path / "out"
     result = backup_mod.create_backup(nerve_dir, workspace, out, config_dir=config_dir)
@@ -1288,6 +1354,50 @@ def test_schema_guard_rejects_newer_bundle(nerve_dir, workspace, config_dir, tmp
     assert any("newer than this code" in e for e in report.errors)
 
     # Restore must refuse cleanly.
+    with pytest.raises(BackupError, match="verification"):
+        backup_mod.restore_bundle(result.path, tmp_path / "nd_new", tmp_path / "ws_new")
+
+
+def test_manifest_records_both_schema_versions(
+    nerve_dir, workspace, config_dir, tmp_path, monkeypatch,
+):
+    import nerve.db
+
+    result = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+    )
+    manifest = backup_mod.verify_bundle(result.path).manifest
+    # No fork migration ever ran on this database, so it has no fork table: 0.
+    assert manifest["schema_version"] == SCHEMA_VERSION
+    assert manifest["fork_schema_version"] == 0
+
+    # A fork's build at fork v5, and a database it migrated.
+    monkeypatch.setattr(nerve.db, "FORK_SCHEMA_VERSION", 5)
+    _make_nerve_db(nerve_dir / "nerve.db", fork_schema_version=5)
+    result = backup_mod.create_backup(
+        nerve_dir, workspace, tmp_path / "out", config_dir=config_dir,
+    )
+    report = backup_mod.verify_bundle(result.path)
+    assert report.ok, report.errors
+    assert report.manifest["fork_schema_version"] == 5
+
+
+def test_schema_guard_rejects_a_bundle_with_a_newer_fork_schema(
+    nerve_dir, workspace, config_dir, tmp_path,
+):
+    """A bundle with fork migrations this code lacks is refused, like a bundle
+    that is ahead on the upstream track."""
+    _make_nerve_db(nerve_dir / "nerve.db", fork_schema_version=FORK_SCHEMA_VERSION + 3)
+    out = tmp_path / "out"
+    result = backup_mod.create_backup(nerve_dir, workspace, out, config_dir=config_dir)
+
+    report = backup_mod.verify_bundle(result.path)
+    assert not report.ok
+    assert report.errors == [(
+        f"bundle fork schema v{FORK_SCHEMA_VERSION + 3} is newer than this code "
+        f"(v{FORK_SCHEMA_VERSION}) — restore it with a Nerve that ships those fork "
+        f"migrations"
+    )]
     with pytest.raises(BackupError, match="verification"):
         backup_mod.restore_bundle(result.path, tmp_path / "nd_new", tmp_path / "ws_new")
 

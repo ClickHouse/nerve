@@ -25,6 +25,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import pytest_asyncio
 
+from nerve.agent.agents import AgentRegistry
+from nerve.agent.backends import SystemEvent
 from nerve.agent.engine import AgentEngine
 from nerve.agent.sessions import SessionManager
 from nerve.db import Database
@@ -101,7 +103,7 @@ class TestEnginePendingWork:
     async def engine(self, db: Database):
         eng = AgentEngine.__new__(AgentEngine)
         eng.db = db
-        eng._bg_task_registry = {}
+        eng.agents = AgentRegistry.for_tests()
         await db.create_session("s1", source="web", actor=None)
         return eng
 
@@ -132,9 +134,9 @@ class TestEnginePendingWork:
     @pytest.mark.asyncio
     async def test_broadcast_carries_pending_work(self, engine):
         await engine.db.add_wakeup("s1", prompt="tick", fire_at=_future())
-        engine._bg_task_registry["s1"] = {
-            "t1": {"task_id": "t1", "status": "running"},
-        }
+        await engine.agents.on_system_event("s1", SystemEvent("task_started", {
+            "task_id": "t1", "task_type": "local_bash", "description": "build",
+        }))
         events: list[dict] = []
         with patch("nerve.agent.engine.broadcaster") as bc:
             bc.broadcast = AsyncMock(side_effect=lambda ch, m: events.append((ch, m)))
@@ -146,6 +148,7 @@ class TestEnginePendingWork:
         assert msg["is_running"] is False
         assert msg["pending_wakeup_at"] is not None
         assert msg["has_background_tasks"] is True
+        assert msg["background_count"] == 1
 
     @pytest.mark.asyncio
     async def test_broadcast_reports_idle_when_nothing_pending(self, engine):
@@ -156,12 +159,17 @@ class TestEnginePendingWork:
 
         assert events[0]["pending_wakeup_at"] is None
         assert events[0]["has_background_tasks"] is False
+        assert events[0]["background_count"] == 0
 
     @pytest.mark.asyncio
     async def test_settled_background_task_is_not_live(self, engine):
-        engine._bg_task_registry["s1"] = {
-            "t1": {"task_id": "t1", "status": "completed"},
-        }
+        await engine.agents.on_system_event("s1", SystemEvent("task_started", {
+            "task_id": "t1", "task_type": "local_bash", "description": "build",
+        }))
+        assert engine.has_live_background_tasks("s1") is True
+        await engine.agents.on_system_event("s1", SystemEvent(
+            "task_notification", {"task_id": "t1", "status": "completed"},
+        ))
         assert engine.has_live_background_tasks("s1") is False
 
     @pytest.mark.parametrize("func", ["run", "_run_inner", "_finalize_turn"])

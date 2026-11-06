@@ -1,5 +1,5 @@
 import { useUIStore } from '../stores/uiStore';
-import { formatCombo, type ShortcutCombo } from '../utils/keyboard';
+import { FOCUS_COMPOSER_COMBO, formatCombo, type ShortcutCombo } from '../utils/keyboard';
 import { Modal } from './ui/Modal';
 
 interface DisplayShortcut {
@@ -39,11 +39,22 @@ const SECTIONS: Section[] = [
     title: 'Chat',
     items: [
       { combo: { mod: true, shift: true, key: 's' }, description: 'Toggle session sidebar' },
-      { combo: { mod: true, shift: true, key: ';' }, description: 'Focus message input' },
+      { combo: FOCUS_COMPOSER_COMBO, description: 'Focus message input' },
       { combo: { mod: true, shift: true, key: 'c' }, description: 'Copy last response' },
       { combo: { mod: true, shift: true, key: 'f' }, description: 'Fork this chat' },
       { combo: { mod: true, shift: true, key: 'Backspace' }, description: 'Delete current conversation' },
       { combo: { mod: true, key: '\\' }, description: 'Toggle side panel' },
+      { combo: { mod: true, shift: true, key: 'e' }, description: 'Toggle the agents panel' },
+      { combo: { key: 'ArrowDown' }, label: '↓', description: 'Open agents (empty message box)' },
+    ],
+  },
+  {
+    title: 'Agents panel',
+    items: [
+      { combo: { key: 'ArrowUp' }, label: '↑ ↓', description: 'Move between agents' },
+      { combo: { key: 'Enter' }, description: 'Open the agent' },
+      { combo: { key: 'x' }, label: 'x x', description: 'Stop the agent' },
+      { combo: { key: 'Escape' }, description: 'Back to the message box' },
     ],
   },
   {

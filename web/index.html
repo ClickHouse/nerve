@@ -23,13 +23,13 @@
            data-theme      Nerve's own preference. Absent means "follow the OS",
                            which a media query in index.css handles.
            data-cui-theme  Click UI's tokens. It has no "system" value and it
-                           defaults to LIGHT when the attribute is missing —
-                           while Nerve defaults to dark. Leaving it unset is a
-                           white flash on every cold load. -->
+                           defaults to LIGHT when the attribute is missing.
+                           Leaving it unset is a white flash on every cold
+                           load of a dark theme. -->
     <script>
       (function () {
         var p = localStorage.getItem('nerve-theme');
-        if (p !== 'light' && p !== 'dark' && p !== 'system') p = 'dark';
+        if (p !== 'light' && p !== 'dark' && p !== 'system') p = 'system';
         if (p !== 'system') {
           document.documentElement.setAttribute('data-theme', p);
         }

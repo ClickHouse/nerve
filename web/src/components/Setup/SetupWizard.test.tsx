@@ -3,7 +3,8 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation, useParams } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
-  SetupAutomationDetail, SetupState, TelegramSyncSession, TelegramSyncSessionSummary,
+  SetupAutomationDetail, SetupModeDetail, SetupSourcesDetail, SetupState, SetupStep, TelegramSyncSession,
+  TelegramSyncSessionSummary, WorkCatalogItem, WorkSelection,
 } from '../../api/client';
 
 vi.mock('../../api/client', async () => {
@@ -51,8 +52,9 @@ const { useAuthStore } = await import('../../stores/authStore');
 const { useSetupStore } = await import('../../stores/setupStore');
 const { browserTimeZone } = await import('../../utils/timeZones');
 const {
-  CHANNELS, MODE_LOCK_REASON, WORKER_AUTOMATION, WORKER_PROFILE, makeExternalState, makeState, makeWorkerState, on,
-  step, withStep,
+  CHANNELS, MODE_LOCK_REASON, NO_WORK, WAITS_FOR_MODE, WORKER_AUTOMATION, WORKER_PROFILE, WORK_CATALOG,
+  makeExternalState, makeState,
+  makeWorkerState, on, step, withStep,
 } = await import('../../test/setupFixtures');
 const { SetupPage } = await import('../../pages/SetupPage');
 const { ReadyScreen } = await import('./ReadyScreen');
@@ -121,6 +123,25 @@ const SESSION_OUT: TelegramSyncSession = {
 };
 const ALICE = { id: 1, username: 'alice_example', first_name: 'Alice' };
 const SESSION_IN: TelegramSyncSession = { ...SESSION_OUT, session_present: true, authorized: true, user: ALICE };
+
+/** The sources preflight while the channel gateway polls GitHub: gh is not run. */
+const HOSTED_PREFLIGHT = {
+  github: {
+    cli: false, authenticated: false, login: null, hosted: true,
+    hint: 'The channel gateway polls GitHub for this agent once a GitHub credential is connected to it; gh is not needed on the server.',
+  },
+  gmail: { cli: false, hint: 'Install gog.' },
+  telegram: { credentials_configured: false },
+  checked_at: '2026-10-10T09:12:03Z',
+};
+/** The Sources step's reason while the channel gateway polls GitHub and the operator holds its switch. */
+const GITHUB_HELD = 'GitHub arrives from the channel gateway of this deployment once a GitHub credential is connected to this agent; nothing to switch here.';
+/** The same, with the switch held off. */
+const GITHUB_HELD_OFF = 'GitHub is switched off for this agent by the operator of this deployment; nothing to switch here.';
+/** The Sources step as the server sends it then: done, GitHub on, Gmail and Telegram still on offer. */
+const githubHeld = (overrides: Partial<SetupStep> = {}, detail: Partial<SetupSourcesDetail> = {}) => step('sources', { status: 'done', ...overrides }, {
+  github: { enabled: true, source: null, managed: true }, available: ['gmail', 'telegram'], unavailable_reason: GITHUB_HELD, ...detail,
+});
 
 const realMatchMedia = window.matchMedia;
 
@@ -262,6 +283,32 @@ describe('rail and overview', () => {
     expect(field).not.toHaveAccessibleDescription(/Prefilled from/);
   });
 
+  it('the agent name the environment gives stands in and is saved on Continue', async () => {
+    // A hosted deployment seeds the agent's display name; IDENTITY.md has no
+    // name yet, so the prefill differs from what the file holds and is sent.
+    current = withStep(makeState(), step('profile', { status: 'pending' }, {
+      agent_name: null, agent_name_prefill: 'Ada',
+    }));
+    renderAt('/setup/profile');
+    await heading('About you');
+    expect(screen.getByLabelText('Agent name')).toHaveValue('Ada');
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledTimes(1));
+    expect(api.setupStep).toHaveBeenCalledWith('profile', expect.objectContaining({ agent_name: 'Ada' }));
+  });
+
+  it('a saved agent name is not sent again, prefill or not', async () => {
+    current = withStep(makeState(), step('profile', { status: 'pending' }, {
+      agent_name: 'Lovelace', agent_name_prefill: null,
+    }));
+    renderAt('/setup/profile');
+    await heading('About you');
+    expect(screen.getByLabelText('Agent name')).toHaveValue('Lovelace');
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledTimes(1));
+    expect(api.setupStep).toHaveBeenCalledWith('profile', expect.not.objectContaining({ agent_name: expect.anything() }));
+  });
+
   it('the model picker names the server default instead of "keep the current model"', async () => {
     current = withStep(makeState(), step('provider', { status: 'done' }, {
       credential: 'api_key', anthropic_api_key: on('ab12'), model: 'claude-sonnet-4-6', effort: 'high',
@@ -304,7 +351,7 @@ describe('rail and overview', () => {
     await heading('Everything is set up');
     expect(screen.getAllByRole('link', { name: 'Change' }).length).toBeGreaterThan(0);
     expect(screen.getByText('7 done · 2 skipped')).toBeInTheDocument();
-    expect(screen.queryByText(/Already configured/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Your operator has configured' })).not.toBeInTheDocument();
     // Done means chat: the primary action goes there; the review is a link.
     expect(screen.getByRole('link', { name: 'Open review' })).toHaveAttribute('href', '/setup/review');
     await userEvent.click(screen.getByRole('button', { name: /Back to chat/ }));
@@ -322,22 +369,15 @@ describe('rail and overview', () => {
     expect(within(nav).queryByRole('link', { name: /^Claim/ })).not.toBeInTheDocument();
   });
 
-  it('"Already configured" names only steps whose configuration provably came from outside the wizard', async () => {
-    // A credential from the server's environment is such a step.
+  it('a done step that the person can still change stays in the list, also with a credential from the environment', async () => {
+    // The model and effort picker stays open beside the operator's credential.
     current = withStep(makeState(), step('provider', { status: 'done' }, { credential: 'environment' }));
-    const view = renderAt('/setup');
-    await heading(/^Welcome, /);
-    expect(screen.getByText(/Already configured/)).toHaveTextContent('Already configured: Model.');
-    view.unmount();
-
-    // A key pasted into this wizard — a minute ago, after a reload, or by
-    // somebody else — is not, whatever this tab happened to read first.
-    useSetupStore.getState().reset();
-    current = withStep(makeState(), step('provider', { status: 'done' }, { credential: 'api_key', anthropic_api_key: on('ab12') }));
     renderAt('/setup');
     await heading(/^Welcome, /);
+    const row = within(screen.getByRole('list', { name: 'Steps' })).getByRole('link', { name: 'Model' }).closest('li')!;
+    expect(within(row).getByRole('link', { name: 'Change' })).toHaveAttribute('href', '/setup/provider');
     expect(screen.getByText(/3 of 9 steps done/)).toBeInTheDocument();
-    expect(screen.queryByText(/Already configured/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Your operator has configured' })).not.toBeInTheDocument();
   });
 
   it('the Account row points at Accounts instead of a Change that changes nothing', async () => {
@@ -727,32 +767,47 @@ describe('forms open on server values and send the right payload', () => {
     expect(worker).toBeChecked();
   });
 
-  it('a worker\'s Mode step says what the onboarding is doing in words, never the session id', async () => {
-    const worker = (onboarding: 'pending' | 'ended', id: string | null) => makeState({
-      mode: 'worker',
+  it('the Mode step says what the onboarding is doing in words, never the session id', async () => {
+    const chosen = (onboarding: 'pending' | 'running' | 'skipped', id: string | null) => makeState({
+      mode: 'personal',
       steps: [
         step('claim', { status: 'done' }),
         step('mode', { status: 'done', read_only: true, read_only_reason: MODE_LOCK_REASON }, {
-          mode: 'worker', task_present: true, onboarding, onboarding_session_id: id,
+          mode: 'personal', onboarding, onboarding_session_id: id,
         }),
-        step('provider', { status: 'done' }), step('profile', { title: 'Operator' }),
+        step('provider', { status: 'done' }),
       ],
     });
-    current = worker('ended', 'sess-1');
+    current = chosen('running', 'onboarding-1');
     const view = renderAt('/setup/mode');
     await heading('Choose a mode');
-    const line = screen.getByText(/ended without writing a plan/);
-    expect(line).not.toHaveTextContent('sess-1');
-    expect(line).not.toHaveTextContent(/Onboarding:/);
-    expect(line).toHaveTextContent('The onboarding session ended without writing a plan. Open it to see why.');
-    expect(within(line).getByRole('link', { name: 'Open it' })).toHaveAttribute('href', '/chat/sess-1');
+    const line = screen.getByText(/waits for you in its onboarding conversation/);
+    expect(line).not.toHaveTextContent('onboarding-1');
+    expect(within(line).getByRole('link', { name: 'Continue the conversation' }))
+      .toHaveAttribute('href', '/chat/onboarding-1');
     view.unmount();
 
+    for (const [status, text] of [
+      ['pending', 'The onboarding conversation starts when you finish setup.'],
+      ['skipped', 'Onboarding was skipped.'],
+    ] as const) {
+      useSetupStore.getState().reset();
+      current = chosen(status, null);
+      const again = renderAt('/setup/mode');
+      await heading('Choose a mode');
+      expect(await screen.findByText(text)).toBeInTheDocument();
+      again.unmount();
+    }
+
     useSetupStore.getState().reset();
-    current = worker('pending', null);
+    const running = chosen('running', 'onboarding-2');
+    const mode = running.steps.find((x) => x.id === 'mode')!;
+    current = withStep(running, { ...mode, detail: { ...mode.detail, onboarding_kind: 'autonomous' } });
     renderAt('/setup/mode');
     await heading('Choose a mode');
-    expect(await screen.findByText('The onboarding session starts after setup finishes.')).toBeInTheDocument();
+    const autonomous = await screen.findByText(/setting itself up from its task description/);
+    expect(within(autonomous).getByRole('link', { name: 'Open the session' }))
+      .toHaveAttribute('href', '/chat/onboarding-2');
   });
 
   it('automation: a done step opens on the file exactly', async () => {
@@ -769,7 +824,7 @@ describe('forms open on server values and send the right payload', () => {
     const planner = screen.getByRole('checkbox', { name: /Task planner/ });
     expect(planner).not.toBeChecked();
     expect(planner).toHaveAccessibleDescription(
-      'Off for workers until onboarding decides. The onboarding session enables it when this worker should plan through the approval loop.',
+      'Off for workers until onboarding decides. The onboarding conversation turns it on when this worker should plan through the approval loop.',
     );
     expect(screen.getByRole('checkbox', { name: /Skill reviser/ })).toBeChecked();
     expect(screen.getByRole('checkbox', { name: /Skill extractor/ })).toBeChecked();
@@ -805,6 +860,16 @@ describe('forms open on server values and send the right payload', () => {
     await screen.findByText(/Run gh auth login/);
     await userEvent.click(screen.getByRole('checkbox', { name: /GitHub/ }));
     expect(screen.getByText(/stays idle until the tool is set up/)).toBeInTheDocument();
+  });
+
+  it('sources: hosted GitHub needs no gh, says so, and does not warn when enabled', async () => {
+    m(api.setupSourcesPreflight).mockResolvedValue(HOSTED_PREFLIGHT);
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    expect(await screen.findByText(/gh is not needed on the server/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('checkbox', { name: /GitHub/ }));
+    expect(screen.queryByText(/stays idle until the tool is set up/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/gh is installed and signed in/)).not.toBeInTheDocument();
   });
 
   it('agents: nothing is pre-checked, the footer line says what Continue writes, and [] is a decision', async () => {
@@ -892,22 +957,247 @@ describe('forms open on server values and send the right payload', () => {
     await waitFor(() => expect(screen.queryByRole('heading', { level: 1, name: 'Choose a mode' })).not.toBeInTheDocument());
   });
 
-  it('a worker needs a task description; a starter template fills one in', async () => {
-    current = withStep(makeState({ mode: null }), step('mode', {}, { mode: null, templates_present: [] }));
+  it('automation: a job that jobs.yaml replaces shows its state and cannot be changed here', async () => {
+    current = withStep(makeWorkerState(), step('automation', {}, {
+      ...WORKER_AUTOMATION,
+      optional: WORKER_AUTOMATION.optional!.map((job) => (
+        job.id === 'task-planner' ? { ...job, enabled: true, overridden: true } : job
+      )),
+    }));
+    renderAt('/setup/automation');
+    await heading('Scheduled jobs');
+    const planner = screen.getByRole('checkbox', { name: /Task planner/ });
+    expect(planner).toBeChecked();
+    expect(planner).toBeDisabled();
+    expect(planner).toHaveAccessibleDescription('Set in jobs.yaml. Change it there, or ask the agent.');
+  });
+
+});
+
+describe('a worker\'s work on the Mode step', () => {
+  const RULES = 'Anything it must know or never do? (optional)';
+  const byGroup = (group: string) => WORK_CATALOG.filter((item) => item.group === group);
+  /** A fresh instance on the Mode step, with the server's catalog. */
+  const fresh = (catalog: WorkCatalogItem[] = WORK_CATALOG) => withStep(
+    makeState({ mode: null }),
+    step('mode', {}, { mode: null, templates_present: [], work_catalog: catalog, work: NO_WORK }),
+  );
+  async function openWorker(catalog?: WorkCatalogItem[]) {
+    current = fresh(catalog);
     renderAt('/setup/mode');
     await heading('Choose a mode');
     await userEvent.click(screen.getByRole('radio', { name: /Worker/ }));
-    await userEvent.type(screen.getByLabelText('Task description'), 'x');
-    await userEvent.click(continueButton());
-    expect(screen.getByLabelText('Task description')).toHaveAccessibleDescription(/at least one full sentence/);
-    expect(api.setupStep).not.toHaveBeenCalled();
+  }
+  const box = (name: string) => screen.getByRole('checkbox', { name });
+  /** A worker past the Mode step whose detail carries `work` (or none: an older backend). */
+  const workerWith = (work: WorkSelection | undefined) => {
+    const base = makeWorkerState();
+    const mode = base.steps.find((s) => s.id === 'mode')!;
+    return withStep(base, { ...mode, detail: { ...mode.detail, work_catalog: WORK_CATALOG, work } as SetupModeDetail });
+  };
+  const modeRow = () => within(screen.getByRole('region', { name: 'Checklist' })).getByText('Worker').closest('li')!;
 
-    await userEvent.click(screen.getByRole('button', { name: 'Monitor a build' }));
-    expect(screen.getByText(/On first boot the worker reads this description/)).toBeInTheDocument();
+  it('lists the catalog in groups, code · operations · communication · knowledge, each item with its line', async () => {
+    // The groups' order is the page's, not the order they arrive in.
+    await openWorker([...byGroup('knowledge'), ...byGroup('communication'), ...byGroup('code'), ...byGroup('operations')]);
+    const section = screen.getByRole('region', { name: 'What should it do?' });
+    expect(within(section).getByText('Tick what applies; the conversation sorts out the details.')).toBeInTheDocument();
+    expect(within(section).getAllByRole('heading', { level: 3 }).map((h) => h.textContent))
+      .toEqual(['Code', 'Operations', 'Communication', 'Knowledge']);
+    const code = within(section).getByRole('group', { name: 'Code' });
+    expect(within(code).getAllByRole('checkbox')).toHaveLength(5);
+    expect(within(code).getByRole('checkbox', { name: 'Review pull requests' }))
+      .toHaveAccessibleDescription('Reads diffs, runs targeted checks, posts review comments.');
+    expect(within(section).getByRole('group', { name: 'Knowledge' })).toHaveTextContent('Research and reports');
+    expect(within(section).getByRole('group', { name: 'Communication' })).toHaveTextContent('Channel digests and answers');
+    // The alerts item carries its connection note under the description; no other item has one.
+    const operations = within(section).getByRole('group', { name: 'Operations' });
+    expect(within(operations).getByRole('checkbox', { name: 'First response to alerts' })).toHaveAccessibleDescription(
+      'Reads where alerts land, does the first investigation, posts findings, escalates by rule. '
+      + 'Needs an alert source; a Slack channel is the first-class one today.',
+    );
+    expect(within(operations).getByText('Needs an alert source; a Slack channel is the first-class one today.')).toBeInTheDocument();
+    expect(within(code).getByRole('checkbox', { name: 'Review pull requests' }))
+      .not.toHaveAccessibleDescription(/Needs an alert source/);
+    // Headings are text, not "select all" boxes; nothing is ticked on arrival.
+    expect(screen.queryByRole('checkbox', { name: 'Code' })).not.toBeInTheDocument();
+    expect(within(section).getAllByRole('checkbox').filter((c) => (c as HTMLInputElement).checked)).toHaveLength(0);
+    expect(box('Custom…')).not.toBeChecked();
+    expect(screen.queryByRole('textbox', { name: 'Other work' })).not.toBeInTheDocument();
+    expect(screen.getByLabelText(RULES)).toHaveAttribute('placeholder', 'For example: never merge anything on its own.');
+    expect(screen.queryByText(/Anything it should know/)).not.toBeInTheDocument();
+  });
+
+  it('an item without a `note` shows its description as the server wrote it, note and all', async () => {
+    const note = 'Needs an alert source; a Slack channel is the first-class one today.';
+    await openWorker(WORK_CATALOG.map((item) => {
+      const plain: WorkCatalogItem = { ...item };
+      delete plain.note;
+      return plain.id === 'alert-response' ? { ...plain, description: `${plain.description} ${note}` } : plain;
+    }));
+    expect(box('First response to alerts')).toHaveAccessibleDescription(
+      `Reads where alerts land, does the first investigation, posts findings, escalates by rule. ${note}`,
+    );
+    // Within the description, not again on a line of its own.
+    expect(screen.queryByText(note)).not.toBeInTheDocument();
+  });
+
+  it('ticked items go to the server in catalog order, with the rules; unticking takes one out', async () => {
+    await openWorker();
+    await userEvent.click(box('Research and reports'));
+    await userEvent.click(box('Triage issues'));
+    await userEvent.click(box('Review pull requests'));
+    expect(box('Triage issues')).toBeChecked();
+    await userEvent.click(box('Triage issues'));
+    expect(box('Triage issues')).not.toBeChecked();
+    // The whole row is the hit area: its description ticks it too.
+    await userEvent.click(screen.getByText('Failures on main, flaky tests, quarantines, perf regressions where benchmarks exist.'));
+    expect(box('Keep CI healthy')).toBeChecked();
+    // Space on a focused box, as a keyboard ticks it.
+    box('Docs and release notes').focus();
+    await userEvent.keyboard(' ');
+    expect(box('Docs and release notes')).toBeChecked();
+    await userEvent.type(screen.getByLabelText(RULES), '  Never merge anything on its own.  ');
     await userEvent.click(continueButton());
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('mode', {
-      mode: 'worker', task_description: expect.stringContaining('nightly build'),
+      mode: 'worker',
+      work: {
+        items: ['review-prs', 'ci-health', 'research-reports', 'docs-release-notes'],
+        custom: '',
+        rules: 'Never merge anything on its own.',
+      },
     }));
+  });
+
+  it('Custom… opens a field for other work; unticking clears and hides it; ticked, it needs words', async () => {
+    await openWorker();
+    await userEvent.click(box('Custom…'));
+    const field = screen.getByRole('textbox', { name: 'Other work' });
+    expect(field).toHaveAttribute('placeholder', 'Describe other work, in your own words');
+    expect(field).toHaveFocus();
+    await userEvent.type(field, 'Watch the nightly benchmark job in org/repo-a.');
+    await userEvent.click(box('Custom…'));
+    expect(screen.queryByRole('textbox', { name: 'Other work' })).not.toBeInTheDocument();
+    await userEvent.click(box('Custom…'));
+    expect(screen.getByRole('textbox', { name: 'Other work' })).toHaveValue('');
+
+    await userEvent.click(continueButton());
+    expect(screen.getByRole('textbox', { name: 'Other work' }))
+      .toHaveAccessibleDescription('Untick Custom… or describe the other work.');
+    expect(api.setupStep).not.toHaveBeenCalled();
+
+    await userEvent.type(screen.getByRole('textbox', { name: 'Other work' }), '  Watch the nightly benchmark job in org/repo-a.  ');
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('mode', {
+      mode: 'worker', work: { items: [], custom: 'Watch the nightly benchmark job in org/repo-a.', rules: '' },
+    }));
+  });
+
+  it('nothing ticked is an answer; the length caps are checked before anything is sent', async () => {
+    await openWorker();
+    await userEvent.click(box('Custom…'));
+    fireEvent.change(screen.getByRole('textbox', { name: 'Other work' }), { target: { value: 'x'.repeat(4001) } });
+    fireEvent.change(screen.getByLabelText(RULES), { target: { value: 'y'.repeat(2001) } });
+    await userEvent.click(continueButton());
+    expect(screen.getByRole('textbox', { name: 'Other work' })).toHaveAccessibleDescription('Keep this under 4000 characters.');
+    expect(screen.getByLabelText(RULES)).toHaveAccessibleDescription('Keep this under 2000 characters.');
+    // Focus lands on the first field to fix.
+    expect(screen.getByRole('textbox', { name: 'Other work' })).toHaveFocus();
+    expect(api.setupStep).not.toHaveBeenCalled();
+
+    await userEvent.click(box('Custom…'));
+    fireEvent.change(screen.getByLabelText(RULES), { target: { value: '' } });
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('mode', {
+      mode: 'worker', work: { items: [], custom: '', rules: '' },
+    }));
+  });
+
+  it('a refusal from the server lands beside the field it names', async () => {
+    m(api.setupStep)
+      .mockRejectedValueOnce(new ApiError(400, '{"detail": "Unknown work item: review-everything.", "field": "work.items"}'))
+      .mockRejectedValueOnce(new ApiError(400, '{"detail": "Keep the rules under 2000 characters.", "field": "work.rules"}'));
+    await openWorker();
+    await userEvent.click(box('Review pull requests'));
+    await userEvent.click(continueButton());
+    const section = screen.getByRole('region', { name: 'What should it do?' });
+    expect(await within(section).findByRole('alert')).toHaveTextContent('Unknown work item: review-everything.');
+
+    await userEvent.type(screen.getByLabelText(RULES), 'Never merge.');
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(screen.getByLabelText(RULES)).toHaveAccessibleDescription('Keep the rules under 2000 characters.'));
+    expect(within(section).queryByRole('alert')).not.toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 1, name: 'Choose a mode' })).toBeInTheDocument();
+  });
+
+  it('personal is unchanged: no catalog, no fields, and the mode alone is sent', async () => {
+    current = fresh();
+    renderAt('/setup/mode');
+    await heading('Choose a mode');
+    expect(screen.getByRole('radio', { name: /Personal assistant/ })).toBeChecked();
+    expect(screen.queryByRole('region', { name: 'What should it do?' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+    expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
+    // Ticks made under Worker stay behind when the choice goes back to Personal.
+    await userEvent.click(screen.getByRole('radio', { name: /Worker/ }));
+    await userEvent.click(box('Review pull requests'));
+    await userEvent.click(screen.getByRole('radio', { name: /Personal assistant/ }));
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('mode', { mode: 'personal' }));
+  });
+
+  it('the Review lists the work chosen, the other work and the rules under the Mode row', async () => {
+    current = workerWith({
+      items: ['triage-issues', 'review-prs'],
+      custom: 'Watch the nightly benchmark job in org/repo-a.',
+      rules: 'Never merge anything on its own.',
+    });
+    const view = renderAt('/setup/review');
+    await heading('Review and finish');
+    expect(modeRow()).toHaveTextContent('Work: Triage issues; Review pull requests');
+    expect(modeRow()).toHaveTextContent('Also: Watch the nightly benchmark job in org/repo-a.');
+    expect(modeRow()).toHaveTextContent('Must know or never do: Never merge anything on its own.');
+    expect(modeRow()).not.toHaveTextContent('No work chosen yet');
+    view.unmount();
+
+    // Nothing chosen: the conversation asks. The rules still show.
+    useSetupStore.getState().reset();
+    current = workerWith({ items: [], custom: '', rules: 'Never merge anything on its own.' });
+    const again = renderAt('/setup/review');
+    await heading('Review and finish');
+    expect(modeRow()).toHaveTextContent('No work chosen yet — the conversation will ask');
+    expect(modeRow()).toHaveTextContent('Must know or never do: Never merge anything on its own.');
+    expect(modeRow()).not.toHaveTextContent('Work:');
+    expect(modeRow()).not.toHaveTextContent('Also:');
+    again.unmount();
+
+    // Other work alone is work chosen.
+    useSetupStore.getState().reset();
+    current = workerWith({ items: [], custom: 'Answer questions about org/repo-a.', rules: '' });
+    const third = renderAt('/setup/review');
+    await heading('Review and finish');
+    expect(modeRow()).toHaveTextContent('Also: Answer questions about org/repo-a.');
+    expect(modeRow()).not.toHaveTextContent('No work chosen yet');
+    expect(modeRow()).not.toHaveTextContent('Must know');
+    third.unmount();
+
+    // An older backend sends no `work`: no lines, rather than a wrong "nothing chosen".
+    useSetupStore.getState().reset();
+    current = workerWith(undefined);
+    const older = renderAt('/setup/review');
+    await heading('Review and finish');
+    expect(modeRow()).not.toHaveTextContent('No work chosen yet');
+    older.unmount();
+
+    // A personal install has no work lines.
+    useSetupStore.getState().reset();
+    current = decided();
+    renderAt('/setup/review');
+    await heading('Review and finish');
+    const personal = within(screen.getByRole('region', { name: 'Checklist' })).getByText('Personal assistant').closest('li')!;
+    expect(personal).not.toHaveTextContent('No work chosen yet');
+    expect(personal).not.toHaveTextContent('Work:');
   });
 });
 
@@ -946,12 +1236,15 @@ describe('provider', () => {
     expect(await screen.findByLabelText('Model')).toHaveValue('claude-opus-5-5');
     expect(screen.getByRole('radio', { name: 'max' })).toBeChecked();
     expect(screen.getByText(/leave blank to keep/)).toHaveTextContent('…ab12');
+    // The picker as it stands is the choice, and the choice is the cron model too.
+    expect(screen.getByLabelText('Model')).toHaveAccessibleDescription(/Scheduled jobs run on this model too\./);
 
-    // Change the effort: the next Continue sends just that, then advances.
+    // Change the effort: the next Continue sends that and the model on
+    // screen — the preselected default counts as the pick — then advances.
     await userEvent.click(screen.getByRole('radio', { name: 'high' }));
     m(api.setupStep).mockClear();
     await userEvent.click(continueButton());
-    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('provider', { effort: 'high' }));
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('provider', { effort: 'high', model: 'claude-opus-5-5' }));
     expect(await heading('About you')).toBeInTheDocument();
     expect(screen.queryByText(/Saved\. Pick the default model/)).not.toBeInTheDocument();
   });
@@ -973,6 +1266,53 @@ describe('provider', () => {
     }));
   });
 
+  it('a live test then Continue sends the preselected model with the credential', async () => {
+    renderAt('/setup/provider');
+    await heading('Connect a model');
+    await userEvent.type(screen.getByLabelText('Anthropic API key'), 'sk-ant-REPLACE');
+    await userEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+    const model = await screen.findByLabelText('Model');
+    expect(model).toHaveAccessibleDescription(/Scheduled jobs run on this model too\./);
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('provider', {
+      type: 'anthropic', anthropic_api_key: 'sk-ant-REPLACE', model: 'claude-opus-5-5',
+    }));
+  });
+
+  it('Bedrock after a live test sends no model: the one on screen is the Anthropic catalogue\'s, the server applies the region\'s ids', async () => {
+    renderAt('/setup/provider');
+    await heading('Connect a model');
+    await userEvent.click(screen.getByRole('radio', { name: /AWS Bedrock/ }));
+    await userEvent.click(screen.getByRole('button', { name: 'Test connection' }));
+    await screen.findByLabelText('Model');
+    m(api.setupStep).mockClear();
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('provider', { type: 'bedrock', aws_region: 'us-east-1' }));
+  });
+
+  it('a "Saved" notice does not outlive the wizard: coming back later confirms nothing', async () => {
+    const saved = withStep(makeState(), step('provider', { status: 'done', etag: 'provider-etag-2' }, {
+      credential: 'api_key', anthropic_api_key: on('ab12'), model: 'claude-opus-5-5', effort: 'max',
+      cron_model: 'claude-haiku-4-5-20251001',
+    }));
+    m(api.setupStep).mockImplementation(async () => { current = saved; return saved; });
+    const first = renderAt('/setup/provider');
+    await heading('Connect a model');
+    await userEvent.type(screen.getByLabelText('Anthropic API key'), 'sk-ant-REPLACE');
+    await userEvent.click(continueButton());
+    expect(await screen.findByText(/Saved\. Pick the default model and effort/)).toBeInTheDocument();
+
+    first.unmount();   // off to the chat page, no Continue
+    m(api.setupStep).mockClear();
+    renderAt('/setup/provider');
+    await heading('Connect a model');
+    await screen.findByLabelText('Model');
+    expect(screen.queryByText(/Saved\. Pick the default model and effort/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('radio', { name: 'high' }));
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('provider', { effort: 'high' }));
+  });
+
   it('lists every model the API returns, marks the configured one recommended, and explains Fable', async () => {
     current = withStep(makeState(), step('provider', { status: 'done' }, {
       credential: 'api_key', anthropic_api_key: on('ab12'), model: 'claude-opus-5-5', effort: 'high',
@@ -986,8 +1326,16 @@ describe('provider', () => {
     expect(model).toHaveAccessibleDescription(/Most capable of the classic line/);
     // Nerve's default and the instance's model agree, so nothing is said about it.
     expect(model).not.toHaveAccessibleDescription(/Nerve's default/);
+    // A done step visited later: the cron model set by hand is named, and
+    // only a different pick would move scheduled jobs.
+    expect(model).toHaveAccessibleDescription(
+      /Scheduled jobs run on claude-sonnet-4-6; choosing a different model here moves them to it\./,
+    );
     await userEvent.selectOptions(model, 'claude-fable-5-1');
-    expect(model).toHaveAccessibleDescription('The newest generation; strongest on long, open-ended work.');
+    // The family guidance, then the line that the pick is the cron model too.
+    expect(model).toHaveAccessibleDescription(
+      'The newest generation; strongest on long, open-ended work. Scheduled jobs run on this model too.',
+    );
   });
 
   it('says which model is Nerve\'s default when the instance was set to another', async () => {
@@ -1388,6 +1736,18 @@ describe('pre-configured connections', () => {
     expect(api.setupStep).not.toHaveBeenCalled();
   });
 
+  it('memory kept in Loom has nothing to choose, and Continue sends nothing', async () => {
+    current = withStep(makeState(), step('memory', { status: 'done', summary: 'Kept in Loom' }, { backend: 'loom' }));
+    renderAt('/setup/memory');
+    await heading('Memory');
+    expect(screen.getByText(/Memory on this server is kept in Loom/)).toBeInTheDocument();
+    expect(screen.queryByRole('radio', { name: /Use embeddings/ })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('OpenAI API key')).not.toBeInTheDocument();
+    await userEvent.click(continueButton());
+    expect(await heading('Connect Telegram or Slack')).toBeInTheDocument();
+    expect(api.setupStep).not.toHaveBeenCalled();
+  });
+
   it('sources the operator provided render as managed lines, not fields', async () => {
     current = withStep(makeState(), step('sources', { status: 'done' }, {
       github: { enabled: true, source: 'environment' },
@@ -1413,17 +1773,100 @@ describe('pre-configured connections', () => {
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { github: true, gmail: true, telegram: true }));
   });
 
-  it('"Already configured" names the steps whose credentials the operator provided', async () => {
+  it('steps with a connection the operator provided stay in the list while the server lets the person change them', async () => {
     current = makeState({
       steps: makeState().steps.map((s) => (
         s.id === 'memory' ? step('memory', { status: 'done' }, { openai_api_key: on('ab12', 'environment') })
           : s.id === 'channels' ? step('channels', { status: 'done' }, { telegram: CHANNELS.telegram, slack: { ...CHANNELS.slack, mode: 'hosted', enabled: true } })
-            : s
+            : s.id === 'sources' ? githubHeld()
+              : s
       )),
     });
     renderAt('/setup');
     await heading(/^Welcome, /);
-    expect(screen.getByText(/Already configured/)).toHaveTextContent('Already configured: Memory, Channels.');
+    const rows = within(screen.getByRole('list', { name: 'Steps' }));
+    for (const [title, path] of [['Memory', '/setup/memory'], ['Channels', '/setup/channels'], ['Sources', '/setup/sources']]) {
+      const row = rows.getByRole('link', { name: title }).closest('li')!;
+      expect(within(row).getByRole('link', { name: 'Change' })).toHaveAttribute('href', path);
+    }
+    expect(screen.queryByRole('region', { name: 'Your operator has configured' })).not.toBeInTheDocument();
+  });
+
+  it('a GitHub switch the operator holds shows the source with no switch, and the save leaves it out', async () => {
+    m(api.setupSourcesPreflight).mockResolvedValue(HOSTED_PREFLIGHT);
+    current = withStep(makeState(), githubHeld());
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    expect(screen.getByText(GITHUB_HELD)).toBeInTheDocument();
+    const card = within(screen.getByRole('region', { name: 'GitHub' }));
+    expect(card.queryByRole('checkbox')).not.toBeInTheDocument();
+    expect(card.getByText('On · managed by the channel gateway')).toBeInTheDocument();
+    expect(await card.findByText(/once a GitHub credential is connected to it/)).toBeInTheDocument();
+    // Gmail and Telegram are still on offer, and the save carries them alone.
+    expect(screen.getByRole('checkbox', { name: /Gmail/ })).toBeEnabled();
+    // GitHub stays on, so the button names the sources it does switch off.
+    expect(screen.queryByRole('button', { name: 'Turn all off' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Turn Gmail and Telegram off' }));
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { gmail: false, telegram: false }));
+  });
+
+  it('a GitHub the operator switched off has no card, is said once, and the step stays the person\'s', async () => {
+    m(api.setupSourcesPreflight).mockResolvedValue(HOSTED_PREFLIGHT);
+    // "None of these" answered earlier: done, with Gmail and Telegram still on offer.
+    current = withStep(makeState(), githubHeld({ summary: 'None' }, {
+      github: { enabled: false, source: null, managed: true }, unavailable_reason: GITHUB_HELD_OFF,
+    }));
+    const view = renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    expect(screen.getAllByText(GITHUB_HELD_OFF)).toHaveLength(1);
+    expect(screen.queryByRole('region', { name: 'GitHub' })).not.toBeInTheDocument();
+    expect(screen.queryByText('On · managed by the channel gateway')).not.toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: /Gmail/ })).toBeEnabled();
+    expect(screen.getByRole('checkbox', { name: /Telegram — your own messages/ })).toBeEnabled();
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { gmail: false, telegram: false }));
+    view.unmount();
+
+    // The person can still change the step, so the Overview lists it as theirs.
+    useSetupStore.getState().reset();
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    expect(within(screen.getByRole('list', { name: 'Steps' })).getByRole('link', { name: 'Sources' })).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Your operator has configured' })).not.toBeInTheDocument();
+  });
+
+  it('a save refused for a GitHub switch the operator took over meanwhile says so and keeps the other choices', async () => {
+    const gmail = { enabled: true, accounts: ['alice@example.com'], source: 'file' as const };
+    // Opened before the operator held the switch, so GitHub is still on offer here.
+    current = withStep(makeState(), step('sources', { status: 'done' }, { github: { enabled: true, source: null }, gmail }));
+    m(api.setupStep).mockImplementationOnce(async () => {
+      // The re-read after the refusal finds the switch held, and the step changed.
+      current = withStep(makeState(), githubHeld({ etag: 'sources-etag-2' }, { gmail }));
+      throw new ApiError(409, JSON.stringify({ detail: GITHUB_HELD, field: 'github' }));
+    });
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    await userEvent.click(screen.getByRole('checkbox', { name: /Gmail/ }));
+    await userEvent.click(screen.getByRole('checkbox', { name: /Telegram — your own messages/ }));
+    await userEvent.type(screen.getByLabelText('API id'), '1234567');
+    await userEvent.type(screen.getByLabelText('API hash'), 'abcdef0123456789abcdef0123456789');
+    await userEvent.click(continueButton());
+    const credentials = { telegram_api_id: 1234567, telegram_api_hash: 'abcdef0123456789abcdef0123456789' };
+    expect(api.setupStep).toHaveBeenCalledWith('sources', { github: true, gmail: false, telegram: true, ...credentials });
+    // The form now shows the switch as the operator's, and the refusal is said
+    // once: in place of the step's reason, which is the same sentence.
+    const card = within(await screen.findByRole('region', { name: 'GitHub' }));
+    await waitFor(() => expect(card.queryByRole('checkbox')).not.toBeInTheDocument());
+    expect(screen.getByRole('alert')).toHaveTextContent(GITHUB_HELD);
+    expect(screen.getAllByText(GITHUB_HELD)).toHaveLength(1);
+    // What the person chose for the other sources is still there, and the
+    // next Continue saves it without the switch.
+    expect(screen.getByRole('checkbox', { name: /Gmail/ })).not.toBeChecked();
+    expect(screen.getByRole('checkbox', { name: /Telegram — your own messages/ })).toBeChecked();
+    expect(screen.getByLabelText('API id')).toHaveValue('1234567');
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenLastCalledWith('sources', { gmail: false, telegram: true, ...credentials }));
   });
 });
 
@@ -1601,8 +2044,8 @@ describe('telegram message sync sign-in', () => {
   });
 
   it('the ready screen lists an unsigned Telegram sync with a way back to the step', () => {
-    const sync = (session: TelegramSyncSessionSummary) =>
-      withStep(makeState({ finished: true, steps_left: 0 }), step('sources', { status: 'done' }, {
+    const sync = (session: TelegramSyncSessionSummary, overrides: Partial<SetupStep> = {}) =>
+      withStep(makeState({ finished: true, steps_left: 0 }), step('sources', { status: 'done', ...overrides }, {
         telegram: { enabled: true, api_id: on('4567'), api_hash: on('ab12'), session },
       }));
     const view = render(<MemoryRouter><ReadyScreen state={sync({ present: false, authorized: false, user: null })} /></MemoryRouter>);
@@ -1614,8 +2057,20 @@ describe('telegram message sync sign-in', () => {
     expect(screen.queryByText(/in effect/)).not.toBeInTheDocument();
     view.unmount();
 
-    render(<MemoryRouter><ReadyScreen state={sync({ present: true, authorized: true, user: ALICE })} /></MemoryRouter>);
+    const signedIn = render(<MemoryRouter><ReadyScreen state={sync({ present: true, authorized: true, user: ALICE })} /></MemoryRouter>);
     expect(screen.queryByText(/not signed in/)).not.toBeInTheDocument();
+    signedIn.unmount();
+
+    // A Sources step that the operator configured is not on the setup page:
+    // the line stays, with no link to the step.
+    const operators = sync(
+      { present: false, authorized: false, user: null },
+      { read_only: true, read_only_reason: 'Configuration is managed from the config repository on this instance.' },
+    );
+    render(<MemoryRouter><ReadyScreen state={operators} /></MemoryRouter>);
+    const lockedSummary = screen.getByRole('list', { name: 'Summary' });
+    expect(lockedSummary).toHaveTextContent('Telegram message sync: not signed in');
+    expect(within(lockedSummary).queryByRole('link', { name: 'Sign in' })).not.toBeInTheDocument();
   });
 });
 
@@ -1660,18 +2115,53 @@ describe('lockdown', () => {
     });
   }
 
-  it('shows Lock badges, Next on blocked steps, and a notice on the overview', async () => {
+  it('leaves the locked steps out, keeps the notice on the overview, and counts what is left', async () => {
     current = lockedState();
-    renderAt('/setup');
+    const view = renderAt('/setup');
     await heading(/^Welcome, /);
     expect(screen.getAllByRole('status').some((el) => el.textContent?.includes(LOCK))).toBe(true);
-    const nav = screen.getByRole('navigation', { name: 'Setup steps' });
-    expect(within(nav).getAllByText('Blocked')).toHaveLength(6);
+    // Nothing on the page can complete a locked step, so the page does not show it.
+    const nav = within(screen.getByRole('navigation', { name: 'Setup steps' }));
+    expect(nav.getAllByRole('link').map((link) => link.textContent)).toEqual([
+      expect.stringMatching(/^Account/), expect.stringMatching(/^Mode/), expect.stringMatching(/^About you/), 'Review',
+    ]);
+    expect(nav.queryByText('Blocked')).not.toBeInTheDocument();
+    const rows = within(screen.getByRole('list', { name: 'Steps' }));
+    expect(rows.getAllByRole('listitem')).toHaveLength(3);
+    expect(screen.queryByText(/Configure this step from the config repository/)).not.toBeInTheDocument();
+    expect(screen.getByText('2 of 3 steps done')).toBeInTheDocument();
+    view.unmount();
 
-    await userEvent.click(within(nav).getByRole('link', { name: /Model/ }));
-    await heading('Connect a model');
-    expect(screen.getByRole('button', { name: /Next/ })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /Continue/ })).not.toBeInTheDocument();
+    // A link to a locked step lands on the Overview.
+    useSetupStore.getState().reset();
+    renderAt('/setup/provider');
+    expect(await heading(/^Welcome, /)).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { level: 1, name: 'Connect a model' })).not.toBeInTheDocument();
+  });
+
+  it('lists a step that arrived from the config repository under "Your operator has configured"', async () => {
+    current = withStep(lockedState(), step('provider', {
+      status: 'done', read_only: true, read_only_reason: LOCK, summary: 'Anthropic API key · claude-opus-5-5 · effort high',
+    }));
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    const section = within(screen.getByRole('region', { name: 'Your operator has configured' }));
+    expect(section.getByText('Model')).toBeInTheDocument();
+    expect(section.getByText('Anthropic API key · claude-opus-5-5 · effort high')).toBeInTheDocument();
+    expect(section.queryByRole('link')).not.toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'Steps' })).queryByText('Model')).not.toBeInTheDocument();
+    expect(within(screen.getByRole('navigation', { name: 'Setup steps' })).queryByText('Model')).not.toBeInTheDocument();
+    expect(screen.getByText('2 of 3 steps done')).toBeInTheDocument();
+  });
+
+  it('does not count a locked step that waits for Mode', async () => {
+    // The server keeps the Mode reason but marks the step `lockdown`.
+    current = withStep(lockedState(), step('profile', {
+      status: 'blocked', blocked_kind: 'lockdown', read_only: true, blocked_reason: WAITS_FOR_MODE,
+    }));
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    expect(screen.getByText('2 of 2 steps done')).toBeInTheDocument();
   });
 
   it('local lockdown: only the name is editable on the profile and Continue sends just that', async () => {
@@ -1710,42 +2200,65 @@ describe('instances that keep no credentials on disk', () => {
     });
   }
 
-  it('the overview says which steps are not available on this instance, and why', async () => {
+  it('the overview, the rail and the review leave out the steps this instance closed', async () => {
     current = keylessState();
-    renderAt('/setup');
+    const view = renderAt('/setup');
     await heading(/^Welcome, /);
     const rows = within(screen.getByRole('list', { name: 'Steps' }));
-    expect(rows.getAllByText('Not available on this instance')).toHaveLength(4);
-    expect(rows.getAllByText(CLOSED)).toHaveLength(4);
+    const nav = within(screen.getByRole('navigation', { name: 'Setup steps' }));
     for (const title of ['Memory', 'Channels', 'Sources', 'Agents']) {
-      const row = rows.getByRole('link', { name: title }).closest('li')!;
-      expect(row).toHaveTextContent('Not available on this instance');
-      expect(within(row).queryByText('Blocked')).not.toBeInTheDocument();
-      expect(within(row).queryByText('To do')).not.toBeInTheDocument();
+      expect(rows.queryByRole('link', { name: title })).not.toBeInTheDocument();
+      expect(nav.queryByRole('link', { name: new RegExp(`^${title}`) })).not.toBeInTheDocument();
     }
     expect(rows.getByRole('link', { name: 'Model' }).closest('li')).toHaveTextContent('To do');
-    // Not "already configured" either: nothing was configured, the steps are closed.
-    expect(screen.queryByText(/Already configured/)).not.toBeInTheDocument();
-    // The rail says the same in a chip, with a lock, and never calls it a chore.
-    const nav = within(screen.getByRole('navigation', { name: 'Setup steps' }));
-    expect(nav.getAllByText('Not available')).toHaveLength(4);
-    expect(nav.queryByText('Blocked')).not.toBeInTheDocument();
+    expect(screen.queryByText(CLOSED)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Not available/)).not.toBeInTheDocument();
+    // Nothing was configured either: the steps are closed, not the operator's.
+    expect(screen.queryByRole('region', { name: 'Your operator has configured' })).not.toBeInTheDocument();
+    view.unmount();
+
+    useSetupStore.getState().reset();
+    renderAt('/setup/review');
+    await heading('Review and finish');
+    const checklist = within(screen.getByRole('region', { name: 'Checklist' }));
+    expect(checklist.getAllByRole('listitem')).toHaveLength(5);
+    expect(checklist.queryByText('Memory')).not.toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'Still to do' })).getAllByRole('listitem')).toHaveLength(3);
   });
 
-  it('opening a closed step shows the sentence instead of the form and reads Next', async () => {
+  it('the overview counts only the steps that apply here', async () => {
     current = keylessState();
-    renderAt('/setup/memory');
-    await heading('Memory');
-    expect(screen.getByText('Not available on this instance.')).toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent(CLOSED);
+    const view = renderAt('/setup');
+    await heading(/^Welcome, /);
+    // Account and Mode, of Account, Mode, Model, About you and Automation.
+    expect(screen.getByText('2 of 5 steps done')).toBeInTheDocument();
+    view.unmount();
+
+    // Finished: the count is whole, and the closed steps are still not shown.
+    useSetupStore.getState().reset();
+    current = keylessState({
+      finished: true, steps_left: 0,
+      steps: keylessState().steps.map((s) => (s.status === 'blocked' ? s : step(s.id, { status: 'done' }))),
+    });
+    renderAt('/setup');
+    await heading('Everything is set up');
+    expect(screen.getByText('5 of 5 steps done')).toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'Steps' })).getAllByRole('listitem')).toHaveLength(5);
+  });
+
+  it('a link to a closed step lands on the overview, and Continue passes over the closed steps', async () => {
+    current = keylessState();
+    const view = renderAt('/setup/memory');
+    expect(await heading(/^Welcome, /)).toBeInTheDocument();
     expect(screen.queryByRole('radiogroup', { name: 'Memory recall' })).not.toBeInTheDocument();
-    expect(screen.queryByLabelText('OpenAI API key')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /Test key/ })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: /Skip for now/ })).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: /Next/ }));
-    // Continue passes over the closed steps: Memory → Automation.
+    view.unmount();
+
+    useSetupStore.getState().reset();
+    renderAt('/setup/profile');
+    await heading('About you');
+    await userEvent.click(continueButton());
+    // About you → Automation: Memory, Channels and Sources are closed.
     expect(await heading('Scheduled jobs')).toBeInTheDocument();
-    expect(api.setupStep).not.toHaveBeenCalled();
   });
 
   it('the model step offers Bedrock and says why a key cannot be entered', async () => {
@@ -1800,25 +2313,279 @@ describe('instances that keep no credentials on disk', () => {
     await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('channels', { slack: { enabled: false } }));
   });
 
-  it('a bot token the operator provided says the sentence once', async () => {
-    // Done and read-only: the frame shows the read-only reason, which is the
-    // sentence. The step must not say it again, and the pairing card (whose
-    // server-side reason would be the sentence a third time) is not shown.
-    const provided = step('channels', { status: 'done', read_only: true, read_only_reason: CLOSED }, {
+  it('a bot token the operator provided puts Channels under "Your operator has configured"', async () => {
+    // Done and read-only: nothing on the step can change it.
+    const provided = step('channels', {
+      status: 'done', read_only: true, read_only_reason: CLOSED, summary: 'Telegram @example_bot · 1 paired',
+    }, {
       telegram: {
         ...CHANNELS.telegram, enabled: true, bot_token: on('', 'environment'), bot_username: 'example_bot', live: true,
         pairing_available: false, pairing_unavailable_reason: CLOSED,
       },
     });
     current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'channels' ? provided : s)) });
+    const view = renderAt('/setup');
+    await heading(/^Welcome, /);
+    const section = within(screen.getByRole('region', { name: 'Your operator has configured' }));
+    expect(section.getAllByRole('listitem')).toHaveLength(1);
+    expect(section.getByText('Channels')).toBeInTheDocument();
+    expect(section.getByText('Telegram @example_bot · 1 paired')).toBeInTheDocument();
+    expect(section.queryByRole('link', { name: 'Change' })).not.toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'Steps' })).queryByText('Channels')).not.toBeInTheDocument();
+    expect(within(screen.getByRole('navigation', { name: 'Setup steps' })).queryByText('Channels')).not.toBeInTheDocument();
+    // The count is of the person's own steps.
+    expect(screen.getByText('2 of 5 steps done')).toBeInTheDocument();
+    view.unmount();
+
+    useSetupStore.getState().reset();
     renderAt('/setup/channels');
-    await heading('Connect Telegram or Slack');
-    const form = within(screen.getByRole('form', { name: 'Connect Telegram or Slack' }));
-    expect(form.getAllByText(CLOSED)).toHaveLength(1);
-    expect(form.getByRole('region', { name: 'Telegram' })).toHaveTextContent('@example_bot');
-    expect(form.queryByLabelText(/Telegram user id/)).not.toBeInTheDocument();
-    expect(form.queryByRole('button', { name: /Test token|Also connect Slack/ })).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Next/ })).toBeInTheDocument();
+    expect(await heading(/^Welcome, /)).toBeInTheDocument();
+  });
+
+  const GITHUB_ONLY = 'GitHub is provided by the operator of this deployment; Gmail and Telegram are not available on this instance.';
+  /** The Sources step as the server sends it when the operator's GitHub token comes from the environment. */
+  const githubOnly = (overrides: Partial<SetupStep> = {}, detail: Partial<SetupSourcesDetail> = {}) => step('sources', overrides, {
+    github: { enabled: false, source: 'environment' }, available: ['github'], unavailable_reason: GITHUB_ONLY, ...detail,
+  });
+
+  it('a GitHub token from the environment keeps the GitHub toggle on offer and nothing else', async () => {
+    current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'sources' ? githubOnly() : s)), steps_left: 4 });
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    const form = within(screen.getByRole('form', { name: 'Choose what Nerve reads' }));
+    // The form, with the server's reason — not the closed-step page, and not the policy's sentence.
+    expect(form.getByText(GITHUB_ONLY)).toBeInTheDocument();
+    expect(form.queryByText(CLOSED)).not.toBeInTheDocument();
+    expect(screen.queryByText('Not available on this instance.')).not.toBeInTheDocument();
+    expect(form.getByText('Token: configured by your operator (environment)')).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Gmail' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Telegram sync' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Turn all off' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Skip for now/ })).toBeInTheDocument();
+    const toggle = screen.getByRole('checkbox', { name: /GitHub/ });
+    expect(toggle).toBeEnabled();
+    await userEvent.click(toggle);
+    await userEvent.click(continueButton());
+    // The one boolean on offer: a Gmail or Telegram field would be refused.
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { github: true }));
+  });
+
+  it('a source the operator switched on where the page may not is shown, not offered', async () => {
+    const provided = githubOnly({ status: 'done' }, {
+      gmail: { enabled: true, accounts: ['alice@example.com'], source: 'config-repo' },
+    });
+    current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'sources' ? provided : s)) });
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    const gmail = within(screen.getByRole('region', { name: 'Gmail' }));
+    expect(gmail.getByRole('checkbox')).toBeChecked();
+    expect(gmail.getByRole('checkbox')).toBeDisabled();
+    expect(gmail.getByText('alice@example.com')).toBeInTheDocument();
+    expect(gmail.queryByRole('button', { name: /Remove alice@example.com/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Telegram sync' })).not.toBeInTheDocument();
+    expect(screen.getByRole('checkbox', { name: /GitHub/ })).toBeEnabled();
+    await userEvent.click(screen.getByRole('checkbox', { name: /GitHub/ }));
+    await userEvent.click(continueButton());
+    await waitFor(() => expect(api.setupStep).toHaveBeenCalledWith('sources', { github: true }));
+  });
+
+  it('the overview counts the open GitHub toggle as a step to do, and leaves out the three closed steps', async () => {
+    current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'sources' ? githubOnly() : s)), steps_left: 4 });
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    const rows = within(screen.getByRole('list', { name: 'Steps' }));
+    expect(rows.getAllByRole('listitem')).toHaveLength(6);
+    expect(rows.getByRole('link', { name: 'Sources' }).closest('li')).toHaveTextContent('To do');
+    expect(screen.getByText('2 of 6 steps done')).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: 'Your operator has configured' })).not.toBeInTheDocument();
+  });
+
+  it('a GitHub switch the operator holds, with nothing else on offer, puts Sources under "Your operator has configured"', async () => {
+    const reason = `${GITHUB_HELD} Gmail and Telegram are not available on this instance.`;
+    const held = githubHeld({ read_only: true, read_only_reason: reason, summary: 'GitHub' }, { available: [], unavailable_reason: reason });
+    current = keylessState({ steps: keylessState().steps.map((s) => (s.id === 'sources' ? held : s)) });
+    const view = renderAt('/setup');
+    await heading(/^Welcome, /);
+    const section = within(screen.getByRole('region', { name: 'Your operator has configured' }));
+    expect(section.getByText('Sources')).toBeInTheDocument();
+    expect(within(screen.getByRole('list', { name: 'Steps' })).queryByText('Sources')).not.toBeInTheDocument();
+    view.unmount();
+
+    useSetupStore.getState().reset();
+    renderAt('/setup/sources');
+    expect(await heading(/^Welcome, /)).toBeInTheDocument();
+    expect(api.setupStep).not.toHaveBeenCalled();
+  });
+});
+
+describe('the steps a person can take, the operator\'s and the hidden ones', () => {
+  const CLOSED = 'This instance does not store credentials entered here. Connections are provided by the operator of this deployment.';
+  const LOCK = 'Configuration is managed from the config repository on this instance; changes arrive by PR and sync.';
+
+  /**
+   * Memory is the operator's (done, read-only); Channels is closed by the
+   * policy and Agents by a lockdown reason (both hidden); the other six
+   * steps are the person's own, two of them done.
+   */
+  function mixedState() {
+    return makeState({
+      local_secrets: false,
+      steps: [
+        step('claim', { status: 'done' }),
+        step('mode', { status: 'done', read_only: true, read_only_reason: MODE_LOCK_REASON }),
+        step('provider'),
+        step('profile'),
+        step('memory', { status: 'done', read_only: true, read_only_reason: CLOSED, summary: 'Kept in Loom' }, { backend: 'loom' }),
+        step('channels', { status: 'blocked', blocked_kind: 'policy', blocked_reason: CLOSED, read_only: true, read_only_reason: CLOSED }),
+        step('sources'),
+        step('automation'),
+        step('agents', { status: 'blocked', blocked_kind: 'lockdown', blocked_reason: LOCK, read_only: true, read_only_reason: LOCK }),
+      ],
+    });
+  }
+
+  beforeEach(() => { current = mixedState(); });
+
+  it('the overview lists the own steps, counts only them, and names the operator\'s steps apart', async () => {
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    const rows = within(screen.getByRole('list', { name: 'Steps' }));
+    expect(rows.getAllByRole('listitem').map((row) => within(row).getAllByRole('link')[0].textContent)).toEqual([
+      'Account', 'Mode', 'Model', 'About you', 'Sources', 'Automation',
+    ]);
+    expect(screen.getByText('2 of 6 steps done')).toBeInTheDocument();
+    const section = within(screen.getByRole('region', { name: 'Your operator has configured' }));
+    expect(section.getAllByRole('listitem')).toHaveLength(1);
+    expect(section.getByRole('listitem')).toHaveTextContent('MemoryKept in Loom');
+    expect(section.queryByRole('link')).not.toBeInTheDocument();
+    // The hidden steps are nowhere, and neither are their reasons.
+    expect(screen.queryByText('Channels')).not.toBeInTheDocument();
+    expect(screen.queryByText('Agents')).not.toBeInTheDocument();
+    expect(screen.queryByText(CLOSED)).not.toBeInTheDocument();
+    // Continue goes to the first pending own step.
+    await userEvent.click(screen.getByRole('button', { name: 'Continue' }));
+    expect(await heading('Connect a model')).toBeInTheDocument();
+  });
+
+  it('the rail lists the own steps and Review, nothing else', async () => {
+    renderAt('/setup/provider');
+    await heading('Connect a model');
+    const nav = within(screen.getByRole('navigation', { name: 'Setup steps' }));
+    expect(nav.getAllByRole('link').map((link) => link.getAttribute('href'))).toEqual([
+      '/setup/claim', '/setup/mode', '/setup/provider', '/setup/profile', '/setup/sources', '/setup/automation', '/setup/review',
+    ]);
+  });
+
+  it('the review lists the own steps only', async () => {
+    renderAt('/setup/review');
+    await heading('Review and finish');
+    const checklist = within(screen.getByRole('region', { name: 'Checklist' }));
+    expect(checklist.getAllByRole('listitem')).toHaveLength(6);
+    for (const title of ['Memory', 'Channels', 'Agents']) expect(checklist.queryByText(title)).not.toBeInTheDocument();
+    const todo = within(screen.getByRole('list', { name: 'Still to do' }));
+    expect(todo.getAllByRole('listitem').map((row) => row.textContent)).toEqual([
+      expect.stringMatching(/^Model/), expect.stringMatching(/^About you/), expect.stringMatching(/^Sources/), expect.stringMatching(/^Automation/),
+    ]);
+  });
+
+  it('Continue and Back pass over the operator\'s and the hidden steps', async () => {
+    renderAt('/setup/profile');
+    await heading('About you');
+    await userEvent.click(continueButton());
+    // About you → Sources: Memory is the operator's, Channels is hidden.
+    expect(await heading('Choose what Nerve reads')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Back' }));
+    expect(await heading('About you')).toBeInTheDocument();
+  });
+
+  it('a link to an operator\'s or a hidden step lands on the overview', async () => {
+    for (const id of ['memory', 'channels', 'agents']) {
+      useSetupStore.getState().reset();
+      const view = renderAt(`/setup/${id}`);
+      expect(await heading(/^Welcome, /)).toBeInTheDocument();
+      view.unmount();
+    }
+  });
+
+  it('the Mode step and the Account stay in the list on a locked instance, never under the operator\'s steps', async () => {
+    current = makeState({
+      lockdown: true, writable: false, read_only_reason: LOCK, steps_left: 1,
+      steps: [
+        // A backend that marks the claim read-only too must not move the Account.
+        step('claim', { status: 'done', read_only: true, read_only_reason: LOCK, summary: 'alice · password set' }),
+        step('mode', { status: 'done', read_only: true, read_only_reason: MODE_LOCK_REASON, summary: 'Personal assistant' }),
+        step('provider', { status: 'done', read_only: true, read_only_reason: LOCK, summary: 'Anthropic API key' }),
+        step('profile', {}, { writable_fields: ['name'] }),
+        step('memory', { status: 'blocked', blocked_kind: 'lockdown', blocked_reason: LOCK, read_only: true, read_only_reason: LOCK }),
+      ],
+    });
+    renderAt('/setup');
+    await heading(/^Welcome, /);
+    const rows = within(screen.getByRole('list', { name: 'Steps' }));
+    expect(rows.getAllByRole('listitem').map((row) => within(row).getAllByRole('link')[0].textContent)).toEqual([
+      'Account', 'Mode', 'About you',
+    ]);
+    // The mode was the person's choice: Done, with the lock, and no Change.
+    const mode = rows.getByRole('link', { name: 'Mode' }).closest('li')!;
+    expect(mode).toHaveTextContent('Done');
+    expect(within(mode).queryByRole('link', { name: 'Change' })).not.toBeInTheDocument();
+    expect(rows.getByRole('link', { name: 'Accounts' })).toHaveAttribute('href', '/accounts');
+    const section = within(screen.getByRole('region', { name: 'Your operator has configured' }));
+    expect(section.getAllByRole('listitem').map((row) => row.querySelector('p')?.textContent)).toEqual(['Model']);
+    expect(screen.getByText('2 of 3 steps done')).toBeInTheDocument();
+    const nav = within(screen.getByRole('navigation', { name: 'Setup steps' }));
+    expect(nav.getByRole('link', { name: /^Mode(?!l)/ })).toBeInTheDocument();
+    expect(nav.getByRole('link', { name: /^Account/ })).toBeInTheDocument();
+  });
+
+  it('with no step left for the person, the overview and the review say that there is nothing to set up', async () => {
+    // External mode under lockdown before a mode is chosen: no claim, the
+    // Mode step is closed, and every other step is the operator's or closed.
+    // The sentence does not say that every step is configured: the mode is not.
+    const NO_OWN = 'There is nothing for you to set up on this page. Your operator sets up this instance.';
+    useHostedStore.setState({ mode: 'external' });
+    const locked = (id: Parameters<typeof step>[0]) => step(id, {
+      status: 'blocked', blocked_kind: 'lockdown', blocked_reason: LOCK, read_only: true, read_only_reason: LOCK,
+    });
+    current = makeState({
+      auth_mode: 'external', mode: null, lockdown: true, writable: false, read_only_reason: LOCK,
+      finished: true, steps_left: 0,
+      steps: [
+        step('mode', {
+          status: 'blocked', blocked_kind: 'lockdown', blocked_reason: LOCK, read_only: true, read_only_reason: LOCK,
+        }, { mode: null, templates_present: [] }),
+        step('provider', { status: 'done', read_only: true, read_only_reason: LOCK, summary: 'Credential from the environment' }),
+        locked('profile'),
+        step('memory', { status: 'done', read_only: true, read_only_reason: LOCK, summary: 'Kept in Loom' }),
+        locked('channels'), locked('sources'), locked('automation'), locked('agents'),
+      ],
+    });
+    const view = renderAt('/setup');
+    await heading('Everything is set up');
+    expect(screen.getByText(NO_OWN)).toBeInTheDocument();
+    expect(screen.queryByRole('list', { name: 'Steps' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/steps done/)).not.toBeInTheDocument();
+    const section = within(screen.getByRole('region', { name: 'Your operator has configured' }));
+    expect(section.getAllByRole('listitem').map((row) => row.querySelector('p')?.textContent)).toEqual(['Model', 'Memory']);
+    view.unmount();
+
+    useSetupStore.getState().reset();
+    renderAt('/setup/review');
+    await heading('Review and finish');
+    expect(screen.queryByRole('region', { name: 'Checklist' })).not.toBeInTheDocument();
+    expect(screen.getByText(NO_OWN)).toBeInTheDocument();
+  });
+
+  it('the phone\'s position line counts the own steps', async () => {
+    window.matchMedia = ((query: string) => ({
+      matches: query === '(max-width: 767px)',
+      media: query, onchange: null,
+      addListener: () => {}, removeListener: () => {},
+      addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => false,
+    })) as typeof window.matchMedia;
+    renderAt('/setup/sources');
+    await heading('Choose what Nerve reads');
+    expect(screen.getByText('Step 5 of 6 · Sources')).toBeInTheDocument();
   });
 });
 
@@ -2041,101 +2808,52 @@ describe('review and the ending', () => {
     expect(screen.getByRole('button', { name: 'Keep waiting' })).toBeInTheDocument();
   });
 
-  it('a worker ends with the onboarding session', async () => {
-    const worker = makeState({
-      mode: 'worker',
-      steps: [step('claim', { status: 'done' }), step('mode', { status: 'done', read_only: true }, {
-        mode: 'worker', task_present: true, onboarding: 'running', onboarding_session_id: 'sess-1',
-      }), step('provider', { status: 'done' }), step('profile', { title: 'Operator' })],
-    });
-    render(
-      <MemoryRouter initialEntries={['/setup/review']}>
-        <Routes>
-          <Route path="/setup/review" element={<ReadyScreen state={worker} onboarding={{ status: 'running', session_id: 'sess-1' }} />} />
-          <Route path="/chat/:sessionId" element={<ChatProbe />} />
-        </Routes>
-      </MemoryRouter>,
-    );
-    expect(screen.getByRole('heading', { level: 1, name: /Your worker is ready/ })).toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent('Onboarding session running');
-    await userEvent.click(screen.getByRole('button', { name: 'Open the onboarding session' }));
-    expect(await screen.findByText(/chat page sess-1/)).toBeInTheDocument();
+  const withOnboarding = (mode: 'personal' | 'worker', onboarding: 'pending' | 'running' | 'done', id: string | null,
+    overrides: Partial<SetupState> = {}) => makeState({
+    mode, finished: true, steps_left: 0,
+    steps: [step('claim', { status: 'done' }), step('mode', { status: 'done', read_only: true }, {
+      mode, task_present: mode === 'worker', onboarding, onboarding_session_id: id,
+    }), step('provider', { status: 'done' })],
+    ...overrides,
+  });
+  const renderReady = (state: SetupState) => render(
+    <MemoryRouter initialEntries={['/setup/review']}>
+      <Routes>
+        <Route path="/setup/review" element={<ReadyScreen state={state} />} />
+        <Route path="/chat/:sessionId" element={<ChatProbe />} />
+      </Routes>
+    </MemoryRouter>,
+  );
+
+  it('both modes end by leading into the onboarding conversation', async () => {
+    for (const mode of ['personal', 'worker'] as const) {
+      const view = renderReady(withOnboarding(mode, 'running', `onboarding-${mode}`));
+      expect(screen.getByText(/waits for you in its first conversation/)).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /Say hello/ })).not.toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', { name: 'Start the conversation' }));
+      expect(await screen.findByText(`chat page onboarding-${mode}`)).toBeInTheDocument();
+      view.unmount();
+    }
   });
 
-  it('the worker ending follows the live onboarding state over the stale finish() answer', async () => {
-    const running = makeState({
-      mode: 'worker',
-      steps: [step('claim', { status: 'done' }), step('mode', { status: 'done', read_only: true }, {
-        mode: 'worker', task_present: true, onboarding: 'running', onboarding_session_id: 'sess-2',
-      }), step('provider', { status: 'done' }), step('profile', { title: 'Operator' })],
-    });
-    // finish() answered before the session existed; a later load() says it is running.
-    render(
-      <MemoryRouter initialEntries={['/setup/review']}>
-        <Routes>
-          <Route path="/setup/review" element={<ReadyScreen state={running} onboarding={{ status: 'pending', session_id: null }} />} />
-          <Route path="/chat/:sessionId" element={<ChatProbe />} />
-        </Routes>
-      </MemoryRouter>,
-    );
-    expect(screen.getByRole('status')).toHaveTextContent('Onboarding session running');
-    expect(screen.queryByText(/Onboarding session starting/)).not.toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Open the onboarding session' }));
-    expect(await screen.findByText(/chat page sess-2/)).toBeInTheDocument();
+  it('links a worker that sets itself up to that session', async () => {
+    const state = withOnboarding('worker', 'running', 'onboarding-7');
+    const mode = state.steps.find((x) => x.id === 'mode')!;
+    renderReady(withStep(state, { ...mode, detail: { ...mode.detail, onboarding_kind: 'autonomous' } }));
+    expect(screen.getByText('Your worker is setting itself up from its task description.')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Start the conversation' })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Open the session' }));
+    expect(await screen.findByText('chat page onboarding-7')).toBeInTheDocument();
   });
 
-  it('a worker whose onboarding ended without a plan gets the link and a Try again, not a spinner', async () => {
-    const ended = makeState({
-      mode: 'worker', finished: true, steps_left: 0,
-      steps: [step('claim', { status: 'done' }), step('mode', { status: 'done', read_only: true }, {
-        mode: 'worker', task_present: true, onboarding: 'ended', onboarding_session_id: 'sess-9',
-      }), step('provider', { status: 'done' }), step('profile', { title: 'Operator', status: 'done' })],
-    });
-    // Try again: the server schedules the onboarding once more and names the new session.
-    m(api.setupFinish).mockResolvedValue({ state: ended, action: 'reloaded', onboarding: { status: 'running', session_id: 'sess-10' } });
-    render(
-      <MemoryRouter initialEntries={['/setup/review']}>
-        <Routes>
-          <Route path="/setup/review" element={<ReadyScreen state={ended} onboarding={{ status: 'pending', session_id: null }} />} />
-          <Route path="/chat/:sessionId" element={<ChatProbe />} />
-        </Routes>
-      </MemoryRouter>,
-    );
-    expect(screen.getByRole('status')).toHaveTextContent('The onboarding session ended without writing a plan. Open it to see why.');
-    expect(screen.queryByText(/Onboarding session starting/)).not.toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Open the onboarding session' })).toBeInTheDocument();
+  it('says the conversation opens after the restart, and offers chat once onboarding is over', () => {
+    const view = renderReady(withOnboarding('worker', 'pending', null, { finished: false, restart_pending: true }));
+    expect(screen.getByRole('status')).toHaveTextContent('The first conversation with your agent opens after the restart.');
+    expect(screen.queryByRole('button', { name: 'Start the conversation' })).not.toBeInTheDocument();
+    view.unmount();
 
-    await userEvent.click(screen.getByRole('button', { name: 'Try again' }));
-    await waitFor(() => expect(api.setupFinish).toHaveBeenCalledTimes(1));
-    // The checklist still describes the session that ended; the answer names
-    // the one just scheduled, and the page follows that one.
-    expect(await screen.findByText('Onboarding session running')).toBeInTheDocument();
-    await userEvent.click(screen.getByRole('button', { name: 'Open the onboarding session' }));
-    expect(await screen.findByText(/chat page sess-10/)).toBeInTheDocument();
-  });
-
-  it('the worker ending reaches "running" through the 5 s poll after finish() answered pending', async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    const pending = makeState({
-      mode: 'worker', finished: true, steps_left: 0,
-      steps: [step('claim', { status: 'done' }), step('mode', { status: 'done', read_only: true }, {
-        mode: 'worker', task_present: true, onboarding: 'pending', onboarding_session_id: null,
-      }), step('provider', { status: 'done' }), step('profile', { title: 'Operator', status: 'done' })],
-    });
-    current = pending;
-    m(api.setupFinish).mockResolvedValue({ state: pending, action: 'reloaded', onboarding: { status: 'pending', session_id: null } });
-    renderAt('/setup/review');
-    await heading('Review and finish');
-    fireEvent.click(screen.getByRole('button', { name: 'Finish' }));
-    expect(await heading('Your worker is ready')).toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent('Onboarding session starting');
-
-    current = withStep(pending, step('mode', { status: 'done', read_only: true }, {
-      mode: 'worker', task_present: true, onboarding: 'running', onboarding_session_id: 'sess-3',
-    }));
-    await act(async () => { await vi.advanceTimersByTimeAsync(5100); });
-    expect(await screen.findByRole('button', { name: 'Open the onboarding session' })).toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent('Onboarding session running');
+    renderReady(withOnboarding('worker', 'done', 'onboarding-3'));
+    expect(screen.getByRole('button', { name: 'Open chat' })).toBeInTheDocument();
   });
 
   it('the ready screen pairing widget degrades to the /pair instruction when the bot has no link', async () => {

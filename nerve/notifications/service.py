@@ -19,6 +19,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from nerve.identity import actor_id_of, attribution_for
 from nerve.notifications import handlers as _handlers
 from nerve.notifications.date_render import render_iso_dates
 
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
     from nerve.config import NerveConfig
     from nerve.db import Database
+    from nerve.identity import Actor
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,48 @@ _APPROVAL_EMOJIS: dict[str, str] = {
     "decline": "❌",       # cross mark
     "snooze_24h": "\U0001F4A4",  # zzz
 }
+
+# Telegram caps an inline button's callback_data at 64 bytes.
+_CALLBACK_DATA_MAX_BYTES = 64
+
+
+def _fit_callback_value(notification_id: str, value: str) -> str:
+    """Cut ``value`` so ``notif:<id>:<value>`` fits, dropping a split UTF-8 tail."""
+    prefix = len(f"notif:{notification_id}:".encode("utf-8"))
+    room = _CALLBACK_DATA_MAX_BYTES - prefix
+    return value.encode("utf-8")[:room].decode("utf-8", errors="ignore")
+
+
+def _stored_options(notif: dict[str, Any] | None) -> list:
+    """Return the row's stored options, or ``[]`` when it has none."""
+    if not notif or not notif.get("options"):
+        return []
+    try:
+        options = json.loads(notif["options"])
+    except (TypeError, ValueError):
+        return []
+    return options if isinstance(options, list) else []
+
+
+def _uncut_answer(notification_id: str, payload: str, options: list) -> str:
+    """Map a ``notif:<id>:<payload>`` answer back to the option that sent it.
+
+    The payload is the option text cut to fit the callback_data cap, as sent
+    by approval buttons and by question buttons older than ``notifopt:``.
+    Return the one stored option that cuts to ``payload``; if several
+    different options do, the payload marked ``[truncated]``; if none does,
+    the payload unchanged.
+    """
+    matches = {
+        option for option in options
+        if isinstance(option, str)
+        and _fit_callback_value(notification_id, option) == payload
+    }
+    if len(matches) == 1:
+        return matches.pop()
+    if matches:
+        return f"[truncated] {payload}"
+    return payload
 
 
 def _resolve_workspace(config: NerveConfig | None) -> Path | None:
@@ -206,6 +250,7 @@ class NotificationService:
         channels: list[str] | None = None,
         silent: bool = False,
         force: bool = False,
+        metadata: dict[str, Any] | None = None,
     ) -> str:
         """Fire-and-forget notification. Returns notification_id.
 
@@ -228,8 +273,14 @@ class NotificationService:
             force: If True, bypass silence matching and deliver normally.
                 A forced send that *still* matched a rule is delivered but
                 stamped + counted as an override for audit.
+            metadata: Fields to store in the row's metadata and to send
+                with the web event. ``plan_id`` and ``task_id`` name the
+                plan and the task that the notification is about: the web
+                UI shows links to them, and Telegram shows an "Open plan"
+                button.
         """
         notification_id = f"notif-{uuid.uuid4().hex[:8]}"
+        refs = dict(metadata or {})
         # Render <YYYY-MM-DD[ HH:MM]> placeholders before silence matching
         # so rules can target the human-readable form ("24 June") and so
         # persisted/delivered text matches what the user sees.
@@ -250,6 +301,7 @@ class NotificationService:
                 priority=priority,            # priority UNCHANGED
                 status="silenced",
                 metadata={
+                    **refs,
                     "silenced_by": match["id"],
                     "silence_reason": match["reason"],
                     "silence_action": match["action"],
@@ -259,6 +311,7 @@ class NotificationService:
             )
             await self._broadcast_silenced_web(
                 notification_id, session_id, title, body, priority, match,
+                metadata=refs,
             )
             return notification_id  # no _fanout → no telegram ping
 
@@ -278,12 +331,14 @@ class NotificationService:
             title=title,
             body=body,
             priority=priority,
-            metadata=extra_meta or None,
+            metadata={**refs, **extra_meta} or None,
         )
 
         await self._fanout(
             notification_id, session_id, "notify", title, body, priority,
             channels=channels, silent=silent,
+            extra_web={"metadata": refs} if refs else None,
+            plan_id=refs.get("plan_id"),
         )
 
         return notification_id
@@ -422,11 +477,13 @@ class NotificationService:
         channel: str,
         target: str,
         actor: str | None = None,
+        answerer: Actor | None = None,
     ) -> dict[str, Any] | None:
         """Answer an explicit notification within its delivery scope.
 
-        The post-answer row lets an adapter render the result without reaching
-        through the service to its database.
+        ``actor`` and ``answerer`` have the meaning that they have in
+        :meth:`handle_answer`. The post-answer row lets an adapter render the
+        result without reaching through the service to its database.
         """
         delivery = await self.db.get_notification_delivery(
             notification_id, channel, target,
@@ -438,6 +495,7 @@ class NotificationService:
             answer,
             answered_by=channel,
             actor=actor,
+            answerer=answerer,
         )
         if not accepted:
             return None
@@ -471,11 +529,21 @@ class NotificationService:
         answer: str,
         answered_by: str,
         actor: str | None = None,
+        *,
+        answerer: Actor | None = None,
     ) -> bool:
         """Process a user's answer to a question or approval.
 
         ``answered_by`` identifies the transport; ``actor`` identifies the
         person within that transport and is retained for audit.
+        ``answerer`` is the person who answered: the signed-in actor of the
+        web answer route, or the person that a channel gateway resolved for
+        a hosted channel answer. A self-hosted channel answer names a
+        provider user and no person, so it passes ``None``. The row records
+        the answerer in ``answered_by_actor_id``; the answer relayed into the
+        asking session is a message written by the answerer, and the agent's
+        work in that turn has the session's cause; an approval dispatcher
+        receives the answerer as its ``actor``.
 
         - For ``type=approval`` rows: claim the row, look up the
           dispatcher in the handler registry, run it, audit-log the
@@ -487,6 +555,10 @@ class NotificationService:
           inject it back into the originating session, broadcast.
         - Fire-and-forget ``type=notify`` rows do not flow through this
           method; the dismiss endpoint handles those.
+
+        Raises:
+            NotAcceptingTurnsError: a question answer while the engine
+                drains. The question stays pending.
         """
         notif = await self.db.get_notification(notification_id)
         if not notif or notif["status"] != "pending":
@@ -494,19 +566,10 @@ class NotificationService:
 
         if notif.get("type") == "approval":
             return await self._handle_approval_answer(
-                notif, answer, answered_by, actor,
+                notif, answer, answered_by, actor, answerer=answerer,
             )
 
-        success = await self.db.answer_notification(
-            notification_id, answer, answered_by, actor=actor,
-        )
-        if not success:
-            return False
-
         session_id = notif["session_id"]
-        attribution = {"answered_by_actor": actor} if actor else {}
-
-        from nerve.agent.streaming import broadcaster
 
         # External (satellite) sessions are MCP-driven by an outside agent
         # (Codex, Claude Code, ...). Nerve doesn't own their conversation
@@ -518,6 +581,25 @@ class NotificationService:
             session_record and session_record.get("source") == "external"
         )
 
+        # During a drain the turn that delivers the answer is refused. Keep
+        # the question pending, so the person can answer after the restart.
+        if not is_external and not self.engine.accepting_turns:
+            from nerve.agent.engine import NotAcceptingTurnsError
+
+            raise NotAcceptingTurnsError()
+
+        success = await self.db.answer_notification(
+            notification_id, answer, answered_by, actor=actor,
+            attribution=attribution_for(answerer),
+        )
+        if not success:
+            return False
+
+        answerer_id = actor_id_of(answerer)
+        attribution = {"answered_by_actor": actor} if actor else {}
+
+        from nerve.agent.streaming import broadcaster
+
         if is_external:
             await broadcaster.broadcast("__global__", {
                 "type": "notification_answered",
@@ -525,6 +607,7 @@ class NotificationService:
                 "session_id": session_id,
                 "answer": answer,
                 "answered_by": answered_by,
+                "actor_id": answerer_id,
                 **attribution,
             })
             return True
@@ -541,6 +624,8 @@ class NotificationService:
             "answer": answer,
             "answered_by": answered_by,
             "content": injected_message,
+            # The relayed message is written by the answerer.
+            "actor_id": answerer_id,
             **attribution,
         })
 
@@ -555,6 +640,7 @@ class NotificationService:
                 injected_message,
                 source=f"notification:{answered_by}",
                 channel=answered_by,
+                actor=answerer,
             )
         except Exception as e:
             logger.error(
@@ -569,6 +655,7 @@ class NotificationService:
             "session_id": session_id,
             "answer": answer,
             "answered_by": answered_by,
+            "actor_id": answerer_id,
             **attribution,
         })
 
@@ -580,6 +667,8 @@ class NotificationService:
         answer: str,
         answered_by: str,
         actor: str | None = None,
+        *,
+        answerer: Actor | None = None,
     ) -> bool:
         """Route an approval answer through the dispatcher registry.
 
@@ -595,7 +684,9 @@ class NotificationService:
         target_kind = notif.get("target_kind") or ""
         target_id = notif.get("target_id") or ""
 
-        if not await self.db.claim_pending_approval(notification_id):
+        if not await self.db.claim_pending_approval(
+            notification_id, attribution=attribution_for(answerer),
+        ):
             logger.info(
                 "approval %s is already claimed; the %r press from %s is "
                 "ignored", notification_id, answer, actor or answered_by,
@@ -632,10 +723,12 @@ class NotificationService:
                     # the event loop — they need the loop-bound DB/services.
                     result = await dispatcher(
                         notif, target_id, answer, self.config,
+                        actor=answerer,
                     )
                 else:
                     result = await asyncio.to_thread(
                         dispatcher, notif, target_id, answer, self.config,
+                        actor=answerer,
                     )
             except Exception as exc:  # defensive: never crash the route
                 logger.exception(
@@ -656,10 +749,16 @@ class NotificationService:
                     },
                 )
 
+        answerer_id = actor_id_of(answerer)
         attribution: dict[str, Any] = {"answered_by": answered_by}
         if actor:
             attribution["answered_by_actor"] = actor
-        await self._append_approval_audit({**result.audit_event, **attribution})
+        audit_attribution = dict(attribution)
+        if answerer_id:
+            audit_attribution["answered_by_actor_id"] = answerer_id
+        await self._append_approval_audit(
+            {**result.audit_event, **audit_attribution},
+        )
 
         # Snooze keeps the row pending and stamps ``redeliver_at`` so
         # the periodic maintenance tick (:meth:`redeliver_due`) fans it
@@ -688,17 +787,25 @@ class NotificationService:
             new_expires_at = (
                 snooze_dt + timedelta(hours=expiry_hours)
             ).isoformat()
-            await self.db.snooze_notification(
+            settled = await self.db.snooze_notification(
                 notification_id, snooze_until, new_expires_at,
+                attribution=attribution_for(answerer),
             )
-        elif not await self.db.answer_notification(
-            notification_id, answer, answered_by, actor=actor,
-        ):
+            if result.after_snooze is not None:
+                await result.after_snooze(settled)
+        else:
+            settled = await self.db.answer_notification(
+                notification_id, answer, answered_by, actor=actor,
+                attribution=attribution_for(answerer),
+            )
+        if not settled:
             # The expiry sweep can take a claimed row while its dispatcher
-            # runs, which leaves the action done and the row expired.
+            # runs, which leaves the action done and the row expired. The
+            # claim already stored who decided.
             logger.warning(
                 "approval %s stopped being pending during its dispatch; the "
-                "%r decision ran but the row does not record it",
+                "%r decision ran, and the expired row names who decided but "
+                "not the answer",
                 notification_id, answer,
             )
 
@@ -710,6 +817,7 @@ class NotificationService:
             "answer": answer,
             "approval_status": "snoozed" if snoozed else "answered",
             "dispatch_ok": result.ok,
+            "actor_id": answerer_id,
             **attribution,
         }
         if snoozed:
@@ -771,6 +879,7 @@ class NotificationService:
         message: str,
         *,
         source: str,
+        actor: Actor | None,
         channel: str | None = None,
         internal: bool = False,
     ) -> None:
@@ -781,11 +890,14 @@ class NotificationService:
         any in-flight turn and runs when it finishes (FIFO) — the
         wakeup-dispatcher pattern. Never skip-on-busy here; that drops
         the message.
+
+        ``actor`` writes the turn's user row. For a relayed answer it is the
+        person who answered, or ``None`` when the answer came through a
+        channel that names no person. For a notice that this service writes
+        itself (an expiry note) it is the system actor. The turn runs in an
+        existing session, so the agent's work in it records that session's
+        cause.
         """
-        # The text is this service's — an answer relayed into the session, or
-        # a redelivery notice. The person who answered is recorded on the
-        # notification itself. This service generates the prompt, so assigning
-        # the responder as its author would be incorrect.
         task = asyncio.create_task(
             self.engine.run(
                 session_id=session_id,
@@ -793,7 +905,7 @@ class NotificationService:
                 source=source,
                 channel=channel,
                 internal=internal,
-                actor=self.db.system_actor,
+                actor=actor,
             )
         )
         task.add_done_callback(self._on_answer_task_done)
@@ -810,13 +922,21 @@ class NotificationService:
         if exc:
             logger.error("Answer injection task failed: %s", exc)
 
-    async def handle_dismiss(self, notification_id: str) -> bool:
-        """Dismiss a notification (no answer routing needed)."""
+    async def handle_dismiss(
+        self, notification_id: str, *, actor: Actor | None = None,
+    ) -> bool:
+        """Dismiss a notification (no answer routing needed).
+
+        ``actor`` is the person who dismissed it, recorded in
+        ``dismissed_by_actor_id``.
+        """
         notif = await self.db.get_notification(notification_id)
         if not notif or notif["status"] != "pending":
             return False
 
-        await self.db.dismiss_notification(notification_id)
+        await self.db.dismiss_notification(
+            notification_id, attribution=attribution_for(actor),
+        )
         return True
 
     # ------------------------------------------------------------------ #
@@ -836,6 +956,7 @@ class NotificationService:
         silent: bool = False,
         option_labels: dict[str, str] | None = None,
         extra_web: dict[str, Any] | None = None,
+        plan_id: str | None = None,
     ) -> None:
         """Deliver notification to all configured channels in parallel.
 
@@ -848,6 +969,9 @@ class NotificationService:
         ``extra_web`` merges additional fields into the web broadcast
         payload only — the re-delivery tick uses it to flag
         ``redelivered: true`` so the UI can badge a resurfaced card.
+
+        ``plan_id`` names the plan of a ``notify`` row. Telegram adds an
+        "Open plan" button for it.
         """
         target_channels = channels or self.config.notifications.channels
 
@@ -870,6 +994,7 @@ class NotificationService:
                         notification_id, session_id, notif_type,
                         title, body, priority, options,
                         silent=silent, option_labels=option_labels,
+                        plan_id=plan_id,
                     )
                     if msg_id:
                         await self.db.update_notification(
@@ -955,6 +1080,7 @@ class NotificationService:
         body: str,
         priority: str,
         match: dict | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         """Surface a silenced ``notify`` on the web UI without delivering it.
 
@@ -987,6 +1113,8 @@ class NotificationService:
             message["silence_reason"] = match.get("reason", "")
             message["silence_pattern"] = match.get("pattern", "")
             message["silenced_by"] = match.get("id", "")
+        if metadata:
+            message["metadata"] = metadata
         await broadcaster.broadcast("__global__", message)
 
     def _resolve_telegram_chat_id(self) -> int | None:
@@ -1046,8 +1174,14 @@ class NotificationService:
         options: list[str] | None,
         silent: bool = False,
         option_labels: dict[str, str] | None = None,
+        plan_id: str | None = None,
     ) -> str | None:
-        """Send notification to Telegram, with inline keyboard for questions/approvals."""
+        """Send notification to Telegram, with inline keyboard for questions/approvals.
+
+        A ``notify`` with a ``plan_id`` gets an "Open plan" button. It sends
+        the ``plan:view:`` callback of the ``/plans`` command, which shows the
+        plan in the chat with its review actions.
+        """
         bot = self._get_telegram_bot()
         if not bot:
             logger.warning("Telegram bot not available for notification %s", notification_id)
@@ -1060,7 +1194,7 @@ class NotificationService:
         text = self._build_notification_text(session_id, title, body, priority)
 
         if notif_type in ("question", "approval") and options:
-            button_labels: list[tuple[str, str]] = []
+            button_labels: list[str | tuple[str, str]] = []
             for value in options:
                 if notif_type == "approval":
                     label = (
@@ -1069,14 +1203,23 @@ class NotificationService:
                     )
                     emoji = _APPROVAL_EMOJIS.get(value, "")
                     rendered = f"{emoji} {label}".strip() if emoji else label
+                    button_labels.append((rendered, value))
                 else:
-                    rendered = value
-                button_labels.append((rendered, value))
+                    button_labels.append(value)
             msg_id = await self._send_telegram_inline(
                 chat_id, notification_id, text, button_labels, silent=silent,
             )
         else:
-            msg = await self._send_telegram_html(bot, chat_id, text, silent=silent)
+            markup = None
+            callback_data = f"plan:view:{plan_id}"
+            if plan_id and len(callback_data.encode("utf-8")) <= _CALLBACK_DATA_MAX_BYTES:
+                from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+                markup = InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("Open plan", callback_data=callback_data)]]
+                )
+            msg = await self._send_telegram_html(
+                bot, chat_id, text, reply_markup=markup, silent=silent,
+            )
             msg_id = str(msg.message_id)
 
         # Cache for reaction context lookups, and record the reply route so a
@@ -1129,15 +1272,20 @@ class NotificationService:
         chat_id: int,
         notification_id: str,
         text: str,
-        options: list[str] | list[tuple[str, str]],
+        options: list[str | tuple[str, str]],
         silent: bool = False,
     ) -> str | None:
         """Send Telegram message with inline keyboard buttons.
 
-        ``options`` accepts either a flat list of strings (legacy
-        question kind: label == callback value) or a list of
+        ``options`` accepts either a flat list of strings (question kind:
+        each option is both the label and the answer) or a list of
         ``(label, value)`` tuples (approval kind: emoji-prefixed label,
         canonical value sent back on the callback).
+
+        Option text can outgrow the 64-byte callback_data cap, so a question
+        button sends ``notifopt:<id>:<index>``, which
+        :meth:`resolve_telegram_answer` maps back to the stored option. An
+        approval button sends ``notif:<id>:<value>``.
         """
         bot = self._get_telegram_bot()
         if not bot:
@@ -1146,17 +1294,16 @@ class NotificationService:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
         buttons = []
-        for entry in options:
+        for index, entry in enumerate(options):
             if isinstance(entry, tuple):
                 label, value = entry
+                callback_data = (
+                    f"notif:{notification_id}:"
+                    f"{_fit_callback_value(notification_id, value)}"
+                )
             else:
-                label = value = entry
-            callback_data = f"notif:{notification_id}:{value}"
-            # Telegram callback_data max 64 bytes — truncate option if needed
-            if len(callback_data.encode("utf-8")) > 64:
-                max_opt_len = 64 - len(f"notif:{notification_id}:".encode("utf-8"))
-                truncated = value.encode("utf-8")[:max_opt_len].decode("utf-8", errors="ignore")
-                callback_data = f"notif:{notification_id}:{truncated}"
+                label = entry
+                callback_data = f"notifopt:{notification_id}:{index}"
             buttons.append([InlineKeyboardButton(label, callback_data=callback_data)])
 
         keyboard = InlineKeyboardMarkup(buttons)
@@ -1170,6 +1317,25 @@ class NotificationService:
         )
 
         return str(msg.message_id)
+
+    async def resolve_telegram_answer(
+        self, notification_id: str, payload: str, *, by_index: bool,
+    ) -> str | None:
+        """Return the answer a tapped inline button stands for.
+
+        A ``notifopt:`` question button (``by_index``) names an option by
+        index: resolve it to the stored option, or to ``None`` when the
+        row is gone or the index is out of range. A ``notif:`` button
+        carries the answer text itself (see :func:`_uncut_answer`).
+        """
+        options = _stored_options(await self.db.get_notification(notification_id))
+        if not by_index:
+            return _uncut_answer(notification_id, payload, options)
+        try:
+            index = int(payload)
+        except ValueError:
+            return None
+        return options[index] if 0 <= index < len(options) else None
 
     # ------------------------------------------------------------------ #
     #  Slack delivery                                                      #
@@ -1379,7 +1545,12 @@ class NotificationService:
         gets an ``approval-expired`` event (approvals), the web UI gets
         a ``notification_expired`` broadcast, and the Telegram card is
         edited to show it expired. ``notify``-kind expiry stays silent.
+
+        Does nothing while the engine drains: the turn with the note would
+        be refused. The sweep after the restart expires the rows.
         """
+        if not self.engine.accepting_turns:
+            return 0
         rows = await self.db.expire_due_notifications()
         if rows:
             await self._report_expired(rows)
@@ -1496,6 +1667,7 @@ class NotificationService:
             session_id,
             message,
             source="notification:expiry",
+            actor=self.db.system_actor,
             internal=True,
         )
 

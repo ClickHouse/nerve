@@ -12,7 +12,14 @@ export interface Notification {
   status: string;
   options: string[] | null;
   answer: string | null;
+  // The transport the answer came through (`web`, `telegram`, `slack`).
   answered_by: string | null;
+  // The person who answered. Null for a chat-channel answer, which names no
+  // person, and on rows from before it was recorded. On a snoozed approval
+  // that is still pending: the person who snoozed it.
+  answered_by_actor_id?: string | null;
+  // The person who dismissed the row.
+  dismissed_by_actor_id?: string | null;
   answered_at: string | null;
   created_at: string;
   expires_at: string | null;
@@ -29,6 +36,28 @@ export interface Notification {
   metadata?: string | Record<string, unknown> | null;
 }
 
+function metadataObject(metadata: Notification['metadata']): Record<string, unknown> {
+  if (!metadata) return {};
+  if (typeof metadata === 'object') return metadata;
+  try {
+    const parsed: unknown = JSON.parse(metadata);
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The plan and the task that a notification is about. The server stores
+ * them as `plan_id` and `task_id` in the metadata, for example on the
+ * notification that a proposed plan sends.
+ */
+export function notificationRefs(notif: Notification): { planId: string | null; taskId: string | null } {
+  const meta = metadataObject(notif.metadata);
+  const text = (value: unknown) => (typeof value === 'string' && value ? value : null);
+  return { planId: text(meta.plan_id), taskId: text(meta.task_id) };
+}
+
 // A deterministic suppression rule. Matched notify's are persisted as
 // status='silenced' and not delivered; priority is never changed.
 export interface Silence {
@@ -36,7 +65,11 @@ export interface Silence {
   pattern: string;
   action: string;
   reason: string;
+  // Origin of the rule: `web` or the session id of the tool call.
   created_by: string;
+  // Who created the rule and on whose behalf. Null on older rows.
+  created_by_actor_id?: string | null;
+  caused_by_actor_id?: string | null;
   created_at: string;
   expires_at: string | null;
   hit_count: number;
@@ -146,6 +179,8 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       options: data.options,
       answer: null,
       answered_by: null,
+      answered_by_actor_id: null,
+      dismissed_by_actor_id: null,
       answered_at: null,
       created_at: new Date().toISOString(),
       expires_at: null,
@@ -155,14 +190,16 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       target_id: data.target_id ?? null,
       option_labels: data.option_labels ?? null,
       // Carry the silence context inline so the greyed row can render
-      // the reason/pattern without a metadata round-trip.
+      // the reason/pattern without a metadata round-trip. `data.metadata`
+      // holds the plan and task that the notification names.
       metadata: silenced
         ? {
+            ...(data.metadata ?? {}),
             silenced_by: data.silenced_by ?? null,
             silence_reason: data.silence_reason ?? '',
             silence_pattern: data.silence_pattern ?? '',
           }
-        : null,
+        : data.metadata ?? null,
     };
 
     set(s => {
@@ -196,7 +233,12 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       set(s => ({
         notifications: s.notifications.map(n =>
           n.id === data.notification_id
-            ? { ...n, status: 'pending', redeliver_at: data.snooze_until ?? null }
+            ? {
+                ...n,
+                status: 'pending',
+                redeliver_at: data.snooze_until ?? null,
+                answered_by_actor_id: data.actor_id ?? null,
+              }
             : n
         ),
       }));
@@ -205,7 +247,13 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
     set(s => ({
       notifications: s.notifications.map(n =>
         n.id === data.notification_id
-          ? { ...n, status: 'answered', answer: data.answer, answered_by: data.answered_by }
+          ? {
+              ...n,
+              status: 'answered',
+              answer: data.answer,
+              answered_by: data.answered_by,
+              answered_by_actor_id: data.actor_id ?? null,
+            }
           : n
       ),
       pendingCount: Math.max(0, s.pendingCount - 1),

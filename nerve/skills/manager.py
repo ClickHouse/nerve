@@ -10,12 +10,18 @@ Directory structure:
         references/       (optional — documentation loaded on demand)
         scripts/          (optional — executable code)
         assets/           (optional — templates, images, etc.)
+
+Platform skills have the same structure in ``<config_dir>/skills/<skill-id>/``,
+next to ``platform.md``. The operator or the hosting platform writes them;
+Nerve only reads them. When both directories have a skill with the same id,
+the platform skill is the one in effect. A locked instance does not read them.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -26,10 +32,18 @@ from typing import Any
 
 import yaml
 
-from nerve.config import ensure_not_locked
+from nerve.config import ensure_not_locked, is_locked
 from nerve.db import Database
 
 logger = logging.getLogger(__name__)
+
+# Where a skill comes from: ``<workspace>/skills`` or ``<config_dir>/skills``.
+SOURCE_WORKSPACE = "workspace"
+SOURCE_PLATFORM = "platform"
+
+PLATFORM_SKILL_READ_ONLY = (
+    "This skill is provided by the platform and cannot be changed here."
+)
 
 
 @dataclass
@@ -49,6 +63,7 @@ class SkillMeta:
     metadata: dict = field(default_factory=dict)
     created_at: str = ""
     updated_at: str = ""
+    source: str = SOURCE_WORKSPACE
 
 
 @dataclass
@@ -75,6 +90,10 @@ _SKILL_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,127}\Z")
 
 class SkillIdError(ValueError):
     """Raised for a skill id that could not name a directory under ``skills/``."""
+
+
+class PlatformSkillError(RuntimeError):
+    """Raised for a change to a skill that the platform provides."""
 
 
 def _skill_id(skill_id: str) -> str:
@@ -138,37 +157,143 @@ def _build_skill_md(name: str, description: str, body: str = "", version: str = 
 class SkillManager:
     """Discovers, loads, and manages skills from the filesystem."""
 
-    def __init__(self, workspace: Path, db: Database):
+    def __init__(self, workspace: Path, db: Database, config_dir: Path | None = None):
         self.skills_dir = workspace / "skills"
+        # Platform skills: ``<config_dir>/skills``, next to ``platform.md``.
+        # When the config directory is the workspace, the two are one
+        # directory, and its skills are workspace skills.
+        self.platform_dir: Path | None = None
+        if config_dir is not None:
+            platform_dir = Path(config_dir) / "skills"
+            if platform_dir.resolve() != self.skills_dir.resolve():
+                self.platform_dir = platform_dir
         self.db = db
         self._cache: dict[str, SkillMeta] = {}
 
+    def _platform_root(self) -> Path | None:
+        """The platform skills directory to read, or ``None``.
+
+        A locked instance runs only what its workspace repository was
+        reviewed for, so it does not read platform skills.
+        """
+        if self.platform_dir is None or is_locked():
+            return None
+        return self.platform_dir
+
+    def _platform_skill_dir(self, skill_id: str) -> Path | None:
+        """The platform's directory for ``skill_id`` when it has a SKILL.md.
+
+        Another party owns this directory. ``os.path.isfile`` gives False for
+        a path that Nerve cannot search, where ``Path.exists`` raises
+        ``PermissionError``, so such a path means "no platform skill" and the
+        lookup of every other skill still works.
+        """
+        root = self._platform_root()
+        if root is None or not _SKILL_ID_RE.match(skill_id):
+            return None
+        skill_dir = root / skill_id
+        return skill_dir if os.path.isfile(skill_dir / "SKILL.md") else None
+
+    def skill_dir(self, skill_id: str) -> Path:
+        """The directory of the skill in effect for ``skill_id``: the
+        platform's when it has the skill, else the workspace's."""
+        skill_id = _skill_id(skill_id)
+        return self._platform_skill_dir(skill_id) or self.skills_dir / skill_id
+
+    def source(self, skill_id: str) -> str:
+        """``"platform"`` when the skill in effect for ``skill_id`` is a
+        platform skill, else ``"workspace"``."""
+        if self._platform_skill_dir(skill_id) is not None:
+            return SOURCE_PLATFORM
+        return SOURCE_WORKSPACE
+
+    def _refuse_platform_skill(self, skill_id: str) -> None:
+        if self._platform_skill_dir(skill_id) is not None:
+            raise PlatformSkillError(PLATFORM_SKILL_READ_ONLY)
+
     async def discover(self) -> list[SkillMeta]:
-        """Scan skills_dir for SKILL.md files, parse frontmatter, sync to DB.
+        """Scan the skill directories for SKILL.md files, parse frontmatter,
+        sync to DB.
 
         Returns all discovered skills. Also removes DB entries for skills
-        that no longer exist on the filesystem.
+        that no longer exist on the filesystem. A missing platform directory
+        is not an error.
         """
         await asyncio.to_thread(self.skills_dir.mkdir, parents=True, exist_ok=True)
         discovered: list[SkillMeta] = []
         found_ids: set[str] = set()
+        platform_root = self._platform_root()
+        if (
+            platform_root is None
+            and self.platform_dir is not None
+            and os.path.isdir(self.platform_dir)
+        ):
+            logger.info(
+                "This instance is in lockdown: platform skills in %s are not read",
+                self.platform_dir,
+            )
 
-        def _scan_skill_dirs() -> list[tuple[Path, str]]:
-            """Collect (skill_dir, raw SKILL.md) pairs off the event loop."""
-            out: list[tuple[Path, str]] = []
-            for sdir in sorted(self.skills_dir.iterdir()):
-                if not sdir.is_dir():
-                    continue
-                smd = sdir / "SKILL.md"
-                if not smd.exists():
-                    continue
-                try:
-                    out.append((sdir, smd.read_text(encoding="utf-8")))
-                except OSError as e:
-                    logger.error("Failed to read skill %s: %s", sdir.name, e)
-            return out
+        def _skill_dirs(root: Path, source: str) -> list[Path]:
+            """The entries of ``root``. A platform directory that is missing
+            or cannot be read has none."""
+            if source == SOURCE_WORKSPACE:
+                return sorted(root.iterdir())
+            try:
+                return sorted(root.iterdir()) if root.is_dir() else []
+            except OSError as e:
+                logger.error("Failed to read platform skills in %s: %s", root, e)
+                return []
 
-        for skill_dir, raw in await asyncio.to_thread(_scan_skill_dirs):
+        def _is_platform_skill(sdir: Path) -> bool:
+            """Whether ``sdir`` holds a platform skill to index. An entry
+            that cannot be read is logged and skipped: it never stops the
+            scan, so the workspace skills still load."""
+            try:
+                if not (sdir / "SKILL.md").is_file():
+                    return False
+            except OSError as e:
+                logger.error("Failed to read platform skill %s: %s", sdir.name, e)
+                return False
+            if not _SKILL_ID_RE.match(sdir.name):
+                logger.warning(
+                    "Skipping platform skill %r: not a valid skill id", sdir.name,
+                )
+                return False
+            return True
+
+        def _scan_skill_dirs() -> list[tuple[Path, str, str]]:
+            """Collect (skill_dir, raw SKILL.md, source) off the event loop.
+
+            One entry for each id. The platform directory is read first, so
+            its skill is the one in effect for an id that is in both.
+            """
+            roots = [(self.skills_dir, SOURCE_WORKSPACE)]
+            if platform_root is not None:
+                roots.insert(0, (platform_root, SOURCE_PLATFORM))
+            claimed: dict[str, Path] = {}
+            out: list[tuple[Path, str, str]] = []
+            for root, source in roots:
+                for sdir in _skill_dirs(root, source):
+                    smd = sdir / "SKILL.md"
+                    if source == SOURCE_PLATFORM:
+                        if not _is_platform_skill(sdir):
+                            continue
+                    elif not sdir.is_dir() or not smd.exists():
+                        continue
+                    if sdir.name in claimed:
+                        logger.warning(
+                            "Skill %s is in %s and in %s: the platform skill is in effect",
+                            sdir.name, claimed[sdir.name], sdir,
+                        )
+                        continue
+                    claimed[sdir.name] = sdir
+                    try:
+                        out.append((sdir, smd.read_text(encoding="utf-8"), source))
+                    except OSError as e:
+                        logger.error("Failed to read skill %s: %s", sdir.name, e)
+            return sorted(out, key=lambda entry: entry[0].name)
+
+        for skill_dir, raw, source in await asyncio.to_thread(_scan_skill_dirs):
             skill_id = skill_dir.name
             found_ids.add(skill_id)
 
@@ -219,6 +344,7 @@ class SkillManager:
                     has_scripts=has_scripts,
                     has_assets=has_assets,
                     metadata=extra_meta,
+                    source=source,
                 )
                 discovered.append(meta)
                 self._cache[skill_id] = meta
@@ -249,13 +375,17 @@ class SkillManager:
             if db_skill["id"] not in found_ids:
                 logger.info("Removing stale skill from DB: %s", db_skill["id"])
                 await self.db.delete_skill_row(db_skill["id"])
+        # The system prompt's skill list reads the cache.
+        for skill_id in set(self._cache) - found_ids:
+            del self._cache[skill_id]
 
         logger.info("Discovered %d skills", len(discovered))
         return discovered
 
     async def get_skill(self, skill_id: str) -> SkillContent | None:
         """Load full SKILL.md content + metadata for a skill."""
-        skill_dir = self.skills_dir / _skill_id(skill_id)
+        skill_dir = self.skill_dir(skill_id)
+        source = self.source(skill_id)
         skill_md = skill_dir / "SKILL.md"
         if not skill_md.exists():
             return None
@@ -278,6 +408,7 @@ class SkillManager:
                 metadata=cached.metadata,
                 created_at=cached.created_at,
                 updated_at=cached.updated_at,
+                source=source,
                 content=body,
                 raw=raw,
             )
@@ -292,6 +423,7 @@ class SkillManager:
             has_references=(skill_dir / "references").is_dir(),
             has_scripts=(skill_dir / "scripts").is_dir(),
             has_assets=(skill_dir / "assets").is_dir(),
+            source=source,
         )
 
     async def create_skill(
@@ -305,6 +437,11 @@ class SkillManager:
         ensure_not_locked("create a skill")
         skill_id = _slugify(name)
         skill_dir = self.skills_dir / _skill_id(skill_id)
+        if self._platform_skill_dir(skill_id) is not None:
+            raise PlatformSkillError(
+                f"A skill with the id {skill_id!r} is provided by the platform "
+                f"and cannot be changed here. Choose a different name."
+            )
 
         # Build SKILL.md
         raw = _build_skill_md(name, description, content, version)
@@ -332,6 +469,7 @@ class SkillManager:
         """Update SKILL.md content (full raw file), re-parse frontmatter, sync DB."""
         ensure_not_locked("update a skill")
         skill_dir = self.skills_dir / _skill_id(skill_id)
+        self._refuse_platform_skill(skill_id)
         skill_md = skill_dir / "SKILL.md"
         if not skill_md.exists():
             return None
@@ -365,6 +503,7 @@ class SkillManager:
         """Remove skill directory and DB record."""
         ensure_not_locked("delete a skill")
         skill_dir = self.skills_dir / _skill_id(skill_id)
+        self._refuse_platform_skill(skill_id)
         if skill_dir.exists():
             await asyncio.to_thread(shutil.rmtree, skill_dir)
         await self.db.delete_skill_row(skill_id)
@@ -384,7 +523,7 @@ class SkillManager:
 
     async def list_references(self, skill_id: str) -> list[str]:
         """List reference files in a skill's references/ directory."""
-        refs_dir = self.skills_dir / _skill_id(skill_id) / "references"
+        refs_dir = self.skill_dir(skill_id) / "references"
         if not refs_dir.is_dir():
             return []
 
@@ -399,10 +538,11 @@ class SkillManager:
 
     async def read_reference(self, skill_id: str, rel_path: str) -> str | None:
         """Read a reference file from a skill."""
-        ref_file = self.skills_dir / _skill_id(skill_id) / "references" / rel_path
+        skill_dir = self.skill_dir(skill_id)
+        ref_file = skill_dir / "references" / rel_path
         # Prevent path traversal
         try:
-            ref_file.resolve().relative_to((self.skills_dir / skill_id).resolve())
+            ref_file.resolve().relative_to(skill_dir.resolve())
         except ValueError:
             return None
         if not ref_file.exists() or not ref_file.is_file():
@@ -411,10 +551,11 @@ class SkillManager:
 
     async def run_script(self, skill_id: str, rel_path: str, args: str = "") -> str:
         """Execute a script from a skill's scripts/ directory."""
-        script_file = self.skills_dir / _skill_id(skill_id) / "scripts" / rel_path
+        skill_dir = self.skill_dir(skill_id)
+        script_file = skill_dir / "scripts" / rel_path
         # Prevent path traversal
         try:
-            script_file.resolve().relative_to((self.skills_dir / skill_id).resolve())
+            script_file.resolve().relative_to(skill_dir.resolve())
         except ValueError:
             return "Error: path traversal detected"
         if not script_file.exists() or not script_file.is_file():
@@ -439,7 +580,7 @@ class SkillManager:
                 capture_output=True,
                 text=True,
                 timeout=30,
-                cwd=str(self.skills_dir / _skill_id(skill_id)),
+                cwd=str(skill_dir),
             )
             output = result.stdout
             if result.returncode != 0:
@@ -451,7 +592,7 @@ class SkillManager:
             return f"Error running script: {e}"
 
     async def get_enabled_summaries(self) -> list[dict]:
-        """Return name+description for all enabled model-invocable skills.
+        """Return name+description+source for all enabled model-invocable skills.
 
         Used for system prompt injection (progressive disclosure level 1).
         """
@@ -463,6 +604,7 @@ class SkillManager:
                     "id": s["id"],
                     "name": s["name"],
                     "description": s["description"],
+                    "source": self.source(s["id"]),
                 })
         return summaries
 

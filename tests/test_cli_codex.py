@@ -77,6 +77,12 @@ class TestDoctorCommand:
         assert result.exit_code == 1
         assert "auth mismatch" in result.output
 
+    def test_it_shows_the_endpoint(self, tmp_path, preflight):
+        preflight.update({"auth": "unknown", "base_url": "http://127.0.0.1:4000/v1"})
+        result = CliRunner().invoke(main, ["-c", str(_config(tmp_path)), "codex", "doctor"])
+        assert result.exit_code == 0, result.output
+        assert "Endpoint: http://127.0.0.1:4000/v1" in result.output
+
     def test_json_output_is_parseable(self, tmp_path, preflight):
         result = CliRunner().invoke(
             main, ["-c", str(_config(tmp_path)), "codex", "doctor", "--json-output"]

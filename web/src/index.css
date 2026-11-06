@@ -418,9 +418,9 @@
      is not the darkest surface, and it holds card-to-lane at 1.053.
 
        bg      #f6f7fa   page
-       sunken  #edeef1   recessed wells
+       sunken  #edeef1   recessed wells, form fields
        surface #ffffff   cards, panels, assistant messages
-       raised  #fafbfc   inputs and secondary buttons sitting on a card
+       raised  #fafbfc   dialogs, secondary buttons sitting on a card
        hover   #eff0f3   hover, which has to darken rather than lighten here
 
      The text ramp below is solved against the darkest background, `sunken`
@@ -542,12 +542,22 @@ body {
 [data-cui-theme="light"] .msg-assistant { background: var(--theme-surface); }
 [data-cui-theme="light"] .msg-user { background: transparent; }
 
+/* One row of the message list. When the row is off screen, the browser skips
+   its style, layout and paint, which is most of the cost of opening a long
+   chat. The DOM stays, so find in page and text selection still work. `auto`
+   keeps the last rendered height of a row; 400px is the estimate before the
+   row was rendered once. Paint containment clips at the padding box, so
+   nothing in a message may draw outside its row. */
+.chat-row { content-visibility: auto; contain-intrinsic-size: auto 400px; }
+
 /* Markdown rendering styles */
 .markdown-content h1 { font-size: 1.5em; font-weight: 600; margin: 0.8em 0 0.4em; }
 .markdown-content h2 { font-size: 1.25em; font-weight: 600; margin: 0.7em 0 0.3em; }
 .markdown-content h3 { font-size: 1.1em; font-weight: 600; margin: 0.6em 0 0.3em; }
 .markdown-content p { margin: 0.4em 0; line-height: 1.6; }
 .markdown-content ul, .markdown-content ol { margin: 0.4em 0; padding-left: 1.5em; }
+/* Tailwind's preflight strips list markers; markdown lists need them back (task lists draw a checkbox instead). */
+.markdown-content ul:not(.contains-task-list) { list-style: disc; } .markdown-content ol { list-style: decimal; }
 .markdown-content li { margin: 0.2em 0; line-height: 1.5; }
 .markdown-content blockquote { border-left: 3px solid var(--theme-text-faint); padding-left: 1em; margin: 0.5em 0; color: var(--theme-text-muted); }
 .markdown-content a { color: var(--theme-link); text-decoration: none; }

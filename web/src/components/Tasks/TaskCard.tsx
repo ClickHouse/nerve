@@ -1,5 +1,5 @@
 import { useNavigate } from 'react-router-dom';
-import { Calendar, Clock, ExternalLink } from '../ui/icons';
+import { Calendar, Clock, ExternalLink, MessageSquare } from '../ui/icons';
 import type { Task } from '../../stores/taskStore';
 import { formatTimeAgo } from '../../utils/dateGroups';
 import { StatusBadge, StatusSelect } from './StatusControls';
@@ -44,6 +44,14 @@ export function TaskCard({ task, onStatusChange }: {
               title={`Updated ${task.updated_at}`}
             >
               <Clock size={11} /> {formatTimeAgo(task.updated_at)}
+            </span>
+          )}
+          {!!task.comment_count && (
+            <span
+              className="flex items-center gap-1 text-text-faint whitespace-nowrap"
+              title={task.comment_count === 1 ? '1 comment' : `${task.comment_count} comments`}
+            >
+              <MessageSquare size={11} aria-hidden="true" /> {task.comment_count}
             </span>
           )}
           {task.source && (

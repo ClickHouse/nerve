@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -108,11 +108,14 @@ class SourceStore:
         records: list,
         source: str,
         ttl_days: int = 7,
-    ) -> int:
-        """Bulk insert source records into the inbox. Returns count inserted.
+    ) -> list[str]:
+        """Bulk insert source records into the inbox. Returns the ids it stored.
 
         The batch is atomic; if any record cannot be persisted, no records are
         committed and the exception is propagated.
+
+        A record identical to the stored one (same metadata and content) is
+        skipped and not returned.
 
         If a record with the same (source, id) already exists but has different
         metadata or content, the old record is deleted and re-inserted at a
@@ -124,7 +127,7 @@ class SourceStore:
         now = datetime.now(timezone.utc)
         expires = (now + timedelta(days=ttl_days)).isoformat()
         now_iso = now.isoformat()
-        inserted = 0
+        stored: list[str] = []
         async with self._atomic():
             for r in records:
                 try:
@@ -192,14 +195,14 @@ class SourceStore:
                              r.timestamp, new_metadata,
                              now_iso, expires),
                         )
-                    inserted += 1
+                    stored.append(r.id)
                 except Exception as e:
                     logger.warning(
                         "Failed to persist source message %s/%s: %s",
                         source, r.id, e,
                     )
                     raise
-        return inserted
+        return stored
 
     async def update_source_messages_processed(
         self,
@@ -343,23 +346,38 @@ class SourceStore:
         If no cursor exists or it has expired, initializes to current
         MAX(rowid) for the source. New consumers see only future messages.
         """
-        now = datetime.now(timezone.utc).isoformat()
-        async with self.db.execute(
-            "SELECT cursor_seq, expires_at FROM consumer_cursors WHERE consumer = ? AND source = ?",
-            (consumer, source),
-        ) as cursor:
-            row = await cursor.fetchone()
-
-        if row is not None:
-            expires = row[1]
-            if expires is None or expires > now:
-                return row[0]
-            # Expired — fall through to re-initialize
+        cursor_seq = await self.peek_consumer_cursor(consumer, source)
+        if cursor_seq is not None:
+            return cursor_seq
 
         # No cursor or expired: initialize to latest
         max_seq = await self.get_source_max_rowid(source)
         await self.set_consumer_cursor(consumer, source, max_seq)
         return max_seq
+
+    async def peek_consumer_cursor(
+        self, consumer: str, source: str, as_of: datetime | None = None,
+    ) -> int | None:
+        """The live cursor position for a consumer+source pair, read-only.
+
+        ``None`` when there is no cursor or it has expired — the case in which
+        :meth:`get_consumer_cursor` starts a cursor at the source's newest
+        message. *as_of* (timezone-aware) asks about a later moment instead of
+        now: a cursor that is live now but expires by then counts as expired.
+        Never writes.
+        """
+        moment = (as_of or datetime.now(UTC)).astimezone(UTC).isoformat()
+        async with self.db.execute(
+            "SELECT cursor_seq, expires_at FROM consumer_cursors WHERE consumer = ? AND source = ?",
+            (consumer, source),
+        ) as cursor:
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        expires = row[1]
+        if expires is not None and expires <= moment:
+            return None
+        return row[0]
 
     async def set_consumer_cursor(
         self,
@@ -380,6 +398,38 @@ class SourceStore:
                    updated_at=excluded.updated_at, expires_at=excluded.expires_at""",
             (consumer, source, cursor_seq, session_id, now.isoformat(), expires),
         )
+
+    async def keep_consumer_cursors_alive(
+        self, consumer: str, sources: list[str] | None = None, ttl_days: int = 2,
+    ) -> int:
+        """Renew the TTL of a consumer's live cursors, leaving their positions.
+
+        For a reader that still uses the cursors without moving them, such as
+        a ``messages`` gate checked on every run of its job: a quiet source
+        then keeps its place instead of starting again at its newest message.
+        Only a live cursor with less than half of *ttl_days* left is renewed,
+        to *ttl_days* from now, so a frequent caller seldom writes; an expired
+        cursor stays expired. *sources* limits it to those sources, ``None``
+        means all of the consumer's. Returns the number of cursors renewed.
+        """
+        if sources is not None and not sources:
+            return 0
+        now = datetime.now(UTC)
+        renew_before = (now + timedelta(days=ttl_days / 2)).isoformat()
+        where = "consumer = ? AND expires_at IS NOT NULL AND expires_at > ? AND expires_at < ?"
+        params: list = [consumer, now.isoformat(), renew_before]
+        if sources is not None:
+            where += f" AND source IN ({', '.join('?' for _ in sources)})"
+            params.extend(sources)
+        async with self.db.execute(f"SELECT COUNT(*) FROM consumer_cursors WHERE {where}", params) as cursor:
+            row = await cursor.fetchone()
+        if not row or not row[0]:
+            return 0  # nothing due, so no write
+        expires = (now + timedelta(days=ttl_days)).isoformat()
+        result = await self._write(
+            f"UPDATE consumer_cursors SET expires_at = ? WHERE {where}", [expires, *params],
+        )
+        return result.rowcount or 0
 
     async def list_consumer_cursors(self, consumer: str | None = None) -> list[dict]:
         """List active (non-expired) consumer cursors with unread counts."""

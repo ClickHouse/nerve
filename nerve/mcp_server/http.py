@@ -188,7 +188,6 @@ def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver
         session_id, runtime_metadata = _bound_identity_from_request(
             engine.config, rctx
         )
-
         if session_id is None:
             client_name, mcp_session_id, _ = _resolve_client_info(rctx)
 
@@ -206,6 +205,9 @@ def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver
                 "mcp_session_id": mcp_session_id,
             }
 
+        # The call is the agent's change for the session's stored cause. A
+        # satellite session stores none: its agent runs outside this instance.
+        session = await engine.db.get_session(session_id)
         return ToolContext(
             session_id=session_id,
             workspace=engine.config.workspace,
@@ -217,6 +219,8 @@ def build_ctx_resolver(engine: "AgentEngine", resolver: SatelliteSessionResolver
             engine=engine,
             notification_service=engine.notification_service,
             runtime_metadata=runtime_metadata,
+            actor=engine.db.system_actor,
+            cause=(session or {}).get("caused_by_actor_id"),
         )
 
     return _resolve

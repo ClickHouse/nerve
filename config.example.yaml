@@ -88,7 +88,7 @@ agent:
   # prune such entries). Ignored when `models` above is set, on Bedrock, or
   # without an API key. false → always use the built-in list.
   model_discovery: true
-  max_turns: 50                  # Max agentic turns per request
+  max_turns: 1000                # Max agentic turns per request; 0 = no cap
   max_concurrent: 32             # Max concurrent agent sessions
   # Keep the appended system prompt byte-identical across sessions so the
   # exact-prefix prompt cache is shared between them: the session id and the
@@ -113,6 +113,15 @@ agent:
     model: ""                    # Empty → falls back to agent.model (chat model)
     max_tokens: 1024
     timeout_seconds: 45
+  # Sub-agents and background tasks inside a session. Defaults shown.
+  # subagents:
+  #   per_task_stop_affordance: true    # Stop ends only the orchestrator's turn; background agents keep running
+  #   progress_summaries: true          # One-line model-written status per running agent (small extra model calls)
+  #   forward_subagent_text: true       # Stream foreground and nested sub-agents' text too
+  #   quiet_after_minutes: 10           # The UI flags a running agent silent for this long
+  #   lost_grace_seconds: 30            # A live background task gone with no final frame becomes "lost"
+  #   stop_confirm_seconds: 10          # A stop with no final frame after this long shows "stop not confirmed"
+  #   transcript_item_max_bytes: 16384  # Cap per stored/streamed tool payload of an agent transcript
   # For Bedrock, use model IDs like:
   #   model: us.anthropic.claude-opus-5-5
   #   cron_model: us.anthropic.claude-sonnet-5-5
@@ -125,6 +134,9 @@ gateway:
   ssl:
     cert: ~/.nerve/certs/cert.pem
     key: ~/.nerve/certs/key.pem
+  # On shutdown, wait up to this many seconds for running turns to end.
+  # 0 (the default) means no wait. See "Shutdown Sequence" in docs/architecture.md.
+  # drain_timeout_seconds: 0
 
 # Channels
 telegram:
@@ -230,8 +242,14 @@ slack:
   #
   # Everything collected is untrusted input: the grant decides whose messages
   # are kept, not whether their contents can be believed. See docs/sources.md.
+  #
+  # In hosted mode (mode: hosted) the gateway sends an observation only for a
+  # channel that the agent's channel policy observes. gateway_grant: true makes
+  # that policy the grant here too, so no allow_channels is needed; the deny
+  # lists still apply. It is ignored in Socket Mode.
   # source:
   #   enabled: true
+  #   gateway_grant: false               # hosted mode only
   #   allow_channels: ["C0456DEF", "eng-*"]
   #   deny_channels: ["*-social"]
   #   deny_senders: ["*-bot"]
@@ -288,6 +306,18 @@ sync:
   github:
     enabled: true
     schedule: "*/15 * * * *"
+    # mode: poll                   # poll = gh CLI on this machine; hosted = the
+                                   # channel gateway polls GitHub and streams the
+                                   # records (needs channels.hosted). Restart-only.
+    # pr_watch: true               # hosted only: a record when one of your own
+                                   # open PRs changes (state, commit, review, CI,
+                                   # comment). Its reason is always "author", and
+                                   # only allow_repos/deny_repos apply to it.
+    # inbox: participating         # participating = threads you are directly
+                                   # involved in; all = the whole inbox as your
+                                   # GitHub watch settings produce it, incl. new
+                                   # issues/PRs of watched repos and CI. Pick
+                                   # within it with the reason guardrails below.
     # Guardrails (case-insensitive globs; deny wins; non-empty allow is
     # fail-closed). allow_* = allowlist (empty = all pass).
     #   repo_name — the notification's repo full_name ("ClickHouse/nerve").
@@ -310,16 +340,35 @@ sync:
     deny_ci_branches: []           # Example: ["main", "master"] — keep CI
                                    # failures on your own PR branches, drop
                                    # default-branch syncs and scheduled runs.
-  github_repos:                    # Monitor a set of repos for NEW issues & PRs
+  # Repositories you follow without taking part in them: new PRs, issues and
+  # releases there. Nothing is set on the GitHub account. With
+  # sync.github.mode: hosted the channel gateway polls them too (it must know
+  # the repository watch). Nothing older than a day is backfilled: a check
+  # more than a day after the last (a daily schedule, an outage) reports the
+  # last day's items, with an hour of grace; in hosted mode, switching the
+  # watch off and on starts fresh. See docs/sources.md "GitHub Repos".
+  github_repos:
     enabled: false
-    schedule: "*/15 * * * *"
-    repos: []                      # Required: ["ClickHouse/clickhouse-go", "owner/repo"]
+    schedule: "*/15 * * * *"       # poll mode; hosted: the fallback drain
+    repos: []                      # Required: ["acme/widgets"], each once, at most 50
+    # types: [pull_request, issue] # pull_request | issue | release
+    # include_bots: false          # also PRs and issues a GitHub App or a [bot]
+                                   # opened; releases arrive whoever published them
+    # include_drafts: true         # false: a draft PR is reported when it is
+                                   # ready for review (event "ready")
+    # updates: false               # true: also new commits, ready, merge and
+                                   # close of the PRs it reported
+    # deny_authors: []             # case-insensitive globs on the author login
     batch_size: 50
 
 # Memory (memU)
 memory:
   recall_model: claude-sonnet-5-5
   # embed_model: text-embedding-3-small  # Only needed with openai_api_key
+  # backend: loom   # Keep memory in Loom, reached through mcp_gateway_url
+  #                 # (docs/config.md "Loom memory backend"); default: memu
+  # loom:
+  #   dashboard_url: "https://loom.example.com"   # Optional: link people to Loom's dashboard
 
 # Cron — no path keys needed. Cron config lives in <workspace>/config/cron/
 # (system.yaml, jobs.yaml, gates/) and is resolved from the workspace, with a
@@ -386,6 +435,17 @@ memory:
 #   notify_on_failure: true     # high-priority notify if a scheduled backup fails
 #   notify_on_success: false    # low-priority digest line on success
 
+# Platform activity reporting — for a machine that a platform parks while it
+# is idle. When the platform's local activity socket exists at startup, the
+# gateway reports running turns, client connections and the next scheduled
+# task to it, and holds keep-awake leases for background work (memorization,
+# workspace sync, backups, background agents). Elsewhere it does nothing.
+# Restart to apply changes. See docs/platform-activity.md.
+# platform:
+#   activity_socket: /run/nerve/guestd.sock  # "" switches reporting off
+#   activity_interval_seconds: 30            # report at least this often (5-300)
+#   lease_ttl_seconds: 120                   # keep-awake lease lifetime (10-3600)
+
 # External MCP server (optional) — expose Nerve's tool registry to
 # external MCP clients (Codex, Claude Code, Cursor) over Streamable HTTP.
 # Off by default. Authentication reuses the gateway JWT
@@ -396,7 +456,14 @@ memory:
 #   path: /mcp/v1
 #   include_hoa: false   # Expose the deprecated houseofagents stub tools externally (default off)
 
-# Observability (optional) — Langfuse tracing for the agent loop and memU.
+# MCP gateway (external mode only, NERVE_AUTH_MODE=external). Nerve then takes
+# its MCP servers only from the gateway's catalog, and mcp_servers has no
+# effect. A change needs a restart. See docs/config.md "MCP servers in
+# external mode". The Loom memory backend (memory.backend: loom) reaches Loom
+# through it in either mode.
+# mcp_gateway_url: "http://192.0.2.1:8080"
+
+# Observability (optional) — Langfuse tracing for the agent loop.
 # Set keys in config.local.yaml. Without keys, the integration is a no-op.
 # See docs/observability.md for setup details.
 # langfuse:

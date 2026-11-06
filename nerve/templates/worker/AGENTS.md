@@ -46,7 +46,7 @@ The left column is autonomous once `TASK.md` § Approval Required grants it. Unt
 Hygiene transitions first, then the work. Before the final text: the status transition, `memorize`, `notify`. The final text says what changed and where.
 
 ## Notify or ask
-- `notify` when a plan is proposed, a task completes, you are blocked or a decision is needed. Priority: `urgent` blockers, security · `high` completions, plans ready · `normal` progress · `low` FYI.
+- `notify` when a task completes, you are blocked or a decision is needed. `plan_propose` notifies with a link to the plan on its own. Priority: `urgent` blockers, security · `high` completions · `normal` progress · `low` FYI.
 - Retry a transient failure up to 3 times, then try another way. Never retry a persistent failure the same way: check memory, change approach, then `ask_user` with options.
 - Chat apps: no markdown tables, full URLs, never a bare `#123`.
 

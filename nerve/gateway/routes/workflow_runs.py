@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
 from nerve.gateway.auth import require_auth
+from nerve.identity import Actor, attribution_for
 
 logger = logging.getLogger(__name__)
 
@@ -70,8 +71,12 @@ async def list_workflow_runs(
 
 
 @router.post("/api/workflow-runs")
-async def create_workflow_run(req: WorkflowRunCreateRequest):
-    """Start a run; returns its wire shape (usually already 'running')."""
+async def create_workflow_run(
+    req: WorkflowRunCreateRequest, actor: Actor = Depends(require_auth),
+):
+    """Start a run; returns its wire shape (usually already 'running').
+
+    The person who sends the request creates the run and is its cause."""
     service = _service()
     from nerve.workflows.service import WorkflowRunError
 
@@ -88,6 +93,7 @@ async def create_workflow_run(req: WorkflowRunCreateRequest):
             budget_usd=req.budget_usd,
             title=req.title,
             created_by="api",
+            attribution=attribution_for(actor),
         )
     except WorkflowRunError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -107,13 +113,17 @@ async def get_workflow_run(run_id: str):
 async def kill_workflow_run(
     run_id: str,
     req: WorkflowRunKillRequest = WorkflowRunKillRequest(),
+    actor: Actor = Depends(require_auth),
 ):
     """Kill a run (idempotent on terminal runs); scoped to its own session."""
     service = _service()
     from nerve.workflows.service import WorkflowRunError
 
     try:
-        run = await service.kill_run(run_id, reason=req.reason, killed_by="api")
+        run = await service.kill_run(
+            run_id, reason=req.reason, killed_by="api",
+            attribution=attribution_for(actor),
+        )
     except WorkflowRunError as e:
         raise HTTPException(status_code=404, detail=str(e))
     return service.public_run(run)

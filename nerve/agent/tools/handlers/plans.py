@@ -5,15 +5,18 @@ plan_approve, plan_decline, plan_revise.
 session (via ``ctx.session_id``), which is how plan_service.py routes
 revisions back to the proposer. Cross-domain calls into task handlers
 are direct function imports (per design decision); no registry round-trip.
+
+Each pending plan that ``plan_propose`` or ``plan_update`` writes also moves
+its task to ``plan_review`` (see :func:`_move_to_plan_review`) and sends one
+notification that names the plan and the task (see :func:`_notify_plan_ready`).
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
 
+from nerve.agent.plan_service import plan_link
 from nerve.agent.tools.registry import ToolContext, ToolResult, ToolSpec
 from nerve.agent.tools.schemas import (
     PLAN_APPROVE_SCHEMA,
@@ -28,12 +31,76 @@ from nerve.agent.tools.schemas import (
 # Direct cross-domain imports — handlers in this file can call task
 # handlers without going through the registry. This is the chosen pattern
 # for intra-package coupling (see plan-a217db3c "Cross-handler calls").
-from nerve.agent.tools.handlers.tasks import (
-    task_done_handler,
-    task_update_handler,
-)
+from nerve.agent.tools.handlers.tasks import task_update_handler
+from nerve.db.task_statuses import PLAN_REVIEW_FROM, PLAN_REVIEW_STATUS
+from nerve.tasks.escalation import _is_quiet_hour
 
 logger = logging.getLogger(__name__)
+
+# A decision lost to a concurrent one: the plan stopped being pending after
+# the handler read it.
+_NO_LONGER_PENDING = (
+    "Plan {plan_id} is no longer pending; another decision was made first."
+)
+
+
+async def _move_to_plan_review(ctx: ToolContext, task_id: str) -> bool:
+    """Move the task to ``plan_review`` if its status is in ``PLAN_REVIEW_FROM``.
+
+    A task in a custom status stays there. The write names the revision that
+    was read, so a status that another writer set in the meantime stays too.
+    Returns True when the task moved.
+    """
+    task = await ctx.db.get_task(task_id)
+    if not task or task.get("status") not in PLAN_REVIEW_FROM:
+        return False
+    result = await task_update_handler(ctx, {
+        "task_id": task_id,
+        "status": PLAN_REVIEW_STATUS,
+        "expect_revision": task["revision"],
+    })
+    return not result.is_error
+
+
+async def _notify_plan_ready(
+    ctx: ToolContext, task: dict, plan_id: str, version: int,
+) -> bool:
+    """Tell the user that a plan waits for review. Returns True when sent.
+
+    The notification stores the plan id and the task id, so the web UI and
+    Telegram can open the plan from it. It replaces the task's earlier plan
+    notifications, and it makes no sound during quiet hours.
+    """
+    if not ctx.notification_service:
+        return False
+    try:
+        await ctx.db.dismiss_plan_notifications(task["id"], attribution=ctx.attribution)
+        service = ctx.notification_service
+        await service.send_notification(
+            session_id=ctx.session_id,
+            title=f"Plan ready for review: {task['title']}",
+            body=f"Version {version} of plan {plan_id} waits for your decision.",
+            priority="high",
+            silent=_is_quiet_hour(service.config),
+            metadata={"plan_id": plan_id, "task_id": task["id"]},
+        )
+    except Exception:
+        logger.exception("Could not send the notification for plan %s", plan_id)
+        return False
+    return True
+
+
+def _review_summary(moved: bool, notified: bool) -> str:
+    """The lines of a plan tool result that say what else happened."""
+    lines = []
+    if moved:
+        lines.append(f"Task moved to {PLAN_REVIEW_STATUS}.")
+    if notified:
+        lines.append(
+            "The user got a notification with a link to the plan. "
+            "Do not send another notification about this plan."
+        )
+    return "\n".join(lines)
 
 
 async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -70,7 +137,9 @@ async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
     # Supersede prior pending plan if any
     for p in existing_plans:
         if p.get("status") == "pending":
-            await ctx.db.update_plan(p["id"], status="superseded")
+            await ctx.db.compare_and_update_plan(
+                p["id"], expect_status="pending", status="superseded",
+            )
 
     plan_id = f"plan-{str(uuid.uuid4())[:8]}"
 
@@ -82,17 +151,20 @@ async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
         model="",
         version=version,
         plan_type=plan_type,
+        # Written by the system actor for the session's cause.
+        attribution=ctx.attribution,
     )
 
-    # Note on the task
+    moved = await _move_to_plan_review(ctx, task_id)
     await task_update_handler(ctx, {
         "task_id": task_id,
-        "note": f"Plan proposed: {plan_id} (v{version})",
+        "note": f"Plan proposed: {plan_link(plan_id)} (v{version})",
     })
+    notified = await _notify_plan_ready(ctx, task, plan_id, version)
 
     return ToolResult.text(
         f"Plan proposed: {plan_id} (v{version}) for task '{task['title']}'. "
-        "Awaiting human review."
+        "Awaiting human review.\n" + _review_summary(moved, notified)
     )
 
 
@@ -120,10 +192,16 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
             f"Plan is '{old_plan['status']}' — only pending plans can be updated."
         )
 
+    # The planner replaces its own plan. That is not a review decision, so
+    # the reviewer columns keep who asked for the revision, if anyone did.
+    # The new version records who wrote it.
     update_fields: dict = {"status": "superseded"}
     if feedback:
         update_fields["feedback"] = feedback
-    await ctx.db.update_plan(plan_id, **update_fields)
+    if not await ctx.db.compare_and_update_plan(
+        plan_id, expect_status="pending", **update_fields,
+    ):
+        return ToolResult.text(_NO_LONGER_PENDING.format(plan_id=plan_id))
 
     new_plan_id = f"plan-{str(uuid.uuid4())[:8]}"
     new_version = int(old_plan.get("version", 1)) + 1
@@ -136,19 +214,22 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         version=new_version,
         parent_plan_id=plan_id,
         plan_type=old_plan.get("plan_type", "generic"),
+        attribution=ctx.attribution,
     )
 
-    note = f"Plan updated: {plan_id} → {new_plan_id} (v{new_version})"
+    task_id = old_plan["task_id"]
+    note = f"Plan updated: {plan_link(plan_id)} → {plan_link(new_plan_id)} (v{new_version})"
     if feedback:
-        note += f" — {feedback}"
-    await task_update_handler(ctx, {
-        "task_id": old_plan["task_id"],
-        "note": note,
-    })
+        note += f": {feedback}"
+    moved = await _move_to_plan_review(ctx, task_id)
+    await task_update_handler(ctx, {"task_id": task_id, "note": note})
+    task = await ctx.db.get_task(task_id)
+    notified = bool(task) and await _notify_plan_ready(ctx, task, new_plan_id, new_version)
 
     return ToolResult.text(
         f"Plan {plan_id} superseded by {new_plan_id} (v{new_version}). "
-        "The new version is pending review."
+        "The new version is pending review.\n"
+        + _review_summary(moved, notified)
     )
 
 
@@ -203,6 +284,20 @@ async def plan_read_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
 
 async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
+    """Wrapper around the shared ``plan_service.approve_plan`` helper.
+
+    The helper holds the validation + session-spawn logic shared with the
+    HTTP route and the Telegram ``/plans`` command. Exceptions are mapped
+    here to user-facing text.
+    """
+    from nerve.agent.engine import NotAcceptingTurnsError
+    from nerve.agent.plan_service import (
+        PlanNotFound,
+        PlanNotPending,
+        TaskNotFound,
+        approve_plan,
+    )
+
     plan_id = args["plan_id"]
 
     if not ctx.db:
@@ -210,147 +305,59 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if not ctx.engine:
         return ToolResult.text("Engine not available — cannot spawn implementation session.")
 
-    plan = await ctx.db.get_plan(plan_id)
-    if not plan:
+    try:
+        result = await approve_plan(
+            db=ctx.db, engine=ctx.engine, plan_id=plan_id,
+            # The agent approved this plan through its own tool, so the
+            # system actor approves, for the cause of the calling session.
+            actor=ctx.db.system_actor, cause=ctx.cause_id,
+            caller_session_id=ctx.session_id or "system",
+        )
+    except PlanNotFound:
         return ToolResult.text(f"Plan not found: {plan_id}")
-
-    if plan["status"] != "pending":
-        return ToolResult.text(
-            f"Plan is '{plan['status']}' — only pending plans can be approved."
-        )
-
-    task = await ctx.db.get_task(plan["task_id"])
-    if not task:
-        return ToolResult.text(f"Task not found: {plan['task_id']}")
-
-    now = datetime.now(timezone.utc).isoformat()
-    plan_type = plan.get("plan_type", "generic")
-
-    # The agent approved this plan through its own tool, so both the session
-    # and the run it dispatches are the instance's own work.
-    impl_actor = ctx.db.system_actor
-
-    # Mark as implementing (prevents double-approve)
-    await ctx.db.update_plan(plan_id, status="implementing", reviewed_at=now)
-
-    impl_session_id = f"impl-{str(uuid.uuid4())[:8]}"
-    await ctx.engine.sessions.get_or_create(
-        impl_session_id, title=f"Implement: {task['title']}", source="web",
-        actor=impl_actor,
-    )
-    await ctx.db.update_plan(plan_id, impl_session_id=impl_session_id)
-
-    # Update task status — cross-domain call into tasks handler
-    await task_update_handler(ctx, {
-        "task_id": plan["task_id"],
-        "status": "in_progress",
-        "note": f"Plan approved — implementation started (session: {impl_session_id})",
-    })
-
-    task_content = ""
-    if task.get("file_path") and ctx.config:
-        task_file = ctx.config.workspace / task["file_path"]
-        if task_file.exists():
-            task_content = await asyncio.to_thread(
-                task_file.read_text, encoding="utf-8",
-            )
-
-    if plan_type in ("skill-create", "skill-update"):
-        prompt = (
-            f"You are implementing an approved plan for a skill task.\n\n"
-            f"## Task: {task['title']}\n\n"
-            f"### Task Content\n{task_content}\n\n"
-            f"## Approved Plan\n{plan['content']}\n\n"
-            f"## Instructions\n"
-        )
-        if plan_type == "skill-create":
-            prompt += (
-                "The plan contains a skill specification. "
-                "Use the `skill_create` tool to create the skill. "
-                "Extract the name, description, and content from the plan. "
-                "If the plan contains a full SKILL.md with frontmatter, parse out the name and description "
-                "from the frontmatter and use the body as the content.\n"
-            )
-        else:
-            prompt += (
-                "The plan contains a skill revision. "
-                "Use the `skill_update` tool to update the existing skill. "
-                "Pass the skill ID (directory name) as the name parameter and the full SKILL.md content "
-                "(frontmatter + body).\n"
-            )
-        prompt += (
-            "\nAfter the skill is created/updated, mark the task as done using "
-            "`task_done` with a note describing what was done.\n"
-        )
-    else:
-        prompt = (
-            f"You are implementing an approved plan for a task.\n\n"
-            f"## Task: {task['title']}\n\n"
-            f"### Task Content\n{task_content}\n\n"
-            f"## Approved Plan\n{plan['content']}\n\n"
-            f"## Instructions\n"
-            f"Follow the plan step by step. You have full tool access.\n"
-            f"After implementation, verify your changes work correctly.\n"
-            f"If you encounter issues not covered by the plan, use your judgment or ask the user.\n"
-        )
-
-    engine = ctx.engine
-    db = ctx.db
-
-    async def _run_impl():
-        try:
-            await engine.run(
-                session_id=impl_session_id, user_message=prompt, source="web",
-                actor=impl_actor,
-            )
-        except Exception:
-            logger.exception("Implementation session %s failed", impl_session_id)
-            try:
-                await db.update_plan(plan_id, status="failed")
-            except Exception:
-                logger.exception("Failed to mark plan %s as failed", plan_id)
-
-    asyncio.create_task(_run_impl())
+    except TaskNotFound:
+        return ToolResult.text("Task not found for this plan.")
+    except (PlanNotPending, NotAcceptingTurnsError) as exc:
+        return ToolResult.text(str(exc))
 
     return ToolResult.text(
-        f"Plan {plan_id} approved. Implementation session started: {impl_session_id}"
+        f"Plan {result['plan_id']} approved. "
+        f"Implementation session started: {result['impl_session_id']}"
     )
 
 
 async def plan_decline_handler(ctx: ToolContext, args: dict) -> ToolResult:
+    """Wrapper around the shared ``plan_service.decline_plan`` helper."""
+    from nerve.agent.plan_service import (
+        PlanNotFound,
+        PlanNotPending,
+        TaskNotFound,
+        decline_plan,
+    )
+
     plan_id = args["plan_id"]
     feedback = (args.get("feedback", "") or "").strip()
 
     if not ctx.db:
         return ToolResult.text("Database not available.")
 
-    plan = await ctx.db.get_plan(plan_id)
-    if not plan:
-        return ToolResult.text(f"Plan not found: {plan_id}")
-
-    if plan["status"] != "pending":
-        return ToolResult.text(
-            f"Plan is '{plan['status']}' — only pending plans can be declined."
+    try:
+        result = await decline_plan(
+            db=ctx.db, engine=ctx.engine, plan_id=plan_id, feedback=feedback,
+            actor=ctx.actor, cause=ctx.cause_id,
+            caller_session_id=ctx.session_id or "system",
         )
+    except PlanNotFound:
+        return ToolResult.text(f"Plan not found: {plan_id}")
+    except TaskNotFound:
+        return ToolResult.text("Task not found for this plan.")
+    except PlanNotPending as exc:
+        return ToolResult.text(str(exc))
 
-    now = datetime.now(timezone.utc).isoformat()
-    fields: dict = {"status": "declined", "reviewed_at": now}
-    if feedback:
-        fields["feedback"] = feedback
-    await ctx.db.update_plan(plan_id, **fields)
-
-    if feedback:
-        note = f"Plan {plan_id} declined — {feedback}"
-    else:
-        note = f"Related plan {plan_id} was closed without a specified reason"
-    await task_done_handler(ctx, {
-        "task_id": plan["task_id"],
-        "note": note,
-    })
-
+    fb = result.get("feedback")
     return ToolResult.text(
         f"Plan {plan_id} declined and task moved to done."
-        + (f" Feedback: {feedback}" if feedback else "")
+        + (f" Feedback: {fb}" if fb else "")
     )
 
 
@@ -361,6 +368,7 @@ async def plan_revise_handler(ctx: ToolContext, args: dict) -> ToolResult:
     the MCP tool surface and the HTTP route. Exceptions are mapped here to
     user-facing text; the HTTP layer maps them to status codes.
     """
+    from nerve.agent.engine import NotAcceptingTurnsError
     from nerve.agent.plan_service import (
         PlanNotFound,
         PlanNotPending,
@@ -381,12 +389,13 @@ async def plan_revise_handler(ctx: ToolContext, args: dict) -> ToolResult:
     try:
         result = await request_plan_revision(
             db=ctx.db, engine=ctx.engine, plan_id=plan_id, feedback=feedback,
+            actor=ctx.actor, cause=ctx.cause_id,
         )
     except PlanNotFound:
         return ToolResult.text(f"Plan not found: {plan_id}")
     except TaskNotFound:
         return ToolResult.text("Task not found for this plan.")
-    except PlanNotPending as exc:
+    except (PlanNotPending, NotAcceptingTurnsError) as exc:
         return ToolResult.text(str(exc))
 
     return ToolResult.text(

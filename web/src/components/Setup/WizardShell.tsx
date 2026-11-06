@@ -6,8 +6,9 @@ import { useSetupStore } from '../../stores/setupStore';
 import { Button, Drawer, PageHeader, PaneToggle } from '../ui';
 import { ShieldCheck } from '../ui/icons';
 import {
-  REVIEW, closedByPolicy, nextStop, previousStop, stepOf, stepTitle, stopPath, stopPosition, type WizardStop,
+  REVIEW, nextStop, previousStop, stepOf, stepPlace, stepTitle, stopPath, stopPosition, type WizardStop,
 } from './navigation';
+import { OnboardingPanel } from './OnboardingPanel';
 import { Overview } from './Overview';
 import { ProgressRail } from './ProgressRail';
 import { RestartOverlay } from './RestartOverlay';
@@ -21,7 +22,6 @@ import { ProviderStep } from './steps/ProviderStep';
 import { ReviewStep } from './steps/ReviewStep';
 import { SourcesStep } from './steps/SourcesStep';
 import { ClaimDoneStep } from './steps/ClaimDoneStep';
-import { UnavailableStep } from './steps/UnavailableStep';
 import { WizardContext, type WizardNav } from './wizardContext';
 
 /**
@@ -63,6 +63,9 @@ export function WizardShell() {
     document.addEventListener('visibilitychange', onVisible);
     return () => document.removeEventListener('visibilitychange', onVisible);
   }, [load]);
+
+  // Leaving the wizard altogether also ends the notice.
+  useEffect(() => () => { useSetupStore.getState().clearSavedNotice(); }, []);
 
   // A "Saved…" notice belongs to the step it was shown on, so it goes when
   // the stop changes — a navigation, not a re-render.
@@ -128,22 +131,20 @@ export function WizardShell() {
         </div>
       );
   } else if (!current) {
-    body = <Overview state={state} />;
+    body = <div className="flex flex-col gap-6"><OnboardingPanel state={state} /><Overview state={state} /></div>;
   } else if (current === REVIEW) {
     body = <ReviewStep state={state} />;
   } else {
     const step = stepOf(state, current);
-    if (!step) {
+    if (!step || stepPlace(step) !== 'own') {
+      // A step that the page does not show, or one that the operator
+      // configured: the Overview says what there is to see.
       body = <Navigate to="/setup" replace />;
-    } else if (closedByPolicy(step)) {
-      // The instance keeps no credentials on disk and this step would store
-      // one: the reason, and Next — never the form.
-      body = <UnavailableStep key={`${viewerId}:${step.etag}`} step={step} />;
     } else {
       const key = `${viewerId}:${step.etag}`;
       switch (step.id) {
         case 'claim': body = <ClaimDoneStep key={key} step={step} />; break;
-        case 'mode': body = <ModeStep key={key} step={step} state={state} />; break;
+        case 'mode': body = <ModeStep key={key} step={step} />; break;
         case 'provider': body = <ProviderStep key={key} step={step} state={state} />; break;
         case 'profile': body = <ProfileStep key={key} step={step} state={state} />; break;
         case 'memory': body = <MemoryStep key={key} step={step} state={state} />; break;
@@ -156,8 +157,8 @@ export function WizardShell() {
     }
   }
 
-  // The phone's position line. Steps count the server's steps only (the same
-  // M as the Overview's "N of M"); Review is named, not numbered.
+  // The phone's position line. Steps count the server's steps only; Review
+  // is named, not numbered.
   const position = state && current ? stopPosition(state, current) : null;
   const currentStep = state && current ? stepOf(state, current) : undefined;
   const positionLine = state && current

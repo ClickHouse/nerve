@@ -17,7 +17,8 @@ MODEL_PRICING: dict[str, tuple[float, float, float, float, float, float]] = {
     "fable-5":    (10,  50, 1.00, 12.50, 20.00, 0.01),  # Fable 5 (Mythos-class, ~2x Opus)
     "opus-5-5":   (4,   20, 0.20,  5.00,  8.00, 0.01),  # Opus 5.5 standard (verified 2026-09-22)
     "opus-5":     (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 5 standard (verified 2026-07-28)
-    "sonnet-5":   (3,   15, 0.30,  3.75,  6.00, 0.01),  # Sonnet 5 standard (verified 2026-07-28)
+    "sonnet-5-5": (2,   10, 0.10,  2.50,  4.00, 0.01),  # Sonnet 5.5 standard (verified 2026-10-13)
+    "sonnet-5":   (2,   10, 0.20,  2.50,  4.00, 0.01),  # Sonnet 5 standard (verified 2026-09-28)
     "opus-4-8":   (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 4.8 standard
     "opus-4-7":   (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 4.7 standard
     "opus-4-6":   (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 4.6 standard
@@ -25,6 +26,9 @@ MODEL_PRICING: dict[str, tuple[float, float, float, float, float, float]] = {
     "opus-4-1":   (15,  75, 1.50, 18.75, 30.00, 0.01),  # Opus 4.1
     "opus-4":     (15,  75, 1.50, 18.75, 30.00, 0.01),  # Opus 4
     "sonnet-4":   (3,   15, 0.30,  3.75,  6.00, 0.01),  # Sonnet 4.x
+    # Haiku 5.5 prompts over 100k tokens cost 5x these rates. Usage is summed
+    # per turn, not per request, so the estimate uses the lower rates.
+    "haiku-5-5":  (0.1, 0.5, 0.01, 0.125, 0.20, 0.01),  # Haiku 5.5, prompts up to 100k (verified 2026-10-13)
     "haiku-4-5":  (1,    5, 0.10,  1.25,  2.00, 0.01),  # Haiku 4.5
     "haiku-3-5":  (0.8,  4, 0.08,  1.00,  1.60, 0.01),  # Haiku 3.5
 }
@@ -32,15 +36,20 @@ MODEL_PRICING: dict[str, tuple[float, float, float, float, float, float]] = {
 # Default fallback when model is unknown or None
 DEFAULT_PRICING = (5, 25, 0.50, 6.25, 10.00, 0.01)  # Opus 4.6 standard
 
-# Cron session ids (see ``SessionManager.create_cron_session`` and
-# ``CronService._start_new_generation``):
-#   cron:<job>                   — legacy stable persistent session
-#   cron:<job>:<YYYYmmdd-HHMMSS> — isolated run / persistent generation
-# The run glob matches the second form, so the job id can be cut out of it
-# even when the job id itself contains ``:``.
-_CRON_RUN_SESSION_GLOB = "cron:?*:" + "[0-9]" * 8 + "-" + "[0-9]" * 6
+# Cron session ids (see ``SessionManager.create_cron_session``,
+# ``CronService._start_new_generation`` and ``new_cron_run_id``):
+#   cron:<job>                            legacy stable persistent session
+#   cron:<job>:<YYYYmmdd-HHMMSS>-<8 hex>  isolated run / persistent generation
+#   cron:<job>:<YYYYmmdd-HHMMSS>          the same, from older versions
+# The run globs match the last two forms, so the job id can be cut out of
+# them even when the job id itself contains ``:``.
+_CRON_RUN_STAMP_GLOB = "[0-9]" * 8 + "-" + "[0-9]" * 6
+_CRON_RUN_SESSION_GLOB = "cron:?*:" + _CRON_RUN_STAMP_GLOB + "-" + "[0-9a-f]" * 8
+# len("cron:") + len(":YYYYmmdd-HHMMSS-xxxxxxxx")
+_CRON_RUN_SESSION_OVERHEAD = 5 + 25
+_CRON_OLD_RUN_SESSION_GLOB = "cron:?*:" + _CRON_RUN_STAMP_GLOB
 # len("cron:") + len(":YYYYmmdd-HHMMSS")
-_CRON_RUN_SESSION_OVERHEAD = 5 + 16
+_CRON_OLD_RUN_SESSION_OVERHEAD = 5 + 16
 
 
 def _get_pricing(
@@ -315,6 +324,8 @@ class UsageStore:
                     CASE WHEN origin_job IS NOT NULL THEN origin_job
                          WHEN origin_session GLOB ? THEN substr(
                              origin_session, 6, length(origin_session) - ?)
+                         WHEN origin_session GLOB ? THEN substr(
+                             origin_session, 6, length(origin_session) - ?)
                          ELSE substr(origin_session, 6) END AS job_id,
                     *
                 FROM usage_origin
@@ -358,6 +369,7 @@ class UsageStore:
             (
                 window,
                 _CRON_RUN_SESSION_GLOB, _CRON_RUN_SESSION_OVERHEAD,
+                _CRON_OLD_RUN_SESSION_GLOB, _CRON_OLD_RUN_SESSION_OVERHEAD,
                 window,
             ),
         ) as cursor:

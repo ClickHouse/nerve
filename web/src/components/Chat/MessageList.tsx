@@ -1,20 +1,22 @@
 import { useEffect, useRef, useCallback, memo } from 'react';
 import { Link } from 'react-router-dom';
-import type { ChatMessage, MessageBlock } from '../../types/chat';
+import type { ChatMessage } from '../../types/chat';
 import { useVisibleActorIds } from '../../stores/actorStore';
 import { useAuthStore } from '../../stores/authStore';
-import { providerConfigured, useSetupStore } from '../../stores/setupStore';
-import { CHAT_EMPTY_NO_PROVIDER } from '../Setup/copy';
+import { useChatStore } from '../../stores/chatStore';
+import { providerConfigured, stepById, useSetupStore } from '../../stores/setupStore';
+import { CHAT_EMPTY_NO_PROVIDER, CHAT_EMPTY_PROVIDER_CLOSED } from '../Setup/copy';
+import { stepPlace } from '../Setup/navigation';
 import { UserMessage } from './UserMessage';
 import { AssistantMessage } from './AssistantMessage';
 import { StreamingMessage } from './StreamingMessage';
 import { SelectionToolbar } from './SelectionToolbar';
 import { MessageActions } from './MessageActions';
 import { GitBranch } from '../ui/icons';
+import { followScrollEnd } from '../../utils/followScrollEnd';
 
-function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage, messageForks }: {
+function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }: {
   messages: ChatMessage[];
-  streamingBlocks: MessageBlock[];
   isStreaming: boolean;
   /** Fork the chat from a specific message (undefined = feature unavailable
       for this session, e.g. a virtual chat). */
@@ -27,6 +29,9 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
   const containerRef = useRef<HTMLDivElement>(null);
   const isNearBottom = useRef(true);
   const prevMessageCount = useRef(0);
+  // The count only: the blocks change for each streamed token, and
+  // StreamingMessage subscribes to them itself.
+  const streamingBlockCount = useChatStore(s => s.streamingBlocks.length);
 
   // A message-anchored fork resolves to a backend-native turn; sessions
   // predating turn recording can only be forked whole (header action).
@@ -39,6 +44,10 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
   // `false` only when the server says no provider is configured; unknown
   // (`null`) keeps the ordinary empty state, so a failed read never nags.
   const needsProvider = useSetupStore(providerConfigured) === false;
+  // A Model step that a lockdown closed is not on the setup page, so the
+  // empty state gives the server's reason and no link to the step.
+  const providerStep = useSetupStore((s) => stepById(s, 'provider'));
+  const providerClosed = !!providerStep && stepPlace(providerStep) !== 'own';
 
   const handleScroll = useCallback(() => {
     const el = containerRef.current;
@@ -46,8 +55,13 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
     isNearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
   }, []);
 
+  // Stops the follow of the end that starts after the first load, while it runs.
+  const stopFollow = useRef<(() => void) | null>(null);
+  useEffect(() => () => stopFollow.current?.(), []);
+
   useEffect(() => {
-    if (!isNearBottom.current) {
+    // While the end is followed after the first load, the follow scrolls.
+    if (stopFollow.current || !isNearBottom.current) {
       prevMessageCount.current = messages.length;
       return;
     }
@@ -55,7 +69,13 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
     const wasEmpty = prevMessageCount.current === 0 && messages.length > 0;
     prevMessageCount.current = messages.length;
     endRef.current?.scrollIntoView({ behavior: wasEmpty ? 'instant' : 'smooth' });
-  }, [messages.length, streamingBlocks.length, isStreaming]);
+    // The rows near the end take their real height only after this jump.
+    if (wasEmpty && containerRef.current) {
+      stopFollow.current = followScrollEnd(containerRef.current, () => {
+        stopFollow.current = null;
+      });
+    }
+  }, [messages.length, streamingBlockCount, isStreaming]);
 
   return (
     <div className="flex-1 overflow-y-auto relative" ref={containerRef} onScroll={handleScroll}>
@@ -64,10 +84,21 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
       {messages.length === 0 && !isStreaming && (
         needsProvider ? (
           <div role="status" className="flex flex-col items-center justify-center h-full gap-2 text-center px-6">
-            <p className="text-text-faint text-lg">{CHAT_EMPTY_NO_PROVIDER}</p>
-            <Link to="/setup/provider" className="text-sm text-accent hover:underline underline-offset-2">
-              Finish setup
-            </Link>
+            {providerClosed ? (
+              <>
+                <p className="text-text-faint text-lg">{CHAT_EMPTY_PROVIDER_CLOSED}</p>
+                {providerStep?.blocked_reason && (
+                  <p className="text-sm text-text-muted max-w-md">{providerStep?.blocked_reason}</p>
+                )}
+              </>
+            ) : (
+              <>
+                <p className="text-text-faint text-lg">{CHAT_EMPTY_NO_PROVIDER}</p>
+                <Link to="/setup/provider" className="text-sm text-accent hover:underline underline-offset-2">
+                  Finish setup
+                </Link>
+              </>
+            )}
           </div>
         ) : (
           <div className="flex items-center justify-center h-full text-text-faint text-lg">
@@ -90,7 +121,7 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
         );
         const forks = msg.id != null ? messageForks?.get(String(msg.id)) : undefined;
         return (
-          <div key={msg.id ?? i}>
+          <div key={msg.id ?? i} className="chat-row">
             {msg.role === 'user'
               ? <UserMessage
                   message={msg}
@@ -122,7 +153,7 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
         );
       })}
 
-      {isStreaming && <StreamingMessage blocks={streamingBlocks} />}
+      {isStreaming && <StreamingMessage />}
 
       <div ref={endRef} />
     </div>
@@ -131,6 +162,6 @@ function MessageListImpl({ messages, streamingBlocks, isStreaming, onForkMessage
 
 // Memoized so unrelated store updates (notably the per-keystroke draft write
 // from the composer) don't re-render the whole message list. Every prop is a
-// stable store slice, so the list re-renders only when messages,
-// streamingBlocks, or isStreaming actually change.
+// stable store slice, so the list re-renders only when messages, isStreaming,
+// or the streaming block count actually change.
 export const MessageList = memo(MessageListImpl);
