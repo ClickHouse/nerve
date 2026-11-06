@@ -25,13 +25,20 @@ class TestTaskStatusStore:
     async def test_seed_defaults(self, db: Database):
         statuses = await db.list_task_statuses()
         names = [s["name"] for s in statuses]
-        assert names == ["pending", "in_progress", "done", "deferred"]
+        assert names == [
+            "backlog", "pending", "plan_review", "in_progress", "done", "deferred",
+        ]
+        assert [s["sort_order"] for s in statuses] == list(range(6))
         by_name = {s["name"]: s for s in statuses}
-        # pending + done are protected; the others are not.
+        # pending, plan_review and done are protected; the others are not.
         assert by_name["pending"]["is_system"] == 1
+        assert by_name["plan_review"]["is_system"] == 1
         assert by_name["done"]["is_system"] == 1
+        assert by_name["backlog"]["is_system"] == 0
         assert by_name["in_progress"]["is_system"] == 0
         assert by_name["deferred"]["is_system"] == 0
+        assert by_name["backlog"]["label"] == "Backlog"
+        assert by_name["plan_review"]["label"] == "Plan in review"
         # Colors are stored as hex.
         assert by_name["pending"]["color"].startswith("#")
 
@@ -41,7 +48,7 @@ class TestTaskStatusStore:
             description="Waiting on something external.",
         )
         assert created["name"] == "blocked"
-        assert created["sort_order"] == 4  # after the 4 seeded (0..3)
+        assert created["sort_order"] == 6  # after the 6 seeded (0..5)
         assert "blocked" in await db.task_status_names()
 
     async def test_create_normalizes_color(self, db: Database):
@@ -65,6 +72,75 @@ class TestTaskStatusStore:
         assert await db.count_tasks_with_status("review") == 1
         await db.delete_task_status_def("review")
         assert "review" not in await db.task_status_names()
+
+
+@pytest.mark.asyncio
+class TestBuiltinStatusMigration:
+    """v059 adds ``backlog`` and ``plan_review`` to an install that has statuses."""
+
+    @staticmethod
+    async def _install(tmp_path, rows: list[tuple[str, str, int]]):
+        """A database with only ``task_statuses``, holding (name, label, sort_order)."""
+        import aiosqlite
+
+        from nerve.db.migrations import v030_task_statuses
+
+        conn = await aiosqlite.connect(tmp_path / "statuses.db")
+        await v030_task_statuses.up(conn)
+        await conn.execute("DELETE FROM task_statuses")
+        await conn.executemany(
+            "INSERT INTO task_statuses (name, label, sort_order) VALUES (?, ?, ?)",
+            rows,
+        )
+        return conn
+
+    @staticmethod
+    async def _statuses(conn) -> list[tuple]:
+        async with conn.execute(
+            "SELECT name, label, is_system, sort_order FROM task_statuses "
+            "ORDER BY sort_order, name"
+        ) as cursor:
+            return [tuple(row) async for row in cursor]
+
+    async def test_places_them_around_pending_and_keeps_a_custom_order(self, tmp_path):
+        from nerve.db.migrations import v059_backlog_plan_review_statuses as v059
+
+        conn = await self._install(tmp_path, [
+            ("deferred", "Deferred", 0), ("in_progress", "In Progress", 1),
+            ("pending", "Pending", 2), ("blocked", "Blocked", 3), ("done", "Done", 4),
+        ])
+        try:
+            await v059.up(conn)
+            rows = await self._statuses(conn)
+        finally:
+            await conn.close()
+        assert [r[0] for r in rows] == [
+            "deferred", "in_progress", "backlog", "pending", "plan_review",
+            "blocked", "done",
+        ]
+        assert [r[3] for r in rows] == list(range(7))
+        by_name = {r[0]: r for r in rows}
+        assert by_name["plan_review"][1:3] == ("Plan in review", 1)
+        assert by_name["backlog"][1:3] == ("Backlog", 0)
+
+    async def test_keeps_a_status_that_has_the_name_and_runs_once(self, tmp_path):
+        from nerve.db.migrations import v059_backlog_plan_review_statuses as v059
+
+        conn = await self._install(tmp_path, [
+            ("pending", "Pending", 0), ("done", "Done", 1), ("backlog", "Someday", 2),
+        ])
+        try:
+            await v059.up(conn)
+            first = await self._statuses(conn)
+            await v059.up(conn)
+            second = await self._statuses(conn)
+        finally:
+            await conn.close()
+        assert [(r[0], r[1]) for r in first] == [
+            ("pending", "Pending"), ("plan_review", "Plan in review"),
+            ("done", "Done"), ("backlog", "Someday"),
+        ]
+        assert second == first
 
 
 class TestColorNormalization:

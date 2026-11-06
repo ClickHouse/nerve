@@ -39,6 +39,7 @@ import yaml
 from nerve import setup_writer
 from nerve.bootstrap import SetupChoices, SetupWizard, run_non_interactive
 from nerve.config import DEFAULT_MODEL, NerveConfig
+from nerve.onboarding_catalog import WorkSelection
 from nerve.setup_writer import (
     TASK_DESCRIPTION_TOKEN,
     TASK_ONBOARDING_MARKER,
@@ -50,8 +51,10 @@ from nerve.setup_writer import (
     merge_private_paths,
     merge_settings_defaults,
     render_task_md,
+    render_work_description,
     task_description_from,
     task_onboarding_pending,
+    work_selection_from,
     workspace_mode,
     write_config_yaml,
     write_cron_jobs,
@@ -175,14 +178,21 @@ def run_writers(root: Path, choices: SetupChoices) -> dict[str, str]:
     return produced
 
 
-def run_unattended(root: Path, mode: str, extra: dict[str, str]) -> dict[str, str]:
+def run_unattended(
+    root: Path, mode: str, extra: dict[str, str], *, on_path: tuple[str, ...] = (),
+) -> dict[str, str]:
     """``run_non_interactive`` under a deterministic environment.
 
-    No CLIs on PATH (so no source is auto-enabled), no web build, a fixed
-    credential and timezone. The extra files are the workspace files whose
-    placeholders the unattended path must leave exactly as the template has
-    them (only the terminal wizard, given a name, fills them in).
+    No CLIs on PATH but those *on_path* names (so by default no source is
+    auto-enabled), no web build, a fixed credential and timezone. The extra
+    files are the workspace files whose placeholders the unattended path must
+    leave exactly as the template has them (only the terminal wizard, given a
+    name, fills them in).
     """
+
+    def which(name: str, *args: object, **kwargs: object) -> str | None:
+        return f"/usr/bin/{name}" if name in on_path else None
+
     config_dir = root / "config"
     config_dir.mkdir(parents=True, exist_ok=True)
     env = {
@@ -199,7 +209,7 @@ def run_unattended(root: Path, mode: str, extra: dict[str, str]) -> dict[str, st
         "NERVE_TASK": "Keep the build green." if mode == "worker" else "",
     })
     with mock.patch.dict(os.environ, env, clear=True), \
-            mock.patch("nerve.bootstrap.shutil.which", return_value=None), \
+            mock.patch("nerve.bootstrap.shutil.which", side_effect=which), \
             mock.patch.object(SetupWizard, "_build_web_ui", lambda self: None):
         run_non_interactive(config_dir)
     produced = {}
@@ -289,7 +299,7 @@ class TestInstallerOutputIsUnchanged:
         _assert_matches_golden(produced, "unattended-worker")
         # The worker template with the description in place — the same file
         # the web Mode step and ``nerve init --terminal`` write — still
-        # carrying the marker the onboarding session deletes.
+        # carrying the marker that onboarding_done deletes.
         assert produced["TASK.md"].startswith("# Task\n")
         assert produced["TASK.md"] == render_task_md("Keep the build green.")
         assert produced["TASK.md"].splitlines()[1].startswith(TASK_ONBOARDING_MARKER)
@@ -657,7 +667,7 @@ class TestApplyMode:
         assert settings["memory"]["categories"][0]["name"] == "personal_info"
         assert "timezone" not in settings, "the About-you step owns the timezone"
         crons = setup_writer.list_optional_crons(ws)
-        assert {c.id for c in crons if c.enabled} == {"inbox-processor", "task-planner"}
+        assert {c.id for c in crons if c.enabled} == {"inbox-processor", "task-planner", "machine-maintenance"}
 
     def test_apply_mode_never_overwrites_onboarded_task(self, tmp_path: Path) -> None:
         ws = tmp_path / "ws"
@@ -675,7 +685,7 @@ class TestApplyMode:
         # Still pending (the marker stands): a second description replaces it.
         apply_mode(ws, "worker", "Something else entirely, twenty characters.")
         assert "Something else" in task.read_text(encoding="utf-8")
-        # Once the onboarding session deleted the marker, the file is theirs.
+        # Once onboarding deleted the marker, the file is theirs.
         task.write_text(text.replace(lines[1] + "\n", "", 1), encoding="utf-8")
         again = apply_mode(ws, "worker", "A third description that must not land.")
         assert not again.task_written
@@ -707,12 +717,18 @@ class TestApplyMode:
         )
         # The writer owns the file: the MANIFEST lists it (``nerve doctor``
         # expects it of a worker), the copier leaves it out, and without a
-        # description there is no TASK.md rather than one with a bare token.
+        # description the template gets an empty description section (never
+        # a bare token), which the onboarding conversation fills.
         assert "TASK.md" in [name for name, _ in read_manifest("worker")]
         assert "TASK.md" not in outcome.created
         bare = tmp_path / "bare"
-        assert apply_mode(bare, "worker").task_written is False
-        assert not (bare / "TASK.md").exists()
+        assert apply_mode(bare, "worker").task_written is True
+        written = (bare / "TASK.md").read_text(encoding="utf-8")
+        assert TASK_DESCRIPTION_TOKEN not in written
+        assert task_onboarding_pending(written) and task_description_from(written) == ""
+        # A later call without a description keeps the file as it is.
+        assert apply_mode(ws, "worker").task_written is False
+        assert task_description_from((ws / "TASK.md").read_text(encoding="utf-8")) == description
         assert "TASK.md" in initialize_workspace(tmp_path / "copied", "worker")
         assert TASK_DESCRIPTION_TOKEN in (tmp_path / "copied" / "TASK.md").read_text(encoding="utf-8")
 
@@ -769,7 +785,7 @@ class TestApplyMode:
     def test_worker_mode_writes_no_quiet_hours_and_leaves_task_planner_off(self, tmp_path: Path) -> None:
         """A worker's defaults: quiet hours off — stated as empty strings, so
         the loader's own 02:00–08:00 cannot come back — and task-planner in
-        the catalogue but disabled until the onboarding session decides."""
+        the catalogue but disabled until the onboarding conversation decides."""
         ws = tmp_path / "ws"
         outcome = apply_mode(ws, "worker", "Watch the nightly build for example/repo and propose fixes.")
         assert {"quiet_start", "quiet_end"} <= set(outcome.settings_defaults_added)
@@ -778,7 +794,9 @@ class TestApplyMode:
         config = NerveConfig.from_dict({"workspace": str(ws), **settings})
         assert (config.quiet_start, config.quiet_end) == ("", "")
         crons = {c.id: c.enabled for c in setup_writer.list_optional_crons(ws)}
-        assert crons == {"task-planner": False, "skill-extractor": True, "skill-reviser": True}
+        assert crons == {
+            "task-planner": False, "skill-extractor": True, "skill-reviser": True, "machine-maintenance": True,
+        }
 
     def test_personal_mode_keeps_the_installer_window(self, tmp_path: Path) -> None:
         ws = tmp_path / "ws"
@@ -793,13 +811,109 @@ class TestApplyMode:
         assert not (ws / "SOUL.md").exists()
         # Templates arrived from the repository: only TASK.md is written.
         apply_mode(ws, "worker")
-        assert not (ws / "TASK.md").exists()
+        assert task_description_from((ws / "TASK.md").read_text(encoding="utf-8")) == ""
         outcome = apply_mode(ws, "worker", "Watch the nightly build and propose fixes.", locked=True)
         assert outcome.task_written and outcome.created == () and not outcome.cron_written
         # The same template-sourced file as the unlocked path writes.
         assert (ws / "TASK.md").read_text(encoding="utf-8") == render_task_md(
             "Watch the nightly build and propose fixes.",
         )
+
+
+class TestWorkDescription:
+    """The Mode step's selection as ``TASK.md``'s description section: one
+    comment line for programs, one line each for people, and back."""
+
+    CHOSEN = WorkSelection(
+        items=("review-prs", "triage-issues"), custom="also watch the release branch",
+        rules="never merge anything",
+    )
+
+    def test_the_contract_shape(self) -> None:
+        assert render_work_description(self.CHOSEN) == (
+            "<!-- nerve:work review-prs, triage-issues -->\n"
+            "Work: Review pull requests; Triage issues\n"
+            "Also: also watch the release branch\n"
+            "Must know or never do: never merge anything"
+        )
+
+    def test_each_line_is_left_out_when_empty(self) -> None:
+        assert render_work_description(WorkSelection()) == ""
+        assert render_work_description(WorkSelection(custom=" \n ", rules="\t")) == ""
+        assert render_work_description(WorkSelection(items=("ci-health",))) == (
+            "<!-- nerve:work ci-health -->\nWork: Keep CI healthy"
+        )
+        # Without items the comment line still opens the section: it tells a
+        # selection from a free-text note.
+        assert render_work_description(WorkSelection(custom="Keep the build green.")) == (
+            "<!-- nerve:work -->\nAlso: Keep the build green."
+        )
+        assert render_work_description(WorkSelection(rules="Never merge.")) == (
+            "<!-- nerve:work -->\nMust know or never do: Never merge."
+        )
+
+    def test_items_once_each_in_catalog_order_unknown_ones_left_out(self) -> None:
+        text = render_work_description(WorkSelection(
+            items=("docs-release-notes", "review-prs", "no-such-work", "review-prs"),
+        ))
+        assert text == (
+            "<!-- nerve:work review-prs, docs-release-notes -->\n"
+            "Work: Review pull requests; Docs and release notes"
+        )
+
+    @pytest.mark.parametrize("selection", [
+        WorkSelection(),
+        WorkSelection(items=("review-prs", "triage-issues"), custom="also watch the release branch",
+                      rules="never merge anything"),
+        WorkSelection(items=("alert-response",)),
+        WorkSelection(custom="Watch org/repo-a.\n\nReport weekly.\n  - indented line"),
+        WorkSelection(rules="Never merge.\nNever push to main."),
+        # Lines of the custom text that read like the people's lines stay its own.
+        WorkSelection(items=("ci-health",), custom="first\nWork: only weekdays\nAlso: the docs",
+                      rules="Also: never close issues"),
+        WorkSelection(items=tuple(i for i in (
+            "review-prs", "triage-issues", "fix-issues", "ci-health", "dependency-updates",
+            "alert-response", "channel-digests", "research-reports", "docs-release-notes",
+        ))),
+    ])
+    def test_round_trip(self, selection: WorkSelection) -> None:
+        text = render_work_description(selection)
+        back = work_selection_from(text)
+        assert back == selection and not back.free_text
+        # Through a real TASK.md as well.
+        assert work_selection_from(task_description_from(render_task_md(text))) == selection
+
+    def test_a_free_text_note_stays_a_paragraph_and_reads_as_custom_work(self) -> None:
+        note = "Watch the nightly build for example/repo.\n\nPropose fixes before changing anything."
+        selection = work_selection_from(note)
+        assert selection == WorkSelection(custom=note) and selection.free_text
+        assert render_work_description(selection) == note
+        # A note that happens to start like the people's lines is still a note.
+        lookalike = work_selection_from("Work: review pull requests in org/repo-a")
+        assert lookalike.free_text and lookalike.custom == "Work: review pull requests in org/repo-a"
+        assert work_selection_from(None) == work_selection_from("") == work_selection_from(" \n") == WorkSelection()
+
+    def test_unknown_ids_are_dropped_with_a_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level("WARNING", logger="nerve.setup_writer"):
+            selection = work_selection_from(
+                "<!-- nerve:work review-prs, retired-item -->\nWork: Review pull requests; Retired"
+            )
+        assert selection == WorkSelection(items=("review-prs",))
+        assert "retired-item" in caplog.text
+
+    def test_the_worker_task_md_carries_the_selection_under_its_heading(self, tmp_path: Path) -> None:
+        ws = tmp_path / "ws"
+        text = render_work_description(self.CHOSEN)
+        assert apply_mode(ws, "worker", text).task_written
+        written = (ws / "TASK.md").read_text(encoding="utf-8")
+        lines = written.splitlines()
+        assert lines[0] == "# Task" and lines[1].startswith(TASK_ONBOARDING_MARKER)
+        assert f"## Task description (as given)\n{text}\n\n## Identity\n" in written
+        assert task_description_from(written) == text
+        assert work_selection_from(task_description_from(written)) == self.CHOSEN
+        # Once onboarding removed the marker, nothing reads as chosen any more.
+        done = written.replace(lines[1] + "\n", "", 1)
+        assert work_selection_from(task_description_from(done)) == WorkSelection()
 
 
 class TestProfileTemplates:
@@ -953,13 +1067,14 @@ class TestFixRoundTwoWriterRules:
             "task-planner": "Task planner",
             "skill-extractor": "Skill extractor",
             "skill-reviser": "Skill reviser",
+            "machine-maintenance": "Machine maintenance",
         }
         assert "name" not in yaml.safe_load(setup_writer.system_cron_file(ws).read_text(encoding="utf-8"))["jobs"][0]
 
 
 class TestModeDefaults:
     """Quiet hours are optional (a worker's are off) and a worker's
-    task-planner is off until its onboarding session enables it."""
+    task-planner is off until its onboarding conversation enables it."""
 
     @staticmethod
     def _quiet(**fields) -> tuple[str, str]:
@@ -1009,13 +1124,113 @@ class TestModeDefaults:
         assert apply_profile_templates(ws, quiet=("22:00", "07:00")) == []
 
     def test_worker_default_crons_leave_task_planner_available_but_off(self) -> None:
-        assert setup_writer.DEFAULT_CRONS["worker"] == ["skill-reviser", "skill-extractor"]
-        assert setup_writer.DEFAULT_CRONS["personal"] == ["inbox-processor", "task-planner"]
-        assert setup_writer.optional_cron_ids_for("worker") == ("task-planner", "skill-extractor", "skill-reviser")
+        assert setup_writer.DEFAULT_CRONS["worker"] == ["skill-reviser", "skill-extractor", "machine-maintenance"]
+        assert setup_writer.DEFAULT_CRONS["personal"] == ["inbox-processor", "task-planner", "machine-maintenance"]
+        assert setup_writer.optional_cron_ids_for("worker") == (
+            "task-planner", "skill-extractor", "skill-reviser", "machine-maintenance",
+        )
         jobs = setup_writer.build_cron_jobs(SetupChoices(
             mode="worker", enabled_crons=list(setup_writer.DEFAULT_CRONS["worker"]),
         ))
         assert {job["id"]: job["enabled"] for job in jobs} == {
             "memory-maintenance": True, "task-planner": False,
-            "skill-extractor": True, "skill-reviser": True,
+            "skill-extractor": True, "skill-reviser": True, "machine-maintenance": True,
         }
+
+
+class TestMachineMaintenance:
+    """The weekly cleanup job: on by default in both modes, offered as a
+    toggle on the Automation step, and worded the same under every memory
+    backend."""
+
+    @staticmethod
+    def _job() -> dict:
+        return next(c for c in setup_writer.PRODUCTIVITY_CRONS if c["id"] == "machine-maintenance")
+
+    @pytest.mark.parametrize("mode", ["personal", "worker"])
+    def test_on_by_default_and_optional_in_both_modes(self, tmp_path: Path, mode: str) -> None:
+        assert "machine-maintenance" in setup_writer.DEFAULT_CRONS[mode]
+        assert "machine-maintenance" in setup_writer.optional_cron_ids_for(mode)
+        ws = tmp_path / "ws"
+        setup_writer.apply_mode(ws, mode)
+        toggle = next(t for t in setup_writer.list_optional_crons(ws) if t.id == "machine-maintenance")
+        assert toggle.enabled and toggle.name == "Machine maintenance"
+        setup_writer.set_optional_crons(ws, set(setup_writer.DEFAULT_CRONS[mode]) - {"machine-maintenance"})
+        assert not next(t for t in setup_writer.list_optional_crons(ws) if t.id == "machine-maintenance").enabled
+
+    def test_runs_weekly_in_its_own_session(self) -> None:
+        job = self._job()
+        assert setup_writer.describe_cron(job["schedule"]) == "Sundays at 04:00"
+        assert job["session_mode"] == "isolated"
+        assert "ask_user" in job["prompt"]
+
+    def test_names_no_memory_tool(self) -> None:
+        """Loom serves none of Nerve's memory tools, and this prompt has no
+        Loom wording: it says "your memory" and lets the session pick."""
+        job = self._job()
+        memory_tools = {
+            "memory_recall", "memory_expand_category", "session_context", "conversation_history",
+            "memory_records_by_date", "memorize", "memory_update", "memory_delete", "category_update",
+        }
+        assert not {name for name in memory_tools if re.search(rf"\b{name}\b", job["prompt"])}
+        assert setup_writer._cron_prompt(job, "loom") == job["prompt"]
+
+
+class TestHostedGitHubKeepsTheEventsSourceOff:
+    """The events source reads with gh on this machine, which a GitHub that
+    the channel gateway polls does not set up. Wherever the writers derive it
+    from the GitHub switch, it stays off while GitHub is hosted."""
+
+    @pytest.mark.parametrize(("mode", "events"), [(None, True), ("poll", True), ("hosted", False)])
+    def test_the_layers_follow_the_switch_only_while_github_is_polled_here(self, mode, events) -> None:
+        _machine, portable, _shadowed = setup_writer.build_config_layers(
+            SetupChoices(mode="personal", github_sync=True, github_mode=mode),
+        )
+        assert portable["sync"]["github"] == {"enabled": True}
+        assert portable["sync"]["github_events"] == {"enabled": events}
+
+    @pytest.mark.parametrize(("settings", "events"), [
+        ("", True),
+        ("sync:\n  github:\n    mode: poll\n", True),
+        ("sync:\n  github:\n    mode: hosted\n", False),
+        ("sync:\n  github:\n    mode: ' Hosted '\n", False),
+        ("sync:\n  github:\n    mode: elsewhere\n", True),
+    ])
+    def test_the_installer_takes_the_mode_from_the_settings_it_writes(
+        self, tmp_path: Path, settings: str, events: bool,
+    ) -> None:
+        workspace = tmp_path / "workspace"
+        settings_file = workspace / "config" / "settings.yaml"
+        settings_file.parent.mkdir(parents=True)
+        settings_file.write_text(settings, encoding="utf-8")
+
+        run_writers(tmp_path, personal_choices(workspace))
+
+        sync = yaml.safe_load(settings_file.read_text(encoding="utf-8"))["sync"]
+        assert sync["github"]["enabled"] is True
+        assert sync["github_events"] == {"enabled": events}
+
+    def test_unattended_init_with_gh_on_the_path_keeps_it_off_over_hosted_settings(
+        self, tmp_path: Path,
+    ) -> None:
+        """The unattended installer switches GitHub on whenever gh is on the
+        PATH; over settings that say ``hosted`` the events source stays off."""
+        settings_file = tmp_path / "workspace" / "config" / "settings.yaml"
+        settings_file.parent.mkdir(parents=True)
+        settings_file.write_text("sync:\n  github:\n    mode: hosted\n", encoding="utf-8")
+
+        produced = run_unattended(tmp_path, "personal", {}, on_path=("gh",))
+
+        sync = yaml.safe_load(produced["settings.yaml"])["sync"]
+        assert sync["github"] == {"mode": "hosted", "enabled": True}
+        assert sync["github_events"] == {"enabled": False}
+
+    def test_the_web_steps_carry_the_running_mode(self, tmp_path: Path) -> None:
+        hosted = choices_from_config(NerveConfig.from_dict({
+            "workspace": str(tmp_path / "ws"), "sync": {"github": {"enabled": True, "mode": "hosted"}},
+        }))
+        assert hosted.github_mode == "hosted"
+        _machine, portable, _shadowed = setup_writer.build_config_layers(hosted)
+        assert portable["sync"]["github_events"] == {"enabled": False}
+        polled = choices_from_config(NerveConfig.from_dict({"workspace": str(tmp_path / "ws")}))
+        assert polled.github_mode == "poll"

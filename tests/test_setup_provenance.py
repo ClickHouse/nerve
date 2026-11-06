@@ -194,6 +194,80 @@ class TestCredentialSourcesOnAnInstall:
         assert sources["openai_api_key"] is None, "lockdown does not read config.local.yaml"
 
 
+class TestMachineSwitches:
+    """Whether a machine layer states a switch the page writes to settings.yaml.
+
+    Any value states it, ``false`` and a bare key included: the loader takes
+    the leaf from the highest layer that has the key, so the page's write to
+    ``settings.yaml`` is shadowed whatever the machine layer says.
+    """
+
+    PATH = "sync.github.enabled"
+
+    def test_the_machine_file_the_loader_takes_it_from_is_named(self):
+        both = _layers(local={"sync": {"github": {"enabled": True}}}, machine={"sync": {"github": {"enabled": False}}})
+        assert prov.machine_layer_of(self.PATH, both) == "config.local.yaml"
+        machine = _layers(machine={"sync": {"github": {"enabled": True}}}, settings={"sync": {"github": {"enabled": False}}})
+        assert prov.machine_layer_of(self.PATH, machine) == "config.yaml"
+
+    @pytest.mark.parametrize("value", [True, False, None, "false", "${GITHUB_SOURCE:-true}"])
+    def test_any_value_states_the_switch(self, value):
+        layers = _layers(local={"sync": {"github": {"enabled": value}}}, settings={"sync": {"github": {"enabled": True}}})
+        assert prov.machine_layer_of(self.PATH, layers) == "config.local.yaml"
+
+    def test_a_switch_in_the_tracked_file_alone_is_the_pages_own(self):
+        assert prov.machine_layer_of(self.PATH, _layers(settings={"sync": {"github": {"enabled": True}}})) is None
+        assert prov.machine_layer_of(self.PATH, _layers(local={"sync": {"github": {"mode": "hosted"}}})) is None
+        assert prov.machine_layer_of(self.PATH, _layers()) is None
+
+    def test_lockdown_reads_no_machine_layer(self):
+        locked = _layers(
+            local={"sync": {"github": {"enabled": True}}}, settings={"sync": {"github": {"enabled": False}}}, locked=True,
+        )
+        assert prov.machine_layer_of(self.PATH, locked) is None
+
+    def test_on_an_install_the_machine_layer_outranks_what_the_page_writes(self, tmp_path):
+        config_dir, ws = _install(tmp_path)
+        # The slim install switches GitHub off in the tracked settings: the page's own switch.
+        config = load_config(config_dir)
+        assert config.sync.github.enabled is False
+        assert prov.machine_switches(config) == {}
+        merge_private_paths(config_dir / "config.local.yaml", {"sync.github.mode": "hosted", "sync.github.enabled": True})
+        config = load_config(config_dir)
+        assert config.sync.github.enabled is True
+        assert prov.machine_switches(config) == {"sync.github.enabled": "config.local.yaml"}
+        # What the page would write lands in settings.yaml and changes nothing the loader reads.
+        merge_settings_paths(ws, {"sync.github.enabled": False})
+        config = load_config(config_dir)
+        assert config.sync.github.enabled is True
+        assert prov.machine_switches(config) == {"sync.github.enabled": "config.local.yaml"}
+
+    def test_config_yaml_states_it_too(self, tmp_path):
+        config_dir, _ws = _install(tmp_path)
+        merge_machine_paths(config_dir / "config.yaml", {"sync.github.enabled": False}, header=CONFIG_YAML_HEADER)
+        assert prov.machine_switches(load_config(config_dir)) == {"sync.github.enabled": "config.yaml"}
+
+    def test_status_and_doctor_read_the_switch_as_the_page_does(self, tmp_path):
+        """``nerve status`` and ``nerve doctor`` derive the checklist in their
+        own process, from the same layers, so the steps they count are the
+        page's."""
+        config_dir, _ws = _install(tmp_path)
+        merge_private_paths(config_dir / "config.local.yaml", {"sync.github.mode": "hosted", "sync.github.enabled": True})
+        summary = cli._setup_summary(load_config(config_dir))
+        sources = next(s for s in summary["steps"] if s["id"] == "sources")
+        assert sources["detail"]["github"]["managed"] is True
+        assert sources["detail"]["available"] == ["gmail", "telegram"]
+
+    def test_an_unreadable_or_missing_layer_states_nothing(self, tmp_path):
+        config_dir, ws = _install(tmp_path)
+        (config_dir / "config.local.yaml").write_text("- not: [a mapping", encoding="utf-8")
+        config = NerveConfig.from_dict({"workspace": str(ws)})
+        config.config_dir = config_dir
+        assert prov.machine_switches(config) == {}
+        config.config_dir = tmp_path / "missing"
+        assert prov.machine_switches(config) == {}
+
+
 class TestDoctorNamesTheSource:
     """``nerve doctor`` prints where every configured connection came from."""
 

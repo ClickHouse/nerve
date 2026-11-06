@@ -152,26 +152,23 @@ def build_source_runners(
                 imap.match.only_matched, vision.enabled,
             )
 
-    # GitHub (notifications)
+    # GitHub (notifications). In hosted mode the gateway polls GitHub and the
+    # runner drains the records it delivered; everything past the fetch —
+    # guardrail, drop hook, condensing, the source name — is the same.
     gh = config.sync.github
     if gh.enabled:
-        from nerve.sources.filters import FieldRule, InboxFilter
-        from nerve.sources.github import GitHubSource
+        from nerve.sources.github import github_inbox_filter
 
-        source = GitHubSource()
-        # Guardrails: restrict which repos (matched on the "repo_name" metadata
-        # key) and which GitHub actors (matched on the "actors" metadata key —
-        # every login involved in a notification) reach the inbox. The rules
-        # AND together; within each, deny wins and a non-empty allow is
-        # fail-closed. ci_branch is deny-only on purpose: it is empty for
-        # everything except CheckSuite notifications, so an allow list there
-        # would fail closed and drop the whole feed.
-        gh_filter = InboxFilter(rules=[
-            FieldRule(field="repo_name", allow=gh.allow_repos, deny=gh.deny_repos),
-            FieldRule(field="actors", allow=gh.allow_actors, deny=gh.deny_actors),
-            FieldRule(field="reason", allow=gh.allow_reasons, deny=gh.deny_reasons),
-            FieldRule(field="ci_branch", deny=gh.deny_ci_branches),
-        ])
+        hosted = gh.mode == "hosted"
+        if hosted:
+            from nerve.sources.github_hosted import HostedGitHubSource
+
+            source = HostedGitHubSource(db)
+        else:
+            from nerve.sources.github import GitHubSource
+
+            source = GitHubSource(config={"inbox": gh.inbox})
+        gh_filter = github_inbox_filter(gh)
         gh_runner = SourceRunner(
             source=source,
             db=db,
@@ -186,12 +183,13 @@ def build_source_runners(
         runners.append(gh_runner)
         # The runner's copy is validated (a wrong-shaped value turns it off).
         hook = gh_runner.drop_hook
+        label = "github (hosted)" if hosted else "github"
         if gh_filter.active:
             logger.info(
-                "Registered source: github (batch=%d, guardrail: "
+                "Registered source: %s (batch=%d, guardrail: "
                 "repos allow=%s deny=%s; actors allow=%s deny=%s; "
                 "reasons allow=%s deny=%s; ci_branches deny=%s; drop_hook=%s)",
-                gh.batch_size,
+                label, gh.batch_size,
                 gh.allow_repos or "*", gh.deny_repos or [],
                 gh.allow_actors or "*", gh.deny_actors or [],
                 gh.allow_reasons or "*", gh.deny_reasons or [],
@@ -205,7 +203,7 @@ def build_source_runners(
                     hook[0],
                 )
         else:
-            logger.info("Registered source: github (batch=%d)", gh.batch_size)
+            logger.info("Registered source: %s (batch=%d)", label, gh.batch_size)
             if hook:
                 logger.warning(
                     "sync.github.drop_hook is set but no guardrail is, so "
@@ -232,17 +230,34 @@ def build_source_runners(
         ))
         logger.info("Registered source: github_events (batch=%d, repos=%s)", gh_events.batch_size, gh_events.repos or "all")
 
-    # GitHub Repos (monitor watched repos for new issues/PRs)
+    # GitHub Repos (repositories the agent follows: new PRs, issues, releases).
+    # GitHub is hosted as a whole: with sync.github.mode hosted the gateway
+    # polls these repositories too, and the runner drains what it delivered.
     gh_repos = config.sync.github_repos
     if gh_repos.enabled:
-        from nerve.sources.github_repos import GitHubReposSource
+        from nerve.sources.github_repos import github_repos_inbox_filter
 
         if not gh_repos.repos:
             logger.warning(
                 "Source github_repos is enabled but no repos are configured — "
                 "it will be a no-op until sync.github_repos.repos is set",
             )
-        source = GitHubReposSource(config={"repos": gh_repos.repos})
+        repos_hosted = gh.mode == "hosted"
+        if repos_hosted:
+            from nerve.sources.github_hosted import HostedGitHubSource
+
+            source = HostedGitHubSource(db, "github_repos")
+        else:
+            from nerve.sources.github_repos import GitHubReposSource
+
+            source = GitHubReposSource(config={
+                "repos": gh_repos.repos,
+                "types": gh_repos.types,
+                "include_bots": gh_repos.include_bots,
+                "include_drafts": gh_repos.include_drafts,
+                "updates": gh_repos.updates,
+                "deny_authors": gh_repos.deny_authors,
+            })
         runners.append(SourceRunner(
             source=source,
             db=db,
@@ -251,10 +266,15 @@ def build_source_runners(
             condense_model=condense_model,
             condense_client_factory=condense_factory,
             ttl_days=ttl_days,
+            inbox_filter=github_repos_inbox_filter(gh_repos),
         ))
         logger.info(
-            "Registered source: github_repos (batch=%d, repos=%s)",
-            gh_repos.batch_size, gh_repos.repos or "none",
+            "Registered source: %s (batch=%d, repos=%s, types=%s, include_bots=%s, "
+            "include_drafts=%s, updates=%s, deny_authors=%s)",
+            "github_repos (hosted)" if repos_hosted else "github_repos",
+            gh_repos.batch_size, gh_repos.repos or "none", gh_repos.types,
+            gh_repos.include_bots, gh_repos.include_drafts, gh_repos.updates,
+            gh_repos.deny_authors or [],
         )
 
     # Channel source drains. Not a poll: the channel transport already
@@ -269,7 +289,7 @@ def build_source_runners(
         source_cfg = getattr(channel_config, "source", None)
         if source_cfg is None or not source_cfg.enabled:
             continue
-        if not source_cfg.allow_conversations:
+        if not source_cfg.collects:
             # ChannelSourceConfig.from_dict already warned. Don't build a
             # runner whose policy can never approve anything to drain.
             continue
@@ -309,9 +329,10 @@ def build_source_runners(
         ))
         logger.info(
             "Registered source: %s observations (batch=%d, schedule=%s, "
-            "conversations allow=%s deny=%s)",
+            "conversations allow=%s deny=%s, gateway grant=%s)",
             channel_name, source_cfg.batch_size, source_cfg.schedule,
             source_cfg.allow_conversations, source_cfg.deny_conversations or [],
+            source_cfg.gateway_grant,
         )
 
     return runners

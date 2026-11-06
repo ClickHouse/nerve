@@ -4,6 +4,7 @@ helpers (no SDK subprocess)."""
 import asyncio
 import contextlib
 import json
+import logging
 import math
 import os
 import re
@@ -624,6 +625,135 @@ async def test_receive_turn_closes_the_iterator_on_a_completed_turn():
     async for _event in client.receive_turn():
         pass
     assert sdk.explicit_aclose == 1
+
+
+# ---------------------------------------------------------------------------
+# ClaudeClient.receive_turn — silence while the person decides is no hang
+# ---------------------------------------------------------------------------
+
+
+class _Hub:
+    """The session's interaction hub, as ``receive_turn`` reads it."""
+
+    def __init__(self, *pending: str):
+        self.pending = list(pending)
+
+    @property
+    def has_pending(self) -> bool:
+        return bool(self.pending)
+
+    def pending_interaction_types(self) -> list[str]:
+        return list(self.pending)
+
+
+class _AskingClient:
+    """SDK double for a CLI that asked the person through ``can_use_tool``:
+    it streams ``before``, is silent until ``answer()``, then streams
+    ``after``. The pause is over before the CLI speaks again, so the hub
+    clears in the same step as the next message.
+
+    ``receive_response`` is a real async generator, like the SDK's: a
+    cancelled ``__anext__()`` finalizes it, and waiting on it again would
+    report a dead runtime.
+    """
+
+    def __init__(self, hub: _Hub, before: list, after: list):
+        self._hub, self._before, self._after = hub, before, after
+        self._answered = asyncio.Event()
+
+    def answer(self) -> None:
+        self._answered.set()
+
+    def receive_response(self):
+        async def _gen():
+            for msg in self._before:
+                yield msg
+            await self._answered.wait()
+            self._hub.pending.clear()
+            for msg in self._after:
+                yield msg
+
+        return _gen()
+
+
+def _deferrals(caplog) -> list[str]:
+    return [
+        r.getMessage() for r in caplog.records
+        if "idle timeout deferred" in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_waits_for_the_person_past_the_idle_timeout(caplog):
+    """A CLI paused on a plan decision is silent because it waits for Nerve's
+    answer, which waits for the person. Past the idle timeout the turn keeps
+    waiting (no TimeoutError), and after the decision the rest of the stream
+    arrives on the same iterator. The deferral is logged once."""
+    hub = _Hub("plan_exit")
+    before = [_text_msg("Here is the plan.")]
+    after = [_text_msg("Approved, building."), _result_msg()]
+    sdk = _AskingClient(hub, before, after)
+    client = _turn_client(sdk, "sess-plan", idle_timeout=0.05)
+    client._spec.interactive = hub
+    seen: list = []
+
+    async def _consume():
+        async for event in client.receive_turn():
+            seen.append(event)
+
+    with caplog.at_level(logging.INFO, logger="nerve.agent.interactive"):
+        turn = asyncio.create_task(_consume())
+        try:
+            await asyncio.sleep(0.4)  # eight idle timeouts of silence
+            assert not turn.done()
+            sdk.answer()
+            await asyncio.wait_for(turn, timeout=2)
+        finally:
+            turn.cancel()
+
+    assert seen == _translated(before + after)
+    assert _deferrals(caplog) == [
+        "idle timeout deferred for session sess-plan: waiting for the person "
+        "(plan_exit pending)",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_times_out_when_nothing_waits_for_the_person():
+    """With a hub but nothing pending, silence past the idle timeout is a
+    hang as before: TimeoutError, and the SDK iterator is closed."""
+    sdk = _StubClient([_text_msg("a")], hang=True, hang_seconds=2.0)
+    client = _turn_client(sdk, "sess-idle", idle_timeout=0.05)
+    client._spec.interactive = _Hub()
+    with pytest.raises(asyncio.TimeoutError):
+        async for _event in client.receive_turn():
+            pass
+    assert sdk.aclose_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_receive_turn_times_out_once_the_interaction_is_over():
+    """The wait lasts only while the interaction is pending: once it is
+    over, silence past the idle timeout is a hang again."""
+    hub = _Hub("question")
+    sdk = _StubClient([_text_msg("a")], hang=True, hang_seconds=5.0)
+    client = _turn_client(sdk, "sess-q", idle_timeout=0.05)
+    client._spec.interactive = hub
+
+    async def _consume():
+        async for _event in client.receive_turn():
+            pass
+
+    turn = asyncio.create_task(_consume())
+    try:
+        await asyncio.sleep(0.2)
+        assert not turn.done()
+        hub.pending.clear()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(turn, timeout=2)
+    finally:
+        turn.cancel()
+    assert sdk.aclose_calls == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1583,6 +1713,81 @@ async def test_sidechain_only_user_turn_still_crash_retries(tmp_path, db):
     assert [r["content"] for r in rows if r["role"] == "assistant"] == ["recovered"]
 
 
+def _thinking_script(first: list) -> list:
+    """Thinking, then ``first`` (the turn's first text or tool call), then
+    more thinking and a closing text."""
+    from claude_agent_sdk import ThinkingBlock
+
+    def _think(text: str) -> AssistantMessage:
+        return AssistantMessage(content=[ThinkingBlock(thinking=text, signature="sig")], model="claude-test")
+
+    return [
+        _think("LEADING-1 "),
+        _think("LEADING-2"),
+        *first,
+        _think("AFTER"),
+        AssistantMessage(content=[TextBlock(text="Done.")], model="claude-test"),
+        ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1, is_error=False,
+            num_turns=1, session_id="native-0", total_cost_usd=0.01,
+            usage={"input_tokens": 1},
+        ),
+    ]
+
+
+def _first_tool_call() -> list:
+    from claude_agent_sdk import ToolResultBlock, ToolUseBlock
+
+    return [
+        AssistantMessage(content=[ToolUseBlock(
+            id="toolu_read", name="Read", input={"file_path": "/tmp/notes.md"},
+        )], model="claude-test"),
+        UserMessage(content=[ToolResultBlock(tool_use_id="toolu_read", content="notes")]),
+    ]
+
+
+_FIRST_TEXT = [AssistantMessage(content=[TextBlock(text="Hello.")], model="claude-test")]
+
+
+async def _run_with_thinking(tmp_path, db, sid, first, **run_kwargs):
+    """Run :func:`_thinking_script`; the stored reply and the thinking sent to the chat."""
+    from nerve.agent.streaming import broadcaster
+
+    engine, _backend = _sdk_script_engine(tmp_path, db, [(_thinking_script(first), False)])
+    sent = AsyncMock()
+    with patch.object(broadcaster, "broadcast_thinking", sent), \
+            patch("nerve.agent.engine._maybe_broadcast_file_changed"), \
+            patch("nerve.agent.engine._maybe_broadcast_plan_update"):
+        await engine.run(sid, "go", source="web", channel="web", actor=None, **run_kwargs)
+    (assistant,) = [r for r in await db.get_messages(sid) if r["role"] == "assistant"]
+    return assistant, [call.args[1] for call in sent.await_args_list]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first, first_type", [(_FIRST_TEXT, "text"), (_first_tool_call(), "tool_call")])
+async def test_drop_leading_thinking_drops_only_the_thinking_before_the_first_output(
+    tmp_path, db, first, first_type,
+):
+    """The onboarding conversation's first turn: the thinking before the
+    first text or tool call is neither sent to the chat nor stored with the
+    reply; the thinking after it is both."""
+    assistant, sent = await _run_with_thinking(tmp_path, db, "s-drop", first, drop_leading_thinking=True)
+    assert sent == ["AFTER"]
+    assert assistant["thinking"] == "AFTER"
+    assert [b["type"] for b in assistant["blocks"]] == [first_type, "thinking", "text"]
+    assert "LEADING" not in json.dumps(assistant["blocks"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first, first_type", [(_FIRST_TEXT, "text"), (_first_tool_call(), "tool_call")])
+async def test_a_normal_turn_sends_and_stores_all_of_its_thinking(tmp_path, db, first, first_type):
+    assistant, sent = await _run_with_thinking(tmp_path, db, "s-keep", first)
+    assert sent == ["LEADING-1 ", "LEADING-2", "AFTER"]
+    assert assistant["thinking"] == "LEADING-1 LEADING-2AFTER"
+    assert [b["type"] for b in assistant["blocks"]] == ["thinking", first_type, "thinking", "text"]
+    assert assistant["blocks"][0]["content"] == "LEADING-1 LEADING-2"
+
+
 @pytest.mark.asyncio
 async def test_process_agent_event_routes_sidechain_to_registry():
     """Every event carrying parent_tool_use_id (and every SubagentUsage) is
@@ -1797,3 +2002,47 @@ def test_build_options_forwards_subagent_text(tmp_path):
             system_prompt="", cwd=str(ws),
         )
         assert backend._build_options(spec).forward_subagent_text is flag
+
+
+# ---------------------------------------------------------------------------
+# Plan files: where the CLI's plan mode writes them, and the plan_update
+# broadcast that streams them into the side panel
+# ---------------------------------------------------------------------------
+
+
+def test_plan_files_live_in_the_clis_plans_directory(tmp_path, monkeypatch):
+    from nerve.agent.engine import _is_plan_file
+
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    assert _is_plan_file("/home/someone/.claude/plans/quiet-blue-river.md")
+    assert not _is_plan_file(str(tmp_path / "plans" / "quiet-blue-river.md"))
+    assert not _is_plan_file(str(tmp_path / "notes.md")) and not _is_plan_file("")
+
+    # CLAUDE_CONFIG_DIR moves the CLI's config directory, plans included.
+    config_dir = tmp_path / "cli-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    assert _is_plan_file(str(config_dir / "plans" / "quiet-blue-river.md"))
+    assert _is_plan_file(str(config_dir / "plans" / "quiet-blue-river-agent-a1b2.md"))
+    assert not _is_plan_file(str(config_dir / "plans-old" / "x.md"))
+    assert not _is_plan_file(str(config_dir / "settings.json"))
+    assert _is_plan_file("/home/someone/.claude/plans/quiet-blue-river.md")
+
+
+@pytest.mark.asyncio
+async def test_a_plan_written_under_a_moved_config_dir_reaches_the_panel(tmp_path, monkeypatch):
+    from nerve.agent import engine as engine_module
+
+    config_dir = tmp_path / "cli-config"
+    plan = config_dir / "plans" / "quiet-blue-river.md"
+    plan.parent.mkdir(parents=True)
+    plan.write_text("# Setup proposal — review PRs in org/repo-a\n", encoding="utf-8")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    sent = AsyncMock()
+    monkeypatch.setattr(engine_module.broadcaster, "broadcast_plan_update", sent)
+
+    log = [{"tool": "Write", "tool_use_id": "tu-1", "input": {"file_path": str(plan)}}]
+    engine_module._maybe_broadcast_plan_update("s-plan", "tu-1", log)
+    other = [{"tool": "Write", "tool_use_id": "tu-2", "input": {"file_path": str(tmp_path / "x.md")}}]
+    engine_module._maybe_broadcast_plan_update("s-plan", "tu-2", other)
+    await asyncio.sleep(0)
+    sent.assert_awaited_once_with("s-plan", "# Setup proposal — review PRs in org/repo-a\n")

@@ -59,17 +59,19 @@ from nerve.agent.backends.events import TurnStatus
 from nerve.agent.cache_policy import resolve_cache_ttl
 from nerve.agent.interactive import (
     InteractiveToolHandler,
+    defer_idle_timeout,
     register_handler,
     unregister_handler,
     get_handler,
 )
+from nerve.agent.plan_summary import summarize_plan
 from nerve.agent.prompts import (
     build_session_preamble,
     build_system_prompt,
     current_time_str,
+    memory_unavailable_note,
     prepend_session_preamble,
     set_skill_manager,
-    worker_onboarding_prompt,
 )
 from nerve.agent.sessions import SessionManager, SessionStatus, new_cron_run_id
 from nerve.agent.streaming import broadcaster
@@ -97,17 +99,15 @@ from nerve.identity import (
 )
 from nerve.inference_principal import inference_principal
 from nerve.mcp_gateway import McpGatewayCatalog
-from nerve.observability.langfuse import attributes as lf_attrs
-from nerve.setup_writer import (
-    TASK_ONBOARDING_MARKER,
-    publish_text,
-    render_task_md,
-    task_description_from,
-    task_onboarding_pending,
+from nerve.memory.backend import (
+    MemoryBackendUnavailable,
+    create_memory_bridge,
+    recall_for_startup,
 )
+from nerve.observability.langfuse import attributes as lf_attrs
+from nerve.platform.activity import LEASE_MEMORIZE, keep_awake
 from nerve.skills.manager import SkillManager
 from nerve.utils.llm import response_text
-from nerve.workspace import read_worker_guide
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +122,19 @@ _RESUME_AFTER_RESTART_PROMPT = (
     "the restart. If you triggered the restart yourself, confirm it succeeded "
     "and carry on."
 )
+
+# Sent to the session's clients when run() refuses a turn during a drain.
+_NOT_ACCEPTING_TURNS_MESSAGE = (
+    "Nerve is shutting down and did not run this message. "
+    "Send it again when Nerve is back."
+)
+
+
+class NotAcceptingTurnsError(RuntimeError):
+    """``AgentEngine.run`` refused a new turn because the engine is draining."""
+
+    def __init__(self) -> None:
+        super().__init__(_NOT_ACCEPTING_TURNS_MESSAGE)
 
 
 def _sanitize_surrogates(s: str) -> str:
@@ -316,6 +329,9 @@ class _TurnState:
     got_content: bool = False
     status: TurnStatus = "completed"
     error: str | None = None
+    # The run's ``drop_leading_thinking``: thinking before the turn's first
+    # text or tool call is neither broadcast nor stored.
+    drop_leading_thinking: bool = False
 
 
 @dataclass(frozen=True)
@@ -383,6 +399,9 @@ class AgentEngine:
         self.sessions = SessionManager(db, default_cwd=str(config.workspace))
         self.config = config
         self._semaphore = asyncio.Semaphore(config.agent.max_concurrent)
+        # Cleared by stop_accepting_turns(). Never set again: a drain ends
+        # with the process exit.
+        self._accepting_turns = True
         self._memory_bridge = None
         self._xmemory_bridge = None
         self._skill_manager: SkillManager | None = None
@@ -391,6 +410,9 @@ class AgentEngine:
         # refs so the tasks aren't GC'd mid-flight; pruned by their
         # done-callbacks and flushed in shutdown().
         self._memorize_bg_tasks: set[asyncio.Task] = set()
+        # Plan summaries being written (see _schedule_plan_summary) — strong
+        # refs too; cancelled in shutdown().
+        self._plan_summary_tasks: set[asyncio.Task] = set()
         self._session_locks: dict[str, asyncio.Lock] = {}
         # Idle stream watchers — one per live SDK client. Between run()
         # calls nothing reads the SDK message stream, but the CLI keeps
@@ -632,6 +654,13 @@ class AgentEngine:
         """Publish the local MCP listener port to backends."""
         self._mcp_loopback_port = port
 
+    def _loom_tools_offered(self) -> bool:
+        """Whether sessions get Loom's tools: the MCP gateway's catalog,
+        read in external mode only, lists the ``loom`` server."""
+        return self._managed_mcp and any(
+            getattr(server, "name", "") == "loom" for server in self._mcp_servers_cache
+        )
+
     async def _refresh_mcp_catalog(self) -> None:
         """External mode: read the catalog and give its servers to new clients.
 
@@ -812,9 +841,16 @@ class AgentEngine:
         cron``) started while the gateway runs must not mark the gateway's
         live agents interrupted.
         """
-        from nerve.memory.memu_bridge import MemUBridge
-        self._memory_bridge = MemUBridge(self.config, audit_db=self.db)
+        self._memory_bridge = create_memory_bridge(self.config, audit_db=self.db)
         await self._memory_bridge.initialize()
+        if self.config.memory.backend == "loom" and not self._managed_mcp:
+            # Loom's own tools reach agents as a server of the MCP gateway's
+            # catalog, which only external mode reads.
+            logger.warning(
+                "memory.backend is loom, but this instance is not in external "
+                "mode, so agents get no MCP gateway catalog and no Loom tools: "
+                "only the startup recall and transcript extraction use Loom",
+            )
 
         # Optional xmemory.ai structured-memory layer — inert unless both a
         # token and instance_id are configured. Runs alongside memU; never
@@ -824,7 +860,9 @@ class AgentEngine:
         await self._xmemory_bridge.initialize()
 
         # Initialize skill manager and discover skills from filesystem
-        self._skill_manager = SkillManager(self.config.workspace, self.db)
+        self._skill_manager = SkillManager(
+            self.config.workspace, self.db, config_dir=self.config.config_dir,
+        )
         try:
             skills = await self._skill_manager.discover()
             logger.info("Skills system initialized: %d skills discovered", len(skills))
@@ -883,11 +921,6 @@ class AgentEngine:
         except Exception as e:
             logger.error("Orphaned session recovery failed: %s", e)
 
-        # Worker mode: check if first-boot onboarding is needed
-        if self._needs_worker_onboarding():
-            asyncio.get_event_loop().call_soon(
-                lambda: asyncio.ensure_future(self._run_worker_onboarding())
-            )
 
         logger.info("Agent engine initialized")
 
@@ -934,71 +967,6 @@ class AgentEngine:
             len(self._claude_code_plugins),
         )
         return self._mcp_servers_cache
-
-    def _needs_worker_onboarding(self) -> bool:
-        """Check if this is a worker instance that needs first-boot onboarding.
-
-        Pending while ``TASK.md`` carries the template's onboarding marker —
-        the onboarding session deletes that line last, once every section is
-        filled — and, for files written by older versions, while it is still
-        the raw ``# Task`` form (:func:`nerve.setup_writer.task_onboarding_pending`).
-        """
-        task_md = self.config.workspace / "TASK.md"
-        if not task_md.exists():
-            return False
-        try:
-            content = task_md.read_text(encoding="utf-8")
-        except OSError as e:
-            logger.warning("Worker onboarding: cannot read %s: %s", task_md, e)
-            return False
-        return task_onboarding_pending(content)
-
-    def ensure_worker_onboarding(self) -> bool:
-        """Start the first-boot onboarding session if it is due and not running.
-
-        The public, idempotent-per-process entry the setup wizard's finish
-        step uses when the mode was chosen in the browser after boot (the
-        start-up check in :meth:`initialize` has already run by then). Returns
-        whether a session was scheduled now. The session it creates is the one
-        :meth:`run_cron` names ``Cron: worker-onboarding`` with
-        ``source="cron"``, which is how the checklist recognises it.
-        """
-        task = getattr(self, "_onboarding_task", None)
-        if task is not None and not task.done():
-            return False
-        if not self._needs_worker_onboarding():
-            return False
-        self._onboarding_task = asyncio.ensure_future(self._run_worker_onboarding())
-        return True
-
-    async def _run_worker_onboarding(self) -> None:
-        """Run the worker onboarding agent session on first boot."""
-        logger.info("Worker onboarding: starting first-boot setup session")
-
-        task_md = self.config.workspace / "TASK.md"
-        raw_task = await asyncio.to_thread(task_md.read_text, encoding="utf-8")
-        task_description = task_description_from(raw_task)
-        if task_description is None:  # completed since the check; nothing to do
-            logger.info("Worker onboarding: TASK.md is already complete")
-            return
-        if TASK_ONBOARDING_MARKER not in raw_task:
-            # A raw ``# Task`` file from an older install. The session is told
-            # to fill the template in place, so give it the template: its text
-            # kept under the description heading, the marker on line 2.
-            await asyncio.to_thread(publish_text, task_md, render_task_md(task_description))
-            logger.info("Worker onboarding: rewrote the legacy TASK.md in the template's shape")
-
-        guide = await asyncio.to_thread(read_worker_guide)
-        prompt = worker_onboarding_prompt(task_description, guide)
-
-        try:
-            await self.run_cron(
-                job_id="worker-onboarding",
-                prompt=prompt,
-            )
-            logger.info("Worker onboarding: setup session completed")
-        except Exception as e:
-            logger.error("Worker onboarding failed: %s", e)
 
     @staticmethod
     async def _safe_disconnect(client: Any, timeout: float = 5.0) -> None:
@@ -1073,6 +1041,15 @@ class AgentEngine:
             )
         self._memorize_bg_tasks.clear()
 
+        # Plan summaries still being written have nobody left to show them to.
+        for task in list(self._plan_summary_tasks):
+            task.cancel()
+        if self._plan_summary_tasks:
+            await asyncio.gather(
+                *self._plan_summary_tasks, return_exceptions=True,
+            )
+        self._plan_summary_tasks.clear()
+
         # Close the optional xmemory HTTP client (no-op when disabled).
         if self._xmemory_bridge is not None:
             try:
@@ -1131,6 +1108,14 @@ class AgentEngine:
     #  Memory bridge                                                       #
     # ------------------------------------------------------------------ #
 
+    @contextlib.asynccontextmanager
+    async def _memorizing(self):
+        """Hold the memorize lock, keeping the machine awake (the
+        ``nerve-memorize`` lease) while waiting for it and while holding it."""
+        with keep_awake(LEASE_MEMORIZE):
+            async with self._memorize_lock:
+                yield
+
     async def _memorize_session(
         self, session_id: str, connected_at_override: str | None = None,
     ) -> None:
@@ -1150,7 +1135,7 @@ class AgentEngine:
         if not self._memory_bridge or not self._memory_bridge.available:
             return
 
-        async with self._memorize_lock:
+        async with self._memorizing():
             # Session state (notably the last_memorized_at watermark) is
             # read inside the lock: queued memorizations for the same
             # session must each see the watermark advanced by the previous
@@ -1270,9 +1255,11 @@ class AgentEngine:
         if bridge is None or not bridge.indexes_conversations or not messages:
             return
 
-        task = asyncio.create_task(
-            bridge.memorize_conversation(session_id, messages),
-        )
+        async def _write() -> None:
+            with keep_awake(LEASE_MEMORIZE):
+                await bridge.memorize_conversation(session_id, messages)
+
+        task = asyncio.create_task(_write())
         self._memorize_bg_tasks.add(task)
 
         def _done(t: asyncio.Task) -> None:
@@ -1350,7 +1337,7 @@ class AgentEngine:
             logger.info("Memorization sweep skipped: another memorize is in progress")
             return {"skipped": "memorize already in progress"}
 
-        async with self._memorize_lock:
+        async with self._memorizing():
             sessions = await self.db.get_sessions_needing_memorization()
             total_messages = 0
             sessions_indexed = 0
@@ -1592,22 +1579,39 @@ class AgentEngine:
             # prompts across rebuilds are what let a resumed conversation
             # hit the prompt cache (see nerve/agent/cache_policy.py), and a
             # session keeping its original priors is more consistent anyway
-            # — live recall stays available via the memory_recall tool.
+            # — live recall stays available via the memory tools.
             recalled_memories: list[str] = []
             meta_updates: dict[str, Any] = {}
             frozen_recall = session_meta.get("recalled_memories")
+            # Said in place of the memories when the Loom backend could not
+            # recall any (memU stays silent): an outage is not an empty memory.
+            memory_note: str | None = None
             if isinstance(frozen_recall, list):
                 recalled_memories = [str(m) for m in frozen_recall]
+            elif (
+                self.config.memory.backend == "loom"
+                and self._memory_bridge is not None
+                and not self._memory_bridge.available
+            ):
+                # The Loom backend did not start (no gateway URL): said as
+                # for an outage.
+                memory_note = memory_unavailable_note(
+                    getattr(self._memory_bridge, "error", "") or "the Loom backend is not running",
+                )
             elif self._memory_bridge and self._memory_bridge.available:
                 try:
-                    raw = await self._memory_bridge.recall(
-                        f"context for {source} session",
-                        limit=8,
+                    raw = await recall_for_startup(
+                        self._memory_bridge, f"context for {source} session", 8,
                     )
                     recalled_memories = [m["summary"] for m in raw]
                     meta_updates["recalled_memories"] = recalled_memories
                 except Exception as e:
                     logger.warning("Pre-recall failed: %s", e)
+                    if (
+                        self.config.memory.backend == "loom"
+                        and isinstance(e, MemoryBackendUnavailable)
+                    ):
+                        memory_note = memory_unavailable_note(str(e))
 
             # Resolve the prompt-cache TTL for this client build (cadence-
             # aware; see nerve/agent/cache_policy.py). Claude-only — other
@@ -1685,6 +1689,10 @@ class AgentEngine:
                 skill_summaries=self._collect_skill_summaries(),
                 excluded_tools=backend.excluded_tools(),
                 static=static_prompt,
+                memory_note=memory_note,
+                memory_backend=self.config.memory.backend,
+                memory_tools=self._loom_tools_offered(),
+                config_dir=self.config.config_dir,
             )
 
             # Observer sessions of a review loop get a context block so the
@@ -1782,6 +1790,7 @@ class AgentEngine:
             if deliver_preamble:
                 self._pending_preambles[session_id] = build_session_preamble(
                     session_id, source, recalled_memories or None,
+                    memory_note=memory_note,
                 )
             self.sessions.set_client(session_id, client)
             self._session_backends[session_id] = backend.name
@@ -1835,13 +1844,64 @@ class AgentEngine:
     ) -> None:
         """Let a session's interaction hub name the sub-agent that asks a
         question and mark it waiting for an answer (attention
-        ``needs_input``) until the pause ends."""
+        ``needs_input``) until the pause ends, and summarize each plan that
+        waits for a decision."""
         handler.describe_agent = (
             lambda task_id: self.agents.describe_task(session_id, task_id)
         )
         handler.on_agent_interaction = (
             lambda task_id, pending: self.agents.on_interaction(session_id, task_id, pending)
         )
+        handler.on_plan_pending = (
+            lambda interaction_id, tool_input: self._schedule_plan_summary(
+                session_id, interaction_id, tool_input,
+            )
+        )
+
+    def _schedule_plan_summary(
+        self, session_id: str, interaction_id: str, tool_input: dict,
+    ) -> None:
+        """Summarize the plan an ``ExitPlanMode`` pause waits on, in the
+        background (the pause never waits for it), then broadcast the
+        ``plan_summary`` event."""
+        plan = tool_input.get("plan") if isinstance(tool_input, dict) else None
+        task = asyncio.create_task(self._broadcast_plan_summary(
+            session_id, interaction_id, plan if isinstance(plan, str) else "",
+        ))
+        self._plan_summary_tasks.add(task)
+
+        def _done(t: asyncio.Task) -> None:
+            self._plan_summary_tasks.discard(t)
+            if not t.cancelled() and t.exception() is not None:
+                logger.warning(
+                    "Plan summary for session %s was not sent: %s",
+                    session_id, t.exception(),
+                )
+
+        task.add_done_callback(_done)
+
+    async def _broadcast_plan_summary(
+        self, session_id: str, interaction_id: str, plan_text: str,
+    ) -> None:
+        """``plan_summary`` on the session channel, as the ``interaction``
+        event is: the same broadcaster, so a running turn's buffer replays it
+        to a client that reconnects. ``unavailable`` with no bullets when no
+        summary could be made (an empty plan never reaches the model)."""
+        try:
+            bullets = await summarize_plan(
+                self.config, plan_text,
+                label=f"session {session_id} (interaction {interaction_id[:8]})",
+            )
+        except Exception:  # noqa: BLE001 — the card falls back to the plan's first lines
+            logger.warning("Plan summary failed for session %s", session_id, exc_info=True)
+            bullets = None
+        await broadcaster.broadcast(session_id, {
+            "type": "plan_summary",
+            "session_id": session_id,
+            "interaction_id": interaction_id,
+            "bullets": bullets or [],
+            "status": "ok" if bullets else "unavailable",
+        })
 
     async def _reset_cost_baseline(self, session_id: str) -> None:
         """Zero the persisted SDK cumulative-cost baseline for a session.
@@ -1909,6 +1969,75 @@ class AgentEngine:
                 "Discarded client for session %s (clear_resume=%s)",
                 session_id, clear_resume,
             )
+
+    # ------------------------------------------------------------------ #
+    #  Drain                                                               #
+    # ------------------------------------------------------------------ #
+
+    # How often drain() checks for running turns (seconds).
+    _DRAIN_POLL_SECONDS = 0.5
+
+    @property
+    def accepting_turns(self) -> bool:
+        """False after stop_accepting_turns(). Schedulers read this to skip work."""
+        return self._accepting_turns
+
+    def stop_accepting_turns(self) -> None:
+        """Make run() refuse every new turn. Running turns continue."""
+        if self._accepting_turns:
+            self._accepting_turns = False
+            logger.info("Engine no longer accepts new turns")
+
+    async def drain(self, timeout: float) -> bool:
+        """Stop accepting new turns, then wait for the running turns to end.
+
+        Returns True when no turn is running, or False if ``timeout``
+        seconds pass first. This does not stop the turns that are still
+        running.
+        """
+        self.stop_accepting_turns()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        running = self.sessions.get_running_ids()
+        if not running:
+            return True
+        logger.info(
+            "Drain: waiting up to %ss for %d running turn(s): %s",
+            timeout, len(running), ", ".join(sorted(running)),
+        )
+        while running:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning(
+                    "Drain: %d turn(s) still running after %ss: %s",
+                    len(running), timeout, ", ".join(sorted(running)),
+                )
+                return False
+            await asyncio.sleep(min(self._DRAIN_POLL_SECONDS, remaining))
+            running = self.sessions.get_running_ids()
+        logger.info("Drain: all running turns ended")
+        return True
+
+    async def _refuse_turn(
+        self,
+        session_id: str,
+        *,
+        entry: QueuedTurn | None = None,
+        client_msg_id: str | None = None,
+    ) -> None:
+        """Tell the session's clients that run() refused the turn, then raise.
+
+        A run that has a queue entry or a ``client_msg_id`` is reported in
+        ``queue_update`` with the reason ``refused``. The caller removes the
+        entry from the queue first.
+        """
+        if entry is not None or client_msg_id:
+            await self._emit_queue_update(session_id, removed=[{
+                "queue_id": entry.queue_id if entry is not None else None,
+                "client_msg_id": client_msg_id, "reason": "refused",
+            }])
+        await broadcaster.broadcast_error(session_id, _NOT_ACCEPTING_TURNS_MESSAGE)
+        raise NotAcceptingTurnsError()
 
     # ------------------------------------------------------------------ #
     #  Public API: run, stop, fork, resume                                 #
@@ -2879,6 +3008,13 @@ class AgentEngine:
                 parent_tool_use_id=event.parent_tool_use_id,
             )
 
+        elif isinstance(event, ThinkingDelta) and st.drop_leading_thinking and not (
+            st.full_response_text or st.tool_calls_log
+        ):
+            # Thinking before the first text or tool call of a run with
+            # ``drop_leading_thinking``: not shown, not kept.
+            st.got_content = True
+
         elif isinstance(event, ThinkingDelta):
             st.got_content = True
             st.thinking_text += event.text
@@ -3514,6 +3650,7 @@ class AgentEngine:
         cause: CauseArg = CAUSE_FROM_ACTOR,
         client_msg_id: str | None = None,
         origin: str | None = None,
+        drop_leading_thinking: bool = False,
     ) -> str:
         """Run the agent for a user message and return the final text response.
 
@@ -3560,6 +3697,17 @@ class AgentEngine:
             origin: Label of where the message came from, shown on its queue
                       entry (``"web"``, ``"api"``, a channel name). Defaults
                       to ``source``.
+            drop_leading_thinking: If True, the thinking that comes before
+                      the turn's first text or tool call is neither broadcast
+                      nor stored with the reply. Thinking after that is kept.
+                      The onboarding conversation's first turn uses it, so
+                      that the chat opens with the greeting.
+
+        Raises:
+            NotAcceptingTurnsError: the engine is draining. The user message
+                      is not stored, the session's clients get an error
+                      event, and a queued run leaves the queue with the
+                      reason ``refused``.
         """
         return (await self._run_turn(
             session_id=session_id,
@@ -3576,6 +3724,7 @@ class AgentEngine:
             cause=cause,
             client_msg_id=client_msg_id,
             origin=origin,
+            drop_leading_thinking=drop_leading_thinking,
         )).text
 
     async def _run_turn(
@@ -3595,6 +3744,7 @@ class AgentEngine:
         cause: CauseArg = CAUSE_FROM_ACTOR,
         client_msg_id: str | None = None,
         origin: str | None = None,
+        drop_leading_thinking: bool = False,
     ) -> TurnResult:
         """``run()`` plus how the invocation's turn ended."""
         # Resolved before the lock: an invalid cause fails here, before the
@@ -3609,6 +3759,8 @@ class AgentEngine:
                 "queue_id": None, "client_msg_id": client_msg_id, "reason": "duplicate",
             }])
             return TurnResult("", TurnOutcome("interrupted", "dropped as a repeated message"))
+        if not self._accepting_turns:
+            await self._refuse_turn(session_id, client_msg_id=client_msg_id)
         # Serialize runs per session — messages for the same session wait
         # in order instead of failing with "already running", and are listed
         # while they wait.
@@ -3645,6 +3797,14 @@ class AgentEngine:
             raise
         turn_task = asyncio.current_task()
         try:
+            # Check again: a drain can start while this run waits in the
+            # queue. Its entry then leaves the queue as refused, not started.
+            if not self._accepting_turns:
+                if entry is not None:
+                    self._dequeue_turn(session_id, entry)
+                await self._refuse_turn(
+                    session_id, entry=entry, client_msg_id=client_msg_id,
+                )
             # The Stop target from the moment this run holds the run lock:
             # Stop reaches the turn, never a message queued behind it.
             self.sessions.set_turn_task(session_id, turn_task)
@@ -3661,6 +3821,7 @@ class AgentEngine:
                 images=images, image_refs=image_refs,
                 bump_updated_at=bump_updated_at, actor=actor,
                 cause_id=cause_id,
+                drop_leading_thinking=drop_leading_thinking,
             )
         finally:
             self.sessions.clear_turn_task(session_id, turn_task)
@@ -3681,12 +3842,20 @@ class AgentEngine:
         bump_updated_at: bool,
         actor: Actor | None,
         cause_id: str | None,
+        drop_leading_thinking: bool = False,
     ) -> TurnResult:
         """The turn of :meth:`run`, with the run lock held: framing
         (buffering, running state, ``session_running``) around
         :meth:`_run_inner`."""
         broadcaster.start_buffering(session_id)
         async with self._semaphore:
+            # Check again: a drain can start after the check in _run_turn,
+            # for example while this turn waits for a concurrency slot. No
+            # await between this check and mark_running, so drain() cannot
+            # miss this turn.
+            if not self._accepting_turns:
+                broadcaster.stop_buffering(session_id)
+                await self._refuse_turn(session_id)
             # Clear any stale deferred-stop flag left over from a *previous*
             # turn.  If /stop arrived while the old turn was still cleaning up
             # (mark_not_running hadn't run yet), the flag lingers and would
@@ -3713,6 +3882,7 @@ class AgentEngine:
                     bump_updated_at=bump_updated_at,
                     actor=actor,
                     cause_id=cause_id,
+                    drop_leading_thinking=drop_leading_thinking,
                 )
             finally:
                 self.sessions.mark_not_running(session_id)
@@ -3760,6 +3930,7 @@ class AgentEngine:
         *,
         actor: Actor | None,
         cause_id: str | None,
+        drop_leading_thinking: bool = False,
     ) -> TurnResult:
         # Ensure session exists in DB. ``cause_id`` applies only if the row
         # is created here.
@@ -3810,7 +3981,7 @@ class AgentEngine:
             )
 
         # Turn accumulator — shared shape with the autonomous-turn drain.
-        st = _TurnState()
+        st = _TurnState(drop_leading_thinking=drop_leading_thinking)
 
         # Wakeup turns (fired by the cron-service sweep) carry a leading
         # marker block so the UI shows a "scheduled wakeup" chip. Persisted
@@ -4286,10 +4457,11 @@ class AgentEngine:
         main-chain ``TurnCompleted``) frames the turn.  Once content flows,
         the wait uses the same idle timeout as a normal run; on that
         timeout the partial turn is persisted and ``asyncio.TimeoutError``
-        propagates so the caller can apply hung-runtime treatment.  While
-        only agents run no turn is open, so agent silence can never trip
-        it.  A framed turn with nothing visible records its usage but
-        stores no message.
+        propagates so the caller can apply hung-runtime treatment — unless
+        the session waits for the person (a question or a plan decision),
+        when the wait goes on.  While only agents run no turn is open, so
+        agent silence can never trip it.  A framed turn with nothing
+        visible records its usage but stores no message.
 
         Backends without an idle stream (codex) return ``None`` from the
         probe immediately — the drain is a no-op for them.
@@ -4311,6 +4483,7 @@ class AgentEngine:
         session_framing = False
         pending_model: ModelObserved | None = None
         idle_batches = 0                    # batches read while st is None
+        deferred = False                    # an idle-timeout deferral was logged
 
         def _new_state() -> _TurnState:
             s = _TurnState()
@@ -4412,6 +4585,13 @@ class AgentEngine:
                             # usage, defer the rest to the next drain.
                             await _close_turn()
                             break
+                        if defer_idle_timeout(
+                            get_handler(session_id), session_id, logged=deferred,
+                        ):
+                            # Silent because it waits for the person's answer,
+                            # not hung: keep the turn open and wait again.
+                            deferred = True
+                            continue
                         logger.warning(
                             "Autonomous turn idle timeout (%ss) for session %s "
                             "— persisting partial turn and flagging runtime as hung",
@@ -4425,6 +4605,7 @@ class AgentEngine:
                         st.status, st.error = "interrupted", "runtime went silent"
                         await _close_turn()
                         raise
+                    deferred = False
                     if batch is None:
                         logger.warning(
                             "Agent stream ended mid-autonomous-turn for session %s",
@@ -5008,6 +5189,24 @@ class AgentEngine:
             logger.warning("Failed to generate session title: %s", e)
 
 
+def _is_plan_file(file_path: str) -> bool:
+    """A file in the Claude CLI's plans directory, where plan mode keeps the
+    session's plan (``<dir>/<slug>.md``).
+
+    The CLI's directory is ``$CLAUDE_CONFIG_DIR/plans`` when that variable
+    moves its config directory, else ``~/.claude/plans``. Its
+    ``plansDirectory`` setting never applies here: Nerve loads no settings
+    files (``setting_sources=[]``).
+    """
+    if "/.claude/plans/" in file_path:
+        return True
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if not file_path or not config_dir:
+        return False
+    plans = os.path.join(os.path.abspath(os.path.expanduser(config_dir)), "plans")
+    return os.path.abspath(os.path.expanduser(file_path)).startswith(plans + os.sep)
+
+
 def _maybe_broadcast_plan_update(
     session_id: str,
     tool_use_id: str,
@@ -5030,7 +5229,7 @@ def _maybe_broadcast_plan_update(
         return
 
     file_path = str(tool_input.get("file_path", ""))
-    if "/.claude/plans/" not in file_path:
+    if not _is_plan_file(file_path):
         return
 
     # Read the updated plan file and broadcast

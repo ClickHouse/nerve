@@ -33,18 +33,16 @@ import numpy as np
 from nerve import paths
 from nerve.config import NerveConfig
 from nerve.inference_principal import system_principal_headers
+from nerve.memory.backend import MemoryBackendUnavailable
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.utils.llm import response_text
 
 logger = logging.getLogger(__name__)
 
-
-class MemoryBackendUnavailable(RuntimeError):
-    """Raised when a memU operation fails because the LLM backend (the shared
-    proxy route) is transiently unavailable — HTTP 429/5xx or an auth blip
-    (``auth_unavailable`` / revoked OAuth) — rather than because the query
-    genuinely had no results. The tool layer surfaces this LOUDLY so a session
-    never mistakes "memory is DOWN" for "no relevant memories"."""
+# MemoryBackendUnavailable is shared with the Loom backend and defined in
+# nerve.memory.backend; importing it from here keeps working. memU raises it
+# when the LLM backend (the shared proxy route) is transiently unavailable —
+# HTTP 429/5xx or an auth blip (``auth_unavailable`` / revoked OAuth).
 
 
 def _llm_error_status(exc: BaseException) -> int | None:

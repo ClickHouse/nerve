@@ -66,6 +66,7 @@ from nerve.agent.interactive import (
     INTERACTIVE_TOOLS,
     InteractiveToolHandler,
     _read_file_safe,
+    defer_idle_timeout,
 )
 from nerve.inference_principal import custom_headers_env
 from nerve.utils.fs import atomic_write_text
@@ -366,8 +367,10 @@ class ClaudeToolPermissions:
 
     * File-modifying tools trigger a pre-execution snapshot (redundant
       with the PreToolUse hook, kept as belt-and-suspenders).
-    * Interactive built-ins pause via the hub and translate its outcome
-      into ``PermissionResultAllow/Deny``.
+    * Interactive built-ins are denied on a non-interactive channel. On an
+      interactive one, ``AskUserQuestion`` and ``ExitPlanMode`` pause via the
+      hub and translate its outcome into ``PermissionResultAllow/Deny``;
+      ``EnterPlanMode`` is allowed without a pause.
     * Everything else auto-approves with zero overhead.
     """
 
@@ -435,6 +438,14 @@ class ClaudeToolPermissions:
                 )
             )
 
+        # Entering plan mode only restricts the agent (it reads and writes
+        # its plan file until ExitPlanMode), so asking the person to allow it
+        # is a click without a decision: allow it at once. The decision is
+        # ExitPlanMode's, which still pauses below. (The bundled CLI does not
+        # even ask: it switches to plan mode itself. This covers one that does.)
+        if tool_name == "EnterPlanMode":
+            return PermissionResultAllow()
+
         # A foreground sub-agent's question names the agent that asked.
         agent_task_id = getattr(context, "agent_id", None)
         if agent_task_id:
@@ -456,8 +467,25 @@ class ClaudeToolPermissions:
         if tool_name == "AskUserQuestion" and outcome.result:
             updated = {**tool_input, "answers": outcome.result}
             return PermissionResultAllow(updated_input=updated)
-        # For ExitPlanMode/EnterPlanMode: just allow
+        # ExitPlanMode approved with the person's edit of the plan
+        # (``{"plan": text}``): the CLI saves the text to the plan file and
+        # tells the agent the approved plan was edited by the user.
+        edited = _edited_plan(outcome.result) if tool_name == "ExitPlanMode" else None
+        if edited is not None:
+            return PermissionResultAllow(updated_input={**tool_input, "plan": edited})
+        # Otherwise just allow (a refusal carried the person's words as the
+        # deny message above)
         return PermissionResultAllow()
+
+
+def _edited_plan(result: Any) -> str | None:
+    """The plan text a person approved with their edits, from the answer of an
+    ``ExitPlanMode`` pause: ``{"plan": "<non-empty text>"}``. ``None`` for a
+    plain approval (no result) or anything else."""
+    if not isinstance(result, dict):
+        return None
+    plan = result.get("plan")
+    return plan if isinstance(plan, str) and plan.strip() else None
 
 
 # ------------------------------------------------------------------ #
@@ -1321,21 +1349,38 @@ class ClaudeClient(AgentClient):
 
         ``receive_response()`` can block indefinitely if the CLI hangs
         (stuck API request, broken stdio pipe). Each ``__anext__()`` is
-        wrapped in ``asyncio.wait_for`` so a silent CLI raises
+        awaited for at most ``idle_timeout`` seconds, so a silent CLI raises
         ``asyncio.TimeoutError`` into the engine's hung-client retry
         path. The timeout is per-message: long tool calls don't trip it
         as long as tool_use/tool_result chunks keep arriving.
         ``idle_timeout <= 0`` disables the timeout.
+
+        A CLI waiting for the person (a question or a plan decision asked
+        through ``can_use_tool``) is silent but not hung: while the
+        session's hub has one pending, a timeout keeps waiting
+        (:func:`~nerve.agent.interactive.defer_idle_timeout`). So the read
+        runs as a task that outlives a timeout: cancelling ``__anext__()``
+        would finalize the SDK's iterator. It runs in this task's context,
+        as the inline await it replaces did.
         """
         idle_timeout = self._spec.idle_timeout
         response_iter = self._sdk.receive_response()
+        read: asyncio.Task | None = None    # the __anext__() in flight
+        deferred = False                    # a deferral was logged
         try:
             while True:
                 try:
                     if idle_timeout and idle_timeout > 0:
-                        message = await asyncio.wait_for(
-                            response_iter.__anext__(), timeout=idle_timeout,
-                        )
+                        if read is None:
+                            read = asyncio.create_task(
+                                response_iter.__anext__(),
+                                context=asyncio.current_task().get_context(),
+                            )
+                        await asyncio.wait((read,), timeout=idle_timeout)
+                        if not read.done():
+                            raise asyncio.TimeoutError
+                        message = read.result()
+                        read = None
                     else:
                         message = await response_iter.__anext__()
                 except StopAsyncIteration:
@@ -1347,12 +1392,19 @@ class ClaudeClient(AgentClient):
                         "claude runtime ended the turn without a result",
                     ) from None
                 except asyncio.TimeoutError:
+                    if defer_idle_timeout(
+                        self._spec.interactive, self._spec.session_id,
+                        logged=deferred,
+                    ):
+                        deferred = True
+                        continue
                     logger.warning(
                         "CLI idle timeout (%ds) for session %s — no SDK "
                         "message received; treating CLI as hung",
                         idle_timeout, self._spec.session_id,
                     )
                     raise
+                deferred = False
                 done = False
                 for event in self._translate_and_capture(message):
                     if isinstance(event, ev.TurnCompleted):
@@ -1361,6 +1413,12 @@ class ClaudeClient(AgentClient):
                 if done:
                     return
         finally:
+            if read is not None:
+                # A real hang, an error or the caller leaving: end the read
+                # first (aclose() refuses an iterator that is running).
+                read.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await read
             with contextlib.suppress(Exception):
                 await response_iter.aclose()
 

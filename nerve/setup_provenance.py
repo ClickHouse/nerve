@@ -22,6 +22,11 @@ wins is the one the loader would take the value from — ``config.local.yaml``
 over ``config.yaml`` over ``settings.yaml``, or ``settings.yaml`` alone under
 lockdown — and only its spelling decides. Values are never returned, only
 their origin.
+
+A switch the page writes to the workspace's ``settings.yaml`` has a second
+question: whether a machine layer (``config.yaml`` / ``config.local.yaml``)
+states it too. Those files outrank ``settings.yaml``, so the page's write
+would change nothing the loader reads (:func:`machine_switches`).
 """
 
 from __future__ import annotations
@@ -70,6 +75,13 @@ CREDENTIAL_PATHS: tuple[str, ...] = (
 
 #: Held by the channel gateway when Slack runs in hosted mode.
 GATEWAY_PATHS = frozenset({"slack.bot_token", "slack.app_token"})
+
+#: Switches the setup page writes to the workspace's ``settings.yaml`` that an
+#: operator may state in a machine layer instead, by dotted path.
+MACHINE_SWITCH_PATHS: tuple[str, ...] = ("sync.github.enabled",)
+
+#: The machine layers by their name in :meth:`RawLayers.winning`, as file names.
+MACHINE_FILES: dict[str, str] = {"local": "config.local.yaml", "machine": "config.yaml"}
 
 
 @dataclass(frozen=True)
@@ -174,6 +186,45 @@ def credential_sources(config: NerveConfig) -> dict[str, str | None]:
     return {path: source_of(path, layers, hosted=hosted) for path in CREDENTIAL_PATHS}
 
 
+def machine_layer_of(path: str, layers: RawLayers) -> str | None:
+    """The machine file the loader takes ``path`` from — ``config.local.yaml``
+    or ``config.yaml`` — or ``None`` when neither states it, and always on a
+    locked instance, where the loader reads ``settings.yaml`` alone.
+
+    Any value states a switch, ``false`` and a bare ``key:`` included: the
+    loader takes the leaf from the highest layer that has the key, whatever
+    it holds (a bare key reads as off), so the ``settings.yaml`` the page
+    writes is shadowed all the same.
+    """
+    for name, layer in layers.winning():
+        if name not in MACHINE_FILES:
+            continue
+        present, _raw = _lookup(layer, path)
+        if present:
+            return MACHINE_FILES[name]
+    return None
+
+
+def machine_switches(config: NerveConfig) -> dict[str, str]:
+    """``{dotted path: machine file}`` for every switch in
+    :data:`MACHINE_SWITCH_PATHS` that a machine layer states.
+
+    Never raises: an unreadable file states nothing, so at worst a switch
+    reads as the page's own, as it did before anything looked.
+    """
+    try:
+        layers = read_layers(config)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("provenance unavailable: %s", e)
+        return {}
+    found: dict[str, str] = {}
+    for path in MACHINE_SWITCH_PATHS:
+        layer = machine_layer_of(path, layers)
+        if layer is not None:
+            found[path] = layer
+    return found
+
+
 def describe(source: str | None) -> str:
     """A short operator-facing label: ``environment`` → ``(environment)``."""
     if not source or source == SOURCE_FILE:
@@ -186,6 +237,8 @@ __all__ = [
     "DIRECT_ENV",
     "ENV_REF_RE",
     "GATEWAY_PATHS",
+    "MACHINE_FILES",
+    "MACHINE_SWITCH_PATHS",
     "SOURCE_CONFIG_REPO",
     "SOURCE_ENVIRONMENT",
     "SOURCE_FILE",
@@ -194,6 +247,8 @@ __all__ = [
     "RawLayers",
     "credential_sources",
     "describe",
+    "machine_layer_of",
+    "machine_switches",
     "read_layers",
     "source_of",
 ]

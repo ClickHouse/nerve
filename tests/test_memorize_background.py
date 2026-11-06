@@ -201,6 +201,91 @@ class TestMemorizeSessionOverride:
         assert watermark["value"] == "2026-01-01 00:06:00"
 
 
+class TestMemorizeKeepsTheMachineAwake:
+    """Memorization queued for the lock or running under it holds the
+    ``nerve-memorize`` keep-awake lease, so a platform that parks idle
+    machines does not cut it short."""
+
+    @staticmethod
+    def _engine(memorize) -> AgentEngine:
+        engine = _make_engine()
+        bridge = MagicMock(available=True)
+        bridge.memorize_conversation = AsyncMock(side_effect=memorize)
+        engine._memory_bridge = bridge
+        engine.db.get_session = AsyncMock(return_value={
+            "connected_at": _CONNECTED_AT, "last_memorized_at": None,
+        })
+        engine.db.get_messages = AsyncMock(return_value=[
+            {"created_at": "2026-01-01 00:05:00", "role": "user", "content": "hi"},
+        ])
+        return engine
+
+    @pytest.mark.asyncio
+    async def test_queued_and_running_memorizations_hold_the_lease(self):
+        from nerve.platform.activity import LEASE_MEMORIZE, held_leases
+
+        gates = {"s1": asyncio.Event(), "s2": asyncio.Event()}
+        running: list[str] = []
+
+        async def memorize(sid, _messages):
+            running.append(sid)
+            await gates[sid].wait()
+
+        engine = self._engine(memorize)
+        first = asyncio.create_task(engine._memorize_session("s1"))
+        second = asyncio.create_task(engine._memorize_session("s2"))
+        while running != ["s1"]:
+            await asyncio.sleep(0)
+        assert LEASE_MEMORIZE in held_leases()
+
+        gates["s1"].set()
+        await first
+        # s2 waited for the lock and runs now: still held.
+        while running != ["s1", "s2"]:
+            await asyncio.sleep(0)
+        assert LEASE_MEMORIZE in held_leases()
+
+        gates["s2"].set()
+        await second
+        assert LEASE_MEMORIZE not in held_leases()
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_holds_the_lease(self):
+        from nerve.platform.activity import LEASE_MEMORIZE, held_leases
+
+        engine = self._engine(None)
+        engine._memory_bridge._release_memory = MagicMock()
+        engine.db.get_sessions_needing_memorization = AsyncMock(return_value=[{"id": "s1"}])
+        held: list[bool] = []
+
+        async def incremental(_sid):
+            held.append(LEASE_MEMORIZE in held_leases())
+            return 0
+
+        engine._memorize_incremental = incremental
+        await engine.run_memorization_sweep()
+        assert held == [True]
+        assert LEASE_MEMORIZE not in held_leases()
+
+    @pytest.mark.asyncio
+    async def test_xmemory_transcript_writes_hold_the_lease(self):
+        from nerve.platform.activity import LEASE_MEMORIZE, held_leases
+
+        engine = _make_engine()
+        held: list[bool] = []
+
+        async def write(_sid, _messages):
+            held.append(LEASE_MEMORIZE in held_leases())
+
+        engine._xmemory_bridge = MagicMock(
+            indexes_conversations=True, memorize_conversation=AsyncMock(side_effect=write),
+        )
+        engine.schedule_xmemory_transcript("s1", [{"role": "user", "content": "hi"}])
+        await asyncio.gather(*engine._memorize_bg_tasks)
+        assert held == [True]
+        assert LEASE_MEMORIZE not in held_leases()
+
+
 # ---------------------------------------------------------------------------
 # _discard_client — background vs inline memorization
 # ---------------------------------------------------------------------------

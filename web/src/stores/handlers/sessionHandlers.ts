@@ -4,6 +4,7 @@ import { applyStreamEvent, rebuildPanelTabsFromBuffer, deriveStatus, extractTodo
 import { hydrateMessage } from '../../utils/hydrateMessage';
 import { useAgentStore } from '../agentStore';
 import type { ChatState } from '../chatStore';
+import { planOpensPanel } from './panelHandlers';
 import type { Get, Set } from './types';
 
 /** Tabs the person opened that a replayed buffer knows nothing about. */
@@ -151,6 +152,15 @@ export function handleSessionStatus(
       }
     }
 
+    // Restore the plan summaries of the buffered pauses (their cards read them).
+    const planSummaries = { ...get().planSummaries };
+    for (const event of bufferedEvents) {
+      if (event.type === 'plan_summary') {
+        const ps = event as Extract<WSMessage, { type: 'plan_summary' }>;
+        planSummaries[ps.interaction_id] = { bullets: Array.isArray(ps.bullets) ? ps.bullets : [], status: ps.status };
+      }
+    }
+
     // Restore plan content from buffer (last plan_update event wins)
     let lastPlanContent: string | null = null;
     for (const event of bufferedEvents) {
@@ -158,6 +168,9 @@ export function handleSessionStatus(
         lastPlanContent = (event as Extract<WSMessage, { type: 'plan_update' }>).content;
       }
     }
+    // A plan tab kept in the background (see `planOpensPanel`): restored, but
+    // it neither opens the panel nor takes the focus.
+    let quietPlanId: string | null = null;
     if (lastPlanContent !== null) {
       const planTab = restored.panels.find(p => p.type === 'plan');
       if (planTab) {
@@ -180,7 +193,8 @@ export function handleSessionStatus(
           blocks: [],
         };
         restored.panels.push(transientPlan);
-        restored.activePanelId = transientPlan.id;
+        if (planOpensPanel(get())) restored.activePanelId = transientPlan.id;
+        else quietPlanId = transientPlan.id;
       }
     }
 
@@ -200,14 +214,16 @@ export function handleSessionStatus(
     const kept = current.panels.filter(p => KEPT_ON_REPLAY.has(p.type) && !restoredIds.has(p.id));
     const panels = [...kept, ...restored.panels];
     const keepActive = kept.some(p => p.id === current.activePanelId);
+    const shown = restored.panels.filter(p => p.id !== quietPlanId);
     const update: Record<string, unknown> = {
       isStreaming: true,
       streamingBlocks: blocks,
       agentStatus: deriveStatus(blocks),
       panels,
       activePanelId: keepActive ? current.activePanelId : restored.activePanelId ?? kept[kept.length - 1]?.id ?? null,
-      panelVisible: keepActive ? current.panelVisible : restored.panels.length > 0 || (kept.length > 0 && current.panelVisible),
+      panelVisible: keepActive ? current.panelVisible : shown.length > 0 || (kept.length > 0 && current.panelVisible),
       pendingInteraction: restoredInteraction,
+      planSummaries,
     };
     if (restoredTodos !== null) {
       update.currentTodos = restoredTodos;

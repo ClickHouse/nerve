@@ -39,10 +39,18 @@ The slug is the title truncated to 40 characters, so two titles that differ only
 
 ## Statuses
 
-- `pending` — Not started
-- `in_progress` — Being worked on
-- `done` — Completed (file moved to `done/`)
-- `deferred` — Postponed
+Statuses are configurable (`task_status_list`, `task_status_create`, and the board's status manager). These ship with Nerve:
+
+- `backlog`: not ready for work yet. No built-in cron job or gate selects it, so the agent does not pick it up. The New Task dialog uses it as its default.
+- `pending`: ready for work. The default of `task_create`. The `task-planner` job and the example work jobs gate on it.
+- `plan_review`: a plan for the task waits for a human decision. `plan_propose` and `plan_update` move a `pending`, `backlog` or `in_progress` task to it ([plans.md](plans.md)).
+- `in_progress`: being worked on. Approving a plan moves the task to it.
+- `done`: completed. The file moves to `done/`.
+- `deferred`: postponed.
+
+`pending`, `plan_review` and `done` are protected and cannot be deleted. Migration v059 adds `backlog` and `plan_review` to an existing install, before and after `pending`; a status that already has one of these names stays as it is.
+
+An install that existed before keeps the `task-planner` prompt in its `config/cron/system.yaml`, which lists all open tasks, until the Automation step writes that file again. On such an install the planner can propose a plan for a `backlog` task.
 
 ## Agent Tools
 
@@ -54,6 +62,7 @@ The slug is the title truncated to 40 characters, so two titles that differ only
 | `task_update` | Update status/deadline/notes (updates both) |
 | `task_read` | Read full task content |
 | `task_done` | Mark complete, move to `done/` |
+| `task_comment` | Add a comment to a task, signed as the agent (see [Comments](#comments)) |
 
 ### Duplicate Detection
 
@@ -189,11 +198,47 @@ The fence protects the row. Two writers that both pass it can still lose one
 another's edits to the markdown body, since each builds the new body from its
 own read of the file.
 
+### Comments
+
+People and the agent can add comments to a task. A comment is markdown text
+of at most 10,000 characters. Comments are rows in `task_comments` (`id`,
+`task_id`, `body`, `actor_id`, `caused_by_actor_id`, `created_at`), added in
+migration v061. They are not in the task's markdown file: a file cannot hold a
+trustworthy author, and an agent that rewrites the file would rewrite the
+comments too.
+
+`actor_id` is who wrote the comment and `caused_by_actor_id` on whose behalf
+(see [Attribution](accounts.md#attribution)). A comment through the HTTP API
+records the caller as both: the person, or the system actor for a system or
+MCP token. A `task_comment` tool call records the system
+actor and the cause of its session, so the web UI shows "Nerve for <person>"
+when the agent wrote it in a session that the person started.
+
+Adding or deleting a comment also updates `tasks.comment_count`,
+`updated_at` and `revision` in the same transaction. Thus the count is on
+every task row, the `task_updated` broadcast (`event` `commented` or
+`comment_deleted`) refreshes open task views, and a writer that read the task
+before the comment gets a revision conflict on a guarded write.
+
+`task_read` shows the newest 50 comments between the file content and the
+revision line, inside a `<!-- nerve: comments ... -->` block, with the time,
+the author and the text of each. `task_write` strips the block, so a
+read-edit-write round trip does not copy comments into the file. In the
+`task_read` output, a file line that starts with `<!-- nerve:` is indented by
+two spaces, so only Nerve's own block and revision line start with a marker:
+file content cannot pose as comments, and the strip cannot remove file
+content. Such a line stays indented after a `task_write` round trip; markdown
+still reads it as an HTML comment.
+
+Only the author of a comment can delete it, through
+`DELETE /api/tasks/{id}/comments/{comment_id}`. Accounts have no roles, so
+no person can delete the words of another. Comments cannot be edited.
+
 ### Live Updates
 
 Every task mutation broadcasts a `task_updated` WebSocket event on the
 `__global__` channel carrying the whole row (`event` is one of `created`,
-`updated`, `moved`, `done`). It fires from both the HTTP routes and the tool
+`updated`, `moved`, `done`, `commented`, `comment_deleted`). It fires from both the HTTP routes and the tool
 handlers, so a card moves on any open board whether the change came from the
 web UI, another tab, or the agent working in an unrelated session. Broadcast
 failures are logged and swallowed — a stale card is never worth failing a
@@ -221,6 +266,10 @@ The escalation check pauses during quiet hours when they are set (`quiet_start`/
 
 Tasks are listed with status filter buttons and a search input (250ms debounce). Status can be changed via dropdown on each card. Clicking a task card navigates to the detail page.
 
+The New Task dialog has a status picker with the configured statuses. It starts on `backlog`, or on the status of the board column whose add button opened it, and falls back to `pending` when `backlog` does not exist. A hint under the picker says that the agent may pick up a `pending` task.
+
+Task notes that the plan tools write link to the plan (`/plans/<id>`) and to the implementation session (`/chat/<id>`). The markdown preview opens these links in the app.
+
 ### Task Detail (`/tasks/:taskId`)
 
 Full-page markdown editor for task content:
@@ -229,6 +278,8 @@ Full-page markdown editor for task content:
 - **Ctrl+S / Cmd+S** to save; Save button appears when content is modified
 - **Status dropdown** — change status inline in the header
 - **Metadata** — deadline, source, external link displayed in header
+- **Plan**: the latest plan of the task (`GET /api/tasks/{id}/plans`), with its version, its status and **Open plan**. A pending plan with no revision request shows "A plan waits for your review". The section reads the plans again when the task changes, for example when `plan_propose` writes its note
+- **Comments**: below the content in preview mode. Each comment shows its author ("Nerve for <person>" for an agent comment), its age and its markdown text. **Comment** (or Ctrl+Enter / Cmd+Enter) adds one; the delete button shows on your own comments only. The list reads the comments again when the task changes, so a comment by another person or by the agent shows without a reload. Board cards show the comment count
 - **Back button** — returns to the task list
 
 Saving writes the full markdown file to disk and re-syncs the title and deadline to SQLite.

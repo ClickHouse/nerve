@@ -17,7 +17,9 @@ from nerve.agent.interactive import get_awaiting_ids
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.gateway.routes.files import session_upload_dir
 from nerve.identity import Actor, attribution_for
+from nerve.platform.activity import LEASE_MEMORIZE, keep_awake
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +36,8 @@ async def _cleanup_uploaded_files(db: object, session_id: str) -> None:
             except Exception:
                 pass
         # Try to remove session upload dir if empty
-        config = get_config()
-        session_dir = config.workspace / ".uploads" / session_id
-        if session_dir.exists():
+        session_dir = session_upload_dir(session_id)
+        if session_dir is not None and session_dir.exists():
             try:
                 session_dir.rmdir()
             except OSError:
@@ -401,8 +402,16 @@ async def get_session(session_id: str, actor: Actor = Depends(require_auth)):
 
 @router.get("/api/sessions/{session_id}/messages")
 async def get_messages(session_id: str, limit: int = 500, actor: Actor = Depends(require_auth)):
+    """The last ``limit`` messages of a session, oldest first.
+
+    The response leaves out the ``thinking`` column. The client renders
+    thinking from the ``thinking`` blocks in ``blocks`` and does not read the
+    column, which adds megabytes to the response of a long chat.
+    """
     deps = get_deps()
     messages = await deps.db.get_messages(session_id, limit=limit)
+    for message in messages:
+        message.pop("thinking", None)
     session = await deps.db.get_session(session_id)
 
     # Return last_usage if stored (for context bar on session switch)
@@ -617,7 +626,10 @@ async def delete_session(session_id: str, actor: Actor = Depends(require_auth)):
                             if norm >= connected_at:
                                 context_msgs.append(msg)
                     if context_msgs:
-                        await engine._memory_bridge.memorize_conversation(session_id, context_msgs)
+                        with keep_awake(LEASE_MEMORIZE):
+                            await engine._memory_bridge.memorize_conversation(
+                                session_id, context_msgs,
+                            )
                         # Same window to xmemory (opt-in, fire-and-forget).
                         engine.schedule_xmemory_transcript(session_id, context_msgs)
                 except Exception as e:

@@ -42,7 +42,9 @@ export function BottomNav() {
     api.getUltracodeDashboardStatus().then(s => setUltracodeEnabled(s.enabled)).catch(() => {});
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const available = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown });
+  // Setup stays in the drawer also when it is finished: the drawer is
+  // already the place for rarely used destinations.
+  const available = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown, setupFinished: false });
   const primary = PRIMARY_PATHS
     .map(p => available.find(i => i.path === p))
     .filter((i): i is NavItem => Boolean(i));

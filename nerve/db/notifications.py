@@ -290,6 +290,27 @@ class NotificationStore:
         )
         return result.rowcount
 
+    async def dismiss_plan_notifications(
+        self, task_id: str, *, attribution: Attribution = UNATTRIBUTED,
+    ) -> int:
+        """Dismiss the pending plan notifications of a task. Returns the count.
+
+        A plan notification is a ``notify`` row whose metadata names a plan
+        and this task (``plan_propose`` and ``plan_update`` send them).
+        ``attribution.actor_id`` is who dismissed them.
+        """
+        result = await self._write(
+            """UPDATE notifications
+               SET status = 'dismissed', dismissed_by_actor_id = ?
+               WHERE status = 'pending' AND type = 'notify'
+                 AND CASE WHEN json_valid(metadata) THEN
+                       json_extract(metadata, '$.task_id') = ?
+                       AND json_extract(metadata, '$.plan_id') IS NOT NULL
+                     END""",
+            (attribution.actor_id, task_id),
+        )
+        return result.rowcount
+
     async def expire_due_notifications(self) -> list[dict]:
         """Flip pending rows past their expiry to ``expired``.
 

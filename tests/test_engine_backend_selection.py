@@ -177,6 +177,28 @@ class TestConfigValidation:
         })
         assert cfg.agent.backend == "claude"
 
+    def test_codex_base_url_is_checked_at_load(self, tmp_path):
+        """Refused also while codex is not a selected backend: workflow runs
+        and review-loop legs can still start Codex sessions."""
+        with pytest.raises(ValueError, match="codex.base_url"):
+            NerveConfig.from_dict({
+                "workspace": str(tmp_path),
+                "codex": {"base_url": "http://user:secret@127.0.0.1:4000/v1"},
+            })
+
+    def test_codex_base_url_keeps_the_path_and_drops_one_slash(self, tmp_path):
+        for raw, want in (
+            ("", ""),
+            ("https://proxy.example.com/v1/", "https://proxy.example.com/v1"),
+            ("http://127.0.0.1:4000/v1", "http://127.0.0.1:4000/v1"),
+        ):
+            cfg = NerveConfig.from_dict({
+                "workspace": str(tmp_path),
+                "agent": {"backend": "codex"},
+                "codex": {"base_url": raw},
+            })
+            assert cfg.codex.base_url == want
+
     def test_pricing_defaults_cover_default_model(self, tmp_path):
         cfg = NerveConfig.from_dict({"workspace": str(tmp_path)})
         from nerve.agent.backends.codex.pricing import match_pricing

@@ -16,6 +16,9 @@ Design:
   three abstract methods, and register the class in :data:`GATE_REGISTRY`.
   (Out-of-tree gates can instead be dropped into the gate-plugins directory
   and auto-registered at startup — see :mod:`nerve.cron.gate_plugins`.)
+* A gate can also say ahead of time what it will decide
+  (:meth:`CronGate.forecast`, combined by :func:`forecast_gates`), which is how
+  the cron service tells which scheduled runs will actually do work.
 
 Example config::
 
@@ -35,6 +38,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -47,6 +51,11 @@ if TYPE_CHECKING:
     from nerve.db import Database
 
 logger = logging.getLogger(__name__)
+
+# How often a job whose gate raises while forecasting is warned about, and
+# when each such job last was (time.monotonic()). See forecast_gates.
+_FORECAST_WARN_SECONDS = 600
+_forecast_warned: dict[str, float] = {}
 
 
 class GateConfigError(ValueError):
@@ -100,6 +109,32 @@ class CronGate(ABC):
     def from_config(cls, spec: dict) -> "CronGate":
         """Build an instance from its config dict (``type`` key included)."""
 
+    async def forecast(self, ctx: GateContext, at: datetime) -> bool:
+        """Whether the job may run at *at*, judged from what is known now.
+
+        Asked ahead of time — to tell what a job's next scheduled run will do,
+        and so when the instance next has work — and possibly often. It never
+        replaces :meth:`is_satisfied`, which still decides when the run comes.
+        So a forecast must have no side effects and must not reach the network.
+
+        The default evaluates the gate now. That is right for a gate over local
+        state: the answer holds until something changes that state. Mostly
+        that is work this instance schedules itself, which is followed by a
+        fresh forecast; a task created or moved from a chat, the web UI or the
+        API is not announced, and is seen the next time a forecast is asked
+        for. A gate whose truth changes with elapsed time — an age threshold,
+        a cooldown — overrides this and reasons about *at*; so does one whose
+        check is not free of side effects.
+        """
+        return await self.is_satisfied(ctx)
+
+
+def has_own_forecast(gate: CronGate | type[CronGate]) -> bool:
+    """Whether *gate*, or a gate class, defines its own :meth:`CronGate.forecast`
+    rather than keeping the default, which runs its check now."""
+    cls = gate if isinstance(gate, type) else type(gate)
+    return cls.forecast is not CronGate.forecast
+
 
 class MessagesGate(CronGate):
     """Satisfied when the sync sources feeding a consumer have unread messages.
@@ -118,7 +153,14 @@ class MessagesGate(CronGate):
     empty), the gate fires when *any* source the consumer already tracks has
     unread messages — so a shared/default inbox job can be gated without
     hard-coding the particular set of connected sources. Either way the check
-    only reads cursor state; it never advances a cursor.
+    never advances a cursor.
+
+    The check does keep the cursors it reads from expiring: it renews a live
+    cursor's ``sync.consumer_cursor_ttl_days``. A cursor expires when nothing
+    reads it for that long, and an expired one starts again at the source's
+    newest message, so without this a source that stayed quiet for a few days
+    would lose its first new message to the restart, here and in the job's
+    own poll. The job reads the cursors on every check, so they stay live.
     """
 
     type = "messages"
@@ -134,6 +176,11 @@ class MessagesGate(CronGate):
         self.consumer = consumer
 
     async def is_satisfied(self, ctx: GateContext) -> bool:
+        satisfied = await self._has_unread(ctx)
+        await self._keep_cursors_alive(ctx)
+        return satisfied
+
+    async def _has_unread(self, ctx: GateContext) -> bool:
         if self.sources:
             for source in self.sources:
                 cursor_seq = await ctx.db.get_consumer_cursor(self.consumer, source)
@@ -142,10 +189,45 @@ class MessagesGate(CronGate):
                     return True
             return False
         # No explicit sources: fire if any source the consumer tracks has
-        # unread messages. Read-only and expiry-agnostic — it never
-        # initializes or advances a cursor (unlike get_consumer_cursor) and
-        # still sees a backlog after a quiet inbox's cursors pass their TTL.
+        # unread messages. Expiry-agnostic — it never initializes or advances
+        # a cursor (unlike get_consumer_cursor) and still sees a backlog after
+        # a quiet inbox's cursors pass their TTL.
         return await ctx.db.consumer_has_unread(self.consumer)
+
+    async def _keep_cursors_alive(self, ctx: GateContext) -> None:
+        """Renew the TTL of the live cursors this gate reads (see the class).
+
+        Best effort: a failure is logged and never changes the answer.
+        """
+        try:
+            await ctx.db.keep_consumer_cursors_alive(
+                self.consumer, self.sources or None, ttl_days=_consumer_cursor_ttl_days(),
+            )
+        except Exception as e:  # noqa: BLE001 — the gate's answer stands
+            logger.warning(
+                "messages gate: could not renew the cursors of consumer %s: %s", self.consumer, e,
+            )
+
+    async def forecast(self, ctx: GateContext, at: datetime) -> bool:
+        """:meth:`is_satisfied` at *at*, without its writes.
+
+        With explicit ``sources``, the check starts a missing or expired cursor
+        at the source's newest message, so that source has nothing unread. The
+        forecast reads the cursor instead and gives the same answer for it —
+        as the cursor will be at *at*: one that is live now but expires before
+        then (``sync.consumer_cursor_ttl_days`` after it last moved or was
+        renewed) counts as expired, since the check reads a cursor before it
+        renews it. The forecast renews no cursor.
+        """
+        if not self.sources:
+            return await ctx.db.consumer_has_unread(self.consumer)
+        for source in self.sources:
+            cursor_seq = await ctx.db.peek_consumer_cursor(self.consumer, source, as_of=at)
+            if cursor_seq is None:
+                continue  # the check would start it at the newest message
+            if await ctx.db.get_source_max_rowid(source) > cursor_seq:
+                return True
+        return False
 
     def describe(self) -> str:
         where = ", ".join(self.sources) if self.sources else "any source"
@@ -307,6 +389,12 @@ class GitHubPrActivityGate(CronGate):
             force_run_after_hours: 8
             ignore_actors: [codecov, sonarqubecloud]
 
+    With ``sync.github.mode: hosted`` the gate is satisfied without running
+    ``gh``: the gateway watches the agent's open PRs (``sync.github.pr_watch``)
+    and delivers a ``github_pr_activity`` record for every change, so a job
+    that should wake on PR activity is gated on ``messages`` with
+    ``sources: [github]`` instead.
+
     Config:
 
     * ``author`` (required) — GitHub login whose open PRs to watch. Also
@@ -360,6 +448,10 @@ class GitHubPrActivityGate(CronGate):
         return s[:-5] if s.endswith("[bot]") else s
 
     async def is_satisfied(self, ctx: GateContext) -> bool:
+        if github_is_hosted():
+            # No gh here: the gateway's PR watch delivers the changes as
+            # records, which a messages gate sees.
+            return True
         fp = await self._fingerprint()
         if fp is None:
             # gh failed entirely — fail open (run) rather than risk stranding a PR.
@@ -383,6 +475,15 @@ class GitHubPrActivityGate(CronGate):
             self._save_state(ctx.job_id, fp, now)
             return True
         return False
+
+    async def forecast(self, ctx: GateContext, at: datetime) -> bool:
+        """Always a run: whether a PR moved is only known by polling GitHub.
+
+        A forecast may neither reach the network nor touch the fingerprint
+        file, so it cannot tell and says the job runs; the check when the run
+        comes still decides.
+        """
+        return True
 
     def describe(self) -> str:
         return (
@@ -549,6 +650,36 @@ class GitHubPrActivityGate(CronGate):
             logger.warning("github_pr_activity: could not persist state: %s", e)
 
 
+def _consumer_cursor_ttl_days() -> int:
+    """``sync.consumer_cursor_ttl_days`` of the loaded config, never loading
+    one; its default without a config or with an unusable value."""
+    from nerve.config import SyncConfig, loaded_config
+
+    config = loaded_config()
+    days = getattr(getattr(config, "sync", None), "consumer_cursor_ttl_days", None)
+    if isinstance(days, int) and not isinstance(days, bool) and days > 0:
+        return days
+    return SyncConfig.consumer_cursor_ttl_days
+
+
+def github_is_hosted() -> bool:
+    """Whether GitHub records come from the channel gateway (``sync.github.mode: hosted``).
+
+    The mode is restart-only, so this reads the configuration the process
+    started with, as the GitHub source runner and the hosted streams do:
+    after a reload that changes the mode, the gate keeps to the mode in
+    effect until the restart. A process that did not start the gateway reads
+    the loaded config and never loads one, so one without a config (a test,
+    a one-off command) counts as polling.
+    """
+    from nerve.config import loaded_config
+    from nerve.config_reload import startup_config
+
+    config = startup_config() or loaded_config()
+    github = getattr(getattr(config, "sync", None), "github", None)
+    return getattr(github, "mode", None) == "hosted"
+
+
 #: Maps a gate's ``type`` key to its implementing class. Register new gate
 #: types here to make them usable from config.
 GATE_REGISTRY: dict[str, type[CronGate]] = {
@@ -623,6 +754,43 @@ async def evaluate_gates(
         except Exception as e:  # noqa: BLE001 — fail open, never block forever
             logger.warning(
                 "Cron gate %r for job %s errored; allowing run: %s",
+                gate.type, ctx.job_id, e,
+            )
+            continue
+        if not ok:
+            return GateDecision(
+                should_run=False,
+                reason=f"gate {gate.type!r} not satisfied ({gate.describe()})",
+            )
+    return GateDecision(should_run=True)
+
+
+async def forecast_gates(
+    gates: list[CronGate], ctx: GateContext, at: datetime,
+) -> GateDecision:
+    """What :func:`evaluate_gates` will decide for a run at *at*, judged now.
+
+    Each gate's :meth:`CronGate.forecast`, with the same AND semantics, the
+    same skip reason and the same fail-open rule: a gate that raises while
+    forecasting counts as satisfied, just as a run would proceed past a gate
+    that raises while checking. Forecasts are asked for on every schedule
+    read, so that is a warning once per job in ``_FORECAST_WARN_SECONDS``,
+    and DEBUG in between.
+    """
+    for gate in gates:
+        try:
+            ok = await gate.forecast(ctx, at)
+        except Exception as e:  # noqa: BLE001 — fail open, as evaluate_gates does
+            now = time.monotonic()
+            last = _forecast_warned.get(ctx.job_id)
+            level = logging.DEBUG
+            if last is None or now - last >= _FORECAST_WARN_SECONDS:
+                _forecast_warned[ctx.job_id] = now
+                level = logging.WARNING
+            logger.log(
+                level,
+                "Cron gate %r for job %s errored while forecasting; assuming "
+                "the run proceeds: %s",
                 gate.type, ctx.job_id, e,
             )
             continue

@@ -28,7 +28,7 @@ const { useAuthStore } = await import('./authStore');
 const { selectViewerStorage } = await import('./helpers/viewerStorage');
 const {
   RECONNECT_INTERVAL_MS, RECONNECT_TIMEOUT_MS, fieldErrorOf, providerConfigured,
-  setupIsUnfinished, setupNotStarted, stepById, stepsLeft, useSetupStore,
+  setupIsUnfinished, setupNotStarted, stepById, stepsLeft, unsavedFor, useSetupStore,
 } = await import('./setupStore');
 const { makeFreshState, makeState, step, withStep } = await import('../test/setupFixtures');
 
@@ -172,6 +172,41 @@ describe('save, skip, finish', () => {
     await useSetupStore.getState().save('mode', () => api.setupStep('mode', { mode: 'worker' }));
     expect(useSetupStore.getState().error).toBe('Mode was chosen already.');
     expect(setupState).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps what a refused form held for the form that a changed step remounts, and for nothing else', async () => {
+    await useSetupStore.getState().load();
+    const opened = stepById(useSetupStore.getState(), 'sources')!;
+    const values = { gmail: false };
+    const refuse = (status: number) => setupStep.mockRejectedValueOnce(
+      new ApiError(status, '{"detail": "Refused.", "field": "github"}'),
+    );
+    const saveSources = () => useSetupStore.getState().save('sources', () => api.setupStep('sources', {}), values);
+
+    // The read after a 409 finds the step changed: the form it remounts takes them.
+    const changed = withStep(makeState(), step('sources', { etag: 'sources-etag-2' }));
+    setupState.mockResolvedValueOnce(changed);
+    refuse(409);
+    await saveSources();
+    await vi.waitFor(() => expect(useSetupStore.getState().state).toBe(changed));
+    expect(unsavedFor(stepById(useSetupStore.getState(), 'sources')!)).toEqual(values);
+    expect(unsavedFor(opened)).toBeNull();
+    // The next write drops them.
+    setupSkip.mockResolvedValueOnce(makeState());
+    await useSetupStore.getState().skip('memory', true);
+    expect(useSetupStore.getState().unsaved).toBeNull();
+
+    // A step the read finds unchanged remounts nothing, so they are not kept.
+    setupState.mockResolvedValueOnce(makeState());
+    refuse(409);
+    await saveSources();
+    await vi.waitFor(() => expect(setupState).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect(useSetupStore.getState().unsaved).toBeNull());
+
+    // A 400 re-reads nothing and keeps nothing.
+    refuse(400);
+    await saveSources();
+    expect(useSetupStore.getState().unsaved).toBeNull();
   });
 
   it('skips and puts back through the server', async () => {

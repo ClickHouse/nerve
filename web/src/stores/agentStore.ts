@@ -63,6 +63,8 @@ export interface AgentStoreState {
   upsertAgents(views: AgentView[]): void;
   addPendingSend(p: PendingSend): void;
   dropPendingSend(clientMsgId: string): void;
+  /** Drop a pending send that the server refused and put its text back in the composer. False if this tab has no such send. */
+  refusePendingSend(clientMsgId: string): boolean;
   openTranscript(agentId: string): Promise<void>;
   closeTranscript(agentId: string): void;
   loadEarlier(agentId: string): Promise<void>;
@@ -500,6 +502,9 @@ export const useAgentStore = create<AgentStoreState>((set, get) => {
         } else if (removal.reason === 'cancelled') {
           result.cancelled.push(pending);
           if (!ownCancel && pending.content) restore.push(pending.content);
+        } else if (removal.reason === 'refused' && pending.content) {
+          // Nerve is shutting down: the text goes back to be sent again later.
+          restore.push(pending.content);
         }
       }
       set({ queue: msg.queue ?? [], ...(pendingSends !== s.pendingSends ? { pendingSends } : {}) });
@@ -511,6 +516,14 @@ export const useAgentStore = create<AgentStoreState>((set, get) => {
 
     addPendingSend: (p) => {
       set((s) => ({ pendingSends: { ...s.pendingSends, [p.clientMsgId]: p } }));
+    },
+
+    refusePendingSend: (clientMsgId) => {
+      const pending = get().pendingSends[clientMsgId];
+      if (!pending) return false;
+      get().dropPendingSend(clientMsgId);
+      if (pending.content) get().prefillComposer(pending.content, 'append');
+      return true;
     },
 
     dropPendingSend: (clientMsgId) => {

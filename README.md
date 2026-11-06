@@ -75,16 +75,22 @@ A task-focused autonomous agent for teams or programmatic deployment. Monitors s
 
 > *"You are a specialist with one mission, set out in `TASK.md`, and an explicit quality bar."* — from the Worker SOUL template
 
-- **Self-configuring**: give it a plain-English task description and it researches, writes its own `TASK.md`, creates skills, sets up cron jobs, and starts working
+- **Self-configuring**: tell it what to work on in its onboarding conversation, or give it a plain-English task description at install time, and it researches, writes its own `TASK.md`, creates skills, sets up cron jobs, and starts working
 - Memory categories are operational: patterns, procedures, decisions, approvals, infrastructure
 - No `IDENTITY.md` or `USER.md` — workers execute a mission, not build a relationship
 - Built for reliability: plan before acting, verify after executing, log everything
 
 The mode is chosen on the setup page: run `nerve init`, open the page it
-prints, and pick **Worker** on the Mode step — it asks for a plain-English task
-description and the agent onboards itself on first boot. The same choice in a
-terminal is `nerve init --terminal`; unattended installs set `NERVE_MODE=worker`
-(and `NERVE_TASK`):
+prints, and pick **Worker** on the Mode step. When you finish setup, the agent
+opens its onboarding conversation: it starts from the note you left on the Mode
+step (or asks what to work on), studies the repositories and sources in the
+background, then asks you the few things only you know, proposes the setup
+as a plan you approve, edit or send back, and applies it. The same choice in a terminal is
+`nerve init --terminal`; unattended installs set `NERVE_MODE=worker` and
+`NERVE_TASK`. Without the browser, a worker with a task description sets
+itself up at its first start, in one session without a person, and notifies
+you when it is done. With an empty task description, it waits for its
+onboarding conversation in the web UI.
 
 ```bash
 # Spin up a worker that monitors CI and fixes flaky tests, with no browser
@@ -153,7 +159,7 @@ Scheduled AI sessions via APScheduler. Three session modes:
 | **Persistent** | Accumulates context across runs. Optional rotation to manage token usage. Reminder mode for lightweight follow-ups. |
 | **Main** | Runs inside the user's primary conversation — full context access. |
 
-Built-in crons (personal mode): `skill-extractor` (12h), `skill-reviser` (weekly), `inbox-processor` (30min), `task-planner` (4h). Worker mode ships with `skill-reviser` and `skill-extractor` on and `task-planner` off; the onboarding session enables `task-planner` when the worker should plan through the approval loop, and configures the worker's own crons.
+Built-in crons (personal mode): `skill-extractor` (12h), `skill-reviser` (weekly), `inbox-processor` (30min), `task-planner` (4h), `machine-maintenance` (weekly). Worker mode ships with `skill-reviser`, `skill-extractor` and `machine-maintenance` on and `task-planner` off; onboarding enables `task-planner` when the worker should plan through the approval loop, and configures the worker's own crons.
 
 ### 📡 Source Sync
 
@@ -213,6 +219,7 @@ workspace/skills/
 - `skill-extractor` cron proposes new skills from repeated workflows
 - `skill-reviser` cron reviews existing skills for accuracy
 - Usage statistics tracked per skill
+- Platform skills: an operator or a hosting platform can add read-only skills in `skills/` in the config directory ([details](docs/architecture.md#platform-skills))
 
 ### 📐 Plans
 
@@ -308,6 +315,7 @@ See [docs/config.md](docs/config.md) for all options.
 | [Tasks](docs/tasks.md) | Task file format, escalation rules |
 | [Memory](docs/memory.md) | Memory file conventions, memU integration |
 | [Cron](docs/cron.md) | Job format, session modes, built-in crons |
+| [Platform Activity](docs/platform-activity.md) | Reporting turns, connections, the next scheduled task and keep-awake leases to a platform that parks idle machines |
 | [Plans](docs/plans.md) | Plan proposal, approval, and implementation workflow |
 | [Web UI](docs/web-ui.md) | Frontend architecture, building, development |
 

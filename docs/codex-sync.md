@@ -2,7 +2,8 @@
 
 Nerve can pull Codex thread transcripts into its own message store so
 Codex sessions become first-class citizens — searchable via
-`memory_recall`, processed by the memory sweep, rendered in the
+`memory_recall` (`loom_search` with the Loom memory backend), processed by
+the memory sweep, rendered in the
 satellite-session UI, and deduped against the external MCP server's
 tool-call log. Without this sync, Nerve only sees the *tool calls*
 Codex makes, not the user prompts and agent replies that frame them.

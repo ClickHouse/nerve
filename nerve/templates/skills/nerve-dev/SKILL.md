@@ -76,7 +76,7 @@ Run the commands below from the repository root (wherever you cloned it).
 │   ├── models_catalog.py   # model picker discovery   ollama.py, coerce.py, _env.py
 │   ├── db/                 # SQLite (aiosqlite): Database = base.py + domain mixins
 │   │   ├── base.py         # connection, pragmas, write lock, migrations, FTS health
-│   │   ├── migrations/     # vNNN_*.py + runner.py (SCHEMA_VERSION = highest file number)
+│   │   ├── migrations/     # vNNN_*.py + runner.py (SCHEMA_VERSION = highest file number); fork/ = a fork's own track
 │   │   └── sessions.py messages.py tasks.py task_statuses.py plans.py notifications.py
 │   │       sources.py cron.py skills.py mcp.py audit.py accounts.py files.py usage.py
 │   │       wakeups.py workflow_runs.py review_loops.py observations.py maintenance.py
@@ -92,7 +92,7 @@ Run the commands below from the repository root (wherever you cloned it).
 │   ├── sources/            # inbox sources: telegram, gmail, imap, github, github_events, github_repos,
 │   │                       #   channel (observed chats), codex_threads/; runner.py, filters.py, registry.py
 │   ├── cron/               # APScheduler service, jobs.py, gates.py, gate_plugins.py
-│   ├── memory/             # files.py, memu_bridge.py (memU), xmemory_bridge.py
+│   ├── memory/             # files.py, memu_bridge.py (memU), loom.py (Loom), xmemory_bridge.py
 │   ├── skills/             # SkillManager — filesystem skills + DB index
 │   ├── tasks/              # task markdown files + manager
 │   ├── notifications/      # NotificationService, silences, approval dispatch
@@ -247,7 +247,7 @@ uv sync --locked --extra test
 # and fails if the two have drifted apart.
 uv lock && uv sync --locked --extra test
 
-# What CI runs on your new migrations (see Critical Rules)
+# What CI runs on your new migrations (see Critical Rules); a fork of Nerve adds --fork
 python3 scripts/check_migration_numbers.py origin/main
 
 # Health check of a running install
@@ -285,7 +285,7 @@ npm run dev                 # Vite dev server; proxies /api and /ws to localhost
 
 5. **Config layers:** `<workspace>/config/settings.yaml` (shareable, git-tracked with the workspace) < `config.yaml` (machine-local, gitignored) < `config.local.yaml` (secrets, gitignored). `config.example.yaml` is the committed example. Never put credentials in a tracked file — reference them as `${ENV_VAR}` or keep them in `config.local.yaml`. New keys go in the dataclasses in `nerve/config.py` and in the `docs/config.md` table, with their layer and whether they hot-reload.
 
-6. **Database migrations:** each migration is a numbered Python file in `nerve/db/migrations/` (`vNNN_your_feature.py`) exporting `async def up(db)`. `SCHEMA_VERSION` is derived from the highest file number. Number a new migration **above the highest version on `main`** — the runner skips versions at or below the database's current one, so a lower number never runs on an already-migrated database. CI enforces this with `scripts/check_migration_numbers.py`; gaps in the sequence are fine, renumbering an existing migration is not. A database newer than the code refuses to start (override only deliberately with `NERVE_ALLOW_NEWER_SCHEMA=1`).
+6. **Database migrations:** each migration is a numbered Python file in `nerve/db/migrations/` (`vNNN_your_feature.py`) exporting `async def up(db)`. `SCHEMA_VERSION` is derived from the highest file number. Number a new migration **above the highest version on `main`** — the runner skips versions at or below the database's current one, so a lower number never runs on an already-migrated database. CI enforces this with `scripts/check_migration_numbers.py`; gaps in the sequence are fine, renumbering an existing migration or reusing its number is not. **Forks add migrations only under `fork/`** (`nerve/db/migrations/fork/`). They are numbered from `v001`, apart from upstream's numbers, and recorded in their own `fork_schema_version` table, so a fork's migration never shadows an upstream one. Never add a fork's migration to the upstream track; to move a change upstream, follow "Moving a change upstream" in `nerve/db/migrations/fork/README.md`. Upstream never ships a fork migration (the check fails on one; a fork runs it with `--fork`). No transaction wraps a migration, so make each one idempotent. A database newer than the code on either track refuses to start: one line, exit status 65 (override only deliberately with `NERVE_ALLOW_NEWER_SCHEMA=1`).
 
 7. **Database domain modules:** data access lives in mixin classes by domain under `nerve/db/` (sessions, messages, tasks, plans, notifications, sources, cron, skills, mcp, audit, accounts, usage, workflow_runs, review_loops, ...). `Database` in `base.py` inherits them all. Add methods to the matching mixin, not to `base.py`.
 
@@ -381,7 +381,7 @@ Key paths (under `~/.nerve`, or `$NERVE_HOME` when set):
 | Backend | Python 3.13+, FastAPI, Uvicorn, aiosqlite, Click |
 | Agents | Claude Agent SDK (in-process MCP tools), Codex app-server backend, `mcp` 2.x for the external endpoint |
 | Model access | Anthropic API, Bedrock, or Claude subscription via the CLIProxyAPI proxy |
-| Memory | memU (`memu-py`, pinned), optional xmemory |
+| Memory | memU (`memu-py`, pinned), or Loom through the MCP gateway (`memory.backend: loom`); optional xmemory |
 | Scheduler | APScheduler |
 | Channels | python-telegram-bot + Telethon, slack-sdk (Socket Mode), WebSocket web UI |
 | Auth | JWT (pyjwt) + bcrypt, local accounts with actor attribution |

@@ -7,6 +7,8 @@ from pydantic import BaseModel
 
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.skills.manager import SOURCE_WORKSPACE
+
 router = APIRouter(dependencies=[Depends(require_auth)])
 
 
@@ -34,9 +36,12 @@ def _require_skill_manager():
 
 @router.get("/api/skills")
 async def list_skills():
-    """List all skills with usage stats."""
+    """List all skills with usage stats and where each one comes from."""
     deps = get_deps()
     skills = await deps.db.get_all_skills_with_stats()
+    mgr = getattr(deps.engine, "_skill_manager", None) if deps.engine else None
+    for skill in skills:
+        skill["source"] = mgr.source(skill["id"]) if mgr else SOURCE_WORKSPACE
     return {"skills": skills}
 
 
@@ -53,7 +58,10 @@ async def sync_skills():
     """Re-scan filesystem and sync skills to DB."""
     mgr = _require_skill_manager()
     skills = await mgr.discover()
-    return {"synced": len(skills), "skills": [{"id": s.id, "name": s.name} for s in skills]}
+    return {
+        "synced": len(skills),
+        "skills": [{"id": s.id, "name": s.name, "source": s.source} for s in skills],
+    }
 
 
 @router.get("/api/skills/{skill_id}")
@@ -82,6 +90,7 @@ async def get_skill_detail(skill_id: str):
         "has_references": skill.has_references,
         "has_scripts": skill.has_scripts,
         "has_assets": skill.has_assets,
+        "source": skill.source,
         "content": skill.content,
         "raw": skill.raw,
         "references": refs,

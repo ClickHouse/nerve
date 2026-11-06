@@ -16,15 +16,16 @@ Call tools as `mcp__nerve__<name>`. The system prompt lists what is live; this i
 
 **Tasks** (persistent tracker, `memory/tasks/`)
 - `task_search` first; `task_create` refuses likely duplicates unless `confirm_duplicate=true`
-- `task_list`: filter by status or tag
+- `task_list`: filter by status or tag; a `backlog` task is not ready for work yet
 - `task_update`: status, deadline, tags, title, or a dated note
 - `task_read`/`task_write`: read or overwrite the markdown; `task_write` needs a prior `task_read`
 - `task_done`: moves the file to `done/` and the task's implementing plans to done
+- `task_comment`: a comment on a task, signed as you; `task_read` shows the newest 50
 - `task_status_list`/`task_status_create`: configured statuses; create only on request
 
-**Plans** (`pending` → `implementing` → `done`/`failed`, or `declined`/`superseded`; reviewed at `/plans`)
-- `plan_propose`: a plan for a task; one pending plan per task
-- `plan_update`: version n+1 of your own pending plan (instead of decline and propose)
+**Plans** (`pending` → `implementing` → `done`/`failed`, or `declined`/`superseded`; in the web UI, link a plan as `[plan-<id>](/plans/plan-<id>)`)
+- `plan_propose`: a plan for a task; one pending plan per task; moves a `pending`, `backlog` or `in_progress` task to `plan_review` and notifies the user with a link, so send no `notify` about it
+- `plan_update`: version n+1 of your own pending plan (instead of decline and propose); moves and notifies like `plan_propose`
 - `plan_list`/`plan_read`: browse; the full plan with version and feedback
 - `plan_approve`: pending → implementing; spawns an `impl-<id>` session, task → `in_progress`
 - `plan_decline`: pending → declined; **moves the task to done**
@@ -38,6 +39,7 @@ Call tools as `mcp__nerve__<name>`. The system prompt lists what is live; this i
 **Notifications and delivery**
 - `notify`: fire-and-forget; priority `low`/`normal`/`high`/`urgent`; a silence rule can suppress it (`force=true` overrides)
 - `ask_user`: async question with optional buttons; the answer lands in this session
+- `ask_form`: web chat only; a form of up to six questions (`choice`, `multi`, `text`, `list`, `repos`, `url`) with an optional `intro` shown above them (the explanation goes there, since the person does not see your thinking), that waits up to an hour and returns the answers as lines and JSON; elsewhere it fails, so use `ask_user`
 - `propose_action`: Approve/Decline/Snooze card dispatched server-side by `target_kind`; the answer is not injected
 - `notification_silence`: `add`/`list`/`remove` silence rules; only on explicit instruction or a recorded ruling
 - `react`/`send_sticker`: emoji reaction on the last message (Telegram, Slack); Telegram sticker by `file_id`
@@ -69,7 +71,7 @@ Call tools as `mcp__nerve__<name>`. The system prompt lists what is live; this i
 ### Features
 
 - **Channels**: web UI; Telegram bot (pair with `nerve pair` and `/pair <code>`); Slack via Socket Mode (`/nerve help` lists subcommands).
-- **Crons**: `config/cron/jobs.yaml` (yours) and `system.yaml` (built-ins `memory-maintenance`, `inbox-processor`, `task-planner`, `skill-extractor`, `skill-reviser`); `schedule`, `prompt`/`prompt_file`, `session_mode` (`isolated`/`persistent`/`main`), `run_if` gates (`tasks`, `messages`, `github_pr_activity`, plugins in `config/cron/gates/`) or a `workflow:` block; `nerve cron <id>` runs one now.
+- **Crons**: `config/cron/jobs.yaml` (yours) and `system.yaml` (built-ins `memory-maintenance`, `inbox-processor`, `task-planner`, `skill-extractor`, `skill-reviser`, `machine-maintenance`); `schedule`, `prompt`/`prompt_file`, `session_mode` (`isolated`/`persistent`/`main`), `run_if` gates (`tasks`, `messages`, `github_pr_activity`, plugins in `config/cron/gates/`) or a `workflow:` block; `nerve cron <id>` runs one now.
 - **External agents**: Codex as session backend (`agent.backend`; `agent.cron_backend` for crons and hooks; sticky per session). The external MCP endpoint (`mcp_endpoint`, `/mcp/v1`, token via `nerve codex token`) serves these tools to other agents as satellite sessions. Codex thread sync ingests local transcripts; `external_agents` renders memory bundles into other agents' home dirs; Claude Code plugins add their MCP servers (Claude backend only).
 - **Config, workspace sync, lockdown**: settings layers `workspace/config/settings.yaml` < `config.yaml` < `config.local.yaml`. `nerve config init-repo` makes the workspace a config repo; `workspace_sync` pulls, validates and reloads it. The reviewed surface is `config/`, `skills/` and the root instruction files; under lockdown it is read-only locally and `propose_config_change` is the only route (see the `nerve-workspace` skill). `nerve reload` applies most edits live.
 - **Backups**: `nerve backup` (`--state-only`, `--no-secrets`) bundles databases, secrets, cron and workspace; `nerve restore <bundle>` verifies first; scheduled `backup.*` is opt-in; `nerve db prune|vacuum` for retention.

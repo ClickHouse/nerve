@@ -87,7 +87,9 @@ export function ProfileStep({ step, state }: { step: SetupStep; state: SetupStat
       quiet_start: quietTime(detail.quiet_start, QUIET_HOURS_PREFILL.start),
       quiet_end: quietTime(detail.quiet_end, QUIET_HOURS_PREFILL.end),
       language: detail.language ?? (pending ? browserLanguageName() : ''),
-      agent_name: detail.agent_name ?? '',
+      // The name the environment gives the agent stands in while IDENTITY.md
+      // has none; as it differs from what the file holds, Continue sends it.
+      agent_name: detail.agent_name ?? detail.agent_name_prefill ?? '',
       agent_emoji: detail.agent_emoji ?? '',
       about: '',
     };

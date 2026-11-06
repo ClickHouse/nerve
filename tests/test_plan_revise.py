@@ -68,6 +68,8 @@ class FakeSessionManager:
 class FakeEngine:
     """Mimics AgentEngine.run + .sessions for revision dispatch tests."""
 
+    accepting_turns = True
+
     def __init__(self, db: Database | None = None) -> None:
         self.sessions = FakeSessionManager()
         # The revision dispatcher resolves the system principal off the
@@ -167,7 +169,7 @@ class TestRequestPlanRevision:
         task = await db.get_task(task_id)
         task_md = tmp_path / task["file_path"]
         body = task_md.read_text(encoding="utf-8")
-        assert "Revision requested for plan-orig" in body
+        assert "Revision requested for [plan-orig](/plans/plan-orig)" in body
         assert "needs more tests" in body
 
     async def test_routes_to_proposer_session(self, db: Database, tmp_path):

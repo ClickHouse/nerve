@@ -38,6 +38,16 @@ logger = logging.getLogger(__name__)
 _FALLBACK_PLANNER_SESSION = "cron:task-planner"
 
 
+def plan_link(plan_id: str) -> str:
+    """A markdown link to the plan's page in the web UI."""
+    return f"[{plan_id}](/plans/{plan_id})"
+
+
+def session_link(session_id: str) -> str:
+    """A markdown link to the session's chat in the web UI."""
+    return f"[{session_id}](/chat/{session_id})"
+
+
 # The prompt template lives here so future tweaks (model selection,
 # wording, calling conventions) happen in exactly one place.
 _REVISION_PROMPT_TEMPLATE = (
@@ -144,6 +154,8 @@ async def request_plan_revision(
         PlanNotFound: No plan with that ID.
         TaskNotFound: The plan's task no longer exists.
         PlanNotPending: The plan is declined/superseded/implementing/etc.
+        NotAcceptingTurnsError: The engine is draining, so the planner turn
+            would be refused. Nothing is stored.
 
     Behavior contract:
         - Stores ``feedback`` on the plan, and ``actor`` + ``cause`` as its
@@ -182,6 +194,8 @@ async def request_plan_revision(
     if not task:
         raise TaskNotFound(f"Task not found for plan {plan_id}: {plan['task_id']}")
 
+    _require_accepting_turns(engine)
+
     # 1. Store feedback on the plan (status stays pending until planner
     #    supersedes it via plan_update). The request is a review decision,
     #    and it applies only while the plan is still pending.
@@ -207,7 +221,7 @@ async def request_plan_revision(
     )
     await task_update_handler(task_ctx, {
         "task_id": plan["task_id"],
-        "note": f"Revision requested for {plan_id}: {feedback_summary}",
+        "note": f"Revision requested for {plan_link(plan_id)}: {feedback_summary}",
     })
 
     # 3. Build the revision prompt from the shared template.
@@ -252,6 +266,18 @@ async def request_plan_revision(
         "session_id": session_id,
         "status": "revision_requested",
     }
+
+
+def _require_accepting_turns(engine: "AgentEngine") -> None:
+    """Raise ``NotAcceptingTurnsError`` while the engine drains.
+
+    Call it before a decision is stored: the turn that acts on the decision
+    would be refused, and the decision would be lost.
+    """
+    if not engine.accepting_turns:
+        from nerve.agent.engine import NotAcceptingTurnsError
+
+        raise NotAcceptingTurnsError()
 
 
 async def _raise_not_pending(db: "Database", plan_id: str, verb: str) -> NoReturn:
@@ -321,13 +347,16 @@ async def approve_plan(
         PlanNotPending: The plan is not ``pending``, including when a
             concurrent approve or decline got to it first.
         TaskNotFound: The plan's task no longer exists.
+        NotAcceptingTurnsError: The engine is draining, so the
+            implementation turn would be refused. The plan stays pending.
 
     Behavior contract:
         - Claims the plan with one atomic ``pending`` → ``implementing``
           transition that also stores the new ``impl-<uuid>`` session id and
           the reviewer, so concurrent approvals spawn exactly one
           implementation session.
-        - Moves the task to ``in_progress`` with an audit note.
+        - Moves the task to ``in_progress`` with an audit note, and
+          dismisses the task's pending plan notifications.
         - If creating the session or updating the task fails, the plan goes
           back to ``pending`` so it can be approved again.
         - Dispatches ``engine.run()`` in the background with the build
@@ -350,6 +379,8 @@ async def approve_plan(
     task = await db.get_task(plan["task_id"])
     if not task:
         raise TaskNotFound(f"Task not found for plan {plan_id}: {plan['task_id']}")
+
+    _require_accepting_turns(engine)
 
     now = datetime.now(timezone.utc).isoformat()
     plan_type = plan.get("plan_type", "generic")
@@ -378,7 +409,10 @@ async def approve_plan(
         await task_update_handler(task_ctx, {
             "task_id": plan["task_id"],
             "status": "in_progress",
-            "note": f"Plan approved — implementation started (session: {impl_session_id})",
+            "note": (
+                f"Plan {plan_link(plan_id)} approved. Implementation started "
+                f"in session {session_link(impl_session_id)}."
+            ),
         })
 
         # Read the task file for the implementation prompt. Resolve against
@@ -401,8 +435,13 @@ async def approve_plan(
             impl_session_id=plan.get("impl_session_id"),
         )
         raise
+    await db.dismiss_plan_notifications(
+        plan["task_id"], attribution=attribution_for(actor, cause),
+    )
 
     async def _run_impl():
+        from nerve.agent.engine import NotAcceptingTurnsError
+
         try:
             await engine.run(
                 session_id=impl_session_id, user_message=prompt, source="web",
@@ -411,6 +450,14 @@ async def approve_plan(
                 # though an approval started it. The session carries who
                 # approved.
                 actor=db.system_actor,
+            )
+        except NotAcceptingTurnsError:
+            # A drain started after the check above. The implementation did
+            # not start, so the plan can be approved again after the restart.
+            logger.info("Plan %s: implementation refused, Nerve is draining", plan_id)
+            await _revert_plan(
+                db, plan, "implementing",
+                impl_session_id=plan.get("impl_session_id"),
             )
         except Exception:
             logger.exception("Implementation session %s failed", impl_session_id)
@@ -453,6 +500,7 @@ async def decline_plan(
     The ``pending`` → ``declined`` transition is atomic, so it cannot
     interleave with a concurrent approve or decline. If closing the task
     fails, the plan goes back to ``pending`` so the decline can be retried.
+    The task's pending plan notifications are dismissed.
 
     Args:
         db: Database instance.
@@ -505,9 +553,9 @@ async def decline_plan(
         await _raise_not_pending(db, plan_id, "declined")
 
     if feedback:
-        note = f"Plan {plan_id} declined — {feedback}"
+        note = f"Plan {plan_link(plan_id)} declined: {feedback}"
     else:
-        note = f"Related plan {plan_id} was closed without a specified reason"
+        note = f"Related plan {plan_link(plan_id)} was closed without a specified reason"
     task_ctx = replace(
         _legacy_ctx(caller_session_id), db=db, engine=engine,
         actor=actor, cause=cause,
@@ -523,6 +571,9 @@ async def decline_plan(
             db, plan, "declined", feedback=plan.get("feedback"),
         )
         raise
+    await db.dismiss_plan_notifications(
+        plan["task_id"], attribution=attribution_for(actor, cause),
+    )
 
     logger.info(
         "Plan declined: plan=%s task=%s", plan_id, plan["task_id"],

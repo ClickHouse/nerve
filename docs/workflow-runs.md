@@ -271,11 +271,11 @@ Two fields deserve care on workflow jobs:
   previous run from the same job is still pending/running. Without it, a
   schedule shorter than the run duration stacks concurrent full-budget runs.
 - **`catchup: false` is recommended.** The default (`true`) fires an
-  overdue job once at daemon startup — for a workflow job that launches a
-  paid multi-agent run right after every restart that crossed a scheduled
-  slot. Note this is the one exception to "nothing resumes on its own after
-  a restart": the *old* run is still marked failed; catchup starts a *new*
-  one.
+  overdue job once at daemon startup, and once when the machine resumes from
+  a pause — for a workflow job that launches a paid multi-agent run right
+  after every restart or pause that crossed a scheduled slot. Note this is the
+  one exception to "nothing resumes on its own after a restart": the *old* run
+  is still marked failed; catchup starts a *new* one.
 
 ## Spec Template: Re-Review Until Agreement
 

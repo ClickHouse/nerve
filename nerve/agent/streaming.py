@@ -300,7 +300,8 @@ class StreamBroadcaster:
         })
 
     async def broadcast_task_event(self, task: dict[str, Any], event: str) -> None:
-        """A task row changed — ``created``/``updated``/``moved``/``done``.
+        """A task row changed: ``created``/``updated``/``moved``/``done``,
+        or ``commented``/``comment_deleted``.
 
         Fanned out on ``__global__`` rather than a session channel because
         the task board is a global view: a card has to move whether the

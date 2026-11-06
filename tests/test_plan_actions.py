@@ -55,6 +55,8 @@ class FakeSessionManager:
 class FakeEngine:
     """Mimics AgentEngine.run + .sessions + .register_task for approve tests."""
 
+    accepting_turns = True
+
     def __init__(self, db: Database) -> None:
         self.db = db
         self.sessions = FakeSessionManager()

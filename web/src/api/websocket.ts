@@ -11,7 +11,8 @@ export type WSMessage =
   | { type: 'tool_output'; session_id: string; tool_use_id?: string; content: string; parent_tool_use_id?: string }
   | { type: 'done'; session_id: string; usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }; max_context_tokens?: number; num_turns?: number }
   | { type: 'stopped'; session_id: string }
-  | { type: 'error'; session_id: string; error: string }
+  // client_msg_id: the refused message, when the error refuses a message (Nerve is shutting down).
+  | { type: 'error'; session_id: string; error: string; client_msg_id?: string | null }
   | { type: 'session_switched'; session_id: string }
   | { type: 'session_updated'; session_id: string; title: string }
   // `agents` is the roster snapshot, sent on every bind and switch (also when
@@ -23,8 +24,11 @@ export type WSMessage =
   | { type: 'plan_update'; session_id: string; content: string }
   | { type: 'backend_status'; session_id: string; subtype: string; data: Record<string, unknown> }
   // `agent` names the subagent that asked; null or absent for the orchestrator.
-  | { type: 'interaction'; session_id: string; interaction_id: string; interaction_type: 'question' | 'plan_exit' | 'plan_enter' | 'command_approval' | 'file_approval' | 'permission_approval'; tool_name: string; tool_input: Record<string, unknown>; agent?: InteractionAgentRef | null }
+  // `form` is Nerve's ask_form (tool_name `ask_form`); it is answered `{answers: {id: string | string[]}}`.
+  | { type: 'interaction'; session_id: string; interaction_id: string; interaction_type: 'question' | 'form' | 'plan_exit' | 'plan_enter' | 'command_approval' | 'file_approval' | 'permission_approval'; tool_name: string; tool_input: Record<string, unknown>; agent?: InteractionAgentRef | null }
   | { type: 'interaction_resolved'; session_id: string; interaction_id: string }
+  // A short summary of the plan an ExitPlanMode pause waits on (buffered for replay like `interaction`).
+  | { type: 'plan_summary'; session_id: string; interaction_id: string; bullets: string[]; status: 'ok' | 'unavailable' }
   // No longer emitted (agent records replaced them); tolerated and ignored.
   | { type: 'subagent_start'; session_id: string; tool_use_id: string; subagent_type: string; description: string; model?: string }
   | { type: 'subagent_complete'; session_id: string; tool_use_id: string; duration_ms: number; is_error?: boolean }
@@ -57,7 +61,11 @@ export type WSMessage =
   // Global (session_id is always null): a task row changed anywhere — the
   // API, another tab, or the agent in an unrelated session. Deliberately
   // NOT view-scoped; the board reflects all of them.
-  | { type: 'task_updated'; session_id: null; event: 'created' | 'updated' | 'moved' | 'done'; task: Task }
+  | {
+      type: 'task_updated'; session_id: null;
+      event: 'created' | 'updated' | 'moved' | 'done' | 'commented' | 'comment_deleted';
+      task: Task;
+    }
   | { type: 'wakeup'; session_id: string }
   // `triggers` names the agents whose settling started the turn (`more` counts the rest).
   | { type: 'auto_turn'; session_id: string; triggers?: AutoTurnTrigger[]; more?: number }
@@ -261,7 +269,7 @@ export class NerveWebSocket {
     this.send({ type: 'resume', session_id: sessionId });
   }
 
-  answerInteraction(sessionId: string, interactionId: string, result: Record<string, string> | null, denied = false, message = '') {
+  answerInteraction(sessionId: string, interactionId: string, result: Record<string, unknown> | null, denied = false, message = '') {
     this.send({ type: 'answer_interaction', session_id: sessionId, interaction_id: interactionId, result, denied, message });
   }
 

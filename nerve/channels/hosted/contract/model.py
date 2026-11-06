@@ -10,6 +10,8 @@ A frame that fails a check closes its stream.
 from __future__ import annotations
 
 import dataclasses
+import re
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -55,6 +57,27 @@ OPERATION_OUTCOMES = (
 )
 # Operations that the gateway may run again without a second provider effect.
 RETRY_SAFE_OPERATIONS = frozenset({"file_read", "typing"})
+# The event kind of a hosted source's record. It carries a ``record`` member
+# and no message.
+EVENT_KIND_SOURCE_RECORD = "source_record"
+# The subscriptions payload, and the bounds that the gateway enforces on it.
+SUBSCRIPTIONS_VERSION = "1"
+MAX_SUBSCRIPTION_SOURCES = 16
+MAX_SUBSCRIPTION_PATTERNS = 256
+MAX_SUBSCRIPTION_PATTERN_BYTES = 256
+# The inboxes that a source subscription may name; empty means participating.
+SUBSCRIPTION_INBOXES = ("", "participating", "all")
+# The provider whose subscription names repositories to watch, and only it.
+REPO_WATCH_PROVIDER = "github_repos"
+# Such a subscription names 1 to this many repositories, each once.
+MAX_REPO_WATCHES = 50
+# What a watched repository may report.
+REPO_WATCH_TYPES = ("pull_request", "issue", "release")
+# A repository as GitHub names it: owner/name.
+_REPO_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_.-]{1,100}")
+# A provider name is a lowercase token of at most this many bytes.
+MAX_PROVIDER_BYTES = 64
+_PROVIDER_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-.")
 
 
 def byte_length(value: str) -> int:
@@ -68,6 +91,54 @@ def byte_length(value: str) -> int:
 def _one_of(name: str, value: str, allowed: tuple[str, ...]) -> None:
     if value not in allowed:
         reject(RejectionReason.KIND_UNSUPPORTED, f"unknown {name} {value!r}")
+
+
+def valid_identifier(value: str, maximum: int = MAX_IDENTIFIER_BYTES) -> bool:
+    """Whether the gateway takes *value* as an ID or a label.
+
+    That is 1 to *maximum* UTF-8 bytes, not only white space, and no control
+    characters.
+    """
+    return (
+        bool(value.strip())
+        and byte_length(value) <= maximum
+        and not any(unicodedata.category(character) == "Cc" for character in value)
+    )
+
+
+def valid_pattern(pattern: str) -> bool:
+    """Whether the gateway takes *pattern* in a subscription filter.
+
+    It must be non-empty, within the pattern byte limit, and free of control
+    characters.
+    """
+    return (
+        bool(pattern)
+        and byte_length(pattern) <= MAX_SUBSCRIPTION_PATTERN_BYTES
+        and not any(unicodedata.category(character) == "Cc" for character in pattern)
+    )
+
+
+def valid_repo_name(name: str) -> bool:
+    """Whether the gateway takes *name* as a watched repository.
+
+    An ``owner/repo`` name as GitHub writes them, whose repository part is
+    not ``.`` or ``..``.
+    """
+    return _REPO_NAME.fullmatch(name) is not None and name.split("/", 1)[1] not in (".", "..")
+
+
+def valid_provider(provider: str) -> bool:
+    """Whether the gateway takes *provider* as a provider name.
+
+    It must be a non-empty token of lowercase ASCII letters, digits, ``_``,
+    ``-`` and ``.``, within the provider byte limit.
+    """
+    return (
+        bool(provider)
+        and all(character in _PROVIDER_CHARACTERS for character in provider)
+        and len(provider) <= MAX_PROVIDER_BYTES
+    )
 
 
 # ---------------------------------------------------------------------- #
@@ -117,12 +188,45 @@ class MessageTarget:
 
 
 @_record
+class LinkedPrincipal:
+    """The tenant person that the gateway linked to a provider author.
+
+    ``display_name`` is untrusted presentation text, never an identity key.
+    """
+
+    id: uuid.UUID = NIL_UUID
+    display_name: str = omit_empty()
+
+
+@_record
 class AuthorReference:
-    """Provider authorship. It grants no authority."""
+    """Provider authorship. It grants no authority.
+
+    ``linked_principal`` is the tenant person that the agent's access snapshot
+    linked to the author when the gateway stored the event. It is attribution
+    only: nothing authorizes with it, and no turn runs as it. An older gateway
+    leaves it out. Read it through :attr:`linked_person`.
+    """
 
     id: str = ""
     kind: str = ""
     display_name: str = omit_empty()
+    linked_principal: LinkedPrincipal | None = omit_empty(None)
+
+    @property
+    def linked_person(self) -> LinkedPrincipal | None:
+        """The linked person, or ``None`` when it is absent or not valid.
+
+        A nil ID, or a display name that the gateway's check of a display name
+        refuses, gives ``None``. These values do not close the stream, because
+        the member is only attribution.
+        """
+        person = self.linked_principal
+        if person is None or person.id == NIL_UUID:
+            return None
+        if person.display_name and not valid_identifier(person.display_name, MAX_DISPLAY_NAME_BYTES):
+            return None
+        return person
 
 
 @_record
@@ -231,6 +335,39 @@ class EventDelivery:
 
 
 @_record
+class MetadataEntry:
+    """One metadata member of a source record: a string, or a list of strings."""
+
+    key: str = ""
+    value: str = omit_empty()
+    values: tuple[str, ...] = omit_empty(())
+
+
+@_record
+class SourceRecordPayload:
+    """One record of a hosted source, normalized the way the local source builds it.
+
+    ``id`` is the source's own key for the record. A changed record keeps its
+    ID, and Nerve stores it in place of the earlier copy.
+    """
+
+    id: str = ""
+    record_type: str = ""
+    summary: str = ""
+    content: str = omit_empty()
+    timestamp: datetime = ZERO_TIME
+    metadata: tuple[MetadataEntry, ...] = omit_empty(())
+
+    def validate(self) -> None:
+        if not self.id or not self.record_type or not self.summary:
+            malformed("source record has no ID, record type, or summary")
+        if max(byte_length(self.id), byte_length(self.record_type)) > MAX_IDENTIFIER_BYTES:
+            reject(RejectionReason.LIMIT_EXCEEDED, "source record ID or type exceeds the identifier limit")
+        if max(byte_length(self.summary), byte_length(self.content)) > MAX_TEXT_BYTES:
+            reject(RejectionReason.LIMIT_EXCEEDED, "source record text exceeds the text limit")
+
+
+@_record
 class Event:
     """One normalized provider event.
 
@@ -253,9 +390,10 @@ class Event:
     attachments: tuple[AttachmentReference, ...] = omit_empty(())
     reaction: Reaction | None = omit_empty(None)
     interaction: InteractionReference | None = omit_empty(None)
+    record: SourceRecordPayload | None = omit_empty(None)
 
     def validate(self) -> None:
-        """Check the members that intake and the hosted channel read."""
+        """Check the members that intake, the hosted channel, and the hosted sources read."""
         if not self.event_id or self.connection_id == NIL_UUID or not self.conversation.id:
             malformed("event has no event ID, connection, or conversation")
         if self.delivery is None or not self.delivery.inbox_id:
@@ -271,6 +409,10 @@ class Event:
             malformed("reaction event has no reaction")
         if self.kind == "interaction" and (self.message is None or self.interaction is None):
             malformed("interaction event has no message or interaction")
+        if self.kind == EVENT_KIND_SOURCE_RECORD:
+            if self.record is None:
+                malformed("source record event has no record")
+            self.record.validate()
 
 
 # ---------------------------------------------------------------------- #
@@ -449,6 +591,17 @@ class SendOperation:
 
 
 @_record
+class NotifyOperation:
+    """Content for the agent's notification conversation.
+
+    The control plane sets that conversation, and the gateway chooses it.
+    Nerve names no conversation.
+    """
+
+    content: tuple[ContentPart, ...] = ()
+
+
+@_record
 class EditOperation:
     target: MessageTarget = struct(MessageTarget)
     content: tuple[ContentPart, ...] = ()
@@ -514,6 +667,7 @@ class Operation:
     kind: str = ""
     deadline_millis: int = 0
     send: SendOperation | None = omit_empty(None)
+    notify: NotifyOperation | None = omit_empty(None)
     edit: EditOperation | None = omit_empty(None)
     delete: DeleteOperation | None = omit_empty(None)
     reaction: ReactionOperation | None = omit_empty(None)
@@ -552,8 +706,214 @@ def validate_operation_result(operation: Operation, result: OperationResult) -> 
         return
     if operation.kind == "send" and result.target is None:
         malformed("successful send has no message target")
+    if operation.kind == "notify":
+        _validate_notify_target(result.target)
     if operation.kind == "file_read" and result.transfer is None:
         malformed("successful file read has no transfer")
+
+
+def _validate_notify_target(target: MessageTarget | None) -> None:
+    """Check the new message that a successful notify names, as the gateway does.
+
+    The gateway chooses the conversation, so Nerve stores the conversation
+    and the message from this target. The conversation carries only its ID,
+    and every ID is valid. The message is outside threads and topics; a
+    thread is permitted only when the message roots it.
+    """
+    if target is None:
+        malformed("successful notify has no message target")
+    conversation = target.conversation
+    if conversation.kind or conversation.display_name:
+        malformed("notify target conversation carries descriptive members")
+    references = (conversation, target.message, target.thread, target.topic)
+    if not all(valid_identifier(reference.id) for reference in references if reference is not None):
+        malformed("notify target has an ID that is missing, too long, or not valid")
+    if target.topic is not None or (target.thread is not None and target.thread.id != target.message.id):
+        reject(RejectionReason.SCOPE_MISMATCH, "notify target is in a thread or topic")
+
+
+# ---------------------------------------------------------------------- #
+#  Source subscriptions                                                   #
+# ---------------------------------------------------------------------- #
+
+
+@_record
+class SourceFilters:
+    """The guardrail patterns of one source.
+
+    They match the way Nerve's inbox filter matches: deny wins, a non-empty
+    allow list must match, globs ignore case, and a list-valued field matches
+    when any of its elements does. A pull request activity record is matched
+    against the repository lists only.
+    """
+
+    allow_repos: tuple[str, ...] = omit_empty(())
+    deny_repos: tuple[str, ...] = omit_empty(())
+    allow_actors: tuple[str, ...] = omit_empty(())
+    deny_actors: tuple[str, ...] = omit_empty(())
+    allow_reasons: tuple[str, ...] = omit_empty(())
+    deny_reasons: tuple[str, ...] = omit_empty(())
+    deny_ci_branches: tuple[str, ...] = omit_empty(())
+
+    def pattern_lists(self) -> dict[str, tuple[str, ...]]:
+        """Every pattern list, by member name."""
+        return {field.name: getattr(self, field.name) for field in dataclasses.fields(self)}
+
+
+@_record
+class RepoWatch:
+    """One repository that the ``github_repos`` source follows.
+
+    ``types`` names what is reported (:data:`REPO_WATCH_TYPES`). A pull
+    request or an issue that a GitHub App or a ``[bot]`` account opened is
+    reported only with ``include_bots``; a release is reported whoever
+    published it. An item whose author's login matches a ``deny_authors``
+    glob never is. Without ``include_drafts`` a draft pull
+    request is reported when it becomes ready for review, and with
+    ``updates`` a reported pull request is reported again when its head
+    commit, its draft state or its state changes. Every member is sent.
+    """
+
+    name: str = ""
+    types: tuple[str, ...] = ()
+    include_bots: bool = False
+    include_drafts: bool = False
+    updates: bool = False
+    deny_authors: tuple[str, ...] = ()
+
+
+@_record
+class SourceSubscription:
+    """What the agent takes from one provider's hosted source.
+
+    ``pr_watch`` asks for a record whenever one of the agent's own open pull
+    requests changes. ``inbox`` says which notification threads the gateway
+    lists: ``all`` for the account's whole inbox, ``participating`` or empty
+    for the threads it takes part in. Nerve sends it only as ``all``, so the
+    frame of an agent that keeps the default is unchanged.
+
+    ``repos`` are the repositories that the ``github_repos`` provider
+    watches. Only that provider carries them, and it carries no filters,
+    ``pr_watch`` or ``inbox``. Nerve sends it only while the repository watch
+    is switched on, so every other frame is unchanged.
+    """
+
+    provider: str = ""
+    filters: SourceFilters = struct(SourceFilters)
+    pr_watch: bool = omit_empty(False)
+    inbox: str = omit_empty("")
+    repos: tuple[RepoWatch, ...] = omit_empty(())
+
+
+@_record
+class Subscriptions:
+    """The agent's hosted source subscriptions, sent one way to the gateway.
+
+    The gateway keeps the newest one it received for the agent, also while
+    no stream is open. No sources means that the agent subscribes to nothing.
+    """
+
+    version: str = ""
+    sources: tuple[SourceSubscription, ...] = omit_empty(())
+
+    def validate(self) -> None:
+        """Check what the gateway checks, before Nerve sends it.
+
+        The version, the number of sources, each provider name and that no
+        provider appears twice, each inbox, the bounds of every filter list,
+        and the watched repositories, which only ``github_repos`` names (see
+        :func:`_validate_repo_watches`).
+        """
+        if self.version != SUBSCRIPTIONS_VERSION:
+            reject(RejectionReason.VERSION_UNSUPPORTED, f"unknown subscriptions version {self.version!r}")
+        if len(self.sources) > MAX_SUBSCRIPTION_SOURCES:
+            reject(RejectionReason.LIMIT_EXCEEDED, "subscriptions name too many sources")
+        providers: set[str] = set()
+        for source in self.sources:
+            if not source.provider:
+                malformed("source subscription has no provider")
+            if byte_length(source.provider) > MAX_PROVIDER_BYTES:
+                reject(RejectionReason.LIMIT_EXCEEDED, "source subscription provider exceeds its byte limit")
+            if not valid_provider(source.provider):
+                malformed("source subscription provider is not a lowercase token")
+            if source.provider in providers:
+                malformed("subscriptions repeat a provider")
+            providers.add(source.provider)
+            if source.inbox not in SUBSCRIPTION_INBOXES:
+                malformed("source subscription inbox is not 'participating' or 'all'")
+            for patterns in source.filters.pattern_lists().values():
+                _validate_patterns(patterns, "source filter")
+            if source.provider == REPO_WATCH_PROVIDER:
+                _validate_repo_watches(source)
+            elif source.repos:
+                malformed(f"only a {REPO_WATCH_PROVIDER} subscription names repositories")
+
+    def without_filters(self) -> Subscriptions:
+        """The same sources with no filter patterns.
+
+        The gateway then keeps every record of those sources, and Nerve's own
+        inbox filter is the only one that drops records. A watched
+        repository's ``deny_authors`` are filter patterns too.
+        """
+        return dataclasses.replace(self, sources=tuple(
+            dataclasses.replace(
+                source,
+                filters=SourceFilters(),
+                repos=tuple(dataclasses.replace(repo, deny_authors=()) for repo in source.repos),
+            )
+            for source in self.sources
+        ))
+
+
+def _validate_patterns(patterns: tuple[str, ...], what: str) -> None:
+    """The bounds of one pattern list: its length and each pattern."""
+    if len(patterns) > MAX_SUBSCRIPTION_PATTERNS:
+        reject(RejectionReason.LIMIT_EXCEEDED, f"{what} has too many patterns")
+    if not all(valid_pattern(pattern) for pattern in patterns):
+        reject(
+            RejectionReason.LIMIT_EXCEEDED,
+            f"{what} pattern is empty, too long, or has a control character",
+        )
+
+
+def _validate_repo_watches(source: SourceSubscription) -> None:
+    """Check a ``github_repos`` subscription as the gateway does.
+
+    It names 1 to :data:`MAX_REPO_WATCHES` repositories, each an
+    ``owner/repo`` name (:func:`valid_repo_name`) and each once, ignoring
+    case; every one reports one or more of :data:`REPO_WATCH_TYPES`, each
+    once, and has at most :data:`MAX_SUBSCRIPTION_PATTERNS` ``deny_authors``
+    that a filter list would take. It carries no filters, ``pr_watch`` or
+    ``inbox``.
+    """
+    if any(source.filters.pattern_lists().values()) or source.pr_watch or source.inbox:
+        malformed(f"a {REPO_WATCH_PROVIDER} subscription carries filters, pr_watch or an inbox")
+    if not source.repos:
+        malformed(f"a {REPO_WATCH_PROVIDER} subscription names no repository")
+    if len(source.repos) > MAX_REPO_WATCHES:
+        reject(
+            RejectionReason.LIMIT_EXCEEDED,
+            f"a {REPO_WATCH_PROVIDER} subscription names too many repositories",
+        )
+    names: set[str] = set()
+    for repo in source.repos:
+        if not valid_repo_name(repo.name):
+            malformed("a watched repository is not an owner/repo name")
+        if repo.name.lower() in names:
+            malformed(f"a {REPO_WATCH_PROVIDER} subscription repeats a repository")
+        names.add(repo.name.lower())
+        for kind in repo.types:
+            if kind not in REPO_WATCH_TYPES:
+                reject(RejectionReason.KIND_UNSUPPORTED, f"a watched repository reports {kind!r}")
+        if not repo.types or len(set(repo.types)) < len(repo.types):
+            malformed("a watched repository reports no type, or one twice")
+        if len(repo.deny_authors) > MAX_SUBSCRIPTION_PATTERNS:
+            reject(RejectionReason.LIMIT_EXCEEDED, "a watched repository has too many deny_authors")
+        if not all(valid_pattern(pattern) for pattern in repo.deny_authors):
+            malformed(
+                "a watched repository's deny_authors pattern is empty, too long, or has a "
+                "control character"
+            )
 
 
 # ---------------------------------------------------------------------- #
@@ -578,6 +938,7 @@ class Payload:
     drain: Drain | None = omit_empty(None)
     negotiation: Negotiation | None = omit_empty(None)
     transfer: TransferChunk | None = omit_empty(None)
+    subscriptions: Subscriptions | None = omit_empty(None)
 
 
 @_record

@@ -156,7 +156,40 @@ def _docker_compose(
 _SELF_DIAGNOSING_COMMANDS = frozenset({"config", "doctor", "init", "migrate"})
 
 
-@click.group()
+class _NerveGroup(click.Group):
+    """The ``nerve`` group. A database newer than this code gets one line, not a
+    traceback.
+
+    Any command that opens the database (``start --foreground``, which runs
+    the gateway, included) can hit the refusal. It prints ``Error: <reason>``
+    and exits with ``NEWER_SCHEMA_EXIT_CODE``, so a supervisor can tell it
+    apart from any other failure.
+    """
+
+    def invoke(self, ctx: click.Context) -> object:
+        try:
+            return super().invoke(ctx)
+        except (RuntimeError, click.ClickException) as e:
+            # Only the runner raises the refusal, so its module is loaded
+            # whenever there is one. The CLI does not load the database package
+            # to start, and a failure elsewhere must not import it either.
+            runner = sys.modules.get("nerve.db.migrations.runner")
+            if runner is None:
+                raise
+            if isinstance(e, runner.SchemaNewerThanCodeError):
+                refusal = click.ClickException(str(e))
+                refusal.exit_code = runner.NEWER_SCHEMA_EXIT_CODE
+                raise refusal from e
+            # A command that puts the refusal in its own message (nerve init)
+            # still exits with the refusal's status.
+            if isinstance(e, click.ClickException) and isinstance(
+                e.__cause__, runner.SchemaNewerThanCodeError,
+            ):
+                e.exit_code = runner.NEWER_SCHEMA_EXIT_CODE
+            raise
+
+
+@click.group(cls=_NerveGroup)
 @click.option(
     "--config-dir", "-c", type=click.Path(), default=None,
     help="Config directory (default: auto-detected — see `nerve doctor`)",
@@ -226,18 +259,29 @@ def main(ctx: click.Context, config_dir: str | None, verbose: bool) -> None:
     "--serve-next", is_flag=True, hidden=True,
     help="Slim setup: this process serves next; leave NERVE_SYSTEM_PRINCIPAL_ID to the gateway",
 )
+@click.option(
+    "--memory-backend", type=click.Choice(["memu", "loom"], case_sensitive=False), default=None,
+    help=(
+        "Word the workspace templates, bundled skills and built-in jobs for this memory "
+        "backend (default: what an existing configuration names, else memu). It does not "
+        "set memory.backend itself"
+    ),
+)
 @click.pass_context
 def init(
     ctx: click.Context, if_needed: bool, non_interactive: bool, inside_docker: bool,
     terminal: bool, deployment: str | None, workspace_opt: str | None, port: int | None,
     bind: str | None, no_start: bool, no_browser: bool, no_clipboard: bool, yes: bool,
-    keep_env: bool, serve_next: bool = False,
+    keep_env: bool, serve_next: bool = False, memory_backend: str | None = None,
 ) -> None:
     """Set up Nerve: decide how it runs here, then finish in your browser.
 
     The default asks only what the browser cannot decide (deployment, paths,
     port), starts Nerve and prints the setup page and token. ``--terminal``
     asks everything here instead; ``--non-interactive`` reads the environment.
+    ``--memory-backend`` is init-only: a platform that switches the instance
+    to Loom afterwards (``memory.backend: loom``) passes ``loom`` so the files
+    written now name Loom's memory tools.
     """
     from nerve.bootstrap import SetupWizard, is_fresh_install, run_non_interactive
 
@@ -252,7 +296,7 @@ def init(
             deployment=deployment, workspace=workspace_opt, port=port, bind=bind,
             start=not no_start, browser=False if no_browser else None,
             clipboard=not no_clipboard, yes=yes, keep_env=keep_env,
-            system_principal=not serve_next,
+            system_principal=not serve_next, memory_backend=memory_backend,
         )
         return
 
@@ -272,9 +316,9 @@ def init(
 
     wizard = None
     if non_interactive:
-        choices = run_non_interactive(config_dir)
+        choices = run_non_interactive(config_dir, memory_backend=memory_backend)
     else:
-        wizard = SetupWizard(config_dir, inside_docker=inside_docker)
+        wizard = SetupWizard(config_dir, inside_docker=inside_docker, memory_backend=memory_backend)
         choices = wizard.run()
 
     # Remember where the config lives so every future `nerve` command
@@ -324,6 +368,20 @@ def init(
         ) from e
     for action in report.identity_actions:
         click.echo(f"  {action}")
+    # A worker with a task description sets itself up at the next start,
+    # without a person. Without one, it waits for its onboarding conversation
+    # in the web UI.
+    if choices.mode == "worker":
+        from nerve.onboarding import request_autonomous_sync
+
+        try:
+            if request_autonomous_sync(config):
+                click.echo("  The worker sets itself up from its task description when Nerve starts.")
+        except Exception as e:  # noqa: BLE001 - the web UI still offers the conversation
+            click.echo(
+                f"  Could not record the worker's onboarding ({e}). It waits for its "
+                "onboarding conversation in the web UI."
+            )
     from nerve.db.accounts import read_setup_required
 
     # In external mode there are no local accounts to claim, so the hint
@@ -384,6 +442,7 @@ def _setup_summary(config) -> dict | None:
         return None
     try:
         from nerve import setup_checklist, setup_provenance, setup_state, setup_telegram_login
+        from nerve.config import default_timezone
         from nerve.db.accounts import read_setup_required
         from nerve.setup_writer import workspace_mode
 
@@ -400,6 +459,7 @@ def _setup_summary(config) -> dict | None:
             restart_pending=[],
             telegram_live=False,
             credential_sources=setup_provenance.credential_sources(config),
+            machine_switches=setup_provenance.machine_switches(config),
             telegram_session_present=setup_telegram_login.session_present(),
             env_credential=bool(
                 os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("CLAUDE_CODE_OAUTH_TOKEN")
@@ -407,9 +467,11 @@ def _setup_summary(config) -> dict | None:
             env_oauth_only=bool(
                 os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") and not os.environ.get("ANTHROPIC_API_KEY")
             ),
+            default_timezone=default_timezone(),
             onboarding=setup_checklist.onboarding_from_task(
                 Path(config.workspace), workspace_mode(Path(config.workspace)),
             ),
+            agent_display_name=setup_checklist.agent_display_name_from_environment(),
         )
         return setup_checklist.summarize(facts)
     except Exception as e:  # noqa: BLE001 — status/doctor must never die on the checklist
@@ -744,6 +806,7 @@ def _slim_init(
     yes: bool,
     keep_env: bool = False,
     system_principal: bool = True,
+    memory_backend: str | None = None,
 ) -> None:
     from nerve.bootstrap import SlimFlags, SlimSetup, is_fresh_install
 
@@ -756,6 +819,7 @@ def _slim_init(
     flags = SlimFlags(
         deployment=deployment, workspace=workspace, port=port, bind=bind,
         yes=yes, start=start, browser=browser, clipboard=clipboard,
+        memory_backend=memory_backend,
     )
     with _quiet_console(paths.log_file()):
         result = SlimSetup(config_dir, flags).run()
@@ -1000,11 +1064,19 @@ def stop(ctx: click.Context) -> None:
         click.echo("Nerve is not running")
         return
 
-    click.echo(f"Stopping Nerve (PID {pid})...")
+    drain = config.gateway.drain_timeout_seconds
+    if drain > 0:
+        click.echo(
+            f"Stopping Nerve (PID {pid}). Running turns get up to {drain}s to end..."
+        )
+    else:
+        click.echo(f"Stopping Nerve (PID {pid})...")
     os.kill(pid, signal.SIGTERM)
 
-    # Wait for graceful shutdown (up to 15 seconds)
-    for i in range(30):
+    from nerve import daemon
+
+    # Wait for graceful shutdown: the drain, then up to 15 seconds
+    for i in range(daemon.shutdown_wait_ticks(drain)):
         time.sleep(0.5)
         if not pidfile.pid_exists(pid):
             _remove_pid()
@@ -1095,6 +1167,7 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
     outcome = daemon.restart_daemon(
         config_dir, verbose=ctx.obj["verbose"],
         old_pid=old_pid if running else None, systemd=False,
+        drain_timeout_seconds=config.gateway.drain_timeout_seconds,
     )
     click.echo(outcome.message)
 
@@ -1490,8 +1563,11 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
     """Doctor lines for the local Slack settings that still apply in hosted mode.
 
     The gateway decides admission and where the agent may post, so only the
-    send tool switch, its local conversation limit, and the notification
-    conversation are reported. Slash commands do not reach Nerve.
+    send tool switch, its local conversation limit, the channel source's
+    local grant, and the notification conversation are reported. A config
+    without a notification conversation is not a problem: the gateway can
+    then post the cards in the notification channel set in the console.
+    Slash commands do not reach Nerve.
     """
     from nerve.channels.slack import is_slack_id, notification_target
     from nerve.config import SLACK_HOST_COMMANDS
@@ -1517,13 +1593,36 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
             )
     else:
         lines.append("[OK] Slack send tool on; the gateway decides where it may post")
-    target = notification_target(config)
-    if target:
-        lines.append(f"[OK] Slack notifications go to {target}")
+    source = slack.source
+    rules = len(source.allow_conversations)
+    if not source.enabled:
+        lines.append("[--] Slack channel source off (slack.source.enabled is false)")
+    elif source.gateway_grant:
+        limit = f", limited to {rules} allow rule(s)" if rules else ""
+        lines.append(
+            f"[OK] Slack channel source on{limit}; the gateway decides which channels are observed"
+        )
+    elif rules:
+        lines.append(
+            f"[OK] Slack channel source on, {rules} allow rule(s); the gateway also decides"
+        )
     else:
         warnings.append(
-            "[WARN] Slack notifications have no conversation: set "
-            "notifications.slack_channel_id"
+            "[WARN] Slack channel source collects nothing: set slack.source.gateway_grant, "
+            "or list channel ids in slack.source.allow_channels"
+        )
+    target = notification_target(config, warn_unset=False)
+    if target:
+        lines.append(f"[OK] Slack notifications go to {target}")
+    elif config.notifications.slack_channel_id.strip():
+        warnings.append(
+            "[WARN] notifications.slack_channel_id is not a Slack conversation id; "
+            "the gateway chooses the notification conversation instead"
+        )
+    else:
+        lines.append(
+            "[--] Slack notifications: the config names no conversation; the gateway "
+            "can post them in the notification channel set in the console"
         )
     lines.append("[--] Slack /nerve commands are not available in hosted mode")
     host = [name for name in slack.commands or () if name in SLACK_HOST_COMMANDS]
@@ -1533,6 +1632,119 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
             "are not available in hosted mode"
         )
     return lines
+
+
+def _hosted_github_lines(config, errors: list[str], warnings: list[str]) -> list[str]:
+    """Doctor lines for ``sync.github.mode: hosted``.
+
+    The gateway polls GitHub, so there is no gh login to check; the hosted
+    stream settings are, as for hosted Slack, also when the source is off.
+    Nerve reads the gateway's events for every hosted provider in one
+    ordered inbox and stops reading while hosted Slack is switched off, so
+    a switched-off hosted Slack holds the GitHub records back too.
+    """
+    github = config.sync.github
+    if github.mode != "hosted":
+        return []
+    from nerve.channels.hosted.auth import KeyFileError, read_key_file
+
+    lines: list[str] = []
+    watching = config.sync.github_repos.enabled and bool(config.sync.github_repos.repos)
+    if not github.enabled:
+        lines.append(
+            "[--] GitHub is hosted but switched off (sync.github.enabled is false); "
+            + (
+                "the gateway is told that this agent takes no notifications"
+                if watching else "the gateway is told that this agent subscribes to nothing"
+            )
+        )
+    hosted = config.channels.hosted
+    problems = hosted.problems()
+    if not problems:
+        try:
+            read_key_file(hosted.gateway_jwks_file)
+        except KeyFileError as error:
+            problems = [f"channels.hosted.gateway_jwks_file: {error}"]
+    if problems:
+        errors.extend(f"[ERR] GitHub is hosted but {problem}" for problem in problems)
+    elif github.enabled:
+        lines.append(
+            "[OK] GitHub notifications come from the channel gateway: filters "
+            f"published from sync.github, PR watch {'on' if github.pr_watch else 'off'}, "
+            f"inbox {github.inbox}"
+        )
+    if (
+        (github.enabled or config.sync.github_repos.enabled)
+        and config.slack.mode == "hosted" and not config.slack.enabled
+    ):
+        warnings.append(
+            "[WARN] Slack is hosted but switched off (slack.enabled is false): Nerve "
+            "reads nothing from the channel gateway until it is switched on, so the "
+            "hosted GitHub records wait there too"
+        )
+    return lines
+
+
+def _actor_context_lines(config, errors: list[str], warnings: list[str]) -> list[str]:
+    """Doctor lines for the actor context check of external mode (``auth.external``)."""
+    from nerve.config import EXTERNAL_VERIFICATION_LOG
+    from nerve.gateway.actor_context import KeyFileError, read_key_file
+
+    settings = config.auth.external
+    if settings.gateway_jwks_file is None:
+        warnings.append(
+            "[WARN] Actor context: the X-Nerve-Actor-Context header is not verified "
+            "(auth.external.gateway_jwks_file is not set), so only the gateway must "
+            "be able to reach Nerve"
+        )
+        return []
+    problems = settings.problems()
+    if not problems:
+        try:
+            keys = read_key_file(settings.gateway_jwks_file)
+        except KeyFileError as error:
+            problems = [f"auth.external.gateway_jwks_file: {error}"]
+    if problems:
+        errors.extend(f"[ERR] Actor context: {problem}" for problem in problems)
+        return []
+    source = f"agent {settings.agent_id}, {len(keys)} gateway key(s) from {settings.gateway_jwks_file}"
+    if settings.verification == EXTERNAL_VERIFICATION_LOG:
+        warnings.append(
+            "[WARN] Actor context: auth.external.verification is log, so a header "
+            f"that fails the check is used anyway ({source})"
+        )
+        return []
+    return [f"[OK] Actor context verified (verification: {settings.verification}): {source}"]
+
+
+def _github_repos_lines(config, warnings: list[str]) -> list[str]:
+    """The doctor line of the repository watch (``sync.github_repos``).
+
+    Its mode follows ``sync.github.mode``: the channel gateway polls the
+    repositories when GitHub is hosted, gh on this machine otherwise. The
+    line says so, with the number of repositories, the types, and whether
+    updates are reported.
+    """
+    watch = config.sync.github_repos
+    if not watch.enabled:
+        return ["[--] GitHub repository watch off (sync.github_repos.enabled is false)"]
+    if not watch.repos:
+        warnings.append(
+            "[WARN] GitHub repository watch is on but sync.github_repos.repos is empty, "
+            "so it watches nothing"
+        )
+        return []
+    how = (
+        "mode hosted, the channel gateway polls" if config.sync.github.mode == "hosted"
+        else "mode poll, gh on this machine"
+    )
+    count = len(watch.repos)
+    line = (
+        f"[OK] GitHub repository watch ({how}): {count} "
+        f"{'repository' if count == 1 else 'repositories'}; types {', '.join(watch.types)}; "
+        f"updates {'on' if watch.updates else 'off'}"
+    )
+    return [line]
 
 
 def _source_suffix(config, path: str) -> str:
@@ -1636,6 +1848,45 @@ def _system_principal_report(*, external: bool) -> tuple[list[str], list[str]]:
         f"[WARN] {label}: keeps the current ID {current}, not {wanted}: {blocker}. "
         "Autonomous work is attributed to that ID."
     ]
+
+
+def _platform_activity_line(config) -> str:
+    """The doctor line for the platform's local activity socket.
+
+    Whether the socket exists, which is what decides whether the gateway
+    reports its activity there when it starts.
+    """
+    from nerve.platform.activity import activity_socket_present
+
+    path = config.platform.activity_socket
+    if not path:
+        return (
+            "[--] Platform activity socket: not present "
+            "(platform.activity_socket is empty, reporting is off)"
+        )
+    if activity_socket_present(path):
+        return f"[OK] Platform activity socket: present ({path})"
+    return f"[--] Platform activity socket: not present ({path})"
+
+
+def _load_cron_gate_plugins(config) -> None:
+    """Register the workspace's drop-in gate plugins before cron jobs are read.
+
+    The daemon does this at startup and on reload. The ``doctor`` and ``cron``
+    commands run outside it: without this, a job gated on a plugin type builds
+    as "unknown gate type" and is dropped, so doctor undercounts the jobs and
+    ``nerve cron`` does not find it. For those CLI processes only — inside the
+    daemon the registry is the reload's business. A broken plugin is logged and
+    skipped by the loader; a directory it cannot read is logged here.
+    """
+    from nerve.cron.gate_plugins import load_gate_plugins
+
+    try:
+        load_gate_plugins(config.cron.gate_plugins_dir)
+    except OSError as e:
+        logging.getLogger(__name__).warning(
+            "Could not read the cron gate plugins in %s: %s", config.cron.gate_plugins_dir, e,
+        )
 
 
 def doctor_report(config, config_source: str = "", check_api: bool = False) -> str:
@@ -1874,7 +2125,14 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         else:
             errors.append(f"[ERR] Claude API: {detail}")
 
-    if config.openai_api_key:
+    if config.memory.backend == "loom":
+        # Loom embeds and recalls on its side, and Nerve reaches it through
+        # the MCP gateway with no credential of its own.
+        if config.mcp_gateway_url:
+            lines.append(f"[OK] Memory backend: Loom, through the MCP gateway at {config.mcp_gateway_url}")
+        else:
+            errors.append("[ERR] Memory backend: Loom, but mcp_gateway_url is not set, so Loom cannot be reached")
+    elif config.openai_api_key:
         lines.append(
             f"[OK] OpenAI API key: ...{config.openai_api_key[-4:]}"
             f"{_source_suffix(config, 'openai_api_key')} (vector embeddings enabled)"
@@ -1978,6 +2236,8 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                 )
     else:
         lines.append("[--] Slack disabled")
+    lines.extend(_hosted_github_lines(config, errors, warnings))
+    lines.extend(_github_repos_lines(config, warnings))
 
     # Check SSL
     if config.gateway.ssl.enabled:
@@ -2030,6 +2290,8 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     else:
         lines.append(f"[OK] Auth mode: {mode} ({mode_source})")
     external = mode == AUTH_MODE_EXTERNAL
+    if external:
+        lines.extend(_actor_context_lines(config, errors, warnings))
 
     configured = bool(config.auth.password_hash)
     identity_state = inspect_bootstrap_state(paths.db_path())
@@ -2174,6 +2436,19 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         all_jobs = list(merged.values())
         enabled = sum(1 for j in all_jobs if j.enabled)
 
+        if config.sync.github.mode == "hosted":
+            pr_gated = sorted(
+                j.id for j in all_jobs
+                if j.enabled and any(g.type == "github_pr_activity" for g in j.gates)
+            )
+            if pr_gated:
+                warnings.append(
+                    f"[WARN] Cron job(s) {', '.join(pr_gated)} use the github_pr_activity "
+                    "gate, which always passes while GitHub is hosted — gate them on "
+                    "messages with sources: [github]; the gateway delivers PR changes as "
+                    "records (sync.github.pr_watch)"
+                )
+
         if all_jobs:
             detail = f"{enabled}/{len(all_jobs)} enabled"
             if overridden:
@@ -2231,11 +2506,17 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
             f"protect {paths.home_label()} against disk loss"
         )
 
+    lines.append(_platform_activity_line(config))
+
     # Check external tools
     import shutil
+
+    from nerve.setup_checks import gh_needed
     for tool_name in ["gog", "gh"]:
         if shutil.which(tool_name):
             lines.append(f"[OK] {tool_name} CLI found")
+        elif tool_name == "gh" and not gh_needed(config):
+            lines.append("[--] gh CLI not found (not needed: GitHub comes from the channel gateway)")
         else:
             warnings.append(f"[WARN] {tool_name} CLI not found (needed for sync)")
 
@@ -2266,6 +2547,12 @@ def doctor(ctx: click.Context) -> None:
             f"[ERR] config failed to load: {ctx.obj.get('config_error')}", fg="red"
         )
         ctx.exit(1)
+    # The report reads the cron files (the setup checklist first, then the job
+    # count), so the plugins must be registered before it, as the daemon does
+    # before it parses the jobs. Here rather than in doctor_report: the
+    # daemon's own /doctor runs that too, and there the registry is the
+    # reload's business.
+    _load_cron_gate_plugins(config)
     report = doctor_report(
         config,
         config_source=ctx.obj.get("config_source", ""),
@@ -2708,6 +2995,8 @@ def codex_doctor(ctx: click.Context, json_output: bool) -> None:
     if json_output:
         click.echo(json.dumps(report, indent=2, sort_keys=True))
     else:
+        if status.get("base_url"):
+            click.echo(f"[--] Endpoint: {status['base_url']} (no Codex login)")
         if status.get("available"):
             click.echo(f"[OK] {status.get('version')} ({status.get('auth')})")
             click.echo(f"[OK] Models: {', '.join(status.get('models') or [])}")
@@ -2902,12 +3191,64 @@ def setup_telegram(ctx: click.Context) -> None:
     asyncio.run(_run())
 
 
+# `nerve cron next` asks the running daemon what runs next instead of running a
+# job of that name.
+_CRON_NEXT = "next"
+
+
+def _print_cron_schedule(report: dict, timezone_name: str) -> None:
+    """Print a ``GET /api/cron/schedule`` body: the next tick, then each job's
+    next run and what its gates forecast for it."""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from nerve.cron.service import _SCHEDULE_HORIZON
+
+    zone = ZoneInfo(timezone_name)
+
+    def when(iso: str | None) -> str:
+        if not iso:
+            return "—"
+        return datetime.fromisoformat(iso).astimezone(zone).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    tick = report.get("next")
+    if tick:
+        click.echo(f"Next: {when(tick['at'])} — {tick['name']} ({tick['kind']})")
+    else:
+        click.echo(
+            f"Next: nothing scheduled in the next {_SCHEDULE_HORIZON.days} days",
+        )
+    rows = []
+    for job in report.get("jobs") or []:
+        forecast = job.get("forecast") or "—"
+        if forecast == "skip" and job.get("reason"):
+            forecast = f"skip — {job['reason']}"
+        rows.append((job["id"], when(job.get("next_run")), forecast))
+    if not rows:
+        return
+    id_width = max(len("JOB"), *(len(row[0]) for row in rows))
+    when_width = max(len("NEXT RUN"), *(len(row[1]) for row in rows))
+    click.echo(f"  {'JOB':<{id_width}}  {'NEXT RUN':<{when_width}}  FORECAST")
+    for job_id, next_run, forecast in rows:
+        click.echo(f"  {job_id:<{id_width}}  {next_run:<{when_width}}  {forecast}")
+
+
 @main.command()
 @click.argument("job_id", default="")
 @click.pass_context
 def cron(ctx: click.Context, job_id: str) -> None:
-    """Run a cron job manually."""
+    """Run a cron job manually, or list the jobs.
+
+    `nerve cron next` shows what the running daemon will run next: the next
+    tick, and for each job its next run and whether its gates, judged now,
+    let that run happen.
+    """
     config = ctx.obj["config"]
+
+    if job_id == _CRON_NEXT:
+        report = _gateway_request(ctx, config, "GET", "/api/cron/schedule")
+        _print_cron_schedule(report, config.timezone)
+        return
 
     async def _run():
         from nerve.migrate import open_production_db
@@ -2916,6 +3257,7 @@ def cron(ctx: click.Context, job_id: str) -> None:
         engine = None
         try:
             engine = await _start_one_shot_engine(config, db)
+            _load_cron_gate_plugins(config)
 
             if job_id:
                 from nerve.cron.service import CronService
@@ -3449,6 +3791,7 @@ def db_vacuum(ctx: click.Context) -> None:
     VACUUM takes a write lock and cannot run while the daemon holds the DB.
     Stop the daemon first (`nerve stop`) for a clean run.
     """
+    from nerve.db.migrations.runner import SchemaNewerThanCodeError
     from nerve.migrate import open_production_db
 
     config = ctx.obj["config"]
@@ -3477,6 +3820,8 @@ def db_vacuum(ctx: click.Context) -> None:
 
     try:
         asyncio.run(_run())
+    except SchemaNewerThanCodeError:
+        raise  # _NerveGroup reports it with its own exit status
     except Exception as e:
         click.echo(f"[ERR] VACUUM failed: {e}")
         ctx.exit(1)

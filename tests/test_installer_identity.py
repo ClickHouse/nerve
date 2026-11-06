@@ -40,7 +40,7 @@ def _stub_wizard(ws: Path, *, name: str, local_yaml: str, checkpoint_ok: bool = 
     class StubWizard:
         checkpoints = 0
 
-        def __init__(self, cfg_dir, inside_docker=False):
+        def __init__(self, cfg_dir, inside_docker=False, memory_backend=None):
             self.config_dir = cfg_dir
 
         def run(self):

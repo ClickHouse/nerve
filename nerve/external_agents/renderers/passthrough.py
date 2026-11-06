@@ -15,6 +15,6 @@ from nerve.external_agents.renderers.base import StyleRenderer
 class PassthroughRenderer(StyleRenderer):
     """Concatenate the included files with ``---`` dividers."""
 
-    def render(self, target: FileTarget, *, workspace: Path) -> str:
+    def render(self, target: FileTarget, *, workspace: Path, memory_backend: str = "memu") -> str:
         body = self._concat_includes(target, workspace, with_headings=True)
         return body.rstrip() + "\n" if body else ""

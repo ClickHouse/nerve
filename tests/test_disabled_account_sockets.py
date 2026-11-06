@@ -156,3 +156,31 @@ def test_a_failed_handshake_leaves_the_registry(instance, monkeypatch):
     except Exception:  # noqa: BLE001 - the handshake failing is the case here
         pass
     assert server._live_sockets == {}
+
+
+def test_the_activity_reporter_hears_every_connection_change(instance, monkeypatch):
+    """Open sockets are the client count the activity reporter sends, so it is
+    told when one opens, when one closes, and when a disable closes one."""
+    counts: list[int] = []
+    monkeypatch.setattr(
+        server, "_activity_reporter",
+        SimpleNamespace(notify=lambda: counts.append(len(server._live_sockets))),
+    )
+    with _connect(instance, instance.owner_id) as owner:
+        assert owner.receive_json()["type"] == "session_switched"
+        assert counts == [1]
+    assert counts == [1, 0]
+
+    counts.clear()
+    with _connect(instance, instance.bob_id) as bob:
+        assert bob.receive_json()["type"] == "session_switched"
+        assert bob.receive_json()["type"] == "session_status"
+        token = create_session_token(_SECRET, instance.owner_id)
+        response = instance.client.post(
+            f"/api/accounts/{instance.bob_id}/disable",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, response.text
+        assert _close_code(bob) == server.WS_ACCOUNT_DISABLED_CODE
+    # Told once by the disable; the handler's own cleanup finds nothing left.
+    assert counts == [1, 0]

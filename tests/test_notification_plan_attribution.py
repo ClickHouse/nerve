@@ -886,7 +886,7 @@ async def test_a_revision_note_is_written_by_who_asked_for_the_revision(
     assert not [w for w in writes if w[0] in (rest_task, tool_task) and w[1] is None]
     for task_id in (rest_task, tool_task):
         note = (install.config.workspace / f"{task_id}.md").read_text(encoding="utf-8")
-        assert "Revision requested for plan-note-" in note
+        assert "Revision requested for [plan-note-" in note
 
 
 @pytest.mark.asyncio

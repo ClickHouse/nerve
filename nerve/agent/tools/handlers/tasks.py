@@ -1,5 +1,5 @@
 """Task tool handlers — task_search, task_create, task_list, task_update,
-task_read, task_write, task_done.
+task_read, task_write, task_done, task_comment.
 
 Handlers are pure functions of ``(ToolContext, args)`` and return
 :class:`ToolResult`. They read only from ``ctx`` for their collaborator
@@ -21,6 +21,7 @@ from zoneinfo import ZoneInfo
 
 from nerve.agent.tools.registry import ToolContext, ToolResult, ToolSpec
 from nerve.agent.tools.schemas import (
+    TASK_COMMENT_SCHEMA,
     TASK_CREATE_SCHEMA,
     TASK_DONE_SCHEMA,
     TASK_LIST_SCHEMA,
@@ -124,6 +125,25 @@ def _revision_conflict(task_id: str, expected: int, *, reopened: bool = False) -
 # task_read appends this line so an agent can see the revision; task_write
 # strips it so a read-edit-write round trip cannot persist it.
 _REVISION_TRAILER_RE = re.compile(r"^<!-- nerve: revision=\d+[^\n]*-->[ \t]*(?:\n|\Z)", re.MULTILINE)
+
+# task_read shows the task's comments between these two lines, and task_write
+# strips the block for the same reason as the revision trailer. Each comment
+# line is indented, and so is each file line that starts with ``<!-- nerve:``
+# (_FILE_MARKER_LINE_RE), so in task_read's output only Nerve's own lines
+# start with a marker. A file cannot fake comments or lose content to the strip.
+_FILE_MARKER_LINE_RE = re.compile(r"^(?=<!-- nerve:)", re.MULTILINE)
+_COMMENTS_START = "<!-- nerve: comments (index metadata, not file content) -->"
+_COMMENTS_END = "<!-- nerve: end of comments -->"
+_COMMENTS_BLOCK_RE = re.compile(
+    rf"^{re.escape(_COMMENTS_START)}\n.*?^{re.escape(_COMMENTS_END)}[ \t]*(?:\n|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+# How many of the newest comments task_read shows.
+_READ_COMMENT_LIMIT = 50
+
+# The longest comment body, in characters.
+MAX_COMMENT_LENGTH = 10_000
 
 
 # Process-wide read-before-write guard. Tracks task IDs that have been
@@ -628,14 +648,21 @@ async def task_read_handler(ctx: ToolContext, args: dict) -> ToolResult:
             # Guarding here would refuse a read with a "Cannot write" message
             # the caller has no way to act on.
             if file_path.exists():
-                content = await asyncio.to_thread(
+                content = _FILE_MARKER_LINE_RE.sub("  ", await asyncio.to_thread(
                     file_path.read_text, encoding="utf-8",
-                )
+                ))
                 _tasks_read.add(task_id)
+                # Read after the row: a comment added in between shows here
+                # with the older revision, so a guarded write is refused and
+                # the agent reads again. The other order could hide it.
+                comments = (
+                    await _format_comments(ctx, task)
+                    if task.get("comment_count") else ""
+                )
                 # The adapters drop ``structured``, so the text carries it too.
                 sep = "" if content.endswith("\n") else "\n"
                 return ToolResult.text(
-                    f"{content}{sep}<!-- nerve: revision={task['revision']} "
+                    f"{content}{sep}{comments}<!-- nerve: revision={task['revision']} "
                     "(index metadata, not file content) -->",
                     structured={"revision": task["revision"]},
                 )
@@ -643,10 +670,83 @@ async def task_read_handler(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult.text(f"Task file not found for: {task_id}")
 
 
+async def _format_comments(ctx: ToolContext, task: dict) -> str:
+    """The comments block that task_read adds after the file content."""
+    comments = await ctx.db.list_task_comments(task["id"], limit=_READ_COMMENT_LIMIT)
+    if not comments:
+        return ""
+    ids = {c[key] for c in comments for key in ("actor_id", "caused_by_actor_id")} - {None}
+    refs = {actor_id: await ctx.db.get_actor_ref(actor_id) for actor_id in ids}
+
+    lines = [_COMMENTS_START, f"## Comments ({task['comment_count']})"]
+    older = task["comment_count"] - len(comments)
+    if older > 0:
+        lines.append(f"({older} older comments are not shown.)")
+    for comment in comments:
+        # "Alice", or "Nerve (agent) for Alice" when the agent wrote it in a
+        # session that Alice started. The web UI uses the same rule.
+        author = _actor_name(refs, comment["actor_id"])
+        cause = refs.get(comment["caused_by_actor_id"])
+        if cause and cause["id"] != comment["actor_id"] and cause["kind"] != "system":
+            author += f" for {_actor_name(refs, cause['id'])}"
+        when = datetime.fromisoformat(comment["created_at"]).strftime("%Y-%m-%d %H:%M UTC")
+        lines.append(f"- {when}, {author}:")
+        lines.extend(f"  {line}" for line in comment["body"].splitlines())
+    lines.append(_COMMENTS_END)
+    return "\n".join(lines) + "\n"
+
+
+def _actor_name(refs: dict[str, dict | None], actor_id: str | None) -> str:
+    """A display name for an ``actor_refs`` ID, with the web UI's fallbacks."""
+    if actor_id is None:
+        return "unknown"
+    ref = refs.get(actor_id)
+    if ref is None:
+        return actor_id[:8]
+    name = (ref["display_name"] or "").strip() or (ref.get("username") or "").strip()
+    if ref["kind"] == "system":
+        return f"{name or 'Nerve'} (agent)"
+    return name or actor_id[:8]
+
+
+async def task_comment_handler(ctx: ToolContext, args: dict) -> ToolResult:
+    """Add a comment to a task as the caller (``ctx.attribution``).
+
+    ``structured["reason"]`` names a refusal, so the REST route can choose a
+    status code without parsing the message.
+    """
+    task_id = args["task_id"]
+    body = (args.get("body") or "").strip()
+    if not body:
+        return ToolResult.text(
+            "Cannot add an empty comment.", is_error=True, structured={"reason": "empty"},
+        )
+    if len(body) > MAX_COMMENT_LENGTH:
+        return ToolResult.text(
+            f"A comment can have at most {MAX_COMMENT_LENGTH} characters; "
+            f"this one has {len(body)}.",
+            is_error=True, structured={"reason": "too_long"},
+        )
+    if not ctx.db:
+        return ToolResult.text("Database not available.", is_error=True)
+    comment = await ctx.db.add_task_comment(task_id, body, attribution=ctx.attribution)
+    if comment is None:
+        return ToolResult.text(
+            f"Task not found: {task_id}", is_error=True, structured={"reason": "not_found"},
+        )
+    await _emit_task_event(ctx, task_id, "commented")
+    return ToolResult.text(
+        f"Comment {comment['id']} added to task {task_id}.",
+        structured={"comment": comment},
+    )
+
+
 @_one_change_per_task
 async def task_write_handler(ctx: ToolContext, args: dict) -> ToolResult:
     task_id = args["task_id"]
-    new_content = _REVISION_TRAILER_RE.sub("", args.get("content", ""))
+    new_content = _REVISION_TRAILER_RE.sub(
+        "", _COMMENTS_BLOCK_RE.sub("", args.get("content", "")),
+    )
 
     if task_id not in _tasks_read:
         return ToolResult.text(
@@ -969,6 +1069,18 @@ TASK_DONE_SPEC = ToolSpec(
     handler=task_done_handler,
 )
 
+TASK_COMMENT_SPEC = ToolSpec(
+    name="task_comment",
+    description=(
+        "Add a comment to a task. The comment shows in the task's comment list "
+        "in the web UI, signed as you, and task_read shows it to agents. Use it "
+        "for discussion with people about the task; use task_update's note for "
+        "a progress line in the task file."
+    ),
+    input_schema=TASK_COMMENT_SCHEMA,
+    handler=task_comment_handler,
+)
+
 TASK_STATUS_LIST_SPEC = ToolSpec(
     name="task_status_list",
     description="List the configured task statuses with their colors and descriptions. Use this to discover valid status values for task_create/task_update.",
@@ -999,6 +1111,7 @@ TASK_SPECS = [
     TASK_READ_SPEC,
     TASK_WRITE_SPEC,
     TASK_DONE_SPEC,
+    TASK_COMMENT_SPEC,
     TASK_STATUS_LIST_SPEC,
     TASK_STATUS_CREATE_SPEC,
 ]

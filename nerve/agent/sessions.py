@@ -100,6 +100,9 @@ class SessionManager:
     # ``has_live_agents(session_id)``: background agents still run in the
     # session (the archive guard). Wired to the agent registry.
     has_live_agents: Callable[[str], bool] | None = None
+    # Called as ``listener(session_id, running)`` right after a session
+    # starts or stops running a turn (see ``add_running_listener``).
+    _running_listeners: tuple[Callable[[str, bool], None], ...] = ()
 
     def __init__(
         self,
@@ -521,15 +524,51 @@ class SessionManager:
 
     def mark_running(self, session_id: str) -> None:
         """Mark a session as currently running."""
+        if session_id in self._running_sessions:
+            return
         self._running_sessions.add(session_id)
+        self._notify_running(session_id, True)
 
     def mark_not_running(self, session_id: str) -> None:
         """Mark a session as no longer running."""
+        if session_id not in self._running_sessions:
+            return
         self._running_sessions.discard(session_id)
+        self._notify_running(session_id, False)
 
     def is_running(self, session_id: str) -> bool:
         """Check if a session has a running agent task."""
         return session_id in self._running_sessions
+
+    def running_count(self) -> int:
+        """How many sessions are running a turn now."""
+        return len(self._running_sessions)
+
+    def add_running_listener(self, listener: Callable[[str, bool], None]) -> None:
+        """Call ``listener(session_id, running)`` whenever a session starts or
+        stops running a turn.
+
+        The listener runs synchronously inside the turn's framing, so it must
+        only hand off (set a flag, wake a task). An exception it raises is
+        logged and never reaches the turn.
+        """
+        if listener not in self._running_listeners:
+            self._running_listeners = (*self._running_listeners, listener)
+
+    def remove_running_listener(self, listener: Callable[[str, bool], None]) -> None:
+        """Stop calling a listener added with :meth:`add_running_listener`."""
+        self._running_listeners = tuple(
+            item for item in self._running_listeners if item != listener
+        )
+
+    def _notify_running(self, session_id: str, running: bool) -> None:
+        for listener in self._running_listeners:
+            try:
+                listener(session_id, running)
+            except Exception:  # a listener never breaks a turn
+                logger.exception(
+                    "running listener failed for %s (running=%s)", session_id, running,
+                )
 
     def set_turn_task(self, session_id: str, task: asyncio.Task | None) -> None:
         """Record the task that runs the session's current turn.

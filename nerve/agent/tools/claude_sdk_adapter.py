@@ -29,6 +29,7 @@ from typing import Any, TYPE_CHECKING
 from claude_agent_sdk import SdkMcpTool, create_sdk_mcp_server
 from claude_agent_sdk import tool as _sdk_tool
 
+from nerve.agent.interactive import INTERACTION_TIMEOUT
 from nerve.agent.tools.registry import (
     ToolContext,
     ToolRegistry,
@@ -38,6 +39,21 @@ from nerve.agent.tools.registry import (
 
 if TYPE_CHECKING:
     pass
+
+
+#: The Claude CLI's budget for one call of a tool on Nerve's own server, in
+#: milliseconds: the server config's ``timeout``, which the CLI reads for
+#: in-process (``sdk``) servers too and which overrides the
+#: ``MCP_TOOL_TIMEOUT`` environment variable for this server only. A call that
+#: runs longer ends as a CLI error whatever the tool is doing. ``ask_form``
+#: waits for the person through the interaction hub for up to
+#: :data:`~nerve.agent.interactive.INTERACTION_TIMEOUT`, so the budget is that
+#: plus a margin: the hub ends an unanswered form with its own result, before
+#: the CLI would. Without it the CLI would apply an ``MCP_TOOL_TIMEOUT`` set in
+#: the environment Nerve runs in, else its default (1e8 ms in CLI 2.1.284). The
+#: CLI's schema takes a positive integer only: a float would fail the whole
+#: ``--mcp-config``. No other Nerve tool runs for minutes, let alone an hour.
+NERVE_TOOL_TIMEOUT_MS = (INTERACTION_TIMEOUT + 100) * 1000
 
 
 def _shim_schema(input_schema: dict) -> dict:
@@ -121,11 +137,14 @@ def build_session_mcp_server(
     config leaves nothing to serve (see
     :func:`~nerve.agent.backends.base.config_excluded_tools`).
 
-    The returned dict matches the SDK's ``McpSdkServerConfig`` shape;
-    ``alwaysLoad`` is set to ``True`` so the Claude Code CLI skips tool-
-    search deferral on first turn (requires CLI >= 2.1.121; silently
-    ignored on older versions). The nerve MCP's tools are used on almost
-    every turn — deferring them adds a ToolSearch round-trip for no benefit.
+    The returned dict matches the SDK's ``McpSdkServerConfig`` shape plus
+    two keys the CLI reads from ``--mcp-config``. ``alwaysLoad`` is set to
+    ``True`` so the Claude Code CLI skips tool-search deferral on first turn
+    (requires CLI >= 2.1.121; silently ignored on older versions). The nerve
+    MCP's tools are used on almost every turn — deferring them adds a
+    ToolSearch round-trip for no benefit. ``timeout`` is
+    :data:`NERVE_TOOL_TIMEOUT_MS`, so the CLI never cuts an ``ask_form`` that
+    waits for the person.
     """
     excluded = exclude or set()
     sdk_tools = [
@@ -133,8 +152,15 @@ def build_session_mcp_server(
         for spec in registry.list(include_hoa=include_hoa)
         if spec.name not in excluded
     ]
+    return _nerve_server_config(sdk_tools)
+
+
+def _nerve_server_config(sdk_tools: list[SdkMcpTool]) -> dict:
+    """Nerve's in-process server with the CLI-side keys (see
+    :func:`build_session_mcp_server`)."""
     config = create_sdk_mcp_server(name="nerve", version="1.0.0", tools=sdk_tools)
     config["alwaysLoad"] = True  # type: ignore[typeddict-unknown-key]
+    config["timeout"] = NERVE_TOOL_TIMEOUT_MS  # type: ignore[typeddict-unknown-key]
     return config
 
 
@@ -149,6 +175,4 @@ def build_nerve_mcp_server(registry: ToolRegistry) -> dict:
     """
     ctx = ToolContext(session_id="unknown")
     sdk_tools = [_wrap_for_sdk(spec, ctx) for spec in registry.list(include_hoa=False)]
-    config = create_sdk_mcp_server(name="nerve", version="1.0.0", tools=sdk_tools)
-    config["alwaysLoad"] = True  # type: ignore[typeddict-unknown-key]
-    return config
+    return _nerve_server_config(sdk_tools)

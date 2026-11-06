@@ -311,6 +311,26 @@ describe('sending while a turn runs', () => {
     expect(useAgentStore.getState().pendingSends).toEqual({});
   });
 
+  it('keeps streaming when the server refuses the queued send', async () => {
+    await useChatStore.getState().sendMessage('also run the e2e suite');
+    const [pending] = Object.values(useAgentStore.getState().pendingSends);
+
+    dispatch({ type: 'error', session_id: SID, error: 'Nerve is shutting down', client_msg_id: pending.clientMsgId });
+
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    expect(useChatStore.getState().messages).toEqual([
+      { role: 'assistant', blocks: [{ type: 'text', content: 'Error: Nerve is shutting down' }] },
+    ]);
+    expect(useAgentStore.getState().pendingSends).toEqual({});
+    expect(useAgentStore.getState().composerInsert).toMatchObject({ text: 'also run the e2e suite' });
+  });
+
+  it('ends the stream for a refused send this tab did not queue', () => {
+    dispatch({ type: 'error', session_id: SID, error: 'Nerve is shutting down', client_msg_id: 'other-tab' });
+
+    expect(useChatStore.getState().isStreaming).toBe(false);
+  });
+
   it('reports a send that could not leave the tab', async () => {
     vi.mocked(ws.sendMessage).mockReturnValueOnce('dropped');
 

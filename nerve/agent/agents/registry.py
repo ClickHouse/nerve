@@ -282,6 +282,9 @@ class AgentRegistry:
         self._loading: dict[str, asyncio.Future] = {}
         self._sweeper: asyncio.Task | None = None
         self._background: set[asyncio.Task] = set()
+        # Called without arguments whenever a session's live count may have
+        # changed (see add_live_listener).
+        self._live_listeners: tuple[Callable[[], None], ...] = ()
 
     @classmethod
     def for_tests(cls, **kw: Any) -> "AgentRegistry":
@@ -491,7 +494,17 @@ class AgentRegistry:
         if not rec.ambient:
             self.emitter.upsert(rec.session_id, rec.id, immediate)
         if counts:
-            self.emitter.counts(rec.session_id)
+            self._counts_changed(rec.session_id)
+
+    def _counts_changed(self, sid: str) -> None:
+        """The session's live count may have changed: tell the emitter and
+        the live listeners."""
+        self.emitter.counts(sid)
+        for listener in self._live_listeners:
+            try:
+                listener()
+            except Exception:  # ingestion never raises
+                logger.exception("agents: live listener failed")
 
     def _append_item(self, rec: AgentRecord, item: dict) -> dict:
         full = {"seq": rec.next_seq, "at": self._now_iso(), **item}
@@ -1451,7 +1464,7 @@ class AgentRegistry:
         rec.rev = m.next_rev(rec.rev)
         st.tombstones[rec.id] = rec
         self.emitter.upsert(st.sid, rec.id, True)
-        self.emitter.counts(st.sid)
+        self._counts_changed(st.sid)
 
     def _spawn_task(self, coro: Awaitable[None]) -> None:
         """Run ``coro`` in the background (from sync code), keeping a reference."""
@@ -1778,6 +1791,28 @@ class AgentRegistry:
         if st is None:
             return 0
         return sum(1 for r in st.records.values() if r.live and not r.ambient)
+
+    def any_live(self) -> bool:
+        """Whether any session has a live, non-ambient agent.
+
+        Every live record is in memory: the sweeper never evicts a session
+        with one, and startup marks the live rows of a previous process
+        interrupted.
+        """
+        return any(self.live_count(sid) > 0 for sid in list(self._sessions))
+
+    def add_live_listener(self, listener: Callable[[], None]) -> None:
+        """Call ``listener()`` whenever a session's live count may have
+        changed. It runs inside ingestion, so it must only hand off; an
+        exception it raises is logged."""
+        if listener not in self._live_listeners:
+            self._live_listeners = (*self._live_listeners, listener)
+
+    def remove_live_listener(self, listener: Callable[[], None]) -> None:
+        """Stop calling a listener added with :meth:`add_live_listener`."""
+        self._live_listeners = tuple(
+            item for item in self._live_listeners if item != listener
+        )
 
     def agent_id_for_spawn(self, sid: str, tool_use_id: str) -> str | None:
         st = self._sessions.get(sid)

@@ -1,8 +1,8 @@
 {
-  "codex_cli_version": "0.155.1",
+  "codex_cli_version": "0.164.0",
   "generated_with": "codex app-server generate-json-schema",
-  "verified_date": "2026-09-22",
-  "canonical_v2_schema_sha256": "4bd2cca110846b2bb604f635e2fa165a3156c0e2ecd3a32823cd3495bb6c716c",
+  "verified_date": "2026-10-23",
+  "canonical_v2_schema_sha256": "25febad0b85cbf3de2b841abfb716c5843e0b7d20fce7cfa40eb03c0d4214d17",
   "required_methods": [
     "initialize",
     "account/read",
@@ -14,5 +14,5 @@
     "turn/start",
     "turn/interrupt"
   ],
-  "notes": "Canonical JSON hash is stable across generator output ordering. Regenerate with scripts/check_codex_schema.py when changing the tested CLI range. 0.153.3 -> 0.155.1 was purely additive for every method and notification nerve uses (no removed definitions or fields; new: thread/attachment/* methods + thread/attachment/updated notification, ResponseItem configuration_update variant, optional account/rateLimits/read params, additive props Thread.originator, McpServerStatus.toolsError, RateLimitSnapshot.normalModelSlug, GetAccountRateLimitsResponse.ordinaryUsageAllowed)."
+  "notes": "Canonical JSON hash is stable across generator output ordering. Regenerate with scripts/check_codex_schema.py when changing the tested CLI range. 0.155.1 -> 0.164.0: 32 definitions added, 49 changed. Removed: thread/rollback (ThreadRollbackParams, ThreadRollbackResponse), ConfigRequirements.windowsSandboxPrivateDesktop, ModelProviderCapabilitiesReadResponse.namespaceTools; nerve uses none of them. Every method and notification nerve uses is still present. Changes in shapes nerve uses are additive or optional: UserInput image takes url or fileId (nerve sends url), new optional TurnStartParams.parentTurnId/rootTurnId/disabledPluginIds, Turn.rootTurnId, McpServerStatus.httpOrigin/serverCapabilities/toolListMeta, ThreadItem mcpToolCall.mcpAppUi, subAgentActivity.model/reasoningEffort, imageGeneration result or fileId, new notifications thread/readState/changed, thread/prediction/updated, account/gatewayOAuth/changed."
 }

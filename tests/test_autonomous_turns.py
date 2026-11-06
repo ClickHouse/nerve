@@ -14,6 +14,7 @@ cover the engine pieces that surface that activity:
 
 import asyncio
 import contextlib
+import logging
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -26,8 +27,17 @@ from claude_agent_sdk import ResultMessage, SystemMessage
 from nerve.agent.agents import AgentRegistry
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.base import SessionSpec
-from nerve.agent.backends.claude import ClaudeClient, translate_message
+from nerve.agent.backends.claude import (
+    ClaudeClient,
+    ClaudeToolPermissions,
+    translate_message,
+)
 from nerve.agent.engine import AgentEngine, _TurnState
+from nerve.agent.interactive import (
+    InteractiveToolHandler,
+    register_handler,
+    unregister_handler,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1255,6 +1265,66 @@ async def test_quiet_subagent_survives_idle_timeout():
     rec, items = await _only_agent(engine)
     assert [i["kind"] for i in items] == ["tool_call"]
     assert rec.live and rec.activity == "Bash: sleep 900"
+
+
+@pytest.mark.asyncio
+async def test_drain_waits_for_the_person_past_the_idle_timeout(caplog):
+    """An autonomous turn paused on ``ExitPlanMode`` is silent because the
+    runtime waits for Nerve's answer, which waits for the person: an idle
+    timeout keeps the turn open (not interrupted, not closed) and the drain
+    waits on. Once the decision is made, silence past the idle timeout
+    interrupts the turn as before."""
+    engine = _make_engine()
+    engine.config.agent.cli_idle_timeout_seconds = 0.05
+    plan = {"plan": "Ship it"}
+    stream = _FakeStream([_main_tool_use("ExitPlanMode", "toolu_plan", plan)])
+    client = _fake_client(stream)
+    finalized = _patch_finalize(engine)
+    engine.sessions = _RecordingSessions()
+
+    asked: list[dict] = []
+
+    async def _hub_broadcast(_channel, msg):
+        asked.append(msg)
+
+    hub = InteractiveToolHandler("s1", _hub_broadcast, interactive_capable=True)
+    register_handler("s1", hub)
+    decision = asyncio.create_task(
+        ClaudeToolPermissions(hub).can_use_tool("ExitPlanMode", plan, None),
+    )
+    drain = None
+    try:
+        with patch("nerve.agent.engine.broadcaster") as bc, \
+                caplog.at_level(logging.INFO, logger="nerve.agent.interactive"):
+            _recording_broadcaster(bc, [])
+            drain = asyncio.create_task(engine._drain_pending_messages(
+                "s1", client, "web", None, manage_framing=True,
+            ))
+            await asyncio.sleep(0.4)  # eight idle timeouts, decision pending
+            assert hub.has_pending
+            assert not drain.done()
+            assert finalized == []
+            (interaction,) = [m for m in asked if m["type"] == "interaction"]
+            assert hub.resolve(interaction["interaction_id"], {})
+            await decision  # the pause is over: nothing pending any more
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(drain, timeout=2)
+    finally:
+        unregister_handler("s1")
+        for task in (decision, drain):
+            if task is not None:
+                task.cancel()
+
+    (st,) = finalized
+    assert (st.status, st.error) == ("interrupted", "runtime went silent")
+    assert st.full_response_text == "[Background turn interrupted: runtime went silent]"
+    assert [
+        r.getMessage() for r in caplog.records
+        if "idle timeout deferred" in r.getMessage()
+    ] == [
+        "idle timeout deferred for session s1: waiting for the person "
+        "(plan_exit pending)",
+    ]
 
 
 class _EventClient:

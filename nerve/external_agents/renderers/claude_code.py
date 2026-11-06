@@ -12,6 +12,7 @@ from pathlib import Path
 
 from nerve.external_agents.registry import FileTarget
 from nerve.external_agents.renderers.base import SECTION_DIVIDER, StyleRenderer
+from nerve.memory import loom_prompts
 
 
 HEADER = """\
@@ -46,15 +47,23 @@ memory.
 class ClaudeCodeRenderer(StyleRenderer):
     """Render the Claude Code global ``CLAUDE.md`` bundle."""
 
-    def render(self, target: FileTarget, *, workspace: Path) -> str:
-        parts: list[str] = [HEADER.rstrip(), FIRST_ACTION.rstrip()]
+    def render(self, target: FileTarget, *, workspace: Path, memory_backend: str = "memu") -> str:
+        loom = memory_backend == "loom"
+        first = loom_prompts.EXTERNAL_AGENT_MEMORY if loom else FIRST_ACTION
+        parts: list[str] = [HEADER.rstrip(), first.rstrip()]
         body = self._concat_includes(target, workspace, with_headings=True)
         if body:
             parts.append(body)
-        parts.append(self._render_footer(workspace))
+        parts.append(self._render_footer(workspace, loom=loom))
         return SECTION_DIVIDER.join(parts).rstrip() + "\n"
 
-    def _render_footer(self, workspace: Path) -> str:
+    def _render_footer(self, workspace: Path, *, loom: bool = False) -> str:
+        if loom:
+            return (
+                "# Workspace\n\n"
+                f"- **Path:** `{workspace}`\n"
+                + loom_prompts.EXTERNAL_AGENT_FOOTER_MEMORY
+            )
         return (
             "# Workspace\n\n"
             f"- **Path:** `{workspace}`\n"

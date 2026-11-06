@@ -1,0 +1,273 @@
+{
+  "from": [
+    "sdk/python/loom/ops.py",
+    "server/operations/toolsets.py"
+  ],
+  "generated_by": "scripts/loom_contract_fixture.py",
+  "ops": {
+    "context.pack": {
+      "idempotent": true,
+      "listed": true,
+      "request": {
+        "properties": {
+          "include_decisions": {
+            "type": "boolean"
+          },
+          "mode": {
+            "enum": [
+              "startup"
+            ]
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "only_sections": {
+            "items": {
+              "enum": [
+                "memories"
+              ]
+            },
+            "type": "array"
+          },
+          "org": {
+            "type": "string"
+          },
+          "query": {
+            "type": "string"
+          },
+          "section_token_budgets": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "type": "object"
+          },
+          "top_k": {
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "result": {
+        "properties": {
+          "rendered": {
+            "type": "string"
+          },
+          "sections": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "tool": "loom_context_pack"
+    },
+    "memory.set_from_messages": {
+      "idempotent": false,
+      "listed": true,
+      "request": {
+        "properties": {
+          "defer": {
+            "type": "boolean"
+          },
+          "extra_tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "last_messages": {
+            "items": {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "role": {
+                  "type": "string"
+                },
+                "timestamp": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "content"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "messages": {
+            "items": {
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "role": {
+                  "type": "string"
+                },
+                "timestamp": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "content"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "observation_date": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "messages"
+        ],
+        "type": "object"
+      },
+      "result": {
+        "properties": {
+          "queue_id": {
+            "type": "string"
+          },
+          "written": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "tool": "loom_memory_set_from_messages"
+    },
+    "namespace.summary": {
+      "idempotent": true,
+      "listed": true,
+      "request": {
+        "properties": {
+          "namespace": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
+          },
+          "top_entities_limit": {
+            "type": "integer"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "result": {
+        "properties": {
+          "namespace": {
+            "type": "string"
+          },
+          "org": {
+            "type": "string"
+          },
+          "total_memories": {
+            "type": "integer"
+          },
+          "type_counts": {
+            "items": {
+              "properties": {
+                "memory_type": {
+                  "type": "string"
+                },
+                "n": {
+                  "type": "integer"
+                }
+              },
+              "type": "object"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "tool": "loom_namespace_summary"
+    },
+    "search.query": {
+      "idempotent": true,
+      "listed": true,
+      "request": {
+        "properties": {
+          "query": {
+            "type": "string"
+          },
+          "top_k": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "query"
+        ],
+        "type": "object"
+      },
+      "result": {
+        "properties": {
+          "memory": {
+            "additionalProperties": {},
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "tool": "loom_search"
+    }
+  },
+  "tools_named_in_prompts": [
+    "loom_blacklist_add",
+    "loom_context_pack",
+    "loom_memory_delete",
+    "loom_memory_get",
+    "loom_memory_history",
+    "loom_memory_list",
+    "loom_memory_pin",
+    "loom_memory_related",
+    "loom_memory_set",
+    "loom_memory_update",
+    "loom_namespace_list_mine",
+    "loom_namespace_validate",
+    "loom_op",
+    "loom_search",
+    "loom_working_memory_*",
+    "loom_working_memory_append",
+    "loom_working_memory_delete",
+    "loom_working_memory_replace",
+    "loom_working_memory_set"
+  ]
+}

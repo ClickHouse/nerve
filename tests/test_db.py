@@ -1101,7 +1101,7 @@ class TestPlanUpdate:
 
         # Task note was appended to the markdown file
         body = task_md.read_text(encoding="utf-8")
-        assert "Plan updated: plan-v1" in body
+        assert "Plan updated: [plan-v1](/plans/plan-v1) → [" in body
         assert "v2" in body
         assert "too vague on edge cases" in body
 

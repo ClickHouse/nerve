@@ -310,6 +310,33 @@ class AccountStore:
         )
         written[actor_id] = display_name
 
+    async def ensure_external_actor(
+        self, actor_id: str, display_name: str | None = None,
+    ) -> str | None:
+        """Add a human actor that the gateway names, and return its display name.
+
+        For an event that names a person, such as a hosted channel message.
+        *display_name* is the name that the event gives the person. It is
+        written only when the row has no name, so a name that a web request
+        stored stays.
+
+        Raises :class:`sqlite3.IntegrityError` for the system actor's ID: the
+        trigger ``system_actor_cannot_be_replaced`` aborts the insert.
+        """
+        await self._write(
+            """INSERT INTO actor_refs (id, kind, display_name, created_at)
+               VALUES (?, 'human', ?, ?)
+               ON CONFLICT(id) DO UPDATE SET display_name = excluded.display_name
+               WHERE actor_refs.display_name IS NULL
+                 AND excluded.display_name IS NOT NULL""",
+            (actor_id, display_name or None, _now()),
+        )
+        async with self.db.execute(
+            "SELECT display_name FROM actor_refs WHERE id = ?", (actor_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row else None
+
     # -- system actor ID -----------------------------------------------------
 
     async def _actor_ref_columns(self) -> list[tuple[str, str]]:

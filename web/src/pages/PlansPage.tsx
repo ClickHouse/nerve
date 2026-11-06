@@ -2,17 +2,8 @@ import { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Lightbulb } from '../components/ui/icons';
 import { usePlanStore, type Plan } from '../stores/planStore';
-import { Badge, type BadgeTone, Button, PageHeader } from '../components/ui';
-
-/** A plan's lifecycle state, as a `Badge` tone. `superseded` is the fallback. */
-const STATUS_TONES: Record<string, BadgeTone> = {
-  pending: 'warning',
-  approved: 'success',
-  implementing: 'info',
-  declined: 'danger',
-  superseded: 'neutral',
-  failed: 'danger',
-};
+import { Badge, Button, PageHeader } from '../components/ui';
+import { PlanStatusBadge } from '../components/Plans/PlanStatusBadge';
 
 /** Plan type is identity, not status — hence `purple` rather than a feedback tone. */
 const TYPE_LABELS: Record<string, string> = {
@@ -42,9 +33,7 @@ function PlanCard({ plan }: { plan: Plan }) {
             {plan.task_title || plan.task_id}
           </h3>
           <div className="flex items-center gap-3 text-xs">
-            <Badge size="sm" pill outline tone={STATUS_TONES[plan.status] ?? 'neutral'}>
-              {plan.status}
-            </Badge>
+            <PlanStatusBadge status={plan.status} />
             {plan.plan_type && plan.plan_type !== 'generic' && TYPE_LABELS[plan.plan_type] && (
               <Badge size="sm" pill outline tone="purple">
                 {TYPE_LABELS[plan.plan_type]}

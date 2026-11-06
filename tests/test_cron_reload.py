@@ -583,6 +583,7 @@ class TestRefusedReloadRestoresGates:
 
         plugin.unlink()
         jobs_file.write_text("jobs: [ this is: not valid: yaml\n", encoding="utf-8")
+        caplog.clear()  # the load's note that the gate keeps the default forecast
         with caplog.at_level(logging.WARNING):
             with pytest.raises(ConfigError):
                 await service.reload()

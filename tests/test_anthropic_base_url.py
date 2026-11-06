@@ -15,7 +15,7 @@ import yaml
 from nerve.agent.backends.claude import ClaudeBackend
 from nerve.config import NerveConfig, load_config
 
-ENDPOINT = "http://10.200.0.1:3128"
+ENDPOINT = "http://192.0.2.1:3128"
 
 
 def _cli_env(cfg: NerveConfig) -> dict[str, str]:

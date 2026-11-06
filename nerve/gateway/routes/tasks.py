@@ -71,6 +71,10 @@ class TaskMoveRequest(BaseModel):
     after_id: str | None = None
 
 
+class TaskCommentRequest(BaseModel):
+    body: str
+
+
 class TaskStatusCreateRequest(BaseModel):
     name: str
     label: str = ""
@@ -310,6 +314,56 @@ async def list_task_events(task_id: str, limit: int = 200):
     deps = get_deps()
     limit = max(1, min(limit, 500))
     return {"events": await deps.db.list_task_events(task_id, limit=limit)}
+
+
+@router.get("/api/tasks/{task_id}/comments")
+async def list_task_comments(task_id: str):
+    """A task's comments, oldest first."""
+    deps = get_deps()
+    if not await deps.db.get_task(task_id):
+        raise HTTPException(status_code=404, detail="Task not found")
+    return {"comments": await deps.db.list_task_comments(task_id)}
+
+
+@router.post("/api/tasks/{task_id}/comments", status_code=201)
+async def add_task_comment(
+    task_id: str, req: TaskCommentRequest, actor: Actor = Depends(require_auth),
+):
+    """Add a comment as the person who sends the request."""
+    result = await get_tool_registry().invoke(
+        "task_comment",
+        build_route_tool_context(_ROUTE_ORIGIN, actor=actor),
+        {"task_id": task_id, "body": req.body},
+    )
+    outcome = result.structured or {}
+    if result.is_error:
+        raise HTTPException(
+            status_code=404 if outcome.get("reason") == "not_found" else 422,
+            detail=result.text_content,
+        )
+    return {"comment": outcome["comment"]}
+
+
+@router.delete("/api/tasks/{task_id}/comments/{comment_id}")
+async def delete_task_comment(
+    task_id: str, comment_id: int, actor: Actor = Depends(require_auth),
+):
+    """Delete a comment. Only its author can.
+
+    Accounts have no roles, so no person can delete the words of another.
+    """
+    deps = get_deps()
+    comment = await deps.db.get_task_comment(comment_id)
+    if not comment or comment["task_id"] != task_id:
+        raise HTTPException(status_code=404, detail="Comment not found")
+    if comment["actor_id"] != actor.actor_id:
+        raise HTTPException(
+            status_code=403, detail="Only the author of a comment can delete it",
+        )
+    if not await deps.db.delete_task_comment(task_id, comment_id):
+        raise HTTPException(status_code=404, detail="Comment not found")
+    await emit_task_event(await deps.db.get_task(task_id), "comment_deleted")
+    return {"id": comment_id, "deleted": True}
 
 
 @router.get("/api/tasks/{task_id}")

@@ -27,9 +27,14 @@ logger = logging.getLogger(__name__)
 # Default timeout for interactive tool waits (1 hour)
 INTERACTION_TIMEOUT = 3600
 
-# Claude CLI built-ins that require user interaction before execution.
-# Defined here (not in the claude backend) so the neutral registry and
-# tests can reference the set without importing backend modules.
+# Claude CLI built-ins whose permission ``can_use_tool`` decides itself (the
+# PreToolUse grant hook leaves them alone). When the CLI asks, all three are
+# denied on a non-interactive channel; on an interactive one
+# ``AskUserQuestion`` and ``ExitPlanMode`` pause for the person, and
+# ``EnterPlanMode`` is allowed at once (entering plan mode only restricts the
+# agent; the bundled CLI does not even ask for it). Defined here (not in the
+# claude backend) so the neutral registry and tests can reference the set
+# without importing backend modules.
 INTERACTIVE_TOOLS = frozenset({
     "AskUserQuestion",
     "ExitPlanMode",
@@ -67,6 +72,9 @@ class PendingInteraction:
     result: dict[str, Any] | None = None
     denied: bool = False
     deny_message: str = ""
+    #: The ``interaction_type`` the UI was sent (``question``, ``plan_exit``,
+    #: one of :data:`APPROVAL_KINDS`, …).
+    interaction_type: str = ""
 
 
 @dataclass
@@ -76,6 +84,8 @@ class InteractionOutcome:
 
     denied: bool = False
     cancelled: bool = False          # session stopped while waiting
+    #: Nobody answered within the pause's timeout (``denied`` is set too).
+    timed_out: bool = False
     message: str = ""
     result: dict[str, Any] | None = None
 
@@ -128,6 +138,11 @@ class InteractiveToolHandler:
         # answer. A question from the orchestrator has no agent.
         self.describe_agent: Callable[[str], dict | None] | None = None
         self.on_agent_interaction: Callable[[str, bool], None] | None = None
+        # Set by the engine: ``on_plan_pending(interaction_id, tool_input)``
+        # hears of each plan that waits for a decision (``plan_exit``), right
+        # after its ``interaction`` event, and writes a summary of it in the
+        # background. Called synchronously: it must not block the pause.
+        self.on_plan_pending: Callable[[str, dict], None] | None = None
 
     # -- snapshot bookkeeping ------------------------------------------- #
 
@@ -148,7 +163,8 @@ class InteractiveToolHandler:
         *,
         agent_task_id: str | None = None,
     ) -> InteractionOutcome:
-        """Pause for an interactive built-in (question / plan approval).
+        """Pause for an interactive built-in (question / plan approval) or
+        for Nerve's own form tool (``ask_form``, which calls this directly).
 
         ``agent_task_id`` is the runtime's id of the sub-agent that asked
         (a foreground agent); the ``interaction`` event then names it, and
@@ -200,6 +216,14 @@ class InteractiveToolHandler:
         except Exception:  # noqa: BLE001
             logger.debug("on_agent_interaction failed for %s", task_id, exc_info=True)
 
+    def _plan_pending(self, interaction_id: str, tool_input: dict[str, Any]) -> None:
+        if self.on_plan_pending is None:
+            return
+        try:
+            self.on_plan_pending(interaction_id, tool_input)
+        except Exception:  # noqa: BLE001 — a summary never breaks a pause
+            logger.debug("on_plan_pending failed for %s", interaction_id[:8], exc_info=True)
+
     async def request_approval(
         self, kind: str, payload: dict[str, Any],
     ) -> InteractionOutcome:
@@ -237,6 +261,7 @@ class InteractiveToolHandler:
             interaction_id=interaction_id,
             tool_name=tool_name,
             tool_input=tool_input,
+            interaction_type=interaction_type,
         )
         self._pending[interaction_id] = pending
 
@@ -250,6 +275,8 @@ class InteractiveToolHandler:
             "tool_input": tool_input,
             "agent": agent,
         })
+        if interaction_type == "plan_exit":
+            self._plan_pending(interaction_id, tool_input)
         # Tell every connected client this session is now waiting for input,
         # so the sidebar can show the "waiting" indicator (blue dot).
         await self._broadcast_awaiting()
@@ -270,6 +297,7 @@ class InteractiveToolHandler:
                 )
                 return InteractionOutcome(
                     denied=True,
+                    timed_out=True,
                     message=(
                         f"No response received after "
                         f"{_humanize_seconds(wait_timeout)} — timed out."
@@ -379,6 +407,13 @@ class InteractiveToolHandler:
     def has_pending(self) -> bool:
         return len(self._pending) > 0
 
+    def pending_interaction_types(self) -> list[str]:
+        """The ``interaction_type`` of each interaction waiting for the
+        person, oldest first: ``question`` (``AskUserQuestion``), ``form``
+        (Nerve's ``ask_form``), ``plan_exit`` (``ExitPlanMode``) or an
+        approval kind. Empty when nothing waits."""
+        return [pending.interaction_type for pending in list(self._pending.values())]
+
 
 # ------------------------------------------------------------------ #
 #  File snapshot helpers                                               #
@@ -435,12 +470,40 @@ def get_awaiting_ids() -> set[str]:
     return {sid for sid, handler in _handlers.items() if handler.has_pending}
 
 
+def defer_idle_timeout(hub: Any, session_id: str, *, logged: bool) -> bool:
+    """True when an idle timeout of *session_id*'s runtime is no hang.
+
+    A runtime that asked the person something (a question, a plan decision,
+    an approval) is silent until Nerve answers, and Nerve answers when the
+    person does. So while *hub* (the session's handler, or ``None``) has an
+    interaction pending, the caller keeps waiting instead of treating the
+    runtime as hung. The wait stays bounded: the pause has its own timeout
+    (:data:`INTERACTION_TIMEOUT`); when it ends the runtime gets its answer,
+    speaks again, and the idle timeout applies as before.
+
+    Logs the deferral unless *logged* (callers log once per silent stretch).
+    """
+    if hub is None or not hub.has_pending:
+        return False
+    if not logged:
+        logger.info(
+            "idle timeout deferred for session %s: waiting for the person (%s pending)",
+            session_id, ", ".join(hub.pending_interaction_types()),
+        )
+    return True
+
+
 def _interaction_type(tool_name: str) -> str:
-    """Map tool name to a UI-friendly interaction type."""
+    """Map tool name to a UI-friendly interaction type.
+
+    ``EnterPlanMode`` never pauses (see :data:`INTERACTIVE_TOOLS`), so there
+    is no interaction type for it. ``ask_form`` is a Nerve tool, not a CLI
+    built-in: its handler pauses through the hub itself, and the permission
+    adapters never see it as interactive."""
     return {
         "AskUserQuestion": "question",
         "ExitPlanMode": "plan_exit",
-        "EnterPlanMode": "plan_enter",
+        "ask_form": "form",
     }.get(tool_name, "unknown")
 
 

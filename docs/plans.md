@@ -11,6 +11,7 @@ Cron (every 4h) → persistent "task-planner" job
   → agent browses tasks, checks memory, picks one worth planning
   → explores codebase with Read, Glob, Grep, Bash, etc.
   → calls plan_propose(task_id, content) to store the proposal
+  → the task moves to plan_review, and one notification links to the plan
   → plan appears in /plans UI for review
 
 User reviews (via /plans UI or chat tools)
@@ -38,6 +39,9 @@ User reviews (via /plans UI or chat tools)
 - Auto-detects `plan_type` from task source (`skill-extractor` → `skill-create`, etc.)
 - Auto-increments version if previous plans exist for the same task
 - Supersedes any prior pending plan for the same task
+- Moves the task to `plan_review` when its status is `pending`, `backlog` or `in_progress`. A task in any other status keeps it. The move names the task revision that was read, so a status that another writer set in the meantime stays.
+- Writes a task note with a markdown link to the plan: `Plan proposed: [plan-…](/plans/plan-…) (v1)`
+- Sends one notification, "Plan ready for review: <task title>", with priority `high`. Its metadata holds `plan_id` and `task_id`. The web UI shows "Open plan" and "Open task" for it, and Telegram shows an "Open plan" button that opens the plan in the chat. During quiet hours it is sent without sound. It dismisses the task's earlier plan notifications, and approve and decline dismiss the last one. Agents do not send their own `notify` about the plan.
 - Returns `{ plan_id, task_id, version }`
 
 ### `plan_list(status?)`
@@ -66,8 +70,8 @@ User reviews (via /plans UI or chat tools)
 - Guards: only pending plans can be updated
 - Marks the old plan as `superseded` (and stores optional `feedback` on it explaining the change)
 - Creates a new plan record: `version = old.version + 1`, `parent_plan_id = old.id`, same `task_id`/`plan_type`, fresh `session_id` from the updating agent
-- Writes a "Plan updated: …" note to task history
-- Task status is untouched — the plan is just being refined
+- Writes a "Plan updated: …" note to task history, with links to both versions
+- Moves the task to `plan_review` and sends a notification for the new version, by the same rules as `plan_propose`
 - Returns `{ new_plan_id, version }`
 
 **When to use which:**

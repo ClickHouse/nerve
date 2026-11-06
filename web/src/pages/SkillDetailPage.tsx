@@ -65,6 +65,8 @@ export function SkillDetailPage() {
     );
   }
 
+  // A platform skill is read only: the server refuses to change or delete it.
+  const readOnly = selectedSkill.source === 'platform';
   const stats = selectedSkill.stats;
   const successRate = stats.total_invocations > 0
     ? Math.round((stats.success_count / stats.total_invocations) * 100)
@@ -82,6 +84,7 @@ export function SkillDetailPage() {
             <div className="flex items-center gap-2">
               <h1 className="text-sm font-medium text-text">{selectedSkill.name}</h1>
               <Badge>v{selectedSkill.version}</Badge>
+              {readOnly && <Badge tone="accent">Platform</Badge>}
             </div>
             <p className="text-2xs text-text-dim mt-0.5">{selectedSkill.id}</p>
           </div>
@@ -97,20 +100,22 @@ export function SkillDetailPage() {
           >
             {selectedSkill.enabled ? 'Enabled' : 'Disabled'}
           </Button>
-          {hasChanges && (
+          {hasChanges && !readOnly && (
             <Button variant="primary" size="xs" onClick={handleSave} disabled={actionLoading}>
               <Save size={12} />
               Save
             </Button>
           )}
-          <IconButton
-            label="Delete skill"
-            variant="dangerGhost"
-            size="xs"
-            onClick={() => setShowDeleteConfirm(true)}
-          >
-            <Trash2 size={12} />
-          </IconButton>
+          {!readOnly && (
+            <IconButton
+              label="Delete skill"
+              variant="dangerGhost"
+              size="xs"
+              onClick={() => setShowDeleteConfirm(true)}
+            >
+              <Trash2 size={12} />
+            </IconButton>
+          )}
         </div>
       </div>
 
@@ -122,11 +127,17 @@ export function SkillDetailPage() {
             <FileText size={12} className="text-text-dim" />
             <span className="text-xs text-text-muted">SKILL.md</span>
             {hasChanges && <span className="text-2xs text-hue-amber">unsaved</span>}
+            {readOnly && (
+              <span className="text-2xs text-text-dim">
+                The platform provides this skill. You cannot change it here.
+              </span>
+            )}
           </div>
           {/* `bare`: a full-bleed editor pane, so no surface, border or radius
               — FIELD_BARE leaves the spacing and colour to this call site. */}
           <TextArea
             bare
+            readOnly={readOnly}
             value={editContent}
             onChange={e => { setEditContent(e.target.value); setHasChanges(true); }}
             className="flex-1 text-text-secondary text-xs font-mono p-4 leading-relaxed"
