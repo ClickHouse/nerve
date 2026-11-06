@@ -1,5 +1,5 @@
 import { useUIStore } from '../stores/uiStore';
-import { formatCombo, type ShortcutCombo } from '../utils/keyboard';
+import { FOCUS_COMPOSER_COMBO, formatCombo, type ShortcutCombo } from '../utils/keyboard';
 import { Modal } from './ui/Modal';
 
 interface DisplayShortcut {
@@ -39,7 +39,7 @@ const SECTIONS: Section[] = [
     title: 'Chat',
     items: [
       { combo: { mod: true, shift: true, key: 's' }, description: 'Toggle session sidebar' },
-      { combo: { mod: true, shift: true, key: ';' }, description: 'Focus message input' },
+      { combo: FOCUS_COMPOSER_COMBO, description: 'Focus message input' },
       { combo: { mod: true, shift: true, key: 'c' }, description: 'Copy last response' },
       { combo: { mod: true, shift: true, key: 'f' }, description: 'Fork this chat' },
       { combo: { mod: true, shift: true, key: 'Backspace' }, description: 'Delete current conversation' },

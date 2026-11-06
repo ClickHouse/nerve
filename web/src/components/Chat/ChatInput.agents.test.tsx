@@ -122,7 +122,7 @@ describe('ChatInput with agents', () => {
 
   it('locks the model picker while agents run', async () => {
     await renderComposer(false);
-    const picker = screen.getByRole('combobox');
+    const picker = screen.getByRole('button', { name: 'Model: model-a' });
     expect(picker).toBeDisabled();
     expect(picker).toHaveAttribute('title', 'Switching model restarts the runtime and would stop 5 running agents');
   });
@@ -130,7 +130,7 @@ describe('ChatInput with agents', () => {
   it('frees the model picker once no agent runs', async () => {
     useAgentStore.setState(makeAgentStoreSeed([FX_COMPLETED]));
     await renderComposer(false);
-    expect(screen.getByRole('combobox')).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Model: model-a' })).toBeEnabled();
   });
 
   it('applies text other surfaces put into the composer', async () => {

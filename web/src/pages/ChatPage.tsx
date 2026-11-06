@@ -22,10 +22,11 @@ import { Button, PaneToggle } from '../components/ui';
 import { api } from '../api/client';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useIsMobile } from '../hooks/useMediaQuery';
-import type { ShortcutDef } from '../utils/keyboard';
+import { FOCUS_COMPOSER_COMBO, type ShortcutDef } from '../utils/keyboard';
 import { copyToClipboard } from '../utils/clipboard';
 import { forkChat } from '../utils/forkChat';
 import { findSessionById } from '../utils/findSession';
+import { modelLabel } from '../utils/modelNames';
 import { langfuseSessionUrl, type LangfuseLinkStatus } from '../utils/langfuseLinks';
 import type { ChatMessage, TextBlockData } from '../types/chat';
 
@@ -33,17 +34,6 @@ const STATUS_LABELS: Record<string, string> = {
   thinking: 'Thinking...',
   writing: 'Writing...',
 };
-
-/** Format a model identifier into a short display label. */
-function formatModelLabel(model: string): string {
-  const m = model.replace(/^claude-/, '');
-  const match = m.match(/^(\w+)-(\d+)-(\d+)/);
-  if (match) {
-    const name = match[1].charAt(0).toUpperCase() + match[1].slice(1);
-    return `${name} ${match[2]}.${match[3]}`;
-  }
-  return m.charAt(0).toUpperCase() + m.slice(1);
-}
 
 export function ChatPage() {
   const { sessionId } = useParams();
@@ -192,7 +182,7 @@ export function ChatPage() {
     },
     {
       id: 'chat-focus-input',
-      combo: { mod: true, shift: true, key: ';' },
+      combo: FOCUS_COMPOSER_COMBO,
       description: 'Focus message input',
       section: 'chat',
       allowInInput: true,
@@ -387,7 +377,7 @@ export function ChatPage() {
                 const model = activeSessionRow?.model;
                 return model ? (
                   <span className="hidden md:inline shrink-0 text-xs text-text-faint bg-surface-raised px-1.5 py-0.5 rounded">
-                    {formatModelLabel(model)}
+                    {modelLabel(model)}
                   </span>
                 ) : null;
               })()}

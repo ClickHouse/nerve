@@ -18,7 +18,7 @@ export type { LucideIcon as Icon } from 'lucide-react';
 
 export {
   Activity, AlertCircle, AlertTriangle, Archive, ArchiveRestore, ArrowLeft,
-  ArrowRight, ArrowUpRight, Ban, BarChart3, Bell, BellOff, BookOpen, Bot, Brain,
+  ArrowRight, ArrowUp, ArrowUpRight, Ban, BarChart3, Bell, BellOff, BookOpen, Bot, Brain,
   Calendar, Check, CheckCheck, CheckCircle, CheckCircle2, CheckSquare,
   ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Circle, CircleCheck, Cloud,
   KeyRound, ListChecks, ListTree, LocateFixed, PartyPopper,
