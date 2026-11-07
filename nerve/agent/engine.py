@@ -97,7 +97,7 @@ from nerve.identity import (
     attribution_for,
     resolve_cause,
 )
-from nerve.inference_principal import inference_principal
+from nerve.inference_principal import inference_principal, inference_trigger
 from nerve.mcp_gateway import McpGatewayCatalog
 from nerve.memory.backend import (
     MemoryBackendUnavailable,
@@ -106,6 +106,7 @@ from nerve.memory.backend import (
 )
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.platform.activity import LEASE_MEMORIZE, keep_awake
+from nerve.session_origin import cron_origin, session_origin
 from nerve.skills.manager import SkillManager
 from nerve.utils.llm import response_text
 
@@ -1766,6 +1767,10 @@ class AgentEngine:
                 # engine has just loaded.
                 inference_principal=inference_principal(
                     (session or {}).get("caused_by_actor_id"),
+                ),
+                # The session's trigger, also fixed for the session.
+                inference_trigger=inference_trigger(
+                    session_origin(session or {}).trigger,
                 ),
                 extra=(
                     # Per-session codex sandbox override (review-loop verifier
@@ -5017,7 +5022,7 @@ class AgentEngine:
         actor = self.db.system_actor
         await self.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron", actor=actor,
-            cause=cause,
+            cause=cause, origin=cron_origin(job_id),
         )
         await self._stamp_cron_session_meta(session_id, "persistent", cache_ttl)
         try:

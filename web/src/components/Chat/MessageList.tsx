@@ -1,6 +1,6 @@
 import { useEffect, useRef, useCallback, memo } from 'react';
 import { Link } from 'react-router-dom';
-import type { ChatMessage } from '../../types/chat';
+import type { ChatMessage, Session } from '../../types/chat';
 import { useVisibleActorIds } from '../../stores/actorStore';
 import { useAuthStore } from '../../stores/authStore';
 import { useChatStore } from '../../stores/chatStore';
@@ -12,12 +12,16 @@ import { AssistantMessage } from './AssistantMessage';
 import { StreamingMessage } from './StreamingMessage';
 import { SelectionToolbar } from './SelectionToolbar';
 import { MessageActions } from './MessageActions';
+import { SessionOriginLine } from './SessionOrigin';
 import { GitBranch } from '../ui/icons';
 import { followScrollEnd } from '../../utils/followScrollEnd';
 
-function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }: {
+function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks, unlistedSession }: {
   messages: ChatMessage[];
   isStreaming: boolean;
+  /** The open session's row when no loaded session list has it, for the
+      origin line. */
+  unlistedSession?: Session | null;
   /** Fork the chat from a specific message (undefined = feature unavailable
       for this session, e.g. a virtual chat). */
   onForkMessage?: (messageId: number) => void;
@@ -106,6 +110,8 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
           </div>
         )
       )}
+
+      {messages.length > 0 && <SessionOriginLine unlisted={unlistedSession} />}
 
       {messages.map((msg, i) => {
         // "Fork from here" needs a persisted row id (live-streamed messages

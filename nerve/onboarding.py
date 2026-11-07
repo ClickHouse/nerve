@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from nerve.identity import ACTOR_KIND_HUMAN, Actor, actor_id_of
+from nerve.session_origin import TRIGGER_CHAT, TRIGGER_SYSTEM, Origin
 from nerve.setup_writer import (
     TASK_ONBOARDING_MARKER,
     publish_text,
@@ -287,8 +288,11 @@ async def start(
         ):
             return await read_state(db, workspace)
         source = "web" if kind == CONVERSATION else "cron"
+        # The conversation is a web chat with a person. The autonomous
+        # onboarding is Nerve's own work.
         await engine.sessions.get_or_create(
             session_id, title=SESSION_TITLE, source=source, actor=actor, cause=cause,
+            origin=Origin(TRIGGER_CHAT if kind == CONVERSATION else TRIGGER_SYSTEM),
         )
     mode = workspace_mode(Path(workspace)) or "personal"
     description, guide, work = await asyncio.to_thread(_prompt_inputs, workspace, mode)

@@ -142,10 +142,12 @@ def _engine(
 
     engine.watch_turns = _watch_turns
 
-    async def _get_or_create(session_id, title=None, source="web", *, actor, cause=None):
+    async def _get_or_create(session_id, title=None, source="web", *, actor, cause=None, origin=None):
         if slow:
             await asyncio.sleep(0.05)
-        await db.create_session(session_id, title=title, source=source, actor=actor, cause=cause)
+        await db.create_session(
+            session_id, title=title, source=source, actor=actor, cause=cause, origin=origin,
+        )
         return await db.get_session(session_id)
 
     engine.sessions.get_or_create = _get_or_create
@@ -1006,6 +1008,7 @@ class TestStart:
         assert turn["actor"] == db.system_actor
         assert turn["user_message"] == onboarding_prompt("personal", **WITH_FACTS)
         assert (await db.get_session(states[0].session_id))["title"] == "Onboarding"
+        assert (await db.get_session(states[0].session_id))["trigger"] == "chat"
 
     async def test_a_start_during_another_start_sees_its_session(self, db, tmp_path):
         apply_mode(tmp_path, "personal")
@@ -1265,6 +1268,8 @@ class TestBoot:
         session = await db.get_session(state.session_id)
         assert session["source"] == "cron"
         assert session["caused_by_actor_id"] == db.system_actor.actor_id
+        # Nerve's own work, not a chat with a person.
+        assert session["trigger"] == "system"
         # Once: the next start opens nothing, and nothing asks again.
         assert await onboarding.start_on_boot(engine, tmp_path) is None
         assert not await onboarding.request_autonomous(db, tmp_path)

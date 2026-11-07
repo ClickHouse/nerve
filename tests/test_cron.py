@@ -22,6 +22,7 @@ from nerve.cron.service import (
     _parse_timestamp,
 )
 from nerve.identity import Attribution, attribution_for
+from nerve.session_origin import cron_origin
 from tests.actor_rows import FAKE_SYSTEM_ACTOR, mock_system_principal
 
 # A person's actor ID (synthetic), distinct from the system actor.
@@ -802,7 +803,7 @@ class TestRotation:
             # Who a cron generation belongs to, and its cause, have their
             # own tests (test_attribution.py, test_schedule_attribution.py);
             # this one is about rotation.
-            actor=ANY, cause=ANY,
+            actor=ANY, cause=ANY, origin=cron_origin("pers"),
         )
         cron_service.db.set_channel_session.assert_awaited_once_with(
             "cron:pers", session_id,

@@ -921,6 +921,11 @@ class HostedChannel(BaseChannel):
             sender_id=target,
             text=body if event.attachments else text,
             metadata=metadata,
+            # Untrusted presentation text, for the origin of a new session.
+            conversation_title=(
+                event.conversation.display_name
+                if event.conversation.kind != "direct" else ""
+            ),
         ), event, attachments=bool(event.attachments))
 
     async def _add_attachments(self, message: InboundMessage, event: Event) -> None:

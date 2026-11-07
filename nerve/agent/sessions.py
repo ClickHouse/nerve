@@ -28,6 +28,15 @@ from nerve.identity import (
     CauseArg,
     attribution_for,
 )
+from nerve.session_origin import (
+    DETAIL_FORK_OF,
+    DETAIL_HOOK,
+    TRIGGER_API,
+    TRIGGER_CHAT,
+    Origin,
+    channel_origin,
+    cron_origin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -157,10 +166,13 @@ class SessionManager:
         *,
         actor: Actor | None,
         cause: CauseArg = CAUSE_FROM_ACTOR,
+        origin: Origin | None = None,
     ) -> dict:
         """Get an existing session or create a new one.
 
-        ``actor`` and ``cause`` are only used when a row is actually created.
+        ``actor``, ``cause`` and ``origin`` (the trigger and origin details,
+        see :mod:`nerve.session_origin`) are only used when a row is actually
+        created.
         An existing session keeps the creator and the cause it was stamped
         with, so re-resolving a session someone else started never
         re-attributes it. ``actor`` is required keyword-only, like the store
@@ -171,6 +183,7 @@ class SessionManager:
             session = await self._create_session(
                 session_id, title=title, source=source, metadata=metadata,
                 backend=backend, model=model, cwd=cwd, actor=actor, cause=cause,
+                origin=origin,
             )
         return session
 
@@ -188,6 +201,7 @@ class SessionManager:
         *,
         actor: Actor | None,
         cause: CauseArg = CAUSE_FROM_ACTOR,
+        origin: Origin | None = None,
     ) -> dict:
         """Create a new session with status=created and log the event."""
         if backend is None:
@@ -216,6 +230,7 @@ class SessionManager:
             # The event names the creator and the session's cause only when
             # this insert made the row.
             created_event=attribution_for(actor, cause),
+            origin=origin,
         )
         logger.info(
             "Created session: %s (parent=%s)", session_id, parent_session_id,
@@ -329,6 +344,7 @@ class SessionManager:
 
     async def get_active_session(
         self, channel_key: str, source: str = "web", *, actor: Actor | None,
+        conversation_title: str = "",
     ) -> str:
         """Get or create the active session for a channel.
 
@@ -339,6 +355,10 @@ class SessionManager:
         ``actor`` is stamped on the fresh session only — the person whose
         message rolled the channel over to a new conversation. A reused
         session keeps whoever started it.
+
+        The fresh session's origin comes from ``source`` and ``channel_key``,
+        with ``conversation_title`` as the conversation's display name (see
+        :func:`nerve.session_origin.channel_origin`).
         """
         row = await self.db.get_channel_session(channel_key)
         if row:
@@ -348,7 +368,10 @@ class SessionManager:
 
         # Create a fresh session
         session_id = self._generate_session_id()
-        await self._create_session(session_id, source=source, actor=actor)
+        await self._create_session(
+            session_id, source=source, actor=actor,
+            origin=channel_origin(source, channel_key, conversation_title),
+        )
         await self.db.set_channel_session(channel_key, session_id)
         return session_id
 
@@ -778,6 +801,8 @@ class SessionManager:
             model=parent.get("model"),
             cwd=parent.get("cwd"),
             actor=actor,
+            # A person forks a chat in the web UI, whatever started the parent.
+            origin=Origin(TRIGGER_CHAT, {DETAIL_FORK_OF: source_session_id}),
         )
         copied = await self.db.copy_messages_to_session(
             source_session_id, fork_id, up_to_native_turn_id=fork_turn_id,
@@ -826,7 +851,7 @@ class SessionManager:
             session_id = f"cron:{job_id}"
         return await self.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron", actor=actor,
-            cause=cause,
+            cause=cause, origin=cron_origin(job_id),
         )
 
     async def create_hook_session(
@@ -836,6 +861,7 @@ class SessionManager:
         session_id = f"hook:{hook_name}:{hook_id}"
         return await self.get_or_create(
             session_id, title=f"Hook: {hook_name}", source="hook", actor=actor,
+            origin=Origin(TRIGGER_API, {DETAIL_HOOK: hook_name}),
         )
 
     # ------------------------------------------------------------------ #

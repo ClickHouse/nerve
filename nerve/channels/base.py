@@ -63,6 +63,7 @@ class InboundMessage:
     session_id: str | None = None                   # Explicit session override (web sends this)
     metadata: dict[str, Any] = field(default_factory=dict)
     actor: Actor | None = None
+    conversation_title: str = ""                    # "general"; "" when unknown or direct
 
 
 @dataclass

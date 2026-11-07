@@ -22,6 +22,7 @@ import { Button, PaneToggle } from '../components/ui';
 import { api } from '../api/client';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useIsMobile } from '../hooks/useMediaQuery';
+import { useFetchedSession } from '../hooks/useFetchedSession';
 import { FOCUS_COMPOSER_COMBO, type ShortcutDef } from '../utils/keyboard';
 import { copyToClipboard } from '../utils/clipboard';
 import { forkChat } from '../utils/forkChat';
@@ -90,8 +91,13 @@ export function ChatPage() {
   const hasPanels = useChatStore(s => s.panels.length > 0);
   const filesPanelActive = useChatStore(s => s.panels.some(p => p.id === 'files-panel'));
 
-  // The active session row may live in the feed or a lazy archived/system group.
-  const activeSessionRow = findSessionById(activeSession, sessions, archivedSessions, systemSessions);
+  // The active session row may live in the feed or a lazy archived/system
+  // group. A session that none of them has loaded is read by its id.
+  const listedSessionRow = findSessionById(activeSession, sessions, archivedSessions, systemSessions);
+  const fetchedSessionRow = useFetchedSession(
+    listedSessionRow || !activeSession || virtualSession?.id === activeSession ? null : activeSession,
+  );
+  const activeSessionRow = listedSessionRow ?? fetchedSessionRow ?? undefined;
 
   // Forks of THIS chat keyed by their anchor message — MessageList marks the
   // divergence points with a pill. Memoized so the memo'd list doesn't
@@ -523,6 +529,7 @@ export function ChatPage() {
               <MessageList
                 messages={messages}
                 isStreaming={isStreaming}
+                unlistedSession={fetchedSessionRow}
                 onForkMessage={canForkSession ? handleForkMessage : undefined}
                 messageForks={messageForks}
               />

@@ -20,6 +20,14 @@ from nerve.gateway.routes._deps import get_deps
 from nerve.gateway.routes.files import session_upload_dir
 from nerve.identity import Actor, attribution_for
 from nerve.platform.activity import LEASE_MEMORIZE, keep_awake
+from nerve.session_origin import (
+    DETAIL_RUN_LATER,
+    TRIGGER_API,
+    TRIGGER_CHAT,
+    TRIGGER_CRON,
+    Origin,
+    origin_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +204,21 @@ _NO_ATTENTION = {
 }
 
 
+async def _attach_origins(deps, sessions: list[dict]) -> None:
+    """Stamp each row with ``trigger``, ``origin_label`` and ``origin_detail``.
+
+    A row from before the trigger column gets a derived origin, which also
+    reads the row's channel mapping.
+    """
+    legacy = [s["id"] for s in sessions if not s.get("trigger")]
+    try:
+        channel_keys = await deps.db.channel_keys_for_sessions(legacy)
+    except Exception:  # noqa: BLE001 - enrichment must never break listing
+        channel_keys = {}
+    for s in sessions:
+        s.update(origin_fields(s, channel_keys.get(s["id"])))
+
+
 def _page_size() -> int | None:
     """Sidebar page size from config; ``None`` when configured unlimited."""
     size = get_config().sessions.sidebar_page_size
@@ -251,6 +274,7 @@ async def _decorate(deps, sessions: list[dict], *, add_needs_you: bool = False) 
         s["background_count"] = _background_count(deps, s["id"], s["has_background_tasks"])
         if s["id"] in loops:
             s["review_loop"] = _loop_summary(loops[s["id"]])
+    await _attach_origins(deps, sessions)
     return sessions
 
 
@@ -378,9 +402,12 @@ async def create_session(req: SessionCreateRequest, actor: Actor = Depends(requi
         session_id, title=req.title, source=req.source, metadata=metadata,
         backend=backend, model=model, cwd=cwd,
         actor=actor,
+        # The web UI sends no source. Another value is a REST caller.
+        origin=Origin(TRIGGER_CHAT if req.source == "web" else TRIGGER_API),
     )
     if req.review_loop is not None:
         session = await _attach_review_loop(deps, session, session_id, cwd, req, actor)
+    await _attach_origins(deps, [session])
     return session
 
 
@@ -446,6 +473,7 @@ async def get_session(session_id: str, actor: Actor = Depends(require_auth)):
     session = await deps.db.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    await _attach_origins(deps, [session])
     return session
 
 
@@ -727,6 +755,7 @@ async def fork_session(req: ForkRequest, actor: Actor = Depends(require_auth)):
             req.source_session_id, req.at_message_id, req.title,
             actor=actor,
         )
+        await _attach_origins(deps, [fork])
         return fork
     except ValueError as e:
         status = 404 if "not found" in str(e).lower() else 409
@@ -769,6 +798,12 @@ async def run_later(req: RunLaterRequest, actor: Actor = Depends(require_auth)):
             status_code=400,
             detail=f"Unknown delay {delay!r} (want one of: 30m, 1h, 24h, none)",
         )
+    # The panel creates an empty session for each deferred prompt. Its first
+    # turn comes from the schedule, so a session without messages gets the
+    # cron trigger.
+    await deps.db.set_session_origin(
+        req.session_id, Origin(TRIGGER_CRON, {DETAIL_RUN_LATER: delay}),
+    )
 
     # Pending user message — mirror the block shape a normal send persists:
     # a text block plus one block per uploaded attachment. Resolve file_ids
@@ -1042,6 +1077,12 @@ async def chat(req: MessageRequest, actor: Actor = Depends(require_auth)):
     if session_id is None:
         session_id = await deps.engine.sessions.get_active_session(
             "api:default", source="api", actor=actor,
+        )
+    elif deps.engine.accepting_turns:
+        # A new session id from the caller: a session of the API. A draining
+        # engine creates nothing: run() refuses the turn with a 503.
+        await deps.engine.sessions.get_or_create(
+            session_id, source="web", actor=actor, origin=Origin(TRIGGER_API),
         )
     response = await deps.engine.run(
         session_id=session_id,

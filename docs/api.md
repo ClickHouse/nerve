@@ -878,6 +878,29 @@ system actor when the agent did) and `pending_wakeup_caused_by_actor_id` (on
 whose behalf it was scheduled; the turn that it fires runs for the session's
 cause). The `session_running` WebSocket event carries the same three fields.
 
+Session payloads also carry where the session comes from:
+
+- `trigger`: the kind of event that started the session. One of `chat` (a
+  person in the web UI, also the onboarding conversation and forks), `api`
+  (`/api/chat`, other REST callers, webhooks), `slack`, `telegram`, `email`,
+  `cron` (cron jobs and "Run later"), `plan` (plan implementation and planner
+  sessions), `workflow` (workflow runs and review loop legs), `external` (MCP
+  satellite sessions and imported threads), `system` (the autonomous
+  onboarding) and `unknown`. The code path that
+  creates the session sets it once; it does not come from `source`. A
+  session from before this field gets a value derived from `source`, its id
+  and its channel mapping.
+- `origin_label`: one short sentence for display, for example
+  `"Started from Slack #general"` or `"Started by cron job daily-digest"`.
+- `origin_detail`: an object with the details that apply, each optional:
+  `channel`, `channel_name`, `thread`, `cron_job`, `run_later`, `plan_id`,
+  `task_id`, `fork_of`, `workflow_run`, `client`, `hook`.
+
+`POST /api/sessions` gives `chat` when `source` is `web` (the default) and
+`api` for another `source`. `POST /api/chat` with a new `session_id` gives
+`api`. `POST /api/sessions/run-later` changes a session
+without messages to `cron`.
+
 Rows also carry `is_running` (the orchestrator's turn is in flight),
 `has_background_tasks` (sub-agents or background tasks are still live) and
 `background_count` (how many). The two are independent: agents can run

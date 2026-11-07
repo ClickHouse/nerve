@@ -1,6 +1,6 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, StarFilled, Pencil, Trash2, Archive, ArchiveRestore, Repeat, Unlink, GitBranch } from '../ui/icons';
+import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, MoreHorizontal, Star, StarFilled, Pencil, Trash2, Archive, ArchiveRestore, Repeat, Unlink, GitBranch } from '../ui/icons';
 import { Button, IconButton, TextField } from '../ui';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp, loadCollapsedGroups, saveCollapsedGroups, loadExpandedParents, saveExpandedParents } from '../../utils/dateGroups';
@@ -9,6 +9,7 @@ import { useChatStore } from '../../stores/chatStore';
 import { useVisibleActorIds } from '../../stores/actorStore';
 import { useAuthStore } from '../../stores/authStore';
 import { SessionCreatorMarker } from './ActorLabel';
+import { SessionOriginIcon } from './SessionOrigin';
 import { useActorAttributionLabel } from '../../hooks/useActorAttribution';
 import { useModalSurface } from '../../hooks/useModalSurface';
 import { safeAreaInsets } from '../../utils/safeArea';
@@ -20,11 +21,6 @@ import { AttentionReason, SessionListSummary, WaitingMark } from './SessionAtten
 function cleanTitle(session: Session): string {
   const raw = session.title || session.id;
   return raw.replace(/^#+\s*/, '').replace(/^Implement:\s*/i, '');
-}
-
-/** Check if this session is an async plan implementation. */
-function isImplementSession(session: Session): boolean {
-  return /^(#+\s*)?Implement:\s/i.test(session.title || '');
 }
 
 /** Format a date string as a short relative/absolute label. */
@@ -799,7 +795,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                             : 'text-text-faint hover:bg-surface-raised hover:text-text-muted'
                           }`}
                       >
-                        <Bot size={11} className="shrink-0" />
+                        <SessionOriginIcon session={s} />
                         <div className="flex-1 min-w-0">
                           <div className="truncate">{cleanTitle(s)}</div>
                         </div>
@@ -1149,7 +1145,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
   /** Feed-only: light up an "unread" marker when updated since last opened. */
   showUnread?: boolean;
   /** Nesting: depth (0 = top level) indents the row; a parent shows a
-      chevron in place of its icon that toggles its children. */
+      chevron before its icon that toggles its children. */
   depth?: number;
   hasChildren?: boolean;
   /** Direct-child count, shown as a badge when the parent is collapsed. */
@@ -1256,23 +1252,19 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
           : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
         }${isDropTarget ? ' ring-2 ring-inset ring-accent bg-accent/10' : ''}${isDragSource ? ' opacity-50' : ''}`}
     >
-      {hasChildren ? (
+      {hasChildren && (
         <button
           type="button"
           onClick={(e) => { e.preventDefault(); e.stopPropagation(); onToggleExpand?.(session.id); }}
-          className="shrink-0 -ml-0.5 p-0.5 rounded text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer"
+          className="shrink-0 -ml-0.5 -mr-1 p-0.5 rounded text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer"
           title={expanded ? 'Collapse children' : 'Expand children'}
         >
           {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         </button>
-      ) : session.review_loop ? (
+      )}
+      <SessionOriginIcon session={session} />
+      {session.review_loop && (
         <Repeat size={13} className={`shrink-0 ${reviewLoopIconTone(session.review_loop.status)}`} />
-      ) : isImplementSession(session) ? (
-        <Hammer size={13} className="shrink-0 text-hue-cyan/70" />
-      ) : session.id.startsWith('fork-') ? (
-        <GitBranch size={13} className="shrink-0 text-hue-violet/70" />
-      ) : (
-        <MessageSquare size={13} className="shrink-0 opacity-50" />
       )}
       <div className="flex-1 min-w-0">
         <div className={`truncate text-xs in-data-[layout=page]:text-sm leading-tight${isUnread ? ' font-semibold text-text' : ''}`}>{cleanTitle(session)}</div>
