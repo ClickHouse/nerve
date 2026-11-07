@@ -1,4 +1,5 @@
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
+import type { ChatMessage } from '../../types/chat';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -74,5 +75,46 @@ describe('empty transcript', () => {
     useSetupStore.setState({ state: withStep(makeState(), step('provider', { status: 'done' })) });
     renderEmpty();
     expect(screen.getByText('Start a conversation')).toBeInTheDocument();
+  });
+});
+
+describe('long history rendering', () => {
+  it('mounts a bounded recent window and reveals earlier messages on request', () => {
+    const messages: ChatMessage[] = Array.from({ length: 35 }, (_, i) => ({
+      id: i + 1,
+      role: 'user',
+      blocks: [{ type: 'text', content: `Test turn ${i}` }],
+    }));
+    const view = (history: ChatMessage[]) => (
+      <MemoryRouter>
+        <MessageList messages={history} isStreaming={false} />
+      </MemoryRouter>
+    );
+    const { rerender } = render(view(messages));
+
+    expect(screen.queryByText('Test turn 0')).not.toBeInTheDocument();
+    expect(screen.getByText('Test turn 5')).toBeInTheDocument();
+    expect(screen.getByText('Test turn 34')).toBeInTheDocument();
+
+    // A new turn must not evict an existing row while the reader is scrolled up.
+    const appended: ChatMessage[] = [
+      ...messages, { id: 36, role: 'user', blocks: [{ type: 'text', content: 'Test turn 35' }] },
+    ];
+    rerender(view(appended));
+    expect(screen.getByText('Test turn 5')).toBeInTheDocument();
+    expect(screen.getByText('Test turn 35')).toBeInTheDocument();
+    expect(screen.queryByText('Test turn 4')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Show earlier messages (5 loaded)' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Show earlier messages (5 loaded)' }));
+    expect(screen.getByText('Test turn 0')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Show earlier messages/ })).not.toBeInTheDocument();
+
+    // Revealed history stays available as more turns arrive too.
+    rerender(view([
+      ...appended, { id: 37, role: 'user', blocks: [{ type: 'text', content: 'Test turn 36' }] },
+    ]));
+    expect(screen.getByText('Test turn 0')).toBeInTheDocument();
+    expect(screen.getByText('Test turn 36')).toBeInTheDocument();
   });
 });
