@@ -185,19 +185,18 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       return false;
     }
     get().loadNotifications();
-    // Read the row again too: the answer event does not come while the
-    // socket is down.
-    if (get().byId[id]) {
-      api.getNotification(id)
-        .then(row => set(s => ({ byId: { ...s.byId, [id]: row } })))
-        .catch(e => console.error('Failed to reload notification:', e));
-    }
+    // Read the row again and update every copy: the answer event does not
+    // come while the socket is down.
+    api.getNotification(id)
+      .then(row => set(s => patchCopies(s, id, row)))
+      .catch(e => console.error('Failed to reload notification:', e));
     return true;
   },
 
   dismissNotification: async (id: string) => {
     try {
       await api.dismissNotification(id);
+      set(s => patchCopies(s, id, { status: 'dismissed' }));
       get().loadNotifications();
     } catch (e) {
       console.error('Failed to dismiss notification:', e);
@@ -207,6 +206,8 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
   dismissAll: async () => {
     try {
       await api.dismissAllNotifications();
+      // The server dismisses the pending `notify` rows only.
+      set(s => ({ toastQueue: s.toastQueue.filter(n => n.type !== 'notify') }));
       get().loadNotifications();
     } catch (e) {
       console.error('Failed to dismiss all:', e);
@@ -292,8 +293,7 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
         answer: data.answer,
         answered_by: data.answered_by,
         answered_by_actor_id: data.actor_id ?? null,
-        // The event carries no time; it arrives as the answer is stored.
-        answered_at: new Date().toISOString(),
+        answered_at: data.answered_at ?? null,
       }),
       pendingCount: Math.max(0, s.pendingCount - 1),
     }));

@@ -35,7 +35,7 @@ export type WSMessage =
   | { type: 'file_changed'; session_id: string; path: string; operation: string; tool_use_id: string }
   | { type: 'notification'; notification_id: string; notification_type: 'notify' | 'question' | 'approval'; session_id: string; title: string; body: string; priority: string; options: string[] | null; option_labels?: Record<string, string>; target_kind?: string; target_id?: string; silenced?: boolean; silence_reason?: string; silence_pattern?: string; silenced_by?: string; redelivered?: boolean; redelivery_count?: number }
   // `actor_id` is the person who answered; null for a chat-channel answer.
-  | { type: 'notification_answered'; notification_id: string; session_id: string; answer: string; answered_by: string; actor_id?: string | null; approval_status?: 'answered' | 'snoozed'; dispatch_ok?: boolean; snooze_until?: string }
+  | { type: 'notification_answered'; notification_id: string; session_id: string; answer: string; answered_by: string; answered_at?: string | null; actor_id?: string | null; approval_status?: 'answered' | 'snoozed'; dispatch_ok?: boolean; snooze_until?: string }
   | { type: 'notification_expired'; notification_id: string; session_id: string; notification_type: string; title: string }
   // The answer becomes a user message written by the person who answered;
   // `actor_id` is null for a chat-channel answer.

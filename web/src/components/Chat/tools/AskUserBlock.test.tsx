@@ -21,11 +21,14 @@ const { api } = await import('../../../api/client');
 const { useNotificationStore } = await import('../../../stores/notificationStore');
 const { ToolCallBlock } = await import('../ToolCallBlock');
 const { questionIdFromResult } = await import('../../Notifications/askOptions');
+const { formatMessageTime } = await import('../../../utils/messageTime');
 
 const getNotification = vi.mocked(api.getNotification);
 const answerNotification = vi.mocked(api.answerNotification);
 
 const ID = 'ask-1a2b3c4d';
+/** The server's answer time, from the answer event. */
+const ANSWERED_AT = '2026-01-02T03:04:00+00:00';
 const OPTIONS = ['Yes, all of these', 'Only the old ones (recommended)', 'No'];
 
 function call(overrides: Partial<ToolCallBlockData> = {}): ToolCallBlockData {
@@ -106,12 +109,14 @@ describe('AskUserBlock', () => {
     await screen.findByRole('group', { name: 'Delete the build caches?' });
     act(() => {
       useNotificationStore.getState().handleWSNotificationAnswered({
-        notification_id: ID, answer: 'Only the old ones (recommended)', answered_by: 'telegram', actor_id: 'actor-alice',
+        notification_id: ID, answer: 'Only the old ones (recommended)', answered_by: 'telegram',
+        answered_at: ANSWERED_AT, actor_id: 'actor-alice',
       });
     });
     expect(screen.queryByRole('group')).not.toBeInTheDocument();
     expect(screen.getByText('Answer:').parentElement).toHaveTextContent('Answer: Only the old ones');
     expect(screen.getByText('via telegram')).toBeInTheDocument();
+    expect(screen.getByText(formatMessageTime(ANSWERED_AT))).toBeInTheDocument();
     expect(await screen.findByText('Alice')).toBeInTheDocument();
     expect(screen.queryByText('12 GB')).not.toBeInTheDocument();
 
