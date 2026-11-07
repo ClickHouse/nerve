@@ -1,6 +1,19 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
 
+/** The implementation session of an approved plan: GET /api/plans/{id} only. */
+export interface ImplSession {
+  id: string;
+  title: string | null;
+  /** The session row's lifecycle status: `active`, `idle`, `stopped`, `error`, ... */
+  status: string | null;
+  updated_at: string | null;
+  is_running: boolean;
+  awaiting_input: boolean;
+  /** No turn runs, but a wake-up is scheduled or background work runs. */
+  parked: boolean;
+}
+
 export interface Plan {
   id: string;
   task_id: string;
@@ -25,6 +38,8 @@ export interface Plan {
   // Who wrote this version and on whose behalf. Null on older rows.
   created_by_actor_id?: string | null;
   caused_by_actor_id?: string | null;
+  /** Null when the plan has no implementation session or its row is gone. */
+  impl_session?: ImplSession | null;
 }
 
 interface PlanState {
@@ -39,6 +54,8 @@ interface PlanState {
   loadPlans: () => Promise<void>;
   setFilter: (f: string) => void;
   loadPlan: (id: string) => Promise<void>;
+  /** Load the open plan again, without the loading state. */
+  refreshPlan: (id: string) => Promise<void>;
   updatePlan: (id: string, status: string, feedback?: string) => Promise<void>;
   approvePlan: (id: string) => Promise<{ impl_session_id: string } | null>;
   revisePlan: (id: string, feedback: string) => Promise<boolean>;
@@ -111,6 +128,8 @@ export const usePlanStore = create<PlanState>((set, get) => {
         set({ detailLoading: false });
       }
     },
+
+    refreshPlan: reloadSelected,
 
     updatePlan: async (id: string, status: string, feedback?: string) => {
       set({ actionLoading: true, actionError: null });

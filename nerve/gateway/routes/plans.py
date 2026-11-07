@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from nerve.agent.interactive import get_awaiting_ids
 from nerve.agent.plan_service import (
     PlanNotFound,
     PlanNotPending,
@@ -50,7 +51,33 @@ async def get_plan(plan_id: str, actor: Actor = Depends(require_auth)):
     plan = await deps.db.get_plan(plan_id)
     if not plan:
         raise HTTPException(status_code=404, detail="Plan not found")
+    plan["impl_session"] = await _impl_session(deps, plan.get("impl_session_id"))
     return plan
+
+
+async def _impl_session(deps, session_id: str | None) -> dict | None:
+    """The implementation session's title and live state, for the plan page.
+
+    ``None`` when the plan has no implementation session or its row is gone.
+    ``parked``: no turn runs, but a wake-up is scheduled or background work
+    still runs, as for the parked dot in the session list.
+    """
+    if not session_id:
+        return None
+    session = await deps.db.get_session(session_id)
+    if not session:
+        return None
+    engine = deps.engine
+    return {
+        "id": session_id,
+        "title": session.get("title"),
+        "status": session.get("status"),
+        "updated_at": session.get("updated_at"),
+        "is_running": engine.is_session_running(session_id),
+        "awaiting_input": session_id in get_awaiting_ids(),
+        "parked": bool(await engine.pending_wakeup(session_id))
+        or engine.has_live_background_tasks(session_id),
+    }
 
 
 @router.patch("/api/plans/{plan_id}")
