@@ -416,7 +416,7 @@ export function handleUserMessage(
   const clientMsgId = msg.client_msg_id ?? null;
   if (clientMsgId && get().messages.some(m => m.client_msg_id === clientMsgId)) return;
   const hydrated = hydrateMessage({ role: 'user', content: msg.content, blocks: msg.blocks ?? undefined, created_at: new Date().toISOString(), actor_id: msg.actor_id ?? null });
-  // The sending tab's id: lets this tab mark the bubble "Queued" while the
-  // message waits in the server queue.
+  // The sending tab's id: while the message waits in the server queue, this
+  // tab shows it as a queue row and hides the bubble (MessageList).
   set(s => ({ messages: [...s.messages, { ...hydrated, client_msg_id: clientMsgId }] }));
 }

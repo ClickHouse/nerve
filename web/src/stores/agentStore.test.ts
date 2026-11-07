@@ -15,6 +15,8 @@ vi.mock('../api/client', async () => {
       stopAgent: vi.fn(),
       stopSession: vi.fn(),
       cancelQueued: vi.fn(),
+      reorderQueue: vi.fn(),
+      getQueue: vi.fn(),
     },
   };
 });
@@ -489,6 +491,35 @@ describe('queue', () => {
 
     expect(store().queue).toEqual([entry]);
     expect(store().composerInsert).toBeNull();
+  });
+});
+
+describe('reorderQueue', () => {
+  const ids = () => store().queue.map(q => q.queue_id);
+  const [a, b, c] = ['q_a', 'q_b', 'q_c'].map(queue_id => fx.makeQueueEntry({ queue_id }));
+
+  it('shows the new order at once and sends it', async () => {
+    store().hydrate(fx.makeSnapshot([], { queue: [a, b, c] }));
+    vi.mocked(api.reorderQueue).mockResolvedValueOnce({ items: [c, a, b] });
+
+    const done = store().reorderQueue(['q_c', 'q_a']);
+    expect(ids()).toEqual(['q_c', 'q_a', 'q_b']);   // not named: last, in order
+    await done;
+
+    expect(api.reorderQueue).toHaveBeenCalledWith(SID, ['q_c', 'q_a']);
+    expect(ids()).toEqual(['q_c', 'q_a', 'q_b']);
+  });
+
+  it('shows the server queue again when the request fails', async () => {
+    store().hydrate(fx.makeSnapshot([], { queue: [a, b, c] }));
+    vi.mocked(api.reorderQueue).mockRejectedValueOnce(apiError(500, 'internal'));
+    vi.mocked(api.getQueue).mockResolvedValueOnce({ items: [a, b, c] });
+    vi.spyOn(console, 'error').mockImplementationOnce(() => {});
+
+    await store().reorderQueue(['q_c', 'q_b', 'q_a']);
+
+    expect(api.getQueue).toHaveBeenCalledWith(SID);
+    expect(ids()).toEqual(['q_a', 'q_b', 'q_c']);
   });
 });
 
