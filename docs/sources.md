@@ -55,6 +55,7 @@ Consumers read from the inbox using the `poll_source` agent tool with a named co
 **Key properties:**
 - Consumer cursors are independent — multiple consumers can read the same source at different positions
 - New consumer cursors initialize to the latest message (no backlog flooding)
+- A source's first run (no source cursor yet) starts a cursor on it for every consumer that already has one, before it stores anything, so its first records are unread for that consumer and wake a `messages` gate that watches any source
 - Consumer cursors expire after N days of inactivity (configurable, default: 2 days); a `messages` gate that checks the consumer renews the cursors it reads (see [cron.md](cron.md#messages))
 - Cross-source deduplication happens naturally because one agent session sees messages from all sources
 
@@ -428,6 +429,102 @@ machine for them.
   platform that parks the machine does not wake it for that run. The mode
   follows `sync.github.mode`, which is restart-only.
 
+### Linear
+
+The issue notifications of the Linear user that an API key belongs to: issues
+assigned to it, mentions, and comments, as `linear` records. The agent is a
+regular Linear user (a service account, or a person's personal API key), not a
+Linear agent app: there are no webhooks and no agent sessions, and Nerve needs
+no public URL. It writes back (comments, status, assignee) through
+[Linear's MCP server](https://linear.app/docs/mcp), which this source registers
+with the same key, so everything it does in Linear is done as that user.
+
+- **Adapter:** `nerve/sources/linear.py` — Linear's GraphQL API (`https://api.linear.app/graphql`), with `httpx`. A personal API key (`lin_api_…`) goes as it is in `Authorization`, an OAuth access token as `Bearer`
+- **Query:** the user's `notifications` of the types asked for, created since the cursor (`createdAt >= since`, archived ones included), 50 per page, every page up to 10 (500 notifications; more between two runs logs a warning and the oldest are not reported). The viewer is asked for on the first page. `batch_size` does not cap this source. Linear allows 2,500 requests an hour per user; the default schedule makes 12
+- **Read state is left alone:** notifications are read whether or not they are read, and none is marked read, so the user's Linear inbox stays as the person who reads it left it, and a failed run reports the same notifications on the next one
+- **Cursor:** JSON, `{"v": 1, "since": <newest createdAt>, "at": [<notification ids created in that millisecond>], "listed_at": <when it was read>, "viewer": <user id>}`. On `createdAt`, since `updatedAt` moves when a notification is read or e-mailed. A notification is new when it was created after `since`, or in that millisecond and not in `at`
+- **First run:** the baseline. The cursor is set at the newest notification of the last hour (else an hour ago, which leaves room for a difference between this clock and Linear's) and nothing is reported. So does a cursor that cannot be read, and a key that now belongs to another user
+- **No backfill beyond a day:** a run more than a day after the last one reads as of a day and an hour ago, as the [GitHub Repos](#github-repos) source does: the last day is reported, nothing older
+- **Failures:** an HTTP error, a rate limit (HTTP 429 or `RATELIMITED`), a GraphQL error at HTTP 200, a key Linear rejects, or a timeout (30 s) fails the run; the cursor stays and the runner backs off
+- **Default schedule:** `*/5 * * * *` (every 5 min)
+- **Disabled by default**
+
+```yaml
+sync:
+  linear:
+    enabled: true
+    api_key: ${LINEAR_API_KEY}     # in config.local.yaml
+    types: [assigned, mentioned, comments]
+    include_bots: false            # comments and mentions of apps, bots and external users
+    deny_actors: []                # globs on the actor's name, display name or e-mail
+    allow_teams: []                # globs on the team key; non-empty = only these teams
+    deny_teams: []
+    mcp: true                      # register Linear's MCP server as "linear"
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `linear.api_key` | string | `""` | A personal API key (Linear → Settings → Security & access → Personal API keys) or an OAuth access token, of the user the agent acts as. Belongs in `config.local.yaml`. Without one an enabled source is skipped with a warning, and `nerve doctor` warns |
+| `linear.types` | list | `[assigned, mentioned, comments]` | `assigned` (`issueAssignedToYou`), `mentioned` (`issueMention`, `issueCommentMention`), `comments` (`issueNewComment`: new comments on the issues the user is subscribed to). Reactions are never asked for. Case does not matter; an unknown type, or an empty list, refuses to load |
+| `linear.include_bots` | bool | `false` | Also report the comments and mentions whose actor is an app (`actor.app`), a bot (`botActor`), an external user or Linear itself. An assignment is reported whoever made it, triage rules included |
+| `linear.deny_actors` | list | `[]` | Case-insensitive globs on the actor's name, display name or e-mail, with the [guardrail](#guardrails-inbox-filtering) rules |
+| `linear.allow_teams` / `linear.deny_teams` | list | `[]` | Case-insensitive globs on the issue's team key (`ENG`). A non-empty allow list drops every other team (fail-closed); deny wins |
+| `linear.mcp` | bool | `true` | Register `linear` (`https://mcp.linear.app/mcp`, the key as a bearer token) in the agent's MCP servers while the source is on and has a key. An `mcp_servers.linear` entry of your own wins. External auth mode ignores the configured MCP servers, and `nerve doctor` warns |
+
+Events (the record's `Event:` line and `event` metadata):
+
+| `event` | Notification | Record ID |
+|---------|--------------|-----------|
+| `assigned` | `issueAssignedToYou` | `<ID>:notification:<notification id>` |
+| `mentioned` | `issueMention` (in the description) | `<ID>:notification:<notification id>` |
+| `mentioned` | `issueCommentMention` | `<ID>:comment:<comment id>` |
+| `commented` / `replied` | `issueNewComment`, `replied` when it is in a thread | `<ID>:comment:<comment id>` |
+
+`<ID>` is the issue's identifier (`ENG-12`). Linear sends a mention in a
+comment and the new comment as two notifications; one comment is one record,
+the mention. Two comments are two records. The record's `timestamp` is the
+notification's `createdAt`.
+
+Before anything is stored, a notification is dropped that the user caused
+itself (`actor.id`, or the comment's author, is the viewer: the agent's own
+comments never come back to it), one without an issue, and the ones the
+settings above leave out. The inbox guardrail applies the settings again to
+what arrives (`team_key` against the team lists, `actor` and `actor_email`
+against `deny_actors`, `actor_kind` against `include_bots` except for
+assignments, `notification_type` against `types`), which catches the records
+fetched before a reload changed them. Everything here follows a reload, the
+MCP server too (`mcp_reload` in a chat, or new sessions).
+
+The record (type `linear_notification`) has a summary such as
+`[ENG-12] Assigned to you by Alice: Fix the login`,
+`[ENG-12] Alice mentioned you: Fix the login` or
+`[ENG-12] Alice replied: Fix the login`. Its content has the lines `Issue:`,
+`Event:`, `Team:`, `State:`, `Priority:`, `Assignee:`, `Actor:`,
+`Issue URL:` and `Comment URL:`, then the description (an assignment or a
+mention in it), or the comment replied to and the comment, each capped at
+4,000 characters. Like every source record it is untrusted content. Its
+metadata, all strings:
+
+| Key | Value |
+|-----|-------|
+| `identifier` | The issue's identifier (`ENG-12`) |
+| `issue_id` | The issue's id, for `mcp__linear__get_issue` / `save_issue` |
+| `team_key` | The issue's team key |
+| `event` | `assigned`, `mentioned`, `commented` or `replied` |
+| `notification_type` | Linear's notification type |
+| `notification_id` | The notification's id |
+| `actor`, `actor_email`, `actor_id` | Who caused it |
+| `actor_kind` | `user`, `app`, `bot`, `external` or `system` |
+| `state`, `state_type` | The issue's workflow state and its type (`unstarted`, `started`, …) |
+| `assignee` | The issue's assignee |
+| `comment_id` | The comment's id; empty without a comment |
+| `issue_url`, `comment_url` | The pages of the issue and the comment |
+| `subject_url` | The comment's page, else the issue's, which the Sources page links to |
+
+**Acting on it.** In personal mode the `inbox-processor` reads `linear` with
+the other sources. A worker has no inbox-processor; give it a job that runs
+when a record arrives (see [worker-guide.md](worker-guide.md#linear)).
+
 ### Telegram account sync
 - **Adapter:** `nerve/sources/telegram.py` — uses Telethon (user account API).
   This is the pull sync for your own Telegram account, and is separate from the
@@ -666,6 +763,19 @@ sync:
     include_drafts: true          # false: a draft PR is reported when it is ready for review
     updates: false                # true: also commits, ready, merge and close of reported PRs
     deny_authors: []              # Globs on the author's login; never reported
+    batch_size: 50
+    condense: false
+
+  linear:
+    enabled: false
+    schedule: "*/5 * * * *"
+    api_key: ""                   # In config.local.yaml, e.g. ${LINEAR_API_KEY}
+    types: [assigned, mentioned, comments]
+    include_bots: false           # Also comments and mentions of apps, bots, external users
+    deny_actors: []               # Globs on the actor's name, display name or e-mail
+    allow_teams: []               # Globs on the team key; non-empty = only these teams
+    deny_teams: []
+    mcp: true                     # Register Linear's MCP server as "linear"
     batch_size: 50
     condense: false
 ```
@@ -1221,6 +1331,7 @@ export function MyRenderer({ content, metadata, summary }: Props) {
 | `nerve/sources/github_hosted.py` | GitHub sources in hosted mode (`github`, `github_repos`): drain the records the channel gateway delivered |
 | `nerve/sources/github_events.py` | GitHub user events adapter (gh CLI) |
 | `nerve/sources/github_repos.py` | GitHub repository watch adapter (gh CLI), record builder, its guardrail |
+| `nerve/sources/linear.py` | Linear notifications adapter (GraphQL), record builder, its guardrail |
 | `nerve/agent/tools.py` | Consumer tools: `list_sources`, `poll_source`, `read_source` |
 | `web/src/components/Sources/` | Source message renderers (email, GitHub, default markdown) |
 
@@ -1228,7 +1339,7 @@ export function MyRenderer({ content, metadata, summary }: Props) {
 
 **Source cursors** (producer-side): Each source owns its cursor semantics. The framework treats cursors as opaque strings stored in the `sync_cursors` SQLite table. Sources return the next cursor in `FetchResult.next_cursor` — the runner stores it as-is. Cursors advance after successful ingestion (persist to inbox).
 
-**Consumer cursors**: Stored in `consumer_cursors` table with composite key `(consumer, source)`. Each consumer has an independent cursor per source, using the implicit `rowid` of `source_messages` as the offset. New cursors initialize to `MAX(rowid)` (no backlog). Cursors expire after `consumer_cursor_ttl_days` of inactivity.
+**Consumer cursors**: Stored in `consumer_cursors` table with composite key `(consumer, source)`. Each consumer has an independent cursor per source, using the implicit `rowid` of `source_messages` as the offset. New cursors initialize to `MAX(rowid)` (no backlog); before a source's first run, every consumer that has a cursor elsewhere gets one on it at its `MAX(rowid)`, so its first records are unread. Cursors expire after `consumer_cursor_ttl_days` of inactivity.
 
 **Inclusive APIs:** Both GitHub and Gmail APIs use inclusive cursor semantics (returning records `>= cursor`). Gmail advances the cursor at query time (+1s) and applies client-side dedup as a safety net. GitHub queries the cursor itself, because a notification can land in the cursor's own second; storage skips the unchanged thread listed again.
 

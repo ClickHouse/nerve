@@ -128,6 +128,8 @@ _EFFECTFUL_SETTINGS_KEYS = (
     ("proxy",),
     ("houseofagents",),
     ("cron", "gate_plugins_dir"),
+    # Registers Linear's MCP server (sync.linear.mcp).
+    ("sync", "linear"),
 )
 
 # Key -> what turning it changes, quoted into the notice so the reviewer does not

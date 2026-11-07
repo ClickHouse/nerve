@@ -296,6 +296,19 @@ def _github_repos_text(config: Any) -> str:
     return text
 
 
+def _linear_text(config: Any, sources: dict[str, str | None] | None) -> str:
+    """The Linear source: what it reports, and whether the agent can write back."""
+    linear = config.sync.linear
+    if not linear.enabled:
+        return "off"
+    if not linear.api_key:
+        return "on, but its API key is not set"
+    text = f"on (API key {_origin(sources, 'sync.linear.api_key')}): {', '.join(linear.types)}"
+    if linear.mcp_server in config.mcp_servers:
+        text += "; writes through the `linear` MCP server (`mcp__linear__*`) as the key's user"
+    return text
+
+
 def _slack_text(config: Any, sources: dict[str, str | None] | None) -> str:
     slack = config.slack
     if slack.mode == "hosted":
@@ -391,6 +404,7 @@ def gather(
         ("GitHub CLI (`gh`)", lambda: _github_cli_text(cli)),
         ("GitHub sync source", lambda: _github_sync_text(config)),
         ("GitHub repository watch", lambda: _github_repos_text(config)),
+        ("Linear", lambda: _linear_text(config, sources)),
         ("Slack", lambda: _slack_text(config, sources)),
         ("Telegram channel", lambda: _telegram_channel_text(config, sources)),
         ("Telegram message sync", lambda: _telegram_sync_text(config, sources)),

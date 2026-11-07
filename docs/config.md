@@ -242,9 +242,9 @@ A reload is always explicit. Two things cause one:
 | Cron jobs (`config/cron/*.yaml`) | ✅ |
 | Custom cron gate plugins (new, edited *and* deleted `.py` files) | ✅ the registry is rebuilt from the directory |
 | Cron file locations (`cron.jobs_file`, `system_file`, `gate_plugins_dir`) | ✅ re-read from the new config |
-| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. In hosted mode the GitHub filters, `pr_watch`, `inbox` and the repository watch (`sync.github_repos`) are published to the gateway again. **`sync.codex` and `sync.github.mode` are not among these**; see the restart table |
+| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.linear`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. In hosted mode the GitHub filters, `pr_watch`, `inbox` and the repository watch (`sync.github_repos`) are published to the gateway again. **`sync.codex` and `sync.github.mode` are not among these**; see the restart table |
 | `cron.delivery_debounce_seconds` | ✅ read for each delivery |
-| MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
+| MCP servers (`mcp_servers`, and the `linear` server that `sync.linear` registers) | ✅ new sessions get the new set |
 | Skills (`skills/`, and the platform skills in `skills/` in the config directory) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
 | `setup.local_secrets` | ✅ read on every request of the setup page |
@@ -1837,6 +1837,26 @@ reload:
 | `sync.github_repos.include_drafts` | bool | `true` | `false`: a draft pull request is reported when it is marked ready for review (event `ready`), not when it is opened |
 | `sync.github_repos.updates` | bool | `false` | Also report a new head commit, ready for review, and the merge or close of each pull request the watch reported |
 | `sync.github_repos.deny_authors` | list | `[]` | Case-insensitive globs on the author's login, with the guardrail rules; what they match is never reported, releases included |
+
+`sync.linear` reports the issue notifications of the Linear user an API key
+belongs to (assignments, mentions, comments), and registers Linear's MCP server
+so that the agent writes back as that user (see
+[sources.md](sources.md#linear)). Everything follows a reload, the MCP server
+too:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `sync.linear.enabled` | bool | `false` | Enable the Linear source. Without `api_key` it is skipped with a warning |
+| `sync.linear.schedule` | cron | `*/5 * * * *` | Poll frequency. Linear allows 2,500 requests an hour per user |
+| `sync.linear.api_key` | string | `""` | A personal API key (`lin_api_…`) or an OAuth access token of the user the agent acts as, e.g. `${LINEAR_API_KEY}`. Put it in `config.local.yaml` |
+| `sync.linear.types` | list | `[assigned, mentioned, comments]` | What is reported: `assigned`, `mentioned` (in a description or a comment), `comments` (new comments on subscribed issues). Case does not matter; an unknown type or an empty list refuses to load |
+| `sync.linear.include_bots` | bool | `false` | Also report the comments and mentions of apps, bots, external users and Linear itself. Assignments are reported whoever made them |
+| `sync.linear.deny_actors` | list | `[]` | Case-insensitive globs on the actor's name, display name or e-mail, with the guardrail rules |
+| `sync.linear.allow_teams` | list | `[]` | Case-insensitive globs on the team key; non-empty = only these teams' issues (fail-closed) |
+| `sync.linear.deny_teams` | list | `[]` | Case-insensitive globs on the team key; deny wins |
+| `sync.linear.mcp` | bool | `true` | Register `linear` (`https://mcp.linear.app/mcp`, the key as a bearer token) as an MCP server while the source is on and has a key. An `mcp_servers.linear` entry wins. External auth mode ignores it |
+| `sync.linear.batch_size` | int | `50` | Kept for symmetry; the source reads every notification since its cursor |
+| `sync.linear.condense` | bool | `false` | LLM-condense long records |
 
 `cron.delivery_debounce_seconds` (int, default `60`) spaces the job runs that a
 hosted delivery starts; a negative value reads as `0`, and a value above `600`

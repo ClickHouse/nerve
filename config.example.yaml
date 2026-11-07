@@ -361,6 +361,21 @@ sync:
     # deny_authors: []             # case-insensitive globs on the author login
     batch_size: 50
 
+  # Linear: notifications of the user the API key belongs to (a service account
+  # or a personal key). The agent writes back through Linear's MCP server as
+  # that user. See docs/sources.md "Linear".
+  linear:
+    enabled: false
+    schedule: "*/5 * * * *"
+    # api_key: ${LINEAR_API_KEY}   # in config.local.yaml
+    # types: [assigned, mentioned, comments]
+    # include_bots: false          # also comments and mentions of apps, bots and
+                                   # external users; assignments always arrive
+    # deny_actors: []              # globs on the actor's name, display name, e-mail
+    # allow_teams: []              # globs on the team key; non-empty = only these
+    # deny_teams: []
+    # mcp: true                    # register Linear's MCP server as "linear"
+
 # Memory (memU)
 memory:
   recall_model: claude-sonnet-5-5
