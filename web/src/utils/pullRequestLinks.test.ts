@@ -31,6 +31,31 @@ describe('findPullRequests', () => {
       .toEqual(['https://github.com/example/repo/pull/12', 'https://github.com/example/repo/pull/13']);
   });
 
+  it.each([
+    ['the end of the text', ''],
+    ['a path', '/files'],
+    ['a query', '?w=1'],
+    ['a fragment', '#discussion_r1'],
+    ['a period', '.'],
+    ['a comma', ', then'],
+    ['a parenthesis', ')'],
+    ['a bracket', ']'],
+    ['an angle bracket', '>'],
+    ['a colon', ': done'],
+    ['an exclamation mark', '!'],
+    ['a quote', '"'],
+    ['a backtick', '`'],
+    ['bold markers', '**'],
+    ['a line break', '\nnext'],
+  ])('finds the URL when %s follows the number', (_, suffix) => {
+    expect(urls([text(`https://github.com/example/repo/pull/12${suffix}`)]))
+      .toEqual(['https://github.com/example/repo/pull/12']);
+  });
+
+  it.each(['12abc', '12x', '12-fix', '12A'])('ignores /pull/%s', (tail) => {
+    expect(urls([text(`https://github.com/example/repo/pull/${tail}`)])).toEqual([]);
+  });
+
   it('lists text links before tool result links, each pull request once', () => {
     expect(urls([
       tool('https://github.com/example/repo/pull/7 created'),

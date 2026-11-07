@@ -3,9 +3,13 @@ import type { MessageBlock } from '../types/chat';
 /** Most PR cards under one message. */
 export const MAX_PR_CARDS = 5;
 
-/** The same owner, repo and number rules as the server's `PULL_URL`. */
+/**
+ * The same owner, repo and number rules as the server's `PULL_URL`. After the
+ * number comes the end of the text, a path (`/files`), a query, a fragment or
+ * punctuation. A letter, a digit or a hyphen after it is not a pull request URL.
+ */
 const PULL_URL =
-  /https:\/\/github\.com\/([A-Za-z0-9][A-Za-z0-9-]{0,38})\/((?!\.+\/)[A-Za-z0-9._-]{1,100})\/pull\/([1-9]\d{0,9})(?!\d)/g;
+  /https:\/\/github\.com\/([A-Za-z0-9][A-Za-z0-9-]{0,38})\/((?!\.+\/)[A-Za-z0-9._-]{1,100})\/pull\/([1-9]\d{0,9})(?![A-Za-z0-9-])/g;
 
 export interface PullRequestRef {
   /** `https://github.com/<owner>/<repo>/pull/<number>`, nothing after it. */
