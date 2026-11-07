@@ -32,9 +32,10 @@ User reviews (via /plans UI or chat tools)
 | `plan_decline` | Decline a pending plan with optional feedback. Moves the related task to `done` (declining is treated as abandoning the effort, not pausing it). |
 | `plan_revise` | Request revision of a pending plan — sends feedback to the session that proposed it (the planner session for cron-made plans; `cron:task-planner` when the plan records no session), which calls `plan_update` to produce v+1. |
 
-### `plan_propose(task_id, content, plan_type?)`
+### `plan_propose(task_id, content, plan_type?, summary?)`
 
 - Validates the task exists
+- Stores the optional `summary`: up to 3 short lines for the reviewer, at most 400 characters. The tool clips a longer summary and says so in its result. The plan page shows the summary under the title, or the first lines of the plan when there is none.
 - Checks no pending/implementing plan already exists → returns error if duplicate
 - Auto-detects `plan_type` from task source (`skill-extractor` → `skill-create`, etc.)
 - Auto-increments version if previous plans exist for the same task
@@ -65,9 +66,10 @@ User reviews (via /plans UI or chat tools)
 - Spawns `engine.run()` in background (unchanged — the agent decides how to implement)
 - Returns `{ plan_id, impl_session_id }`
 
-### `plan_update(plan_id, content, feedback?)`
+### `plan_update(plan_id, content, feedback?, summary?)`
 
 - Guards: only pending plans can be updated
+- Stores the optional `summary` on the new version, as `plan_propose` does. The summary of the old version is not copied, because it can describe the old content.
 - Marks the old plan as `superseded` (and stores optional `feedback` on it explaining the change)
 - Creates a new plan record: `version = old.version + 1`, `parent_plan_id = old.id`, same `task_id`/`plan_type`, fresh `session_id` from the updating agent
 - Writes a "Plan updated: …" note to task history, with links to both versions
@@ -163,6 +165,7 @@ Plans are stored in the `plans` SQLite table (schema v12):
 | `impl_session_id` | TEXT | Implementation session (after approval) |
 | `status` | TEXT | pending/approved/declined/superseded/implementing |
 | `content` | TEXT | Plan markdown |
+| `summary` | TEXT | Short summary from `plan_propose` or `plan_update`; NULL when the agent gave none |
 | `feedback` | TEXT | User revision feedback |
 | `version` | INTEGER | Version number (increments on revision) |
 | `parent_plan_id` | TEXT | Previous version's ID |
@@ -205,6 +208,8 @@ of the same plan can both proceed.
 
 ### Plan Detail (`/plans/:planId`)
 
+- Under the title, the plan's `summary` in up to 3 lines. A plan without one
+  shows its first heading and the two lines after it
 - Rendered markdown plan content
 - Task link + implementation session link (when applicable)
 - Who proposed this version and who reviewed the plan, from the writer and

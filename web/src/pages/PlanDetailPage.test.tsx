@@ -17,8 +17,12 @@ vi.mock('../api/client', () => ({
   setToken: vi.fn(), clearToken: vi.fn(), getToken: vi.fn(),
   setUnauthorizedHandler: vi.fn(),
 }));
-vi.mock('../stores/helpers/draftStorage', () => ({ clearAllDrafts: vi.fn() }));
-vi.mock('../stores/helpers/readStorage', () => ({ clearAllReads: vi.fn() }));
+vi.mock('../stores/helpers/draftStorage', async (orig) => ({
+  ...(await orig<typeof import('../stores/helpers/draftStorage')>()), clearAllDrafts: vi.fn(),
+}));
+vi.mock('../stores/helpers/readStorage', async (orig) => ({
+  ...(await orig<typeof import('../stores/helpers/readStorage')>()), clearAllReads: vi.fn(),
+}));
 // The plan body is not under test; keep the markdown pipeline out of it.
 vi.mock('../components/Chat/MarkdownContent', () => ({
   MarkdownContent: ({ content }: { content: string }) => <div>{content}</div>,
@@ -84,6 +88,23 @@ beforeEach(() => {
   });
 });
 
+describe('PlanDetailPage summary', () => {
+  it('shows the summary from the agent under the title', async () => {
+    getPlan.mockResolvedValue(plan({ summary: 'Adds a toggle.\nOne PR in example/repo.' }));
+    renderPage();
+    expect(await screen.findByTestId('plan-summary')).toHaveTextContent('Adds a toggle. One PR in example/repo.');
+  });
+
+  it('shows the first heading and lines of a plan without a summary', async () => {
+    getPlan.mockResolvedValue(plan({
+      summary: null, content: '# Add a toggle\n\nThe settings page gets a switch.\n\n- Step one\n- Step two',
+    }));
+    renderPage();
+    expect(await screen.findByTestId('plan-summary'))
+      .toHaveTextContent('Add a toggle The settings page gets a switch. Step one');
+  });
+});
+
 describe('PlanDetailPage reviewer', () => {
   it('names the person who reviewed the plan', async () => {
     getPlan.mockResolvedValue(plan({
@@ -130,7 +151,7 @@ describe('PlanDetailPage reviewer', () => {
   it('shows no reviewer for a plan that nobody reviewed', async () => {
     getPlan.mockResolvedValue(plan({}));
     renderPage();
-    await screen.findByText('Ship it');
+    await screen.findByTestId('plan-summary');
     expect(screen.queryByTestId('plan-reviewer')).not.toBeInTheDocument();
     expect(screen.queryByTestId('plan-author')).not.toBeInTheDocument();
   });
