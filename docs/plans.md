@@ -214,10 +214,17 @@ of the same plan can both proceed.
 - Task link + implementation session link (when applicable)
 - Who proposed this version and who reviewed the plan, from the writer and
   reviewer columns
-- Action bar for pending plans:
-  - **Approve & Implement** — spawns implementation session, redirects to Chat
-  - **Decline** — marks plan as declined
-  - **Request Revision** — quote-style feedback input, sends to planner session
+- A decision bar at the bottom of the page for pending plans. It stays in view
+  at every scroll position, above the bottom nav on a phone. It uses the
+  decision controls of the chat's plan card (`PlanDecisionControls`):
+  - **Approve & implement** starts the implementation session and opens it
+    in Chat
+  - **Request revision…** opens a required "What should change?" field in the
+    bar; **Send** sends it to the session that proposed the plan
+  - **Decline…** opens an optional reason field in the bar; **Decline plan**
+    declines the plan and closes its task
+  - Cmd/Ctrl+Enter sends a field, Escape closes it. The buttons are disabled
+    while a decision is sent, and an error shows above them
 - Previous feedback shown as blockquote
 
 ## Telegram
