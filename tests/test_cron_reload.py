@@ -35,6 +35,8 @@ async def svc(tmp_path):
 
     db = AsyncMock()
     db.get_last_successful_cron_run = AsyncMock(return_value=None)
+    db.get_last_cron_runs = AsyncMock(return_value={})
+    db.get_cron_job_stats = AsyncMock(return_value={})
 
     service = CronService(config, AsyncMock(), db)
     # Start the scheduler paused so add/remove/replace_existing hit the real

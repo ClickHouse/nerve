@@ -12,7 +12,7 @@ git-syncable workspace subtree):
 | File | Purpose | Managed by |
 |------|---------|------------|
 | `system.yaml` | Built-in crons (core + productivity) | The Mode step of setup writes it (or `nerve init --terminal`); the Automation step flips its `enabled` flags — safe to regenerate with `nerve init --terminal` |
-| `jobs.yaml` | Your custom crons | You — Nerve never touches this file |
+| `jobs.yaml` | Your custom crons | You. Nerve changes only the `enabled` flag of a job, when you switch it on the Cron page (see [Switching a job on and off](#switching-a-job-on-and-off)) |
 
 > **Location & migration.** New installs write cron config to
 > `<workspace>/config/cron/`. Installs that still have the legacy
@@ -312,8 +312,8 @@ on every scheduled tick; `nerve doctor` names the jobs that still use this gate.
 
 A gate can also say ahead of time what it will decide. `forecast(ctx, at)`
 answers "would this gate let the job run at `at`?" from what is known now. Nerve
-asks it to show what each job's next run will do — `GET /api/cron/schedule`,
-`nerve cron next`, and the **Forecast** column on the Cron page — and to work out
+asks it to show what each job's next run will do (`GET /api/cron/schedule`,
+`nerve cron next`, and the next run on the Cron page), and to work out
 when the instance next has work of its own (see [What runs next](#what-runs-next)).
 The gate is still checked for real when the run comes; a forecast only predicts
 that check.
@@ -624,9 +624,10 @@ machine, more than 30 seconds before it ended, is not a late run: see
 
 `GET /api/cron/schedule` reports the next moment the instance will start work on
 its own, and what each job's next run is forecast to do. `nerve cron next` prints
-the same from the running daemon, and the Cron page shows each job's forecast in
-its card. The page lists the jobs without waiting for the forecasts, fills them
-in when they arrive, and goes on without them after 10 seconds.
+the same from the running daemon, and the Cron page shows the forecast under the
+next run of a job with gates, and a forecast skip of any job. The page lists the
+jobs without waiting for the forecasts, fills them in when they arrive, and goes
+on without them after 10 seconds.
 
 ```json
 {
@@ -758,7 +759,63 @@ Every cron and source run is logged in the `cron_logs` SQLite table:
   creates has that person as its cause, so the agent's work in it is the
   system actor's for that person. See
   [Attribution](accounts.md#attribution).
+- `records`: for a source run, the number of records that it fetched: stored
+  in the inbox plus dropped by the inbox guardrail. NULL for agent, workflow
+  and missed runs. A source run with `records = 0` and status `success` found
+  nothing new.
 
 Source runs also log to `source_run_log` with per-source diagnostics (records fetched/processed, errors).
 
-View logs via API: `GET /api/cron/logs?job_id=morning-briefing&limit=10`
+View logs via API: `GET /api/cron/logs?job_id=morning-briefing&limit=10`.
+Add `hide_empty=1` to leave out the source runs that found nothing new.
+
+## The Cron page
+
+The Cron page opens on the sheet of the first job: its name and kind (agent,
+workflow or source), an **Active** switch, **Run now**, the schedule in words
+with the next run, the latest run, and how many of the runs of the last 7 days
+succeeded. Below the sheet, **History** lists the runs, newest first, with ✓,
+✗ or − (missed), the duration and a link to the run's session. The history
+hides the source runs that found nothing new; **Show runs with no new items**
+shows them. **All jobs** in the job list shows the runs of every job.
+
+### Switching a job on and off
+
+The **Active** switch writes `enabled` into the job's YAML file and reloads the
+cron jobs (`PUT /api/cron/jobs/{job_id}/enabled`). The file is the one that
+defines the job: `jobs.yaml` for your own jobs and for a built-in job that
+`jobs.yaml` replaces, `system.yaml` for the other built-in jobs.
+
+Nerve changes one line of the file: the job's `enabled:` line, or, when the
+job has none, a new `enabled:` line under its `id:` line, with the indentation
+of the job's keys. Comments, quotes, block scalars and the rest of the file
+stay as they are. Nerve then reads the result again and writes it only if the
+job's `enabled` is the one difference. A layout where one line cannot do that
+(a job written as a flow mapping, `{id: ..., ...}`, for example) is refused,
+and the error tells you to change `enabled` in the file. When the reload after
+the change fails, the file gets its old text back and the error is shown.
+
+Nerve also refuses the change under [lockdown](config.md#lockdown-remote-only-read-only)
+(change the job in the config repository) and for a file that it cannot
+write. A source has no switch: switch it in its `sync` settings.
+
+### Failure notices
+
+An agent job that starts to fail sends a notification: **Cron job `<id>`
+failed**, priority `high`, with the first lines of the error. It names the
+run's session, so the web UI links to it. More failed runs send nothing. The
+first run that succeeds after that sends **Cron job `<id>` works again**,
+priority `low`. The job's previous run decides: the latest run of the job
+that started before this one and has a result. A run that fails after a
+success, or as the job's first recorded run, sends the first notice; a
+success after a failed run sends the second. Missed runs, and earlier runs
+that are still going, do not count. Two runs that overlap and both fail can
+each send the first notice. The daily cleanup deletes runs older than 14
+days, but it keeps the latest finished run of each job, so a job that runs
+less often than that and keeps failing does not send the notice again.
+
+The notices go through the notification service, so notification silences
+and the notification channels apply to them. Their
+metadata has `cron_job_id` and `cron_log_id`. A failing job is not switched
+off. Workflow-run jobs and source runners are left out: a workflow run sends
+its own notices, and a source sends its health notices.

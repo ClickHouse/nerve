@@ -1681,11 +1681,47 @@ and workflow runs that were cancelled while still queued, are not counted,
 so `cost_usd / runs` is the average cost per run. Jobs without usage are
 omitted.
 
-#### `GET /api/cron/logs?job_id=&limit=50&offset=0`
+#### `GET /api/cron/jobs`
+The cron jobs and source runners, with their schedule and next run. Each job
+also has:
+
+| Field | Meaning |
+|---|---|
+| `kind` | `agent`, `workflow` (a workflow-run job) or `source` |
+| `last_run` | `{status, started_at, finished_at}` of the latest run, or `null`. `status` is `null` while the run goes on |
+| `stats_7d` | `{runs, success, error, missed}`: the runs that started in the last 7 days |
+
+```json
+Response: { "jobs": [ { "id": "daily-digest", "type": "cron", "kind": "agent", "enabled": true,
+  "schedule": "0 8 * * *", "next_run": "2026-03-02T08:00:00+00:00",
+  "last_run": { "status": "success", "started_at": "2026-03-01 08:00:00", "finished_at": "2026-03-01T08:00:41+00:00" },
+  "stats_7d": { "runs": 7, "success": 6, "error": 1, "missed": 0 }, ... } ] }
+```
+
+#### `PUT /api/cron/jobs/{job_id}/enabled`
+Switch a cron job on or off. Writes `enabled` into the job's YAML file and
+reloads the cron jobs (see
+[Switching a job on and off](cron.md#switching-a-job-on-and-off)). A person's
+action: a system or MCP token gets `403`. Only the job's `enabled:` line
+changes. `404` for an unknown job or a source; `409` with the reason under
+lockdown, for a file that Nerve cannot write, and for a layout where one line
+cannot make the change; `400` when the reload refuses the files, which then
+get their old text back.
+
+```json
+Request:  { "enabled": false }
+Response: { "job_id": "daily-digest", "enabled": false }
+```
+
+#### `GET /api/cron/logs?job_id=&limit=50&offset=0&hide_empty=0`
 Get cron job execution logs, newest first. `limit` is clamped to 1–200;
 combine with `offset` for pagination. Each log row carries the
 `session_id` of the chat session the run executed in (null for source
-runners and missed runs).
+runners and missed runs), and `records`: the records that a source run
+fetched, stored plus dropped by the inbox guardrail (null for other runs). `hide_empty=1` leaves out the source runs
+that found nothing new (`records = 0`, status `success`); `total` counts
+the rows that the filter keeps. `empty` is the number of those source runs,
+with or without the filter.
 
 Each log row also carries `actor_id` (who started the run) and
 `caused_by_actor_id` (on whose behalf). Both are the system actor for a
@@ -1695,8 +1731,9 @@ scheduled run, and the person for a run that a person started with
 
 ```json
 Response: {
-  "logs": [ { "id": 12, "job_id": "...", "status": "success", "session_id": "cron:...", "actor_id": "…", "caused_by_actor_id": "…", ... } ],
+  "logs": [ { "id": 12, "job_id": "...", "status": "success", "session_id": "cron:...", "records": null, "actor_id": "…", "caused_by_actor_id": "…", ... } ],
   "total": 234,
+  "empty": 5400,
   "limit": 50,
   "offset": 0
 }

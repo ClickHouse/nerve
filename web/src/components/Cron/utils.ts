@@ -1,4 +1,5 @@
-import type { CronJob } from '../../stores/cronStore';
+import cronstrue from 'cronstrue';
+import type { CronJob, CronJobStats } from '../../stores/cronStore';
 
 /** Chat-page path for a session id. */
 export function chatPath(sessionId: string): string {
@@ -48,26 +49,52 @@ export function formatDuration(startIso: string, endIso: string | null): string 
   return `${mins}m ${remSecs}s`;
 }
 
-export function formatSchedule(schedule: string): string {
-  // Try to produce a human-readable label for common patterns
-  if (/^\d+[hm]$/.test(schedule)) return `every ${schedule}`;
-  if (/^\*\/(\d+) \* \* \* \*$/.test(schedule)) {
-    const m = schedule.match(/^\*\/(\d+)/);
-    return `every ${m![1]}m`;
-  }
-  if (/^0 (\d+) \* \* \*$/.test(schedule)) {
-    const m = schedule.match(/^0 (\d+)/);
-    return `daily at ${m![1]}:00`;
-  }
-  return schedule;
+/** An interval schedule (`2h`, `30m`, `1h30m`, `0.5h`) in words, or null. */
+export function formatSchedule(schedule: string): string | null {
+  const compact = schedule.replace(/\s+/g, '');
+  if (!/^(\d+(\.\d+)?[hms])+$/i.test(compact)) return null;
+  return `Every ${compact.toLowerCase().replace(/([hms])(?=\d)/g, '$1 ')}`;
 }
 
-/** What the job's next run is forecast to do: "run", "skip — <reason>", or "—"
- *  when there is no forecast (no next run). */
-export function formatForecast(job: Pick<CronJob, 'forecast' | 'forecast_reason'>): string {
-  if (job.forecast === 'run') return 'run';
-  if (job.forecast === 'skip') return job.forecast_reason ? `skip — ${job.forecast_reason}` : 'skip';
-  return '—';
+/** Whether a schedule is a 5-field crontab expression (not an interval). */
+export function isCrontab(schedule: string): boolean {
+  return schedule.trim().split(/\s+/).length === 5;
+}
+
+/**
+ * A job's schedule in words: `cronstrue` for a crontab expression ("At 08:00"),
+ * `formatSchedule` for an interval ("Every 2h"), or the schedule as written
+ * when neither can read it.
+ */
+export function describeSchedule(schedule: string): string {
+  if (isCrontab(schedule)) {
+    try {
+      return cronstrue.toString(schedule, { use24HourTimeFormat: true });
+    } catch {
+      return schedule;
+    }
+  }
+  return formatSchedule(schedule) ?? schedule;
+}
+
+/** What the job's next run is forecast to do, or null when there is no forecast. */
+export function formatForecast(job: Pick<CronJob, 'forecast' | 'forecast_reason'>): string | null {
+  if (job.forecast === 'run') return 'Will run';
+  if (job.forecast === 'skip') return job.forecast_reason ? `Will skip: ${job.forecast_reason}` : 'Will skip';
+  return null;
+}
+
+/** A run's start as a short local date and time, for example "Nov 7, 8:04 AM". */
+export function formatRunTime(iso: string): string {
+  return new Date(parseUTC(iso)).toLocaleString(undefined, {
+    month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  });
+}
+
+/** "6 of 7 succeeded" over the finished runs of the last 7 days, or null without runs. */
+export function formatSuccess(stats: CronJobStats): string | null {
+  const finished = stats.success + stats.error + stats.missed;
+  return finished > 0 ? `${stats.success} of ${finished} succeeded` : null;
 }
 
 /** Display label: always the job name (id) — descriptions go in tooltips. */
