@@ -20,7 +20,7 @@ const UNAVAILABLE: Partial<Record<AlertSupport, { badge: string; tone: BadgeTone
   unsupported: {
     badge: 'Not supported',
     tone: 'neutral',
-    help: 'This browser cannot show system alerts.',
+    help: 'This browser cannot show alerts.',
   },
 };
 
@@ -31,7 +31,7 @@ const UNAVAILABLE: Partial<Record<AlertSupport, { badge: string; tone: BadgeTone
  * writes none of the section's fields.
  */
 export function ThisBrowserRow() {
-  const titleId = useId();
+  const labelId = useId();
   const alerts = useBrowserAlertStore();
   const quietHours = useSettingsStore((s) => Boolean(
     s.notifications?.fields.quiet_start.value && s.notifications.fields.quiet_end.value,
@@ -44,12 +44,11 @@ export function ThisBrowserRow() {
     <SettingRow
       icon={<Globe size={16} />}
       title="This browser"
-      titleId={titleId}
-      description="System alerts while a panel tab is open but not in front."
+      description={<span id={labelId}>Alerts while a tab is open</span>}
       control={unavailable ? <Badge tone={unavailable.tone}>{unavailable.badge}</Badge> : (
         <Switch
           checked={on}
-          aria-labelledby={titleId}
+          aria-labelledby={labelId}
           onChange={(next) => void (next ? alerts.turnOn() : alerts.turnOff())}
         />
       )}
