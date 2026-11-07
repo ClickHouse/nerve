@@ -28,7 +28,7 @@ export {
   FilePlus, FileText, FileX, Files, Filter, Folder, FolderOpen, GitBranch,
   Github, Globe, GripVertical, Hammer, HardDrive, HelpCircle, History,
   Hourglass, Inbox, Lightbulb, List, ListTodo, Loader2, Lock, LogOut, Mail,
-  Maximize2, MessageCircle, MessageCircleQuestion, MessageSquare, Monitor,
+  Maximize2, MessageCircle, MessageCircleQuestion, MessageSquare, MessagesSquare, Monitor,
   Moon, MoreHorizontal, OctagonX, PanelLeftClose, PanelLeftOpen, Paperclip,
   Pause, Pencil, Play, Plug, Plus, Radio, RefreshCw, Repeat, Reply, Rocket,
   RotateCcw, RotateCw, Save, Search, SearchCheck, Send, Server, Settings,
