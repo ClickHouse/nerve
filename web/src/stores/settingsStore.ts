@@ -29,8 +29,8 @@ export interface SettingsStoreState {
   loadNotifications: () => Promise<void>;
   /** Sends the changed fields; true when the server took them. */
   saveNotifications: (values: NotificationSettingValues) => Promise<boolean>;
+  /** Sends a test once the saves in flight are done. */
   sendTest: () => Promise<void>;
-  reset: () => void;
 }
 
 const INITIAL = {
@@ -52,7 +52,8 @@ let saves: Promise<unknown> = Promise.resolve();
 /**
  * The Settings page's sections. Saves run one after another, in the order
  * the person made the changes, so a click while a text field saves on blur
- * is not lost. The controls of the fields in flight show busy.
+ * is not lost. A test waits for them, so it uses the saved configuration,
+ * and a change clears the result of the last test.
  */
 export const useSettingsStore = create<SettingsStoreState>((set, get) => ({
   ...INITIAL,
@@ -68,6 +69,7 @@ export const useSettingsStore = create<SettingsStoreState>((set, get) => ({
   },
 
   saveNotifications: (values) => {
+    set({ testResult: null, testError: null });
     const run = saves.then(async () => {
       set({ saving: Object.keys(values) as NotificationSettingPath[], saved: false, saveError: null });
       try {
@@ -87,12 +89,11 @@ export const useSettingsStore = create<SettingsStoreState>((set, get) => ({
   sendTest: async () => {
     if (get().testing) return;
     set({ testing: true, testResult: null, testError: null });
+    await saves;
     try {
       set({ testing: false, testResult: await api.testSettingsNotifications() });
     } catch (e) {
       set({ testing: false, testError: errorDetail(e, 'The test was not sent.') });
     }
   },
-
-  reset: () => set(INITIAL),
 }));

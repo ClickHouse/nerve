@@ -22,7 +22,7 @@ const store = () => useSettingsStore.getState();
 
 beforeEach(() => {
   vi.clearAllMocks();
-  store().reset();
+  useSettingsStore.setState(useSettingsStore.getInitialState(), true);
 });
 
 describe('settingsStore', () => {
@@ -69,6 +69,28 @@ describe('settingsStore', () => {
     api.settingsNotifications.mockResolvedValue(BODY);
     await store().loadNotifications();
     expect(store()).toMatchObject({ saved: false, saveError: null, reloadErrors: {}, notifications: BODY });
+  });
+
+  it('sends a test after the save in flight, and a change clears the last result', async () => {
+    let answer: (body: NotificationSettings) => void = () => {};
+    api.saveSettingsNotifications.mockReturnValueOnce(new Promise((resolve) => { answer = resolve; }));
+    const result = { notification_id: 'notif-1', silenced: false, results: [{ channel: 'web', delivered: true }] };
+    api.testSettingsNotifications.mockResolvedValue(result);
+    useSettingsStore.setState({ testResult: result });
+
+    const saved = store().saveNotifications({ 'notifications.slack_channel_id': 'C0456DEFG' });
+    expect(store().testResult).toBeNull();
+    const tested = store().sendTest();
+    await Promise.resolve();
+    expect(api.testSettingsNotifications).not.toHaveBeenCalled();
+
+    answer(BODY);
+    await saved;
+    await tested;
+    expect(api.testSettingsNotifications).toHaveBeenCalledTimes(1);
+    expect(api.saveSettingsNotifications.mock.invocationCallOrder[0])
+      .toBeLessThan(api.testSettingsNotifications.mock.invocationCallOrder[0]);
+    expect(store().testResult).toEqual(result);
   });
 
   it('keeps the error of a test that was not sent', async () => {

@@ -56,7 +56,7 @@ const refusal = (status: number, body: object) => new Error(`${status}: ${JSON.s
 
 beforeEach(() => {
   vi.clearAllMocks();
-  useSettingsStore.getState().reset();
+  useSettingsStore.setState(useSettingsStore.getInitialState(), true);
 });
 
 describe('NotificationsSection', () => {
