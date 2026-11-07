@@ -166,6 +166,13 @@ describe('NotificationsPage attribution', () => {
     await waitFor(() => expect(attributions()).toEqual(['Alice', 'Nerve for Bob']));
   });
 
+  it('opens the silences manager for a link from Settings', async () => {
+    listNotifications.mockResolvedValue({ notifications: [], pending_count: 0 });
+    listSilences.mockResolvedValue({ silences: [silence({ id: 'sil-web', created_by_actor_id: ALICE })] });
+    render(<MemoryRouter initialEntries={['/notifications?silences=1']}><NotificationsPage /></MemoryRouter>);
+    expect(await screen.findByRole('heading', { name: 'Silences' })).toBeInTheDocument();
+  });
+
   it('updates the answerer from the answer broadcast', async () => {
     listNotifications.mockResolvedValue({
       notifications: [notification({
