@@ -1630,6 +1630,22 @@ combine with `offset` for pagination. Each log row carries the
 `session_id` of the chat session the run executed in (null for source
 runners and missed runs).
 
+For a cron row linked to a workflow,
+`status`, `finished_at`, `output` and `error` reflect the workflow at read
+time. `output` is its `result`; `status` is `pending`, `running`, `done`,
+`failed`, `killed` or `budget_exhausted`. `started_at` remains the cron
+attempt's start, including queue time. Active workflows have
+`finished_at: null`. These rows also contain `workflow_id` and a `dispatch`
+object with the original `status`, `finished_at`, `output` and `error`.
+The workflow must match both the `workflow:<id>` session link and
+`created_by = cron:<job_id>`; a missing or mismatched workflow returns
+`status: "unavailable"`, null `finished_at`/`output`, and an explanatory
+`error`. This projection covers old rows without changing stored logs or
+scheduling queries. Ordinary runs, failures before workflow creation and lock skips are
+unchanged and do not carry `workflow_id` or `dispatch`. A recording error
+after the workflow was created stays in `dispatch`; it does not override
+the linked workflow's outcome.
+
 Each log row also carries `actor_id` (who started the run) and
 `caused_by_actor_id` (on whose behalf). Both are the system actor for a
 scheduled run, and the person for a run that a person started with

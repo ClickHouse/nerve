@@ -1,5 +1,7 @@
 import { create } from 'zustand';
-import { api, type CronSchedule } from '../api/client';
+import { api, type CronLog, type CronSchedule } from '../api/client';
+
+export type { CronLog } from '../api/client';
 
 export const LOGS_PAGE_SIZE = 50;
 
@@ -75,18 +77,7 @@ async function loadSchedule(): Promise<CronSchedule | null> {
 
 /** Counts loadJobs calls, so that answers to an older one never replace a newer one's. */
 let jobsLoads = 0;
-
-export interface CronLog {
-  id: number;
-  job_id: string;
-  started_at: string;
-  finished_at: string | null;
-  status: string | null;
-  output: string | null;
-  error: string | null;
-  /** Session the run executed in — deep-links to the chat page. */
-  session_id?: string | null;
-}
+let logsLoads = 0;
 
 interface CronState {
   jobs: CronJob[];
@@ -137,15 +128,23 @@ export const useCronStore = create<CronState>((set, get) => ({
   },
 
   loadLogs: async (offset?: number) => {
+    const load = ++logsLoads;
     const { selectedJobId, logsOffset } = get();
     const effectiveOffset = offset ?? logsOffset;
-    set({ loading: true });
+    // Record the requested page now: a workflow event arriving while this
+    // request is in flight must refresh this page, not the previous one.
+    set({
+      loading: true, logsOffset: effectiveOffset,
+      ...(effectiveOffset !== logsOffset ? { logs: [] } : {}),
+    });
     try {
       const { logs, total } = await api.getCronLogs(
         selectedJobId || undefined, LOGS_PAGE_SIZE, effectiveOffset,
       );
-      set({ logs, logsTotal: total, logsOffset: effectiveOffset, loading: false });
+      if (load !== logsLoads) return;
+      set({ logs, logsTotal: total, loading: false });
     } catch (e) {
+      if (load !== logsLoads) return;
       console.error('Failed to load cron logs:', e);
       set({ loading: false });
     }
@@ -156,7 +155,7 @@ export const useCronStore = create<CronState>((set, get) => ({
   },
 
   selectJob: (jobId: string | null) => {
-    set({ selectedJobId: jobId, logsOffset: 0 });
+    set({ selectedJobId: jobId, logsOffset: 0, logs: [], logsTotal: 0 });
     get().loadLogs(0);
   },
 

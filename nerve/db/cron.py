@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from nerve.db.workflow_runs import ACTIVE_STATUSES
 from nerve.identity import UNATTRIBUTED, Attribution
 from nerve.utils.time import utc_now_iso
 
@@ -76,6 +77,11 @@ class CronStore:
     async def get_cron_logs(
         self, job_id: str | None = None, limit: int = 50, offset: int = 0,
     ) -> list[dict]:
+        """Read the history with workflow outcomes, leaving dispatch rows intact.
+
+        Scheduling queries below deliberately read the stored launch result.
+        This projection also works for old logs and after a daemon restart.
+        """
         # Secondary sort on id keeps pagination stable when several runs
         # share the same started_at second.
         if job_id:
@@ -90,8 +96,44 @@ class CronStore:
                 "ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?"
             )
             params = (limit, offset)
+        # Join only the requested page, using the workflow primary key. Match
+        # the origin as well as the id so a stray link cannot borrow another
+        # job's result. No per-row queries or workflow spec loading.
+        query = f"""
+            SELECT logs.*, run.id AS wf_id, run.status AS wf_status,
+                   run.finished_at AS wf_finished_at,
+                   run.result AS wf_output, run.error AS wf_error
+            FROM ({query}) AS logs
+            LEFT JOIN workflow_runs AS run
+              ON run.id = substr(logs.session_id, 10)
+             AND substr(logs.session_id, 1, 9) = 'workflow:'
+             AND run.created_by = 'cron:' || logs.job_id
+            ORDER BY logs.started_at DESC, logs.id DESC
+        """
         async with self.db.execute(query, params) as cursor:
-            return [dict(row) async for row in cursor]
+            logs = [dict(row) async for row in cursor]
+        for log in logs:
+            workflow = {
+                key: log.pop(f"wf_{key}")
+                for key in ("id", "status", "finished_at", "output", "error")
+            }
+            session_id = log.get("session_id") or ""
+            if not session_id.startswith("workflow:"):
+                continue
+            log["workflow_id"] = session_id.removeprefix("workflow:")
+            log["dispatch"] = {
+                key: log[key] for key in ("status", "finished_at", "output", "error")
+            }
+            if workflow["id"] is None:
+                log.update(
+                    status="unavailable", finished_at=None, output=None,
+                    error="Workflow result is unavailable.",
+                )
+            else:
+                log.update({key: value for key, value in workflow.items() if key != "id"})
+                if log["status"] in ACTIVE_STATUSES:
+                    log["finished_at"] = None
+        return logs
 
     async def count_cron_logs(self, job_id: str | None = None) -> int:
         if job_id:

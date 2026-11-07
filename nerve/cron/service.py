@@ -1894,7 +1894,8 @@ class CronService:
     ) -> None:
         """Start the workflow run a job declares instead of a prompt.
 
-        Fire-and-forget: the cron log records only the launch. The run
+        Fire-and-forget: the stored cron log records only the launch;
+        history reads project the linked workflow's outcome. The run
         owns its ``workflow:<run-id>`` session and sends its own budget /
         completion / failure notifications — no cron session is created
         and the job does not wait for the run to finish.

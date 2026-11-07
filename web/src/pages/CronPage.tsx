@@ -9,9 +9,10 @@ import { PageHeader } from '../components/ui/PageHeader';
 import { PaneToggle } from '../components/ui/PaneToggle';
 import { Drawer } from '../components/ui/Drawer';
 import { useIsMobile } from '../hooks/useMediaQuery';
+import { ws } from '../api/websocket';
 
 export function CronPage() {
-  const { jobs, selectedJobId, loadJobs, loadLogs, refresh } = useCronStore();
+  const { jobs, logs, selectedJobId, loadJobs, loadLogs, refresh } = useCronStore();
   const [refreshing, setRefreshing] = useState(false);
 
   // The job list is "which item within this section", so on a phone it
@@ -37,10 +38,28 @@ export function CronPage() {
   }
 
   useEffect(() => {
-    loadJobs();
-    loadLogs();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    void loadJobs();
+    void loadLogs();
+    const offMessage = ws.onMessage(msg => {
+      if (msg.type !== 'workflow_run_update' || !msg.run.created_by.startsWith('cron:')) return;
+      const selected = useCronStore.getState().selectedJobId;
+      if (!selected || msg.run.created_by === `cron:${selected}`) void loadLogs();
+    });
+    // A completed run may have changed while the socket was disconnected.
+    const offOpen = ws.onOpen(() => { void loadLogs(); });
+    return () => { offMessage(); offOpen(); };
+  }, [loadJobs, loadLogs]);
+
+  const hasActive = logs.some(log => !log.status || log.status === 'pending' || log.status === 'running');
+  useEffect(() => {
+    if (!hasActive) return;
+    // Covers a missed event and the brief gap between workflow creation and
+    // linking its cron log. Read the current filter/page on every refresh.
+    const timer = window.setInterval(() => {
+      if (!useCronStore.getState().loading) void loadLogs();
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, [hasActive, loadLogs]);
 
   const handleRefresh = async () => {
     if (refreshing) return;

@@ -31,13 +31,20 @@ export function JobTypeBadge({ type }: { type: string }) {
 }
 
 export function StatusBadge({ status }: { status: string | null | undefined }) {
-  if (status === 'success') {
-    return <span className="flex items-center gap-1 text-success"><CheckCircle2 size={12} /> ok</span>;
+  if (status === 'success' || status === 'done') {
+    return <span className="flex items-center gap-1 text-success"><CheckCircle2 size={12} /> {status === 'done' ? 'done' : 'ok'}</span>;
   }
-  if (status === 'error') {
-    return <span className="flex items-center gap-1 text-error"><XCircle size={12} /> error</span>;
+  if (status === 'error' || status === 'failed') {
+    return <span className="flex items-center gap-1 text-error"><XCircle size={12} /> {status}</span>;
   }
-  if (!status) {
+  if (status === 'pending') {
+    return <span className="flex items-center gap-1 text-warning"><Clock size={12} /> pending</span>;
+  }
+  if (status === 'killed' || status === 'budget_exhausted' || status === 'unavailable') {
+    const label = status === 'budget_exhausted' ? 'budget exhausted' : status;
+    return <span className="flex items-center gap-1 text-warning"><XCircle size={12} /> {label}</span>;
+  }
+  if (!status || status === 'running') {
     return (
       <span className="flex items-center gap-1 text-warning">
         <Loader2 size={12} className="animate-spin" /> running
