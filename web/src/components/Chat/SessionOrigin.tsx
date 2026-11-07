@@ -30,11 +30,15 @@ export function SessionOriginIcon({ session }: { session: Session }) {
  * from, the person who wrote the first message when that is someone else,
  * and a link to the page of the origin. Nothing for a plain web chat, and
  * nothing for a fork, which has its own line under the header.
+ *
+ * The row comes from the loaded session lists, else from `unlisted`: the
+ * row that the page read by id.
  */
-export function SessionOriginLine() {
-  const session = useChatStore((s) => findSessionById(
+export function SessionOriginLine({ unlisted }: { unlisted?: Session | null }) {
+  const listed = useChatStore((s) => findSessionById(
     s.activeSession, s.sessions, s.archivedSessions, s.systemSessions,
   ));
+  const session = listed ?? unlisted ?? undefined;
   const viewerActorId = useAuthStore((s) => s.viewer?.id ?? null);
   const creatorId = session && startedByPerson(session) ? session.created_by_actor_id : null;
   const creator = useAttribution(creatorId !== viewerActorId ? creatorId : null);

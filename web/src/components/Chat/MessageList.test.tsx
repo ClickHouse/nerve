@@ -100,4 +100,24 @@ describe('origin line', () => {
     expect(line.compareDocumentPosition(screen.getByText('tidy up')))
       .toBe(Node.DOCUMENT_POSITION_FOLLOWING);
   });
+
+  it('uses the row that the page read for a session that no list has', () => {
+    useChatStore.setState({
+      activeSession: 'cron:nightly:2', sessions: [], archivedSessions: null, systemSessions: null,
+    });
+    render(
+      <MemoryRouter>
+        <MessageList
+          messages={[{ role: 'user', blocks: [{ type: 'text', content: 'tidy up' }] }]}
+          isStreaming={false}
+          unlistedSession={{
+            id: 'cron:nightly:2', title: 'Cron: nightly', source: 'cron',
+            updated_at: '2026-01-01T00:00:00Z', trigger: 'cron',
+            origin_label: 'Started by cron job nightly', origin_detail: { cron_job: 'nightly' },
+          }}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId('session-origin')).toHaveTextContent('Started by cron job nightly');
+  });
 });
