@@ -1,11 +1,11 @@
 import { Fragment, useId, useState } from 'react';
-import { Check, ChevronDown, ChevronUp, Clock } from '../ui/icons';
+import { ChevronDown, ChevronUp, Clock } from '../ui/icons';
 import { Button } from '../ui';
 import { ActorAttribution } from '../Chat/ActorLabel';
 import { useNotificationStore, type Notification } from '../../stores/notificationStore';
 import { formatMessageTime } from '../../utils/messageTime';
 import { notificationOptions } from './askOptions';
-import { OptionList } from './OptionList';
+import { AnswerIcon, OptionList } from './OptionList';
 
 /** The statuses that end a question without an answer, and how the card says so. */
 const CLOSED_TEXT: Record<string, string> = {
@@ -65,18 +65,19 @@ export function NotificationOptions({ notif, onAnswered }: {
   const closed = CLOSED_TEXT[notif.status];
   if (!answered && !closed) return null;
   const answer = notif.answer ?? '';
+  const chosen = options.find(o => o.value === answer);
   return (
     <div className="mt-3">
       <div className="flex items-start gap-2">
         {answered
-          ? <Check size={14} className="shrink-0 mt-0.5 text-success" aria-hidden="true" />
+          ? <AnswerIcon mark={chosen?.mark} />
           : <Clock size={14} className="shrink-0 mt-0.5 text-text-faint" aria-hidden="true" />}
         <div className="flex-1 min-w-0">
           {answered ? (
             <>
               <p className="text-sm font-medium text-text break-words">
                 <span className="sr-only">Answer: </span>
-                {options.find(o => o.value === answer)?.label ?? answer}
+                {chosen?.label ?? answer}
               </p>
               <AnswerMeta notif={notif} />
             </>
