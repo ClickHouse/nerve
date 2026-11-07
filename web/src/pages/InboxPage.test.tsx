@@ -130,6 +130,20 @@ describe('the Inbox on a phone', () => {
     expect(location()).toHaveTextContent('/inbox');
   });
 
+  it('says that the send failed until the person types again', async () => {
+    startChat.mockResolvedValue(null);
+    renderInbox();
+    const box = screen.getByRole('textbox', { name: 'Message Nerve' });
+    expect(screen.queryByRole('alert')).toBeNull();
+
+    await userEvent.type(box, 'Plan my week');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not send. Try again.');
+    await userEvent.type(box, '!');
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
   it('names the agent from the setup checklist', () => {
     useSetupStore.setState({
       state: makeState({ steps: [step('profile', {}, { agent_name: 'Ada' })] }),
