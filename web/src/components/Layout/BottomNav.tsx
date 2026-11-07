@@ -44,7 +44,7 @@ export function BottomNav() {
 
   // Setup stays in the drawer also when it is finished: the drawer is
   // already the place for rarely used destinations.
-  const available = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown, setupFinished: false });
+  const available = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown, setupFinished: false, phone: true });
   const primary = PRIMARY_PATHS
     .map(p => available.find(i => i.path === p))
     .filter((i): i is NavItem => Boolean(i));

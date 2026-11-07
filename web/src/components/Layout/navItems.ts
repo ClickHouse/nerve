@@ -1,5 +1,5 @@
 import {
-  MessageSquare, FolderOpen, CheckSquare, Inbox, Activity, Brain, Clock,
+  MessageSquare, MessagesSquare, FolderOpen, CheckSquare, Inbox, Activity, Brain, Clock,
   Lightbulb, Sparkles, Bell, Plug, Workflow, Rocket, Users, ShieldCheck, type Icon,
 } from '../ui/icons';
 
@@ -15,11 +15,13 @@ export type NavItem = {
    *  not finished; hidden while the checklist is unknown (an older backend,
    *  or before the first read answers). When setup is finished, a gear in
    *  the nav rail footer links to `/setup`; the phone's "More" drawer keeps
-   *  the entry. */
-  feature?: 'ultracode' | 'accounts' | 'setup';
+   *  the entry. `phone` is enabled only in the phone layout: the desktop
+   *  chat page already shows the session list next to the chat. */
+  feature?: 'ultracode' | 'accounts' | 'setup' | 'phone';
 };
 
 export const NAV_ITEMS: NavItem[] = [
+  { path: '/inbox', icon: MessagesSquare, label: 'Inbox', feature: 'phone' },
   { path: '/chat', icon: MessageSquare, label: 'Chat' },
   { path: '/notifications', icon: Bell, label: 'Notifs' },
   { path: '/files', icon: FolderOpen, label: 'Files' },
@@ -45,6 +47,8 @@ export interface NavVisibility {
   setupKnown: boolean;
   /** The checklist says that setup is finished. */
   setupFinished: boolean;
+  /** The phone layout (the bottom bar), not the desktop nav rail. */
+  phone: boolean;
 }
 
 /**
@@ -53,8 +57,9 @@ export interface NavVisibility {
  * store with `getState()` inside a render-time filter, which would not
  * re-render when the answer changes.
  */
-export function visibleNavItems(items: NavItem[], { hosted, ultracodeEnabled, setupKnown, setupFinished }: NavVisibility): NavItem[] {
+export function visibleNavItems(items: NavItem[], { hosted, ultracodeEnabled, setupKnown, setupFinished, phone }: NavVisibility): NavItem[] {
   return items.filter((item) => {
+    if (item.feature === 'phone' && !phone) return false;
     if (item.feature === 'ultracode' && !ultracodeEnabled) return false;
     if (item.feature === 'accounts' && hosted) return false;
     if (item.feature === 'setup' && (!setupKnown || setupFinished)) return false;
@@ -67,12 +72,14 @@ export function visibleNavItems(items: NavItem[], { hosted, ultracodeEnabled, se
  * everything else lives behind "More".
  *
  * These are the ones you open to *decide* something — read what the agent
- * said, check a task, approve a plan, answer a blocking question. Notifs
- * earns its slot by carrying the pending-question badge, which is the whole
- * reason to open the panel on a phone and is useless if it is hidden behind
- * a menu. The rest (files, skills, MCP, cron, memory, diagnostics, sources)
+ * said, check a task, answer a blocking question. Inbox is the session list
+ * with the sessions that need you at the top, pending plans included, so
+ * Plans is behind "More". Notifs earns its slot by carrying the
+ * pending-question badge, which is the whole reason to open the panel on a
+ * phone and is useless if it is hidden behind a menu. The rest (files,
+ * skills, MCP, cron, memory, diagnostics, sources)
  * are configuration and inspection surfaces — reached deliberately, rarely
  * in a hurry. Accounts is the same kind of thing: opened once when somebody
  * joins or leaves, never in a hurry. Setup likewise.
  */
-export const PRIMARY_PATHS = ['/chat', '/tasks', '/notifications', '/plans'];
+export const PRIMARY_PATHS = ['/inbox', '/chat', '/tasks', '/notifications'];
