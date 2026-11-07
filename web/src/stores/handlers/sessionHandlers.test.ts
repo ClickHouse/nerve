@@ -200,14 +200,17 @@ describe('handleSessionStatus — the agent roster', () => {
     expect(store.current().isStreaming).toBe(false);
   });
 
-  it('keeps the Agents panel and agent tabs when a running turn replays', () => {
+  it('keeps the Agents panel, agent tabs and the Tasks tab when a running turn replays', () => {
     const tab = (id: string, type: PanelTab['type']): PanelTab => ({
       id, type, label: id, subagentType: id, description: '', content: null, prompt: '',
       streaming: false, status: 'running', startedAt: 1, blocks: [],
     });
     const store = fakeStore([row(fx.FX_SESSION_ID)], fx.FX_SESSION_ID);
     store.set({
-      panels: [tab('agents-panel', 'agents'), tab(`agent:${fx.FX_RUNNING.id}`, 'agent'), tab('toolu_old', 'subagent')],
+      panels: [
+        tab('agents-panel', 'agents'), tab(`agent:${fx.FX_RUNNING.id}`, 'agent'), tab('tasks-panel', 'tasks'),
+        tab('toolu_old', 'subagent'),
+      ],
       activePanelId: `agent:${fx.FX_RUNNING.id}`,
       panelVisible: true,
     });
@@ -222,7 +225,7 @@ describe('handleSessionStatus — the agent roster', () => {
     }), store.get, store.set);
 
     const s = store.current();
-    expect(s.panels.map(p => p.id)).toEqual(['agents-panel', `agent:${fx.FX_RUNNING.id}`, 'toolu_wf']);
+    expect(s.panels.map(p => p.id)).toEqual(['agents-panel', `agent:${fx.FX_RUNNING.id}`, 'tasks-panel', 'toolu_wf']);
     expect(s.activePanelId).toBe(`agent:${fx.FX_RUNNING.id}`);
     expect(s.panelVisible).toBe(true);
     expect(s.streamingBlocks.map(b => b.type === 'tool_call' && b.tool)).toEqual(['Workflow', 'Agent']);
