@@ -75,7 +75,6 @@ export function ThisBrowserRow() {
       {(on || pushOn) && quietHours && (
         <p className="text-xs text-text-dim">During quiet hours, alerts make no sound unless urgent.</p>
       )}
-      <p className="text-2xs text-text-faint">Applies to this browser only</p>
       <OtherDevices />
     </SettingRow>
   );
