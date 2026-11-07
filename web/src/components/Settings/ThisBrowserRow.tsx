@@ -47,11 +47,12 @@ export function ThisBrowserRow() {
   }, []);
 
   const pushOn = usePushStore((s) => thisDevice(s) !== undefined);
+  const pushBusy = usePushStore((s) => s.busy);
   const unavailable = UNAVAILABLE[alerts.support];
   const on = alertsOn(alerts);
-  const setLevel = (level: NotificationLevel) => {
-    alerts.setLevel(level);
-    void usePushStore.getState().setLevel(level);
+  // The choice changes after push took it, so a failed save keeps the level that push uses.
+  const setLevel = async (level: NotificationLevel) => {
+    if (await usePushStore.getState().setLevel(level)) alerts.setLevel(level);
   };
   return (
     <SettingRow
@@ -68,7 +69,9 @@ export function ThisBrowserRow() {
     >
       {unavailable && <p className="text-xs text-text-dim">{unavailable.help}</p>}
       <PushSwitch />
-      {(on || pushOn) && <LevelChoice value={alerts.level} disabled={false} busy={false} onChange={setLevel} />}
+      {(on || pushOn) && (
+        <LevelChoice value={alerts.level} disabled={false} busy={pushBusy} onChange={(level) => void setLevel(level)} />
+      )}
       {(on || pushOn) && quietHours && (
         <p className="text-xs text-text-dim">During quiet hours, alerts make no sound unless urgent.</p>
       )}

@@ -85,6 +85,32 @@ describe('pushStore', () => {
     expect(subscription.unsubscribe).toHaveBeenCalled();
   });
 
+  it('runs both steps of turning off and reads the state again when one fails', async () => {
+    stubBrowser({ permission: 'granted' });
+    const subscription = fakeSubscription();
+    subscription.unsubscribe.mockRejectedValueOnce(new Error('unsubscribe failed'));
+    stubPushBrowser({ subscription });
+    api.pushDevices.mockResolvedValue({ public_key: PUBLIC_KEY, subscriptions: [device({ id: 7 })] });
+    await store().load();
+    api.pushDevices.mockClear();
+    api.pushDevices.mockResolvedValue({ public_key: PUBLIC_KEY, subscriptions: [] });
+
+    expect(await store().turnOff()).toBe(false);
+
+    expect(api.deletePushDevice).toHaveBeenCalledWith(7);
+    expect(api.pushDevices).toHaveBeenCalled();
+    expect(thisDevice(store())).toBeUndefined();
+    expect(store().busy).toBe(false);
+    expect(store().error).toBe('Could not change push notifications for this browser.');
+
+    api.deletePushDevice.mockRejectedValueOnce(new ApiError(500, '{"detail": "Database is busy."}'));
+    api.pushDevices.mockResolvedValue({ public_key: PUBLIC_KEY, subscriptions: [device({ id: 7 })] });
+    await store().load();
+    expect(await store().turnOff()).toBe(false);
+    expect(subscription.unsubscribe).toHaveBeenCalledTimes(2);
+    expect(store().error).toBe('Database is busy.');
+  });
+
   it('saves a new level only while push is on here', async () => {
     stubBrowser({ permission: 'granted' });
     stubPushBrowser({ subscription: fakeSubscription() });
@@ -93,8 +119,11 @@ describe('pushStore', () => {
 
     api.pushDevices.mockResolvedValue({ public_key: PUBLIC_KEY, subscriptions: [device()] });
     await store().load();
-    await store().setLevel('all');
+    expect(await store().setLevel('all')).toBe(true);
     expect(api.savePushDevice).toHaveBeenCalledWith(expect.objectContaining({ level: 'all' }));
+
+    api.savePushDevice.mockRejectedValueOnce(new ApiError(500, '{"detail": "Not saved."}'));
+    expect(await store().setLevel('important')).toBe(false);
   });
 
   it('removes another browser and shows what the server refuses', async () => {
