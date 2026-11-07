@@ -1,6 +1,7 @@
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { ApiError } from '../../api/hosted';
 import { useBrowserAlertStore } from '../../stores/browserAlertStore';
 import { stubBrowser } from '../../test/browserAlertFixtures';
 import {
@@ -62,6 +63,21 @@ describe('Push in the This browser row', () => {
     await userEvent.click(screen.getByRole('radio', { name: 'Everything' }));
     await waitFor(() => expect(api.savePushDevice).toHaveBeenLastCalledWith(expect.objectContaining({ level: 'all' })));
     expect(useBrowserAlertStore.getState().level).toBe('all');
+  });
+
+  it('keeps the level when push does not take the new one', async () => {
+    stubBrowser({ permission: 'granted' });
+    stubPushBrowser({ subscription: fakeSubscription() });
+    serverHas(device());
+    api.savePushDevice.mockRejectedValue(new ApiError(500, '{"detail": "Not saved."}'));
+    renderRow();
+    await waitFor(() => expect(pushSwitch()).toHaveAttribute('aria-checked', 'true'));
+
+    await userEvent.click(screen.getByRole('radio', { name: 'Everything' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Not saved.');
+    expect(useBrowserAlertStore.getState().level).toBe('important');
+    expect(screen.getByRole('radio', { name: 'Questions and important' })).toHaveAttribute('aria-checked', 'true');
   });
 
   it('lists the other devices of the person, and removes one', async () => {

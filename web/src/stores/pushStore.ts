@@ -21,12 +21,12 @@ export interface PushState {
   error: string | null;
   load: () => Promise<void>;
   /** Asks for permission when the browser did not ask yet, subscribes and saves the subscription. */
-  turnOn: (level: NotificationLevel) => Promise<void>;
-  turnOff: () => Promise<void>;
-  /** Saves the level of this browser, when push is on. */
-  setLevel: (level: NotificationLevel) => Promise<void>;
+  turnOn: (level: NotificationLevel) => Promise<boolean>;
+  turnOff: () => Promise<boolean>;
+  /** Saves the level of this browser when push is on here. False when the save failed. */
+  setLevel: (level: NotificationLevel) => Promise<boolean>;
   /** Turns push off for another browser of this person. */
-  remove: (id: number) => Promise<void>;
+  remove: (id: number) => Promise<boolean>;
 }
 
 /** The server's row of this browser, when push is on here. */
@@ -50,17 +50,20 @@ async function save(subscription: PushSubscription, level: NotificationLevel): P
  * Push is on here when both have it.
  */
 export const usePushStore = create<PushState>((set, get) => {
-  /** Runs one change, then reads the devices again. */
-  const change = async (work: () => Promise<void>) => {
+  /** Runs one change and reads the devices again, also after a failure. True when the change worked. */
+  const change = async (work: () => Promise<void>): Promise<boolean> => {
     set({ busy: true, error: null });
+    let ok = true;
     try {
       await work();
-      await get().load();
     } catch (e) {
+      ok = false;
       set({ error: failure(e) });
     } finally {
+      await get().load();
       set({ busy: false });
     }
+    return ok;
   };
 
   return {
@@ -100,14 +103,19 @@ export const usePushStore = create<PushState>((set, get) => {
       });
       await save(subscription, level);
     }),
+    // Both steps run, also when the other one fails.
     turnOff: () => change(async () => {
       const device = thisDevice(get());
-      if (device) await api.deletePushDevice(device.id);
-      await (await browserSubscription())?.unsubscribe();
+      const [row, browser] = await Promise.allSettled([
+        device ? api.deletePushDevice(device.id) : null,
+        browserSubscription().then((subscription) => subscription?.unsubscribe()),
+      ]);
+      if (row.status === 'rejected') throw row.reason;
+      if (browser.status === 'rejected') throw browser.reason;
     }),
     setLevel: async (level) => {
       const subscription = thisDevice(get()) ? await browserSubscription() : null;
-      if (subscription) await change(() => save(subscription, level));
+      return subscription ? change(() => save(subscription, level)) : true;
     },
     remove: (id) => change(async () => {
       await api.deletePushDevice(id);
