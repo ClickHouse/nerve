@@ -1,22 +1,12 @@
 """The panel's Settings page: one route group for each section.
 
-A section is a list of fields. Each field is a dotted configuration path.
-``GET`` gives the value of each field, its state and the file that a change
-goes to. ``PUT`` takes a partial body: it checks each value, checks the merged
-configuration with the configuration validator, writes each value to the file
-it comes from (a new value goes to ``settings.yaml``) and reloads.
-
-The guards and the writers are those of the setup checklist
+A section is a list of fields, each a dotted configuration path with a value,
+a state and the file a change goes to (the states are in ``docs/api.md``,
+"Settings"). ``PUT`` checks each value and the merged configuration, writes
+each value to the file it comes from (a new value to ``settings.yaml``) and
+reloads. The guards and writers are the setup checklist's
 (:mod:`nerve.gateway.routes.setup`), so the people who can change setup can
-change settings. Field states:
-
-* ``editable``: the value is in ``settings.yaml``, or no file states it.
-* ``machine``: ``config.yaml`` or ``config.local.yaml`` on this machine states
-  it. A change is written there, because that file outranks ``settings.yaml``.
-* ``managed``: the environment (a ``${VAR}`` reference) or the control plane
-  sets it. ``reason`` says which. The page cannot change it.
-* ``read_only``: nothing on the page can change (lockdown, or no
-  configuration directory). ``reason`` says why.
+change settings.
 """
 
 from __future__ import annotations
@@ -311,7 +301,6 @@ async def _notifications_body(ctx: _Context) -> dict[str, Any]:
         "fields": _fields(ctx, NOTIFICATION_FIELDS),
         "slack": {
             "connected": _slack_connected(config),
-            "hosted": config.slack.mode == "hosted",
             "channel_name": await _slack_channel_name(config),
         },
         "telegram": {"connected": bool(config.telegram.enabled and config.telegram.bot_token)},

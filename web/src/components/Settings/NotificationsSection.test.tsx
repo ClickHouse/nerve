@@ -39,7 +39,7 @@ function settings(over: Partial<NotificationSettings> = {}, fields: Partial<Noti
       'notifications.max_redeliveries': field(3),
       ...fields,
     },
-    slack: { connected: true, hosted: false, channel_name: 'alerts' },
+    slack: { connected: true, channel_name: 'alerts' },
     telegram: { connected: true },
     ...over,
   };
@@ -113,14 +113,14 @@ describe('NotificationsSection', () => {
   });
 
   it('links to Setup for a channel that is not connected', async () => {
-    await renderSection(settings({ slack: { connected: false, hosted: false, channel_name: null } }));
+    await renderSection(settings({ slack: { connected: false, channel_name: null } }));
     expect(screen.queryByRole('switch', { name: 'Slack' })).not.toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'Connect Slack in Setup' })).toHaveAttribute('href', '/setup/channels');
   });
 
   it('shows a destination the control plane sets, with no field for it', async () => {
     await renderSection(settings(
-      { slack: { connected: true, hosted: true, channel_name: null } },
+      { slack: { connected: true, channel_name: null } },
       { 'notifications.slack_channel_id': field<string | null>(null, {
         state: 'managed', file: null, reason: 'Set by an admin in the control plane.',
       }) },

@@ -1,18 +1,9 @@
 /**
- * Types of the Settings API (`/api/settings/<section>`).
- *
- * Each field of a section is a dotted configuration path. `GET` gives each
- * field with its value, its state and the file a change goes to; `PUT` takes
- * a partial body of `{path: value}` and answers with the whole section again.
+ * Types of the Settings API (`/api/settings/<section>`, see `docs/api.md`).
+ * `PUT` takes a partial body of `{path: value}` and answers with the whole
+ * section again.
  */
 
-/**
- * - `editable`: in `settings.yaml`, or not stated anywhere.
- * - `machine`: stated in `config.yaml` or `config.local.yaml` on this machine;
- *   a change is written there.
- * - `managed`: the environment or the control plane sets it; `reason` says which.
- * - `read_only`: nothing on the page can change (lockdown); `reason` says why.
- */
 export type SettingState = 'editable' | 'machine' | 'managed' | 'read_only';
 
 export interface SettingField<T> {
@@ -48,8 +39,6 @@ export interface NotificationSettings {
   slack: {
     /** Tokens are set (or the channel gateway holds them) and Slack is on. */
     connected: boolean;
-    /** Nerve Cloud: the channel gateway posts the cards. */
-    hosted: boolean;
     /** The name of the configured channel, when Slack answered. */
     channel_name: string | null;
   };

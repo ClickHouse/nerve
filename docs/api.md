@@ -786,7 +786,7 @@ instance.
     "notifications.levels.slack": { "value": "important", "state": "machine", "file": "config.yaml", "reason": null },
     "notifications.slack_channel_id": { "value": null, "state": "managed", "file": null, "reason": "Set by an admin in the control plane." }
   },
-  "slack": { "connected": true, "hosted": true, "channel_name": null },
+  "slack": { "connected": true, "channel_name": null },
   "telegram": { "connected": false }
 }
 ```

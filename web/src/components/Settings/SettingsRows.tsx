@@ -6,12 +6,6 @@ import { Field } from '../Setup/Field';
 import { focusRadio, radioTabIndex, radioTarget } from '../Setup/rovingRadio';
 import { canEdit } from './sections';
 
-/**
- * The building blocks of a Settings section: a titled group of rows, a row,
- * and the small controls and notes inside a row. A section composes these;
- * a new row (a browser, a device) is one more `SettingRow` in a group.
- */
-
 /** A titled list of rows in one bordered card, with an optional footer. */
 export function SettingsGroup({ title, description, children, footer }: {
   title: string;

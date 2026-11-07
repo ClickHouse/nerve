@@ -59,7 +59,7 @@ class TestStates:
         }
         assert body["fields"]["notifications.channels"]["value"] == ["web", "telegram", "slack"]
         assert body["fields"]["notifications.slack_channel_id"]["value"] is None
-        assert body["slack"] == {"connected": False, "hosted": False, "channel_name": None}
+        assert body["slack"] == {"connected": False, "channel_name": None}
         assert body["telegram"] == {"connected": False}
 
     async def test_a_value_in_config_yaml_is_machine_and_is_written_there(self, inst):
@@ -94,7 +94,7 @@ class TestStates:
         field = body["fields"]["notifications.slack_channel_id"]
         assert field["state"] == "managed"
         assert field["reason"] == settings_routes.CONTROL_PLANE_TEXT
-        assert body["slack"]["hosted"] is True and body["slack"]["connected"] is True
+        assert body["slack"]["connected"] is True
         # The other Slack fields stay this page's.
         assert body["fields"][LEVEL_SLACK]["state"] == "editable"
 
