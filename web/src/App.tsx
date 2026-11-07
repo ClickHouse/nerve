@@ -35,6 +35,7 @@ import { NotificationsPage } from './pages/NotificationsPage';
 import { AccountsPage } from './pages/AccountsPage';
 import { SetupPage } from './pages/SetupPage';
 import { SettingsPage } from './pages/SettingsPage';
+import { BrowserAlerts } from './components/Notifications/BrowserAlerts';
 import { NotificationToast } from './components/Notifications/NotificationToast';
 import { SetupBanner } from './components/Setup/SetupBanner';
 import { SetupLanding } from './components/Setup/SetupLanding';
@@ -152,6 +153,7 @@ function App() {
       )}
 
       <NotificationToast />
+      <BrowserAlerts />
       <SetupLanding />
       <SetupBanner />
       <ShortcutsModal />
