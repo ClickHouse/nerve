@@ -96,7 +96,7 @@ describe('origin line', () => {
       </MemoryRouter>,
     );
     const line = screen.getByTestId('session-origin');
-    expect(line).toHaveTextContent('Started by cron job nightly');
+    expect(line).toHaveTextContent('From cron job nightly');
     expect(line.compareDocumentPosition(screen.getByText('tidy up')))
       .toBe(Node.DOCUMENT_POSITION_FOLLOWING);
   });
@@ -118,6 +118,6 @@ describe('origin line', () => {
         />
       </MemoryRouter>,
     );
-    expect(screen.getByTestId('session-origin')).toHaveTextContent('Started by cron job nightly');
+    expect(screen.getByTestId('session-origin')).toHaveTextContent('From cron job nightly');
   });
 });

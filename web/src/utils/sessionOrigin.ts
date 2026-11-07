@@ -45,22 +45,28 @@ export function showsOrigin(session: OriginFields): boolean {
   return session.trigger !== 'chat' || !!session.origin_detail?.fork_of;
 }
 
+/** The origin line of each trigger when the details give no better one. */
+const FROM: Record<SessionTrigger, string> = {
+  chat: 'From the web chat', api: 'From the API', slack: 'From Slack',
+  telegram: 'From Telegram', email: 'From email', cron: 'From a scheduled run',
+  plan: 'From a plan', workflow: 'From a workflow run',
+  external: 'From an external client', system: 'From Nerve', unknown: 'From an unknown origin',
+};
+
 /**
- * Whether a person wrote the first message, so that the origin line names
- * the session's creator: channel input, the API, and "Run later".
+ * The origin for the line above the first message, for example "From Slack
+ * #general" or "From cron job daily-digest". It names no person: the chat
+ * header names who started the session.
  */
-export function startedByPerson(session: OriginFields): boolean {
-  switch (session.trigger) {
-    case 'slack':
-    case 'telegram':
-    case 'email':
-    case 'api':
-      return true;
-    case 'cron':
-      return !!session.origin_detail?.run_later;
-    default:
-      return false;
-  }
+export function originPhrase(session: OriginFields): string {
+  const detail = session.origin_detail ?? {};
+  if (session.trigger === 'slack' && detail.channel_name) return `From Slack #${detail.channel_name}`;
+  if (session.trigger === 'slack' && detail.channel?.startsWith('D')) return 'From a Slack direct message';
+  if (detail.hook) return `From webhook ${detail.hook}`;
+  if (detail.run_later) return 'From Run later';
+  if (detail.cron_job) return `From cron job ${detail.cron_job}`;
+  if (detail.client) return `From ${detail.client}`;
+  return (session.trigger && FROM[session.trigger]) || FROM.unknown;
 }
 
 /** The page that the origin line links to, if there is one. */

@@ -143,27 +143,20 @@ describe('session rows', () => {
 });
 
 describe('SessionOriginLine', () => {
-  it('says where the open session comes from and who wrote to it', () => {
+  it('says where the open session comes from and names no person', () => {
     openSession(slack);
     wrap(<SessionOriginLine />);
-    expect(screen.getByTestId('session-origin').textContent)
-      .toBe('Started from Slack #general by Bob');
+    expect(screen.getByTestId('session-origin').textContent).toBe('From Slack #general');
     expect(screen.queryByRole('link')).toBeNull();
   });
 
-  it('does not name the viewer', () => {
-    openSession({ ...slack, created_by_actor_id: ALICE });
-    wrap(<SessionOriginLine />);
-    expect(screen.getByTestId('session-origin').textContent).toBe('Started from Slack #general');
-  });
-
-  it('links a plan and names no approver', () => {
+  it('links a plan', () => {
     openSession(session({
       id: 'impl-1', trigger: 'plan', created_by_actor_id: BOB,
       origin_label: 'Started by a plan', origin_detail: { plan_id: 'plan-1', task_id: 't' },
     }));
     wrap(<SessionOriginLine />);
-    expect(screen.getByTestId('session-origin').textContent).toBe('Started by a plan·Open plan');
+    expect(screen.getByTestId('session-origin').textContent).toBe('From a plan·Open plan');
     expect(screen.getByRole('link', { name: 'Open plan' }).getAttribute('href')).toBe('/plans/plan-1');
   });
 
