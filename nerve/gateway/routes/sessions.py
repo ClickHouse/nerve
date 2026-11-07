@@ -1078,8 +1078,9 @@ async def chat(req: MessageRequest, actor: Actor = Depends(require_auth)):
         session_id = await deps.engine.sessions.get_active_session(
             "api:default", source="api", actor=actor,
         )
-    else:
-        # A new session id from the caller: a session of the API.
+    elif deps.engine.accepting_turns:
+        # A new session id from the caller: a session of the API. A draining
+        # engine creates nothing: run() refuses the turn with a 503.
         await deps.engine.sessions.get_or_create(
             session_id, source="web", actor=actor, origin=Origin(TRIGGER_API),
         )
