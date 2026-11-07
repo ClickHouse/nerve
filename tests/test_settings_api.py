@@ -243,3 +243,66 @@ class TestSendTest:
         async with inst.client() as http:
             response = await http.post(f"{URL}/test")
         assert response.status_code == 503
+
+
+@pytest.mark.asyncio
+class TestQuietHours:
+    async def test_the_section_has_both_times_and_the_time_zone(self, inst):
+        body = await _get(inst)
+        for path in ("quiet_start", "quiet_end"):
+            assert body["fields"][path]["state"] == "editable"
+            assert isinstance(body["fields"][path]["value"], str)
+        assert body["quiet_hours"] == {"timezone": get_config().timezone}
+
+    async def test_two_times_go_to_settings_yaml_and_are_live(self, inst):
+        response = await _put(inst, {"quiet_start": "22:00", "quiet_end": "07:00"})
+        assert response.status_code == 200, response.text
+        fields = response.json()["fields"]
+        assert (fields["quiet_start"]["value"], fields["quiet_end"]["value"]) == ("22:00", "07:00")
+        assert (inst.settings_yaml()["quiet_start"], inst.settings_yaml()["quiet_end"]) == ("22:00", "07:00")
+        assert (get_config().quiet_start, get_config().quiet_end) == ("22:00", "07:00")
+
+        assert (await _put(inst, {"quiet_end": "06:30"})).status_code == 200
+        assert get_config().quiet_end == "06:30"
+
+    async def test_off_writes_both_times_empty_so_no_default_comes_back(self, inst):
+        response = await _put(inst, {"quiet_start": "", "quiet_end": ""})
+        assert response.status_code == 200, response.text
+        assert (inst.settings_yaml()["quiet_start"], inst.settings_yaml()["quiet_end"]) == ("", "")
+        assert (get_config().quiet_start, get_config().quiet_end) == ("", "")
+        fields = response.json()["fields"]
+        assert (fields["quiet_start"]["value"], fields["quiet_end"]["value"]) == ("", "")
+
+    async def test_a_time_in_config_yaml_is_written_there(self, inst):
+        merge_machine_paths(inst.config_dir / "config.yaml", {"quiet_start": "23:00", "quiet_end": "06:00"})
+        inst.reload()
+        field = (await _get(inst))["fields"]["quiet_start"]
+        assert (field["state"], field["file"]) == ("machine", "config.yaml")
+        assert (await _put(inst, {"quiet_start": "21:00"})).status_code == 200
+        assert inst.machine_yaml()["quiet_start"] == "21:00"
+        assert "quiet_start" not in inst.settings_yaml()
+
+    @pytest.mark.parametrize("body, field", [
+        ({"quiet_start": "24:00"}, "quiet_start"),
+        ({"quiet_start": "25:00"}, "quiet_start"),
+        ({"quiet_end": "08:60"}, "quiet_end"),
+        ({"quiet_end": "7am"}, "quiet_end"),
+        ({"quiet_start": 2200}, "quiet_start"),
+        ({"quiet_start": None}, "quiet_start"),
+        ({"quiet_start": "22:00", "quiet_end": ""}, "quiet_end"),
+        ({"quiet_start": "", "quiet_end": "07:00"}, "quiet_start"),
+        ({"quiet_start": "22:00", "quiet_end": "22:00"}, "quiet_end"),
+    ])
+    async def test_a_bad_time_or_half_a_pair_is_refused(self, inst, body, field):
+        before = inst.settings_yaml()
+        response = await _put(inst, body)
+        assert response.status_code == 400
+        assert response.json()["field"] == field
+        assert inst.settings_yaml() == before
+
+    async def test_one_time_alone_must_not_switch_quiet_hours_half_off(self, inst):
+        assert (await _put(inst, {"quiet_start": "22:00", "quiet_end": "07:00"})).status_code == 200
+        response = await _put(inst, {"quiet_end": ""})
+        assert response.status_code == 400
+        assert response.json()["field"] == "quiet_end"
+        assert get_config().quiet_end == "07:00"

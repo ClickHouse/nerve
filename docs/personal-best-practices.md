@@ -169,7 +169,7 @@ Tool calls first, the message last. Make turn-ending calls (`memorize`, `Schedul
 - A cron that creates tasks or finds problems notifies, because nobody reads cron output. Housekeeping stays silent. `plan_propose` sends its own notification with a link to the plan, so do not notify about a plan.
 - In monitoring loops and delegated work, notify each decision you made on your own ("restarted the export after a stall, my call"), not only status.
 - When the human is mentioned, assigned or asked for a review anywhere, notify with the full URL.
-- Apply quiet hours yourself. Nerve's `quiet_start` and `quiet_end` ([config.md](config.md#quiet-hours)) gate nothing the agent sends, `notify` included, so hold anything below `urgent` and keep the human's timezone and quiet hours as `[stable]` facts.
+- Apply quiet hours yourself. During `quiet_start` to `quiet_end` ([config.md](config.md#quiet-hours)) Nerve sends each notification below `urgent` without sound, but it holds nothing back, `notify` included. So hold anything below `urgent` and keep the human's timezone and quiet hours as `[stable]` facts.
 - Record known-benign anomalies so they are not raised again. Create a `notification_silence` rule only on the human's instruction or a recorded ruling, and say which rule you created.
 - Match the channel: no markdown tables in chat apps, full URLs, at most one `react` per message.
 

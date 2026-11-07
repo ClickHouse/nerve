@@ -787,14 +787,16 @@ instance.
     "notifications.slack_channel_id": { "value": null, "state": "managed", "file": null, "reason": "Set by an admin in the control plane." }
   },
   "slack": { "connected": true, "channel_name": null },
-  "telegram": { "connected": false }
+  "telegram": { "connected": false },
+  "quiet_hours": { "timezone": "Europe/Berlin" }
 }
 ```
 
 The fields are `notifications.channels`, `notifications.levels.slack`,
 `notifications.levels.telegram`, `notifications.slack_channel_id`,
-`notifications.telegram_chat_id`, `notifications.default_expiry_hours` and
-`notifications.max_redeliveries`. `state` is one of:
+`notifications.telegram_chat_id`, `notifications.default_expiry_hours`,
+`notifications.max_redeliveries`, `quiet_start` and `quiet_end` (`HH:MM`, or
+`""` for both when quiet hours are off). `state` is one of:
 
 | State | Meaning |
 |---|---|
@@ -804,7 +806,8 @@ The fields are `notifications.channels`, `notifications.levels.slack`,
 | `read_only` | lockdown, or no configuration directory. `read_only_reason` and `reason` say why |
 
 `slack.channel_name` is the name of the configured channel when Slack runs
-and answers `conversations.info`, else `null`.
+and answers `conversations.info`, else `null`. `quiet_hours.timezone` is the
+time zone of the quiet hours (`timezone`).
 
 #### `PUT /api/settings/notifications`
 
@@ -814,8 +817,10 @@ copies of the configuration files with the change applied: an error that the
 files without the change do not have is `400`. Then each value goes to the
 file it comes from (see `state`), a new value to `settings.yaml`, and the
 configuration reloads. `null` or `""` for the Slack channel or the Telegram
-chat removes the key. A `managed` field is `409` with its `field`; lockdown
-is `409`. The response is the `GET` body with `reload_errors`:
+chat removes the key. `quiet_start` and `quiet_end` take a 24-hour `HH:MM`
+or `""`; after the change both must be set or both empty, with two different
+times (`400` names the field to fix). A `managed` field is `409` with its
+`field`; lockdown is `409`. The response is the `GET` body with `reload_errors`:
 `{part: error}` for each part that did not reload, `{}` when all did.
 
 ```json
@@ -2167,8 +2172,8 @@ those for another session. Events marked *global* go to every socket.
 // A session waits for input, or no longer does (global)
 { type: "session_awaiting_input", session_id: "main", awaiting: true }
 
-// Notifications (global)
-{ type: "notification", notification_id: "…", notification_type: "notify" | "question" | …, session_id: "…", title: "…", body: "…", priority: "normal", options: [...] | null }
+// Notifications (global). silent: true (else absent) during quiet hours for an item that is not urgent: show it without sound
+{ type: "notification", notification_id: "…", notification_type: "notify" | "question" | …, session_id: "…", title: "…", body: "…", priority: "normal", options: [...] | null, silent: true }
 { type: "notification_answered", notification_id: "…", session_id: "…", answer: "…", answered_by: "…", answered_at: "…" | null, actor_id: "…" }
 // answered_at: the stored answer time (ISO 8601). A snoozed approval has approval_status: "snoozed" and snooze_until instead.
 { type: "notification_expired", notification_id: "…", session_id: "…", notification_type: "question", title: "…" }

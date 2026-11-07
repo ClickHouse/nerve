@@ -1766,20 +1766,30 @@ notifications:
 
 Quiet hours are optional. Both values empty (`''`) means there are none;
 otherwise both are `HH:MM`, and the window may cross midnight (`22:00` to
-`07:00`). The setup writers (the setup page's Mode step, `nerve init
+`07:00`). A value that is not a 24-hour time from `00:00` to `23:59` also
+means no quiet hours. The setup writers (the setup page's Mode step, `nerve init
 --terminal` and `--non-interactive`) state the mode's default in
 `settings.yaml`: `02:00`/`08:00` for a personal install, and empty values for
 a worker, so a worker has no quiet hours until someone turns them on (the
 setup page's Operator step, or these two keys). A key that no layer sets falls
 back to `02:00`/`08:00`.
 
-Nerve stores quiet hours for the agent; it does not enforce them. On a
-personal install the setup page also fills the `Quiet hours:` line of
-`USER.md`, and `AGENTS.md` tells the agent to hold anything below `urgent`
-during them. A worker's brain files do not mention them, so state the rule in
-`TASK.md` if the worker should keep them. No built-in delivery gating is
-attached today: `notify`, `ask_user` and cron runs go out whenever they
-happen.
+During quiet hours, each notification (`notify`, `ask_user`,
+`propose_action`, and a re-delivered snoozed item) with a priority other than
+`urgent` goes out without sound: Telegram sends it with
+`disable_notification`, and the panel's `notification` event has
+`silent: true`. Nerve still delivers it at once. An `urgent` item makes a
+sound. Slack has no such option for one message, so Slack follows its own
+notification settings. The Notifications section of the panel's Settings page
+changes the two keys (see [web-ui.md](web-ui.md#settings)).
+
+Nerve holds nothing back during quiet hours: `notify`, `ask_user` and cron
+runs go out whenever they happen. On a personal install the setup page also
+fills the `Quiet hours:` line of `USER.md`, and `AGENTS.md` tells the agent to
+hold anything below `urgent` during them. A worker's brain files do not
+mention them, so state the rule in `TASK.md` if the worker should keep them.
+The deadline escalation check pauses during quiet hours (see
+[tasks.md](tasks.md)).
 
 ## Sources (sync)
 

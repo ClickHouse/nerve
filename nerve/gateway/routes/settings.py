@@ -47,6 +47,7 @@ from nerve.gateway.routes.setup import (
     require_person,
 )
 from nerve.identity import Actor
+from nerve.notifications.quiet_hours import minutes_of_day
 from nerve.setup_writer import merge_machine_paths, merge_private_paths, merge_settings_paths
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,7 @@ _MACHINE_FILE, _LOCAL_FILE = "config.yaml", "config.local.yaml"
 CONTROL_PLANE_TEXT = "Set by an admin in the control plane."
 _UNKNOWN_FIELD = "This is not a setting of this section."
 _NOT_VALID = "With this value the configuration is not valid: {}"
+_QUIET_TIME_TEXT = "Use a 24-hour time such as 22:00."
 
 #: Bounds of the question fields.
 EXPIRY_HOURS_RANGE = (1, 720)
@@ -136,6 +138,19 @@ def _int_between(low: int, high: int) -> Callable[[Any], int]:
     return parse
 
 
+def _parse_quiet_time(value: Any) -> str:
+    """``HH:MM``, or ``""`` (no quiet hours)."""
+    if not isinstance(value, str):
+        raise ValueError(_QUIET_TIME_TEXT)
+    text = value.strip()
+    if text:
+        try:
+            minutes_of_day(text)
+        except ValueError:
+            raise ValueError(_QUIET_TIME_TEXT) from None
+    return text
+
+
 def _level_field(channel: str) -> SettingField:
     return SettingField(
         f"notifications.levels.{channel}",
@@ -145,6 +160,7 @@ def _level_field(channel: str) -> SettingField:
 
 
 SLACK_DESTINATION = "notifications.slack_channel_id"
+QUIET_START, QUIET_END = "quiet_start", "quiet_end"
 
 NOTIFICATION_FIELDS: tuple[SettingField, ...] = (
     SettingField("notifications.channels", lambda c: c.notifications.delivery_channels(), _parse_channels),
@@ -162,7 +178,22 @@ NOTIFICATION_FIELDS: tuple[SettingField, ...] = (
         "notifications.max_redeliveries",
         lambda c: c.notifications.max_redeliveries, _int_between(*REDELIVERIES_RANGE),
     ),
+    SettingField(QUIET_START, lambda c: str(c.quiet_start or ""), _parse_quiet_time),
+    SettingField(QUIET_END, lambda c: str(c.quiet_end or ""), _parse_quiet_time),
 )
+
+
+def _check_quiet_hours(values: dict[str, Any], config: NerveConfig) -> None:
+    """Quiet hours have both times or neither, and two different times.
+    400 with the field to fix."""
+    if QUIET_START not in values and QUIET_END not in values:
+        return
+    start = values.get(QUIET_START, str(config.quiet_start or ""))
+    end = values.get(QUIET_END, str(config.quiet_end or ""))
+    if bool(start) != bool(end):
+        raise SetupFieldError(QUIET_END if start else QUIET_START, "Quiet hours need both a start and an end time.")
+    if start and start == end:
+        raise SetupFieldError(QUIET_END if QUIET_END in values else QUIET_START, "Use two different times.")
 
 
 def _managed_reason(path: str, layers: setup_provenance.RawLayers, config: NerveConfig) -> str | None:
@@ -304,6 +335,7 @@ async def _notifications_body(ctx: _Context) -> dict[str, Any]:
             "channel_name": await _slack_channel_name(config),
         },
         "telegram": {"connected": bool(config.telegram.enabled and config.telegram.bot_token)},
+        "quiet_hours": {"timezone": config.timezone},
     }
 
 
@@ -322,6 +354,7 @@ async def put_notifications(
     async with _loop_lock("state"):
         ctx = await _context(actor)
         _require_claimed(ctx)
+        _check_quiet_hours(values, ctx.config)
         failures = await _save(ctx, values) if values else {}
         fresh = await _context(actor)
     return {**await _notifications_body(fresh), "reload_errors": failures}

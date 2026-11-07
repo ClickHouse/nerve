@@ -25,6 +25,9 @@ export interface NotificationSettingFields {
   'notifications.telegram_chat_id': SettingField<number | null>;
   'notifications.default_expiry_hours': SettingField<number>;
   'notifications.max_redeliveries': SettingField<number>;
+  /** `HH:MM`, or `''` for both while quiet hours are off. */
+  quiet_start: SettingField<string>;
+  quiet_end: SettingField<string>;
 }
 
 export type NotificationSettingPath = keyof NotificationSettingFields;
@@ -43,6 +46,8 @@ export interface NotificationSettings {
     channel_name: string | null;
   };
   telegram: { connected: boolean };
+  /** The time zone of the quiet hours (the instance's `timezone`). */
+  quiet_hours: { timezone: string };
   /** `PUT` only: `{part: error}` for each part that did not reload. */
   reload_errors?: Record<string, string>;
 }
