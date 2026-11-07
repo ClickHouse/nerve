@@ -1684,8 +1684,12 @@ if (typeof ws.onOpen === 'function') {
     }
     // A reconnect (a gateway restart, a dropped network) missed the global
     // events sent meanwhile, and a restarted server never re-sends the zero
-    // counts: the sidebar rows come back from the server.
-    if (socketOpenedBefore) void s.loadSessions();
+    // counts: the sidebar rows and the notifications (the badge count, the
+    // questions that put "!" in the tab title) come back from the server.
+    if (socketOpenedBefore) {
+      void s.loadSessions();
+      void import('./notificationStore').then(({ useNotificationStore }) => useNotificationStore.getState().loadNotifications());
+    }
     socketOpenedBefore = true;
   });
 }

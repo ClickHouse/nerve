@@ -1,15 +1,29 @@
 import { act, render, screen } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { api } from '../../api/client';
 import type { WSMessage } from '../../api/websocket';
 import { useBrowserAlertStore } from '../../stores/browserAlertStore';
-import { ALERT_DELAY_MS } from '../../utils/browserAlerts';
+import { useChatStore } from '../../stores/chatStore';
+import { useNotificationStore } from '../../stores/notificationStore';
+import type { Session, SessionAttention } from '../../types/chat';
+import { ALERT_CHANNEL, ALERT_DELAY_MS, tellNotificationsChanged } from '../../utils/browserAlerts';
+import { ANSWER_DOT, UNREAD_DOT } from '../../utils/tabAttention';
 import { OPEN_MESSAGE } from '../../utils/webPush';
+import { FakeChannel } from '../../test/browserAlertFixtures';
 import { stubPushBrowser, unstubPushBrowser } from '../../test/pushFixtures';
 
 const handlers: ((msg: WSMessage) => void)[] = [];
 vi.mock('../../api/websocket', () => ({
   ws: { onMessage: vi.fn((h: (msg: WSMessage) => void) => { handlers.push(h); return () => {}; }) },
+}));
+vi.mock('../../api/client', async (orig) => ({
+  ...(await orig<typeof import('../../api/client')>()),
+  api: {
+    listNotifications: vi.fn(async () => ({ notifications: [], pending_count: 0 })),
+    dismissNotification: vi.fn(async () => ({})),
+    dismissAllNotifications: vi.fn(async () => ({})),
+  },
 }));
 
 const { BrowserAlerts } = await import('./BrowserAlerts');
@@ -56,6 +70,20 @@ function renderAlerts() {
   render(<MemoryRouter initialEntries={['/chat']}><BrowserAlerts /><Where /></MemoryRouter>);
 }
 
+const NONE: SessionAttention = { questions: 0, approvals: 0, plans: 0, awaiting_input: false, review: false };
+
+/** The session list after a reload, with one session that has `attention`. */
+function setSessions(attention?: Partial<SessionAttention>) {
+  const sessions: Session[] = attention
+    ? [{ id: 's1', title: 'Deploy', source: 'web', updated_at: '2026-11-07T10:00:00Z', attention: { ...NONE, ...attention } }]
+    : [];
+  act(() => useChatStore.setState({ sessions }));
+}
+
+function setUnread(pendingCount: number) {
+  act(() => useNotificationStore.setState({ pendingCount }));
+}
+
 beforeEach(() => {
   handlers.length = 0;
   FakeNotification.shown = [];
@@ -65,6 +93,9 @@ beforeEach(() => {
   Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => (front ? 'visible' : 'hidden') });
   localStorage.clear();
   useBrowserAlertStore.setState({ enabled: false, level: 'important', offerDone: false });
+  useChatStore.setState({ sessions: [] });
+  useNotificationStore.setState({ pendingCount: 0, notifications: [], toastQueue: [] });
+  FakeChannel.all = [];
 });
 
 afterEach(() => {
@@ -85,49 +116,127 @@ describe('BrowserAlerts', () => {
     expect(screen.getByTestId('path')).toHaveTextContent('/notifications');
   });
 
-  it('counts the items that arrive while the tab is not in front', async () => {
+  it('puts "!" before the title while an answer waits, else the unread count, on every page title', async () => {
     renderAlerts();
-    send({});
     expect(document.title).toBe('Nerve');
 
-    setFront(false);
-    send({ notification_id: 'ask-2' });
-    send({ notification_id: 'n-3', notification_type: 'notify', silenced: true });
-    expect(document.title).toBe('(1) Nerve');
-    send({ notification_id: 'n-4', notification_type: 'notify' });
-    expect(document.title).toBe('(2) Nerve');
+    // A question arrives: its row in the notification list gives "!" before the session list reloads.
+    act(() => useNotificationStore.getState().handleWSNotification({
+      notification_id: 'ask-1', notification_type: 'question', session_id: 's1', title: 'Deploy now?', priority: 'normal',
+    }));
+    expect(document.title).toBe('! Nerve');
+    setSessions({ questions: 1 });
+    expect(document.title).toBe('! Nerve');
 
-    // A page that sets its own title keeps the count.
+    // A page that sets its own title gets the prefix again, also on a tab in front.
     act(() => { document.title = 'Fix the login test'; });
     await Promise.resolve();
-    expect(document.title).toBe('(2) Fix the login test');
+    expect(document.title).toBe('! Fix the login test');
 
+    // Answered in another tab or channel.
+    act(() => useNotificationStore.getState().handleWSNotificationAnswered({
+      notification_id: 'ask-1', answer: 'Yes', answered_by: 'telegram',
+    }));
+    setSessions({});
+    expect(document.title).toBe('Fix the login test');
+
+    // A plain notify, then read (the list reload after a dismiss).
+    setFront(false);
+    act(() => useNotificationStore.getState().handleWSNotification({
+      notification_id: 'n-2', notification_type: 'notify', session_id: 's1', title: 'Build done', priority: 'normal',
+    }));
+    expect(document.title).toBe('(1) Fix the login test');
     setFront(true);
+    expect(document.title).toBe('(1) Fix the login test');
+    setUnread(0);
     expect(document.title).toBe('Fix the login test');
   });
 
-  it('puts a dot on the favicon while items wait, and takes it away on return', async () => {
+  it('reads the notifications again when another tab of the browser dismissed items', async () => {
+    vi.stubGlobal('BroadcastChannel', FakeChannel);
+    renderAlerts();
+    setUnread(1);
+    expect(document.title).toBe('(1) Nerve');
+    vi.mocked(api.listNotifications).mockClear();
+
+    // What the store of the other tab sends after a dismissal.
+    act(() => tellNotificationsChanged());
+    await act(async () => { await Promise.resolve(); });
+
+    expect(api.listNotifications).toHaveBeenCalled();
+    expect(document.title).toBe('Nerve');
+  });
+
+  it('tells the other tabs after a dismissal, and not after a failed one', async () => {
+    vi.stubGlobal('BroadcastChannel', FakeChannel);
+    const otherTab: unknown[] = [];
+    new FakeChannel(ALERT_CHANNEL).addEventListener('message', (e) => otherTab.push(e.data));
+    const { dismissNotification, dismissAll } = useNotificationStore.getState();
+
+    await act(() => dismissNotification('n-1'));
+    await act(() => dismissAll());
+    expect(otherTab).toEqual([{ kind: 'changed' }, { kind: 'changed' }]);
+
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(api.dismissNotification).mockRejectedValueOnce(new Error('offline'));
+    await act(() => dismissNotification('n-2'));
+    expect(otherTab).toHaveLength(2);
+    quiet.mockRestore();
+  });
+
+  it('keeps a page title that starts with the same characters as the prefix', async () => {
+    renderAlerts();
+    setSessions({ questions: 1 });
+    act(() => { document.title = '! Release'; });
+    await Promise.resolve();
+    expect(document.title).toBe('! ! Release');
+    setSessions();
+    expect(document.title).toBe('! Release');
+  });
+
+  it('colours the favicon dot by what waits, and takes it away when nothing does', async () => {
     const link = Object.assign(document.createElement('link'), { rel: 'icon', href: '/favicon.ico' });
     document.head.append(link);
-    const context = { fillStyle: '', drawImage: vi.fn(), beginPath: vi.fn(), arc: vi.fn(), fill: vi.fn() };
+    const fills: string[] = [];
+    const context = {
+      fillStyle: '', globalCompositeOperation: 'source-over', drawImage: vi.fn(), beginPath: vi.fn(), arc: vi.fn(),
+      fill: vi.fn(() => fills.push(`${context.globalCompositeOperation} ${context.fillStyle}`)),
+    };
     vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(context as unknown as CanvasRenderingContext2D);
-    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockReturnValue('data:image/png;base64,ZG90');
+    vi.spyOn(HTMLCanvasElement.prototype, 'toDataURL').mockImplementation(() => `data:image/png;dot=${context.fillStyle}`);
+    let iconLoads = true;
     vi.stubGlobal('Image', class {
       onload: (() => void) | null = null;
       onerror: (() => void) | null = null;
-      set src(_url: string) { queueMicrotask(() => this.onerror?.()); }
+      set src(_url: string) { queueMicrotask(() => (iconLoads ? this.onload : this.onerror)?.()); }
     });
+    const drawn = async () => { await act(async () => { await Promise.resolve(); }); return link.getAttribute('href'); };
     renderAlerts();
-    setFront(false);
 
-    send({});
-    await act(async () => { await Promise.resolve(); });
+    setUnread(2);
+    expect(await drawn()).toBe(`data:image/png;dot=${UNREAD_DOT}`);
+    // A clear ring around the dot first, so the dot stands apart from the icon. Both at the top right.
+    expect(fills).toEqual(['destination-out ', `source-over ${UNREAD_DOT}`]);
+    expect(context.arc.mock.calls.map(([x, y, r]) => [x, y, r])).toEqual([[25, 7, 9], [25, 7, 7]]);
 
-    expect(link.getAttribute('href')).toBe('data:image/png;base64,ZG90');
-    expect(context.arc).toHaveBeenCalled();
-    expect(context.drawImage).not.toHaveBeenCalled();
-    setFront(true);
+    setSessions({ approvals: 1 });
+    expect(await drawn()).toBe(`data:image/png;dot=${ANSWER_DOT}`);
+
+    setUnread(0);
+    setSessions();
     expect(link.getAttribute('href')).toBe('/favicon.ico');
+
+    // Without an icon (no favicon on the instance), only the dot, in the middle.
+    iconLoads = false;
+    fills.length = 0;
+    context.fillStyle = '';
+    context.drawImage.mockClear();
+    context.arc.mockClear();
+    setUnread(1);
+    expect(await drawn()).toBe(`data:image/png;dot=${UNREAD_DOT}`);
+    expect(context.drawImage).not.toHaveBeenCalled();
+    expect(fills).toEqual([`source-over ${UNREAD_DOT}`]);
+    expect(context.arc.mock.calls.map(([x, y, r]) => [x, y, r])).toEqual([[16, 16, 7]]);
     link.remove();
   });
 

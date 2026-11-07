@@ -1,45 +1,50 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ws } from '../../api/websocket';
 import { alertsOn, useBrowserAlertStore } from '../../stores/browserAlertStore';
-import { createAlerter, levelWants, tabInFront } from '../../utils/browserAlerts';
+import { useChatStore } from '../../stores/chatStore';
+import { useNotificationStore } from '../../stores/notificationStore';
+import { createAlerter, levelWants } from '../../utils/browserAlerts';
+import { tabAttention } from '../../utils/tabAttention';
 import { OPEN_MESSAGE, registerWorker, workerSupported } from '../../utils/webPush';
 
 const NOTIFICATIONS_PATH = '/notifications';
 const ICON_SIZE = 32;
 const DOT_RADIUS = 7;
-/** A fixed red: the tab strip of the browser does not follow the panel theme. */
-const DOT_COLOR = '#e5484d';
+/** The clear ring between the dot and the icon, so the dot stands apart from any icon. */
+const DOT_GAP = 2;
 
 /**
  * The parts of browser alerts that run on every page: system alerts while
- * the tab is not in front, and for the items that arrive while the person
- * is away, "(N)" in the tab title and a dot on the favicon. It registers the
- * panel's service worker, which shows the alerts and the push notifications,
- * and opens the page that the worker names after a click. Renders nothing.
+ * the tab is not in front, and on every tab "! " or "(N) " in the title and
+ * a coloured dot on the favicon (`tabAttention`). It registers the panel's
+ * service worker, which shows the alerts and the push notifications, and
+ * opens the page that the worker names after a click. Renders nothing.
  */
 export function BrowserAlerts() {
   const navigate = useNavigate();
   // The alerter lives as long as the panel; a click on an alert uses the current `navigate`.
   const navigateRef = useRef(navigate);
   useEffect(() => { navigateRef.current = navigate; }, [navigate]);
-  const [unseen, setUnseen] = useState(0);
+  const sessions = useChatStore((s) => s.sessions);
+  const notifications = useNotificationStore((s) => s.notifications);
+  const unread = useNotificationStore((s) => s.pendingCount);
+  const { prefix, dot } = tabAttention(sessions, notifications, unread);
 
   useEffect(() => {
-    const alerter = createAlerter({ onOpen: () => navigateRef.current(NOTIFICATIONS_PATH) });
+    const alerter = createAlerter({
+      onOpen: () => navigateRef.current(NOTIFICATIONS_PATH),
+      onChanged: () => void useNotificationStore.getState().loadNotifications(),
+    });
     const offMessage = ws.onMessage((msg) => {
       if (msg.type === 'notification' && !msg.silenced) {
         const alerts = useBrowserAlertStore.getState();
         alerter.receive(msg, alertsOn(alerts) && levelWants(alerts.level, msg.notification_type, msg.priority));
-        if (!tabInFront()) setUnseen((n) => n + 1);
       } else if (msg.type === 'notification_answered' || msg.type === 'notification_expired') {
         alerter.close(msg.notification_id);
       }
     });
-    const onReturn = () => {
-      useBrowserAlertStore.getState().refresh();
-      if (tabInFront()) setUnseen(0);
-    };
+    const onReturn = () => useBrowserAlertStore.getState().refresh();
     const worker = workerSupported() ? navigator.serviceWorker : null;
     const onWorkerMessage = (e: MessageEvent<{ type?: string; url?: unknown }>) => {
       if (e.data?.type !== OPEN_MESSAGE) return;
@@ -59,18 +64,24 @@ export function BrowserAlerts() {
     };
   }, []);
 
-  useTitleCount(unseen);
-  useFaviconDot(unseen > 0);
+  useTitlePrefix(prefix);
+  useFaviconDot(dot);
   return null;
 }
 
-/** `(N) ` before the title. Pages set the title too, so a new title gets it again. */
-function useTitleCount(count: number) {
+/**
+ * `prefix` before the title. Pages set the title too, so a new title gets it
+ * again. Only the text that this hook wrote counts as prefixed, so a page
+ * title that starts with the same characters keeps them.
+ */
+function useTitlePrefix(prefix: string) {
   useEffect(() => {
-    if (count === 0) return;
-    const prefix = `(${count}) `;
+    if (!prefix) return;
+    let written = '';
     const apply = () => {
-      if (!document.title.startsWith(prefix)) document.title = prefix + document.title;
+      if (document.title === written) return;
+      written = prefix + document.title;
+      document.title = written;
     };
     apply();
     const observer = new MutationObserver(apply);
@@ -78,27 +89,30 @@ function useTitleCount(count: number) {
     if (title) observer.observe(title, { childList: true, characterData: true, subtree: true });
     return () => {
       observer.disconnect();
-      if (document.title.startsWith(prefix)) document.title = document.title.slice(prefix.length);
+      if (document.title === written) document.title = written.slice(prefix.length);
     };
-  }, [count]);
+  }, [prefix]);
 }
 
-function useFaviconDot(on: boolean) {
+function useFaviconDot(color: string | null) {
   useEffect(() => {
     const link = document.querySelector<HTMLLinkElement>('link[rel="icon"]');
-    if (!on || !link) return;
+    if (!color || !link) return;
     const href = link.getAttribute('href') ?? '';
     let current = true;
-    void iconWithDot(href).then((url) => { if (current && url) link.href = url; });
+    void iconWithDot(href, color).then((url) => { if (current && url) link.href = url; });
     return () => {
       current = false;
       link.setAttribute('href', href);
     };
-  }, [on]);
+  }, [color]);
 }
 
-/** The icon at `href` with a dot at its top right, as a data URL. Only the dot when the icon does not load. */
-function iconWithDot(href: string): Promise<string | null> {
+/**
+ * The icon at `href` with a dot at its top right, as a data URL. When the
+ * icon does not load (the instance has no favicon), only the dot, in the middle.
+ */
+function iconWithDot(href: string, color: string): Promise<string | null> {
   const canvas = document.createElement('canvas');
   canvas.width = ICON_SIZE;
   canvas.height = ICON_SIZE;
@@ -107,11 +121,20 @@ function iconWithDot(href: string): Promise<string | null> {
   return new Promise((resolve) => {
     const image = new Image();
     const draw = (loaded: boolean) => {
-      if (loaded) context.drawImage(image, 0, 0, ICON_SIZE, ICON_SIZE);
-      context.fillStyle = DOT_COLOR;
-      context.beginPath();
-      context.arc(ICON_SIZE - DOT_RADIUS, DOT_RADIUS, DOT_RADIUS, 0, 2 * Math.PI);
-      context.fill();
+      const [x, y] = loaded ? [ICON_SIZE - DOT_RADIUS, DOT_RADIUS] : [ICON_SIZE / 2, ICON_SIZE / 2];
+      const circle = (radius: number) => {
+        context.beginPath();
+        context.arc(x, y, radius, 0, 2 * Math.PI);
+        context.fill();
+      };
+      if (loaded) {
+        context.drawImage(image, 0, 0, ICON_SIZE, ICON_SIZE);
+        context.globalCompositeOperation = 'destination-out';
+        circle(DOT_RADIUS + DOT_GAP);
+        context.globalCompositeOperation = 'source-over';
+      }
+      context.fillStyle = color;
+      circle(DOT_RADIUS);
       resolve(canvas.toDataURL('image/png'));
     };
     image.onload = () => draw(true);

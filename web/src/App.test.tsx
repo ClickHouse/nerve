@@ -35,6 +35,7 @@ vi.mock('./stores/chatStore', () => {
     createSession: vi.fn(),
     stopSession: vi.fn(),
     isStreaming: false,
+    sessions: [],
   };
   const hook = ((selector?: (s: typeof state) => unknown) => (selector ? selector(state) : state)) as unknown as {
     (): typeof state;
