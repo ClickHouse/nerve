@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
@@ -52,15 +52,16 @@ function renderInbox() {
 const location = () => screen.getByRole('status', { name: 'Location' });
 
 let createSession: ReturnType<typeof vi.fn>;
-let sendMessage: ReturnType<typeof vi.fn>;
+let startChat: ReturnType<typeof vi.fn>;
+let loadSessions: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   localStorage.clear();
   useSetupStore.getState().reset();
-  // The store's own actions talk to the server; these stand in for them
-  // with the same effect on `activeSession`.
+  // The store's own actions talk to the server; these stand in for them.
   createSession = vi.fn(async () => { useChatStore.setState({ activeSession: 'local-1' }); });
-  sendMessage = vi.fn(async () => { useChatStore.setState({ activeSession: 'abc123' }); });
+  startChat = vi.fn(async () => 'abc123');
+  loadSessions = vi.fn(async () => {});
   useChatStore.setState({
     sessions: [
       session('asks', { title: 'Merge the docs PR?', attention: { questions: 1, approvals: 0, plans: 0, awaiting_input: false, review: false } }),
@@ -69,8 +70,7 @@ beforeEach(() => {
     searchResults: null, archivedSessions: null, systemSessions: null,
     archivedCount: 0, systemCount: 0, drafts: {}, reads: {}, readsBaseline: 0,
     virtualSession: null, activeSession: '',
-    loadSessions: vi.fn(async () => {}),
-    createSession, sendMessage,
+    loadSessions, createSession, startChat,
   });
 });
 
@@ -95,7 +95,12 @@ describe('the Inbox on a phone', () => {
     expect(within(group).getByRole('link', { name: /Merge the docs PR\?/ })).toHaveAttribute('href', '/chat/asks');
   });
 
-  it('starts a new chat with the message and opens it', async () => {
+  it('starts a new chat with the message and opens the chat it started', async () => {
+    // Another chat became active meanwhile: the page still opens the new one.
+    startChat.mockImplementation(async () => {
+      useChatStore.setState({ activeSession: 'other' });
+      return 'abc123';
+    });
     renderInbox();
     const send = screen.getByRole('button', { name: 'Send' });
     expect(send).toBeDisabled();
@@ -103,10 +108,24 @@ describe('the Inbox on a phone', () => {
     await userEvent.type(screen.getByRole('textbox', { name: 'Message Nerve' }), '  Plan my week  ');
     await userEvent.click(send);
 
-    expect(createSession).toHaveBeenCalledTimes(1);
-    expect(sendMessage).toHaveBeenCalledWith('Plan my week');
-    expect(createSession.mock.invocationCallOrder[0]).toBeLessThan(sendMessage.mock.invocationCallOrder[0]);
-    expect(location()).toHaveTextContent('/chat/abc123');
+    expect(startChat).toHaveBeenCalledWith('Plan my week');
+    // Not the unsent new chat of the chat page, with its settings.
+    expect(createSession).not.toHaveBeenCalled();
+    await waitFor(() => expect(location()).toHaveTextContent('/chat/abc123'));
+  });
+
+  it('keeps the text and stays when the chat cannot be started', async () => {
+    startChat.mockResolvedValue(null);
+    renderInbox();
+    const box = screen.getByRole('textbox', { name: 'Message Nerve' });
+
+    await userEvent.type(box, 'Plan my week');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled());
+    expect(startChat).toHaveBeenCalledTimes(1);
+    expect(box).toHaveValue('Plan my week');
+    expect(location()).toHaveTextContent('/inbox');
   });
 
   it('names the agent from the setup checklist', () => {
@@ -125,8 +144,8 @@ describe('the Inbox on a phone', () => {
     await userEvent.click(screen.getByRole('button', { name: 'New chat' }));
 
     expect(createSession).toHaveBeenCalledTimes(1);
-    expect(sendMessage).not.toHaveBeenCalled();
-    expect(location()).toHaveTextContent('/chat/local-1');
+    expect(startChat).not.toHaveBeenCalled();
+    await waitFor(() => expect(location()).toHaveTextContent('/chat/local-1'));
   });
 });
 

@@ -34,6 +34,7 @@ vi.mock('../api/client', () => ({
     getAgentTranscript: vi.fn(),
     archiveSession: vi.fn(),
     stopSession: vi.fn(),
+    createSession: vi.fn(),
   },
   apiErrorCode: () => null,
   // chatStore reads these authStore dependencies when it stamps optimistic rows.
@@ -52,7 +53,7 @@ vi.mock('../api/websocket', () => ({
 
 const { api } = await import('../api/client');
 const { ws } = await import('../api/websocket');
-const { useChatStore, registerComposerFlush, AGENTS_PANEL_ID, MAX_AGENT_TABS } = await import('./chatStore');
+const { useChatStore, registerComposerFlush, AGENTS_PANEL_ID, MAX_AGENT_TABS, EMPTY_REVIEW_LOOP } = await import('./chatStore');
 const { reenter, setAuthMode, useHostedStore } = await import('../api/hosted');
 const { useAgentStore } = await import('./agentStore');
 const fx = await import('../test/agentFixtures');
@@ -453,6 +454,55 @@ describe('socket open', () => {
       useAgentStore.setState({ resubscribeAll: original });
     }
     expect(onSocketOpen).toBeTypeOf('function');
+  });
+});
+
+describe('starting a chat from the Inbox', () => {
+  // An unsent new chat with a draft and a review loop set up in the chat page.
+  const loop = { ...EMPTY_REVIEW_LOOP, goal: 'Ship the parser', verifier: 'Tests pass', budget: '20' };
+  beforeEach(() => {
+    useChatStore.setState({
+      sessions: [], messages: [], isStreaming: false, streamingBlocks: [],
+      activeSession: 'v-1', virtualSession: { id: 'v-1', title: '', source: 'web', updated_at: '' },
+      drafts: { 'v-1': 'half a thought' }, newChatReviewLoop: loop,
+      newChatBackend: 'codex', newChatModels: { codex: 'gpt-x' },
+    });
+  });
+
+  it('opens a new default chat and leaves the unsent chat, its draft and its settings alone', async () => {
+    vi.mocked(api.createSession).mockResolvedValueOnce({ id: 'n-1', source: 'web' });
+
+    const id = await useChatStore.getState().startChat('Plan my week');
+
+    expect(id).toBe('n-1');
+    // No backend, model, work directory or review loop: the defaults.
+    expect(api.createSession).toHaveBeenCalledWith();
+    expect(ws.sendMessage).toHaveBeenCalledWith('Plan my week', 'n-1', undefined, expect.any(String));
+    const s = useChatStore.getState();
+    expect(s.activeSession).toBe('n-1');
+    expect(s.sessions.map(r => r.id)).toEqual(['n-1']);
+    expect(s.virtualSession?.id).toBe('v-1');
+    expect(s.drafts['v-1']).toBe('half a thought');
+    expect(s.newChatReviewLoop).toEqual(loop);
+    expect(s.newChatBackend).toBe('codex');
+    expect(s.newChatModels).toEqual({ codex: 'gpt-x' });
+  });
+
+  it('opens nothing when the chat cannot be created', async () => {
+    vi.mocked(api.createSession).mockRejectedValueOnce(new Error('500'));
+    vi.spyOn(console, 'error').mockImplementationOnce(() => {});
+
+    expect(await useChatStore.getState().startChat('Plan my week')).toBeNull();
+
+    expect(useChatStore.getState().activeSession).toBe('v-1');
+    expect(ws.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('reports a message that could not be sent', async () => {
+    vi.mocked(api.createSession).mockResolvedValueOnce({ id: 'n-1', source: 'web' });
+    vi.mocked(ws.sendMessage).mockReturnValueOnce('dropped');
+
+    expect(await useChatStore.getState().startChat('Plan my week')).toBeNull();
   });
 });
 

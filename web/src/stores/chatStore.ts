@@ -296,12 +296,19 @@ interface ChatState {
   /** Trigger the sidebar to mount + focus the search input (used by Cmd+K). */
   requestSearchFocus: () => void;
   /** Send a message. While a turn streams it is queued on the server (the
-   *  agent store tracks it as a pending send) instead of opening a turn. */
+   *  agent store tracks it as a pending send) instead of opening a turn.
+   *  Resolves to the id of the session that got the message, or null when
+   *  the message could not be sent. */
   sendMessage: (
     content: string,
     fileIds?: string[],
     imageBlocks?: Array<{ url: string; filename: string; media_type: string }>,
-  ) => Promise<void>;
+  ) => Promise<string | null>;
+  /** Start a new chat with the default backend and model, open it and send
+   *  `content` to it. The unsent new chat, its draft and its settings stay
+   *  as they are. Resolves to the new session's id, or null when the chat
+   *  could not be created or the message could not be sent. */
+  startChat: (content: string) => Promise<string | null>;
   /** Defer a composed prompt into a new session without running the model
    *  now. ``delay`` is one of "30m" | "1h" | "24h" | "none". */
   runLater: (
@@ -1282,8 +1289,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
             blocks: [{ type: 'text', content: 'Error: Message could not be sent. The connection is closed; please retry.' }],
           }],
         }));
+        return null;
       }
-      return;
+      return session;
     }
     // Optimistic update: append the user message, flip to streaming. If the
     // socket isn't open, send() returns 'queued' (will flush on reconnect)
@@ -1316,7 +1324,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           isStreaming: false,
           agentStatus: { state: 'idle' },
         }));
-        return;
+        return null;
       }
     }
     // No per-message model override: the session row is the source of
@@ -1341,7 +1349,30 @@ export const useChatStore = create<ChatState>((set, get) => ({
         isStreaming: false,
         agentStatus: { state: 'idle' },
       }));
+      return null;
     }
+    return session;
+  },
+
+  startChat: async (content: string) => {
+    let created: Session;
+    try {
+      created = await api.createSession();
+    } catch (e) {
+      console.error('Failed to create session:', e);
+      return null;
+    }
+    set((state) => ({
+      // POST /api/sessions returns a partial row; fill what the list needs.
+      sessions: [
+        { ...created, title: 'New chat', is_running: false, updated_at: new Date().toISOString() },
+        ...state.sessions,
+      ],
+    }));
+    await get().switchSession(created.id);
+    // The view moved to another chat while the messages loaded: do not send there.
+    if (get().activeSession !== created.id) return null;
+    return get().sendMessage(content);
   },
 
   runLater: async (content, delay, fileIds, imageBlocks) => {
