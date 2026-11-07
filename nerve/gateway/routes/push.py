@@ -129,7 +129,7 @@ async def save_subscription(
     """Turn push on for this browser, or change its keys or level."""
     try:
         endpoint = webpush.check_endpoint(body.endpoint)
-        p256dh = webpush.check_key(body.keys.p256dh, webpush.P256DH_BYTES)
+        p256dh = webpush.check_p256dh(body.keys.p256dh)
         auth = webpush.check_key(body.keys.auth, webpush.AUTH_BYTES)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None

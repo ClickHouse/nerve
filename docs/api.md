@@ -889,7 +889,8 @@ The body is `PushSubscription.toJSON()` of the browser and a level:
 default) or `all`. The endpoint must be an https URL of a browser push
 service (`fcm.googleapis.com`, `updates.push.services.mozilla.com`,
 `*.push.apple.com`, `*.notify.windows.com`) on the default port, with at most
-2048 characters; the keys must have their sizes. Otherwise `400`. A second
+2048 characters; `p256dh` must be a point on P-256 and `auth` 16 bytes.
+Otherwise `400`. A second
 `POST` for the same endpoint changes its keys and level; a `POST` of another
 person moves the browser to that person. `409` when the person has 20
 browsers already. The answer is the browser as in the list.

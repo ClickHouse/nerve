@@ -47,6 +47,10 @@ def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
 
 
+#: 65 bytes in the uncompressed form, but (0, 0) is not a point on P-256.
+NOT_A_POINT = _b64url(b"\x04" + bytes(64))
+
+
 class Browser:
     """The keys that a browser makes when it subscribes."""
 
@@ -217,11 +221,17 @@ class TestChecks:
 
     def test_a_key_must_decode_to_its_size(self):
         keys = Browser().keys
-        assert webpush.check_key(keys["p256dh"], webpush.P256DH_BYTES)
         assert webpush.check_key(keys["auth"], webpush.AUTH_BYTES)
-        for bad in (keys["auth"], "not base64 !", ""):
+        for bad in (keys["p256dh"], "not base64 !", ""):
             with pytest.raises(ValueError):
-                webpush.check_key(bad, webpush.P256DH_BYTES)
+                webpush.check_key(bad, webpush.AUTH_BYTES)
+
+    def test_the_public_key_must_be_a_point_on_the_curve(self):
+        keys = Browser().keys
+        assert webpush.check_p256dh(keys["p256dh"]) == keys["p256dh"]
+        for bad in (NOT_A_POINT, keys["auth"], "not base64 !"):
+            with pytest.raises(ValueError):
+                webpush.check_p256dh(bad)
 
 
 # --------------------------------------------------------------------------- #
@@ -350,6 +360,21 @@ class TestDeliver:
         assert await _deliver(people, _config(tmp_path))
         (row,) = await people.db.list_push_subscriptions()
         assert row["endpoint"] == MOZILLA
+
+    async def test_keys_that_do_not_encrypt_stop_only_their_own_browser(
+        self, people, push_service, tmp_path, caplog,
+    ):
+        bad = Browser(FCM)
+        bad.keys["p256dh"] = NOT_A_POINT
+        await _subscribe(people.db, people.alice, bad)
+        await _subscribe(people.db, people.alice, Browser(MOZILLA))
+
+        assert await _deliver(people, _config(tmp_path))
+
+        assert [r["url"] for r in push_service.requests] == [MOZILLA]
+        assert "Push to subscription" in caplog.text
+        for secret in ("device-one", NOT_A_POINT, bad.keys["auth"]):
+            assert secret not in caplog.text
 
     async def test_nothing_is_sent_without_subscriptions(self, people, push_service, tmp_path):
         assert not await _deliver(people, _config(tmp_path))
@@ -482,6 +507,7 @@ class TestRoutes:
         {"endpoint": "https://127.0.0.1/api/push"},
         {"endpoint": "https://nerve-test/api/push/subscriptions"},
         {"keys": {"p256dh": "AAAA", "auth": "AAAA"}},
+        {"keys": {"p256dh": NOT_A_POINT, "auth": _b64url(bytes(16))}},
     ])
     async def test_a_bad_subscription_is_refused_and_nothing_is_stored(self, api, body):
         async with api.client(api.alice_account) as http:

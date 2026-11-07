@@ -89,14 +89,33 @@ def check_endpoint(endpoint: str) -> str:
     return endpoint
 
 
-def check_key(value: str, size: int) -> str:
-    """A browser key in base64url that decodes to ``size`` bytes, else :class:`ValueError`."""
+_BAD_KEY = "The browser sent a key that is not valid."
+
+
+def _key_bytes(value: str, size: int) -> bytes:
     try:
         decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
     except (binascii.Error, ValueError):
         decoded = b""
     if len(decoded) != size:
-        raise ValueError("The browser sent a key that is not valid.")
+        raise ValueError(_BAD_KEY)
+    return decoded
+
+
+def check_key(value: str, size: int) -> str:
+    """A browser key in base64url that decodes to ``size`` bytes, else :class:`ValueError`."""
+    _key_bytes(value, size)
+    return value
+
+
+def check_p256dh(value: str) -> str:
+    """The browser's public key when it is a point on P-256 (uncompressed,
+    base64url), else :class:`ValueError`. The payload encryption fails for
+    any other value."""
+    try:
+        ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), _key_bytes(value, P256DH_BYTES))
+    except ValueError:
+        raise ValueError(_BAD_KEY) from None
     return value
 
 
@@ -163,10 +182,12 @@ async def deliver(
     data = payload(agent, notification_id, title, body, silent)
     urgency = "high" if priority in _URGENT_PRIORITIES else "normal"
     async with _http_session() as session:
-        sent = await asyncio.gather(*(
-            _send(db, session, row, data, vapid, urgency) for row in subscriptions
-        ))
-    return any(sent)
+        # return_exceptions: a failure for one browser never stops the others.
+        sent = await asyncio.gather(
+            *(_send(db, session, row, data, vapid, urgency) for row in subscriptions),
+            return_exceptions=True,
+        )
+    return any(result is True for result in sent)
 
 
 def _http_session() -> aiohttp.ClientSession:
@@ -178,6 +199,8 @@ def _http_session() -> aiohttp.ClientSession:
 async def _send(
     db: Database, session: aiohttp.ClientSession, row: dict, data: str, vapid: Vapid, urgency: str,
 ) -> bool:
+    """Push to one browser. The log names the row, never its endpoint (a
+    capability URL) or its keys."""
     info = {"endpoint": row["endpoint"], "keys": {"p256dh": row["p256dh"], "auth": row["auth"]}}
     try:
         await webpush_async(
@@ -190,14 +213,13 @@ async def _send(
             aiohttp_session=session,
         )
     except WebPushException as e:
-        # The log names the row, never its endpoint: the endpoint is a capability URL.
         if e.status_code in GONE_STATUSES:
             await db.delete_push_subscription(row["id"])
             logger.info("Push subscription %s is gone (%s); deleted it", row["id"], e.status_code)
         else:
             logger.warning("Push to subscription %s failed with status %s", row["id"], e.status_code)
         return False
-    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+    except Exception as e:  # noqa: BLE001 - a network error, or keys that do not encrypt
         logger.warning("Push to subscription %s failed: %s", row["id"], type(e).__name__)
         return False
     await db.mark_push_success(row["id"])
