@@ -16,15 +16,17 @@ import { isAskFormTool } from './tools/formQuestions';
  */
 
 /**
- * True for a call whose card the person acts on: a question (`ask_user`,
- * `AskUserQuestion`, `ask_form`), the plan decision (`ExitPlanMode`), or the
- * live card of a workflow run. Only the first call for a run in a message
- * shows that card; later calls for the run show a compact row, which a burst
- * can hold.
+ * True for a call whose card the person acts on or reads: a question
+ * (`ask_user`, `AskUserQuestion`, `ask_form`), the plan decision
+ * (`ExitPlanMode`), a file that the agent sends (`send_file`), or the live
+ * card of a workflow run. Only the first call for a run in a message shows
+ * that card; later calls for the run show a compact row, which a burst can
+ * hold.
  */
 export function isPinnedCall(block: ToolCallBlockData, repeatRunCalls: ReadonlySet<string>): boolean {
   if (block.tool === 'AskUserQuestion' || block.tool === 'ExitPlanMode') return true;
-  if (isAskFormTool(block.tool) || toolBaseName(block.tool) === 'ask_user') return true;
+  const baseName = toolBaseName(block.tool);
+  if (isAskFormTool(block.tool) || baseName === 'ask_user' || baseName === 'send_file') return true;
   return workflowRunCardId(block) !== null && !repeatRunCalls.has(block.toolUseId);
 }
 
