@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { tellNotificationsChanged } from '../utils/browserAlerts';
 
 export interface Notification {
   id: string;
@@ -201,6 +202,7 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       await api.dismissNotification(id);
       set(s => patchCopies(s, id, { status: 'dismissed' }));
       get().loadNotifications();
+      tellNotificationsChanged();
     } catch (e) {
       console.error('Failed to dismiss notification:', e);
     }
@@ -212,6 +214,7 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       // The server dismisses the pending `notify` rows only.
       set(s => ({ toastQueue: s.toastQueue.filter(n => n.type !== 'notify') }));
       get().loadNotifications();
+      tellNotificationsChanged();
     } catch (e) {
       console.error('Failed to dismiss all:', e);
     }

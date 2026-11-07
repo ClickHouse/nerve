@@ -1,19 +1,29 @@
 import { act, render, screen } from '@testing-library/react';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { api } from '../../api/client';
 import type { WSMessage } from '../../api/websocket';
 import { useBrowserAlertStore } from '../../stores/browserAlertStore';
 import { useChatStore } from '../../stores/chatStore';
 import { useNotificationStore } from '../../stores/notificationStore';
 import type { Session, SessionAttention } from '../../types/chat';
-import { ALERT_DELAY_MS } from '../../utils/browserAlerts';
+import { ALERT_CHANNEL, ALERT_DELAY_MS, tellNotificationsChanged } from '../../utils/browserAlerts';
 import { ANSWER_DOT, UNREAD_DOT } from '../../utils/tabAttention';
 import { OPEN_MESSAGE } from '../../utils/webPush';
+import { FakeChannel } from '../../test/browserAlertFixtures';
 import { stubPushBrowser, unstubPushBrowser } from '../../test/pushFixtures';
 
 const handlers: ((msg: WSMessage) => void)[] = [];
 vi.mock('../../api/websocket', () => ({
   ws: { onMessage: vi.fn((h: (msg: WSMessage) => void) => { handlers.push(h); return () => {}; }) },
+}));
+vi.mock('../../api/client', async (orig) => ({
+  ...(await orig<typeof import('../../api/client')>()),
+  api: {
+    listNotifications: vi.fn(async () => ({ notifications: [], pending_count: 0 })),
+    dismissNotification: vi.fn(async () => ({})),
+    dismissAllNotifications: vi.fn(async () => ({})),
+  },
 }));
 
 const { BrowserAlerts } = await import('./BrowserAlerts');
@@ -85,6 +95,7 @@ beforeEach(() => {
   useBrowserAlertStore.setState({ enabled: false, level: 'important', offerDone: false });
   useChatStore.setState({ sessions: [] });
   useNotificationStore.setState({ pendingCount: 0, notifications: [], toastQueue: [] });
+  FakeChannel.all = [];
 });
 
 afterEach(() => {
@@ -139,6 +150,38 @@ describe('BrowserAlerts', () => {
     expect(document.title).toBe('(1) Fix the login test');
     setUnread(0);
     expect(document.title).toBe('Fix the login test');
+  });
+
+  it('reads the notifications again when another tab of the browser dismissed items', async () => {
+    vi.stubGlobal('BroadcastChannel', FakeChannel);
+    renderAlerts();
+    setUnread(1);
+    expect(document.title).toBe('(1) Nerve');
+    vi.mocked(api.listNotifications).mockClear();
+
+    // What the store of the other tab sends after a dismissal.
+    act(() => tellNotificationsChanged());
+    await act(async () => { await Promise.resolve(); });
+
+    expect(api.listNotifications).toHaveBeenCalled();
+    expect(document.title).toBe('Nerve');
+  });
+
+  it('tells the other tabs after a dismissal, and not after a failed one', async () => {
+    vi.stubGlobal('BroadcastChannel', FakeChannel);
+    const otherTab: unknown[] = [];
+    new FakeChannel(ALERT_CHANNEL).addEventListener('message', (e) => otherTab.push(e.data));
+    const { dismissNotification, dismissAll } = useNotificationStore.getState();
+
+    await act(() => dismissNotification('n-1'));
+    await act(() => dismissAll());
+    expect(otherTab).toEqual([{ kind: 'changed' }, { kind: 'changed' }]);
+
+    const quiet = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.mocked(api.dismissNotification).mockRejectedValueOnce(new Error('offline'));
+    await act(() => dismissNotification('n-2'));
+    expect(otherTab).toHaveLength(2);
+    quiet.mockRestore();
   });
 
   it('keeps a page title that starts with the same characters as the prefix', async () => {
