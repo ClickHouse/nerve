@@ -69,18 +69,22 @@ describe('ChatHeaderMenu', () => {
     await user.keyboard('{Escape}');
 
     expect(menuButton()).toHaveAttribute('aria-expanded', 'false');
-    expect(screen.queryByRole('button', { name: /Tasks from this session/ })).toBeNull();
+    expect(screen.queryByRole('button', { name: /from this session/ })).toBeNull();
     expect(document.activeElement).toBe(menuButton());
     expect(pageEscape).not.toHaveBeenCalled();
     document.removeEventListener('keydown', pageEscape);
   });
 
-  it('says so when the session has no tasks', async () => {
+  it('shows a disabled item and opens no dialog when the session has no tasks', async () => {
     getSessionTasks.mockResolvedValue({ tasks: [] });
     const user = renderMenu();
     await user.click(menuButton());
-    await user.click(await screen.findByRole('button', { name: 'Tasks from this session (0)' }));
-    expect(screen.getByText('This session did not create or change a task.')).toBeInTheDocument();
+    const item = await screen.findByRole('button', { name: 'No tasks from this session' });
+    expect(item).toBeDisabled();
+
+    await user.click(item);
+
+    expect(screen.queryByRole('dialog')).toBeNull();
   });
 
   it('offers a retry when the tasks do not load', async () => {

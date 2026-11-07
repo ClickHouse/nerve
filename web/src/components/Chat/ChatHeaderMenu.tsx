@@ -82,6 +82,10 @@ export function ChatHeaderMenu({ sessionId }: { sessionId: string }) {
         // composer's menu has the same note.
         aria-expanded={menuOpen}
         onClick={toggleMenu}
+        // On a phone the pseudo-element makes the tap target 44 px square
+        // and keeps the 24 px button: 8 px to the left (the header's gap),
+        // 12 px to the right (its padding), 10 px up and down.
+        className="relative max-md:before:absolute max-md:before:-inset-y-2.5 max-md:before:-left-2 max-md:before:-right-3 max-md:before:content-['']"
       >
         <MoreHorizontal size={16} />
       </IconButton>
@@ -93,10 +97,14 @@ export function ChatHeaderMenu({ sessionId }: { sessionId: string }) {
             size="sm"
             fullWidth
             onClick={openDialog}
+            // An empty list is not worth a dialog.
+            disabled={tasks?.length === 0}
             className="justify-start gap-2.5 px-3 py-1.5 rounded-none text-left whitespace-nowrap"
           >
             <CheckSquare size={14} />
-            Tasks from this session{tasks && ` (${tasks.length})`}
+            {tasks?.length === 0
+              ? 'No tasks from this session'
+              : `Tasks from this session${tasks ? ` (${tasks.length})` : ''}`}
           </Button>
         </div>
       )}
