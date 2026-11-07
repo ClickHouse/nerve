@@ -71,7 +71,8 @@ export function alertsOn(state: Pick<BrowserAlertState, 'enabled' | 'support'>):
 /**
  * Browser alerts, kept per browser in localStorage. Every panel tab of the
  * browser reads the same value, and a change in one tab reaches the others
- * through the `storage` event.
+ * through the `storage` event. The permission is per browser too, so a tab
+ * reads it again with the change: another tab can have asked for it.
  */
 export const useBrowserAlertStore = create<BrowserAlertState>((set, get) => {
   const save = (patch: Partial<AlertChoices>) => {
@@ -80,7 +81,7 @@ export const useBrowserAlertStore = create<BrowserAlertState>((set, get) => {
     set(patch);
   };
   window.addEventListener('storage', (e) => {
-    if (e.key === BROWSER_ALERTS_KEY) set(readChoices());
+    if (e.key === BROWSER_ALERTS_KEY) set({ ...readChoices(), support: alertSupport() });
   });
 
   return {
