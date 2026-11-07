@@ -3086,6 +3086,14 @@ NOTIFY_RECORD_CHANNEL = "web"
 NOTIFY_CHANNELS = (NOTIFY_RECORD_CHANNEL, "telegram", "slack")
 
 
+def level_wants(level: str, notif_type: str, priority: str) -> bool:
+    """Whether a channel at ``level`` gets an item of this type and priority:
+    ``important`` gets questions, approvals, and ``high`` or ``urgent`` items."""
+    if level != NOTIFY_LEVEL_IMPORTANT:
+        return True
+    return notif_type in ("question", "approval") or priority in _IMPORTANT_PRIORITIES
+
+
 def _notification_levels(raw: Any) -> dict[str, str]:
     """``notifications.levels`` as ``{channel: level}``. An unknown level is
     logged and read as ``all``, so a typo holds nothing back."""
@@ -3148,9 +3156,7 @@ class NotificationsConfig:
         """
         if channel == NOTIFY_RECORD_CHANNEL:
             return True
-        if self.levels.get(channel, NOTIFY_LEVEL_ALL) != NOTIFY_LEVEL_IMPORTANT:
-            return True
-        return notif_type in ("question", "approval") or priority in _IMPORTANT_PRIORITIES
+        return level_wants(self.levels.get(channel, NOTIFY_LEVEL_ALL), notif_type, priority)
 
     @classmethod
     @_coerced
