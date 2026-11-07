@@ -39,7 +39,7 @@ function loomHealth(loom: Record<string, unknown>, dashboardUrl = '') {
 describe('DiagnosticsPage memory card', () => {
   beforeEach(() => {
     vi.mocked(api.getDiagnostics).mockResolvedValue({ system: {} });
-    vi.mocked(api.getCronLogs).mockResolvedValue({ logs: [], total: 0, limit: 30, offset: 0 });
+    vi.mocked(api.getCronLogs).mockResolvedValue({ logs: [], total: 0, empty: 0, limit: 30, offset: 0 });
     vi.mocked(api.listExternalAgents).mockResolvedValue({
       enabled: false, sync_interval_minutes: 60, conflict_policy: 'skip', available: [], configured: [],
     });
