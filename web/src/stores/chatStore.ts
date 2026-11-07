@@ -1650,6 +1650,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // A send this tab queued while a turn ran has started: its bubble
         // appears now, in the order the server runs it.
         const { started } = useAgentStore.getState().applyQueueUpdate(msg);
+        // A queued message that never ran (cancelled by its sender, refused
+        // at shutdown) keeps no bubble: drop the echo of another tab's send.
+        const unsent = new Set((msg.removed ?? [])
+          .filter(r => r.reason === 'cancelled' || r.reason === 'refused')
+          .map(r => r.client_msg_id));
+        if (msg.session_id === get().activeSession
+          && get().messages.some(m => m.role === 'user' && m.client_msg_id && unsent.has(m.client_msg_id))) {
+          set((s) => ({
+            messages: s.messages.filter(m => m.role !== 'user' || !m.client_msg_id || !unsent.has(m.client_msg_id)),
+          }));
+        }
         if (started.length > 0) {
           const now = new Date().toISOString();
           const actor = selfActorId();

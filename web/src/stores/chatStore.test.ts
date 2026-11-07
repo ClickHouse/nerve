@@ -326,6 +326,21 @@ describe('agent events in the dispatcher', () => {
     expect(useAgentStore.getState().queue).toEqual([entry]);
   });
 
+  it('drops the echoed bubble of a queued message that never ran', () => {
+    const echo = (content: string, client_msg_id: string) => ({
+      role: 'user' as const, blocks: [{ type: 'text' as const, content }], client_msg_id,
+    });
+    onSession({ messages: [echo('cancelled', 'c-1'), echo('refused', 'c-2'), echo('started', 'c-3')] });
+
+    dispatch({ type: 'queue_update', session_id: SID, queue: [], removed: [
+      { queue_id: 'q_1', client_msg_id: 'c-1', reason: 'cancelled' },
+      { queue_id: 'q_2', client_msg_id: 'c-2', reason: 'refused' },
+      { queue_id: 'q_3', client_msg_id: 'c-3', reason: 'started' },
+    ] });
+
+    expect(useChatStore.getState().messages.map(m => m.client_msg_id)).toEqual(['c-3']);
+  });
+
   it('drops the agent events of a session that is not on screen', () => {
     dispatch({ type: 'agent_update', session_id: 's-other', agents: [{ ...fx.FX_RUNNING, session_id: 's-other' }], summary: fx.makeSummary([]) });
     dispatch({ type: 'queue_update', session_id: 's-other', queue: [fx.makeQueueEntry()] });
