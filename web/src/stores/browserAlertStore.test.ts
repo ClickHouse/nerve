@@ -63,6 +63,19 @@ describe('useBrowserAlertStore', () => {
     expect(saved()).toEqual({ enabled: false, level: 'all', offerDone: true });
   });
 
+  it('takes the permission with a change from another tab', () => {
+    // This tab read the permission before another tab asked for it.
+    const request = stubBrowser();
+    expect(useBrowserAlertStore.getState().support).toBe('default');
+    Object.assign(window.Notification, { permission: 'granted' });
+    localStorage.setItem(BROWSER_ALERTS_KEY, JSON.stringify({ enabled: true, level: 'important', offerDone: true }));
+
+    window.dispatchEvent(new StorageEvent('storage', { key: BROWSER_ALERTS_KEY }));
+
+    expect(alertsOn(useBrowserAlertStore.getState())).toBe(true);
+    expect(request).not.toHaveBeenCalled();
+  });
+
   it('takes a change from another tab', () => {
     localStorage.setItem(BROWSER_ALERTS_KEY, JSON.stringify({ enabled: true, level: 'all', offerDone: true }));
     window.dispatchEvent(new StorageEvent('storage', { key: BROWSER_ALERTS_KEY }));
