@@ -562,15 +562,9 @@ class TestManifest:
         monkeypatch.setenv("NERVE_DISPLAY_NAME", "Support bot")
         assert (await self._get(api))["name"] == "Support bot"
 
-    async def test_an_svg_or_a_large_png_favicon_is_the_icon(self, api):
-        favicon = api.workspace / "config" / "favicon.png"
-        favicon.write_bytes(_png(512))
-        assert (await self._get(api))["icons"] == [
-            {"src": "/favicon.ico", "sizes": "512x512", "type": "image/png"},
-        ]
-        favicon.write_bytes(_png(64))
-        assert (await self._get(api))["icons"][0]["src"] == "/nerve-icon-192.png"
-        (api.workspace / "config" / "favicon.svg").write_text("<svg xmlns='http://www.w3.org/2000/svg'/>")
-        assert (await self._get(api))["icons"] == [
-            {"src": "/favicon.ico", "sizes": "any", "type": "image/svg+xml"},
-        ]
+    async def test_the_icons_are_nerve_s_192_and_512_px_pngs_also_with_a_favicon(self, api):
+        (api.workspace / "config" / "favicon.png").write_bytes(_png(256))
+        icons = (await self._get(api))["icons"]
+        assert {(icon["src"], icon["sizes"]) for icon in icons} == {
+            ("/nerve-icon-192.png", "192x192"), ("/nerve-icon-512.png", "512x512"),
+        }
