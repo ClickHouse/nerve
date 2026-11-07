@@ -1,10 +1,10 @@
 import { useState } from 'react';
-import { ChevronRight, ChevronDown, Terminal, FileText, Search, Globe, Loader2, Download } from '../ui/icons';
+import { ChevronRight, ChevronDown, Terminal, FileText, Search, Globe, Loader2 } from '../ui/icons';
 import { Button } from '../ui';
 import { getToolSummary } from '../../utils/toolSummary';
 import type { ToolCallBlockData } from '../../types/chat';
-import { authUrl } from '../../api/hosted';
 import { EditToolBlock } from './tools/EditToolBlock';
+import { SendFileBlock } from './tools/SendFileBlock';
 import { BashToolBlock } from './tools/BashToolBlock';
 import { FileToolBlock } from './tools/FileToolBlock';
 import { MemoryToolBlock } from './tools/MemoryToolBlock';
@@ -92,13 +92,11 @@ export function ToolCallBlock({
     return <FormBlock block={block} fallback={<GenericToolBlock block={block} />} />;
   }
 
-  // send_file — render as inline download card, no tool chrome
-  if (block.tool.includes('send_file')) {
-    return <SendFileBlock block={block} />;
-  }
+  // Nerve's send_file (`mcp__nerve__send_file`): the image or a download card, no tool chrome.
+  const baseName = toolBaseName(block.tool);
+  if (baseName === 'send_file') return <SendFileBlock block={block} />;
 
   // Nerve's notification tools (`mcp__nerve__ask_user`, `mcp__nerve__notify`)
-  const baseName = toolBaseName(block.tool);
   if (baseName === 'ask_user') return <AskUserBlock block={block} />;
   if (baseName === 'notify') return <NotificationToolBlock block={block} />;
 
@@ -134,43 +132,6 @@ export function ToolCallBlock({
 
   // Generic fallback
   return <GenericToolBlock block={block} />;
-}
-
-function SendFileBlock({ block }: { block: ToolCallBlockData }) {
-  const filePath = block.input?.file_path as string || '';
-  const filename = filePath.split('/').pop() || 'file';
-  const downloadUrl = `/api/files/download?path=${encodeURIComponent(filePath)}`;
-  const isRunning = block.status === 'running';
-
-  if (isRunning) {
-    return (
-      <div className="my-1.5 inline-flex items-center gap-2 px-3 py-2 text-sm text-text-muted">
-        <Loader2 size={14} className="animate-spin" /> Sending file...
-      </div>
-    );
-  }
-
-  if (block.isError) {
-    return (
-      <div className="my-1.5 inline-flex items-center gap-2 px-3 py-2 text-sm text-error">
-        <FileText size={14} /> Failed to send file
-      </div>
-    );
-  }
-
-  return (
-    <div className="my-2">
-      <a
-        href={authUrl(downloadUrl)}
-        download={filename}
-        className="inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-surface hover:bg-surface-hover transition-colors text-sm text-text-secondary"
-      >
-        <FileText size={14} />
-        <span className="truncate max-w-[200px]">{filename}</span>
-        <Download size={12} className="text-text-muted" />
-      </a>
-    </div>
-  );
 }
 
 function GenericToolBlock({ block }: { block: ToolCallBlockData }) {
