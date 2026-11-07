@@ -1235,6 +1235,11 @@ class SlackChannel(BaseChannel):
         if images:
             metadata["images"] = images
         self._remember(self._last_inbound_ts, target, ts, _INBOUND_TS_MAX)
+        # The channel name for the origin of a new session. The lookup is
+        # cached, and a direct message has no name.
+        conversation = await self._identify_conversation(
+            channel_id, channel_type, True,
+        )
 
         msg = InboundMessage(
             channel_name="slack",
@@ -1242,6 +1247,7 @@ class SlackChannel(BaseChannel):
             sender_id=target,
             text=text,
             metadata=metadata,
+            conversation_title=next(iter(conversation.names), ""),
         )
 
         try:

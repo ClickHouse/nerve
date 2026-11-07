@@ -13,6 +13,7 @@ from nerve.identity import (
     CauseArg,
     resolve_cause,
 )
+from nerve.session_origin import Origin, derive_origin
 
 # Sources the sidebar treats as "system" (machine-driven); everything else is a conversation by exclusion, so a new source shows up in the feed by default.
 SYSTEM_SOURCES = ("cron", "hook")
@@ -64,6 +65,7 @@ class SessionStore:
         actor: Actor | None,
         cause: CauseArg = CAUSE_FROM_ACTOR,
         created_event: Attribution | None = None,
+        origin: Origin | None = None,
     ) -> dict:
         """Insert a session row, recording who caused it to exist.
 
@@ -93,21 +95,33 @@ class SessionStore:
         session event with that attribution, only when this call's insert
         made the row. Of two callers that create one ID at the same time,
         only the one that the row names is recorded.
+
+        ``origin`` is the session's trigger and origin details
+        (:mod:`nerve.session_origin`), written once like the attribution.
+        Without it, the origin comes from ``source``, the ID and the other
+        arguments, as for a row from before the column existed.
         """
         now = datetime.now(timezone.utc).isoformat()
         created_by = actor.actor_id if actor else None
         caused_by = resolve_cause(actor, cause)
+        if origin is None:
+            origin = derive_origin({
+                "id": session_id, "source": source, "metadata": metadata,
+                "parent_session_id": parent_session_id,
+            })
         async with self._atomic():
             cursor = await self.db.execute(
                 """INSERT OR IGNORE INTO sessions
                    (id, title, source, metadata, status, parent_session_id,
                     forked_from_message, backend, model, cwd, created_by_actor_id,
-                    caused_by_actor_id, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    caused_by_actor_id, trigger, origin_detail,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (session_id, title or session_id, source,
                  json.dumps(metadata or {}), status,
                  parent_session_id, forked_from_message, backend, model, cwd,
-                 created_by, caused_by, now, now),
+                 created_by, caused_by, origin.trigger, origin.detail_json(),
+                 now, now),
             )
             inserted = cursor.rowcount == 1
             await cursor.close()
@@ -132,7 +146,40 @@ class SessionStore:
             "backend": backend, "model": model, "cwd": cwd,
             "created_by_actor_id": created_by,
             "caused_by_actor_id": caused_by,
+            "trigger": origin.trigger,
+            "origin_detail": origin.detail_json(),
         }
+
+    async def set_session_origin(self, session_id: str, origin: Origin) -> bool:
+        """Replace the origin of a session that has no messages yet.
+
+        For a session that a person creates first and then gives its first
+        message in a different way ("Run later"). A session with messages
+        keeps its origin. Returns ``True`` when the row changed.
+        """
+        result = await self._write(
+            "UPDATE sessions SET trigger = ?, origin_detail = ?"
+            " WHERE id = ? AND COALESCE(message_count, 0) = 0",
+            (origin.trigger, origin.detail_json(), session_id),
+        )
+        return result.rowcount == 1
+
+    async def channel_keys_for_sessions(self, session_ids: list[str]) -> dict[str, str]:
+        """The mapped channel key of each session that has one.
+
+        ``channel_sessions`` maps each channel to its latest session, so an
+        older session of the channel has no entry. A session with more than
+        one mapped channel gives one of them.
+        """
+        if not session_ids:
+            return {}
+        placeholders = ",".join("?" for _ in session_ids)
+        async with self.db.execute(
+            f"SELECT session_id, channel_key FROM channel_sessions"
+            f" WHERE session_id IN ({placeholders})",
+            tuple(session_ids),
+        ) as cursor:
+            return {row[0]: row[1] async for row in cursor}
 
     async def get_session(self, session_id: str) -> dict | None:
         async with self.db.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)) as cursor:

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 from nerve.agent.streaming import broadcaster as default_broadcaster
 from nerve.identity import attribution_for
+from nerve.session_origin import external_origin
 from nerve.sources.codex_threads.base import (
     SessionMeta,
     ThreadEvent,
@@ -207,6 +208,7 @@ class CodexIngester:
             # mirrors was started outside Nerve entirely, by nobody known.
             actor=self.db.system_actor,
             cause=None,
+            origin=external_origin("codex"),
         )
         await self.db.bind_native_thread("codex", event.thread_id, session_id)
         self.stats["threads_in_scope"] += 1
