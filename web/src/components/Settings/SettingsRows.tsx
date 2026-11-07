@@ -140,7 +140,7 @@ export function LevelChoice({ value, disabled, busy, onChange }: {
  * changed. Escape puts the saved value back. Remount it (`key`) when the
  * saved value changes, so the field shows the new one.
  */
-export function CommitField({ label, value, help, error, disabled, busy, placeholder, inputMode, unit, onCommit }: {
+export function CommitField({ label, value, help, error, disabled, busy, placeholder, inputMode, type, unit, onCommit }: {
   label: string;
   value: string;
   help?: ReactNode;
@@ -149,6 +149,8 @@ export function CommitField({ label, value, help, error, disabled, busy, placeho
   busy: boolean;
   placeholder?: string;
   inputMode?: 'text' | 'numeric';
+  /** `time` gives the browser's time picker; its value is `HH:MM`. */
+  type?: 'text' | 'time';
   /** A word after the field, such as "hours". */
   unit?: string;
   onCommit: (text: string) => void;
@@ -177,7 +179,8 @@ export function CommitField({ label, value, help, error, disabled, busy, placeho
         aria-busy={busy || undefined}
         placeholder={placeholder}
         inputMode={inputMode}
-        className={unit ? 'w-24' : 'w-full max-w-xs'}
+        type={type}
+        className={unit ? 'w-24' : type === 'time' ? 'w-32' : 'w-full max-w-xs'}
       />
     </Field>
   );

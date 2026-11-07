@@ -353,6 +353,11 @@ Under lockdown the section is read-only, with one line that says why.
   Channels step of Setup. On Nerve Cloud the Slack destination is read-only.
 - **Send a test** sends one notification to each place that is on. Each row
   then shows "Test arrived" or "Test did not arrive".
+- **Quiet hours**: a switch and a start and end time (`quiet_start`,
+  `quiet_end`), in the instance's time zone, which the row names. On fills in
+  22:00 to 07:00; off empties both times. "Quiet now" shows while they apply.
+  During them, notifications below `urgent` arrive without sound (see
+  [config.md](config.md#quiet-hours)).
 - **Silences** opens the silences manager (`/notifications?silences=1`).
 - **Advanced**: when an unanswered question expires, and how often a
   snoozed question comes back.
