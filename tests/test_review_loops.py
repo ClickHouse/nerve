@@ -991,6 +991,20 @@ class TestReviewLoopTools:
         assert result2.ok
         assert (await db.get_review_loop(loop["id"]))["status"] == "passed"
 
+    async def test_an_untitled_observer_is_named_after_the_goal(self, db, engine, wired):
+        _runs, rls = wired
+        engine._generate_session_title = AsyncMock()
+        await db.create_session("obs-titled", title="Launch prep", source="web", actor=None)
+        untitled = await _mk_observer(db, "obs-untitled")
+        for obs in ("obs-titled", untitled):
+            await rls.create_loop(goal="build the thing", verifier="- a", session_id=obs, budget_usd=0.04)
+        deadline = time.monotonic() + 5
+        while not engine._generate_session_title.await_count and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert [c.args for c in engine._generate_session_title.await_args_list] == [
+            (untitled, "Review loop goal: build the thing"),
+        ]
+
 
 # --------------------------------------------------------------------------- #
 #  Workdir handling                                                            #

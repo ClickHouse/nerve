@@ -471,6 +471,7 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
     fields: dict = {}
     if "title" in req:
         fields["title"] = req["title"]
+        fields["title_source"] = "manual"
     if "starred" in req:
         fields["starred"] = 1 if req["starred"] else 0
     if "model" in req:
@@ -583,6 +584,21 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
         except Exception as e:  # a hook failure must never break the PATCH
             logger.warning("star-project hook failed for %s: %s", session_id, e)
     return updated
+
+
+@router.post("/api/sessions/{session_id}/regenerate-title")
+async def regenerate_session_title(session_id: str, actor: Actor = Depends(require_auth)):
+    """Retitle the session from its first request and its last reply, with
+    ``agent.title_model``, replacing whatever title it has."""
+    deps = get_deps()
+    if not await deps.db.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    title = await deps.engine.regenerate_session_title(
+        session_id, attribution=attribution_for(actor),
+    )
+    if not title:
+        raise HTTPException(status_code=502, detail="No title could be made")
+    return {"title": title}
 
 
 @router.delete("/api/sessions/{session_id}")

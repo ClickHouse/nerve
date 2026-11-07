@@ -61,6 +61,7 @@ agent:
   # Note: ~2x the cost of Opus ($10/$50 per MTok in/out).
   cron_model: claude-sonnet-5-5  # Cheaper model for cron jobs
   title_model: claude-haiku-5-5  # Session title generation
+  # outcome_titles: true         # Rename a session once its first answer ends, from what it did
   # Model-alias remapping for the CLI: short aliases ("opus") used in
   # Agent/Workflow tool model options and skill frontmatter resolve to the
   # mapped ID. Supported: opus, sonnet, haiku, fable. opus → claude-opus-5-5

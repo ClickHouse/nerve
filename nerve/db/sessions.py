@@ -331,14 +331,34 @@ class SessionStore:
     async def update_session_title(
         self, session_id: str, title: str, *,
         attribution: Attribution = UNATTRIBUTED, reason: str | None = None,
-    ) -> None:
+        source: str | None = None,
+        only_from: tuple[str | None, ...] | None = None,
+    ) -> bool:
         """Set the title and record a ``title_changed`` event when it changes.
 
-        See :meth:`change_session_fields` for ``attribution`` and ``reason``.
+        ``source`` is stored as ``title_source`` (migration v062) when given.
+        With ``only_from``, nothing is written unless the stored
+        ``title_source`` is one of these. Returns whether the title was
+        written. See :meth:`change_session_fields` for ``attribution`` and
+        ``reason``.
         """
-        await self.change_session_fields(
-            session_id, {"title": title}, attribution=attribution, reason=reason,
+        fields: dict = {"title": title}
+        if source is not None:
+            fields["title_source"] = source
+        written = await self.change_session_fields(
+            session_id, fields, attribution=attribution, reason=reason,
+            only_from=None if only_from is None else {"title_source": only_from},
         )
+        return written is not None
+
+    async def recent_manual_titles(self, limit: int) -> list[str]:
+        """The titles people gave their sessions, newest session first."""
+        async with self.db.execute(
+            "SELECT title FROM sessions WHERE title_source = 'manual'"
+            " ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            return [row[0] for row in await cursor.fetchall() if row[0]]
 
     async def delete_session(
         self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
@@ -434,7 +454,7 @@ class SessionStore:
             "status", "sdk_session_id", "connected_at", "last_activity_at",
             "archived_at", "title", "message_count", "total_cost_usd",
             "parent_session_id", "forked_from_message", "last_memorized_at",
-            "starred", "model", "backend", "cwd",
+            "starred", "model", "backend", "cwd", "title_source",
         }
         set_clauses: list[str] = []
         params: list = []
@@ -464,7 +484,8 @@ class SessionStore:
         *,
         attribution: Attribution = UNATTRIBUTED,
         reason: str | None = None,
-    ) -> list[str]:
+        only_from: dict[str, tuple] | None = None,
+    ) -> list[str] | None:
         """Write session fields and record each tracked change as an event.
 
         Like :meth:`update_session_fields`. In the same transaction, each
@@ -476,7 +497,12 @@ class SessionStore:
         when it is set (for example ``generated`` for a title that the agent
         made). A field that keeps its value records nothing.
 
-        Returns the event types written, in the order of ``fields``.
+        ``only_from`` maps columns to the values they must hold for the write
+        to happen.
+
+        Returns the event types written, in the order of ``fields``, or
+        ``None`` when nothing was written: no such session, or ``only_from``
+        did not hold.
         """
         built = self._build_session_fields_update(session_id, fields)
         if built is None:
@@ -488,8 +514,13 @@ class SessionStore:
             ) as cursor:
                 row = await cursor.fetchone()
             if row is None:
-                return []
+                return None
             before = dict(row)
+            if only_from and any(
+                before.get(column) not in allowed
+                for column, allowed in only_from.items()
+            ):
+                return None
             await self.db.execute(*built)
             for field, value in fields.items():
                 previous = before.get(field)
