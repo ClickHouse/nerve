@@ -34,6 +34,7 @@ from nerve.gateway.routes import (
     sources,
     notifications,
     files,
+    github,
     external_agents,
     prompt_rewrite,
     models,
@@ -80,6 +81,7 @@ def register_all_routes() -> APIRouter:
     router.include_router(sources.router)
     router.include_router(notifications.router)
     router.include_router(files.router)
+    router.include_router(github.router)
     router.include_router(external_agents.router)
     router.include_router(prompt_rewrite.router)
     router.include_router(models.router)

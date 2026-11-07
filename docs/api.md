@@ -1601,6 +1601,46 @@ Response: {
 }
 ```
 
+### GitHub
+
+#### `GET /api/github/pulls?url=...&url=...`
+Summaries of 1 to 10 GitHub pull requests, for the PR cards in the chat. Each
+`url` must be exactly `https://github.com/<owner>/<repo>/pull/<number>`. Any
+other value refuses the whole request with 400. The server runs
+`gh pr view <number> --repo github.com/<owner>/<repo> --json ...` with its own
+`gh` login. No shell runs, and the URL parts go to `gh` as separate arguments.
+The server keeps each result (also an error) for 60 s, and requests for one URL
+in that time share one `gh` call. At most 4 `gh` calls run at the same time,
+and a call stops after 15 s.
+
+The response has one result per distinct `url`, in request order, with `pull`
+or `error`. `state` is `draft`, `open`, `merged` or `closed`. `review` is
+`approved`, `changes_requested`, `review_required` or `null`. `error` is
+`no_access` (`gh` could not read the pull request: no login, no permission or
+no such pull request) or `gh_unavailable` (`gh` is not installed, gave no JSON,
+or did not answer in time).
+
+```json
+Response: {
+  "pulls": [
+    {
+      "url": "https://github.com/example/repo/pull/12", "error": null,
+      "pull": {
+        "repo": "example/repo", "number": 12, "title": "Fix the flaky login test",
+        "state": "open", "review": "approved",
+        "checks": { "passed": 12, "failed": 0, "running": 3 },
+        "head_ref": "alice/fix-login", "base_ref": "main"
+      }
+    },
+    { "url": "https://github.com/example/repo/pull/13", "pull": null, "error": "no_access" }
+  ]
+}
+```
+
+A check run that ends as success, neutral or skipped counts as passed. A check
+run that has not completed counts as running. A commit status counts as running
+while it is pending or expected.
+
 ### Diagnostics
 
 #### `GET /api/diagnostics`
