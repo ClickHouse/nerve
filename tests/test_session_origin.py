@@ -79,7 +79,9 @@ def test_channel_origin(name, key, title, expected):
     ({"id": "workflow:wfr-1", "source": "workflow"}, None,
      Origin("workflow", {"workflow_run": "wfr-1"})),
     ({"id": "impl-1a2b3c4d", "source": "web"}, None, Origin("plan")),
-    ({"id": "onboarding-1a2b", "source": "cron"}, None, Origin("chat")),
+    # The onboarding conversation, and the autonomous onboarding.
+    ({"id": "onboarding-1a2b", "source": "web"}, None, Origin("chat")),
+    ({"id": "onboarding-1a2b", "source": "cron"}, None, Origin("system")),
     # A fork copies the source of its parent.
     ({"id": "fork-1a2b", "source": "telegram", "parent_session_id": "p1"}, None,
      Origin("chat", {"fork_of": "p1"})),
@@ -229,6 +231,10 @@ async def test_web_and_rest_sessions(install):
             "/api/sessions", headers=headers, json={"source": "nightly-script"},
         )).json()
         await client.post("/api/chat", headers=headers, json={"message": "hi"})
+        # A new session id from the caller.
+        await client.post(
+            "/api/chat", headers=headers, json={"session_id": "rest-new", "message": "hi"},
+        )
         await install.db.update_session_fields(web["id"], {"sdk_session_id": "native-1"})
         fork = (await client.post(
             "/api/sessions/fork", headers=headers, json={"source_session_id": web["id"]},
@@ -243,6 +249,7 @@ async def test_web_and_rest_sessions(install):
     assert await _origin_of(install.db, web["id"]) == ("chat", {})
     assert await _origin_of(install.db, rest["id"]) == ("api", {})
     assert await _origin_of(install.db, api_session) == ("api", {})
+    assert await _origin_of(install.db, "rest-new") == ("api", {})
     assert await _origin_of(install.db, fork["id"]) == ("chat", {"fork_of": web["id"]})
     # Every session payload has the three origin fields.
     for payload in (web, rest, fork, single, listed[web["id"]], listed[api_session]):

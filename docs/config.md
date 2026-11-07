@@ -2313,7 +2313,7 @@ its own model calls. The value is the kind of event that started the work:
 
 | Requests | Trigger |
 |---|---|
-| The model requests of an agent session | The session's `trigger`: `chat`, `api`, `slack`, `telegram`, `email`, `cron`, `plan`, `workflow`, `external` or `unknown`. See `trigger` in [api.md](api.md#sessions) |
+| The model requests of an agent session | The session's `trigger`: `chat`, `api`, `slack`, `telegram`, `email`, `cron`, `plan`, `workflow`, `external`, `system` (the autonomous onboarding) or `unknown`. See `trigger` in [api.md](api.md#sessions) |
 | Nerve's own model calls (the second row of the table above) | `system` |
 
 Nerve sets a session's trigger when it creates the session, from the code

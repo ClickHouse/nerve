@@ -885,7 +885,8 @@ Session payloads also carry where the session comes from:
   (`/api/chat`, other REST callers, webhooks), `slack`, `telegram`, `email`,
   `cron` (cron jobs and "Run later"), `plan` (plan implementation and planner
   sessions), `workflow` (workflow runs and review loop legs), `external` (MCP
-  satellite sessions and imported threads) and `unknown`. The code path that
+  satellite sessions and imported threads), `system` (the autonomous
+  onboarding) and `unknown`. The code path that
   creates the session sets it once; it does not come from `source`. A
   session from before this field gets a value derived from `source`, its id
   and its channel mapping.
@@ -896,7 +897,8 @@ Session payloads also carry where the session comes from:
   `task_id`, `fork_of`, `workflow_run`, `client`, `hook`.
 
 `POST /api/sessions` gives `chat` when `source` is `web` (the default) and
-`api` for another `source`. `POST /api/sessions/run-later` changes a session
+`api` for another `source`. `POST /api/chat` with a new `session_id` gives
+`api`. `POST /api/sessions/run-later` changes a session
 without messages to `cron`.
 
 Rows also carry `is_running` (the orchestrator's turn is in flight),
