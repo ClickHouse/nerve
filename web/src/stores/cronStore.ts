@@ -43,8 +43,6 @@ export interface CronJob {
   forecast_reason?: string | null;
   last_run: CronLastRun | null;
   stats_7d: CronJobStats;
-  /** Why the Active switch cannot change this job; null when it can. */
-  toggle_blocked: string | null;
 }
 
 /** Each job with the forecast the schedule reports for it. */

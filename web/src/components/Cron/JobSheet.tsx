@@ -1,7 +1,7 @@
 import { useId, type ReactNode } from 'react';
 import { useCronStore, type CronJob } from '../../stores/cronStore';
 import { Badge, Switch } from '../ui';
-import { Filter, FileText, Lock } from '../ui/icons';
+import { Filter, FileText } from '../ui/icons';
 import {
   describeSchedule, formatDuration, formatForecast, formatRelativeTime, formatRunTime,
   formatSuccess, isCrontab, jobLabel, parseUTC,
@@ -31,7 +31,7 @@ function absolute(iso: string): string {
  */
 export function JobSheet({ job }: { job: CronJob }) {
   const { toggling, toggleError, setJobEnabled } = useCronStore();
-  const blockedId = useId();
+  const titleId = useId();
   const schedule = describeSchedule(job.schedule);
   // For a job without gates the forecast is always "run": it adds nothing.
   const forecast = job.enabled && (job.forecast === 'skip' || (job.gates ?? []).length > 0)
@@ -44,13 +44,13 @@ export function JobSheet({ job }: { job: CronJob }) {
   ].filter(Boolean).join(', ');
 
   return (
-    <section aria-labelledby={`${blockedId}-title`}
+    <section aria-labelledby={titleId}
       className="p-4 bg-surface border border-border-subtle rounded-lg">
       <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-3">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <JobTypeIcon kind={job.kind} />
-            <h2 id={`${blockedId}-title`} className="text-base font-medium text-text truncate">
+            <h2 id={titleId} className="text-base font-medium text-text truncate">
               {jobLabel(job)}
             </h2>
             <JobTypeBadge kind={job.kind} />
@@ -67,8 +67,7 @@ export function JobSheet({ job }: { job: CronJob }) {
             <Switch
               label="Active"
               checked={job.enabled}
-              disabled={toggling === job.id || job.toggle_blocked !== null}
-              aria-describedby={job.toggle_blocked ? blockedId : undefined}
+              disabled={toggling === job.id}
               onChange={(enabled) => void setJobEnabled(job.id, enabled)}
               className="mr-2 px-1 py-1.5"
             />
@@ -79,11 +78,6 @@ export function JobSheet({ job }: { job: CronJob }) {
         </div>
       </div>
 
-      {job.kind !== 'source' && job.toggle_blocked && (
-        <p id={blockedId} className="mt-2 text-xs text-text-dim flex items-start gap-1">
-          <Lock size={11} className="mt-0.5 shrink-0" /> {job.toggle_blocked}
-        </p>
-      )}
       {toggleError?.jobId === job.id && (
         <p role="alert" className="mt-2 text-xs text-error">{toggleError.message}</p>
       )}

@@ -786,18 +786,18 @@ cron jobs (`PUT /api/cron/jobs/{job_id}/enabled`). The file is the one that
 defines the job: `jobs.yaml` for your own jobs and for a built-in job that
 `jobs.yaml` replaces, `system.yaml` for the other built-in jobs.
 
-Nerve rewrites the file with the same YAML dump that the setup page uses for
-`system.yaml`. That dump keeps the comment block at the top of the file, but
-not other comments or your own formatting (block scalars, quotes,
-indentation). So the switch changes a file only when the dump writes back the
-file unchanged apart from the flag. For a file with comments or formatting of
-its own, the switch is not available, and its tooltip tells you to change
-`enabled` in the file. `system.yaml`, which Nerve writes, can always be
-switched, unless you edited it by hand.
+Nerve changes one line of the file: the job's `enabled:` line, or, when the
+job has none, a new `enabled:` line under its `id:` line, with the indentation
+of the job's keys. Comments, quotes, block scalars and the rest of the file
+stay as they are. Nerve then reads the result again and writes it only if the
+job's `enabled` is the one difference. A layout where one line cannot do that
+(a job written as a flow mapping, `{id: ..., ...}`, for example) is refused,
+and the error tells you to change `enabled` in the file. When the reload after
+the change fails, the file gets its old text back and the error is shown.
 
-The switch is also not available under [lockdown](config.md#lockdown-remote-only-read-only)
-(change the job in the config repository), for a file that Nerve cannot
-write, and for a source (switch it in its `sync` settings).
+Nerve also refuses the change under [lockdown](config.md#lockdown-remote-only-read-only)
+(change the job in the config repository) and for a file that it cannot
+write. A source has no switch: switch it in its `sync` settings.
 
 ### Failure notices
 
