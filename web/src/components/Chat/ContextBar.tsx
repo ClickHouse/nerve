@@ -1,144 +1,133 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { api, apiErrorDetail, type SessionContext } from '../../api/client';
+import { ContextPopover, type CompactState } from './ContextPopover';
+import { contextTokens, formatTokens, meterColor, type ContextUsage } from './contextUsage';
 
-interface ContextUsage {
-  input_tokens: number;
-  output_tokens: number;
-  cache_creation_input_tokens: number;
-  cache_read_input_tokens: number;
-  // 5m vs 1h ephemeral cache TTL split — emitted by the Anthropic API
-  // under usage.cache_creation. Both default to 0 when the API omits
-  // the split (older responses) or when no cache was written.
-  cache_creation_5m_input_tokens?: number;
-  cache_creation_1h_input_tokens?: number;
-  max_context_tokens: number;
-  num_turns: number;
-}
+const POPOVER_ID = 'context-popover';
 
-function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-  return String(n);
-}
+/**
+ * The chat header's context meter. A click opens the context popover, which
+ * loads the breakdown of the session's context and offers Compact. Render it
+ * with `key={sessionId}`, so a session switch starts it fresh.
+ */
+export function ContextBar({ usage, sessionId, backend, busy, sessionCostUsd }: {
+  usage: ContextUsage;
+  sessionId: string;
+  backend: string;
+  /** A turn runs: Compact waits until it ends. */
+  busy: boolean;
+  sessionCostUsd?: number;
+}) {
+  const [open, setOpen] = useState(false);
+  // The last breakdown, with the usage it was loaded after: the next turn's
+  // usage makes it old.
+  const [loaded, setLoaded] = useState<{ usage: ContextUsage; context: SessionContext } | null>(null);
+  const [loadFailed, setLoadFailed] = useState(false);
+  const [compact, setCompact] = useState<CompactState>({ step: 'idle' });
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
 
-export function ContextBar({ usage, sessionCostUsd }: { usage: ContextUsage; sessionCostUsd?: number }) {
-  const [hovering, setHovering] = useState(false);
+  // Load the breakdown when the popover opens, and again after each turn.
+  useEffect(() => {
+    if (!open) return;
+    let stale = false;
+    api.getSessionContext(sessionId)
+      .then(context => {
+        if (stale) return;
+        setLoaded({ usage, context });
+        setLoadFailed(false);
+      })
+      .catch(() => { if (!stale) setLoadFailed(true); });
+    return () => { stale = true; };
+  }, [open, sessionId, usage]);
 
-  // The SDK's ResultMessage.usage aggregates tokens across ALL API sub-calls
-  // in a turn (each tool use triggers a new API call). So cache_read can be
-  // N× the context window — it's summed across calls, not one call's context.
-  //
-  // To estimate the ACTUAL context window occupancy for the most recent call,
-  // we divide total input tokens by the number of API sub-calls (num_turns).
-  // Output tokens are excluded — they don't consume the context window.
-  const totalInput = usage.input_tokens + usage.cache_read_input_tokens
-    + usage.cache_creation_input_tokens;
-  const max = usage.max_context_tokens;
-  const numCalls = usage.num_turns || Math.max(1, Math.ceil(totalInput / max));
-  const estimatedContext = Math.round(totalInput / numCalls);
-  const pct = Math.min((estimatedContext / max) * 100, 100);
+  // Close on an outside press, and on Escape, which must not also reach the
+  // global Escape that stops the turn.
+  useEffect(() => {
+    if (!open) return;
+    const onDown = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      e.stopPropagation();
+      setOpen(false);
+      triggerRef.current?.focus();
+    };
+    document.addEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey, true);
+    };
+  }, [open]);
 
-  // Cache hit rate (across all sub-calls — this IS a billing metric, so aggregate is correct)
-  const cacheRate = totalInput > 0
-    ? (usage.cache_read_input_tokens / totalInput * 100)
-    : 0;
+  // The meter shows the measured use while no turn ended after it.
+  const measured = loaded?.usage === usage && loaded.context.live ? loaded.context : null;
+  const estimate = contextTokens(usage);
+  const used = measured?.total_tokens ?? estimate.tokens;
+  const exact = measured != null || estimate.exact;
+  const max = measured?.max_tokens || usage.max_context_tokens;
+  const pct = max > 0 ? Math.min((used / max) * 100, 100) : 0;
 
-  // Colour by usage level. These land in an inline `backgroundColor`, so they
-  // reference the theme variables directly rather than Tailwind classes —
-  // same tokens, resolved at paint time, so they follow the theme.
-  let barColor = 'var(--theme-info)';
-  if (pct > 80) barColor = 'var(--theme-error)';
-  else if (pct > 60) barColor = 'var(--theme-warning)';
+  const toggle = () => {
+    if (!open && compact.step !== 'running') setCompact({ step: 'idle' });
+    setOpen(!open);
+  };
+
+  const runCompact = async () => {
+    setCompact({ step: 'running' });
+    try {
+      const after = await api.compactSession(sessionId);
+      setLoaded({ usage, context: after });
+      setCompact({ step: 'done', freed: used - after.total_tokens });
+    } catch (e) {
+      const message = apiErrorDetail(e)?.message;
+      setCompact({ step: 'error', message: typeof message === 'string' ? message : 'Compact failed.' });
+    }
+  };
 
   return (
-    <div
-      className="relative flex items-center gap-2 cursor-default"
-      onMouseEnter={() => setHovering(true)}
-      onMouseLeave={() => setHovering(false)}
-    >
-      <span className="text-xs text-text-dim whitespace-nowrap">
-        ~{formatTokens(estimatedContext)} / {formatTokens(max)}
-      </span>
-      <div className="w-20 h-1.5 bg-border-subtle rounded-full overflow-hidden">
-        <div
-          className="h-full rounded-full transition-all duration-300"
-          style={{ width: `${pct}%`, backgroundColor: barColor }}
+    <div ref={wrapRef} className="relative flex">
+      <button
+        ref={triggerRef}
+        type="button"
+        aria-expanded={open}
+        aria-controls={open ? POPOVER_ID : undefined}
+        aria-label={`Context window: ${exact ? '' : 'about '}${formatTokens(used)} of ${formatTokens(max)} tokens`}
+        onClick={toggle}
+        className="flex items-center gap-2 h-7 px-1.5 rounded hover:bg-surface-raised cursor-pointer transition-colors"
+      >
+        <span className="hidden md:inline text-xs text-text-dim whitespace-nowrap tabular-nums">
+          {exact ? '' : '~'}{formatTokens(used)} / {formatTokens(max)}
+        </span>
+        <span className="md:hidden text-xs text-text-dim tabular-nums">{Math.round(pct)}%</span>
+        <span className="w-10 md:w-20 h-1.5 bg-border-subtle rounded-full overflow-hidden">
+          <span
+            className="block h-full rounded-full transition-all duration-300"
+            style={{ width: `${pct}%`, backgroundColor: meterColor(pct) }}
+          />
+        </span>
+      </button>
+      {open && (
+        <ContextPopover
+          id={POPOVER_ID}
+          used={used}
+          exact={exact}
+          max={max}
+          context={loaded?.context ?? null}
+          loadFailed={loadFailed}
+          usage={usage}
+          backend={backend}
+          busy={busy}
+          sessionCostUsd={sessionCostUsd}
+          compact={compact}
+          onCompact={() => setCompact({ step: 'confirm' })}
+          onConfirm={() => void runCompact()}
+          onCancel={() => setCompact({ step: 'idle' })}
         />
-      </div>
-
-      {hovering && (
-        <div className="absolute right-0 top-full mt-2 z-50 bg-surface-raised border border-border-subtle rounded-lg p-3 shadow-xl min-w-[220px]">
-          <div className="text-xs text-text-muted uppercase tracking-wider mb-2">Context Window</div>
-          <div className="space-y-1.5 text-xs leading-tight">
-            <Row label="Est. context" value={estimatedContext} bold />
-            <Row label="Max context" value={max} />
-            <Row label="Remaining" value={Math.max(0, max - estimatedContext)} color={pct > 80 ? 'var(--theme-error)' : 'var(--theme-success)'} />
-
-            {/* Per-turn token breakdown */}
-            <div className="border-t border-border-subtle my-1.5" />
-            <div className="text-xs text-text-muted uppercase tracking-wider mb-1">
-              Turn Tokens (cumulative)
-            </div>
-            <Row label="Fresh input" value={usage.input_tokens} />
-            <Row label="Output" value={usage.output_tokens} />
-            {usage.cache_read_input_tokens > 0 && (
-              <Row label="Cache read" value={usage.cache_read_input_tokens} color="var(--theme-success)" />
-            )}
-            {usage.cache_creation_input_tokens > 0 && (
-              <Row label="Cache created" value={usage.cache_creation_input_tokens} color="var(--theme-hue-purple)" />
-            )}
-            {(usage.cache_creation_5m_input_tokens ?? 0) > 0 && (
-              <Row label="  ↳ 5m TTL" value={usage.cache_creation_5m_input_tokens!} color="var(--theme-hue-violet)" />
-            )}
-            {(usage.cache_creation_1h_input_tokens ?? 0) > 0 && (
-              <Row label="  ↳ 1h TTL" value={usage.cache_creation_1h_input_tokens!} color="var(--theme-hue-violet)" />
-            )}
-            {numCalls > 1 && (
-              <div className="flex justify-between items-center">
-                <span className="text-text-muted">API sub-calls</span>
-                <span className="text-text-muted">{numCalls}</span>
-              </div>
-            )}
-
-            {/* Cost section */}
-            <div className="border-t border-border-subtle my-1.5" />
-            <div className="text-xs text-text-muted uppercase tracking-wider mb-1">Cost</div>
-            {(sessionCostUsd ?? 0) > 0 && (
-              <CostRow label="Session total" value={sessionCostUsd!} bold />
-            )}
-            {cacheRate > 0 && (
-              <div className="flex justify-between items-center">
-                <span className="text-text-muted">Cache hit rate</span>
-                <span className={cacheRate > 50 ? 'text-success' : 'text-text-muted'}>
-                  {cacheRate.toFixed(1)}%
-                </span>
-              </div>
-            )}
-          </div>
-        </div>
       )}
-    </div>
-  );
-}
-
-function Row({ label, value, color, bold }: { label: string; value: number; color?: string; bold?: boolean }) {
-  return (
-    <div className="flex justify-between items-center">
-      <span className="text-text-muted">{label}</span>
-      <span className={bold ? 'text-text font-medium' : 'text-text-muted'} style={color ? { color } : undefined}>
-        {formatTokens(value)}
-      </span>
-    </div>
-  );
-}
-
-function CostRow({ label, value, bold }: { label: string; value: number; bold?: boolean }) {
-  const formatted = value < 0.01 ? `$${value.toFixed(4)}` : `$${value.toFixed(2)}`;
-  return (
-    <div className="flex justify-between items-center">
-      <span className="text-text-muted">{label}</span>
-      <span className={bold ? 'text-text font-medium' : 'text-text-muted'}>
-        {formatted}
-      </span>
     </div>
   );
 }

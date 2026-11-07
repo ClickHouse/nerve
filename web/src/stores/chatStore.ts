@@ -111,6 +111,7 @@ function contextUsageFrom(usage: LastUsage): NonNullable<ChatState['contextUsage
     cache_creation_1h_input_tokens: cc?.ephemeral_1h_input_tokens ?? 0,
     max_context_tokens: usage.max_context_tokens || 200_000,
     num_turns: usage.num_turns || 1,
+    context_tokens: usage.context_tokens,
   };
 }
 
@@ -186,8 +187,10 @@ interface ChatState {
     cache_creation_1h_input_tokens?: number;
     max_context_tokens: number;
     num_turns: number;
+    // Measured after a compact; the bar shows it instead of its estimate.
+    context_tokens?: number;
   } | null;
-  backendStatus: { subtype: string; data: Record<string, unknown> } | null;
+  backendStatus:{ subtype: string; data: Record<string, unknown> } | null;
   // TodoWrite panel state (legacy Claude Code todos)
   currentTodos: TodoItem[];
   // Claude Code 2.1+ task panel state (TaskCreate / TaskUpdate / TaskList)
