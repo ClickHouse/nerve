@@ -7,6 +7,7 @@ import { PageHeader } from '../components/ui/PageHeader';
 import { ActorAttribution } from '../components/Chat/ActorLabel';
 import { NotificationBody, NotificationLinks } from '../components/Notifications/NotificationParts';
 import { NotificationOptions } from '../components/Notifications/NotificationOptions';
+import { BrowserAlertsLink } from '../components/Notifications/BrowserAlertOffer';
 
 /** Lifecycle state — a status, so it takes a `Badge` tone. */
 const STATUS_TONES: Record<string, BadgeTone> = {
@@ -388,6 +389,7 @@ export function NotificationsPage() {
       />
 
       <div className="flex-1 overflow-y-auto p-4 md:p-6">
+        <BrowserAlertsLink />
         {showSilences && <SilencesPanel />}
         {loading ? (
           <div className="text-text-faint text-center py-10">Loading...</div>

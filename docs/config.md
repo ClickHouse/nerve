@@ -1778,7 +1778,8 @@ During quiet hours, each notification (`notify`, `ask_user`,
 `propose_action`, and a re-delivered snoozed item) with a priority other than
 `urgent` goes out without sound: Telegram sends it with
 `disable_notification`, and the panel's `notification` event has
-`silent: true`. Nerve still delivers it at once. An `urgent` item makes a
+`silent: true`, so a browser alert of the panel makes no sound either. Nerve
+still delivers it at once. An `urgent` item makes a
 sound. Slack has no such option for one message, so Slack follows its own
 notification settings. The Notifications section of the panel's Settings page
 changes the two keys (see [web-ui.md](web-ui.md#settings)).

@@ -346,7 +346,9 @@ Under lockdown the section is read-only, with one line that says why.
 **Notifications** (`NotificationsSection`):
 
 - **Where notifications go**: the Nerve panel (always on), This browser,
-  Slack and Telegram. Slack and Telegram have a switch (`notifications.channels`),
+  Slack and Telegram. This browser (`ThisBrowserRow`) has the switch and the
+  level of the [browser alerts](#browser-alerts). Slack and Telegram have a
+  switch (`notifications.channels`),
   a destination (the Slack channel ID with the channel name, the Telegram
   chat ID) and "What to send": Everything or Questions and important
   (`notifications.levels`). A channel that is not connected links to the
@@ -360,6 +362,37 @@ Under lockdown the section is read-only, with one line that says why.
 - **Silences** opens the silences manager (`/notifications?silences=1`).
 - **Advanced**: when an unanswered question expires, and how often a
   snoozed question comes back.
+
+### Browser alerts
+
+A panel tab that is open but not in front can show a system alert for a new
+notification. The choice is per browser, in localStorage
+(`nerve-browser-alerts`), not on the server. It is made in Settings >
+Notifications > This browser ("Alerts while a tab is open"), or with "Turn
+on" in the offer on the first toast that waits for an answer ("Turn on · Not
+now", shown until the person answers it). On the Notifications page, a line
+above the list ("Browser alerts are on" or "off") opens the setting.
+
+- **What alerts:** "Questions and important" (questions, approvals, `high`
+  and `urgent`; the default) or "Everything". A silenced item never alerts.
+- **One alert across tabs:** the tabs of a browser share a `BroadcastChannel`.
+  A tab in front tells the others that the person sees the item; a tab in
+  the background waits a moment, then shows the alert and tells the others.
+  Before it shows the alert, a tab takes a Web Lock for the item and keeps it
+  while the alert is open, so two tabs that wait the same time give one
+  alert. The alert's tag is the notification id.
+- **Click and close:** a click focuses the tab and opens `/notifications`.
+  The alert closes when the item is answered or expires.
+- **Quiet hours:** an item that the server sends with `silent: true` gives an
+  alert without sound.
+- **Title and favicon:** while the tab is not in front, its title starts with
+  "(N)", the number of new items since the person left, and the favicon gets a
+  dot. Both go away when the tab is in front again. This needs no permission.
+- **Limits:** browsers show alerts only for HTTPS addresses (and
+  `localhost`); on plain HTTP the row says "Needs HTTPS". A browser that
+  blocks the site shows "Blocked", and a browser that shows alerts only
+  through a service worker (some phone browsers) shows "Not supported". A
+  tab must be open. The alert has no answer buttons.
 
 ### Accounts
 
