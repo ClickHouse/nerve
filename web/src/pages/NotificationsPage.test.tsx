@@ -326,7 +326,7 @@ describe('NotificationsPage options', () => {
     });
     renderPage();
     const list = within(await screen.findByRole('group', { name: 'Pick one' }));
-    expect(list.getAllByRole('button').map(b => b.textContent)).toEqual(['AApprove', 'BDecline']);
+    expect(list.getAllByRole('button').map(b => b.textContent)).toEqual(['Approve', 'Decline']);
     expect(screen.getByText('Nothing happens until you choose.')).toBeInTheDocument();
   });
 

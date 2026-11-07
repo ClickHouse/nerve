@@ -2,7 +2,7 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { OptionList } from './OptionList';
-import { questionOptions } from './askOptions';
+import { questionOptions, type OptionItem } from './askOptions';
 
 const OPTIONS = questionOptions(['Keep them', 'Delete all (recommended)', 'Ask me later']);
 
@@ -102,5 +102,23 @@ describe('OptionList', () => {
     expect(items[1]).toHaveTextContent('Keep them(your answer)');
     expect(items[0]).not.toHaveTextContent('your answer');
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
+  });
+
+  it('shows the colour of an approval row and its icon in place of the letter, and keeps the key', () => {
+    const approval: OptionItem[] = [
+      { value: 'approve', label: 'Approve', recommended: false, mark: 'approve' },
+      { value: 'decline', label: 'Decline', recommended: false, mark: 'decline' },
+      { value: 'run_twice', label: 'Run Twice', recommended: false },
+    ];
+    const { onChoose, list } = renderList({ options: approval, allowOther: false });
+    const rows = list.getAllByRole('button');
+    expect(rows.map(r => r.textContent)).toEqual(['Approve', 'Decline', 'CRun Twice']);
+    expect(rows[0]).toHaveClass('text-success');
+    expect(rows[1]).toHaveClass('text-error');
+    expect(rows[1]).toHaveAttribute('title', 'Press B');
+    expect(rows[1]).toHaveAttribute('aria-keyshortcuts', 'B 2');
+    expect(rows[2]).not.toHaveAttribute('title');
+    fireEvent.keyDown(rows[0], { key: 'b' });
+    expect(onChoose).toHaveBeenCalledWith('decline');
   });
 });

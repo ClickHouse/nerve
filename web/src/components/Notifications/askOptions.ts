@@ -1,5 +1,8 @@
 import type { Notification } from '../../stores/notificationStore';
 
+/** An approval option that has its own icon and colour. */
+export type OptionMark = 'approve' | 'decline' | 'snooze';
+
 /** One answer option, as a row of `OptionList` shows it. */
 export interface OptionItem {
   /** The answer it sends: the option as the agent wrote it, or an approval's value. */
@@ -8,6 +11,8 @@ export interface OptionItem {
   label: string;
   /** The agent marked it "(recommended)": it shows first, with a tag. */
   recommended: boolean;
+  /** An approval value with its own icon and colour. The icon shows where other rows show a letter. */
+  mark?: OptionMark;
 }
 
 const RECOMMENDED = /\s*\(recommended\)\s*$/i;
@@ -55,6 +60,13 @@ const APPROVAL_DEFAULT_LABELS: Record<string, string> = {
   snooze_24h: 'Snooze 24h',
 };
 
+/** Keyed by the value, not the label: an approval keeps its colours when the agent gives its own labels. */
+const APPROVAL_MARKS: Record<string, OptionMark> = {
+  approve: 'approve',
+  decline: 'decline',
+  snooze_24h: 'snooze',
+};
+
 /** An approval's label map (value to label), from the live event or the row's metadata. */
 function approvalLabels(notif: Notification): Record<string, string> {
   if (notif.option_labels) return notif.option_labels;
@@ -79,5 +91,10 @@ export function notificationOptions(notif: Notification): OptionItem[] {
   const values = parseAskOptions(notif.options);
   if (notif.type !== 'approval') return questionOptions(values);
   const labels = approvalLabels(notif);
-  return values.map(value => ({ value, label: approvalLabel(value, labels), recommended: false }));
+  return values.map(value => ({
+    value,
+    label: approvalLabel(value, labels),
+    recommended: false,
+    mark: APPROVAL_MARKS[value],
+  }));
 }

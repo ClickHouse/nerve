@@ -60,6 +60,11 @@ describe('notificationOptions', () => {
     expect(notificationOptions(notif).map(o => o.value)).toEqual(['approve', 'decline', 'snooze_24h', 'run_twice']);
   });
 
+  it('marks the known approval values by value, also with the agent labels', () => {
+    const notif = approval({ option_labels: { approve: 'Ship it', decline: 'Not now' } });
+    expect(notificationOptions(notif).map(o => o.mark)).toEqual(['approve', 'decline', 'snooze', undefined]);
+  });
+
   it('prefers the live label map', () => {
     const notif = approval({ option_labels: { decline: 'Not now' }, metadata: '{not json' });
     expect(notificationOptions(notif)[1].label).toBe('Not now');
