@@ -76,7 +76,8 @@ export function visibleNavItems(items: NavItem[], { hosted, ultracodeEnabled, se
  * with the sessions that need you at the top, pending plans included, so
  * Plans is behind "More". Notifs earns its slot by carrying the
  * pending-question badge, which is the whole reason to open the panel on a
- * phone and is useless if it is hidden behind a menu. The rest (files, skills, MCP, cron, memory, diagnostics, sources)
+ * phone and is useless if it is hidden behind a menu. The rest (files,
+ * skills, MCP, cron, memory, diagnostics, sources)
  * are configuration and inspection surfaces — reached deliberately, rarely
  * in a hurry. Accounts is the same kind of thing: opened once when somebody
  * joins or leaves, never in a hurry. Setup likewise.
