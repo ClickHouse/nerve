@@ -21,6 +21,8 @@ import { PlanApprovalBlock } from './tools/PlanApprovalBlock';
 import { PlanToolBlock } from './tools/PlanToolBlock';
 import { SkillToolBlock } from './tools/SkillToolBlock';
 import { NotificationToolBlock } from './tools/NotificationToolBlock';
+import { AskUserBlock } from './tools/AskUserBlock';
+import { toolBaseName } from '../../utils/toolNames';
 import { WorkflowRunRepeatBlock, WorkflowRunToolBlock } from './tools/WorkflowRunToolBlock';
 import { workflowRunCardId } from '../../utils/workflowRunCards';
 
@@ -95,10 +97,10 @@ export function ToolCallBlock({
     return <SendFileBlock block={block} />;
   }
 
-  // Notification tools
-  if (block.tool.includes('notify') || block.tool.includes('ask_user')) {
-    return <NotificationToolBlock block={block} />;
-  }
+  // Nerve's notification tools (`mcp__nerve__ask_user`, `mcp__nerve__notify`)
+  const baseName = toolBaseName(block.tool);
+  if (baseName === 'ask_user') return <AskUserBlock block={block} />;
+  if (baseName === 'notify') return <NotificationToolBlock block={block} />;
 
   // Workflow runs (workflow_run_start / workflow_run_status) — live run card
   // fed by the runs store (global workflow_run_update WS event). The run id
