@@ -359,6 +359,7 @@ work uses the system actor.
 | `agent_stop_requested` | One agent is stopped (with the agents it started) | `agent_ids`, `task_ids`, `cascade` |
 | `agents_stop_all_requested` | Every live agent of the session is stopped | `agent_ids`, `include_shells` |
 | `force_stop_requested` | The session's runtime is stopped by force | `ended_agent_ids` |
+| `context_compacted` | The conversation is compacted (Compact in the context popover) | `pre_tokens`, `post_tokens` (the runtime's count of the conversation before and after) |
 | `external_tool_call` | An external MCP client calls a tool | The tool call |
 
 A change through the web UI, the REST API or the browser WebSocket records the

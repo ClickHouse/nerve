@@ -1011,6 +1011,47 @@ records the state of the runtime, for a change with no known person, and for
 legacy rows. The event types and their details are in
 [Session changes](accounts.md#session-changes).
 
+#### `GET /api/sessions/{id}/context`
+What fills the session's context window. With a live Claude runtime
+(`live: true`), the runtime measures it: `categories` are the parts of
+`total_tokens` (system prompt, tools, skills, messages, and so on; categories
+with no tokens and tools that load only on demand are not in the list), and
+`auto_compact_threshold` is where the runtime compacts by itself (`null` when
+auto-compact is off). Otherwise (`live: false`: a Codex session, no live
+runtime, or a runtime that did not answer) the totals come from the last
+turn's usage, as the context bar estimates them, and `categories` is empty.
+`can_compact` is `true` when the session has a live Claude runtime. `404`
+for an unknown session.
+
+```json
+Response: {
+  "session_id": "a1b2c3d4", "live": true, "can_compact": true,
+  "total_tokens": 20237, "max_tokens": 200000, "auto_compact_threshold": 167000,
+  "categories": [
+    { "name": "System prompt", "tokens": 170 },
+    { "name": "System tools", "tokens": 15149 },
+    { "name": "Skills", "tokens": 1715 },
+    { "name": "Messages", "tokens": 3203 }
+  ]
+}
+```
+
+#### `POST /api/sessions/{id}/compact`
+Compact the conversation: the runtime replaces the earlier messages with a
+summary, which frees context. The transcript in Nerve does not change. The
+compact runs as a turn: it takes the session's run lock, the session shows
+as running, and Stop ends it. Its `done` event carries `usage.context_tokens`,
+the context use measured after the compact, and the session's last usage
+keeps it until the next turn. The event `context_compacted` records who
+compacted. Responds with the `GET /api/sessions/{id}/context` shape, measured
+again.
+
+Errors are `{"detail": {"code": "…", "message": "…"}}`: `404`
+`session_not_found`; `409` `unavailable` (no live Claude runtime), `busy` (a
+turn runs or waits), `nothing_to_compact` (the runtime has no messages yet;
+its answer is not shown in the chat) or `stopped`; `502` `failed` (the
+runtime reported an error); `503` `not_accepting_turns` (Nerve shuts down).
+
 ### Modified Files
 
 #### `GET /api/sessions/{id}/modified-files`
@@ -1926,8 +1967,9 @@ those for another session. Events marked *global* go to every socket.
 // Live output of a running command (Codex)
 { type: "tool_output", session_id: "main", tool_use_id: "toolu_...", content: "..." }
 
-// Turn complete (context usage)
-{ type: "done", session_id: "main", usage?: { input_tokens: 1234, output_tokens: 567, cache_read_input_tokens: 890, cache_creation_input_tokens: 0 }, max_context_tokens?: 1048576, num_turns?: 1 }
+// Turn complete (context usage). After a compact, usage also has
+// context_tokens: the measured context use, which the context bar shows.
+{ type: "done", session_id: "main", usage?: { input_tokens: 1234, output_tokens: 567, cache_read_input_tokens: 890, cache_creation_input_tokens: 0, context_tokens?: 20662 }, max_context_tokens?: 1048576, num_turns?: 1 }
 
 // Turn stopped by a user / error
 { type: "stopped", session_id: "main" }
