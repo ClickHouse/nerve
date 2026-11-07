@@ -12,6 +12,8 @@ interface ContextUsage {
   cache_creation_1h_input_tokens?: number;
   max_context_tokens: number;
   num_turns: number;
+  // Input tokens of the last API call, when the backend reports them (Codex).
+  context_tokens?: number;
 }
 
 function formatTokens(n: number): string {
@@ -30,11 +32,12 @@ export function ContextBar({ usage, sessionCostUsd }: { usage: ContextUsage; ses
   // To estimate the ACTUAL context window occupancy for the most recent call,
   // we divide total input tokens by the number of API sub-calls (num_turns).
   // Output tokens are excluded — they don't consume the context window.
+  // When the backend reports the last call's input (context_tokens), use it.
   const totalInput = usage.input_tokens + usage.cache_read_input_tokens
     + usage.cache_creation_input_tokens;
   const max = usage.max_context_tokens;
   const numCalls = usage.num_turns || Math.max(1, Math.ceil(totalInput / max));
-  const estimatedContext = Math.round(totalInput / numCalls);
+  const estimatedContext = usage.context_tokens ?? Math.round(totalInput / numCalls);
   const pct = Math.min((estimatedContext / max) * 100, 100);
 
   // Cache hit rate (across all sub-calls — this IS a billing metric, so aggregate is correct)
