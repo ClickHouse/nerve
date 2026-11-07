@@ -1,12 +1,15 @@
 import type { Session } from '../../types/chat';
 import { ATTENTION_TONE, attentionReasons, needsYouLabel } from '../../utils/sessionAttention';
 
-/** Second line of a session row: why the session needs the user. */
+/**
+ * Second line of a session row: why the session needs the user. One step
+ * larger in the page layout of the session list (`data-layout="page"`).
+ */
 export function AttentionReason({ session }: { session: Session }) {
   const text = attentionReasons(session).join(' · ');
   if (!text) return null;
   return (
-    <div className={`truncate text-2xs leading-tight mt-0.5 ${ATTENTION_TONE}`} title={text}>
+    <div className={`truncate text-2xs in-data-[layout=page]:text-xs leading-tight mt-0.5 ${ATTENTION_TONE}`} title={text}>
       {text}
     </div>
   );
