@@ -1292,7 +1292,7 @@ def write_cron_jobs(choices: SetupChoices) -> CronOutcome:
         else:
             with open(jobs_file, "w", encoding="utf-8") as f:
                 f.write("# Nerve — Custom Cron Jobs\n")
-                f.write("# Add your own cron jobs here. Nerve will never overwrite this file.\n")
+                f.write("# Add your own cron jobs here. Nerve does not regenerate this file.\n")
                 f.write("# Format is the same as system.yaml — see it for examples.\n\n")
                 f.write("jobs: []\n")
 
@@ -1535,9 +1535,8 @@ def system_cron_file(workspace: Path) -> Path:
     return Path(workspace) / "config" / "cron" / "system.yaml"
 
 
-def _read_system_crons(workspace: Path) -> tuple[dict[str, Any] | None, str, str]:
-    """``(document, raw_text, problem)`` for the generated cron file."""
-    path = system_cron_file(workspace)
+def _read_cron_file(path: Path) -> tuple[dict[str, Any] | None, str, str]:
+    """``(document, raw_text, problem)`` for a cron file."""
     if not path.exists():
         return None, "", "missing"
     raw = path.read_text(encoding="utf-8")
@@ -1576,7 +1575,7 @@ def list_optional_crons(workspace: Path) -> list[CronToggle]:
     step has nothing to offer rather than inventing jobs that were never
     written.
     """
-    document, _raw, problem = _read_system_crons(workspace)
+    document, _raw, problem = _read_cron_file(system_cron_file(workspace))
     if problem or document is None:
         return []
     present = {
@@ -1614,7 +1613,7 @@ def plan_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronTogglePla
     error message is wrong.
     """
     path = system_cron_file(workspace)
-    document, raw, problem = _read_system_crons(workspace)
+    document, raw, problem = _read_cron_file(system_cron_file(workspace))
     if problem or document is None:
         return CronTogglePlan(path=path, text=None, problem=problem or "unreadable")
 
@@ -1641,10 +1640,8 @@ def plan_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronTogglePla
             enabled=tuple(enabled), disabled=tuple(disabled),
         )
 
-    header = leading_comment(raw) or _CRON_FILE_HEADER
-    body = yaml.safe_dump(document, default_flow_style=False, sort_keys=False)
     return CronTogglePlan(
-        path=path, text=header + body,
+        path=path, text=_dump_cron_file(leading_comment(raw) or _CRON_FILE_HEADER, document),
         enabled=tuple(enabled), disabled=tuple(disabled),
     )
 
@@ -1658,6 +1655,71 @@ def set_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronToggleOutc
     one call, for a caller with nothing else to coordinate.
     """
     return plan_optional_crons(workspace, enabled_ids).publish()
+
+
+# --- Turning one job on and off (the Cron page) --------------------------------
+#
+# The same rewrite as above, for one job of any cron file: ``system.yaml`` or
+# ``jobs.yaml``. The rewrite keeps the leading comment block and dumps the
+# rest, which loses other comments and a person's own formatting (block
+# scalars, quoting, indentation). So it is done only on a file that the dump
+# writes back unchanged: then the switch changes one flag and nothing else.
+
+#: ``CronTogglePlan.problem`` values of :func:`plan_cron_job_enabled`, beside
+#: ``missing`` and ``unreadable: ...``.
+CRON_FILE_HAND_EDITED = "hand-edited"
+CRON_FILE_READ_ONLY = "read-only"
+CRON_JOB_MISSING = "no such job"
+
+
+def _dump_cron_file(header: str, document: dict[str, Any]) -> str:
+    return header + yaml.safe_dump(document, default_flow_style=False, sort_keys=False)
+
+
+def _rewritable_cron_file(path: Path) -> tuple[dict[str, Any] | None, str, str]:
+    """``(document, raw_text, problem)``, with ``problem`` set when the
+    rewrite would change more than the job's flag or cannot be written."""
+    document, raw, problem = _read_cron_file(path)
+    if problem or document is None:
+        return None, raw, problem or "unreadable"
+    if _dump_cron_file(leading_comment(raw), document) != raw:
+        return None, raw, CRON_FILE_HAND_EDITED
+    # publish_text writes a temporary file beside the file, then renames it.
+    if not (os.access(path, os.W_OK) and os.access(path.parent, os.W_OK)):
+        return None, raw, CRON_FILE_READ_ONLY
+    return document, raw, ""
+
+
+def cron_file_problem(path: Path) -> str:
+    """Why :func:`plan_cron_job_enabled` cannot change ``path``; "" when it can."""
+    return _rewritable_cron_file(path)[2]
+
+
+def plan_cron_job_enabled(path: Path, job_id: str, enabled: bool) -> CronTogglePlan:
+    """Set ``enabled`` of the job ``job_id`` in the cron file ``path``.
+
+    Nothing is written: :meth:`CronTogglePlan.publish` does that. ``problem``
+    is set for a file that :func:`cron_file_problem` refuses, and for a file
+    without the job.
+    """
+    document, raw, problem = _rewritable_cron_file(path)
+    if problem or document is None:
+        return CronTogglePlan(path=path, text=None, problem=problem)
+    jobs = [
+        job for job in document["jobs"]
+        if isinstance(job, dict) and str(job.get("id") or "") == job_id
+    ]
+    if not jobs:
+        return CronTogglePlan(path=path, text=None, problem=CRON_JOB_MISSING)
+    names = {"enabled": (job_id,)} if enabled else {"disabled": (job_id,)}
+    # A job without the key is enabled (CronJob.enabled defaults to True).
+    if all(bool(job.get("enabled", True)) == enabled for job in jobs):
+        return CronTogglePlan(path=path, text=None, **names)
+    for job in jobs:
+        job["enabled"] = enabled
+    return CronTogglePlan(
+        path=path, text=_dump_cron_file(leading_comment(raw), document), **names,
+    )
 
 
 _WEEKDAYS = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")

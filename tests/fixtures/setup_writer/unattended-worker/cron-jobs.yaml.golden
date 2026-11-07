@@ -1,5 +1,5 @@
 # Nerve — Custom Cron Jobs
-# Add your own cron jobs here. Nerve will never overwrite this file.
+# Add your own cron jobs here. Nerve does not regenerate this file.
 # Format is the same as system.yaml — see it for examples.
 
 jobs: []

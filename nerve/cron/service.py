@@ -17,6 +17,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
 
@@ -38,6 +39,13 @@ from nerve.cron.jobs import (
 )
 from nerve.db import Database
 from nerve.identity import CAUSE_FROM_ACTOR, Attribution, CauseArg, attribution_for
+from nerve.setup_writer import (
+    CRON_FILE_HAND_EDITED,
+    CRON_FILE_READ_ONLY,
+    CRON_JOB_MISSING,
+    cron_file_problem,
+    plan_cron_job_enabled,
+)
 from nerve.utils.aio import GRACEFUL_STOP_SECONDS
 
 if TYPE_CHECKING:
@@ -88,6 +96,29 @@ _PAUSED_MISS = "run skipped: came due while the machine was paused (catchup: fal
 # by hand (the Cron page's "Run now", the trigger API), or for source records
 # that a hosted source delivered (see CronService.on_source_delivered).
 RunOrigin = Literal["schedule", "catchup", "manual", "delivery"]
+
+# The window of the run counts that GET /api/cron/jobs gives for each job.
+_STATS_DAYS = 7
+
+# Why the Cron page cannot switch a job on or off. ``{file}`` is the name of
+# the job's YAML file. The keys are CronTogglePlan problems (setup_writer).
+_TOGGLE_LOCKDOWN = "This instance is in lockdown. Change the job in the config repository."
+_TOGGLE_PROBLEMS = {
+    CRON_FILE_HAND_EDITED: "Switch this job in {file}. Nerve does not rewrite a file "
+                           "that has your own comments or formatting.",
+    CRON_FILE_READ_ONLY: "Nerve cannot write {file}.",
+    CRON_JOB_MISSING: "{file} does not have this job.",
+}
+_TOGGLE_UNREADABLE = "Nerve cannot read {file}."
+_TOGGLE_SOURCE = "A source is switched on and off in its sync settings."
+
+
+class CronToggleRefused(Exception):
+    """A job cannot be switched on or off through the API. The message says why."""
+
+
+def _toggle_refusal(problem: str, file: Path) -> str:
+    return _TOGGLE_PROBLEMS.get(problem, _TOGGLE_UNREADABLE).format(file=file.name)
 
 
 class _RunsInFlight:
@@ -1645,7 +1676,7 @@ class CronService:
         """Load and merge jobs from system.yaml and jobs.yaml.
 
         System jobs come from system.yaml (managed by `nerve init`).
-        User jobs come from jobs.yaml (user-defined, never touched by Nerve).
+        User jobs come from jobs.yaml (user-defined; Nerve only switches a job there).
         If a user job has the same ID as a system job, the user version wins.
 
         Jobs holding an id the daemon reserves for itself are dropped here, so
@@ -2013,7 +2044,9 @@ class CronService:
                 summary += f", error: {result.error}"
 
             status = "success" if result.error is None else "error"
-            await self.db.log_cron_finish(log_id, status, output=summary[:2000])
+            await self.db.log_cron_finish(
+                log_id, status, output=summary[:2000], records=result.records_ingested,
+            )
             await self.db.log_source_run(
                 source=runner.source.source_name,
                 records_fetched=result.records_ingested,
@@ -2331,7 +2364,25 @@ class CronService:
         }
 
     async def list_jobs(self) -> list[dict]:
-        """List all registered jobs (cron + sources) with their next run times."""
+        """List all registered jobs (cron + sources) with their next run times.
+
+        Each job also has its kind (``agent``, ``workflow`` or ``source``), its
+        latest run, its run counts of the last 7 days, and ``toggle_blocked``:
+        why :meth:`set_job_enabled` cannot switch it, or None when it can.
+        """
+        last_runs = await self.db.get_last_cron_runs()
+        stats = await self.db.get_cron_job_stats(_STATS_DAYS)
+
+        def health(job_id: str) -> dict:
+            return {
+                "last_run": last_runs.get(job_id),
+                "stats_7d": stats.get(job_id, {"runs": 0, "success": 0, "error": 0, "missed": 0}),
+            }
+
+        # Each file is checked once, not once for each of its jobs.
+        file_problems = {
+            path: cron_file_problem(path) for path in {self._job_file(job) for job in self._jobs}
+        }
         result = []
         for job in self._jobs:
             sched_job = self.scheduler.get_job(job.id)
@@ -2340,9 +2391,17 @@ class CronService:
                 last_session_id = await self.db.get_latest_cron_session_id(job.id)
             except Exception:
                 last_session_id = None
+            path = self._job_file(job)
+            if self.config.lockdown:
+                toggle_blocked = _TOGGLE_LOCKDOWN
+            elif file_problems[path]:
+                toggle_blocked = _toggle_refusal(file_problems[path], path)
+            else:
+                toggle_blocked = None
             result.append({
                 "id": job.id,
                 "type": "cron",
+                "kind": "workflow" if job.workflow is not None else "agent",
                 "source": job.metadata.get("_source", "unknown"),
                 "schedule": job.schedule,
                 "description": job.description,
@@ -2353,6 +2412,8 @@ class CronService:
                 "gates": [gate.describe() for gate in job.gates],
                 "next_run": next_run.isoformat() if next_run else None,
                 "last_session_id": last_session_id,
+                "toggle_blocked": toggle_blocked,
+                **health(job.id),
             })
 
         # Include source runners
@@ -2369,14 +2430,49 @@ class CronService:
             result.append({
                 "id": runner.job_id,
                 "type": "source",
+                "kind": "source",
                 "schedule": schedule,
                 "description": f"Source: {source_name} (ingestor)",
                 "enabled": True,
                 "next_run": next_run.isoformat() if next_run else None,
                 "last_session_id": None,
+                "toggle_blocked": _TOGGLE_SOURCE,
+                **health(runner.job_id),
             })
 
         return result
+
+    def _job_file(self, job: CronJob) -> Path:
+        """The YAML file that the job comes from: a job in ``jobs.yaml``
+        replaces the ``system.yaml`` job with its id."""
+        if job.metadata.get("_source") == "user":
+            return Path(self.config.cron.jobs_file)
+        return Path(self.config.cron.system_file)
+
+    async def set_job_enabled(self, job_id: str, enabled: bool) -> dict:
+        """Write ``enabled`` into the job's YAML file, then reload.
+
+        The file is changed with the setup page's cron rewrite
+        (:func:`nerve.setup_writer.plan_cron_job_enabled`). Raises ValueError
+        for an unknown job, CronToggleRefused under lockdown or for a file
+        that the rewrite cannot change, and the reload's ConfigError. Returns
+        the reload summary, as :meth:`reload` does.
+        """
+        async with self._reload_lock:
+            job = next((j for j in self._jobs if j.id == job_id), None)
+            if job is None:
+                raise ValueError(f"Unknown cron job: {job_id}")
+            if self.config.lockdown:
+                raise CronToggleRefused(_TOGGLE_LOCKDOWN)
+            path = self._job_file(job)
+            plan = plan_cron_job_enabled(path, job_id, enabled)
+            if not plan.ok:
+                raise CronToggleRefused(_toggle_refusal(plan.problem, path))
+            plan.publish()
+            summary = await self._reload_locked()
+        self._schedule_changed()
+        logger.info("Cron job %s %s", job_id, "enabled" if enabled else "disabled")
+        return summary
 
     # -- What runs next --------------------------------------------------------
 
