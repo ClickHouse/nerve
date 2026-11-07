@@ -28,7 +28,7 @@ describe('ThisBrowserRow', () => {
   it('turns alerts on after the browser allows them, then offers the level', async () => {
     const request = stubBrowser();
     renderRow();
-    const toggle = screen.getByRole('switch', { name: 'This browser' });
+    const toggle = screen.getByRole('switch', { name: 'Alerts while a tab is open' });
     expect(toggle).toHaveAttribute('aria-checked', 'false');
     expect(screen.queryByRole('radiogroup')).not.toBeInTheDocument();
 
@@ -47,7 +47,7 @@ describe('ThisBrowserRow', () => {
     useBrowserAlertStore.setState({ enabled: true });
     renderRow();
 
-    await userEvent.click(screen.getByRole('switch', { name: 'This browser' }));
+    await userEvent.click(screen.getByRole('switch', { name: 'Alerts while a tab is open' }));
 
     expect(useBrowserAlertStore.getState().enabled).toBe(false);
   });
@@ -63,7 +63,7 @@ describe('ThisBrowserRow', () => {
   it.each([
     [{ secure: false }, 'Needs HTTPS', 'Open the panel over HTTPS'],
     [{ permission: 'denied' as const }, 'Blocked', 'Allow notifications in the site settings'],
-    [{ permission: null }, 'Not supported', 'cannot show system alerts'],
+    [{ permission: null }, 'Not supported', 'cannot show alerts'],
   ])('shows why alerts are not available (%o)', (browser, badge, help) => {
     stubBrowser(browser);
     renderRow();
