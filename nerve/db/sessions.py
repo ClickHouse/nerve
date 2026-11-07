@@ -13,7 +13,7 @@ from nerve.identity import (
     CauseArg,
     resolve_cause,
 )
-from nerve.session_origin import Origin, derive_origin
+from nerve.session_origin import Origin
 
 # Sources the sidebar treats as "system" (machine-driven); everything else is a conversation by exclusion, so a new source shows up in the feed by default.
 SYSTEM_SOURCES = ("cron", "hook")
@@ -98,17 +98,14 @@ class SessionStore:
 
         ``origin`` is the session's trigger and origin details
         (:mod:`nerve.session_origin`), written once like the attribution.
-        Without it, the origin comes from ``source``, the ID and the other
-        arguments, as for a row from before the column existed.
+        Without it, both columns stay NULL, as in a row from before the
+        columns existed, and a reader derives the origin.
         """
         now = datetime.now(timezone.utc).isoformat()
         created_by = actor.actor_id if actor else None
         caused_by = resolve_cause(actor, cause)
-        if origin is None:
-            origin = derive_origin({
-                "id": session_id, "source": source, "metadata": metadata,
-                "parent_session_id": parent_session_id,
-            })
+        trigger = origin.trigger if origin else None
+        origin_detail = origin.detail_json() if origin else None
         async with self._atomic():
             cursor = await self.db.execute(
                 """INSERT OR IGNORE INTO sessions
@@ -120,8 +117,7 @@ class SessionStore:
                 (session_id, title or session_id, source,
                  json.dumps(metadata or {}), status,
                  parent_session_id, forked_from_message, backend, model, cwd,
-                 created_by, caused_by, origin.trigger, origin.detail_json(),
-                 now, now),
+                 created_by, caused_by, trigger, origin_detail, now, now),
             )
             inserted = cursor.rowcount == 1
             await cursor.close()
@@ -146,8 +142,8 @@ class SessionStore:
             "backend": backend, "model": model, "cwd": cwd,
             "created_by_actor_id": created_by,
             "caused_by_actor_id": caused_by,
-            "trigger": origin.trigger,
-            "origin_detail": origin.detail_json(),
+            "trigger": trigger,
+            "origin_detail": origin_detail,
         }
 
     async def set_session_origin(self, session_id: str, origin: Origin) -> bool:
