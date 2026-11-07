@@ -14,7 +14,7 @@ export function ContextBar({ usage, sessionId, backend, busy, sessionCostUsd }: 
   usage: ContextUsage;
   sessionId: string;
   backend: string;
-  /** A turn runs: Compact waits until it ends. */
+  /** A turn runs: Compact is disabled until the agent is idle. */
   busy: boolean;
   sessionCostUsd?: number;
 }) {
