@@ -56,6 +56,6 @@ export interface NotificationTestResult {
   notification_id: string;
   /** A silence rule matched the test, so only the panel shows it. */
   silenced: boolean;
-  /** One entry per channel in `notifications.channels`. */
+  /** One entry per channel in `notifications.channels`, and `webpush` when a browser has push on. */
   results: { channel: string; delivered: boolean }[];
 }

@@ -6,6 +6,10 @@ import { deviceLabel, needsHomeScreen, pushSupported } from '../../utils/webPush
 import { formatRelativeTime } from '../Cron/utils';
 import { IconButton, Switch } from '../ui';
 import { Trash2 } from '../ui/icons';
+import { TestResult } from './SettingsRows';
+
+/** The channel name of Web Push in the results of "Send a test". */
+const PUSH_CHANNEL = 'webpush';
 
 /**
  * The Web Push switch of the "This browser" row. Push uses the level of the
@@ -41,6 +45,7 @@ export function PushSwitch() {
           />
         </div>
       )}
+      {on && <TestResult channel={PUSH_CHANNEL} />}
       {push.error && <p role="alert" className="text-xs text-error">{push.error}</p>}
     </>
   );
