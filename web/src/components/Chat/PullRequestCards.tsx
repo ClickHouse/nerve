@@ -1,8 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type RefObject } from 'react';
 import { api } from '../../api/client';
 import type { MessageBlock } from '../../types/chat';
 import type {
-  PullRequestError, PullRequestResult, PullRequestReview, PullRequestState,
+  PullRequestError, PullRequestResult, PullRequestReview, PullRequestState, PullRequestSummary,
 } from '../../types/github';
 import { findPullRequests, type PullRequestRef } from '../../utils/pullRequestLinks';
 import { Badge, type BadgeTone } from '../ui/Badge';
@@ -42,50 +42,74 @@ function isLive(result: PullRequestResult): boolean {
   return !!pull && (pull.state === 'open' || pull.state === 'draft') && pull.checks.running > 0;
 }
 
-/**
- * The results for `urls`, read once, then again every `REFRESH_MS` while one
- * of them is open with checks running. A hidden tab skips a refresh.
- */
-function usePullRequests(urls: string[]): { results: Map<string, PullRequestResult> | null; failed: boolean } {
-  const key = urls.join('\n');
-  const [results, setResults] = useState<Map<string, PullRequestResult> | null>(null);
-  const [failed, setFailed] = useState(false);
+/** A card list this close (px) to the viewport counts as in view, so it reads just before it scrolls in. */
+const VIEW_MARGIN = '200px 0px';
 
+/** Whether `ref` is in or near the viewport. Without IntersectionObserver: always. */
+function useInView(ref: RefObject<HTMLElement | null>): boolean {
+  const [inView, setInView] = useState(typeof IntersectionObserver === 'undefined');
   useEffect(() => {
-    let stopped = false;
-    let loaded = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const refreshLater = () => { timer = setTimeout(refresh, REFRESH_MS); };
-    const load = async () => {
-      try {
-        const { pulls } = await api.getPullRequests(key.split('\n'));
-        if (stopped) return;
-        loaded = true;
-        setResults(new Map(pulls.map(p => [p.url, p])));
-        if (pulls.some(isLive)) refreshLater();
-      } catch {
-        if (stopped) return;
-        // A failed refresh keeps the cards as they are and tries again.
-        if (loaded) refreshLater();
-        else setFailed(true);
-      }
-    };
-    function refresh() {
-      if (document.hidden) refreshLater();
-      else void load();
-    }
-    void load();
-    return () => {
-      stopped = true;
-      clearTimeout(timer);
-    };
-  }, [key]);
-
-  return { results, failed };
+    const el = ref.current;
+    if (!el || typeof IntersectionObserver === 'undefined') return;
+    const observer = new IntersectionObserver(
+      ([entry]) => setInView(entry.isIntersecting),
+      { rootMargin: VIEW_MARGIN },
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [ref]);
+  return inView;
 }
 
-function Checks({ result }: { result: PullRequestResult }) {
-  const pull = result.pull!;
+/** Whether the browser tab shows. */
+function useTabVisible(): boolean {
+  const [visible, setVisible] = useState(() => !document.hidden);
+  useEffect(() => {
+    const onChange = () => setVisible(!document.hidden);
+    document.addEventListener('visibilitychange', onChange);
+    return () => document.removeEventListener('visibilitychange', onChange);
+  }, []);
+  return visible;
+}
+
+interface Loaded {
+  key: string;
+  results: Map<string, PullRequestResult> | null;
+  failed: boolean;
+  /** `Date.now()` when the last request ended. */
+  at: number;
+}
+
+/**
+ * The results for `urls`. They are read the first time `visible` is true,
+ * then again `REFRESH_MS` after each read while one of them is open with
+ * checks running and `visible` stays true. A failed refresh keeps the last
+ * results and tries again.
+ */
+function usePullRequests(urls: string[], visible: boolean): { results: Map<string, PullRequestResult> | null; failed: boolean } {
+  const key = urls.join('\n');
+  const [loaded, setLoaded] = useState<Loaded | null>(null);
+  const current = loaded?.key === key ? loaded : null;
+
+  useEffect(() => {
+    if (!visible) return;
+    const results = current?.results ?? null;
+    const live = !!results && [...results.values()].some(isLive);
+    if (current && !live) return;
+    const wait = current ? Math.max(0, current.at + REFRESH_MS - Date.now()) : 0;
+    const timer = setTimeout(() => {
+      void api.getPullRequests(key.split('\n')).then(
+        ({ pulls }) => setLoaded({ key, results: new Map(pulls.map(p => [p.url, p])), failed: false, at: Date.now() }),
+        () => setLoaded({ key, results, failed: true, at: Date.now() }),
+      );
+    }, wait);
+    return () => clearTimeout(timer);
+  }, [key, visible, current]);
+
+  return { results: current?.results ?? null, failed: current?.failed ?? false };
+}
+
+function Checks({ pull }: { pull: PullRequestSummary }) {
   const { passed, failed, running } = pull.checks;
   const review = pull.review ? REVIEWS[pull.review] : null;
   if (!passed && !failed && !running && !review) return null;
@@ -158,7 +182,7 @@ function PullRequestCard({ pr, result, failed }: {
             {state && <Badge tone={state.tone} pill className="ml-auto shrink-0">{state.label}</Badge>}
           </div>
           <div className="mt-0.5 truncate text-xs text-text-muted">{detail}</div>
-          {pull && <Checks result={result!} />}
+          {pull && <Checks pull={pull} />}
         </div>
       </div>
     </li>
@@ -174,8 +198,10 @@ function scrollParent(el: HTMLElement): HTMLElement | null {
 }
 
 function PullRequestCardList({ prs }: { prs: PullRequestRef[] }) {
-  const { results, failed } = usePullRequests(prs.map(pr => pr.url));
   const listRef = useRef<HTMLUListElement>(null);
+  const inView = useInView(listRef);
+  const tabVisible = useTabVisible();
+  const { results, failed } = usePullRequests(prs.map(pr => pr.url), inView && tabVisible);
 
   // The details arrive after the chat scrolled to its end and make the cards
   // taller. While the end of the chat is in view, keep it in view.

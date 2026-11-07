@@ -159,16 +159,22 @@ describe('refresh', () => {
     expect(getPullRequests).toHaveBeenCalledTimes(1);
   });
 
-  it('skips a refresh while the tab is hidden', async () => {
+  it('reads again only while the tab shows', async () => {
     const running = ok(URL_12, pull({ checks: { passed: 0, failed: 0, running: 1 } }));
     getPullRequests.mockResolvedValue({ pulls: [running] });
-    const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+    const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(false);
+    const setHidden = (value: boolean) => act(() => {
+      hidden.mockReturnValue(value);
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
     render(<PullRequestCards blocks={message(URL_12)} />);
     await flush();
+    expect(getPullRequests).toHaveBeenCalledTimes(1);
+    setHidden(true);
     await wait(120_000);
     expect(getPullRequests).toHaveBeenCalledTimes(1);
-    hidden.mockReturnValue(false);
-    await wait(60_000);
+    setHidden(false);
+    await flush();
     expect(getPullRequests).toHaveBeenCalledTimes(2);
     hidden.mockRestore();
   });
@@ -194,6 +200,64 @@ describe('refresh', () => {
     unmount();
     await wait(180_000);
     expect(getPullRequests).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('in view', () => {
+  let setInView: (inView: boolean) => void;
+  const flush = () => act(async () => { await vi.advanceTimersByTimeAsync(0); });
+  const wait = (ms: number) => act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.stubGlobal('IntersectionObserver', class {
+      constructor(callback: IntersectionObserverCallback) {
+        setInView = (inView) => act(() => callback(
+          [{ isIntersecting: inView } as IntersectionObserverEntry],
+          this as unknown as IntersectionObserver,
+        ));
+      }
+      observe() {}
+      disconnect() {}
+    });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('reads nothing until the cards come into view', async () => {
+    getPullRequests.mockResolvedValue({ pulls: [ok(URL_12, pull())] });
+    render(<PullRequestCards blocks={message(URL_12)} />);
+    await wait(180_000);
+    expect(getPullRequests).not.toHaveBeenCalled();
+    expect(screen.getByText('Loading details…')).toBeInTheDocument();
+    setInView(true);
+    await flush();
+    expect(getPullRequests).toHaveBeenCalledTimes(1);
+    expect(screen.getByText('Open')).toBeInTheDocument();
+  });
+
+  it('refreshes only in view, and not within a minute of the last read', async () => {
+    getPullRequests.mockResolvedValue({ pulls: [ok(URL_12, pull({ checks: { passed: 0, failed: 0, running: 1 } }))] });
+    render(<PullRequestCards blocks={message(URL_12)} />);
+    setInView(true);
+    await flush();
+    expect(getPullRequests).toHaveBeenCalledTimes(1);
+    await wait(30_000);
+    setInView(false);
+    await wait(180_000);
+    expect(getPullRequests).toHaveBeenCalledTimes(1);
+    setInView(true);
+    await flush();
+    expect(getPullRequests).toHaveBeenCalledTimes(2);
+    await wait(20_000);
+    setInView(false);
+    setInView(true);
+    await flush();
+    expect(getPullRequests).toHaveBeenCalledTimes(2);
+    await wait(40_000);
+    expect(getPullRequests).toHaveBeenCalledTimes(3);
   });
 });
 
