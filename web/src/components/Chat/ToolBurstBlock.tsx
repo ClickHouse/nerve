@@ -10,6 +10,9 @@ import { burstSummary } from './toolBursts';
 /** A burst folds to its summary line from this many blocks (one a tool call). */
 const MIN_FOLD_BLOCKS = 2;
 
+/** Holds an icon at the height of the first text line, also when the summary wraps. */
+const FIRST_LINE = 'flex h-[1lh] shrink-0 items-center';
+
 /**
  * A run of thinking and tool calls (see `toolBursts.ts`). While it is the
  * live end of a running turn it stays open, so the newest rows show; after
@@ -55,11 +58,13 @@ export const ToolBurstBlock = memo(function ToolBurstBlock({
         size="sm"
         onClick={() => setToggled(!open)}
         aria-expanded={open}
-        className="-mx-1.5 px-1.5 py-1 justify-start text-left text-sm leading-snug text-text-muted"
+        className="-mx-1.5 px-1.5 py-1 items-start justify-start text-left text-sm leading-snug text-text-muted"
       >
-        {open
-          ? <ChevronDown size={14} className="shrink-0 text-text-faint" aria-hidden="true" />
-          : <ChevronRight size={14} className="shrink-0 text-text-faint" aria-hidden="true" />}
+        <span className={FIRST_LINE} aria-hidden="true">
+          {open
+            ? <ChevronDown size={14} className="text-text-faint" />
+            : <ChevronRight size={14} className="text-text-faint" />}
+        </span>
         <span>
           {summary}
           {failed > 0 && (
@@ -69,7 +74,11 @@ export const ToolBurstBlock = memo(function ToolBurstBlock({
             </>
           )}
         </span>
-        {running && <Loader2 size={12} className="shrink-0 text-accent animate-spin" aria-hidden="true" />}
+        {running && (
+          <span className={FIRST_LINE} aria-hidden="true">
+            <Loader2 size={12} className="text-accent animate-spin" />
+          </span>
+        )}
       </Button>
       {/* The rail sits under the centre of the 14 px chevron. */}
       {open && <div className="ml-[7px] pl-3 border-l border-border-subtle">{rows}</div>}
