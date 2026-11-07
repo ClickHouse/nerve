@@ -1,5 +1,6 @@
 """``notifications.levels``: which items a channel gets, and the fan-out
-that skips a channel for an item below its level."""
+that skips a channel for an item below its level. The panel is always a
+channel, whatever ``notifications.channels`` lists."""
 
 from __future__ import annotations
 
@@ -55,3 +56,32 @@ async def test_the_fanout_skips_a_channel_below_its_level(db):
     await db.create_notification(notification_id="n2", session_id="s1", type="question", title="q")
     await service._fanout("n2", "s1", "question", "q", "", "normal", options=["Yes", "No"])
     assert json.loads((await db.get_notification("n2"))["channels_delivered"]) == ["web", "telegram", "slack"]
+
+
+@pytest.mark.parametrize("raw, channels", [
+    (["telegram"], ["web", "telegram"]),
+    ([], ["web"]),
+    (None, ["web"]),
+    ("slack", ["web", "slack"]),
+    (["slack", "web"], ["slack", "web"]),
+])
+def test_the_panel_is_always_in_the_channel_list(raw, channels):
+    assert NotificationsConfig.from_dict({"channels": raw}).channels == channels
+
+
+@pytest.mark.asyncio
+async def test_an_install_that_lists_only_telegram_still_delivers_to_the_panel(db):
+    """A settings.yaml written before the panel was always on."""
+    await ensure_system_principal(db)
+    config = NerveConfig()
+    config.notifications = NotificationsConfig.from_dict({"channels": ["telegram"]})
+    service = NotificationService(config, db, MagicMock())
+    service._deliver_web = AsyncMock()
+    service._deliver_telegram = AsyncMock(return_value=7)
+    await db.create_session("s1", actor=None)
+    await db.create_notification(notification_id="n1", session_id="s1", type="notify", title="t")
+
+    await service._fanout("n1", "s1", "notify", "t", "", "normal")
+
+    service._deliver_web.assert_awaited_once()
+    assert json.loads((await db.get_notification("n1"))["channels_delivered"]) == ["web", "telegram"]
