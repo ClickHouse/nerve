@@ -43,12 +43,11 @@ from nerve.gateway.routes.setup import (
     _reload,
     _require_claimed,
     _require_writable,
-    _valid_time,
     _write,
     require_person,
 )
 from nerve.identity import Actor
-from nerve.notifications.quiet_hours import in_quiet_hours
+from nerve.notifications.quiet_hours import in_quiet_hours, minutes_of_day
 from nerve.setup_writer import merge_machine_paths, merge_private_paths, merge_settings_paths
 
 logger = logging.getLogger(__name__)
@@ -66,6 +65,7 @@ _MACHINE_FILE, _LOCAL_FILE = "config.yaml", "config.local.yaml"
 CONTROL_PLANE_TEXT = "Set by an admin in the control plane."
 _UNKNOWN_FIELD = "This is not a setting of this section."
 _NOT_VALID = "With this value the configuration is not valid: {}"
+_QUIET_TIME_TEXT = "Use a 24-hour time such as 22:00."
 
 #: Bounds of the question fields.
 EXPIRY_HOURS_RANGE = (1, 720)
@@ -140,9 +140,14 @@ def _int_between(low: int, high: int) -> Callable[[Any], int]:
 
 def _parse_quiet_time(value: Any) -> str:
     """``HH:MM``, or ``""`` (no quiet hours)."""
-    text = value.strip() if isinstance(value, str) else None
-    if text is None or (text and not _valid_time(text)):
-        raise ValueError("Use a 24-hour time such as 22:00.")
+    if not isinstance(value, str):
+        raise ValueError(_QUIET_TIME_TEXT)
+    text = value.strip()
+    if text:
+        try:
+            minutes_of_day(text)
+        except ValueError:
+            raise ValueError(_QUIET_TIME_TEXT) from None
     return text
 
 
