@@ -41,16 +41,12 @@ export function InboxPage() {
   // that came while another page was open shows at once.
   useEffect(() => { void loadSessions(); }, [loadSessions]);
 
-  // Opens the chat that the store made active: a new empty chat, or the
-  // chat that the composer started.
-  const openActiveChat = useCallback(() => {
-    navigate(`/chat/${useChatStore.getState().activeSession}`);
-  }, [navigate]);
-
+  // "New chat": the unsent new chat, opened in the chat page, which shows
+  // its settings. `createSession` makes it active before it returns.
   const handleCreate = useCallback(async () => {
     await createSession();
-    openActiveChat();
-  }, [createSession, openActiveChat]);
+    navigate(`/chat/${useChatStore.getState().activeSession}`);
+  }, [createSession, navigate]);
 
   if (!isMobile) return <Navigate to="/chat" replace />;
 
@@ -65,13 +61,16 @@ export function InboxPage() {
         onCreate={handleCreate}
         onDelete={(id) => void deleteSession(id)}
       />
-      <NewChatComposer onStarted={openActiveChat} />
+      <NewChatComposer onStarted={(id) => navigate(`/chat/${id}`)} />
     </div>
   );
 }
 
-/** A message box that starts a new chat with its text. */
-function NewChatComposer({ onStarted }: { onStarted: () => void }) {
+/**
+ * A message box that starts a new chat with its text. When the chat cannot
+ * be started, the text stays in the box.
+ */
+function NewChatComposer({ onStarted }: { onStarted: (sessionId: string) => void }) {
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -91,16 +90,9 @@ function NewChatComposer({ onStarted }: { onStarted: () => void }) {
   const send = async () => {
     if (!canSend) return;
     setSending(true);
-    try {
-      // A new chat starts as a local chat; the first message creates it on
-      // the server and makes it the active session.
-      const { createSession, sendMessage } = useChatStore.getState();
-      await createSession();
-      await sendMessage(text.trim());
-      onStarted();
-    } finally {
-      setSending(false);
-    }
+    const sessionId = await useChatStore.getState().startChat(text.trim());
+    if (sessionId) onStarted(sessionId);
+    else setSending(false);
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
