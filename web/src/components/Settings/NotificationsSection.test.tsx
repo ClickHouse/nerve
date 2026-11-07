@@ -44,7 +44,7 @@ function settings(over: Partial<NotificationSettings> = {}, fields: Partial<Noti
     },
     slack: { connected: true, channel_name: 'alerts' },
     telegram: { connected: true },
-    quiet_hours: { timezone: 'Europe/Berlin', active: false },
+    quiet_hours: { timezone: 'Europe/Berlin' },
     ...over,
   };
 }
@@ -240,10 +240,9 @@ describe('NotificationsSection', () => {
     api.saveSettingsNotifications.mockRejectedValue(refusal(400, {
       detail: 'Use two different times.', field: 'quiet_end',
     }));
-    await renderSection(settings({ quiet_hours: { timezone: 'Europe/Berlin', active: true } }));
+    await renderSection();
     const quiet = row('No sound except urgent');
     expect(within(quiet).getByText('Every day, in Europe/Berlin time.')).toBeInTheDocument();
-    expect(within(quiet).getByText('Quiet now')).toBeInTheDocument();
     const end = within(quiet).getByLabelText('End');
 
     fireEvent.change(end, { target: { value: '22:00' } });

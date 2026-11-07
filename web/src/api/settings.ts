@@ -48,12 +48,8 @@ export interface NotificationSettings {
     channel_name: string | null;
   };
   telegram: { connected: boolean };
-  quiet_hours: {
-    /** The time zone of the quiet hours (the instance's `timezone`). */
-    timezone: string;
-    /** The current time is inside quiet hours. */
-    active: boolean;
-  };
+  /** The time zone of the quiet hours (the instance's `timezone`). */
+  quiet_hours: { timezone: string };
   /** `PUT` only: `{part: error}` for each part that did not reload. */
   reload_errors?: Record<string, string>;
 }
