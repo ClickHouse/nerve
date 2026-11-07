@@ -982,8 +982,15 @@ class NotificationService:
 
         ``plan_id`` names the plan of a ``notify`` row. Telegram adds an
         "Open plan" button for it.
+
+        A channel whose ``notifications.levels`` entry is ``important``
+        skips an item below that level (:meth:`NotificationsConfig.wants`).
         """
-        target_channels = channels or self.config.notifications.channels
+        settings = self.config.notifications
+        target_channels = [
+            name for name in (channels or settings.channels)
+            if settings.wants(name, notif_type, priority)
+        ]
 
         async def _deliver(channel_name: str) -> str | None:
             """Deliver to a single channel, return name on success."""
