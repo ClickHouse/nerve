@@ -2305,6 +2305,25 @@ again for the session (after a model change or a crash) gets the same header.
 These requests have no header: memory embedding requests to the OpenAI API,
 and Codex sessions.
 
+#### Inference trigger header
+
+In external mode, Nerve also adds one `X-Nerve-Inference-Trigger` header to
+each model request of a session, also a session with no cause, and to each of
+its own model calls. The value is the kind of event that started the work:
+
+| Requests | Trigger |
+|---|---|
+| The model requests of an agent session | The session's `trigger`: `chat`, `api`, `slack`, `telegram`, `email`, `cron`, `plan`, `workflow`, `external` or `unknown`. See `trigger` in [api.md](api.md#sessions) |
+| Nerve's own model calls (the second row of the table above) | `system` |
+
+Nerve sets a session's trigger when it creates the session, from the code
+path that creates it, and never changes it. A session from before the
+trigger field sends the value that Nerve derives from its source and its
+id. The header has the same rules as the principal header: local mode sends
+none, Nerve removes an inherited line for it from `ANTHROPIC_CUSTOM_HEADERS`,
+and a CLI process keeps it for its whole life. Nerve does not prove the
+value. The same requests as above have no header.
+
 ### System principal ID
 
 The environment variable `NERVE_SYSTEM_PRINCIPAL_ID` gives the ID of the
