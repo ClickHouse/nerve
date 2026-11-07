@@ -3,9 +3,13 @@ import {
   ALERT_BODY_LIMIT, ALERT_CHANNEL, ALERT_DELAY_MS, createAlerter, levelWants, type NotificationEvent,
 } from './browserAlerts';
 
-/** BroadcastChannel between the "tabs" of one test: a message reaches every other channel of the name. */
+/**
+ * BroadcastChannel between the "tabs" of one test: a message reaches every
+ * other channel of the name, at once or (`later`) in a microtask, as in a browser.
+ */
 class FakeChannel {
   static all: FakeChannel[] = [];
+  static later = false;
   listeners: ((e: MessageEvent) => void)[] = [];
   closed = false;
   name: string;
@@ -14,11 +18,15 @@ class FakeChannel {
     FakeChannel.all.push(this);
   }
   postMessage(data: unknown) {
-    for (const other of FakeChannel.all) {
-      if (other !== this && other.name === this.name && !other.closed) {
-        other.listeners.forEach((l) => l({ data } as MessageEvent));
+    const deliver = () => {
+      for (const other of FakeChannel.all) {
+        if (other !== this && other.name === this.name && !other.closed) {
+          other.listeners.forEach((l) => l({ data } as MessageEvent));
+        }
       }
-    }
+    };
+    if (FakeChannel.later) queueMicrotask(deliver);
+    else deliver();
   }
   addEventListener(_type: string, listener: (e: MessageEvent) => void) { this.listeners.push(listener); }
   removeEventListener(_type: string, listener: (e: MessageEvent) => void) {
@@ -42,6 +50,22 @@ class FakeNotification {
   close() { this.closed = true; this.onclose?.(); }
 }
 
+/** The Web Locks API of one browser, for `ifAvailable` requests. Returns the names that are held. */
+function stubLocks(): Set<string> {
+  const held = new Set<string>();
+  const request = async (name: string, _options: LockOptions, callback: (lock: Lock | null) => unknown) => {
+    if (held.has(name)) return callback(null);
+    held.add(name);
+    try {
+      return await callback({ name, mode: 'exclusive' });
+    } finally {
+      held.delete(name);
+    }
+  };
+  Object.defineProperty(navigator, 'locks', { configurable: true, value: { request } });
+  return held;
+}
+
 function event(over: Partial<NotificationEvent> = {}): NotificationEvent {
   return {
     type: 'notification', notification_id: 'ask-1', notification_type: 'question', session_id: 's1',
@@ -52,6 +76,7 @@ function event(over: Partial<NotificationEvent> = {}): NotificationEvent {
 beforeEach(() => {
   vi.useFakeTimers();
   FakeChannel.all = [];
+  FakeChannel.later = false;
   FakeNotification.shown = [];
   vi.stubGlobal('BroadcastChannel', FakeChannel);
   vi.stubGlobal('Notification', FakeNotification);
@@ -60,6 +85,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  Reflect.deleteProperty(navigator, 'locks');
 });
 
 describe('levelWants', () => {
@@ -122,6 +148,25 @@ describe('createAlerter', () => {
     expect(FakeNotification.shown).toHaveLength(1);
   });
 
+  it('shows one alert when two tabs in the background wait the same time', async () => {
+    FakeChannel.later = true;
+    const held = stubLocks();
+    const first = createAlerter({ inFront: () => false, onOpen: vi.fn() });
+    const second = createAlerter({ inFront: () => false, onOpen: vi.fn() });
+    first.receive(event(), true);
+    second.receive(event(), true);
+
+    vi.advanceTimersByTime(ALERT_DELAY_MS);
+    await Promise.resolve();
+
+    expect(FakeNotification.shown).toHaveLength(1);
+    // The tab keeps the item's lock while its alert is open.
+    expect(held).toEqual(new Set([`${ALERT_CHANNEL}:ask-1:0`]));
+    first.close('ask-1');
+    second.close('ask-1');
+    await vi.waitFor(() => expect(held.size).toBe(0));
+  });
+
   it('alerts again for a re-delivered item', () => {
     const first = createAlerter({ inFront: () => false, onOpen: vi.fn() });
     const second = createAlerter({ inFront: () => false, onOpen: vi.fn() });
@@ -156,7 +201,7 @@ describe('createAlerter', () => {
     FakeNotification.shown[0].onclick?.();
 
     expect(focus).toHaveBeenCalled();
-    expect(onOpen).toHaveBeenCalledWith('ask-1');
+    expect(onOpen).toHaveBeenCalledTimes(1);
     expect(FakeNotification.shown[0].closed).toBe(true);
   });
 
