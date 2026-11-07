@@ -118,12 +118,12 @@ Adding a new channel (Discord, WhatsApp, etc.) requires implementing ~5 methods 
 ### Notifications (`nerve/notifications/`)
 Async notification system for agent→user communication:
 - **`notify` tool** — fire-and-forget notifications (status updates, alerts, reminders)
-- **`ask_user` tool** — questions with predefined options (rendered as buttons) + free-text input. Supports blocking mode (`wait=true`) and async mode (answer injected as session message)
+- **`ask_user` tool**: questions with predefined options (rendered as buttons) + free-text input. Supports blocking mode (`wait=true`) and async mode (answer injected as session message). `options` is an array of strings; a JSON array as text or a comma-separated string is also accepted. An option that ends in "(recommended)" shows first
 - **NotificationService** — centralized fanout to configurable channels (web + Telegram by default), answer routing, periodic expiry
 - **Multi-channel delivery** — web UI via `__global__` WebSocket broadcast channel, Telegram via direct bot API with inline keyboard buttons, Slack via Block Kit action buttons
 - **Answer routing**: answers from any channel (web UI, Telegram inline button, Slack button, `/reply` command) are persisted and either unblock a waiting tool or injected as a user message into the originating session. A web answer records the person in `answered_by_actor_id`, and the relayed message is written by that person; the agent's work in that turn has the session's cause. A channel answer keeps the provider user ID in metadata. A hosted channel answer in external mode records the person that the channel gateway resolved, as a web answer does; another channel answer records no actor. An approval dispatcher (`nerve/notifications/handlers.py`) receives the person who answered as its `actor` keyword argument, `None` for a channel answer with no actor
   A dispatcher that asks for a snooze can return an `after_snooze` callback; the service awaits it with the result of its snooze write (False when the card was no longer pending)
-- **Web UI** — `/notifications` page with status/type filters, inline answer buttons, dismiss, dismiss-all; real-time toast overlay for new notifications; NavRail badge for pending count
+- **Web UI**: `/notifications` page with status/type filters, inline answer options, dismiss, dismiss-all; real-time toast overlay for new notifications; NavRail badge for pending count. The page, the toast and the `ask_user` card in the chat show the same option list (see [web-ui.md](web-ui.md#tool-call-rendering))
 
 ### Cron Service (`nerve/cron/`)
 APScheduler-based job scheduler:

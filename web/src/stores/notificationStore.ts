@@ -87,11 +87,20 @@ interface NotificationState {
   loading: boolean;
   toastQueue: Notification[];
   silences: Silence[];
+  /**
+   * Rows read one at a time, for the questions in a chat transcript. Null:
+   * the row could not be read. The answer and expiry events update these
+   * rows, the list and the toasts alike.
+   */
+  byId: Record<string, Notification | null>;
 
   loadNotifications: () => Promise<void>;
   setFilter: (f: string) => void;
   setTypeFilter: (f: string) => void;
-  answerNotification: (id: string, answer: string) => Promise<void>;
+  /** Reads a row into `byId`, once. */
+  fetchNotification: (id: string) => Promise<void>;
+  /** Resolves true when the server took the answer. */
+  answerNotification: (id: string, answer: string) => Promise<boolean>;
   dismissNotification: (id: string) => Promise<void>;
   dismissAll: () => Promise<void>;
   handleWSNotification: (data: any) => void;
@@ -103,6 +112,22 @@ interface NotificationState {
   removeSilence: (id: string) => Promise<void>;
 }
 
+/** The rows that `fetchNotification` is reading, so that it reads each row once. */
+const reading = new Set<string>();
+
+type Copies = Pick<NotificationState, 'notifications' | 'toastQueue' | 'byId'>;
+
+/** The same change on every copy of a row: the list, the toasts and `byId`. */
+function patchCopies(s: Copies, id: string, patch: Partial<Notification>): Copies {
+  const update = (n: Notification) => (n.id === id ? { ...n, ...patch } : n);
+  const row = s.byId[id];
+  return {
+    notifications: s.notifications.map(update),
+    toastQueue: s.toastQueue.map(update),
+    byId: row ? { ...s.byId, [id]: { ...row, ...patch } } : s.byId,
+  };
+}
+
 export const useNotificationStore = create<NotificationState>((set, get) => ({
   notifications: [],
   pendingCount: 0,
@@ -111,6 +136,7 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
   loading: true,
   toastQueue: [],
   silences: [],
+  byId: {},
 
   loadNotifications: async () => {
     try {
@@ -137,18 +163,40 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
     get().loadNotifications();
   },
 
+  fetchNotification: async (id: string) => {
+    if (id in get().byId || reading.has(id)) return;
+    reading.add(id);
+    let row: Notification | null = null;
+    try {
+      row = await api.getNotification(id);
+    } catch (e) {
+      console.error('Failed to load notification:', e);
+    } finally {
+      reading.delete(id);
+    }
+    set(s => ({ byId: { ...s.byId, [id]: row } }));
+  },
+
   answerNotification: async (id: string, answer: string) => {
     try {
       await api.answerNotification(id, answer);
-      get().loadNotifications();
     } catch (e) {
       console.error('Failed to answer notification:', e);
+      return false;
     }
+    get().loadNotifications();
+    // Read the row again and update every copy: the answer event does not
+    // come while the socket is down.
+    api.getNotification(id)
+      .then(row => set(s => patchCopies(s, id, row)))
+      .catch(e => console.error('Failed to reload notification:', e));
+    return true;
   },
 
   dismissNotification: async (id: string) => {
     try {
       await api.dismissNotification(id);
+      set(s => patchCopies(s, id, { status: 'dismissed' }));
       get().loadNotifications();
     } catch (e) {
       console.error('Failed to dismiss notification:', e);
@@ -158,6 +206,8 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
   dismissAll: async () => {
     try {
       await api.dismissAllNotifications();
+      // The server dismisses the pending `notify` rows only.
+      set(s => ({ toastQueue: s.toastQueue.filter(n => n.type !== 'notify') }));
       get().loadNotifications();
     } catch (e) {
       console.error('Failed to dismiss all:', e);
@@ -230,32 +280,21 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
     // the row actionable, stamp when it will resurface, leave the
     // pending count alone (matches the server's pending_count).
     if (data.approval_status === 'snoozed') {
-      set(s => ({
-        notifications: s.notifications.map(n =>
-          n.id === data.notification_id
-            ? {
-                ...n,
-                status: 'pending',
-                redeliver_at: data.snooze_until ?? null,
-                answered_by_actor_id: data.actor_id ?? null,
-              }
-            : n
-        ),
+      set(s => patchCopies(s, data.notification_id, {
+        status: 'pending',
+        redeliver_at: data.snooze_until ?? null,
+        answered_by_actor_id: data.actor_id ?? null,
       }));
       return;
     }
     set(s => ({
-      notifications: s.notifications.map(n =>
-        n.id === data.notification_id
-          ? {
-              ...n,
-              status: 'answered',
-              answer: data.answer,
-              answered_by: data.answered_by,
-              answered_by_actor_id: data.actor_id ?? null,
-            }
-          : n
-      ),
+      ...patchCopies(s, data.notification_id, {
+        status: 'answered',
+        answer: data.answer,
+        answered_by: data.answered_by,
+        answered_by_actor_id: data.actor_id ?? null,
+        answered_at: data.answered_at ?? null,
+      }),
       pendingCount: Math.max(0, s.pendingCount - 1),
     }));
   },
@@ -266,9 +305,7 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
         n => n.id === data.notification_id && n.status === 'pending'
       );
       return {
-        notifications: s.notifications.map(n =>
-          n.id === data.notification_id ? { ...n, status: 'expired' } : n
-        ),
+        ...patchCopies(s, data.notification_id, { status: 'expired' }),
         pendingCount: wasPending
           ? Math.max(0, s.pendingCount - 1)
           : s.pendingCount,
