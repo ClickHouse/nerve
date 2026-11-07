@@ -1290,11 +1290,26 @@ Response: { "task": { "id": "2026-03-01-fix-bug", ... }, "message": "Task create
 ```
 
 #### `GET /api/tasks/{id}`
-Get task details including full markdown file content.
+Get task details including full markdown file content, and `sessions`: the
+sessions that created, implemented or updated the task. Each session shows
+once, with the first relation that applies in the order `created`,
+`implemented`, `updated`. See [Sessions](tasks.md#sessions-created_session_id).
 
 ```json
-Response: { "id": "2026-03-01-fix-bug", "title": "Fix bug", "status": "pending", "content": "# Fix bug\n\n...", ... }
+Response: {
+  "id": "2026-03-01-fix-bug", "title": "Fix bug", "status": "pending", "content": "# Fix bug\n\n...",
+  "created_session_id": "a1b2c3d4", "created_session_title": "Triage the inbox",
+  "sessions": [
+    { "id": "a1b2c3d4", "title": "Triage the inbox", "relation": "created" },
+    { "id": "impl-5c2e9a1f", "title": "Implement: Fix bug", "relation": "implemented" }
+  ],
+  ...
+}
 ```
+
+Every task row (list, search, board, detail, the `task_updated` broadcast) has
+`created_session_id` (`null` when no session created the task) and
+`created_session_title` (`null` when that session does not exist).
 
 #### `PATCH /api/tasks/{id}`
 Update a task. All fields are optional. `content` replaces the full markdown
@@ -1309,6 +1324,15 @@ Request:  { "status": "done", "note": "Fixed in PR #123" }
 Request:  { "content": "# Updated Title\n\n**Deadline:** 2026-03-15\n\nNew details..." }
 Request:  { "deadline": "" }
 Response: { "task": { ... }, "task_id": "2026-03-01-fix-bug", "updated": true }
+```
+
+#### `GET /api/sessions/{id}/tasks`
+The tasks that the session created, implemented or updated, the most recently
+updated first. Each task row has `relation`: `created`, `implemented` or
+`updated`, the first that applies. **404** if the session does not exist.
+
+```json
+Response: { "tasks": [{ "id": "2026-03-01-fix-bug", "title": "Fix bug", "status": "pending", "relation": "created", ... }] }
 ```
 
 #### `GET /api/tasks/{id}/events`

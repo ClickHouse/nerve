@@ -234,6 +234,34 @@ Only the author of a comment can delete it, through
 `DELETE /api/tasks/{id}/comments/{comment_id}`. Accounts have no roles, so
 no person can delete the words of another. Comments cannot be edited.
 
+### Sessions (`created_session_id`)
+
+`tasks.created_session_id` (migration v066) is the session that created the
+task. `task_create` in an agent session sets it. It is NULL for a task created
+through the HTTP API or by a reindex, because their actor (`web`, `system`) is
+not a session ID. For tasks that existed before v066, the migration copies the
+actor of the creation event in `task_events`, but only when a session with that
+ID exists.
+
+Task rows from the list, search, board and detail routes, and the
+`task_updated` broadcast, have `created_session_title`: the title of that
+session, or its ID when it has no title. It is `null` when the session does not
+exist, for example after a delete.
+
+A session relates to a task in one of three ways, in this order:
+
+| Relation | Source |
+|---|---|
+| `created` | `tasks.created_session_id` |
+| `implemented` | `plans.impl_session_id` of a plan of the task |
+| `updated` | `task_events.actor`: the session changed the status |
+
+A session that relates in more than one way gets the first relation. The task
+detail (`GET /api/tasks/{id}`) lists the sessions of the task in `sessions`,
+and `GET /api/sessions/{id}/tasks` lists the tasks of a session. Both include
+only sessions that exist. A change that keeps the status (a note, a content
+edit) records no event, so it does not make a session `updated`.
+
 ### Live Updates
 
 Every task mutation broadcasts a `task_updated` WebSocket event on the
