@@ -699,9 +699,19 @@ ASK_USER_SCHEMA = {
             "default": "",
         },
         "options": {
-            "type": "string",
-            "description": "Predefined answer options (shown as buttons). Comma-separated string or JSON array. Optional — user can always type free text.",
-            "default": "",
+            # A string stays valid for callers that send a JSON array as
+            # text or a comma-separated list; the handler parses both.
+            "anyOf": [
+                {"type": "array", "items": {"type": "string"}},
+                {"type": "string"},
+            ],
+            "description": (
+                "Answer options, one button each. Send an array of strings, "
+                'for example ["Yes, all of these", "No"]. End the option you '
+                'recommend with "(recommended)" to show it first. Optional: '
+                "the person can always type their own answer."
+            ),
+            "default": [],
         },
         "wait": {
             "type": "string",
