@@ -63,11 +63,13 @@ export function InboxPage() {
 
 /**
  * A message box that starts a new chat with its text. When the chat cannot
- * be started, the text stays in the box.
+ * be started, the text stays in the box and a line under it says so, until
+ * the person types or sends again.
  */
 function NewChatComposer({ onStarted }: { onStarted: (sessionId: string) => void }) {
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
+  const [failed, setFailed] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const agentName = useSetupStore(s => agentNameOf(s.state));
   // As in the chat composer: on a touch device Enter types a new line and
@@ -85,9 +87,14 @@ function NewChatComposer({ onStarted }: { onStarted: (sessionId: string) => void
   const send = async () => {
     if (!canSend) return;
     setSending(true);
+    setFailed(false);
     const sessionId = await useChatStore.getState().startChat(text.trim());
-    if (sessionId) onStarted(sessionId);
-    else setSending(false);
+    if (sessionId) {
+      onStarted(sessionId);
+    } else {
+      setSending(false);
+      setFailed(true);
+    }
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -107,7 +114,7 @@ function NewChatComposer({ onStarted }: { onStarted: (sessionId: string) => void
         <textarea
           ref={textareaRef}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => { setText(e.target.value); setFailed(false); }}
           onKeyDown={handleKeyDown}
           enterKeyHint={enterSends ? 'send' : 'enter'}
           placeholder={`Message ${agentName}...`}
@@ -120,6 +127,9 @@ function NewChatComposer({ onStarted }: { onStarted: (sessionId: string) => void
           <ArrowUp size={16} />
         </IconButton>
       </div>
+      {failed && (
+        <p role="alert" className="mt-1.5 px-4 text-xs text-error">Could not send. Try again.</p>
+      )}
     </form>
   );
 }
