@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { reloadSessionsSoon } from './helpers/sessionsReload';
 
 /** The implementation session of an approved plan: GET /api/plans/{id} only. */
 export interface ImplSession {
@@ -140,6 +141,8 @@ export const usePlanStore = create<PlanState>((set, get) => {
       set({ actionLoading: true, actionError: null });
       try {
         await api.updatePlan(id, { status, feedback });
+        // The plan leaves the "Needs you" group of the session list.
+        reloadSessionsSoon();
         const sel = get().selectedPlan;
         if (sel && sel.id === id) {
           set({ selectedPlan: { ...sel, status, ...(feedback ? { feedback } : {}) } });
@@ -158,6 +161,8 @@ export const usePlanStore = create<PlanState>((set, get) => {
       set({ actionLoading: true, actionError: null });
       try {
         const result = await api.approvePlan(id);
+        // The plan leaves the "Needs you" group of the session list.
+        reloadSessionsSoon();
         const sel = get().selectedPlan;
         if (sel && sel.id === id) {
           set({ selectedPlan: { ...sel, status: 'implementing', impl_session_id: result.impl_session_id } });

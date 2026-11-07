@@ -312,6 +312,16 @@ class SessionStore:
             f"status != 'archived' AND starred = 0 AND source IN {_SYSTEM_SQL}",
         )
 
+    async def list_unarchived_sessions(self, session_ids: list[str]) -> list[dict]:
+        """The non-archived sessions among ``session_ids``, any source."""
+        if not session_ids:
+            return []
+        placeholders = ", ".join("?" for _ in session_ids)
+        return await self._page(
+            f"SELECT * FROM sessions WHERE id IN ({placeholders}) AND status != 'archived'",
+            tuple(session_ids), None, 0,
+        )
+
     async def search_sessions(self, query: str, limit: int = 100) -> list[dict]:
         """Search sessions by title (LIKE match), across all non-archived sessions."""
         sql = (

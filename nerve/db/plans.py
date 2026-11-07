@@ -136,3 +136,12 @@ class PlanStore:
             "SELECT DISTINCT task_id FROM plans WHERE status IN ('pending', 'implementing')"
         ) as cursor:
             return [row[0] async for row in cursor]
+
+    async def count_pending_plans_by_session(self) -> dict[str, int]:
+        """Pending plans per proposing session: ``{session_id: count}``."""
+        async with self.db.execute(
+            """SELECT session_id, COUNT(*) FROM plans
+               WHERE status = 'pending' AND session_id IS NOT NULL
+               GROUP BY session_id"""
+        ) as cursor:
+            return {session_id: count async for session_id, count in cursor}

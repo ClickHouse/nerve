@@ -134,3 +134,162 @@ class TestSidebarListRoutes:
                 break
             offset = page["next_offset"]
         assert len(seen) == len(set(seen)) == total
+
+    # ── Needs you ────────────────────────────────────────────────────────
+
+    async def _ask(self, db: Database, nid: str, session_id: str, kind: str = "question") -> None:
+        await db.create_notification(nid, session_id, kind, f"{kind} {nid}")
+
+    async def _plan(self, db: Database, plan_id: str, session_id: str) -> None:
+        await db.create_plan(plan_id, "task-1", "Do the thing.", session_id=session_id)
+
+    async def test_every_row_carries_attention(self, setup):
+        await self._seed(setup.sm, setup.db, chats=2)
+        await self._ask(setup.db, "n1", "chat-000")
+        await self._ask(setup.db, "n2", "chat-000")
+        await self._ask(setup.db, "n3", "chat-000", kind="approval")
+        await self._ask(setup.db, "n4", "chat-000", kind="notify")
+        await self._plan(setup.db, "plan-1", "chat-000")
+
+        rows = {s["id"]: s for s in setup.client.get("/api/sessions").json()["sessions"]}
+        assert rows["chat-000"]["attention"] == {
+            "questions": 2, "approvals": 1, "plans": 1,
+            "awaiting_input": False, "review": False,
+        }
+        assert rows["chat-001"]["attention"] == {
+            "questions": 0, "approvals": 0, "plans": 0,
+            "awaiting_input": False, "review": False,
+        }
+
+    async def test_page_one_adds_system_sessions_that_need_you(self, setup):
+        """A cron session with a pending plan is not in the feed, yet page 1 returns it."""
+        await self._seed(setup.sm, setup.db, chats=2, crons=3)
+        await self._plan(setup.db, "plan-1", "cron-001")
+
+        body = setup.client.get("/api/sessions").json()
+        ids = [s["id"] for s in body["sessions"]]
+        assert sorted(ids) == ["chat-000", "chat-001", "cron-001"]
+        cron = next(s for s in body["sessions"] if s["id"] == "cron-001")
+        assert cron["attention"]["plans"] == 1
+        # The group badge and the page window do not change.
+        assert body["system_count"] == 3
+        assert body["next_offset"] == 2
+
+    async def test_page_one_adds_a_waiting_session_from_a_later_page(self, setup):
+        setup.cfg.sessions.sidebar_page_size = 5
+        await self._seed(setup.sm, setup.db, chats=8)
+        page2 = setup.client.get("/api/sessions?offset=5").json()["sessions"]
+        later = page2[-1]["id"]
+        await self._ask(setup.db, "n1", later)
+
+        body = setup.client.get("/api/sessions").json()
+        assert later in {s["id"] for s in body["sessions"]}
+        assert len(body["sessions"]) == 6
+        # Later pages never add rows.
+        again = setup.client.get("/api/sessions?offset=5").json()["sessions"]
+        assert [s["id"] for s in again] == [s["id"] for s in page2]
+
+    async def test_archived_and_unknown_sessions_are_not_added(self, setup):
+        await self._seed(setup.sm, setup.db, chats=1, archived=1)
+        await self._ask(setup.db, "n1", "arch-000")
+        await self._ask(setup.db, "n2", "no-such-session")
+
+        ids = [s["id"] for s in setup.client.get("/api/sessions").json()["sessions"]]
+        assert ids == ["chat-000"]
+
+    async def test_a_handled_item_leaves_needs_you(self, setup):
+        await self._seed(setup.sm, setup.db, chats=1, crons=1)
+        await self._ask(setup.db, "n1", "cron-000")
+        await self._plan(setup.db, "plan-1", "cron-000")
+        assert "cron-000" in {s["id"] for s in setup.client.get("/api/sessions").json()["sessions"]}
+
+        await setup.db.answer_notification("n1", "yes", "web")
+        await setup.db.update_plan("plan-1", status="implementing")
+
+        ids = [s["id"] for s in setup.client.get("/api/sessions").json()["sessions"]]
+        assert ids == ["chat-000"]
+
+    async def test_awaiting_input_and_review_count_as_needs_you(self, setup, monkeypatch):
+        import nerve.gateway.routes.sessions as routes
+
+        await self._seed(setup.sm, setup.db, chats=1, crons=2)
+        monkeypatch.setattr(routes, "get_awaiting_ids", lambda: {"cron-000"})
+
+        async def loops(_deps):
+            return {"cron-001": {"id": "rvl-1", "status": "awaiting_user"}}
+        monkeypatch.setattr(routes, "_newest_review_loops", loops)
+
+        rows = {s["id"]: s for s in setup.client.get("/api/sessions").json()["sessions"]}
+        assert set(rows) == {"chat-000", "cron-000", "cron-001"}
+        assert rows["cron-000"]["attention"]["awaiting_input"] is True
+        assert rows["cron-000"]["awaiting_input"] is True
+        assert rows["cron-001"]["attention"]["review"] is True
+        assert rows["cron-001"]["review_loop"]["status"] == "awaiting_user"
+
+    async def test_an_old_parked_review_loop_still_needs_you(self, setup, monkeypatch):
+        """A loop that waits for a decision counts even behind 100 newer loops."""
+        import nerve.workflows as workflows
+
+        monkeypatch.setattr(workflows, "get_review_loop_service", lambda: object())
+        await self._seed(setup.sm, setup.db, chats=1, crons=1)
+
+        async def loop(loop_id: str, session_id: str, status: str, created_at: str) -> None:
+            await setup.db.create_review_loop(
+                loop_id, title="t", session_id=session_id, goal_prompt="g",
+                verifier_prompt="- a", criteria_adoption="no", criteria=[],
+                implementer={}, verifier={}, cwd=None, max_iterations=3, budget_usd=1.0,
+            )
+            await setup.db._write(
+                "UPDATE review_loops SET status = ?, created_at = ? WHERE id = ?",
+                (status, created_at, loop_id),
+            )
+
+        await loop("rvl-old", "cron-000", "awaiting_user", "2026-01-01T00:00:00+00:00")
+        for i in range(100):
+            await loop(f"rvl-{i:03d}", "chat-000", "passed", f"2026-02-01T00:{i // 60:02d}:{i % 60:02d}+00:00")
+
+        rows = {s["id"]: s for s in setup.client.get("/api/sessions").json()["sessions"]}
+        assert rows["cron-000"]["attention"]["review"] is True
+        assert rows["cron-000"]["review_loop"]["id"] == "rvl-old"
+        assert rows["chat-000"]["attention"]["review"] is False
+
+    async def test_lazy_groups_carry_attention_without_extra_rows(self, setup):
+        await self._seed(setup.sm, setup.db, chats=1, crons=1)
+        await self._ask(setup.db, "n1", "chat-000", kind="approval")
+
+        system = setup.client.get("/api/sessions/system").json()["sessions"]
+        assert [s["id"] for s in system] == ["cron-000"]
+        assert system[0]["attention"]["approvals"] == 0
+
+
+@pytest.mark.asyncio
+class TestAttentionCounts:
+    async def test_pending_asks_are_counted_per_session_and_type(self, db: Database):
+        for nid, sid, kind in [
+            ("n1", "s1", "question"), ("n2", "s1", "question"), ("n3", "s1", "approval"),
+            ("n4", "s2", "approval"), ("n5", "s2", "notify"), ("n6", "s3", "question"),
+        ]:
+            await db.create_notification(nid, sid, kind, "title")
+        await db.update_notification("n6", status="expired")
+
+        assert await db.count_pending_by_session() == {
+            "s1": {"question": 2, "approval": 1},
+            "s2": {"approval": 1},
+        }
+
+    async def test_pending_plans_are_counted_per_session(self, db: Database):
+        await db.create_plan("p1", "t1", "c", session_id="s1")
+        await db.create_plan("p2", "t2", "c", session_id="s1")
+        await db.create_plan("p3", "t3", "c", session_id="s2")
+        await db.create_plan("p4", "t4", "c")
+        await db.update_plan("p3", status="declined")
+
+        assert await db.count_pending_plans_by_session() == {"s1": 2}
+
+    async def test_plan_count_reads_only_the_index(self, db: Database):
+        async with db.db.execute(
+            "EXPLAIN QUERY PLAN SELECT session_id, COUNT(*) FROM plans"
+            " WHERE status = 'pending' AND session_id IS NOT NULL GROUP BY session_id"
+        ) as cursor:
+            plan = " ".join(str(row[-1]) for row in await cursor.fetchall())
+        assert "COVERING INDEX idx_plans_status_session" in plan

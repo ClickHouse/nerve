@@ -56,6 +56,7 @@ const { useChatStore, registerComposerFlush, AGENTS_PANEL_ID, MAX_AGENT_TABS } =
 const { reenter, setAuthMode, useHostedStore } = await import('../api/hosted');
 const { useAgentStore } = await import('./agentStore');
 const fx = await import('../test/agentFixtures');
+const { needsYou } = await import('../utils/sessionAttention');
 // chatStore registers its socket-open handler once, at module init.
 const onSocketOpen = vi.mocked(ws.onOpen).mock.calls[0]?.[0] as (() => void) | undefined;
 
@@ -115,6 +116,78 @@ describe('loadSessions depth preservation', () => {
     const s = useChatStore.getState();
     expect(s.sessions.length).toBe(100);
     expect(s.sessionsHasMore).toBe(false);
+  });
+});
+
+describe('the sessions that need you', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('a later page never repeats a session that page 1 already holds', async () => {
+    // Page 1 carries s60 from page 2, because it waits for the user.
+    vi.mocked(api.listSessions).mockImplementation(async (offset = 0) => offset === 0
+      ? { sessions: [...rows(0, PAGE), rows(60, 1)[0]], archived_count: 0, system_count: 0, has_more: true, next_offset: PAGE }
+      : { sessions: rows(PAGE, PAGE), archived_count: 0, system_count: 0, has_more: false, next_offset: 2 * PAGE });
+    useChatStore.setState({
+      sessions: [], sessionsNextOffset: 0, sessionsHasMore: false,
+      archivedSessions: null, systemSessions: null, activeSession: '', virtualSession: null,
+    });
+
+    await useChatStore.getState().loadSessions();
+    await useChatStore.getState().loadMoreSessions();
+
+    const ids = useChatStore.getState().sessions.map(s => s.id);
+    expect(ids.length).toBe(2 * PAGE);
+    expect(new Set(ids).size).toBe(2 * PAGE);
+    expect(useChatStore.getState().sessionsNextOffset).toBe(2 * PAGE);
+  });
+
+  // The server list after the reload, and the store before the event.
+  const listed = (sessions: unknown[]) => vi.mocked(api.listSessions).mockResolvedValue(
+    { sessions, archived_count: 0, system_count: 0, has_more: false, next_offset: 1 } as never);
+  const feed = (sessions: unknown[]) => useChatStore.setState({
+    sessions: sessions as never, sessionsNextOffset: 0, sessionsHasMore: false,
+    archivedSessions: null, systemSessions: null, activeSession: '', virtualSession: null,
+  });
+  const chat = { id: 'chat-1', title: 'chat', source: 'web', updated_at: '2026-11-07T04:00:00Z' };
+  const cron = { ...chat, id: 'cron-1', source: 'cron' };
+
+  it('a session from outside the feed that starts to wait enters Needs you', async () => {
+    vi.useFakeTimers();
+    feed([chat]);
+    listed([chat, { ...cron, awaiting_input: true }]);
+
+    dispatch({ type: 'session_awaiting_input', session_id: 'cron-1', awaiting: true });
+    await vi.advanceTimersByTimeAsync(500);
+
+    const added = useChatStore.getState().sessions.find(s => s.id === 'cron-1');
+    expect(added && needsYou(added)).toBe(true);
+  });
+
+  it('a session from outside the feed leaves when its review loop stops waiting', async () => {
+    vi.useFakeTimers();
+    const loop = { id: 'rvl-1', status: 'awaiting_user', iteration: 1, max_iterations: 3 };
+    feed([chat, { ...cron, review_loop: loop }]);
+    listed([chat]);
+
+    dispatch({ type: 'review_loop_update', session_id: 'cron-1', loop: { ...loop, status: 'implementing' } } as never);
+    // The row is patched at once and dropped by the reload.
+    expect(needsYou(useChatStore.getState().sessions.find(s => s.id === 'cron-1')!)).toBe(false);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(useChatStore.getState().sessions.map(s => s.id)).toEqual(['chat-1']);
+  });
+
+  it('a burst of notification events reloads the list once', async () => {
+    vi.useFakeTimers();
+    useChatStore.setState({ sessionsNextOffset: 0, sessionsHasMore: false, archivedSessions: null, systemSessions: null });
+    const base = { notification_id: 'n1', session_id: 's1', title: 't' };
+    dispatch({ ...base, type: 'notification', notification_type: 'question', body: '', priority: 'normal', options: null });
+    dispatch({ ...base, type: 'notification_answered', answer: 'yes', answered_by: 'web' });
+    dispatch({ ...base, type: 'notification_expired', notification_type: 'question' });
+    expect(api.listSessions).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(api.listSessions).toHaveBeenCalledTimes(1);
   });
 });
 
