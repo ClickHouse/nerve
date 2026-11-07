@@ -161,8 +161,9 @@ def _prompt_inputs(workspace: Path, mode: str) -> "tuple[str, str, WorkSelection
 _IDENTITY_NAME = "- **Name:**"
 
 
-def _agent_name(workspace: Path) -> str:
-    """The name the agent gives itself in its first message, else ``""``.
+def read_agent_name(workspace: Path) -> str:
+    """The agent's name, else ``""``: the name it gives itself in its first
+    message, the name of the installed panel and of its push notifications.
     Blocking file I/O.
 
     The name line of ``IDENTITY.md`` once it is filled in (About you), else
@@ -298,7 +299,7 @@ async def start(
     description, guide, work = await asyncio.to_thread(_prompt_inputs, workspace, mode)
     if kind == CONVERSATION:
         name = await _person_name(db, cause)
-        agent_name = await asyncio.to_thread(_agent_name, workspace)
+        agent_name = await asyncio.to_thread(read_agent_name, workspace)
         # The first turn calls no tool before its message: Nerve hands the
         # agent what is configured, and from where, instead.
         facts = await _instance_facts(engine, workspace)

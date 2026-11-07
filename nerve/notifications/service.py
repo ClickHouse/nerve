@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 
 from nerve.identity import actor_id_of, attribution_for
 from nerve.notifications import handlers as _handlers
+from nerve.notifications import webpush
 from nerve.notifications.date_render import render_iso_dates
 from nerve.notifications.quiet_hours import deliver_silently
 
@@ -987,7 +988,8 @@ class NotificationService:
         "Open plan" button for it.
 
         Without ``channels`` the configured list goes out, with the panel
-        in it (:meth:`NotificationsConfig.delivery_channels`). A channel whose
+        in it (:meth:`NotificationsConfig.delivery_channels`), and Web Push
+        to the browsers that turned it on (:func:`webpush.deliver`). A channel whose
         ``notifications.levels`` entry is ``important`` skips an item below
         that level (:meth:`NotificationsConfig.wants`).
 
@@ -998,7 +1000,7 @@ class NotificationService:
         silent = silent or deliver_silently(self.config, priority)
         settings = self.config.notifications
         target_channels = [
-            name for name in (channels or settings.delivery_channels())
+            name for name in (channels or [*settings.delivery_channels(), webpush.PUSH_CHANNEL])
             if settings.wants(name, notif_type, priority)
         ]
 
@@ -1038,6 +1040,13 @@ class NotificationService:
                     if not msg_id:
                         return None
                     return "slack"
+                elif channel_name == webpush.PUSH_CHANNEL:
+                    pushed = await webpush.deliver(
+                        self.db, self.config, notification_id=notification_id,
+                        notif_type=notif_type, title=title, body=body,
+                        priority=priority, silent=silent,
+                    )
+                    return webpush.PUSH_CHANNEL if pushed else None
                 else:
                     logger.warning(
                         "notifications.channels names %r, which nothing "
