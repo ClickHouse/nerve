@@ -1696,9 +1696,10 @@ export const api = {
 
   // Diagnostics
   getDiagnostics: () => request<any>('/diagnostics'),
-  getCronLogs: (jobId?: string, limit = 50, offset = 0) =>
-    request<{ logs: any[]; total: number; limit: number; offset: number }>(
-      `/cron/logs?job_id=${jobId || ''}&limit=${limit}&offset=${offset}`),
+  getCronLogs: (jobId?: string, limit = 50, offset = 0, hideEmpty = false) =>
+    request<{ logs: any[]; total: number; empty: number; limit: number; offset: number }>(
+      `/cron/logs?job_id=${encodeURIComponent(jobId || '')}&limit=${limit}&offset=${offset}`
+      + (hideEmpty ? '&hide_empty=1' : '')),
 
   // Observability — lightweight status for UI deep-links
   getObservabilityStatus: () =>
@@ -1730,6 +1731,11 @@ export const api = {
     request<any>(`/cron/jobs/${encodeURIComponent(jobId)}/trigger`, { method: 'POST' }),
   rotateCronJob: (jobId: string) =>
     request<any>(`/cron/jobs/${encodeURIComponent(jobId)}/rotate`, { method: 'POST' }),
+  setCronJobEnabled: (jobId: string, enabled: boolean) =>
+    request<{ job_id: string; enabled: boolean }>(`/cron/jobs/${encodeURIComponent(jobId)}/enabled`, {
+      method: 'PUT',
+      body: JSON.stringify({ enabled }),
+    }),
 
   // Skills
   listSkills: () => request<{ skills: any[] }>('/skills'),

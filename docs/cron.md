@@ -312,8 +312,8 @@ on every scheduled tick; `nerve doctor` names the jobs that still use this gate.
 
 A gate can also say ahead of time what it will decide. `forecast(ctx, at)`
 answers "would this gate let the job run at `at`?" from what is known now. Nerve
-asks it to show what each job's next run will do — `GET /api/cron/schedule`,
-`nerve cron next`, and the **Forecast** column on the Cron page — and to work out
+asks it to show what each job's next run will do (`GET /api/cron/schedule`,
+`nerve cron next`, and the next run on the Cron page), and to work out
 when the instance next has work of its own (see [What runs next](#what-runs-next)).
 The gate is still checked for real when the run comes; a forecast only predicts
 that check.
@@ -624,9 +624,10 @@ machine, more than 30 seconds before it ended, is not a late run: see
 
 `GET /api/cron/schedule` reports the next moment the instance will start work on
 its own, and what each job's next run is forecast to do. `nerve cron next` prints
-the same from the running daemon, and the Cron page shows each job's forecast in
-its card. The page lists the jobs without waiting for the forecasts, fills them
-in when they arrive, and goes on without them after 10 seconds.
+the same from the running daemon, and the Cron page shows the forecast under the
+next run of a job with gates, and a forecast skip of any job. The page lists the
+jobs without waiting for the forecasts, fills them in when they arrive, and goes
+on without them after 10 seconds.
 
 ```json
 {

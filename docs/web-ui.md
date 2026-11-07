@@ -385,6 +385,14 @@ System status dashboard (`/diagnostics`) with:
 - **Memory service** — memU's status, item counts and operations; with `memory.backend: loom`, Loom's: the gateway it is reached through, the org and namespace, where the namespace came from, the last error and when it was checked, and a link to Loom's dashboard when `memory.loom.dashboard_url` is set
 - **Recent Cron Logs** — Job ID, status, timestamps, errors
 
+### Cron Page
+`/cron` opens on the sheet of the first job: the **Active** switch, **Run
+now**, the schedule in words (`cronstrue` for crontab expressions), the next
+run with its forecast, the latest run and the 7-day success count. **History**
+lists the runs with ✓, ✗ or −, the duration and a link to the run's session,
+and hides the source runs that found nothing new until you select **Show runs
+with no new items**. See [The Cron page](cron.md#the-cron-page).
+
 ### Reload Resilience
 - Server buffers streaming events per session
 - On reconnect/tab switch, buffered events are replayed to reconstruct streaming state
