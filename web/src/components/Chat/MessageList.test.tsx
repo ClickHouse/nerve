@@ -24,6 +24,7 @@ vi.mock('../../api/websocket', () => ({
 }));
 
 const { useSetupStore } = await import('../../stores/setupStore');
+const { useChatStore } = await import('../../stores/chatStore');
 const { makeState, step, withStep } = await import('../../test/setupFixtures');
 const { MessageList } = await import('./MessageList');
 
@@ -74,5 +75,29 @@ describe('empty transcript', () => {
     useSetupStore.setState({ state: withStep(makeState(), step('provider', { status: 'done' })) });
     renderEmpty();
     expect(screen.getByText('Start a conversation')).toBeInTheDocument();
+  });
+});
+
+describe('origin line', () => {
+  it('leads the transcript of a session that a cron job started', () => {
+    useChatStore.setState({
+      activeSession: 'cron:nightly:1', archivedSessions: null, systemSessions: null,
+      sessions: [{
+        id: 'cron:nightly:1', title: 'Cron: nightly', source: 'cron', updated_at: '2026-01-01T00:00:00Z',
+        trigger: 'cron', origin_label: 'Started by cron job nightly', origin_detail: { cron_job: 'nightly' },
+      }],
+    });
+    render(
+      <MemoryRouter>
+        <MessageList
+          messages={[{ role: 'user', blocks: [{ type: 'text', content: 'tidy up' }] }]}
+          isStreaming={false}
+        />
+      </MemoryRouter>,
+    );
+    const line = screen.getByTestId('session-origin');
+    expect(line).toHaveTextContent('Started by cron job nightly');
+    expect(line.compareDocumentPosition(screen.getByText('tidy up')))
+      .toBe(Node.DOCUMENT_POSITION_FOLLOWING);
   });
 });
