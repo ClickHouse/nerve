@@ -138,6 +138,22 @@ class NotAcceptingTurnsError(RuntimeError):
         super().__init__(_NOT_ACCEPTING_TURNS_MESSAGE)
 
 
+# The runtime's system frame that marks a compacted conversation.
+_COMPACT_BOUNDARY = "compact_boundary"
+# A compact turn that ended with no such frame: the runtime had no messages.
+_NOTHING_TO_COMPACT = "Nothing to compact yet."
+
+
+class CompactError(RuntimeError):
+    """``AgentEngine.compact_session`` did not compact. ``code``:
+    ``unavailable`` (no live client that can compact), ``busy`` (a turn runs
+    or waits), ``nothing_to_compact``, ``stopped`` or ``failed``."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def _sanitize_surrogates(s: str) -> str:
     """Remove orphaned UTF-16 surrogates that break JSON serialization.
 
@@ -2727,6 +2743,61 @@ class AgentEngine:
         session = await self.db.get_session(session_id)
         return session
 
+    def can_compact(self, session_id: str) -> bool:
+        """The session has a live client whose backend can compact (and tell
+        its context use by category)."""
+        return (
+            self.sessions.get_client(session_id) is not None
+            and self._backend_for_live_session(session_id).capabilities.supports_compact
+        )
+
+    async def context_usage(self, session_id: str) -> dict | None:
+        """The live client's context use by category (the
+        ``AgentClient.context_usage`` shape), or None: no live client, a
+        backend that cannot tell it, or a runtime that did not answer."""
+        if not self.can_compact(session_id):
+            return None
+        client = self.sessions.get_client(session_id)
+        try:
+            return await client.context_usage()
+        except Exception as e:  # noqa: BLE001 (the breakdown is optional)
+            logger.info("No context usage for session %s: %s", session_id, e)
+            return None
+
+    async def compact_session(self, session_id: str, *, actor: Actor | None) -> None:
+        """Compact the conversation of the session's live client.
+
+        The compact runs as a turn: it takes the run lock, the session shows
+        as running, and Stop reaches it. Its frames are not shown and it adds
+        no message to the transcript. Its ``done`` event carries the context
+        use measured after the compact (``usage.context_tokens``).
+
+        Raises:
+            CompactError: the session did not compact (see its ``code``).
+        """
+        if not self.can_compact(session_id):
+            raise CompactError(
+                "unavailable", "Compact needs a running Claude session.",
+            )
+        lock = self._session_locks.get(session_id)
+        if (
+            self.sessions.is_running(session_id)
+            or (lock is not None and lock.locked())
+            or self._queue_state()[0].get(session_id)
+        ):
+            raise CompactError("busy", "The agent is busy. Try again when the turn ends.")
+        result = await self._run_turn(
+            session_id, "", internal=True, actor=actor, compact=True,
+        )
+        outcome = result.outcome
+        if outcome.ok:
+            return
+        if outcome.status == "interrupted":
+            raise CompactError("stopped", "Compact stopped.")
+        if outcome.error == _NOTHING_TO_COMPACT:
+            raise CompactError("nothing_to_compact", _NOTHING_TO_COMPACT)
+        raise CompactError("failed", f"Compact failed: {outcome.error or 'no detail'}")
+
     async def resume_enrolled_sessions(self) -> int:
         """Re-drive sessions enrolled via ``nerve restart --resume`` on startup.
 
@@ -3750,8 +3821,10 @@ class AgentEngine:
         client_msg_id: str | None = None,
         origin: str | None = None,
         drop_leading_thinking: bool = False,
+        compact: bool = False,
     ) -> TurnResult:
-        """``run()`` plus how the invocation's turn ended."""
+        """``run()`` plus how the invocation's turn ended. ``compact``: the
+        turn is the compact of :meth:`compact_session`, not a message."""
         # Resolved before the lock: an invalid cause fails here, before the
         # session is marked as running.
         cause_id = resolve_cause(actor, cause)
@@ -3827,6 +3900,7 @@ class AgentEngine:
                 bump_updated_at=bump_updated_at, actor=actor,
                 cause_id=cause_id,
                 drop_leading_thinking=drop_leading_thinking,
+                compact=compact,
             )
         finally:
             self.sessions.clear_turn_task(session_id, turn_task)
@@ -3848,10 +3922,11 @@ class AgentEngine:
         actor: Actor | None,
         cause_id: str | None,
         drop_leading_thinking: bool = False,
+        compact: bool = False,
     ) -> TurnResult:
         """The turn of :meth:`run`, with the run lock held: framing
         (buffering, running state, ``session_running``) around
-        :meth:`_run_inner`."""
+        :meth:`_run_inner`, or around :meth:`_compact_inner` for a compact."""
         broadcaster.start_buffering(session_id)
         async with self._semaphore:
             # Check again: a drain can start after the check in _run_turn,
@@ -3879,6 +3954,8 @@ class AgentEngine:
             # Notify all connected clients that this session started running
             await self._broadcast_session_running(session_id, True)
             try:
+                if compact:
+                    return await self._compact_inner(session_id, channel, actor)
                 return await self._run_inner(
                     session_id, user_message, source, channel, model,
                     effort_override=effort_override,
@@ -3919,6 +3996,82 @@ class AgentEngine:
                 # Carries pending work, so a session parked on a wakeup or
                 # a background task stays "running" in the sidebar.
                 await self._broadcast_session_running(session_id, False)
+
+    async def _compact_inner(
+        self, session_id: str, channel: str | None, actor: Actor | None,
+    ) -> TurnResult:
+        """The compact turn of :meth:`compact_session`, framed by
+        :meth:`_run_locked`."""
+        client = self.sessions.get_client(session_id)
+        if client is None:
+            return TurnResult("", TurnOutcome("failed", "the session has no live client"))
+        st = _TurnState()
+        boundary: dict | None = None
+        try:
+            # Autonomous turns that buffered since the last turn go first, as
+            # before a message (see _run_inner).
+            await self._drain_pending_messages(
+                session_id, client, "web", channel, first_content_timeout=3.0,
+            )
+            broadcaster.mark_turn_open(session_id)
+            await client.start_compact()
+            async for event in client.receive_turn():
+                if isinstance(event, SystemEvent) and event.subtype == _COMPACT_BOUNDARY:
+                    boundary = (event.data or {}).get("compact_metadata") or {}
+                elif isinstance(event, TurnCompleted):
+                    st.status, st.error = event.status, event.error
+                    break
+                elif isinstance(event, SystemEvent) or _is_sidechain(event):
+                    # Background agents go on while the conversation compacts.
+                    await self._process_agent_event(session_id, event, st)
+                # Text of the main chain is the runtime's answer to the
+                # command ("No messages to compact"), not a reply: not shown.
+        except asyncio.CancelledError:
+            # A hard Stop: the runtime can be in the middle of the compact.
+            st.status, st.error = "interrupted", "stopped by user"
+            await self._discard_client(
+                session_id, background_memorize=True, reason="force_stop",
+            )
+        except Exception as e:  # noqa: BLE001 (the turn's outcome reports it)
+            logger.warning("Compact failed for session %s: %s", session_id, e)
+            st.status, st.error = "failed", str(e)
+            await self._discard_client(
+                session_id, background_memorize=True, reason="process_exit",
+            )
+        if st.status == "completed" and boundary is None:
+            st.status, st.error = "failed", _NOTHING_TO_COMPACT
+        usage = None
+        if boundary is not None:
+            await self.db.log_session_event(
+                session_id, "context_compacted",
+                {k: boundary.get(k) for k in ("pre_tokens", "post_tokens")},
+                attribution=attribution_for(actor),
+            )
+            # The result of a compact reports no usage: measure it.
+            context = await self.context_usage(session_id)
+            if context is not None:
+                usage = await self._store_context_tokens(session_id, context)
+        await broadcaster.broadcast_done(
+            session_id, usage=usage,
+            max_context_tokens=usage["max_context_tokens"] if usage else None,
+            num_turns=usage.get("num_turns") if usage else None,
+        )
+        return TurnResult("", TurnOutcome(st.status, st.error))
+
+    async def _store_context_tokens(self, session_id: str, context: dict) -> dict:
+        """Add the measured context use (``context_tokens``) to the session's
+        last usage, so the context bar shows it after a reload. The next turn
+        replaces the last usage. Returns the new last usage."""
+        session = await self.db.get_session(session_id)
+        meta = json.loads((session or {}).get("metadata") or "{}")
+        usage = {
+            **(meta.get("last_usage") or {}),
+            "context_tokens": context["total_tokens"],
+            "max_context_tokens": context["max_tokens"],
+        }
+        meta["last_usage"] = usage
+        await self.db.update_session_metadata(session_id, meta)
+        return usage
 
     async def _run_inner(
         self,
