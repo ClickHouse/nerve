@@ -26,6 +26,7 @@ export {
   Columns3, Copy, CornerDownLeft, Cpu, Database, DollarSign, Download,
   Edit3, ExternalLink, Eye, EyeOff, File, FileCheck, FileDiff, FileEdit,
   FilePlus, FileText, FileX, Files, Filter, Folder, FolderOpen, GitBranch,
+  GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft,
   Github, Globe, GripVertical, Hammer, HardDrive, HelpCircle, History,
   Hourglass, Inbox, Lightbulb, List, ListTodo, Loader2, Lock, LogOut, Mail,
   Maximize2, MessageCircle, MessageCircleQuestion, MessageSquare, MessagesSquare, Monitor,
