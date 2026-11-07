@@ -796,3 +796,19 @@ switched, unless you edited it by hand.
 The switch is also not available under [lockdown](config.md#lockdown-remote-only-read-only)
 (change the job in the config repository), for a file that Nerve cannot
 write, and for a source (switch it in its `sync` settings).
+
+### Failure notices
+
+An agent job that starts to fail sends a notification: **Cron job `<id>`
+failed**, priority `high`, with the first lines of the error. It names the
+run's session, so the web UI links to it. More failed runs send nothing. The
+first run that succeeds after that sends **Cron job `<id>` works again**,
+priority `low`. The job's previous finished run decides: a run that fails
+after a success, or as the job's first recorded run, sends the first notice;
+a success after a failed run sends the second. Missed runs do not count.
+
+The notices go through the notification service, so notification silences
+and the notification channels apply to them. Their
+metadata has `cron_job_id` and `cron_log_id`. A failing job is not switched
+off. Workflow-run jobs and source runners are left out: a workflow run sends
+its own notices, and a source sends its health notices.
