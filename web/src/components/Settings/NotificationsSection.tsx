@@ -320,16 +320,13 @@ function QuietHoursGroup({ data }: { data: NotificationSettings }) {
         titleId={titleId}
         description={`Every day, in ${data.quiet_hours.timezone} time.`}
         control={(
-          <>
-            {on && data.quiet_hours.active && <Badge tone="info">Quiet now</Badge>}
-            <Switch
-              checked={on}
-              aria-labelledby={titleId}
-              aria-busy={busy || undefined}
-              disabled={!start.editable || !end.editable}
-              onChange={toggle}
-            />
-          </>
+          <Switch
+            checked={on}
+            aria-labelledby={titleId}
+            aria-busy={busy || undefined}
+            disabled={!start.editable || !end.editable}
+            onChange={toggle}
+          />
         )}
       >
         {on && <div className="flex flex-wrap gap-3">{time(start, 'Start')}{time(end, 'End')}</div>}

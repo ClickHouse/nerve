@@ -247,13 +247,12 @@ class TestSendTest:
 
 @pytest.mark.asyncio
 class TestQuietHours:
-    async def test_the_section_has_both_times_and_the_time_zone(self, inst, monkeypatch):
-        monkeypatch.setattr(settings_routes, "in_quiet_hours", lambda config: True)
+    async def test_the_section_has_both_times_and_the_time_zone(self, inst):
         body = await _get(inst)
         for path in ("quiet_start", "quiet_end"):
             assert body["fields"][path]["state"] == "editable"
             assert isinstance(body["fields"][path]["value"], str)
-        assert body["quiet_hours"] == {"timezone": get_config().timezone, "active": True}
+        assert body["quiet_hours"] == {"timezone": get_config().timezone}
 
     async def test_two_times_go_to_settings_yaml_and_are_live(self, inst):
         response = await _put(inst, {"quiet_start": "22:00", "quiet_end": "07:00"})
@@ -271,7 +270,8 @@ class TestQuietHours:
         assert response.status_code == 200, response.text
         assert (inst.settings_yaml()["quiet_start"], inst.settings_yaml()["quiet_end"]) == ("", "")
         assert (get_config().quiet_start, get_config().quiet_end) == ("", "")
-        assert response.json()["quiet_hours"]["active"] is False
+        fields = response.json()["fields"]
+        assert (fields["quiet_start"]["value"], fields["quiet_end"]["value"]) == ("", "")
 
     async def test_a_time_in_config_yaml_is_written_there(self, inst):
         merge_machine_paths(inst.config_dir / "config.yaml", {"quiet_start": "23:00", "quiet_end": "06:00"})

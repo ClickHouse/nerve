@@ -47,7 +47,7 @@ from nerve.gateway.routes.setup import (
     require_person,
 )
 from nerve.identity import Actor
-from nerve.notifications.quiet_hours import in_quiet_hours, minutes_of_day
+from nerve.notifications.quiet_hours import minutes_of_day
 from nerve.setup_writer import merge_machine_paths, merge_private_paths, merge_settings_paths
 
 logger = logging.getLogger(__name__)
@@ -335,7 +335,7 @@ async def _notifications_body(ctx: _Context) -> dict[str, Any]:
             "channel_name": await _slack_channel_name(config),
         },
         "telegram": {"connected": bool(config.telegram.enabled and config.telegram.bot_token)},
-        "quiet_hours": {"timezone": config.timezone, "active": in_quiet_hours(config)},
+        "quiet_hours": {"timezone": config.timezone},
     }
 
 

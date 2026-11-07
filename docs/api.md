@@ -788,7 +788,7 @@ instance.
   },
   "slack": { "connected": true, "channel_name": null },
   "telegram": { "connected": false },
-  "quiet_hours": { "timezone": "Europe/Berlin", "active": false }
+  "quiet_hours": { "timezone": "Europe/Berlin" }
 }
 ```
 
@@ -807,8 +807,7 @@ The fields are `notifications.channels`, `notifications.levels.slack`,
 
 `slack.channel_name` is the name of the configured channel when Slack runs
 and answers `conversations.info`, else `null`. `quiet_hours.timezone` is the
-time zone of the quiet hours (`timezone`), and `quiet_hours.active` is true
-when the current time is inside them.
+time zone of the quiet hours (`timezone`).
 
 #### `PUT /api/settings/notifications`
 
