@@ -6,7 +6,8 @@ import type { SessionTask } from '../api/client';
 
 /**
  * The chat header's tasks button: it shows while the session has tasks,
- * opens the Tasks tab of the side panel, and follows task broadcasts.
+ * opens the Tasks tab of the side panel, and follows task broadcasts. The
+ * header holds one tasks button and one context meter.
  */
 
 const mocks = vi.hoisted(() => ({ calls: {} as Record<string, unknown> }));
@@ -128,6 +129,30 @@ describe('the tasks button in the chat header', () => {
     getSessionTasks.mockClear();
     broadcast('commented', sessionTasks[0]);
     expect(getSessionTasks).not.toHaveBeenCalled();
+  });
+});
+
+describe('the chat header with the context bar', () => {
+  it('shows one context meter and one tasks button, also after a session switch', async () => {
+    sessionTasks = TWO;
+    const lastUsage = {
+      input_tokens: 10, output_tokens: 400, cache_read_input_tokens: 60000,
+      cache_creation_input_tokens: 6000, max_context_tokens: 200000, num_turns: 2,
+    };
+    mocks.calls.getMessages = vi.fn(async () => ({
+      messages: [{ id: 1, role: 'user', content: 'Sort the inbox.', created_at: '2026-08-05T02:00:00Z' }],
+      last_usage: lastUsage,
+    }));
+    await renderPage();
+    const meters = () => screen.queryAllByRole('button', { name: /^Context window:/ });
+    const tasksButtons = () => screen.queryAllByRole('button', { name: /^Tasks from this session/ });
+    await waitFor(() => expect(meters()).toHaveLength(1));
+    expect(tasksButtons()).toHaveLength(1);
+
+    await act(() => useChatStore.getState().switchSession('e5f6a7b8'));
+    await waitFor(() => expect(useChatStore.getState().activeSession).toBe('e5f6a7b8'));
+    await waitFor(() => expect(meters()).toHaveLength(1));
+    await waitFor(() => expect(tasksButtons()).toHaveLength(1));
   });
 });
 

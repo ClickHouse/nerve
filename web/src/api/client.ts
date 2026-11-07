@@ -1112,6 +1112,21 @@ export interface ArchiveSessionResult {
 }
 
 /**
+ * `GET /api/sessions/{id}/context`: what fills the context window. `live`:
+ * measured by the session's runtime, with `categories` (each part of
+ * `total_tokens`); otherwise the last turn's totals and no categories.
+ */
+export interface SessionContext {
+  session_id: string;
+  live: boolean;
+  can_compact: boolean;
+  total_tokens: number;
+  max_tokens: number;
+  auto_compact_threshold: number | null;
+  categories: { name: string; tokens: number }[];
+}
+
+/**
  * `GET /health` — not under `/api`, unauthenticated, and deliberately a raw
  * `fetch`: during a restart it answers with connection errors and 5xx, and
  * none of those may reach the 401 handler or the hosted re-entry path.
@@ -1443,7 +1458,7 @@ export const api = {
   updateSession: (id: string, data: { title?: string; starred?: boolean; model?: string; parent_session_id?: string | null }) =>
     request<any>(`/sessions/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   getMessages: (sessionId: string, limit = 100) =>
-    request<{ messages: any[]; last_usage?: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number; cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }; max_context_tokens: number; num_turns?: number } }>(`/sessions/${sessionId}/messages?limit=${limit}`),
+    request<{ messages: any[]; last_usage?: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number; cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }; max_context_tokens: number; num_turns?: number; context_tokens?: number } }>(`/sessions/${sessionId}/messages?limit=${limit}`),
   forkSession: (sourceSessionId: string, atMessageId?: string, title?: string) =>
     request<any>('/sessions/fork', {
       method: 'POST',
@@ -1462,6 +1477,11 @@ export const api = {
     request<any>(`/sessions/${id}/status`),
   getSessionEvents: (id: string, limit = 50) =>
     request<{ events: any[] }>(`/sessions/${id}/events?limit=${limit}`),
+  getSessionContext: (id: string) =>
+    request<SessionContext>(`/sessions/${encodeURIComponent(id)}/context`),
+  /** Runs as a turn; answers with the context measured after it. */
+  compactSession: (id: string) =>
+    request<SessionContext>(`/sessions/${encodeURIComponent(id)}/compact`, { method: 'POST' }),
 
   // Agents — the subagent / background-task records of one session, their
   // transcripts and output, scoped stops, and the server-visible turn queue.

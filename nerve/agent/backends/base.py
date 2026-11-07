@@ -107,6 +107,10 @@ class BackendCapabilities:
     supports_task_stop: bool = False
     # Sub-agents stream their own transcript (sidechain events) to the host.
     supports_agent_transcripts: bool = False
+    # The live client tells its context use by category
+    # (AgentClient.context_usage) and can compact the conversation
+    # (AgentClient.start_compact).
+    supports_compact: bool = False
 
 
 @runtime_checkable
@@ -163,6 +167,19 @@ class AgentClient(Protocol):
         it would end background agents when this is ``False``.
         """
         return False
+
+    async def context_usage(self) -> dict[str, Any]:
+        """The context window now: ``total_tokens``, ``max_tokens``,
+        ``auto_compact_threshold`` (``None`` when auto-compact is off) and
+        ``categories`` (``{"name", "tokens"}`` of each category that is part
+        of ``total_tokens``). The default: unsupported."""
+        raise BackendError("context_usage unsupported")
+
+    async def start_compact(self) -> None:
+        """Send the runtime's compact command as a turn: the runtime replaces
+        the conversation so far with a summary. Read the turn with
+        :meth:`receive_turn`. The default: unsupported."""
+        raise BackendError("compact unsupported")
 
     async def disconnect(self) -> None:
         """Full teardown, owning every process/transport internal."""
