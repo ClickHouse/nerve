@@ -8,6 +8,7 @@ import type {
 } from '../types/agents';
 import type { PullRequestResult } from '../types/github';
 import type { NotificationSettingValues, NotificationSettings, NotificationTestResult } from './settings';
+import type { PushDevice, PushDevices, PushSubscriptionBody } from './push';
 
 const API_BASE = '/api';
 
@@ -1339,6 +1340,13 @@ export const api = {
     }),
   testSettingsNotifications: () =>
     request<NotificationTestResult>('/settings/notifications/test', { method: 'POST', body: '{}' }),
+
+  // Web Push: the browsers of the signed-in person.
+  pushDevices: () => request<PushDevices>('/push/subscriptions'),
+  savePushDevice: (body: PushSubscriptionBody) =>
+    request<PushDevice>('/push/subscriptions', { method: 'POST', body: JSON.stringify(body) }),
+  deletePushDevice: (id: number) =>
+    request<{ deleted: boolean }>(`/push/subscriptions/${id}`, { method: 'DELETE' }),
 
   restartSystem: () =>
     request<RestartResponse>('/system/restart', { method: 'POST', body: '{}' }),

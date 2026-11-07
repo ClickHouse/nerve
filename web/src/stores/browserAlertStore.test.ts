@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { stubBrowser } from '../test/browserAlertFixtures';
+import { stubPushBrowser, unstubPushBrowser } from '../test/pushFixtures';
 import { BROWSER_ALERTS_KEY, alertSupport, alertsOn, useBrowserAlertStore } from './browserAlertStore';
 
 const saved = () => JSON.parse(localStorage.getItem(BROWSER_ALERTS_KEY) ?? 'null');
@@ -9,7 +10,10 @@ beforeEach(() => {
   useBrowserAlertStore.setState({ enabled: false, level: 'important', offerDone: false });
 });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => {
+  vi.unstubAllGlobals();
+  unstubPushBrowser();
+});
 
 describe('alertSupport', () => {
   it('names why the browser cannot show alerts', () => {
@@ -27,6 +31,15 @@ describe('alertSupport', () => {
       permission: 'default',
     }));
     expect(alertSupport()).toBe('unsupported');
+  });
+
+  it('calls such a browser supported when it runs service workers, which show the alerts', () => {
+    stubBrowser();
+    vi.stubGlobal('Notification', Object.assign(function Notification() { throw new TypeError('Illegal constructor'); }, {
+      permission: 'default',
+    }));
+    stubPushBrowser();
+    expect(alertSupport()).toBe('default');
   });
 });
 
