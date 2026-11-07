@@ -549,6 +549,49 @@ async def test_a_reorder_racing_the_next_start_is_safe(db, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_slow_listener_never_gets_an_older_queue_after_a_newer_one(db, tmp_path):
+    """A reorder update that waits on a slow client must not let the update
+    of the next start reach another client first: that client would then
+    keep the reordered queue, with the started run still in it."""
+    alice = db.system_actor
+    client = _Client()
+    engine = await _engine(db, tmp_path, client)
+    first, (b_task, c_task, d_task) = await _queue_three(engine, client, alice)
+    slow = asyncio.Event()                      # "slow" holds the next update
+    hold = asyncio.Event()
+    received: list[list[str]] = []
+
+    async def _slow(_sid, message):
+        if message.get("type") == "queue_update" and slow.is_set():
+            slow.clear()
+            await hold.wait()
+
+    async def _record(_sid, message):
+        if message.get("type") == "queue_update":
+            received.append(_ids(message["queue"]))
+
+    await broadcaster.register(SID, "slow", _slow)
+    await broadcaster.register(SID, "record", _record)
+    try:
+        b, c, d = _ids(engine.queue_view(SID))
+        slow.set()
+        reorder = asyncio.create_task(engine.reorder_queue(SID, [c, b, d]))
+        await asyncio.sleep(0.05)               # the reorder update waits on "slow"
+        client.release()                        # "first" ends: "c" gets the lock
+        await asyncio.sleep(0.1)
+        hold.set()
+        assert _ids(await asyncio.wait_for(reorder, timeout=5)) == [c, b, d]
+        await client.wait_turns(2)
+        assert client.prompts == ["first", "c"]
+        assert received == [[c, b, d], [b, d]]
+        assert received[-1] == _ids(engine.queue_view(SID))
+    finally:
+        await broadcaster.unregister(SID, "slow")
+        await broadcaster.unregister(SID, "record")
+        await _drain(client, first, b_task, c_task, d_task)
+
+
+@pytest.mark.asyncio
 async def test_cancel_still_works_after_a_reorder(db, tmp_path):
     alice = db.system_actor
     client = _Client()
