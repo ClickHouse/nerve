@@ -759,9 +759,10 @@ Every cron and source run is logged in the `cron_logs` SQLite table:
   creates has that person as its cause, so the agent's work in it is the
   system actor's for that person. See
   [Attribution](accounts.md#attribution).
-- `records`: for a source run, the number of new records that it stored in
-  the inbox. NULL for agent, workflow and missed runs. A source run with
-  `records = 0` and status `success` found nothing new.
+- `records`: for a source run, the number of records that it fetched: stored
+  in the inbox plus dropped by the inbox guardrail. NULL for agent, workflow
+  and missed runs. A source run with `records = 0` and status `success` found
+  nothing new.
 
 Source runs also log to `source_run_log` with per-source diagnostics (records fetched/processed, errors).
 
@@ -804,9 +805,14 @@ An agent job that starts to fail sends a notification: **Cron job `<id>`
 failed**, priority `high`, with the first lines of the error. It names the
 run's session, so the web UI links to it. More failed runs send nothing. The
 first run that succeeds after that sends **Cron job `<id>` works again**,
-priority `low`. The job's previous finished run decides: a run that fails
-after a success, or as the job's first recorded run, sends the first notice;
-a success after a failed run sends the second. Missed runs do not count.
+priority `low`. The job's previous run decides: the latest run of the job
+that started before this one and has a result. A run that fails after a
+success, or as the job's first recorded run, sends the first notice; a
+success after a failed run sends the second. Missed runs, and earlier runs
+that are still going, do not count. Two runs that overlap and both fail can
+each send the first notice. The daily cleanup deletes runs older than 14
+days, but it keeps the latest finished run of each job, so a job that runs
+less often than that and keeps failing does not send the notice again.
 
 The notices go through the notification service, so notification silences
 and the notification channels apply to them. Their

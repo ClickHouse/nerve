@@ -88,6 +88,45 @@ async def test_a_job_whose_first_run_fails_sends_the_notice(svc):
     assert "boom" in svc.notification_service.send_notification.call_args.kwargs["body"]
 
 
+async def test_two_overlapping_failures_still_send_the_notice(svc, db):
+    await _run(svc, OK)
+    first = await db.log_cron_start("digest")
+    second = await db.log_cron_start("digest")
+    await db.log_cron_finish(first, "error", error="boom")
+    await db.log_cron_finish(second, "error", error="boom")
+
+    # Each run compares with the run that started before it, not with the
+    # run that finished last.
+    await svc._send_health_notice("digest", second, "error")
+    await svc._send_health_notice("digest", first, "error")
+
+    assert _notices(svc) == [("Cron job digest failed", "high")]
+
+
+async def test_an_earlier_run_that_is_still_going_does_not_count(svc, db):
+    await _run(svc, OK)
+    await db.log_cron_start("digest")
+    later = await db.log_cron_start("digest")
+    await db.log_cron_finish(later, "error", error="boom")
+
+    await svc._send_health_notice("digest", later, "error")
+
+    assert _notices(svc) == [("Cron job digest failed", "high")]
+
+
+async def test_a_job_that_fails_less_often_than_the_cleanup_notifies_once(svc, db):
+    await db._write(
+        "INSERT INTO cron_logs (job_id, started_at, finished_at, status, error) "
+        "VALUES ('digest', datetime('now', '-30 days'), datetime('now', '-30 days'), "
+        "'error', 'boom')",
+    )
+    await db.cleanup_old_cron_logs(days=14)
+
+    await _run(svc, FAILED)
+
+    assert _notices(svc) == []
+
+
 async def test_a_missed_run_between_two_failures_does_not_repeat_the_notice(svc, db):
     await _run(svc, FAILED)
     await db.log_cron_missed("digest", "2030-01-01 00:00:00")

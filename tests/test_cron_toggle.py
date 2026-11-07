@@ -15,6 +15,7 @@ import yaml
 from fastapi import FastAPI
 
 from nerve import setup_writer
+from nerve.config import ConfigError
 from nerve.cron.service import CronService, CronToggleRefused
 from tests.conftest import TEST_ACTOR
 
@@ -191,6 +192,19 @@ class TestSetJobEnabled:
             await svc.set_job_enabled("digest", True)
 
     @pytest.mark.asyncio
+    async def test_a_refused_reload_puts_the_file_back(self, svc, monkeypatch):
+        before = svc.config.cron.jobs_file.read_bytes()
+        monkeypatch.setattr(
+            svc, "_reload_from_disk", AsyncMock(side_effect=ConfigError("bad gate")),
+        )
+
+        with pytest.raises(ConfigError, match="bad gate"):
+            await svc.set_job_enabled("digest", True)
+
+        assert svc.config.cron.jobs_file.read_bytes() == before
+        assert svc.scheduler.get_job("digest") is None
+
+    @pytest.mark.asyncio
     async def test_an_unknown_job_is_a_value_error(self, svc):
         with pytest.raises(ValueError):
             await svc.set_job_enabled("nope", True)
@@ -252,6 +266,20 @@ async def test_the_switch_is_refused_under_lockdown(svc, bypass_auth, monkeypatc
 
     assert response.status_code == 409
     assert "lockdown" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_a_refused_reload_is_400_and_changes_nothing(svc, bypass_auth, monkeypatch):
+    monkeypatch.setattr("nerve.gateway.server._cron_service", svc)
+    monkeypatch.setattr(svc, "_reload_from_disk", AsyncMock(side_effect=ConfigError("bad gate")))
+    before = svc.config.cron.jobs_file.read_bytes()
+
+    async with _client(bypass_auth) as client:
+        response = await client.put("/api/cron/jobs/digest/enabled", json={"enabled": True})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "bad gate"
+    assert svc.config.cron.jobs_file.read_bytes() == before
 
 
 @pytest.mark.asyncio
