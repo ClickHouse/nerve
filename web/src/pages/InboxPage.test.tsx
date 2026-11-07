@@ -93,6 +93,8 @@ describe('the Inbox on a phone', () => {
     expect(screen.queryByRole('dialog', { name: 'Conversations' })).toBeNull();
     const group = screen.getByRole('button', { name: 'Needs you' }).parentElement!;
     expect(within(group).getByRole('link', { name: /Merge the docs PR\?/ })).toHaveAttribute('href', '/chat/asks');
+    // It renders the store's list; it does not fetch it again.
+    expect(loadSessions).not.toHaveBeenCalled();
   });
 
   it('starts a new chat with the message and opens the chat it started', async () => {
