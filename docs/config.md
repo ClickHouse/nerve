@@ -1692,7 +1692,8 @@ Question and approval cards go to Slack by default.
 | `notifications.slack_channel_id` | string | `""` | Target channel ID; defaults to the first literal ID in `slack.allow_channels` |
 
 `notifications.channels` replaces the default rather than adding to it, so
-list every transport you want. A name nothing delivers to is skipped with a
+list every transport you want. The panel (`web`) is always in the list: Nerve
+adds it to a list without it. A name nothing delivers to is skipped with a
 warning. Slack in the list costs nothing while Slack is off.
 
 Names and globs are not resolved for the `slack_channel_id` fallback. Without
@@ -1728,6 +1729,33 @@ Three differences from the inbound policy:
   multi-person DM, and only `conversations.info` can tell them apart, so a
   `G` target costs one cached lookup; a lookup that cannot answer is refused
   rather than guessed.
+
+## Notification delivery
+
+`notify`, `ask_user` and `propose_action` go to each channel in
+`notifications.channels` (see [Slack](#notifications) and
+[Telegram](#notification-sink) for the destinations). The Notifications
+section of the panel's Settings page changes these keys (see
+[web-ui.md](web-ui.md#settings)).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `notifications.levels` | map | `{}` | For each channel, `all` or `important` |
+| `notifications.default_expiry_hours` | int | `48` | Hours until an unanswered question or approval expires, when the agent gives no time |
+| `notifications.max_redeliveries` | int | `3` | How often one snoozed item comes back, at most. At this count it expires |
+
+A channel at `important` gets questions, approvals, and items with priority
+`high` or `urgent`. It does not get other items. The panel (`web`) gets every
+item. A channel without an entry gets every item, and so does a channel with
+an unknown level (Nerve logs a warning).
+
+```yaml
+notifications:
+  channels: [web, slack, telegram]
+  levels:
+    slack: all
+    telegram: important
+```
 
 ## Quiet Hours
 

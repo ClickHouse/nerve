@@ -84,17 +84,15 @@ export function NavRail() {
         <div className={`w-2 h-2 rounded-full ${ws.connected ? 'bg-success' : 'bg-error'}`}
              title={ws.connected ? 'Connected' : 'Disconnected'} />
         <ThemeToggle />
-        {/* A finished setup leaves the main list; this keeps it one click away. */}
-        {setupFinished && (
-          <IconButton
-            label="Setup"
-            size="md"
-            active={location.pathname.startsWith('/setup')}
-            onClick={() => navigate('/setup')}
-          >
-            <Settings size={16} />
-          </IconButton>
-        )}
+        {/* Settings has "Run setup again"; the list keeps Setup while it is unfinished. */}
+        <IconButton
+          label="Settings"
+          size="md"
+          active={location.pathname.startsWith('/settings')}
+          onClick={() => navigate('/settings')}
+        >
+          <Settings size={16} />
+        </IconButton>
         {!hosted && (
           <IconButton label="Logout" size="md" onClick={logout}>
             <LogOut size={16} />

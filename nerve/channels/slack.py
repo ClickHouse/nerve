@@ -879,6 +879,12 @@ class SlackChannel(BaseChannel):
         )
         return identity
 
+    async def conversation_name(self, channel_id: str) -> str | None:
+        """The name of a channel (``conversations.info``, cached), or
+        ``None`` for a direct message or when Slack does not answer."""
+        identity = await self._identify_conversation(channel_id, "channel", True)
+        return identity.names[0] if identity.names else None
+
     async def _identify_conversation(
         self, channel_id: str, channel_type: str, resolve: bool,
     ) -> Identity:

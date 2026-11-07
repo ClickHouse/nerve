@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { Bell, CheckCheck, EyeOff, BellOff, Trash2, Plus, RotateCw, Clock } from '../components/ui/icons';
 import { Badge, Button, IconButton, TextField, type BadgeTone } from '../components/ui';
 import { useNotificationStore, type Notification, type Silence } from '../stores/notificationStore';
@@ -334,7 +334,9 @@ export function NotificationsPage() {
     notifications, pendingCount, filter, typeFilter, loading,
     loadNotifications, setFilter, setTypeFilter, dismissAll,
   } = useNotificationStore();
-  const [showSilences, setShowSilences] = useState(false);
+  // Settings links here with `?silences=1` to open the silences manager.
+  const [searchParams] = useSearchParams();
+  const [showSilences, setShowSilences] = useState(() => searchParams.has('silences'));
 
   useEffect(() => { loadNotifications(); }, []);
 

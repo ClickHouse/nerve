@@ -3074,12 +3074,45 @@ class SetupConfig:
         return cls(local_secrets=_as_local_secrets(d["local_secrets"]))
 
 
+#: ``notifications.levels`` values: a channel gets every item, or only the
+#: important ones (questions, approvals, and ``high`` or ``urgent`` items).
+NOTIFY_LEVEL_ALL = "all"
+NOTIFY_LEVEL_IMPORTANT = "important"
+NOTIFY_LEVELS = (NOTIFY_LEVEL_ALL, NOTIFY_LEVEL_IMPORTANT)
+_IMPORTANT_PRIORITIES = frozenset({"high", "urgent"})
+#: The channel that gets every item whatever its level: the panel is the record.
+NOTIFY_RECORD_CHANNEL = "web"
+#: The names ``notifications.channels`` can list (the channels the fan-out delivers to).
+NOTIFY_CHANNELS = (NOTIFY_RECORD_CHANNEL, "telegram", "slack")
+
+
+def _notification_levels(raw: Any) -> dict[str, str]:
+    """``notifications.levels`` as ``{channel: level}``. An unknown level is
+    logged and read as ``all``, so a typo holds nothing back."""
+    if not isinstance(raw, dict):
+        if raw:
+            logger.warning("notifications.levels is not a mapping; every channel gets every item")
+        return {}
+    levels: dict[str, str] = {}
+    for channel, level in raw.items():
+        value = str(level or "").strip().lower()
+        if value not in NOTIFY_LEVELS:
+            logger.warning(
+                "notifications.levels.%s: unknown level %r, using %r", channel, level, NOTIFY_LEVEL_ALL,
+            )
+            value = NOTIFY_LEVEL_ALL
+        levels[str(channel)] = value
+    return levels
+
+
 @dataclass
 class NotificationsConfig:
     """Async notification delivery settings."""
     channels: list[str] = field(
         default_factory=lambda: ["web", "telegram", "slack"],
     )
+    # Per channel, ``all`` (the default) or ``important``: see :meth:`wants`.
+    levels: dict[str, str] = field(default_factory=dict)
     telegram_chat_id: int | None = None       # Target chat; falls back to first allowed_user
     # Opt-in, default off = backward compatible. When true AND telegram_chat_id
     # is a non-private group/supergroup, that chat is DELIVERY-ONLY: notifications
@@ -3100,11 +3133,31 @@ class NotificationsConfig:
     # from may be in any language. Unknown values fall back to English.
     date_locale: str = "en"
 
+    def delivery_channels(self) -> list[str]:
+        """``channels`` with the panel first when the list leaves it out. The
+        panel is the record and the place to answer, so a list written
+        without ``web`` (for example ``[telegram]``) still delivers there."""
+        channels = list(self.channels)
+        return channels if NOTIFY_RECORD_CHANNEL in channels else [NOTIFY_RECORD_CHANNEL, *channels]
+
+    def wants(self, channel: str, notif_type: str, priority: str) -> bool:
+        """Whether ``channel`` gets an item of this type and priority.
+
+        A channel at ``important`` gets questions, approvals, and ``high`` or
+        ``urgent`` items. The panel gets every item.
+        """
+        if channel == NOTIFY_RECORD_CHANNEL:
+            return True
+        if self.levels.get(channel, NOTIFY_LEVEL_ALL) != NOTIFY_LEVEL_IMPORTANT:
+            return True
+        return notif_type in ("question", "approval") or priority in _IMPORTANT_PRIORITIES
+
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> NotificationsConfig:
         return cls(
             channels=d.get("channels", ["web", "telegram", "slack"]),
+            levels=_notification_levels(d.get("levels")),
             telegram_chat_id=d.get("telegram_chat_id"),
             delivery_only_sink=d.get("delivery_only_sink", False),
             slack_channel_id=str(d.get("slack_channel_id") or ""),

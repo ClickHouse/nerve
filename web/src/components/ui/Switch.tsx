@@ -1,11 +1,16 @@
 import type { ButtonHTMLAttributes, ReactNode } from 'react';
 import { cx } from './styles';
 
+/** Below `md`, padding makes a switch without a label a 44x44 touch target;
+ *  the negative margin keeps the row layout the same. */
+const TOUCH_TARGET = 'shrink-0 p-3 -m-3 md:p-0 md:m-0';
+
 export interface SwitchProps
   extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'onChange' | 'role' | 'aria-checked'> {
   checked: boolean;
   onChange: (checked: boolean) => void;
-  /** Visible text after the track. It is also the switch's accessible name. */
+  /** Visible text after the track. It is also the switch's accessible name.
+   *  Without it, give the switch `aria-label` or `aria-labelledby`. */
   label?: ReactNode;
 }
 
@@ -25,6 +30,7 @@ export function Switch({ checked, onChange, label, disabled, className, ...rest 
       className={cx(
         'group inline-flex items-center gap-2 rounded text-sm text-text-secondary outline-none',
         'cursor-pointer disabled:cursor-not-allowed disabled:opacity-50',
+        label == null && TOUCH_TARGET,
         className,
       )}
       {...rest}

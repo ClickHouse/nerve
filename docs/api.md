@@ -769,6 +769,67 @@ Sessions survive the restart: the signing secret is pinned and persisted, and
 nothing in the wizard rotates it. Allowed under lockdown, because a restart
 writes no configuration.
 
+### Settings
+
+The Settings page of the panel. Each section is a set of configuration
+fields, named by their dotted path. The routes use the guards of the setup
+checklist: a signed-in person (a system or MCP token is `403`) on a claimed
+instance.
+
+#### `GET /api/settings/notifications`
+
+```json
+{
+  "read_only_reason": null,
+  "fields": {
+    "notifications.channels": { "value": ["web", "slack"], "state": "editable", "file": "settings.yaml", "reason": null },
+    "notifications.levels.slack": { "value": "important", "state": "machine", "file": "config.yaml", "reason": null },
+    "notifications.slack_channel_id": { "value": null, "state": "managed", "file": null, "reason": "Set by an admin in the control plane." }
+  },
+  "slack": { "connected": true, "channel_name": null },
+  "telegram": { "connected": false }
+}
+```
+
+The fields are `notifications.channels`, `notifications.levels.slack`,
+`notifications.levels.telegram`, `notifications.slack_channel_id`,
+`notifications.telegram_chat_id`, `notifications.default_expiry_hours` and
+`notifications.max_redeliveries`. `state` is one of:
+
+| State | Meaning |
+|---|---|
+| `editable` | `settings.yaml` states the value, or no file does. A change goes to `settings.yaml` |
+| `machine` | `config.yaml` or `config.local.yaml` on this machine states it. A change goes to that file (`file`) |
+| `managed` | a `${VAR}` reference sets it, or the control plane does (the Slack destination with `slack.mode: hosted`). `reason` says which; the page cannot change it |
+| `read_only` | lockdown, or no configuration directory. `read_only_reason` and `reason` say why |
+
+`slack.channel_name` is the name of the configured channel when Slack runs
+and answers `conversations.info`, else `null`.
+
+#### `PUT /api/settings/notifications`
+
+A partial body of `{path: value}`; an omitted field is not changed. Each value
+is checked (`400 {detail, field}`), then the configuration validator checks
+copies of the configuration files with the change applied: an error that the
+files without the change do not have is `400`. Then each value goes to the
+file it comes from (see `state`), a new value to `settings.yaml`, and the
+configuration reloads. `null` or `""` for the Slack channel or the Telegram
+chat removes the key. A `managed` field is `409` with its `field`; lockdown
+is `409`. The response is the `GET` body with `reload_errors`:
+`{part: error}` for each part that did not reload, `{}` when all did.
+
+```json
+PUT /api/settings/notifications  { "notifications.channels": ["web", "telegram"], "notifications.levels.telegram": "important" }
+```
+
+#### `POST /api/settings/notifications/test`
+
+Sends one `high` "Test notification" through the normal fan-out (so a
+channel at `important` gets it too) and answers
+`{notification_id, silenced, results: [{channel, delivered}]}`, one result
+for each channel in `notifications.channels`. `silenced` is true when a
+silence rule matched, so only the panel shows it.
+
 ### Actors
 
 An actor is *who* something is attributed to: a person, or the agent's system
