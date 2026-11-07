@@ -12,6 +12,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from nerve.agent import workspaces
 from nerve.agent.backends.base import BackendError
 from nerve.agent.interactive import get_awaiting_ids
 from nerve.config import get_config
@@ -202,7 +203,18 @@ async def _decorate(deps, sessions: list[dict]) -> list[dict]:
         # How many agents still run (the sidebar's count).
         s["background_count"] = _background_count(deps, s["id"], s["has_background_tasks"])
     await _attach_review_loops(deps, sessions)
+    await _attach_workspaces(deps, sessions)
     return sessions
+
+
+async def _attach_workspaces(deps, sessions: list[dict]) -> None:
+    try:
+        rows = await deps.db.list_session_workspaces([s["id"] for s in sessions])
+        workspace = get_config().workspace
+        for s in sessions:
+            s["workspaces"] = workspaces.describe_rows(rows.get(s["id"], []), workspace)
+    except Exception:  # noqa: BLE001 — enrichment must never break listing
+        logger.debug("workspace listing failed", exc_info=True)
 
 
 def _background_count(deps, session_id: str, has_background: bool | None = None) -> int:

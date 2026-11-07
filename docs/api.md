@@ -866,6 +866,27 @@ Rows also carry `is_running` (the orchestrator's turn is in flight),
 `background_count` (how many). The two are independent: agents can run
 between turns. See [Sub-agents and background tasks](agents.md).
 
+Rows also carry `workspaces`: the git checkouts the session changed, most
+recent first. Nerve records one when a tool call of the session (or of its
+sub-agents) succeeds: an `Edit`/`Write`/`NotebookEdit` into a checkout, a
+Bash `git` subcommand that changes a checkout (`commit`, `switch`, `rebase`,
+`stash`, …) with an explicit directory (`-C`, a `cd` in the same command, or
+the `cwd` Codex reports), `git worktree add`, or the CLI's `EnterWorktree`.
+Nerve's own workspace is never listed.
+
+```json
+"workspaces": [{
+  "path": "/home/alice/dev/app-wt-login",
+  "branch": "login-form",
+  "current_branch": "login-form",
+  "exists": true
+}]
+```
+
+`branch` is the branch the session last saw there (`null` for a detached
+HEAD); `current_branch` is the checkout's branch now (`null` when detached or
+gone); `exists` is false once the checkout is removed.
+
 #### `GET /api/sessions/{id}`
 Get session details.
 
@@ -1828,6 +1849,8 @@ those for another session. Events marked *global* go to every socket.
 { type: "agent_event", session_id: "s-1234", agent_id: "ag_3f9a1c2b7d4e", item: AgentEventItem }
 // Live-agent counts changed between turns (global, debounced 1 s)
 { type: "session_agents", session_id: "s-1234", background_count: 5, has_background_tasks: true }
+// The session's most recent checkout, or its branch there, changed (global; the full list, as in GET /api/sessions)
+{ type: "session_workspaces", session_id: "s-1234", workspaces: [SessionWorkspace] }
 // The turn queue: the full queue, plus what just left it (never buffered)
 { type: "queue_update", session_id: "s-1234", queue: [QueueEntryView], removed?: [{ queue_id: "q_9c1d2e3f" | null, client_msg_id: "4b6f…" | null, reason: "started" | "cancelled" | "duplicate" | "refused" }] }
 // "refused": Nerve is shutting down and did not run the message (an error event follows)

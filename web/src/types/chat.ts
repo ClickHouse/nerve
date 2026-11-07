@@ -176,6 +176,15 @@ export interface Session {
     spent_usd?: number;
     updated_at?: string;
   };
+  // Git checkouts the session wrote to, most recent first.
+  workspaces?: SessionWorkspace[];
+}
+
+export interface SessionWorkspace {
+  path: string;
+  branch: string | null;
+  current_branch: string | null;
+  exists: boolean;
 }
 
 export type AgentStatus =

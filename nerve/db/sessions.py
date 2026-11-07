@@ -357,6 +357,7 @@ class SessionStore:
             ) as cursor:
                 row = await cursor.fetchone()
             await self.db.execute("DELETE FROM session_file_snapshots WHERE session_id = ?", (session_id,))
+            await self.db.execute("DELETE FROM session_workspaces WHERE session_id = ?", (session_id,))
             # Agent transcript items before their records (their foreign
             # key); the cascade is a second line of defence.
             await self.db.execute("DELETE FROM session_agent_events WHERE session_id = ?", (session_id,))
@@ -731,6 +732,43 @@ class SessionStore:
             (parent_id,),
         ) as cursor:
             return [dict(row) async for row in cursor]
+
+    async def touch_session_workspace(
+        self, session_id: str, toplevel: str, branch: str | None,
+    ) -> bool:
+        """Record that a session works in a checkout; ``True`` when its most recent checkout or branch changed."""
+        async with self.db.execute(
+            "SELECT toplevel, branch FROM session_workspaces WHERE session_id = ?"
+            " ORDER BY last_seen_at DESC LIMIT 1",
+            (session_id,),
+        ) as cursor:
+            latest = await cursor.fetchone()
+        if latest is not None and (latest[0], latest[1]) == (toplevel, branch):
+            return False
+        await self._write(
+            "INSERT INTO session_workspaces (session_id, toplevel, branch, last_seen_at)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT (session_id, toplevel) DO UPDATE SET"
+            " branch = excluded.branch, last_seen_at = excluded.last_seen_at",
+            (session_id, toplevel, branch, datetime.now(timezone.utc).isoformat()),
+        )
+        return True
+
+    async def list_session_workspaces(self, session_ids: list[str]) -> dict[str, list[dict]]:
+        """``session_id -> workspace rows``, most recently seen first."""
+        if not session_ids:
+            return {}
+        placeholders = ",".join("?" for _ in session_ids)
+        result: dict[str, list[dict]] = {}
+        async with self.db.execute(
+            "SELECT * FROM session_workspaces"
+            f" WHERE session_id IN ({placeholders})"
+            " ORDER BY last_seen_at DESC",
+            tuple(session_ids),
+        ) as cursor:
+            async for row in cursor:
+                result.setdefault(row["session_id"], []).append(dict(row))
+        return result
 
     async def get_stale_sessions(
         self, before_iso: str, exclude_ids: list[str] | None = None,

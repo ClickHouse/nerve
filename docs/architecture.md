@@ -319,6 +319,7 @@ SQLite with WAL mode (schema version 16):
 - `session_deletions`: one row for each deleted session: last title, time, `actor_id` and `caused_by_actor_id`. Written in the transaction of the delete, which removes the session's events
 - `channel_sessions` — Persistent channel-to-session mapping (survives restarts)
 - `session_file_snapshots` — Pre-modification file content captured via `PreToolUse` hook for session-scoped diff computation. Keyed by `(session_id, file_path)`, first-touch only. Cleaned up on session delete.
+- `session_workspaces` — The git checkouts each session changed (`toplevel`, the `branch` it last saw, `last_seen_at`), keyed by `(session_id, toplevel)`. Fed by successful tool calls (see `nerve/agent/workspaces.py`); backfilled from `session_file_snapshots` by V63. Cleaned up on session delete.
 - `session_agents` — One row per sub-agent or background task of a session: kind, status and end reason, brief, progress, usage and estimated cost, stop attribution (`stopped_by_actor_id`, `stopped_caused_by_actor_id` → `actor_refs`). Deleted with the session (see [agents.md](agents.md))
 - `session_agent_events` — Each agent's transcript items (`agent_id`, gap-free `seq`, `kind`, JSON `payload`), capped per item; follows telemetry retention when it is enabled
 - `tasks` — Task index (mirrors markdown files)

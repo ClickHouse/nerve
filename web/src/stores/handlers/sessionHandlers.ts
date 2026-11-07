@@ -51,6 +51,22 @@ export function handleSessionUpdated(
   }));
 }
 
+export function handleSessionWorkspaces(
+  msg: Extract<WSMessage, { type: 'session_workspaces' }>,
+  _get: Get,
+  set: Set,
+): void {
+  const patch = (sess: Session): Session => sess.id === msg.session_id
+    ? { ...sess, workspaces: msg.workspaces }
+    : sess;
+  set((s) => ({
+    sessions: s.sessions.map(patch),
+    archivedSessions: s.archivedSessions?.map(patch) ?? null,
+    systemSessions: s.systemSessions?.map(patch) ?? null,
+    searchResults: s.searchResults?.map(patch) ?? null,
+  }));
+}
+
 export function handleReviewLoopUpdate(
   msg: Extract<WSMessage, { type: 'review_loop_update' }>,
   get: Get,
