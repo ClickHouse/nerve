@@ -101,12 +101,12 @@ async def set_cron_job_enabled(
 
     try:
         await _cron_service.set_job_enabled(job_id, req.enabled)
-    except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e)) from e
     except CronToggleRefused as e:
         raise HTTPException(status_code=409, detail=str(e)) from e
-    except ConfigError as e:
+    except ConfigError as e:  # before ValueError, its base class
         raise HTTPException(status_code=400, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except OSError as e:
         raise HTTPException(status_code=500, detail="The cron file could not be written.") from e
     return {"job_id": job_id, "enabled": req.enabled}

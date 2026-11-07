@@ -11,6 +11,20 @@ from nerve.utils.time import utc_now_iso
 EMPTY_RUN = "(records IS 0 AND status IS 'success')"
 
 
+#: The finished runs that tell whether a job works. A missed run did not run,
+#: and a run that is still going has no result.
+_COMPLETED = "status IN ('success', 'error')"
+
+
+def _ranked(where: str = "") -> str:
+    """The rows of ``cron_logs`` (with ``where``), each with ``row_rank``: 1 for
+    the latest row of its job, by start and then id, as the history lists them."""
+    return (
+        "SELECT *, ROW_NUMBER() OVER (PARTITION BY job_id ORDER BY started_at DESC, id DESC) "
+        f"AS row_rank FROM cron_logs {where}"
+    )
+
+
 def _logs_filter(job_id: str | None, empty: bool | None) -> tuple[str, tuple]:
     """The WHERE clause and its parameters for a list of runs.
 
@@ -65,7 +79,8 @@ class CronStore:
         session_id: str | None = None,
         records: int | None = None,
     ) -> None:
-        """Close a run. ``records`` is the number of new records of a source run."""
+        """Close a run. ``records``: the records that a source run fetched
+        (stored, plus dropped by the inbox guardrail)."""
         now = utc_now_iso()
         await self._write(
             "UPDATE cron_logs SET finished_at = ?, status = ?, output = ?, error = ?, "
@@ -155,11 +170,9 @@ class CronStore:
 
         ``status`` is None while the run is going.
         """
-        # With MAX(), SQLite takes the bare columns from the row that has the
-        # maximum, so this is the latest row of each job in one pass.
         async with self.db.execute(
-            "SELECT job_id, status, started_at, finished_at, MAX(started_at) "
-            "FROM cron_logs GROUP BY job_id",
+            f"SELECT job_id, status, started_at, finished_at FROM ({_ranked()}) "
+            "WHERE row_rank = 1",
         ) as cursor:
             return {
                 row["job_id"]: {
@@ -170,17 +183,22 @@ class CronStore:
                 async for row in cursor
             }
 
-    async def get_previous_cron_status(self, job_id: str, log_id: int) -> str | None:
-        """The status of the job's latest finished run other than ``log_id``.
+    async def get_previous_cron_status(self, log_id: int) -> str | None:
+        """The status of the run before run ``log_id``: the latest run of the
+        same job that started before it and has a result.
 
-        Only ``success`` and ``error`` count: a missed run did not run, and a
-        run that is still going has no result. None when there is no such run.
+        Only ``success`` and ``error`` count (``_COMPLETED``). A run that
+        started earlier and is still going is skipped, so two runs that
+        overlap can both see the run before them, but neither misses it.
+        None when there is no such run.
         """
         async with self.db.execute(
-            "SELECT status FROM cron_logs WHERE job_id = ? AND id != ? "
-            "AND status IN ('success', 'error') "
-            "ORDER BY finished_at DESC, id DESC LIMIT 1",
-            (job_id, log_id),
+            "SELECT p.status FROM cron_logs AS p JOIN cron_logs AS c ON c.id = ? "
+            "AND p.job_id = c.job_id "
+            f"WHERE p.{_COMPLETED} AND (p.started_at < c.started_at "
+            "OR (p.started_at = c.started_at AND p.id < c.id)) "
+            "ORDER BY p.started_at DESC, p.id DESC LIMIT 1",
+            (log_id,),
         ) as cursor:
             row = await cursor.fetchone()
             return row["status"] if row else None
@@ -231,9 +249,16 @@ class CronStore:
         produces ~100 rows/day. Without retention the table reaches tens of
         thousands of rows and the unfiltered "latest N" query (used by the
         diagnostics endpoint) degrades to a full-table scan + memory sort.
+
+        The latest finished run of each job (``_COMPLETED``) stays, however
+        old: the failure notice of the next run compares with it, so a job
+        that runs less often than every ``days`` days and keeps failing does
+        not send the notice again.
         """
         result = await self._write(
-            "DELETE FROM cron_logs WHERE started_at < datetime('now', ? || ' days')",
+            "DELETE FROM cron_logs WHERE started_at < datetime('now', ? || ' days') "
+            f"AND id NOT IN (SELECT id FROM ({_ranked('WHERE ' + _COMPLETED)}) "
+            "WHERE row_rank = 1)",
             (f"-{days}",),
         )
         return result.rowcount or 0

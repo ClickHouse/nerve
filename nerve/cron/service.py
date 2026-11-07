@@ -45,6 +45,7 @@ from nerve.setup_writer import (
     CRON_JOB_MISSING,
     cron_file_problem,
     plan_cron_job_enabled,
+    publish_text,
 )
 from nerve.utils.aio import GRACEFUL_STOP_SECONDS
 
@@ -1944,9 +1945,10 @@ class CronService:
     ) -> None:
         """Tell the user when an agent job starts to fail, and when it works again.
 
-        The job's previous finished run decides. An error after a success, or
-        as the job's first recorded run, sends "Cron job <id> failed" (high);
-        more errors send nothing. The first success after an error sends
+        The job's previous run decides: the latest run with a result that
+        started before this one (``get_previous_cron_status``). An error after
+        a success, or as the job's first recorded run, sends "Cron job <id>
+        failed" (high); more errors send nothing. The first success after an error sends
         "Cron job <id> works again" (low). The notice goes through the
         notification service, so silences and channels apply, and it names the
         run's session. A notice that fails is logged and does not change the run.
@@ -1957,7 +1959,7 @@ class CronService:
         if service is None:
             return
         try:
-            previous = await self.db.get_previous_cron_status(job_id, log_id)
+            previous = await self.db.get_previous_cron_status(log_id)
             if status == "error" and previous != "error":
                 title = f"Cron job {job_id} failed"
                 body, priority = _failure_notice_body(error), "high"
@@ -2098,7 +2100,8 @@ class CronService:
 
             status = "success" if result.error is None else "error"
             await self.db.log_cron_finish(
-                log_id, status, output=summary[:2000], records=result.records_ingested,
+                log_id, status, output=summary[:2000],
+                records=result.records_ingested + result.records_dropped,
             )
             await self.db.log_source_run(
                 source=runner.source.source_name,
@@ -2508,8 +2511,10 @@ class CronService:
         The file is changed with the setup page's cron rewrite
         (:func:`nerve.setup_writer.plan_cron_job_enabled`). Raises ValueError
         for an unknown job, CronToggleRefused under lockdown or for a file
-        that the rewrite cannot change, and the reload's ConfigError. Returns
-        the reload summary, as :meth:`reload` does.
+        that the rewrite cannot change, and the reload's ConfigError. A reload
+        that fails leaves the schedule as it was, so the file gets its old
+        text back before the error goes on. Returns the reload summary, as
+        :meth:`reload` does.
         """
         async with self._reload_lock:
             job = next((j for j in self._jobs if j.id == job_id), None)
@@ -2521,8 +2526,14 @@ class CronService:
             plan = plan_cron_job_enabled(path, job_id, enabled)
             if not plan.ok:
                 raise CronToggleRefused(_toggle_refusal(plan.problem, path))
+            original = path.read_text(encoding="utf-8")
             plan.publish()
-            summary = await self._reload_locked()
+            try:
+                summary = await self._reload_locked()
+            except BaseException:
+                if plan.changes_anything:
+                    publish_text(path, original)
+                raise
         self._schedule_changed()
         logger.info("Cron job %s %s", job_id, "enabled" if enabled else "disabled")
         return summary

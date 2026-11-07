@@ -66,16 +66,19 @@ async def _add_log(db, job_id: str, status: str | None, *, started: str, records
 # --------------------------------------------------------------------------- #
 
 
-async def test_a_source_run_records_its_new_records(svc, db):
+async def test_a_source_run_records_what_it_fetched(svc, db):
     runner = MagicMock()
     runner.job_id = "source:mail"
     runner.source.source_name = "mail"
     runner.run = AsyncMock(return_value=IngestResult(records_ingested=3, records_dropped=2))
     await svc._run_source_inner(runner)
+    runner.run = AsyncMock(return_value=IngestResult(records_ingested=0, records_dropped=4))
+    await svc._run_source_inner(runner)
     runner.run = AsyncMock(return_value=IngestResult(records_ingested=0))
     await svc._run_source_inner(runner)
 
-    assert [log["records"] for log in await _logs(db, "source:mail")] == [3, 0]
+    # A run whose records the guardrail all dropped is not an empty run.
+    assert [log["records"] for log in await _logs(db, "source:mail")] == [5, 4, 0]
 
 
 async def test_hide_empty_leaves_out_only_successful_runs_with_no_records(db):
@@ -104,6 +107,8 @@ async def test_the_migration_counts_the_records_of_older_source_runs(db):
     for job_id, output in (
         ("source:mail", "0 ingested"),
         ("source:mail", "12 ingested, 1 dropped by guardrail"),
+        ("source:mail", "0 ingested, 4 dropped by guardrail, error: timeout"),
+        ("source:mail", "0 ingested, error: 2 dropped by guardrail"),
         ("source:mail", None),
         ("digest", "3 ingested"),
     ):
@@ -116,7 +121,7 @@ async def test_the_migration_counts_the_records_of_older_source_runs(db):
     await v064_cron_log_records.up(db.db)
 
     async with db.db.execute("SELECT records FROM cron_logs ORDER BY id") as cursor:
-        assert [row[0] for row in await cursor.fetchall()] == [0, 12, None, None]
+        assert [row[0] for row in await cursor.fetchall()] == [0, 13, 4, 0, None, None]
 
 
 # --------------------------------------------------------------------------- #
@@ -143,17 +148,40 @@ async def test_the_counts_cover_seven_days_in_one_query(db):
 
 async def test_the_latest_run_of_each_job(db):
     await _add_log(db, "digest", "success", started="2030-01-01 08:00:00")
+    await _add_log(db, "digest", "success", started="2030-01-02 08:00:00")
     await _add_log(db, "digest", "error", started="2030-01-02 08:00:00")
     await _add_log(db, "digest", "missed", started="2030-01-01 12:00:00")
     await _add_log(db, "triage", None, started="2030-01-03 08:00:00")
 
     last = await db.get_last_cron_runs()
 
+    # Two runs in the same second: the later row is the latest run.
     assert last["digest"]["status"] == "error"
     assert last["digest"]["started_at"] == "2030-01-02 08:00:00"
     assert last["triage"] == {
         "status": None, "started_at": "2030-01-03 08:00:00", "finished_at": None,
     }
+
+
+async def test_the_cleanup_keeps_the_latest_finished_run_of_each_job(db):
+    async def old(job_id: str, status: str | None, days: int) -> int:
+        result = await db._write(
+            "INSERT INTO cron_logs (job_id, started_at, status) "
+            f"VALUES (?, datetime('now', '-{days} days'), ?)",
+            (job_id, status),
+        )
+        return result.lastrowid
+
+    await old("monthly", "error", 60)
+    kept = await old("monthly", "error", 30)
+    await old("monthly", "missed", 20)
+    await old("hourly", "success", 30)
+    recent = await _add_log(db, "hourly", "success", started="2030-01-01 00:00:00")
+
+    assert await db.cleanup_old_cron_logs(days=14) == 3
+
+    async with db.db.execute("SELECT id FROM cron_logs ORDER BY id") as cursor:
+        assert [row[0] for row in await cursor.fetchall()] == [kept, recent]
 
 
 async def test_the_job_list_has_kind_latest_run_and_counts(svc, db, tmp_path):

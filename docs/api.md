@@ -1716,8 +1716,8 @@ Response: { "job_id": "daily-digest", "enabled": false }
 Get cron job execution logs, newest first. `limit` is clamped to 1–200;
 combine with `offset` for pagination. Each log row carries the
 `session_id` of the chat session the run executed in (null for source
-runners and missed runs), and `records`: the number of new records of a
-source run (null for other runs). `hide_empty=1` leaves out the source runs
+runners and missed runs), and `records`: the records that a source run
+fetched, stored plus dropped by the inbox guardrail (null for other runs). `hide_empty=1` leaves out the source runs
 that found nothing new (`records = 0`, status `success`); `total` counts
 the rows that the filter keeps. `empty` is the number of those source runs,
 with or without the filter.
