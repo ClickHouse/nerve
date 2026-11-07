@@ -45,7 +45,7 @@ class FakeSessionManager:
 
     async def get_or_create(
         self, session_id, title=None, source="web", metadata=None,
-        *, actor: Actor | None, cause=None,
+        *, actor: Actor | None, cause=None, origin=None,
     ) -> dict:
         self.calls.append({
             "session_id": session_id, "title": title, "source": source,
