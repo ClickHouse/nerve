@@ -8,6 +8,7 @@ import { ChatInput } from '../components/Chat/ChatInput';
 import { ApprovalCard } from '../components/Chat/ApprovalCard';
 import { InteractiveQuestionCard } from '../components/Chat/InteractiveQuestionCard';
 import { ContextBar } from '../components/Chat/ContextBar';
+import { ChatHeaderMenu } from '../components/Chat/ChatHeaderMenu';
 import { TodoPanel } from '../components/Chat/TodoPanel';
 import { SidePanel } from '../components/Chat/SidePanel';
 import { ChatWidthHandle } from '../components/Chat/ChatWidthHandle';
@@ -477,6 +478,9 @@ export function ChatPage() {
                   <ExternalLink size={12} />
                   <span>Langfuse</span>
                 </a>
+              )}
+              {activeSessionRow && virtualSession?.id !== activeSession && (
+                <ChatHeaderMenu key={activeSessionRow.id} sessionId={activeSessionRow.id} />
               )}
             </div>
           </div>
