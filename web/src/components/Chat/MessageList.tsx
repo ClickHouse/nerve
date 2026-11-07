@@ -12,6 +12,7 @@ import { AssistantMessage } from './AssistantMessage';
 import { StreamingMessage } from './StreamingMessage';
 import { SelectionToolbar } from './SelectionToolbar';
 import { MessageActions } from './MessageActions';
+import { SessionOriginLine } from './SessionOrigin';
 import { GitBranch } from '../ui/icons';
 import { followScrollEnd } from '../../utils/followScrollEnd';
 
@@ -106,6 +107,8 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
           </div>
         )
       )}
+
+      {messages.length > 0 && <SessionOriginLine />}
 
       {messages.map((msg, i) => {
         // "Fork from here" needs a persisted row id (live-streamed messages

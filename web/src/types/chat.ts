@@ -120,10 +120,35 @@ export interface ChatMessage {
   client_msg_id?: string | null;
 }
 
+/** The kind of event that started a session: a closed vocabulary that the
+    server sets once, when it creates the session. */
+export type SessionTrigger =
+  | 'chat' | 'api' | 'slack' | 'telegram' | 'email' | 'cron' | 'plan'
+  | 'workflow' | 'external' | 'system' | 'unknown';
+
+/** Details of where a session comes from. Each key is optional. */
+export interface SessionOriginDetail {
+  channel?: string;
+  channel_name?: string;
+  thread?: string;
+  cron_job?: string;
+  run_later?: string;
+  plan_id?: string;
+  task_id?: string;
+  fork_of?: string;
+  workflow_run?: string;
+  client?: string;
+  hook?: string;
+}
+
 export interface Session {
   id: string;
   title: string;
   source: string;
+  trigger?: SessionTrigger;
+  /** One short sentence, for example "Started from Slack #general". */
+  origin_label?: string;
+  origin_detail?: SessionOriginDetail;
   /** Who created this session: an actor id to resolve against
       GET /api/actors. Null for legacy sessions and unidentified external
       people. This is an actor id, not an account id. */
