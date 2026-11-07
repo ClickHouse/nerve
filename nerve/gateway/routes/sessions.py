@@ -1078,6 +1078,11 @@ async def chat(req: MessageRequest, actor: Actor = Depends(require_auth)):
         session_id = await deps.engine.sessions.get_active_session(
             "api:default", source="api", actor=actor,
         )
+    else:
+        # A new session id from the caller: a session of the API.
+        await deps.engine.sessions.get_or_create(
+            session_id, source="web", actor=actor, origin=Origin(TRIGGER_API),
+        )
     response = await deps.engine.run(
         session_id=session_id,
         user_message=req.message,

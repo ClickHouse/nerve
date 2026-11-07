@@ -37,7 +37,8 @@ TRIGGER_PLAN = "plan"
 TRIGGER_WORKFLOW = "workflow"
 # MCP satellite sessions and imported threads.
 TRIGGER_EXTERNAL = "external"
-# Nerve's own model calls outside a session turn. No session has it.
+# Nerve's own work: the autonomous onboarding session, and Nerve's model
+# calls outside a session turn.
 TRIGGER_SYSTEM = "system"
 # No other value applies.
 TRIGGER_UNKNOWN = "unknown"
@@ -84,7 +85,6 @@ _ID_PREFIXES: dict[str, tuple[str, str | None]] = {
     "hook:": (TRIGGER_API, DETAIL_HOOK),
     "workflow:": (TRIGGER_WORKFLOW, DETAIL_WORKFLOW_RUN),
     "impl-": (TRIGGER_PLAN, None),
-    "onboarding-": (TRIGGER_CHAT, None),
 }
 
 # The label of each trigger when the details give no better one.
@@ -174,11 +174,12 @@ def _metadata(row: Mapping) -> dict:
 def derive_origin(row: Mapping, channel_key: str | None = None) -> Origin:
     """The origin of a session row that has no stored trigger.
 
-    Uses, in this order: the session ID prefixes that Nerve gives, a fork's
-    parent (a fork copies the ``source`` of its parent), the channel
-    ``source`` values with the channel mapping ``channel_key`` (the latest
-    mapped channel of the session, if any), and then ``source`` alone. An
-    unknown ``source`` gives ``unknown``.
+    Uses, in this order: the session ID prefixes that Nerve gives (for the
+    onboarding, with its source), a fork's parent (a fork copies the
+    ``source`` of its parent), the channel ``source`` values with the
+    channel mapping ``channel_key`` (the latest mapped channel of the
+    session, if any), and then ``source`` alone. An unknown ``source`` gives
+    ``unknown``.
     """
     source = row.get("source") or ""
     session_id = row.get("id") or ""
@@ -186,6 +187,10 @@ def derive_origin(row: Mapping, channel_key: str | None = None) -> Origin:
         if session_id.startswith(prefix):
             part = session_id[len(prefix):].split(":", 1)[0]
             return Origin(trigger, {key: part} if key else {})
+    if session_id.startswith("onboarding-"):
+        # The conversation has the source "web"; the autonomous onboarding
+        # has "cron".
+        return Origin(TRIGGER_CHAT if source == "web" else TRIGGER_SYSTEM)
     if session_id.startswith("fork-") and row.get("parent_session_id"):
         return Origin(TRIGGER_CHAT, {DETAIL_FORK_OF: row["parent_session_id"]})
     if source in _CHANNEL_TRIGGERS:
