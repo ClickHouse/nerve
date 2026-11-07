@@ -31,7 +31,7 @@ const APPROVED_AT = '2026-01-02T10:00:00+00:00';
 
 function session(overrides: Partial<ImplSession> = {}): ImplSession {
   return {
-    id: 'impl-1', title: 'Implement: Add dark mode', status: 'active', updated_at: APPROVED_AT,
+    id: 'impl-1', title: 'Implement: Add dark mode', updated_at: APPROVED_AT,
     is_running: true, awaiting_input: false, parked: false, ...overrides,
   };
 }
@@ -79,12 +79,14 @@ afterEach(() => {
 describe('implementationState', () => {
   it.each([
     ['done', plan({ status: 'done' })],
-    ['failed', plan({ status: 'failed' })],
-    ['failed', plan({ impl_session: session({ status: 'error', is_running: false }) })],
+    ['failed', plan({ status: 'failed', impl_session: session({ is_running: false }) })],
+    ['failed', plan({ status: 'failed', impl_session: null })],
+    // A later turn in the session of a failed plan.
+    ['running', plan({ status: 'failed' })],
     ['waiting', plan({ impl_session: session({ awaiting_input: true }) })],
     ['running', plan()],
     ['parked', plan({ impl_session: session({ is_running: false, parked: true }) })],
-    ['waiting', plan({ impl_session: session({ is_running: false, status: 'idle' }) })],
+    ['waiting', plan({ impl_session: session({ is_running: false }) })],
     [null, plan({ impl_session: null })],
   ])('reads %s', (state, value) => {
     expect(implementationState(value)).toBe(state);
@@ -126,13 +128,49 @@ describe('PlanProgressCard', () => {
     expect(getPlan).toHaveBeenCalledWith('plan-1');
   });
 
-  it('loads the plan again when its task changes, and stops listening once it is done', async () => {
+  it('ignores comments on the task', async () => {
     renderCard(plan());
-    getPlan.mockResolvedValue(plan({ status: 'done', impl_session: session({ is_running: false }) }));
+    await emit({ type: 'task_updated', session_id: null, event: 'commented', task: { id: 'task-1' } as never });
+    expect(getPlan).not.toHaveBeenCalled();
+  });
+
+  it('shows a failed implementation when the server marks the plan failed', async () => {
+    renderCard(plan({ impl_session: session({ is_running: false }) }));
+    getPlan.mockResolvedValue(plan({ status: 'failed', impl_session: session({ is_running: false }) }));
+    await emit({ type: 'task_updated', session_id: null, event: 'updated', task: { id: 'task-1' } as never });
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Implementation' })).toHaveTextContent('Failed'));
+    // A later turn in the session can still finish the work.
+    expect(listeners.size).toBe(1);
+  });
+
+  it('follows a done plan until the last turn ends, for the final time', async () => {
+    renderCard(plan());
+    // task_done marks the plan done while the turn still writes its reply.
+    getPlan.mockResolvedValue(plan({ status: 'done', impl_session: session({ updated_at: '2026-01-02T10:05:00+00:00' }) }));
     await emit({ type: 'task_updated', session_id: null, event: 'done', task: { id: 'task-1' } as never });
-    await waitFor(() => expect(screen.getByRole('region', { name: 'Implementation' })).toHaveTextContent('Done'));
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Implementation' })).toHaveTextContent('Done after 5m'));
+    expect(listeners.size).toBe(1);
+
+    getPlan.mockResolvedValue(plan({
+      status: 'done', impl_session: session({ is_running: false, updated_at: '2026-01-02T10:09:00+00:00' }),
+    }));
+    await emit({ type: 'session_running', session_id: 'impl-1', is_running: false });
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Implementation' })).toHaveTextContent('Done after 9m'));
     expect(listeners.size).toBe(0);
     expect(openers.size).toBe(0);
+  });
+
+  it('keeps a finished plan when an older load answers last', async () => {
+    renderCard(plan());
+    let answerOld!: (value: Plan) => void;
+    getPlan
+      .mockReturnValueOnce(new Promise(r => { answerOld = r; }))
+      .mockResolvedValueOnce(plan({ status: 'done', impl_session: session({ is_running: false }) }));
+    await emit({ type: 'session_agents', session_id: 'impl-1', background_count: 0, has_background_tasks: false } as WSMessage);
+    await emit({ type: 'task_updated', session_id: null, event: 'done', task: { id: 'task-1' } as never });
+    await waitFor(() => expect(screen.getByRole('region', { name: 'Implementation' })).toHaveTextContent('Done'));
+    await act(async () => { answerOld(plan()); });
+    expect(screen.getByRole('region', { name: 'Implementation' })).toHaveTextContent('Done');
   });
 
   it('loads the plan again after a reconnect', async () => {

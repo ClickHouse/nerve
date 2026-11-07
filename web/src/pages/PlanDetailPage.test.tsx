@@ -288,7 +288,7 @@ describe('PlanDetailPage implementation', () => {
     getPlan.mockResolvedValue(plan({
       status: 'implementing', impl_session_id: 'impl-1', reviewed_at: '2026-01-02T10:30:00+00:00',
       impl_session: {
-        id: 'impl-1', title: 'Implement: Write the report', status: 'active',
+        id: 'impl-1', title: 'Implement: Write the report',
         updated_at: '2026-01-02T10:30:00+00:00', is_running: true, awaiting_input: false, parked: false,
       },
     }));

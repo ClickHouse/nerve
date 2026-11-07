@@ -5,8 +5,6 @@ import { api } from '../api/client';
 export interface ImplSession {
   id: string;
   title: string | null;
-  /** The session row's lifecycle status: `active`, `idle`, `stopped`, `error`, ... */
-  status: string | null;
   updated_at: string | null;
   is_running: boolean;
   awaiting_input: boolean;
@@ -81,13 +79,20 @@ function extractErrorMessage(err: unknown, fallback: string): string {
   return body || fallback;
 }
 
+/** Plan statuses after implementing. */
+const TERMINAL = new Set(['done', 'failed']);
+
 export const usePlanStore = create<PlanState>((set, get) => {
   // After a decision, install the plan as the server stored it: the
   // reviewer columns and a status that another decision set come from there.
   async function reloadSelected(id: string): Promise<void> {
     try {
       const plan = await api.getPlan(id);
-      if (get().selectedPlan?.id === id) set({ selectedPlan: plan });
+      const open = get().selectedPlan;
+      // Loads can overlap. A plan never goes back to implementing from done
+      // or failed, so such an answer is older than the plan on screen.
+      const stale = plan.status === 'implementing' && TERMINAL.has(open?.status ?? '');
+      if (open?.id === id && !stale) set({ selectedPlan: plan });
     } catch (e) {
       console.error('Failed to reload plan:', e);
     }
