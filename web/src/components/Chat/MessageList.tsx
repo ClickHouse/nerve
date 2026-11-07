@@ -2,6 +2,7 @@ import { useEffect, useRef, useCallback, memo } from 'react';
 import { Link } from 'react-router-dom';
 import type { ChatMessage, Session } from '../../types/chat';
 import { useVisibleActorIds } from '../../stores/actorStore';
+import { useAgentStore } from '../../stores/agentStore';
 import { useAuthStore } from '../../stores/authStore';
 import { useChatStore } from '../../stores/chatStore';
 import { providerConfigured, stepById, useSetupStore } from '../../stores/setupStore';
@@ -40,6 +41,11 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks, u
   // A message-anchored fork resolves to a backend-native turn; sessions
   // predating turn recording can only be forked whole (header action).
   const hasForkAnchors = messages.some(m => m.native_turn_id != null);
+
+  // A message waiting in the turn queue (an echo from another tab) shows as
+  // a queue row above the composer, not as a bubble, until it starts.
+  const queue = useAgentStore(s => s.queue);
+  const queuedMsgIds = new Set(queue.map(q => q.client_msg_id));
 
   const viewerActorId = useAuthStore((s) => s.viewer?.id ?? null);
   const namedSenders = useVisibleActorIds(
@@ -114,6 +120,7 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks, u
       {messages.length > 0 && <SessionOriginLine unlisted={unlistedSession} />}
 
       {messages.map((msg, i) => {
+        if (msg.role === 'user' && msg.client_msg_id && queuedMsgIds.has(msg.client_msg_id)) return null;
         // "Fork from here" needs a persisted row id (live-streamed messages
         // gain one on the next reload) and at least one native turn mapping
         // in the transcript to anchor the branch to.

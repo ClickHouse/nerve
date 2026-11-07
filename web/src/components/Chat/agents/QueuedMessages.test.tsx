@@ -56,7 +56,9 @@ describe('QueuedMessages', () => {
     expect(within(first).getByRole('button', { name: 'Cancel the queued message' })).toBeInTheDocument();
     expect(second).toHaveTextContent('deploy after');
     expect(second).toHaveTextContent('telegram');
-    expect(within(second).getAllByRole('button').map(b => b.getAttribute('aria-label'))).toEqual(['Move up', 'Move down']);
+    expect(within(second).getAllByRole('button').map(b => b.getAttribute('aria-label'))).toEqual([
+      'Move up: deploy after', 'Move down: deploy after',
+    ]);
   });
 
   it('mutes internal entries and gives them no actions', () => {
@@ -80,14 +82,17 @@ describe('QueuedMessages', () => {
     expect(chips()[1]).toHaveTextContent('still on its waySending…');
   });
 
-  it('does not repeat a message that is already a bubble here', () => {
-    const entry = makeQueueEntry({ preview: 'sent while the lock was held' });
-    useAgentStore.setState({ queue: [entry] });
+  it('lists a message sent from another tab, whose echo is a bubble here', async () => {
+    const mine = makeQueueEntry({ preview: 'mine' });
+    const other = makeQueueEntry({ preview: 'from the other tab' });
+    useAgentStore.setState({ queue: [mine, other] });
     useChatStore.setState({
-      messages: [{ role: 'user', blocks: [{ type: 'text', content: 'sent while the lock was held' }], client_msg_id: entry.client_msg_id }],
+      messages: [{ role: 'user', blocks: [{ type: 'text', content: 'from the other tab' }], client_msg_id: other.client_msg_id }],
     });
     render(<QueuedMessages />);
-    expect(screen.queryByRole('list', { name: 'Queued messages' })).toBeNull();
+    expect(chips()).toHaveLength(2);
+    await userEvent.click(within(chips()[1]).getByRole('button', { name: 'Move up: from the other tab' }));
+    expect(reorderQueue).toHaveBeenLastCalledWith([other.queue_id, mine.queue_id]);
   });
 
   it('cancels with ×', async () => {
@@ -110,7 +115,8 @@ describe('QueuedMessages', () => {
 
   describe('reorder', () => {
     const three = () => ['a', 'b', 'c'].map(n => makeQueueEntry({ queue_id: `q_${n}`, preview: n }));
-    const button = (row: HTMLElement, name: string) => within(row).getByRole('button', { name });
+    // "Move up: a", "Move down: c", ...
+    const button = (row: HTMLElement, name: string) => within(row).getByRole('button', { name: new RegExp(`^${name}: `) });
 
     it('moves a message up or down and sends the whole new order', async () => {
       useAgentStore.setState({ queue: three() });
@@ -131,19 +137,14 @@ describe('QueuedMessages', () => {
         pendingSends: { 'local-1': { clientMsgId: 'local-1', content: 'on its way', blocks: [], at: 1 } },
       });
       render(<QueuedMessages />);
-      expect(screen.queryByRole('button', { name: 'Move up' })).toBeNull();
+      expect(screen.queryByRole('button', { name: /^Move up/ })).toBeNull();
     });
 
-    it('moves past the next row shown here; a hidden entry keeps its place', async () => {
-      const [a, hidden, c] = three();
-      useAgentStore.setState({ queue: [a, hidden, c] });
-      useChatStore.setState({
-        messages: [{ role: 'user', blocks: [{ type: 'text', content: 'b' }], client_msg_id: hidden.client_msg_id }],
-      });
+    it('names the message in a long move label, cut short', () => {
+      const long = 'Then update the changelog with a short note about the flaky login test';
+      useAgentStore.setState({ queue: [makeQueueEntry({ preview: 'a' }), makeQueueEntry({ preview: long })] });
       render(<QueuedMessages />);
-      expect(chips()).toHaveLength(2);
-      await userEvent.click(button(chips()[0], 'Move down'));
-      expect(reorderQueue).toHaveBeenLastCalledWith(['q_b', 'q_c', 'q_a']);
+      expect(within(chips()[1]).getByRole('button', { name: `Move up: ${long.slice(0, 40)}…` })).toBeInTheDocument();
     });
 
     it('keeps the keyboard focus on the moved message', async () => {

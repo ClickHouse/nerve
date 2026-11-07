@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -25,7 +25,9 @@ vi.mock('../../api/websocket', () => ({
 
 const { useSetupStore } = await import('../../stores/setupStore');
 const { useChatStore } = await import('../../stores/chatStore');
+const { useAgentStore } = await import('../../stores/agentStore');
 const { makeState, step, withStep } = await import('../../test/setupFixtures');
+const { makeQueueEntry } = await import('../../test/agentFixtures');
 const { MessageList } = await import('./MessageList');
 
 function renderEmpty() {
@@ -38,6 +40,7 @@ function renderEmpty() {
 
 beforeEach(() => {
   useSetupStore.getState().reset();
+  useAgentStore.setState({ queue: [] });
 });
 
 describe('empty transcript', () => {
@@ -119,5 +122,36 @@ describe('origin line', () => {
       </MemoryRouter>,
     );
     expect(screen.getByTestId('session-origin')).toHaveTextContent('From cron job nightly');
+  });
+});
+
+describe('a message waiting in the turn queue', () => {
+  const bubble = (content: string, client_msg_id: string | null) => ({
+    role: 'user' as const, blocks: [{ type: 'text' as const, content }],
+    created_at: '2026-02-27T02:06:00Z', client_msg_id,
+  });
+
+  function renderList(messages: ReturnType<typeof bubble>[]) {
+    return render(
+      <MemoryRouter>
+        <MessageList messages={messages} isStreaming />
+      </MemoryRouter>,
+    );
+  }
+
+  it('has no bubble while it waits (another tab sent it), and one when it starts', () => {
+    useAgentStore.setState({ queue: [makeQueueEntry({ client_msg_id: 'c-other-tab' })] });
+    renderList([bubble('earlier message', null), bubble('from the other tab', 'c-other-tab')]);
+    expect(screen.getByText('earlier message')).toBeInTheDocument();
+    expect(screen.queryByText('from the other tab')).toBeNull();
+
+    act(() => useAgentStore.setState({ queue: [] }));
+    expect(screen.getByText('from the other tab')).toBeInTheDocument();
+  });
+
+  it('always shows history, which has no client id', () => {
+    useAgentStore.setState({ queue: [makeQueueEntry({ client_msg_id: null })] });
+    renderList([bubble('stored message', null)]);
+    expect(screen.getByText('stored message')).toBeInTheDocument();
   });
 });
