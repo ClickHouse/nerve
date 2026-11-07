@@ -14,10 +14,16 @@ export function NotificationToast() {
   const toastQueue = useNotificationStore(s => s.toastQueue);
   if (toastQueue.length === 0) return null;
 
-  // Above the bottom navigation on a phone; bottom right on a desktop.
+  // The newest toasts: a question that waits must not hide later ones. The
+  // newest is first in the DOM and, in the reversed column, at the bottom,
+  // where the stack starts when it scrolls.
+  const visible = toastQueue.slice(-MAX_VISIBLE).reverse();
+  // Above the bottom navigation on a phone; bottom right on a desktop. The
+  // stack scrolls when it is taller than the screen. Its padding keeps the
+  // toast shadows inside the scroll box, and it lets clicks through.
   return (
-    <div className="fixed z-50 inset-x-2 bottom-[calc(env(safe-area-inset-bottom)+4rem)] md:inset-x-auto md:right-4 md:bottom-4 md:w-96 flex flex-col gap-2">
-      {toastQueue.slice(0, MAX_VISIBLE).map(notif => (
+    <div className="fixed z-50 inset-x-0 bottom-[calc(env(safe-area-inset-bottom)+3.5rem)] p-2 max-h-[calc(100dvh-env(safe-area-inset-bottom)-3.5rem)] md:inset-x-auto md:right-0 md:bottom-0 md:w-[26rem] md:p-4 md:max-h-dvh overflow-y-auto flex flex-col-reverse gap-2 pointer-events-none">
+      {visible.map(notif => (
         <Toast key={notif.id} notif={notif} />
       ))}
     </div>
@@ -45,7 +51,7 @@ function Toast({ notif }: { notif: Notification }) {
   const iconColor = notif.type === 'approval' ? 'text-hue-violet' : notif.type === 'question' ? 'text-hue-blue' : 'text-accent';
 
   return (
-    <div className="max-h-[60dvh] overflow-y-auto bg-surface-raised border border-border-subtle rounded-lg shadow-xl p-3 animate-slide-in">
+    <div className="pointer-events-auto bg-surface-raised border border-border-subtle rounded-lg shadow-xl p-3 animate-slide-in">
       <div className="flex items-start gap-2">
         <Icon size={16} className={`${iconColor} shrink-0 mt-0.5`} />
         <div className="flex-1 min-w-0">

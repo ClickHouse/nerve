@@ -90,9 +90,7 @@ function NotificationCard({ notif }: { notif: Notification }) {
   const isApproval = notif.type === 'approval';
 
   return (
-    <div className={`p-4 bg-surface border rounded-lg transition-colors ${
-      notif.status === 'pending' ? 'border-border-subtle' : 'border-border-subtle'
-    }`}>
+    <div className="p-4 bg-surface border border-border-subtle rounded-lg transition-colors">
       {/* The badge column is shrink-0, so beside the text it costs a fixed
           ~127px — over a third of the card on a phone, which left the body
           wrapping at ~190px. Below `sm` the badges take a row of their own

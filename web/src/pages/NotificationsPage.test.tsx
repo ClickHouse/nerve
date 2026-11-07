@@ -12,6 +12,8 @@ vi.mock('../api/client', () => ({
     listSilences: vi.fn(),
     listActors: vi.fn(),
     answerNotification: vi.fn(),
+    getNotification: vi.fn(),
+    dismissAllNotifications: vi.fn(),
   },
   // ActorLabel reads the viewer through the auth store, which wires these.
   setToken: vi.fn(), clearToken: vi.fn(), getToken: vi.fn(),
@@ -30,6 +32,8 @@ const listNotifications = vi.mocked(api.listNotifications);
 const listSilences = vi.mocked(api.listSilences);
 const listActors = vi.mocked(api.listActors);
 const answerNotification = vi.mocked(api.answerNotification);
+const getNotification = vi.mocked(api.getNotification);
+const dismissAllNotifications = vi.mocked(api.dismissAllNotifications);
 
 const ALICE = 'actor-alice';
 const BOB = 'actor-bob';
@@ -303,6 +307,7 @@ describe('NotificationsPage options', () => {
       pending_count: 1,
     });
     answerNotification.mockResolvedValue({ answered: true });
+    getNotification.mockResolvedValue(notification({ id: 'ask-1', answer: 'Yes, all of these' }));
     renderPage();
     const list = within(await screen.findByRole('group', { name: 'Pick one' }));
     expect(list.getAllByRole('button').map(b => b.textContent)).toEqual(['AYes, all of these', 'BNo', 'COther…']);
@@ -363,11 +368,46 @@ describe('NotificationToast options', () => {
 
   it('closes when answered in the toast', async () => {
     answerNotification.mockResolvedValue({ answered: true });
+    getNotification.mockResolvedValue(notification({ id: 'ask-live', title: 'Which region?', answer: 'West' }));
     renderAt(<NotificationToast />);
     push(ASK);
     await userEvent.click(screen.getByRole('button', { name: 'West' }));
     expect(answerNotification).toHaveBeenCalledWith('ask-live', 'West');
     await waitFor(() => expect(useNotificationStore.getState().toastQueue).toEqual([]));
+  });
+
+  it('shows the newest toasts when three questions wait', () => {
+    renderAt(<NotificationToast />);
+    for (const n of [1, 2, 3]) push({ ...ASK, notification_id: `ask-${n}`, title: `Question ${n}` });
+    push({ ...ASK, notification_id: 'n-urgent', notification_type: 'notify', title: 'Disk is full', options: null });
+    expect(screen.getByText('Disk is full')).toBeInTheDocument();
+    expect(screen.queryByText('Question 1')).not.toBeInTheDocument();
+    expect(screen.getByText('Question 3')).toBeInTheDocument();
+    expect(useNotificationStore.getState().toastQueue).toHaveLength(4);
+  });
+
+  it('folds after an answer from the page, without the answer event', async () => {
+    listNotifications.mockResolvedValue({ notifications: [], pending_count: 0 });
+    answerNotification.mockResolvedValue({ answered: true });
+    getNotification.mockResolvedValue(notification({
+      id: 'ask-live', title: 'Which region?', answer: 'East', answered_by: 'web',
+    }));
+    renderAt(<NotificationToast />);
+    push(ASK);
+    await act(async () => { await useNotificationStore.getState().answerNotification('ask-live', 'East'); });
+    expect(getNotification).toHaveBeenCalledWith('ask-live');
+    expect((await screen.findByText('Answer:')).parentElement).toHaveTextContent('Answer: East');
+  });
+
+  it('closes the notify toasts on Dismiss all and keeps the questions', async () => {
+    listNotifications.mockResolvedValue({ notifications: [], pending_count: 0 });
+    dismissAllNotifications.mockResolvedValue({ dismissed: 1 });
+    renderAt(<NotificationToast />);
+    push(ASK);
+    push({ ...ASK, notification_id: 'n-plain', notification_type: 'notify', title: 'Build finished', options: null });
+    await act(async () => { await useNotificationStore.getState().dismissAll(); });
+    expect(screen.queryByText('Build finished')).not.toBeInTheDocument();
+    expect(screen.getByText('Which region?')).toBeInTheDocument();
   });
 
   it('folds to the answer from another place, then closes', () => {
