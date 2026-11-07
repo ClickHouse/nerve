@@ -97,7 +97,9 @@ export function ContextBar({ usage, sessionId, backend, busy, sessionCostUsd }: 
         aria-controls={open ? POPOVER_ID : undefined}
         aria-label={`Context window: ${exact ? '' : 'about '}${formatTokens(used)} of ${formatTokens(max)} tokens`}
         onClick={toggle}
-        className="flex items-center gap-2 h-7 px-1.5 rounded hover:bg-surface-raised cursor-pointer transition-colors"
+        // On a phone, the pseudo-element makes the tap target 44 px high
+        // (28 px + 2 x 8 px) and keeps the header and the meter as they are.
+        className="relative flex items-center gap-2 h-7 px-1.5 rounded hover:bg-surface-raised cursor-pointer transition-colors before:absolute before:inset-x-0 before:-inset-y-2 md:before:hidden"
       >
         <span className="hidden md:inline text-xs text-text-dim whitespace-nowrap tabular-nums">
           {exact ? '' : '~'}{formatTokens(used)} / {formatTokens(max)}

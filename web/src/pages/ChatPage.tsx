@@ -483,7 +483,7 @@ export function ChatPage() {
               )}
               {contextUsage && activeSession && (
                 <ContextBar
-                  key={activeSession}
+                  key={`context-${activeSession}`}
                   usage={contextUsage}
                   sessionId={activeSession}
                   backend={activeSessionRow?.backend ?? 'claude'}
