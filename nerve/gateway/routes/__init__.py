@@ -23,6 +23,7 @@ from nerve.gateway.routes import (
     agents,
     auth,
     setup,
+    settings,
     sessions,
     session_context,
     tasks,
@@ -70,6 +71,7 @@ def register_all_routes() -> APIRouter:
     if local_accounts:
         router.include_router(setup.claim_router)
     router.include_router(setup.router)
+    router.include_router(settings.router)
     router.include_router(sessions.router)
     router.include_router(session_context.router)
     router.include_router(agents.router)
