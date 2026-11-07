@@ -188,6 +188,32 @@ describe('opening the page', () => {
     await vi.waitFor(() => expect(getCronLogs).toHaveBeenCalledWith('digest', 50, 0, true));
   });
 
+  it('selects the first job when the selected one is gone, on open and on refresh', async () => {
+    listCronJobs.mockResolvedValue({ jobs: [job({ id: 'digest' }), job({ id: 'triage' })] });
+    useCronStore.setState({ selectedJobId: 'removed' });
+
+    await useCronStore.getState().open();
+
+    expect(useCronStore.getState().selectedJobId).toBe('digest');
+    expect(getCronLogs.mock.calls).toEqual([['digest', 50, 0, true]]);
+
+    useCronStore.setState({ selectedJobId: 'triage' });
+    listCronJobs.mockResolvedValue({ jobs: [job({ id: 'digest' })] });
+    await useCronStore.getState().refresh();
+
+    expect(useCronStore.getState().selectedJobId).toBe('digest');
+    expect(getCronLogs).toHaveBeenLastCalledWith('digest', 50, 0, true);
+  });
+
+  it('keeps the list of all jobs on a refresh', async () => {
+    listCronJobs.mockResolvedValue({ jobs: [job({ id: 'digest' })] });
+
+    await useCronStore.getState().refresh();
+
+    expect(useCronStore.getState().selectedJobId).toBeNull();
+    expect(getCronLogs).toHaveBeenLastCalledWith(undefined, 50, 0, true);
+  });
+
   it('keeps a job that was selected before', async () => {
     useCronStore.setState({ selectedJobId: 'triage' });
     listCronJobs.mockResolvedValue({ jobs: [job({ id: 'digest' }), job({ id: 'triage' })] });
