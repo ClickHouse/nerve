@@ -34,7 +34,6 @@ from nerve.agent.tools.schemas import (
 # for intra-package coupling (see plan-a217db3c "Cross-handler calls").
 from nerve.agent.tools.handlers.tasks import task_update_handler
 from nerve.db.task_statuses import PLAN_REVIEW_FROM, PLAN_REVIEW_STATUS
-from nerve.tasks.escalation import _is_quiet_hour
 
 logger = logging.getLogger(__name__)
 
@@ -70,19 +69,17 @@ async def _notify_plan_ready(
 
     The notification stores the plan id and the task id, so the web UI and
     Telegram can open the plan from it. It replaces the task's earlier plan
-    notifications, and it makes no sound during quiet hours.
+    notifications. During quiet hours the fan-out sends it without sound.
     """
     if not ctx.notification_service:
         return False
     try:
         await ctx.db.dismiss_plan_notifications(task["id"], attribution=ctx.attribution)
-        service = ctx.notification_service
-        await service.send_notification(
+        await ctx.notification_service.send_notification(
             session_id=ctx.session_id,
             title=f"Plan ready for review: {task['title']}",
             body=f"Version {version} of plan {plan_id} waits for your decision.",
             priority="high",
-            silent=_is_quiet_hour(service.config),
             metadata={"plan_id": plan_id, "task_id": task["id"]},
         )
     except Exception:

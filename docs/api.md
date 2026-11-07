@@ -2183,8 +2183,8 @@ those for another session. Events marked *global* go to every socket.
 // A session waits for input, or no longer does (global)
 { type: "session_awaiting_input", session_id: "main", awaiting: true }
 
-// Notifications (global)
-{ type: "notification", notification_id: "…", notification_type: "notify" | "question" | …, session_id: "…", title: "…", body: "…", priority: "normal", options: [...] | null }
+// Notifications (global). silent: true (else absent) during quiet hours for an item that is not urgent: show it without sound
+{ type: "notification", notification_id: "…", notification_type: "notify" | "question" | …, session_id: "…", title: "…", body: "…", priority: "normal", options: [...] | null, silent: true }
 { type: "notification_answered", notification_id: "…", session_id: "…", answer: "…", answered_by: "…", answered_at: "…" | null, actor_id: "…" }
 // answered_at: the stored answer time (ISO 8601). A snoozed approval has approval_status: "snoozed" and snooze_until instead.
 { type: "notification_expired", notification_id: "…", session_id: "…", notification_type: "question", title: "…" }

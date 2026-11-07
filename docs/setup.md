@@ -230,8 +230,9 @@ A few things worth knowing per step:
   the step would refuse — over 40 characters, or not a single line — is not
   offered, and nothing is offered under lockdown.
   Continuing accepts what the form shows; the step counts as decided. Nerve
-  records quiet hours for the agent and does not hold messages back itself
-  (see [Configuration → Quiet Hours](config.md#quiet-hours)).
+  records quiet hours for the agent and does not hold messages back itself;
+  during them, notifications below `urgent` arrive without sound (see
+  [Configuration → Quiet Hours](config.md#quiet-hours)).
 - **Channels.** A Telegram token is checked with Telegram before anything is
   written: a well-formed but revoked token would otherwise take the bot — and
   the next start — down. The bot itself starts with the new token after the
