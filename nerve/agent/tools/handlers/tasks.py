@@ -861,10 +861,12 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
             if not done and expect_revision is not None:
                 return _revision_conflict(task_id, expect_revision)
 
-        # Mark any implementing plans for this task as done
-        implementing_plans = await ctx.db.get_plans_for_task(task_id)
-        for p in implementing_plans:
-            if p.get("status") == "implementing":
+        # Mark any implementing plans for this task as done. A failed plan
+        # is done too when its own implementation session closes the task:
+        # a later turn there finished the work.
+        for p in await ctx.db.get_plans_for_task(task_id):
+            retried = p.get("status") == "failed" and p.get("impl_session_id") == ctx.session_id
+            if p.get("status") == "implementing" or retried:
                 await ctx.db.update_plan(p["id"], status="done")
 
         await _emit_task_event(ctx, task_id, "done")
