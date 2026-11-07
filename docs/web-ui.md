@@ -90,6 +90,8 @@ On a phone (narrower than 768 px), a bar at the bottom replaces the nav rail: **
 - **Per-session** — Sidebar shows spinner on the active session when agent is working
 
 ### Tool Call Rendering
+In the chat, each run of tool calls and thinking between two text blocks of a message is one **tool burst**. A finished burst with a tool call and at least two blocks shows as one muted line that names the work, for example "Read 3 files, ran 4 commands, searched 2 times, edited 2 files" (reads and edits count distinct files; MCP tools count per server, "used 2 nerve tools"), with "1 failed" in red when calls failed. A click opens the rows. While a turn runs, its last burst stays open, so the newest calls show; it folds when text follows or the turn ends. Question cards (`ask_user`, AskUserQuestion, `ask_form`), the ExitPlanMode decision card and the first card of a workflow run are never in a burst. Agent tabs and plan tabs show the rows without bursts.
+
 Tool calls are collapsed by default with specialized renderers:
 - **Edit** — Unified diff with red/green highlighting
 - **Bash** — Terminal-styled with `$` prompt and output

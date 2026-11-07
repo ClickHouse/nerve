@@ -34,7 +34,7 @@ export function AssistantMessage({ message, actions }: {
             N
           </div>
           <div className="min-w-0 flex-1">
-            <BlockRenderer blocks={message.blocks} />
+            <BlockRenderer blocks={message.blocks} rollUpTools />
           </div>
         </div>
         {message.created_at && (

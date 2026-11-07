@@ -28,7 +28,7 @@ export function StreamingMessage() {
             N
           </div>
           <div className="min-w-0 flex-1">
-            <BlockRenderer blocks={blocks} streaming />
+            <BlockRenderer blocks={blocks} streaming rollUpTools />
           </div>
         </div>
       </div>
