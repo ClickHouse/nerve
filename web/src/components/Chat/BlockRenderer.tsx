@@ -1,10 +1,13 @@
 import { useMemo } from 'react';
 import { Download, FileText, Clock, TrendingDown, TrendingUp } from '../ui/icons';
 import type { MessageBlock } from '../../types/chat';
+import type { RenderItem } from '../../types/renderBlocks';
 import { AutoTurnDivider } from './agents/AutoTurnDivider';
 import { ThinkingBlock } from './ThinkingBlock';
 import { ToolCallBlock } from './ToolCallBlock';
 import { ToolCallGroupBlock } from './ToolCallGroupBlock';
+import { ToolBurstBlock } from './ToolBurstBlock';
+import { groupToolBursts } from './toolBursts';
 import { MarkdownContent } from './MarkdownContent';
 import { groupToolCalls } from '../../utils/groupToolCalls';
 import { findRepeatWorkflowRunCalls } from '../../utils/workflowRunCards';
@@ -18,6 +21,8 @@ interface BlockRendererProps {
   cursorColor?: string;
   /** Optional wrapper class for text blocks (e.g. 'text-sm my-1'). */
   textClassName?: string;
+  /** Fold each run of thinking and tool calls to one summary line (the chat transcript). */
+  rollUpTools?: boolean;
 }
 
 export function BlockRenderer({
@@ -25,9 +30,13 @@ export function BlockRenderer({
   streaming = false,
   cursorColor = 'bg-accent',
   textClassName,
+  rollUpTools = false,
 }: BlockRendererProps) {
-  const renderItems = useMemo(() => groupToolCalls(blocks), [blocks]);
   const repeatRunCalls = useMemo(() => findRepeatWorkflowRunCalls(blocks), [blocks]);
+  const renderItems = useMemo<RenderItem[]>(
+    () => (rollUpTools ? groupToolBursts(blocks, repeatRunCalls) : groupToolCalls(blocks)),
+    [blocks, rollUpTools, repeatRunCalls],
+  );
 
   return (
     <>
@@ -80,6 +89,8 @@ export function BlockRenderer({
             return <ToolCallBlock key={i} block={item} repeatRunCard={repeatRunCalls.has(item.toolUseId)} />;
           case 'tool_call_group':
             return <ToolCallGroupBlock key={i} group={item} repeatRunCalls={repeatRunCalls} />;
+          case 'tool_burst':
+            return <ToolBurstBlock key={i} burst={item} live={isLast} repeatRunCalls={repeatRunCalls} />;
           case 'text': {
             const inner = (
               <>
