@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { ClickUIProvider } from '@clickhouse/click-ui';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -114,6 +114,31 @@ describe('session rows', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /System \(1\)/ }));
     expect(await screen.findByRole('img', { name: 'Started by cron job nightly' })).toBeTruthy();
+  });
+
+  it('keep the origin icon next to the expand control and the review loop icon', () => {
+    const parent = { ...slack, id: 'parent-1', title: 'Parent thread' };
+    const child = session({ id: 'child-1', title: 'Child', parent_session_id: 'parent-1' });
+    const observer = session({
+      id: 'loop-1', title: 'Loop observer', trigger: 'api', origin_label: 'Started through the API',
+      review_loop: { id: 'rvl-1', status: 'implementing', iteration: 1, max_iterations: 3 },
+    });
+    useChatStore.setState({
+      sessions: [parent, child, observer], searchResults: null, archivedSessions: null,
+      systemSessions: null, systemCount: 0, drafts: {}, reads: {}, readsBaseline: 0,
+      activeSession: '',
+    });
+    wrap(
+      <SessionSidebar
+        sessions={[parent, child, observer]} activeSession="" agentStatus={{ state: 'idle' }}
+        onCreate={() => {}} onDelete={() => {}}
+      />,
+    );
+    const parentRow = screen.getByText('Parent thread').closest('a')!;
+    expect(within(parentRow).getByTitle(/children/)).toBeTruthy();
+    expect(within(parentRow).getByRole('img', { name: 'Started from Slack #general' })).toBeTruthy();
+    const loopRow = screen.getByText('Loop observer').closest('a')!;
+    expect(within(loopRow).getByRole('img', { name: 'Started through the API' })).toBeTruthy();
   });
 });
 

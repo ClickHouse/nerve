@@ -1145,7 +1145,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
   /** Feed-only: light up an "unread" marker when updated since last opened. */
   showUnread?: boolean;
   /** Nesting: depth (0 = top level) indents the row; a parent shows a
-      chevron in place of its icon that toggles its children. */
+      chevron before its icon that toggles its children. */
   depth?: number;
   hasChildren?: boolean;
   /** Direct-child count, shown as a badge when the parent is collapsed. */
@@ -1252,19 +1252,19 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
           : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
         }${isDropTarget ? ' ring-2 ring-inset ring-accent bg-accent/10' : ''}${isDragSource ? ' opacity-50' : ''}`}
     >
-      {hasChildren ? (
+      {hasChildren && (
         <button
           type="button"
           onClick={(e) => { e.preventDefault(); e.stopPropagation(); onToggleExpand?.(session.id); }}
-          className="shrink-0 -ml-0.5 p-0.5 rounded text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer"
+          className="shrink-0 -ml-0.5 -mr-1 p-0.5 rounded text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer"
           title={expanded ? 'Collapse children' : 'Expand children'}
         >
           {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         </button>
-      ) : session.review_loop ? (
+      )}
+      <SessionOriginIcon session={session} />
+      {session.review_loop && (
         <Repeat size={13} className={`shrink-0 ${reviewLoopIconTone(session.review_loop.status)}`} />
-      ) : (
-        <SessionOriginIcon session={session} />
       )}
       <div className="flex-1 min-w-0">
         <div className={`truncate text-xs in-data-[layout=page]:text-sm leading-tight${isUnread ? ' font-semibold text-text' : ''}`}>{cleanTitle(session)}</div>
