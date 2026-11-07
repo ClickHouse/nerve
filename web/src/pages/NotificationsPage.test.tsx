@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
@@ -11,6 +11,7 @@ vi.mock('../api/client', () => ({
     listNotifications: vi.fn(),
     listSilences: vi.fn(),
     listActors: vi.fn(),
+    answerNotification: vi.fn(),
   },
   // ActorLabel reads the viewer through the auth store, which wires these.
   setToken: vi.fn(), clearToken: vi.fn(), getToken: vi.fn(),
@@ -28,6 +29,7 @@ const { NotificationToast } = await import('../components/Notifications/Notifica
 const listNotifications = vi.mocked(api.listNotifications);
 const listSilences = vi.mocked(api.listSilences);
 const listActors = vi.mocked(api.listActors);
+const answerNotification = vi.mocked(api.answerNotification);
 
 const ALICE = 'actor-alice';
 const BOB = 'actor-bob';
@@ -288,5 +290,102 @@ describe('NotificationToast links', () => {
     expect(useNotificationStore.getState().toastQueue).toEqual([]);
     expect(useNotificationStore.getState().notifications[0].metadata)
       .toEqual({ plan_id: 'plan-1', task_id: 'task-1' });
+  });
+});
+
+describe('NotificationsPage options', () => {
+  it('answers a question from one row per option, with Other… and no wait note', async () => {
+    listNotifications.mockResolvedValue({
+      notifications: [notification({
+        id: 'ask-1', status: 'pending', answer: null, answered_by: null, answered_at: null,
+        options: '["Yes, all of these","No"]' as unknown as string[],
+      })],
+      pending_count: 1,
+    });
+    answerNotification.mockResolvedValue({ answered: true });
+    renderPage();
+    const list = within(await screen.findByRole('group', { name: 'Pick one' }));
+    expect(list.getAllByRole('button').map(b => b.textContent)).toEqual(['AYes, all of these', 'BNo', 'COther…']);
+    expect(screen.queryByText('Nothing happens until you choose.')).not.toBeInTheDocument();
+    await userEvent.click(list.getByRole('button', { name: 'Yes, all of these' }));
+    expect(answerNotification).toHaveBeenCalledWith('ask-1', 'Yes, all of these');
+  });
+
+  it('says that an approval waits, and offers no Other…', async () => {
+    listNotifications.mockResolvedValue({
+      notifications: [notification({
+        id: 'approval-1', type: 'approval', status: 'pending', answer: null, answered_by: null,
+        answered_at: null, options: ['approve', 'decline'],
+      })],
+      pending_count: 1,
+    });
+    renderPage();
+    const list = within(await screen.findByRole('group', { name: 'Pick one' }));
+    expect(list.getAllByRole('button').map(b => b.textContent)).toEqual(['AApprove', 'BDecline']);
+    expect(screen.getByText('Nothing happens until you choose.')).toBeInTheDocument();
+  });
+
+  it('folds an answered approval to its label', async () => {
+    listNotifications.mockResolvedValue({
+      notifications: [notification({ type: 'approval', options: ['approve', 'decline'], answer: 'decline' })],
+      pending_count: 0,
+    });
+    renderPage();
+    expect((await screen.findByText('Answer:')).parentElement).toHaveTextContent('Answer: Decline');
+  });
+});
+
+describe('NotificationToast options', () => {
+  const ASK = {
+    notification_id: 'ask-live', notification_type: 'question', session_id: 's1',
+    title: 'Which region?', body: '', priority: 'normal',
+    options: ['North', 'South', 'East', 'West', 'Nowhere'],
+  };
+
+  function push(data: Record<string, unknown>) {
+    act(() => { useNotificationStore.getState().handleWSNotification(data); });
+  }
+
+  it('shows every option and stays open until the question is answered', () => {
+    vi.useFakeTimers();
+    try {
+      renderAt(<NotificationToast />);
+      push(ASK);
+      push({ ...ASK, notification_id: 'n-plain', notification_type: 'notify', title: 'Build finished', options: null });
+      act(() => { vi.advanceTimersByTime(6000); });
+      const list = within(screen.getByRole('group', { name: 'Which region?' }));
+      expect(list.getAllByRole('button')).toHaveLength(6);
+      expect(screen.queryByText('Build finished')).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('closes when answered in the toast', async () => {
+    answerNotification.mockResolvedValue({ answered: true });
+    renderAt(<NotificationToast />);
+    push(ASK);
+    await userEvent.click(screen.getByRole('button', { name: 'West' }));
+    expect(answerNotification).toHaveBeenCalledWith('ask-live', 'West');
+    await waitFor(() => expect(useNotificationStore.getState().toastQueue).toEqual([]));
+  });
+
+  it('folds to the answer from another place, then closes', () => {
+    vi.useFakeTimers();
+    try {
+      renderAt(<NotificationToast />);
+      push(ASK);
+      act(() => {
+        useNotificationStore.getState().handleWSNotificationAnswered({
+          notification_id: 'ask-live', answer: 'East', answered_by: 'web', actor_id: null,
+        });
+      });
+      expect(screen.queryByRole('group')).not.toBeInTheDocument();
+      expect(screen.getByText('Answer:').parentElement).toHaveTextContent('Answer: East');
+      act(() => { vi.advanceTimersByTime(6000); });
+      expect(screen.queryByText('Which region?')).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
