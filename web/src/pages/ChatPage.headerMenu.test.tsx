@@ -62,7 +62,7 @@ describe('ChatPage header menu', () => {
 
     expect(mocks.calls.getSessionTasks).toHaveBeenCalledWith(SESSION_ID);
     expect(
-      await screen.findByRole('button', { name: 'Tasks from this session (0)' }),
+      await screen.findByRole('button', { name: 'No tasks from this session' }),
     ).toBeInTheDocument();
   });
 });
