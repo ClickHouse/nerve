@@ -42,7 +42,6 @@ interface PlanState {
   updatePlan: (id: string, status: string, feedback?: string) => Promise<void>;
   approvePlan: (id: string) => Promise<{ impl_session_id: string } | null>;
   revisePlan: (id: string, feedback: string) => Promise<boolean>;
-  clearActionError: () => void;
   clearSelectedPlan: () => void;
 }
 
@@ -114,7 +113,7 @@ export const usePlanStore = create<PlanState>((set, get) => {
     },
 
     updatePlan: async (id: string, status: string, feedback?: string) => {
-      set({ actionLoading: true });
+      set({ actionLoading: true, actionError: null });
       try {
         await api.updatePlan(id, { status, feedback });
         const sel = get().selectedPlan;
@@ -125,13 +124,14 @@ export const usePlanStore = create<PlanState>((set, get) => {
         get().loadPlans();
       } catch (e) {
         console.error('Failed to update plan:', e);
+        set({ actionError: extractErrorMessage(e, 'Failed to update the plan') });
       } finally {
         set({ actionLoading: false });
       }
     },
 
     approvePlan: async (id: string) => {
-      set({ actionLoading: true });
+      set({ actionLoading: true, actionError: null });
       try {
         const result = await api.approvePlan(id);
         const sel = get().selectedPlan;
@@ -143,6 +143,7 @@ export const usePlanStore = create<PlanState>((set, get) => {
         return result;
       } catch (e) {
         console.error('Failed to approve plan:', e);
+        set({ actionError: extractErrorMessage(e, 'Failed to approve the plan') });
         return null;
       } finally {
         set({ actionLoading: false });
@@ -168,7 +169,6 @@ export const usePlanStore = create<PlanState>((set, get) => {
       }
     },
 
-    clearActionError: () => set({ actionError: null }),
     clearSelectedPlan: () => set({ selectedPlan: null, actionError: null }),
   };
 });
