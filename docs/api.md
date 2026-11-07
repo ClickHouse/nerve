@@ -863,7 +863,8 @@ their own browsers.
 The web app manifest of the panel. It needs no sign-in, because the browser
 fetches it without the panel's token. `name` and `short_name` are the agent's
 name: the name line of `IDENTITY.md`, else `NERVE_DISPLAY_NAME`, else
-"Nerve". The icons are Nerve's 192 and 512 px PNGs.
+"Nerve". The icons are Nerve's app icon at 192 and 512 px, and a full-bleed
+512 px tile with `purpose: maskable` for launchers that cut their own shape.
 
 #### `GET /api/push/subscriptions`
 

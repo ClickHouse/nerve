@@ -43,7 +43,8 @@ describe('the service worker', () => {
       const { scope, dispatch } = loadWorker(windows);
       await dispatch('push', pushEvent(PAYLOAD));
       expect(scope.registration.showNotification).toHaveBeenCalledWith('Ada: Deploy now?', {
-        body: 'The build passed.', tag: 'ask-1234', silent: true, data: { url: '/notifications' },
+        body: 'The build passed.', icon: '/nerve-icon-192.png', badge: '/nerve-badge.png', tag: 'ask-1234',
+        silent: true, data: { url: '/notifications' },
       });
     }
   });

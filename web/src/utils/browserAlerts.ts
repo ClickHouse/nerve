@@ -13,6 +13,9 @@ export const ALERT_CHANNEL = 'nerve-browser-alerts';
 export const ALERT_DELAY_MS = 300;
 /** The number of body characters that an alert shows. */
 export const ALERT_BODY_LIMIT = 180;
+/** Nerve's app icon, and the white N that Android shows in the status bar. The same files as in `public/sw.js`. */
+export const ALERT_ICON = '/nerve-icon-192.png';
+export const ALERT_BADGE = '/nerve-badge.png';
 
 const IMPORTANT_TYPES = new Set(['question', 'approval']);
 const IMPORTANT_PRIORITIES = new Set(['high', 'urgent']);
@@ -85,6 +88,8 @@ export function createAlerter({ inFront = tabInFront, onOpen }: {
     if (handled.has(key) || inFront()) return;
     const options = {
       body: event.body.slice(0, ALERT_BODY_LIMIT),
+      icon: ALERT_ICON,
+      badge: ALERT_BADGE,
       tag: event.notification_id,
       silent: event.silent === true,
     };

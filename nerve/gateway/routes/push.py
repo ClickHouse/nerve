@@ -30,12 +30,13 @@ router = APIRouter()
 MANIFEST_MEDIA_TYPE = "application/manifest+json"
 #: The background of the dark theme: the start screen of the installed app.
 APP_BACKGROUND = "#1f1f1c"
-#: Nerve's icons in the web bundle (``web/public``): the 192 and 512 px PNGs
-#: that installing needs.
+#: Nerve's app icons in the web bundle (``web/public``), from the Nerve brand
+#: kit: the rounded tile at 192 and 512 px, which installing needs, and a
+#: full-bleed tile for launchers that cut their own shape (``maskable``).
 NERVE_ICONS = (
     {"src": "/nerve-icon-192.png", "sizes": "192x192", "type": "image/png"},
     {"src": "/nerve-icon-512.png", "sizes": "512x512", "type": "image/png"},
-    {"src": "/nerve-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
+    {"src": "/nerve-icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
 )
 USER_AGENT_CHARS = 300
 

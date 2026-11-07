@@ -32,6 +32,7 @@ from nerve.config import NerveConfig, NotificationsConfig, set_config
 from nerve.db.migrations import v068_push_subscriptions
 from nerve.db.push_subscriptions import MAX_PUSH_SUBSCRIPTIONS
 from nerve.gateway.auth import create_session_token, create_system_token, hash_password, pin_jwt_secret
+from nerve.gateway.routes import push as push_routes
 from nerve.gateway.routes import register_all_routes
 from nerve.gateway.routes._deps import RouteDeps
 from nerve.notifications import webpush
@@ -565,6 +566,16 @@ class TestManifest:
     async def test_the_icons_are_nerve_s_192_and_512_px_pngs_also_with_a_favicon(self, api):
         (api.workspace / "config" / "favicon.png").write_bytes(_png(256))
         icons = (await self._get(api))["icons"]
-        assert {(icon["src"], icon["sizes"]) for icon in icons} == {
-            ("/nerve-icon-192.png", "192x192"), ("/nerve-icon-512.png", "512x512"),
-        }
+        assert [(icon["src"], icon["sizes"], icon.get("purpose")) for icon in icons] == [
+            ("/nerve-icon-192.png", "192x192", None),
+            ("/nerve-icon-512.png", "512x512", None),
+            ("/nerve-icon-maskable-512.png", "512x512", "maskable"),
+        ]
+
+
+def test_the_manifest_icons_are_pngs_of_their_size_in_the_web_bundle():
+    public = Path(__file__).resolve().parent.parent / "web" / "public"
+    for icon in push_routes.NERVE_ICONS:
+        data = (public / icon["src"].lstrip("/")).read_bytes()
+        width, height = struct.unpack(">II", data[16:24])
+        assert data[:8] == b"\x89PNG\r\n\x1a\n" and f"{width}x{height}" == icon["sizes"]

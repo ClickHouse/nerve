@@ -6,6 +6,10 @@
 const DEFAULT_PATH = '/notifications';
 // The message that tells a panel tab to open a page (see web/src/utils/webPush.ts).
 const OPEN_MESSAGE = 'nerve-open';
+// Nerve's app icon, and the white N that Android shows in the status bar.
+// The same files as in web/src/utils/browserAlerts.ts.
+const ICON = '/nerve-icon-192.png';
+const BADGE = '/nerve-badge.png';
 
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
@@ -31,6 +35,8 @@ async function showPush(event) {
   if ((await panelWindows()).some((client) => client.focused)) return;
   await self.registration.showNotification(data.title || 'Nerve', {
     body: data.body || '',
+    icon: ICON,
+    badge: BADGE,
     tag: data.tag,
     silent: data.silent === true,
     data: { url: data.url },

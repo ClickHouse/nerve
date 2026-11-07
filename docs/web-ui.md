@@ -440,7 +440,10 @@ removes each one.
   each browser must turn push on again. When a push service answers `404` or
   `410`, the browser dropped the subscription, and Nerve deletes it.
 - **Install:** the panel has a web app manifest (`/api/manifest.webmanifest`)
-  with the agent's name, so a browser can install it as an app. The worker
+  with the agent's name and Nerve's app icon, so a browser can install it as an
+  app. `apple-touch-icon.png` is the Home Screen icon on iPhone and iPad. Push
+  notifications and browser alerts show the app icon, and Android shows a white
+  N in the status bar. The worker
   has no fetch handler, so every page comes from the server.
 - **Limits:** HTTPS only (and `localhost`). On iPhone and iPad, push works
   only after "Add to Home Screen" (iOS 16.4 or later), and a Safari tab says

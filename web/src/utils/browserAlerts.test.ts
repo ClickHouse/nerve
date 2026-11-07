@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  ALERT_BODY_LIMIT, ALERT_CHANNEL, ALERT_DELAY_MS, createAlerter, levelWants, type NotificationEvent,
+  ALERT_BADGE, ALERT_BODY_LIMIT, ALERT_CHANNEL, ALERT_DELAY_MS, ALERT_ICON, createAlerter, levelWants,
+  type NotificationEvent,
 } from './browserAlerts';
 import { stubPushBrowser, unstubPushBrowser } from '../test/pushFixtures';
 
@@ -112,7 +113,9 @@ describe('createAlerter', () => {
     expect(FakeNotification.shown).toHaveLength(1);
     const [alert] = FakeNotification.shown;
     expect(alert.title).toBe('Deploy now?');
-    expect(alert.options).toEqual({ body: 'x'.repeat(ALERT_BODY_LIMIT), tag: 'ask-1', silent: true });
+    expect(alert.options).toEqual({
+      body: 'x'.repeat(ALERT_BODY_LIMIT), icon: ALERT_ICON, badge: ALERT_BADGE, tag: 'ask-1', silent: true,
+    });
     expect(FakeChannel.all[0].name).toBe(ALERT_CHANNEL);
   });
 
@@ -216,7 +219,7 @@ describe('createAlerter', () => {
 
     expect(FakeNotification.shown).toHaveLength(0);
     expect(worker.registration.showNotification).toHaveBeenCalledWith(
-      'Deploy now?', { body: 'The build passed.', tag: 'ask-1', silent: true },
+      'Deploy now?', { body: 'The build passed.', icon: ALERT_ICON, badge: ALERT_BADGE, tag: 'ask-1', silent: true },
     );
     const shown = { close: vi.fn() };
     worker.registration.getNotifications.mockResolvedValue([shown]);
