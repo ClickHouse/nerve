@@ -62,6 +62,11 @@ class TestStates:
         assert body["slack"] == {"connected": False, "channel_name": None}
         assert body["telegram"] == {"connected": False}
 
+    async def test_a_channel_list_without_the_panel_shows_it(self, inst):
+        merge_settings_paths(inst.workspace, {"notifications.channels": ["telegram"]})
+        inst.reload()
+        assert (await _get(inst))["fields"]["notifications.channels"]["value"] == ["web", "telegram"]
+
     async def test_a_value_in_config_yaml_is_machine_and_is_written_there(self, inst):
         merge_machine_paths(inst.config_dir / "config.yaml", {EXPIRY: 24})
         inst.reload()

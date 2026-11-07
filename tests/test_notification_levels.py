@@ -65,8 +65,8 @@ async def test_the_fanout_skips_a_channel_below_its_level(db):
     ("slack", ["web", "slack"]),
     (["slack", "web"], ["slack", "web"]),
 ])
-def test_the_panel_is_always_in_the_channel_list(raw, channels):
-    assert NotificationsConfig.from_dict({"channels": raw}).channels == channels
+def test_the_panel_is_always_a_delivery_channel(raw, channels):
+    assert NotificationsConfig.from_dict({"channels": raw}).delivery_channels() == channels
 
 
 @pytest.mark.asyncio

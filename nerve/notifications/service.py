@@ -983,12 +983,14 @@ class NotificationService:
         ``plan_id`` names the plan of a ``notify`` row. Telegram adds an
         "Open plan" button for it.
 
-        A channel whose ``notifications.levels`` entry is ``important``
-        skips an item below that level (:meth:`NotificationsConfig.wants`).
+        Without ``channels`` the configured list goes out, with the panel
+        in it (:meth:`NotificationsConfig.delivery_channels`). A channel whose
+        ``notifications.levels`` entry is ``important`` skips an item below
+        that level (:meth:`NotificationsConfig.wants`).
         """
         settings = self.config.notifications
         target_channels = [
-            name for name in (channels or settings.channels)
+            name for name in (channels or settings.delivery_channels())
             if settings.wants(name, notif_type, priority)
         ]
 

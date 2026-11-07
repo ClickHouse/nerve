@@ -147,7 +147,7 @@ def _level_field(channel: str) -> SettingField:
 SLACK_DESTINATION = "notifications.slack_channel_id"
 
 NOTIFICATION_FIELDS: tuple[SettingField, ...] = (
-    SettingField("notifications.channels", lambda c: list(c.notifications.channels), _parse_channels),
+    SettingField("notifications.channels", lambda c: c.notifications.delivery_channels(), _parse_channels),
     _level_field("slack"),
     _level_field("telegram"),
     SettingField(SLACK_DESTINATION, lambda c: c.notifications.slack_channel_id or None, _parse_slack_channel),
@@ -347,6 +347,6 @@ async def test_notifications(actor: Actor = Depends(require_person)):
         "silenced": row.get("status") == "silenced",
         "results": [
             {"channel": channel, "delivered": channel in delivered}
-            for channel in ctx.config.notifications.channels
+            for channel in ctx.config.notifications.delivery_channels()
         ],
     }
