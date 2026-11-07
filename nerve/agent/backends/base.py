@@ -87,6 +87,9 @@ class SessionSpec:
     # cause in external mode. None: no principal. A backend that cannot send
     # it ignores it.
     inference_principal: str | None = None
+    # The session's trigger for the same proxy (nerve.session_origin), in
+    # external mode. None: no trigger. A backend that cannot send it ignores it.
+    inference_trigger: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 

@@ -32,7 +32,7 @@ import numpy as np
 
 from nerve import paths
 from nerve.config import NerveConfig
-from nerve.inference_principal import system_principal_headers
+from nerve.inference_principal import system_inference_headers
 from nerve.memory.backend import MemoryBackendUnavailable
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.utils.llm import response_text
@@ -2232,7 +2232,7 @@ class MemUBridge:
             aws_profile=self.config.provider.aws_profile,
             aws_access_key_id=self.config.provider.aws_access_key_id,
             aws_secret_access_key=self.config.provider.aws_secret_access_key,
-            default_headers=system_principal_headers(),
+            default_headers=system_inference_headers(),
         )
 
     def _inject_bedrock_clients(self) -> None:
@@ -2261,7 +2261,7 @@ class MemUBridge:
         clients do. The embedding profile calls the OpenAI API directly and
         gets no header.
         """
-        headers = system_principal_headers()
+        headers = system_inference_headers()
         if not headers:
             return
         for name in self._service.llm_profiles.profiles:
