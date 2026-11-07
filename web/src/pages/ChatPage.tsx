@@ -479,8 +479,11 @@ export function ChatPage() {
                   <span>Langfuse</span>
                 </a>
               )}
-              {activeSessionRow && virtualSession?.id !== activeSession && (
-                <ChatHeaderMenu key={activeSessionRow.id} sessionId={activeSessionRow.id} />
+              {/* An archived or system session opened by a link is in no
+                  loaded sidebar list and has no `activeSessionRow`, so the
+                  menu takes the active session id. */}
+              {activeSession && virtualSession?.id !== activeSession && (
+                <ChatHeaderMenu key={activeSession} sessionId={activeSession} />
               )}
             </div>
           </div>

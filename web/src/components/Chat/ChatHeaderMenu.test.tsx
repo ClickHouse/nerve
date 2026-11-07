@@ -57,6 +57,24 @@ describe('ChatHeaderMenu', () => {
     ]);
   });
 
+  it('closes on Escape without letting it reach the page', async () => {
+    // The global Escape that stops the running turn listens on the document.
+    const pageEscape = vi.fn();
+    document.addEventListener('keydown', pageEscape);
+    getSessionTasks.mockResolvedValue({ tasks: [] });
+    const user = renderMenu();
+    await user.click(menuButton());
+    expect(menuButton()).toHaveAttribute('aria-expanded', 'true');
+
+    await user.keyboard('{Escape}');
+
+    expect(menuButton()).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('button', { name: /Tasks from this session/ })).toBeNull();
+    expect(document.activeElement).toBe(menuButton());
+    expect(pageEscape).not.toHaveBeenCalled();
+    document.removeEventListener('keydown', pageEscape);
+  });
+
   it('says so when the session has no tasks', async () => {
     getSessionTasks.mockResolvedValue({ tasks: [] });
     const user = renderMenu();
