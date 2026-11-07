@@ -24,7 +24,7 @@ const api = client.api as unknown as Record<string, ReturnType<typeof vi.fn>>;
 
 const PHONE = 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0 Mobile Safari/537.36';
 const renderRow = () => render(<ul><ThisBrowserRow /></ul>);
-const pushSwitch = () => screen.getByRole('switch', { name: 'Get notifications when no tab is open' });
+const pushSwitch = () => screen.getByRole('switch', { name: 'Alerts when no tab is open' });
 
 function serverHas(...devices: ReturnType<typeof device>[]) {
   api.pushDevices.mockResolvedValue({ public_key: PUBLIC_KEY, subscriptions: devices });
@@ -123,7 +123,7 @@ describe('Push in the This browser row', () => {
     serverHas(device({ id: 4, endpoint: 'https://fcm.googleapis.com/fcm/send/phone', user_agent: PHONE }));
     renderRow();
     expect(await screen.findByText('Chrome on Android')).toBeInTheDocument();
-    expect(screen.queryByRole('switch', { name: 'Get notifications when no tab is open' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('switch', { name: 'Alerts when no tab is open' })).not.toBeInTheDocument();
   });
 
   it('tells an iPhone tab to add the panel to the Home Screen', () => {

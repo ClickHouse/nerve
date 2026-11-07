@@ -35,7 +35,7 @@ export function PushSwitch() {
     <>
       {!blocked && (
         <div className="flex items-center justify-between gap-3">
-          <p id={switchId} className="min-w-0 text-xs font-medium text-text-muted">Get notifications when no tab is open</p>
+          <p id={switchId} className="min-w-0 text-xs font-medium text-text-muted">Alerts when no tab is open</p>
           <Switch
             checked={on}
             disabled={push.busy}

@@ -402,8 +402,8 @@ above the list ("Browser alerts are on" or "off") opens the setting.
 
 ### Push notifications
 
-"Get notifications when no tab is open", in Settings > Notifications > This
-browser, turns on Web Push for the browser. The instance sends each item to
+"Alerts when no tab is open", in Settings > Notifications > This browser,
+turns on Web Push for the browser. The instance sends each item to
 the push service of the browser, and the panel's service worker (`/sw.js`)
 shows it as a system notification, also when no panel tab is open. The server
 keeps one row for each browser (see [api.md](api.md#web-push)). Under "Your
