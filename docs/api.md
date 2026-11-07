@@ -788,14 +788,16 @@ instance.
     "notifications.slack_channel_id": { "value": "C0123ABCD", "state": "editable", "file": "settings.yaml", "reason": null }
   },
   "slack": { "connected": true, "channel_name": "alerts" },
-  "telegram": { "connected": false }
+  "telegram": { "connected": false },
+  "quiet_hours": { "timezone": "Europe/Berlin", "active": false }
 }
 ```
 
 The fields are `notifications.channels`, `notifications.levels.slack`,
 `notifications.levels.telegram`, `notifications.slack_channel_id`,
-`notifications.telegram_chat_id`, `notifications.default_expiry_hours` and
-`notifications.max_redeliveries`. `state` is one of:
+`notifications.telegram_chat_id`, `notifications.default_expiry_hours`,
+`notifications.max_redeliveries`, `quiet_start` and `quiet_end` (`HH:MM`, or
+`""` for both when quiet hours are off). `state` is one of:
 
 | State | Meaning |
 |---|---|
@@ -819,6 +821,9 @@ In Socket Mode, `slack.connected` is `true` when Slack is on and has both
 tokens, and `slack.channel_name` is the name of the configured channel when
 Slack runs and answers `conversations.info`, else `null`.
 
+`quiet_hours.timezone` is the time zone of the quiet hours (`timezone`), and
+`quiet_hours.active` is true when the current time is inside them.
+
 #### `PUT /api/settings/notifications`
 
 A partial body of `{path: value}`; an omitted field is not changed. Each value
@@ -827,8 +832,10 @@ copies of the configuration files with the change applied: an error that the
 files without the change do not have is `400`. Then each value goes to the
 file it comes from (see `state`), a new value to `settings.yaml`, and the
 configuration reloads. `null` or `""` for the Slack channel or the Telegram
-chat removes the key. A `managed` field is `409` with its `field`; lockdown
-is `409`. The response is the `GET` body with `reload_errors`:
+chat removes the key. `quiet_start` and `quiet_end` take a 24-hour `HH:MM`
+or `""`; after the change both must be set or both empty, with two different
+times (`400` names the field to fix). A `managed` field is `409` with its
+`field`; lockdown is `409`. The response is the `GET` body with `reload_errors`:
 `{part: error}` for each part that did not reload, `{}` when all did.
 
 ```json
