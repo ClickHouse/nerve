@@ -769,6 +769,26 @@ export type WorkflowRunStatus =
   | 'killed'
   | 'budget_exhausted';
 
+export interface CronLog {
+  id: number;
+  job_id: string;
+  /** Cron start, including time spent waiting in the workflow queue. */
+  started_at: string;
+  finished_at: string | null;
+  status: 'success' | 'error' | 'missed' | WorkflowRunStatus | 'unavailable' | null;
+  output: string | null;
+  error: string | null;
+  session_id?: string | null;
+  /** Present when this row projects a linked workflow's outcome. */
+  workflow_id?: string;
+  dispatch?: {
+    status: string | null;
+    finished_at: string | null;
+    output: string | null;
+    error: string | null;
+  };
+}
+
 export interface WorkflowRun {
   id: string;
   engine: 'claude-workflow' | 'codex-ultracode';
@@ -1690,8 +1710,8 @@ export const api = {
   // Diagnostics
   getDiagnostics: () => request<any>('/diagnostics'),
   getCronLogs: (jobId?: string, limit = 50, offset = 0) =>
-    request<{ logs: any[]; total: number; limit: number; offset: number }>(
-      `/cron/logs?job_id=${jobId || ''}&limit=${limit}&offset=${offset}`),
+    request<{ logs: CronLog[]; total: number; limit: number; offset: number }>(
+      `/cron/logs?job_id=${encodeURIComponent(jobId || '')}&limit=${limit}&offset=${offset}`),
 
   // Observability — lightweight status for UI deep-links
   getObservabilityStatus: () =>

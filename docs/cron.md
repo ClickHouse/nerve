@@ -762,3 +762,22 @@ Every cron and source run is logged in the `cron_logs` SQLite table:
 Source runs also log to `source_run_log` with per-source diagnostics (records fetched/processed, errors).
 
 View logs via API: `GET /api/cron/logs?job_id=morning-briefing&limit=10`
+
+For jobs with a `workflow` declaration, the Cron page and log API show the
+linked workflow's current outcome: `pending`, `running`, `done`, `failed`,
+`killed`, or `budget_exhausted`. A successful launch does not mean the work
+has completed. Pending/running rows have no finish time; completed rows use
+the workflow's finish time, error and result. Duration starts at the cron
+attempt, so it includes queue time. The page refreshes on workflow events
+and reconnect, with polling while a displayed run is active.
+
+This is a read-time projection, including for existing history and after a
+restart. The link is the stored `workflow:<id>` session, verified against
+the workflow's `created_by = cron:<job_id>`. If the workflow is missing or
+belongs to another job, the row shows `unavailable`, with no finish time or
+result. The API preserves the original launch outcome under `dispatch`.
+Stored rows and scheduling anchors are unchanged: a failed workflow does
+not cause an extra catch-up or retry. Ordinary cron/source runs, errors
+before workflow creation and lock skips keep their own result. If recording
+the launch fails after linking a workflow, the workflow's outcome still
+takes precedence; the recording error remains available in `dispatch`.

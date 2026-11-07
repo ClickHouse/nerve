@@ -101,18 +101,18 @@ function LogRow({ log, showJobColumn }: { log: CronLog; showJobColumn: boolean }
         )}
         <td className="px-3 py-2 text-text-muted whitespace-nowrap">{formatRelativeTime(log.started_at)}</td>
         <td className="px-3 py-2 text-text-dim">
-          {!log.finished_at ? (
-            <span className="flex items-center gap-1 text-warning">
-              <Loader2 size={12} className="animate-spin" /> running
-            </span>
-          ) : log.status === 'missed' ? (
+          {log.status === 'missed' || log.status === 'unavailable' ? (
             '—'
+          ) : !log.finished_at && (!log.status || log.status === 'pending' || log.status === 'running') ? (
+            <span className="flex items-center gap-1 text-warning">
+              <Loader2 size={12} className="animate-spin" /> {log.status === 'pending' ? 'waiting' : 'running'}
+            </span>
           ) : (
             formatDuration(log.started_at, log.finished_at)
           )}
         </td>
         <td className="px-3 py-2">
-          {log.status ? <StatusBadge status={log.status} /> : <span className="text-text-dim">—</span>}
+          <StatusBadge status={log.status} />
         </td>
         <td className="px-3 py-2 text-text-dim max-w-[300px]">
           <span className={`truncate block ${log.error ? 'text-error/70' : ''}`}>

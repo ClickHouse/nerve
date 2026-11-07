@@ -280,7 +280,8 @@ class TestRunWorkflowJob:
         self, cron_service, workflow_service,
     ):
         # start_run returns as soon as the run is queued; the cron log
-        # records success while the run itself is still pending.
+        # stores launch success while the run itself is still pending.
+        # History reads project the workflow state (test_cron_workflow_logs).
         workflow_service.start_run.return_value = {
             "id": "wfr-x", "session_id": "workflow:wfr-x", "status": "pending",
         }
