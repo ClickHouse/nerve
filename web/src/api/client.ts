@@ -1529,6 +1529,12 @@ export const api = {
       `/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(queueId)}`,
       { method: 'DELETE' },
     ),
+  /** Set the run order of the queued messages, the one that runs next first. */
+  reorderQueue: (sessionId: string, queueIds: string[]) =>
+    request<{ items: QueueEntryView[] }>(
+      `/sessions/${encodeURIComponent(sessionId)}/queue/order`,
+      { method: 'PUT', body: JSON.stringify({ queue_ids: queueIds }) },
+    ),
 
   // Chat (non-streaming)
   chat: (message: string, sessionId?: string) =>

@@ -83,8 +83,9 @@ session totals still come from the runtime and are not changed by it.
 - **Split Stop.** The red button stops the turn. Its caret offers "Stop turn
   and send" and "Stop all agents…".
 - **Queued messages.** While a turn streams, Enter queues the message: it is
-  shown above the composer until the turn ends, and you can edit or cancel it
-  (either way its text comes back into the composer).
+  shown above the composer until it runs, in run order (the top one runs
+  next). Any queued message can move up or down. You can edit or cancel your
+  own (either way its text comes back into the composer).
 
 ## Stopping
 
