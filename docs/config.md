@@ -1692,7 +1692,8 @@ Question and approval cards go to Slack by default.
 | `notifications.slack_channel_id` | string | `""` | Target channel ID; defaults to the first literal ID in `slack.allow_channels` |
 
 `notifications.channels` replaces the default rather than adding to it, so
-list every transport you want. A name nothing delivers to is skipped with a
+list every transport you want. The panel (`web`) is always in the list: Nerve
+adds it to a list without it. A name nothing delivers to is skipped with a
 warning. Slack in the list costs nothing while Slack is off.
 
 Names and globs are not resolved for the `slack_channel_id` fallback. Without
