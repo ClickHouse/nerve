@@ -58,14 +58,15 @@ export const ToolBurstBlock = memo(function ToolBurstBlock({
         size="sm"
         onClick={() => setToggled(!open)}
         aria-expanded={open}
-        className="-mx-1.5 px-1.5 py-1 items-start justify-start text-left text-sm leading-snug text-text-muted"
+        className="-mx-1.5 max-w-full px-1.5 py-1 items-start justify-start text-left text-sm leading-snug text-text-muted"
       >
         <span className={FIRST_LINE} aria-hidden="true">
           {open
             ? <ChevronDown size={14} className="text-text-faint" />
             : <ChevronRight size={14} className="text-text-faint" />}
         </span>
-        <span>
+        {/* A long MCP server name wraps inside the line on a phone. */}
+        <span className="min-w-0 break-words">
           {summary}
           {failed > 0 && (
             <>
@@ -75,9 +76,12 @@ export const ToolBurstBlock = memo(function ToolBurstBlock({
           )}
         </span>
         {running && (
-          <span className={FIRST_LINE} aria-hidden="true">
-            <Loader2 size={12} className="text-accent animate-spin" />
-          </span>
+          <>
+            <span className={FIRST_LINE} aria-hidden="true">
+              <Loader2 size={12} className="text-accent animate-spin" />
+            </span>
+            <span className="sr-only">Running</span>
+          </>
         )}
       </Button>
       {/* The rail sits under the centre of the 14 px chevron. */}
