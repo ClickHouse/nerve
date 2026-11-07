@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { ClickUIProvider } from '@clickhouse/click-ui';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import type { ReactNode } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -13,6 +13,7 @@ vi.mock('../../api/client', () => ({
     listSessions: vi.fn(async () => ({
       sessions: [], archived_count: 0, system_count: 0, has_more: false, next_offset: 0,
     })),
+    listSystemSessions: vi.fn(),
   },
   getToken: vi.fn(() => 'tok'), setUnauthorizedHandler: vi.fn(),
 }));
@@ -23,6 +24,7 @@ vi.mock('../../api/websocket', () => ({
   },
 }));
 
+const { api } = await import('../../api/client');
 const { useActorStore } = await import('../../stores/actorStore');
 const { useAuthStore } = await import('../../stores/authStore');
 const { useChatStore } = await import('../../stores/chatStore');
@@ -87,26 +89,31 @@ describe('SessionOriginIcon', () => {
 });
 
 describe('session rows', () => {
-  it('lead with the origin icon of each session', () => {
+  it('lead with the origin icon of each session, also in the System group', async () => {
     const cron = session({
-      id: 'cron-1', title: 'Nightly digest', trigger: 'cron',
+      id: 'cron:nightly:1', title: 'Cron: nightly', source: 'cron', trigger: 'cron',
       origin_label: 'Started by cron job nightly', origin_detail: { cron_job: 'nightly' },
     });
     const web = session({ id: 'web-1', title: 'A chat', trigger: 'chat', origin_label: 'Started in the web chat' });
+    (api.listSystemSessions as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
+      sessions: [cron], has_more: false, next_offset: 1,
+    });
     useChatStore.setState({
-      sessions: [slack, cron, web], searchResults: null, archivedSessions: null,
-      systemSessions: null, drafts: {}, reads: {}, readsBaseline: 0, activeSession: '',
+      sessions: [slack, web], searchResults: null, archivedSessions: null,
+      systemSessions: null, systemCount: 1, drafts: {}, reads: {}, readsBaseline: 0,
+      activeSession: '',
     });
     wrap(
       <SessionSidebar
-        sessions={[slack, cron, web]} activeSession="" agentStatus={{ state: 'idle' }}
+        sessions={[slack, web]} activeSession="" agentStatus={{ state: 'idle' }}
         onCreate={() => {}} onDelete={() => {}}
       />,
     );
-    expect(screen.getAllByRole('img').map((el) => el.getAttribute('aria-label'))).toEqual(
-      expect.arrayContaining(['Started from Slack #general', 'Started by cron job nightly']),
-    );
+    expect(screen.getByRole('img', { name: 'Started from Slack #general' })).toBeTruthy();
     expect(screen.queryByRole('img', { name: 'Started in the web chat' })).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: /System \(1\)/ }));
+    expect(await screen.findByRole('img', { name: 'Started by cron job nightly' })).toBeTruthy();
   });
 });
 

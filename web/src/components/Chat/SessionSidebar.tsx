@@ -795,7 +795,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                             : 'text-text-faint hover:bg-surface-raised hover:text-text-muted'
                           }`}
                       >
-                        <Bot size={11} className="shrink-0" />
+                        <SessionOriginIcon session={s} />
                         <div className="flex-1 min-w-0">
                           <div className="truncate">{cleanTitle(s)}</div>
                         </div>
