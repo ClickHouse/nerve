@@ -122,7 +122,7 @@ export interface CronLog {
   error: string | null;
   /** Session the run executed in — deep-links to the chat page. */
   session_id?: string | null;
-  /** New records of a source run; null for other runs. */
+  /** Records that a source run fetched (stored or dropped); null for other runs. */
   records?: number | null;
 }
 
@@ -145,8 +145,9 @@ interface CronState {
   /** Why the last switch of a job failed. */
   toggleError: { jobId: string; message: string } | null;
 
-  /** Load the page: the jobs, then the first job's sheet if none is selected. */
+  /** Load the page: the jobs, the first job if none is selected, its runs. */
   open: () => Promise<void>;
+  /** Load the jobs. A selected job that is gone gives way to the first job. */
   loadJobs: () => Promise<void>;
   loadLogs: (offset?: number) => Promise<void>;
   setLogsPage: (offset: number) => void;
@@ -175,8 +176,8 @@ export const useCronStore = create<CronState>((set, get) => ({
   open: async () => {
     await get().loadJobs();
     const { selectedJobId, jobs } = get();
-    if (selectedJobId === null && jobs.length > 0) get().selectJob(jobs[0].id);
-    else await get().loadLogs();
+    if (selectedJobId === null && jobs.length > 0) set({ selectedJobId: jobs[0].id, logsOffset: 0 });
+    await get().loadLogs();
   },
 
   loadJobs: async () => {
@@ -188,7 +189,13 @@ export const useCronStore = create<CronState>((set, get) => ({
     try {
       const { jobs } = await api.listCronJobs();
       if (load !== jobsLoads) return;
-      set({ jobs: keepForecasts(jobs, get().jobs) });
+      // A selected job that is gone from the list gives way to the first job.
+      const { selectedJobId } = get();
+      const gone = selectedJobId !== null && !jobs.some((job: CronJob) => job.id === selectedJobId);
+      set({
+        jobs: keepForecasts(jobs, get().jobs),
+        ...(gone ? { selectedJobId: jobs[0]?.id ?? null, logsOffset: 0, toggleError: null } : {}),
+      });
     } catch (e) {
       console.error('Failed to load cron jobs:', e);
       return;
@@ -268,6 +275,8 @@ export const useCronStore = create<CronState>((set, get) => ({
   },
 
   refresh: async () => {
-    await Promise.all([get().loadJobs(), get().loadLogs()]);
+    // The jobs first: they can change the selected job, whose runs come next.
+    await get().loadJobs();
+    await get().loadLogs();
   },
 }));
