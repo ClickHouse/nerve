@@ -226,6 +226,33 @@ class TestSidebarListRoutes:
         assert rows["cron-001"]["attention"]["review"] is True
         assert rows["cron-001"]["review_loop"]["status"] == "awaiting_user"
 
+    async def test_an_old_parked_review_loop_still_needs_you(self, setup, monkeypatch):
+        """A loop that waits for a decision counts even behind 100 newer loops."""
+        import nerve.workflows as workflows
+
+        monkeypatch.setattr(workflows, "get_review_loop_service", lambda: object())
+        await self._seed(setup.sm, setup.db, chats=1, crons=1)
+
+        async def loop(loop_id: str, session_id: str, status: str, created_at: str) -> None:
+            await setup.db.create_review_loop(
+                loop_id, title="t", session_id=session_id, goal_prompt="g",
+                verifier_prompt="- a", criteria_adoption="no", criteria=[],
+                implementer={}, verifier={}, cwd=None, max_iterations=3, budget_usd=1.0,
+            )
+            await setup.db._write(
+                "UPDATE review_loops SET status = ?, created_at = ? WHERE id = ?",
+                (status, created_at, loop_id),
+            )
+
+        await loop("rvl-old", "cron-000", "awaiting_user", "2026-01-01T00:00:00+00:00")
+        for i in range(100):
+            await loop(f"rvl-{i:03d}", "chat-000", "passed", f"2026-02-01T00:{i // 60:02d}:{i % 60:02d}+00:00")
+
+        rows = {s["id"]: s for s in setup.client.get("/api/sessions").json()["sessions"]}
+        assert rows["cron-000"]["attention"]["review"] is True
+        assert rows["cron-000"]["review_loop"]["id"] == "rvl-old"
+        assert rows["chat-000"]["attention"]["review"] is False
+
     async def test_lazy_groups_carry_attention_without_extra_rows(self, setup):
         await self._seed(setup.sm, setup.db, chats=1, crons=1)
         await self._ask(setup.db, "n1", "chat-000", kind="approval")
