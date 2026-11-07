@@ -3086,16 +3086,6 @@ NOTIFY_RECORD_CHANNEL = "web"
 NOTIFY_CHANNELS = (NOTIFY_RECORD_CHANNEL, "telegram", "slack")
 
 
-def _notification_channels(raw: Any) -> Any:
-    """``notifications.channels`` with the panel in it. The panel is the record
-    and the place to answer, so a list without ``web`` gets it first."""
-    if raw is None or isinstance(raw, str):
-        raw = [raw] if raw and raw.strip() else []
-    if isinstance(raw, list) and NOTIFY_RECORD_CHANNEL not in raw:
-        return [NOTIFY_RECORD_CHANNEL, *raw]
-    return raw
-
-
 def _notification_levels(raw: Any) -> dict[str, str]:
     """``notifications.levels`` as ``{channel: level}``. An unknown level is
     logged and read as ``all``, so a typo holds nothing back."""
@@ -3143,6 +3133,13 @@ class NotificationsConfig:
     # from may be in any language. Unknown values fall back to English.
     date_locale: str = "en"
 
+    def delivery_channels(self) -> list[str]:
+        """``channels`` with the panel first when the list leaves it out. The
+        panel is the record and the place to answer, so a list written
+        without ``web`` (for example ``[telegram]``) still delivers there."""
+        channels = list(self.channels)
+        return channels if NOTIFY_RECORD_CHANNEL in channels else [NOTIFY_RECORD_CHANNEL, *channels]
+
     def wants(self, channel: str, notif_type: str, priority: str) -> bool:
         """Whether ``channel`` gets an item of this type and priority.
 
@@ -3159,7 +3156,7 @@ class NotificationsConfig:
     @_coerced
     def from_dict(cls, d: dict) -> NotificationsConfig:
         return cls(
-            channels=_notification_channels(d.get("channels", ["web", "telegram", "slack"])),
+            channels=d.get("channels", ["web", "telegram", "slack"]),
             levels=_notification_levels(d.get("levels")),
             telegram_chat_id=d.get("telegram_chat_id"),
             delivery_only_sink=d.get("delivery_only_sink", False),
