@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from nerve.identity import actor_id_of, attribution_for
 from nerve.notifications import handlers as _handlers
 from nerve.notifications.date_render import render_iso_dates
+from nerve.notifications.quiet_hours import deliver_silently
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -270,6 +271,8 @@ class NotificationService:
         Args:
             channels: Override default notification channels (e.g. ["telegram"]).
             silent: If True, deliver without sound (Telegram disable_notification).
+                During quiet hours the fan-out does this for each item that
+                is not ``urgent``.
             force: If True, bypass silence matching and deliver normally.
                 A forced send that *still* matched a rule is delivered but
                 stamped + counted as an override for audit.
@@ -987,7 +990,12 @@ class NotificationService:
         in it (:meth:`NotificationsConfig.delivery_channels`). A channel whose
         ``notifications.levels`` entry is ``important`` skips an item below
         that level (:meth:`NotificationsConfig.wants`).
+
+        During quiet hours an item that is not ``urgent`` goes out without
+        sound (:func:`deliver_silently`): Telegram gets
+        ``disable_notification`` and the web event gets ``silent: true``.
         """
+        silent = silent or deliver_silently(self.config, priority)
         settings = self.config.notifications
         target_channels = [
             name for name in (channels or settings.delivery_channels())
@@ -1002,7 +1010,7 @@ class NotificationService:
                         notification_id, session_id, notif_type,
                         title, body, priority, options,
                         option_labels=option_labels,
-                        extra=extra_web,
+                        extra={**(extra_web or {}), "silent": True} if silent else extra_web,
                     )
                     await self.db.record_notification_delivery(
                         notification_id, "web",
