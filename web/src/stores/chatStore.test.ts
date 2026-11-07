@@ -118,6 +118,42 @@ describe('loadSessions depth preservation', () => {
   });
 });
 
+describe('the sessions that need you', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('a later page never repeats a session that page 1 already holds', async () => {
+    // Page 1 carries s60 from page 2, because it waits for the user.
+    vi.mocked(api.listSessions).mockImplementation(async (offset = 0) => offset === 0
+      ? { sessions: [...rows(0, PAGE), rows(60, 1)[0]], archived_count: 0, system_count: 0, has_more: true, next_offset: PAGE }
+      : { sessions: rows(PAGE, PAGE), archived_count: 0, system_count: 0, has_more: false, next_offset: 2 * PAGE });
+    useChatStore.setState({
+      sessions: [], sessionsNextOffset: 0, sessionsHasMore: false,
+      archivedSessions: null, systemSessions: null, activeSession: '', virtualSession: null,
+    });
+
+    await useChatStore.getState().loadSessions();
+    await useChatStore.getState().loadMoreSessions();
+
+    const ids = useChatStore.getState().sessions.map(s => s.id);
+    expect(ids.length).toBe(2 * PAGE);
+    expect(new Set(ids).size).toBe(2 * PAGE);
+    expect(useChatStore.getState().sessionsNextOffset).toBe(2 * PAGE);
+  });
+
+  it('a burst of notification events reloads the list once', async () => {
+    vi.useFakeTimers();
+    useChatStore.setState({ sessionsNextOffset: 0, sessionsHasMore: false, archivedSessions: null, systemSessions: null });
+    const base = { notification_id: 'n1', session_id: 's1', title: 't' };
+    dispatch({ ...base, type: 'notification', notification_type: 'question', body: '', priority: 'normal', options: null });
+    dispatch({ ...base, type: 'notification_answered', answer: 'yes', answered_by: 'web' });
+    dispatch({ ...base, type: 'notification_expired', notification_type: 'question' });
+    expect(api.listSessions).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(api.listSessions).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('unsent work on re-entry', () => {
   const takePending = ws.takePendingMessages as unknown as ReturnType<typeof vi.fn>;
   let unregister: () => void = () => {};

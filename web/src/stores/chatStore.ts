@@ -18,6 +18,7 @@ import { loadReads, persistRead, removeRead, loadBaseline } from './helpers/read
 import { removeSeen } from './helpers/agentSeen';
 import { loadVirtualSession, persistVirtualSession, clearVirtualSession } from './helpers/virtualSessionStorage';
 import { onViewerStorageChange } from './helpers/viewerStorage';
+import { registerSessionsLoader } from './helpers/sessionsReload';
 // Handlers
 import { discardStreamDeltas, flushStreamDeltas, handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate, exitStreaming } from './handlers/sessionHandlers';
@@ -1080,11 +1081,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Feed '...': append the next page of conversations (starred already arrived in full on page 1).
     try {
       const { sessions, has_more, next_offset } = await api.listSessions(get().sessionsNextOffset);
-      set(s => ({
-        sessions: [...s.sessions, ...sessions],
-        sessionsHasMore: !!has_more,
-        sessionsNextOffset: next_offset ?? s.sessionsNextOffset + sessions.length,
-      }));
+      set(s => {
+        // Page 1 also holds the sessions that need you, so a later page
+        // can repeat one of them.
+        const listed = new Set(s.sessions.map(x => x.id));
+        return {
+          sessions: [...s.sessions, ...sessions.filter(x => !listed.has(x.id))],
+          sessionsHasMore: !!has_more,
+          sessionsNextOffset: next_offset ?? s.sessionsNextOffset + sessions.length,
+        };
+      });
     } catch (e) {
       console.error('Failed to load more sessions:', e);
     }
@@ -1581,6 +1587,8 @@ if (typeof ws.onOpen === 'function') {
     socketOpenedBefore = true;
   });
 }
+
+registerSessionsLoader(() => void useChatStore.getState().loadSessions());
 
 onViewerStorageChange(() => {
   tabFocus.clear();

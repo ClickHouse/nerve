@@ -13,6 +13,8 @@ import { useActorAttributionLabel } from '../../hooks/useActorAttribution';
 import { useModalSurface } from '../../hooks/useModalSurface';
 import { safeAreaInsets } from '../../utils/safeArea';
 import { forkChat } from '../../utils/forkChat';
+import { ATTENTION_TONE, needsYou } from '../../utils/sessionAttention';
+import { AttentionReason, SessionListSummary } from './SessionAttention';
 
 /** Strip leading '#' and 'Implement: ' prefixes from generated titles. */
 function cleanTitle(session: Session): string {
@@ -44,6 +46,9 @@ function formatShortDate(dateStr: string): string {
 // Collapsed-group persistence (Running / Starred / date buckets, keyed by the
 // group's visible label) lives in utils/dateGroups next to the bucket
 // taxonomy and its default-collapsed set.
+
+/** Label (and collapsed-state key) of the group of sessions that wait for the user. */
+const NEEDS_YOU = 'Needs you';
 
 /** Order by last message activity, newest first (opening/starring doesn't bump it). */
 const byUpdatedDesc = (a: Session, b: Session) =>
@@ -290,14 +295,15 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   // to whatever depth the data carries — no client-side cap). A session whose
   // parent isn't in the feed (not returned under the page limit, archived, or
   // deleted) stays top-level, so the client draws exactly the hierarchy the
-  // server sent and nothing more.
+  // server sent and nothing more. A session that needs you is never nested:
+  // it shows in the "Needs you" group, not inside a collapsed parent.
   const { childrenByParent, topLevel } = useMemo(() => {
     const byId = new Map(conversations.map(s => [s.id, s]));
     const kids = new Map<string, Session[]>();
     const top: Session[] = [];
     for (const s of conversations) {
       const pid = s.parent_session_id;
-      if (pid && pid !== s.id && byId.has(pid)) {
+      if (pid && pid !== s.id && byId.has(pid) && !needsYou(s)) {
         const arr = kids.get(pid);
         if (arr) arr.push(s); else kids.set(pid, [s]);
       } else {
@@ -308,24 +314,28 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
     return { childrenByParent: kids, topLevel: top };
   }, [conversations]);
 
-  // Split TOP-LEVEL conversations into pinned Running / Starred / rest. Children
+  // Split TOP-LEVEL conversations into pinned Needs you / Running / Starred /
+  // rest. Each session is in one group only, the first that applies. Children
   // never appear here — they ride under their parent wherever it renders,
   // including inside the pinned Starred group.
-  const { pinnedRunning, pinnedStarred, restConversations } = useMemo(() => {
+  const { pinnedNeedsYou, pinnedRunning, pinnedStarred, restConversations } = useMemo(() => {
+    const waiting: Session[] = [];
     const running: Session[] = [];
     const starred: Session[] = [];
     const rest: Session[] = [];
     for (const s of topLevel) {
       const isRunning = s.id === activeSession ? activeIsRunning : !!s.is_running;
+      if (needsYou(s)) waiting.push(s);
       // Parked sessions count as running: work is still pending, it just
       // isn't executing this second.
-      if (isRunning || isParked(s)) running.push(s);
+      else if (isRunning || isParked(s)) running.push(s);
       else if (s.starred) starred.push(s);
       else rest.push(s);
     }
+    waiting.sort(byUpdatedDesc);
     starred.sort(byUpdatedDesc);
     rest.sort(byUpdatedDesc);
-    return { pinnedRunning: running, pinnedStarred: starred, restConversations: rest };
+    return { pinnedNeedsYou: waiting, pinnedRunning: running, pinnedStarred: starred, restConversations: rest };
   }, [topLevel, activeSession, activeIsRunning]);
 
   const groupedConversations = useMemo(() => groupByDate(restConversations), [restConversations]);
@@ -428,7 +438,8 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   useEffect(() => {
     if (!activeSession || autoExpandedForRef.current === activeSession) return;
     let label: string | null = null;
-    if (pinnedRunning.some(s => s.id === activeSession)) label = 'Running';
+    if (pinnedNeedsYou.some(s => s.id === activeSession)) label = NEEDS_YOU;
+    else if (pinnedRunning.some(s => s.id === activeSession)) label = 'Running';
     else if (pinnedStarred.some(s => s.id === activeSession)) label = 'Starred';
     else label = groupedConversations.find(g => g.items.some(s => s.id === activeSession))?.group ?? null;
     if (!label) return; // not located yet (sessions still loading) — retry on the next update
@@ -441,7 +452,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
       saveCollapsedGroups(next);
       return next;
     });
-  }, [activeSession, pinnedRunning, pinnedStarred, groupedConversations]);
+  }, [activeSession, pinnedNeedsYou, pinnedRunning, pinnedStarred, groupedConversations]);
 
   // Never leave the active session hidden inside a collapsed parent: expand its
   // whole ancestor chain when it (or the feed) changes. The seen-set guards any
@@ -610,6 +621,10 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
           </div>
         ) : (
           <>
+            {conversations.length > 0 && (
+              <SessionListSummary needsYou={pinnedNeedsYou.length} running={pinnedRunning.length} />
+            )}
+
             {/* Virtual "new chat" — pinned at the very top until the first
                 message materializes it server-side. */}
             {virtualSession && (
@@ -638,6 +653,21 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                   <X size={13} />
                 </IconButton>
               </Link>
+            )}
+
+            {/* Sessions with a question, an approval, a plan or a review
+                loop that waits for the user */}
+            {pinnedNeedsYou.length > 0 && (
+              <div>
+                <GroupHeader
+                  label={NEEDS_YOU}
+                  count={pinnedNeedsYou.length}
+                  collapsed={collapsedGroups.has(NEEDS_YOU)}
+                  tone={ATTENTION_TONE}
+                  onToggle={() => toggleGroup(NEEDS_YOU)}
+                />
+                {!collapsedGroups.has(NEEDS_YOU) && pinnedNeedsYou.map(renderTree)}
+              </div>
             )}
 
             {/* Pinned running sessions */}
@@ -670,7 +700,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
             )}
 
             {/* Normal date-grouped view */}
-            {groupedConversations.length === 0 && pinnedRunning.length === 0 && pinnedStarred.length === 0 && !virtualSession && (
+            {groupedConversations.length === 0 && pinnedNeedsYou.length === 0 && pinnedRunning.length === 0 && pinnedStarred.length === 0 && !virtualSession && (
               <div className="px-3 py-2 text-xs text-text-faint">No conversations yet</div>
             )}
 
@@ -1248,6 +1278,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
       )}
       <div className="flex-1 min-w-0">
         <div className={`truncate text-xs leading-tight${isUnread ? ' font-semibold text-text' : ''}`}>{cleanTitle(session)}</div>
+        <AttentionReason session={session} />
       </div>
 
       {session.created_by_actor_id && namedCreators?.has(session.created_by_actor_id) && (
