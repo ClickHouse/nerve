@@ -378,7 +378,9 @@ alerts are on" or "off") opens the setting.
 - **One alert across tabs:** the tabs of a browser share a `BroadcastChannel`.
   A tab in front tells the others that the person sees the item; a tab in
   the background waits a moment, then shows the alert and tells the others.
-  The alert's tag is the notification id.
+  Before it shows the alert, a tab takes a Web Lock for the item and keeps it
+  while the alert is open, so two tabs that wait the same time give one
+  alert. The alert's tag is the notification id.
 - **Click and close:** a click focuses the tab and opens `/notifications`.
   The alert closes when the item is answered or expires.
 - **Quiet hours:** an item that the server sends with `silent: true` gives an
