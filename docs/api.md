@@ -832,8 +832,59 @@ PUT /api/settings/notifications  { "notifications.channels": ["web", "telegram"]
 Sends one `high` "Test notification" through the normal fan-out (so a
 channel at `important` gets it too) and answers
 `{notification_id, silenced, results: [{channel, delivered}]}`, one result
-for each channel in `notifications.channels`. `silenced` is true when a
-silence rule matched, so only the panel shows it.
+for each channel in `notifications.channels`, and one for `webpush` when a
+browser has push on (`delivered`: a push service took it). `silenced` is true
+when a silence rule matched, so only the panel shows it.
+
+### Web Push
+
+The installable panel and its push notifications (see
+[web-ui.md](web-ui.md#push-notifications) and
+[config.md](config.md#web-push)). The subscription routes need a signed-in
+person (a system or MCP token is `403`), and a person sees and removes only
+their own browsers.
+
+#### `GET /api/manifest.webmanifest`
+
+The web app manifest of the panel. It needs no sign-in, because the browser
+fetches it without the panel's token. `name` and `short_name` are the agent's
+name: the name line of `IDENTITY.md`, else `NERVE_DISPLAY_NAME`, else
+"Nerve". The icons are Nerve's 192 and 512 px PNGs.
+
+#### `GET /api/push/subscriptions`
+
+```json
+{
+  "public_key": "BKx9...q3M",
+  "subscriptions": [
+    { "id": 3, "endpoint": "https://fcm.googleapis.com/fcm/send/f1LsxkKphfQ", "level": "important",
+      "user_agent": "Mozilla/5.0 (Linux; Android 15) Chrome/141.0", "created_at": "2026-11-07T08:00:00+00:00",
+      "last_success_at": null }
+  ]
+}
+```
+
+`public_key` is the VAPID public key (base64url) that a browser subscribes
+with. `last_success_at` is when a push service last took a notification for
+the browser.
+
+#### `POST /api/push/subscriptions`
+
+The body is `PushSubscription.toJSON()` of the browser and a level:
+`{endpoint, keys: {p256dh, auth}, level}`. `level` is `important` (the
+default) or `all`. The endpoint must be an https URL of a browser push
+service (`fcm.googleapis.com`, `updates.push.services.mozilla.com`,
+`*.push.apple.com`, `*.notify.windows.com`) on the default port, with at most
+2048 characters; `p256dh` must be a point on P-256 and `auth` 16 bytes.
+Otherwise `400`. A second
+`POST` for the same endpoint changes its keys and level; a `POST` of another
+person moves the browser to that person. `409` when the person has 20
+browsers already. The answer is the browser as in the list.
+
+#### `DELETE /api/push/subscriptions/{id}`
+
+Turns push off for one browser of this person. `404` when the person has no
+browser with this id.
 
 ### Actors
 

@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import type { NotificationLevel } from '../api/settings';
+import { workerSupported } from '../utils/webPush';
 
 /**
  * What this browser can do about system alerts: a permission of the
@@ -33,14 +34,16 @@ export function alertSupport(): AlertSupport {
   if (!window.isSecureContext) return 'insecure';
   const Alert = window.Notification;
   if (typeof Alert !== 'function') return 'unsupported';
-  if (Alert.permission !== 'granted' && !constructs(Alert)) return 'unsupported';
+  if (Alert.permission !== 'granted' && !workerSupported() && !constructs(Alert)) return 'unsupported';
   return Alert.permission;
 }
 
 /**
  * Some phone browsers have the Notification API but show alerts only through
- * a service worker, so the constructor throws. Without permission the
- * constructor shows nothing, so the check is safe then.
+ * a service worker, so the constructor throws. The panel's worker shows the
+ * alerts where the browser runs it, so only a browser without one needs this
+ * check. Without permission the constructor shows nothing, so the check is
+ * safe then.
  */
 function constructs(Alert: typeof Notification): boolean {
   try {

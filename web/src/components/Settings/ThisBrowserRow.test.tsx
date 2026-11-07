@@ -39,7 +39,6 @@ describe('ThisBrowserRow', () => {
     expect(screen.getByRole('radio', { name: 'Questions and important' })).toHaveAttribute('aria-checked', 'true');
     await userEvent.click(screen.getByRole('radio', { name: 'Everything' }));
     expect(useBrowserAlertStore.getState().level).toBe('all');
-    expect(screen.getByText('Applies to this browser only')).toBeInTheDocument();
   });
 
   it('turns alerts off', async () => {

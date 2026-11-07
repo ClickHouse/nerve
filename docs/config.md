@@ -1757,6 +1757,15 @@ notifications:
     telegram: important
 ```
 
+### Web Push
+
+The fan-out also sends each item as a push notification (channel `webpush`)
+to the browsers where a person turned push on. `notifications.channels` does
+not list it, and `notifications.levels.webpush: important` limits all
+browsers. The instance must reach the push services of the browsers; on Nerve
+Cloud that works only for agents in open internet mode. How push works, the
+VAPID key and the hosts: [web-ui.md](web-ui.md#push-notifications).
+
 ## Quiet Hours
 
 | Key | Type | Default | Description |

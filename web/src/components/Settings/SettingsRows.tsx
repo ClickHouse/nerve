@@ -1,7 +1,8 @@
 import { useId, useState, type KeyboardEvent, type ReactNode } from 'react';
 import type { NotificationLevel, SettingField } from '../../api/settings';
-import { Button, TextField } from '../ui';
-import { Lock } from '../ui/icons';
+import { useSettingsStore } from '../../stores/settingsStore';
+import { Badge, Button, TextField } from '../ui';
+import { Check, Lock, X } from '../ui/icons';
 import { Field } from '../Setup/Field';
 import { focusRadio, radioTabIndex, radioTarget } from '../Setup/rovingRadio';
 import { canEdit } from './sections';
@@ -83,6 +84,19 @@ export function ManagedNote({ field }: { field: SettingField<unknown> }) {
       <Lock size={12} className="mt-0.5 shrink-0" aria-hidden="true" />
       <span>{field.reason}</span>
     </p>
+  );
+}
+
+/** "Test arrived" or "Test did not arrive" on a row, after a test. */
+export function TestResult({ channel }: { channel: string }) {
+  const entry = useSettingsStore((s) => s.testResult?.results.find((r) => r.channel === channel));
+  if (!entry) return null;
+  return (
+    <div>
+      {entry.delivered
+        ? <Badge tone="success"><Check size={11} aria-hidden="true" />Test arrived</Badge>
+        : <Badge tone="danger"><X size={11} aria-hidden="true" />Test did not arrive</Badge>}
+    </div>
   );
 }
 

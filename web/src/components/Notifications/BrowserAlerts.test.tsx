@@ -4,6 +4,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { WSMessage } from '../../api/websocket';
 import { useBrowserAlertStore } from '../../stores/browserAlertStore';
 import { ALERT_DELAY_MS } from '../../utils/browserAlerts';
+import { OPEN_MESSAGE } from '../../utils/webPush';
+import { stubPushBrowser, unstubPushBrowser } from '../../test/pushFixtures';
 
 const handlers: ((msg: WSMessage) => void)[] = [];
 vi.mock('../../api/websocket', () => ({
@@ -68,9 +70,21 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  unstubPushBrowser();
 });
 
 describe('BrowserAlerts', () => {
+  it('registers the service worker and opens the page that it names after a click', async () => {
+    const worker = stubPushBrowser();
+    renderAlerts();
+    await act(async () => { await Promise.resolve(); });
+    expect(worker.container.register).toHaveBeenCalledWith('/sw.js');
+
+    const [, onMessage] = worker.container.addEventListener.mock.calls[0] as [string, (e: MessageEvent) => void];
+    act(() => onMessage({ data: { type: OPEN_MESSAGE, url: '/notifications' } } as MessageEvent));
+    expect(screen.getByTestId('path')).toHaveTextContent('/notifications');
+  });
+
   it('counts the items that arrive while the tab is not in front', async () => {
     renderAlerts();
     send({});

@@ -239,6 +239,26 @@ class TestSendTest:
         row = await inst.db.get_notification(body["notification_id"])
         assert row["title"] == settings_routes.TEST_TITLE and row["session_id"] == "system"
 
+    async def test_web_push_says_whether_a_push_service_took_the_test(self, inst, monkeypatch):
+        from nerve.notifications import webpush
+
+        await inst.db.save_push_subscription(
+            actor_id=inst.db.system_actor_id, endpoint="https://fcm.googleapis.com/fcm/send/x",
+            p256dh="key", auth="auth", level="all", user_agent="",
+        )
+        monkeypatch.setattr(webpush, "deliver", AsyncMock(return_value=True))
+        engine = MagicMock()
+        service = NotificationService(get_config(), inst.db, engine)
+        monkeypatch.setattr(service, "_deliver_web", AsyncMock())
+        monkeypatch.setattr(service, "_deliver_telegram", AsyncMock(return_value=None))
+        monkeypatch.setattr(service, "_deliver_slack", AsyncMock(return_value=None))
+        monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(
+            engine=engine, db=inst.db, notification_service=service,
+        ))
+        async with inst.client() as http:
+            response = await http.post(f"{URL}/test")
+        assert response.json()["results"][-1] == {"channel": "webpush", "delivered": True}
+
     async def test_without_a_notification_service_the_test_is_refused(self, inst):
         async with inst.client() as http:
             response = await http.post(f"{URL}/test")
