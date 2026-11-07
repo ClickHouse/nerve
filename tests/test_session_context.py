@@ -178,7 +178,11 @@ def _compact_frames() -> list:
         ev.SystemEvent("compact_boundary", {"compact_metadata": {
             "trigger": "manual", "pre_tokens": 35177, "post_tokens": 2300,
         }}),
-        ev.TurnCompleted(native_session_id="native-1", usage=ev.NormalizedUsage()),
+        # The CLI reports zero usage and its cumulative cost for a compact.
+        ev.TurnCompleted(
+            native_session_id="native-1", usage=ev.NormalizedUsage(),
+            total_cost_usd=0.3564, num_turns=0,
+        ),
     ]
 
 
@@ -199,7 +203,8 @@ async def api(db, tmp_path, bypass_auth, monkeypatch):
         "input_tokens": 10, "cache_read_input_tokens": 60000,
         "cache_creation_input_tokens": 6000, "output_tokens": 400,
         "max_context_tokens": 200000, "num_turns": 2,
-    }})
+    }, "_sdk_cumulative_cost": 0.2619})
+    await db.update_session_fields(SID, {"total_cost_usd": 0.2619})
     sent: list[dict] = []
 
     async def _listen(_sid, msg):
@@ -286,6 +291,9 @@ async def test_context_of_an_unknown_session_404(api):
 async def test_compact_runs_as_a_turn_and_returns_the_new_context(api):
     client = _Client(_compact_frames())
     api.engine.sessions.set_client(SID, client)
+    # A runtime about to be recycled by the idle sweep.
+    api.engine.sessions._last_activity[SID] = asyncio.get_running_loop().time() - 3600
+    assert SID in api.engine.sessions.get_idle_client_ids(1800)
     response = await api.client.post(f"/api/sessions/{SID}/compact")
     assert response.status_code == 200
     assert response.json() == {"session_id": SID, "live": True, "can_compact": True, **COMPACTED}
@@ -299,21 +307,22 @@ async def test_compact_runs_as_a_turn_and_returns_the_new_context(api):
     assert running == [True, False]
     (done,) = [m for m in api.sent if m["type"] == "done"]
     assert done["usage"]["context_tokens"] == COMPACTED["total_tokens"]
-    assert done["max_context_tokens"] == 200000 and done["num_turns"] == 2
+    assert done["max_context_tokens"] == 200000 and done["num_turns"] == 1
     assert not api.engine.sessions.is_running(SID)
+    assert SID not in api.engine.sessions.get_idle_client_ids(1800)
 
-    # The context bar reads it after a reload; the last turn's tokens stay.
+    # The context bar reads it after a reload.
     usage = await _last_usage(api.db)
     assert usage["context_tokens"] == COMPACTED["total_tokens"]
-    assert usage["cache_read_input_tokens"] == 60000
+    assert usage["input_tokens"] == 0 and usage["max_context_tokens"] == 200000
 
-    # Nothing in the transcript, one event that says who compacted.
+    # The compact's cost is the session's, as for any turn.
+    session = await api.db.get_session(SID)
+    assert session["total_cost_usd"] == pytest.approx(0.3564)
+    assert json.loads(session["metadata"])["_sdk_cumulative_cost"] == pytest.approx(0.3564)
+
+    # Nothing in the transcript.
     assert await api.db.get_messages(SID) == []
-    events = await api.db.get_session_events(SID)
-    (compacted,) = [e for e in events if e["event_type"] == "context_compacted"]
-    details = compacted["details"]
-    details = json.loads(details) if isinstance(details, str) else details
-    assert details == {"pre_tokens": 35177, "post_tokens": 2300}
 
 
 @pytest.mark.asyncio
@@ -330,13 +339,13 @@ async def test_compact_with_nothing_to_compact_shows_no_reply(api):
     }
     assert not [m for m in api.sent if m["type"] == "token"]
     assert await api.db.get_messages(SID) == []
-    assert "context_tokens" not in await _last_usage(api.db)
+    # The bar shows the measured use, which did not change.
     (done,) = [m for m in api.sent if m["type"] == "done"]
-    assert "usage" not in done
+    assert done["usage"]["context_tokens"] == BREAKDOWN["total_tokens"]
 
 
 @pytest.mark.asyncio
-async def test_a_failed_compact_is_502_and_keeps_nothing(api):
+async def test_a_failed_compact_is_502_and_shows_no_reply(api):
     api.engine.sessions.set_client(SID, _Client([
         ev.TurnCompleted(status="failed", error="API error (HTTP 529)"),
     ]))
@@ -344,7 +353,9 @@ async def test_a_failed_compact_is_502_and_keeps_nothing(api):
     assert response.status_code == 502
     detail = _detail(response)
     assert detail["code"] == "failed" and "HTTP 529" in detail["message"]
-    assert "context_tokens" not in await _last_usage(api.db)
+    assert not [m for m in api.sent if m["type"] == "token"]
+    assert await api.db.get_messages(SID) == []
+    assert (await _last_usage(api.db))["context_tokens"] == BREAKDOWN["total_tokens"]
 
 
 @pytest.mark.asyncio
