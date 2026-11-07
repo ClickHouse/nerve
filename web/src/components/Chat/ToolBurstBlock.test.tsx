@@ -1,4 +1,4 @@
-import { render, screen } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it, vi } from 'vitest';
@@ -81,16 +81,31 @@ describe('ToolBurstBlock', () => {
       .toHaveAttribute('aria-expanded', 'false');
   });
 
-  it('never hides a question card in a finished turn', () => {
+  it('never hides a question card in a finished turn', async () => {
     show([
       call('Read', { file_path: 'a.ts' }), call('Bash', { command: 'ls' }),
       call('mcp__nerve__ask_user', { title: 'Merge the PR now?' }, { result: 'Question sent (ask-0000beef).' }),
       call('Read', { file_path: 'b.ts' }), call('Bash', { command: 'pwd' }),
       text('I wait for the answer.'),
     ]);
+    await act(async () => {}); // the card reads its question
     expect(screen.getByText('Merge the PR now?')).toBeInTheDocument();
     const lines = screen.getAllByRole('button', { name: 'Read 1 file, ran 1 command' });
     expect(lines.map(b => b.getAttribute('aria-expanded'))).toEqual(['false', 'false']);
+  });
+
+  it('says "Running" to a screen reader while a call of a folded burst runs', () => {
+    const view = show([
+      ...BURST.slice(0, -1),
+      call('Bash', { command: 'npm test -- login' }, { status: 'running', result: undefined }),
+    ]);
+    const button = screen.getByRole('button', { name: /^Read 1 file, ran 2 commands, edited 1 file\W+1 failed\W*Running$/ });
+    expect(button).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByText('Running')).toHaveClass('sr-only');
+
+    view.rerender(BURST);
+    expect(line()).toBeInTheDocument();
+    expect(screen.queryByText('Running')).toBeNull();
   });
 
   it('shows a burst of one call as its row, with no summary line', () => {
