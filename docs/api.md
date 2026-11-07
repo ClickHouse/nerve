@@ -806,9 +806,26 @@ Sidebar feed: one page of conversations plus every starred session.
 
 `sessions` is a single page of the conversation feed (page size = `sessions.sidebar_page_size`, default 50; `0` = unlimited). The window covers only non-archived, non-system (cron/hook), non-starred rows, so cron traffic can never displace conversations. On the first page (`offset=0`) all starred sessions are prepended in full and are never truncated; pass the returned `next_offset` back as `?offset=N` to load subsequent pages. `archived_count`/`system_count` are the collapsed-group badge counts, and `has_more`/`next_offset` drive the "…" load-more control.
 
+The first page also contains every non-archived session that needs the user, of any source and outside the page window, so a later page can repeat one of them. A cron session with a pending plan is an example. `has_more`, `next_offset` and the counts do not include these rows.
+
+Each row of this list, and of the archived, system and search lists, has an `attention` object:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `questions` | integer | Pending `ask_user` questions of the session. |
+| `approvals` | integer | Pending approvals (`propose_action`) of the session. |
+| `plans` | integer | Pending plans that the session proposed. |
+| `awaiting_input` | boolean | A question inside a running turn (equal to `awaiting_input` of the row). |
+| `review` | boolean | The newest review loop of the session waits for a decision. |
+
+A session needs the user when a count is above zero or a boolean is true.
+
 ```json
 Response: {
-  "sessions": [{ "id": "main", "title": "Main", "source": "system", "updated_at": "..." }],
+  "sessions": [{
+    "id": "main", "title": "Main", "source": "system", "updated_at": "...",
+    "attention": { "questions": 1, "approvals": 0, "plans": 0, "awaiting_input": false, "review": false }
+  }],
   "archived_count": 12,
   "system_count": 3,
   "has_more": true,

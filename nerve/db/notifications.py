@@ -479,6 +479,23 @@ class NotificationStore:
                 )
         return True
 
+    async def count_pending_by_session(self) -> dict[str, dict[str, int]]:
+        """Pending questions and approvals, counted per session and type.
+
+        Returns ``{session_id: {"question": n, "approval": m}}`` with only
+        the sessions and types that have pending rows.
+        """
+        counts: dict[str, dict[str, int]] = {}
+        async with self.db.execute(
+            """SELECT session_id, type, COUNT(*) FROM notifications
+               WHERE status = 'pending' AND type IN ('question', 'approval')
+                 AND session_id IS NOT NULL
+               GROUP BY session_id, type"""
+        ) as cursor:
+            async for session_id, kind, count in cursor:
+                counts.setdefault(session_id, {})[kind] = count
+        return counts
+
     async def count_pending_notifications(self, channel: str | None = None) -> int:
         sql = "SELECT COUNT(*) FROM notifications WHERE status = 'pending'"
         params: tuple = ()
