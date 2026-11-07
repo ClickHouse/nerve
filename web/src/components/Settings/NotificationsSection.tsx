@@ -5,7 +5,8 @@ import type {
 } from '../../api/settings';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { Badge, Button, Switch } from '../ui';
-import { BellOff, Check, ChevronRight, Monitor, Send, Slack, X } from '../ui/icons';
+import { BellOff, Check, ChevronRight, Monitor, Moon, Send, Slack, X } from '../ui/icons';
+import { QUIET_HOURS_PREFILL } from '../Setup/copy';
 import { Notice } from '../Setup/Notice';
 import { canEdit } from './sections';
 import { CommitField, FileNote, LevelChoice, ManagedNote, SettingRow, SettingsGroup } from './SettingsRows';
@@ -109,6 +110,8 @@ function SectionBody({ data }: { data: NotificationSettings }) {
           <ChatChannelRow key={channel.name} data={data} channel={channel} />
         ))}
       </SettingsGroup>
+
+      <QuietHoursGroup data={data} />
 
       <SilencesLink />
 
@@ -289,6 +292,65 @@ function TestFooter() {
       </Button>
       <p role={error ? 'alert' : 'status'} className={`text-xs ${error ? 'text-error' : 'text-text-dim'}`}>{line}</p>
     </div>
+  );
+}
+
+/**
+ * Quiet hours: one switch for both times (on fills in the times that Setup
+ * offers, off empties both), then a time field for each. The times are in
+ * the instance's time zone, which can differ from the browser's.
+ */
+function QuietHoursGroup({ data }: { data: NotificationSettings }) {
+  const titleId = useId();
+  const start = useSetting(data, 'quiet_start');
+  const end = useSetting(data, 'quiet_end');
+  const save = useSettingsStore((s) => s.saveNotifications);
+  const on = Boolean(start.field.value && end.field.value);
+  const busy = start.busy || end.busy;
+  const toggle = (next: boolean) => {
+    if (busy) return;
+    void save(next
+      ? { quiet_start: QUIET_HOURS_PREFILL.start, quiet_end: QUIET_HOURS_PREFILL.end }
+      : { quiet_start: '', quiet_end: '' });
+  };
+  const time = (setting: typeof start, label: string) => (
+    <CommitField
+      key={`${label}-${setting.field.value}`}
+      type="time"
+      label={label}
+      value={setting.field.value}
+      error={setting.error}
+      disabled={!setting.editable}
+      busy={setting.busy}
+      onCommit={(text) => void setting.save(text)}
+    />
+  );
+  return (
+    <SettingsGroup title="Quiet hours" description="Notifications still arrive, without sound. Slack follows its own settings.">
+      <SettingRow
+        icon={<Moon size={16} />}
+        title="No sound except urgent"
+        titleId={titleId}
+        description={`Every day, in ${data.quiet_hours.timezone} time.`}
+        control={(
+          <>
+            {on && data.quiet_hours.active && <Badge tone="info">Quiet now</Badge>}
+            <Switch
+              checked={on}
+              aria-labelledby={titleId}
+              aria-busy={busy || undefined}
+              disabled={!start.editable || !end.editable}
+              onChange={toggle}
+            />
+          </>
+        )}
+      >
+        {on && <div className="flex flex-wrap gap-3">{time(start, 'Start')}{time(end, 'End')}</div>}
+        {!on && (start.error || end.error) && <p role="alert" className="text-xs text-error">{start.error ?? end.error}</p>}
+        <ManagedNote field={start.field.state === 'managed' ? start.field : end.field} />
+        <FileNote fields={[start.field, end.field]} />
+      </SettingRow>
+    </SettingsGroup>
   );
 }
 

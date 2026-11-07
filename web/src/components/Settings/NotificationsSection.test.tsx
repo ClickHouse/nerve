@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -38,10 +38,13 @@ function settings(over: Partial<NotificationSettings> = {}, fields: Partial<Noti
       'notifications.telegram_chat_id': field<number | null>(null),
       'notifications.default_expiry_hours': field(48),
       'notifications.max_redeliveries': field(3),
+      quiet_start: field('22:00'),
+      quiet_end: field('07:00'),
       ...fields,
     },
     slack: { connected: true, channel_name: 'alerts' },
     telegram: { connected: true },
+    quiet_hours: { timezone: 'Europe/Berlin', active: false },
     ...over,
   };
 }
@@ -211,6 +214,55 @@ describe('NotificationsSection', () => {
     await renderSection();
     await userEvent.click(within(row('Slack')).getByRole('radio', { name: 'Questions and important' }));
     expect(await screen.findByText(/did not reload: cron \(the cron file is not valid\)/)).toBeInTheDocument();
+  });
+
+  it('switches quiet hours on with both default times, and off with both empty', async () => {
+    const off = settings({}, { quiet_start: field(''), quiet_end: field('') });
+    api.saveSettingsNotifications.mockResolvedValueOnce({ ...settings(), reload_errors: {} });
+    await renderSection(off);
+    const quiet = screen.getByRole('switch', { name: 'No sound except urgent' });
+    expect(quiet).toHaveAttribute('aria-checked', 'false');
+    expect(screen.queryByLabelText('Start')).not.toBeInTheDocument();
+
+    await userEvent.click(quiet);
+
+    expect(api.saveSettingsNotifications).toHaveBeenCalledWith({ quiet_start: '22:00', quiet_end: '07:00' });
+    expect(await screen.findByLabelText('Start')).toHaveValue('22:00');
+    expect(screen.getByLabelText('End')).toHaveValue('07:00');
+
+    api.saveSettingsNotifications.mockResolvedValueOnce({ ...off, reload_errors: {} });
+    await userEvent.click(screen.getByRole('switch', { name: 'No sound except urgent' }));
+    expect(api.saveSettingsNotifications).toHaveBeenLastCalledWith({ quiet_start: '', quiet_end: '' });
+    await waitFor(() => expect(screen.queryByLabelText('Start')).not.toBeInTheDocument());
+  });
+
+  it('saves a quiet time when its field loses focus, in the instance time zone', async () => {
+    api.saveSettingsNotifications.mockRejectedValue(refusal(400, {
+      detail: 'Use two different times.', field: 'quiet_end',
+    }));
+    await renderSection(settings({ quiet_hours: { timezone: 'Europe/Berlin', active: true } }));
+    const quiet = row('No sound except urgent');
+    expect(within(quiet).getByText('Every day, in Europe/Berlin time.')).toBeInTheDocument();
+    expect(within(quiet).getByText('Quiet now')).toBeInTheDocument();
+    const end = within(quiet).getByLabelText('End');
+
+    fireEvent.change(end, { target: { value: '22:00' } });
+    fireEvent.blur(end);
+
+    await waitFor(() => expect(api.saveSettingsNotifications).toHaveBeenCalledWith({ quiet_end: '22:00' }));
+    expect(await within(quiet).findByRole('alert')).toHaveTextContent('Use two different times.');
+    expect(end).toHaveAttribute('aria-invalid', 'true');
+  });
+
+  it('keeps the quiet hours switch off limits when the environment sets a time', async () => {
+    const reason = 'Set by the environment (a ${VAR} reference in the configuration).';
+    await renderSection(settings({}, { quiet_end: field('07:00', { state: 'managed', file: null, reason }) }));
+    const quiet = row('No sound except urgent');
+    expect(screen.getByRole('switch', { name: 'No sound except urgent' })).toBeDisabled();
+    expect(within(quiet).getByLabelText('Start')).toBeEnabled();
+    expect(within(quiet).getByLabelText('End')).toBeDisabled();
+    expect(within(quiet).getByText(reason)).toBeInTheDocument();
+    expect(within(quiet).getByText('Saved in settings.yaml')).toBeInTheDocument();
   });
 
   it('links to the silences manager', async () => {
