@@ -1,10 +1,9 @@
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
-import { useIsMobile } from '../../hooks/useMediaQuery';
+import { Link } from 'react-router-dom';
 import { alertsOn, useBrowserAlertStore } from '../../stores/browserAlertStore';
 import { useNotificationStore, type Notification } from '../../stores/notificationStore';
 import { Button } from '../ui';
-import { BellRing } from '../ui/icons';
+import { BellRing, ChevronRight } from '../ui/icons';
 
 export const ALERT_SETTINGS_PATH = '/settings/notifications';
 
@@ -57,23 +56,21 @@ export function BrowserAlertOffer({ notif }: { notif: Notification }) {
 }
 
 /**
- * The Notifications page's way to the alert settings, with their state in
- * this browser. Not on a phone, where the page header has no room for it.
+ * The Notifications page's way to the alert settings: one line above the
+ * list, with the state of the alerts in this browser.
  */
 export function BrowserAlertsLink() {
   const on = useBrowserAlertStore(alertsOn);
-  const navigate = useNavigate();
-  const mobile = useIsMobile();
-  if (mobile) return null;
   return (
-    <Button
-      variant="pill"
-      className="rounded-lg whitespace-nowrap"
-      title="Browser alerts, in Settings"
-      onClick={() => navigate(ALERT_SETTINGS_PATH)}
-    >
-      <BellRing size={13} aria-hidden="true" />
-      {on ? 'Alerts on' : 'Alerts off'}
-    </Button>
+    <div className="mx-auto mb-3 flex max-w-3xl">
+      <Link
+        to={ALERT_SETTINGS_PATH}
+        className="inline-flex min-h-11 items-center gap-1.5 text-xs text-text-dim hover:text-text-muted md:min-h-0"
+      >
+        <BellRing size={13} aria-hidden="true" />
+        {on ? 'Browser alerts are on' : 'Browser alerts are off'}
+        <ChevronRight size={12} aria-hidden="true" />
+      </Link>
+    </div>
   );
 }

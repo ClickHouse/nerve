@@ -369,7 +369,6 @@ export function NotificationsPage() {
         }
         actions={
           <>
-          <BrowserAlertsLink />
           {/* A toggle, not a filter chip, so it keeps the rounded-lg button
               shape — `pill` supplies the same active treatment either way. */}
           <Button variant="pill" active={showSilences}
@@ -390,6 +389,7 @@ export function NotificationsPage() {
       />
 
       <div className="flex-1 overflow-y-auto p-4 md:p-6">
+        <BrowserAlertsLink />
         {showSilences && <SilencesPanel />}
         {loading ? (
           <div className="text-text-faint text-center py-10">Loading...</div>

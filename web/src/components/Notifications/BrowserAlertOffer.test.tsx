@@ -2,6 +2,7 @@ import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { MOBILE_QUERY } from '../../hooks/useMediaQuery';
 import { useBrowserAlertStore } from '../../stores/browserAlertStore';
 import { useNotificationStore, type Notification } from '../../stores/notificationStore';
 import { stubBrowser } from '../../test/browserAlertFixtures';
@@ -81,10 +82,15 @@ describe('BrowserAlertOffer', () => {
 });
 
 describe('BrowserAlertsLink', () => {
-  it('shows the state of this browser', () => {
+  it('links to the setting with the state of this browser, also on a phone', () => {
+    const stub = window.matchMedia;
+    const matchMedia = vi.spyOn(window, 'matchMedia').mockImplementation(
+      (query: string) => ({ ...stub(query), matches: query === MOBILE_QUERY }),
+    );
     stubBrowser({ permission: 'granted' });
     useBrowserAlertStore.setState({ enabled: true });
     render(<MemoryRouter><BrowserAlertsLink /></MemoryRouter>);
-    expect(screen.getByRole('button', { name: 'Alerts on' })).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Browser alerts are on' })).toHaveAttribute('href', '/settings/notifications');
+    matchMedia.mockRestore();
   });
 });
