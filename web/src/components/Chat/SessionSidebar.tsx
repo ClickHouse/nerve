@@ -13,8 +13,8 @@ import { useActorAttributionLabel } from '../../hooks/useActorAttribution';
 import { useModalSurface } from '../../hooks/useModalSurface';
 import { safeAreaInsets } from '../../utils/safeArea';
 import { forkChat } from '../../utils/forkChat';
-import { ATTENTION_TONE, needsYou } from '../../utils/sessionAttention';
-import { AttentionReason, SessionListSummary } from './SessionAttention';
+import { ATTENTION_TONE, blockedOnYou, needsYou } from '../../utils/sessionAttention';
+import { AttentionReason, SessionListSummary, WaitingMark } from './SessionAttention';
 
 /** Strip leading '#' and 'Implement: ' prefixes from generated titles. */
 function cleanTitle(session: Session): string {
@@ -987,27 +987,11 @@ function StatusIndicator({ session, isActive, isRunning }: {
   isActive: boolean;
   isRunning: boolean;
 }) {
-  // Waiting for user input (AskUserQuestion / plan mode): pulsing blue dot.
-  // Takes priority over the running spinner/dot — the session is paused, not
-  // working, and needs the user's attention.
-  if (session.awaiting_input) {
-    return (
-      <span className="relative flex h-2 w-2 shrink-0" title="Waiting for your input">
-        <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-blue opacity-75" />
-        <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-blue" />
-      </span>
-    );
-  }
-
-  // Review loop parked on a decision: pulsing orange dot — same "needs you"
-  // urgency class as awaiting_input.
-  if (session.review_loop?.status === 'awaiting_user') {
-    return (
-      <span className="relative flex h-2 w-2 shrink-0" title="Review loop needs your decision">
-        <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-orange opacity-75" />
-        <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-orange" />
-      </span>
-    );
+  // Blocked on the user (a question, an approval, a review loop on a
+  // decision): a red "!" in place of the dot. A running turn keeps its dot,
+  // except when the turn itself waits (AskUserQuestion / plan mode).
+  if (session.awaiting_input || (!isRunning && blockedOnYou(session))) {
+    return <WaitingMark session={session} />;
   }
 
   // Review loop leg working: the observer session itself is idle (legs run

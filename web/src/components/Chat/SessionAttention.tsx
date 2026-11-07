@@ -12,6 +12,20 @@ export function AttentionReason({ session }: { session: Session }) {
   );
 }
 
+/** Status mark of a session that is blocked on the user: a red "!", no pulse. */
+export function WaitingMark({ session }: { session: Session }) {
+  return (
+    <span
+      role="img"
+      aria-label="Waiting for you"
+      title={attentionReasons(session).join(' · ')}
+      className="inline-flex w-2 shrink-0 justify-center text-sm font-extrabold leading-none text-error"
+    >
+      !
+    </span>
+  );
+}
+
 /** One line above the session list: "2 need you · 3 running". */
 export function SessionListSummary({ needsYou, running }: { needsYou: number; running: number }) {
   return (
