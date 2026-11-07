@@ -146,11 +146,14 @@ async def _newest_review_loops(deps) -> dict[str, dict]:
 
         if get_review_loop_service() is None:
             return {}
-        loops = await deps.db.list_review_loops(limit=100)
+        recent = await deps.db.list_review_loops(limit=100)
+        # An open loop older than the recent ones can still wait for the
+        # user, so it counts too (oldest first, so reversed below).
+        open_loops = await deps.db.get_open_review_loops()
     except Exception:  # noqa: BLE001 — enrichment must never break listing
         return {}
     newest: dict[str, dict] = {}
-    for lp in loops:  # newest first
+    for lp in [*recent, *reversed(open_loops)]:  # newest first
         sid = lp.get("session_id")
         if sid and sid not in newest:
             newest[sid] = lp
