@@ -2654,6 +2654,14 @@ class AgentEngine:
             "background_count": self.agents.live_count(session_id),
         })
 
+    def get_live_codex_parent_cost(self, session_id: str) -> float:
+        """Token-priced active Codex parent usage, before its turn is persisted."""
+        if not self.is_session_running(session_id):
+            return 0.0
+        client = self.sessions.get_client(session_id)
+        getter = getattr(client, "live_parent_cost", None)
+        return getter() if callable(getter) else 0.0
+
     def get_codex_ultracode_run_ids(self, session_id: str) -> set[str] | None:
         """Ultracode run ids the session's live Codex client attributed to
         its current turn, or None when unavailable (no client / claude

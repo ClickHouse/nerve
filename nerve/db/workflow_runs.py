@@ -174,6 +174,15 @@ class WorkflowRunStore:
         )
         return (result.rowcount or 0) == 1
 
+    async def update_running_workflow_spend(self, run_id: str, spent: float) -> dict | None:
+        """Meter only a still-running row; a late sample cannot alter a terminal run."""
+        await self._write(
+            """UPDATE workflow_runs SET spent_usd=?,
+            updated_at=? WHERE id=? AND status='running'""",
+            (spent, utc_now_iso(), run_id),
+        )
+        return await self.get_workflow_run(run_id)
+
     async def transition_workflow_run(
         self,
         run_id: str,

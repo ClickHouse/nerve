@@ -4,6 +4,7 @@ import { Link, useInRouterContext } from 'react-router-dom';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { CodeBlock } from './CodeBlock';
+import { MermaidBlock } from './MermaidBlock';
 
 /**
  * A page of this app, such as `/plans/plan-1`. `//host` is another site, and
@@ -70,6 +71,9 @@ export const MarkdownContent = memo(function MarkdownContent({ content }: { cont
             return <>{children}</>;
           },
           code({ className, children, ...props }) {
+            if (className?.includes('language-mermaid') && typeof children === 'string') {
+              return <MermaidBlock source={children} />;
+            }
             const isBlock = className?.includes('language-') || className?.includes('hljs') || (typeof children === 'string' && children.includes('\n'));
             if (isBlock) {
               return <CodeBlock className={className}>{children}</CodeBlock>;

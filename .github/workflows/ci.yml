@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
   workflow_dispatch:
 
 # Cancel superseded runs on the same branch/PR (e.g. rapid pushes). Never a push
@@ -76,6 +75,7 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
           BEFORE: ${{ github.event.before }}
+          IS_FORK: ${{ github.event.repository.fork }}
         run: |
           if [ "$GITHUB_EVENT_NAME" = push ]; then
             git fetch --no-tags --depth=1 origin "$BEFORE"
@@ -84,7 +84,11 @@ jobs:
             git fetch --no-tags --depth=1 origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
             base=origin/$BASE_REF
           fi
-          python3 scripts/check_migration_numbers.py "$base"
+          if [ "$IS_FORK" = true ]; then
+            python3 scripts/check_migration_numbers.py --fork "$base"
+          else
+            python3 scripts/check_migration_numbers.py "$base"
+          fi
 
   frontend-build:
     name: Frontend build (Vite)

@@ -1038,7 +1038,7 @@ async function send(
   throw error;
 }
 
-async function request<T>(path: string, options: RequestInit = {}, authenticate = true): Promise<T> {
+export async function request<T>(path: string, options: RequestInit = {}, authenticate = true): Promise<T> {
   const res = await send(path, options, {
     'Content-Type': 'application/json',
     ...(options.headers as Record<string, string> || {}),

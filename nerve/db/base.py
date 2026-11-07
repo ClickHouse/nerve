@@ -39,6 +39,7 @@ from nerve.db.observations import ObservationStore
 from nerve.db.onboarding import OnboardingStore
 from nerve.db.plans import PlanStore
 from nerve.db.review_loops import ReviewLoopStore
+from nerve.db.code_review import CodeReviewStore
 from nerve.db.sessions import SessionStore
 from nerve.db.skills import SkillStore
 from nerve.db.sources import SourceStore
@@ -359,6 +360,7 @@ class Database(
     WakeupStore,
     WorkflowRunStore,
     ReviewLoopStore,
+    CodeReviewStore,
     AccountStore,
     MaintenanceStore,
     AgentStore,

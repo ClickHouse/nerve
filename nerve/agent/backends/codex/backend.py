@@ -792,6 +792,7 @@ class CodexClient(AgentClient):
         self._items: dict[str, dict] = {}
         # Latest thread/tokenUsage/updated for the active turn.
         self._turn_usage: dict | None = None
+        self._turn_usage_completed = False
         # Cumulative `total` at the end of the previous turn on this client,
         # kept across turns; the baseline for the next turn's delta when known.
         self._prev_total_usage: dict | None = None
@@ -1483,6 +1484,7 @@ class CodexClient(AgentClient):
             logger.warning("Snapshot failed for %s: %s", path, e)
 
     def _map_turn_completed(self, params: dict) -> ev.TurnCompleted:
+        self._turn_usage_completed = True
         turn = params.get("turn") or {}
         status = str(turn.get("status") or "completed").lower()
         if status not in ("completed", "interrupted", "failed"):
@@ -1580,8 +1582,21 @@ class CodexClient(AgentClient):
         """Clear per-turn token-accounting state (latest tokenUsage payload,
         turn-start cumulative baseline, response count) at turn start."""
         self._turn_usage = None
+        self._turn_usage_completed = False
         self._turn_total_base = None
         self._turn_response_count = 0
+
+    def live_parent_cost(self) -> float:
+        """Current parent turn's API-equivalent cost, excluding child journals.
+
+        Use the same delta and pricing as final accounting, without advancing
+        its baseline. Completion hands the charge to persisted turn usage.
+        """
+        if self._turn_usage_completed:
+            return 0.0
+        baseline = self._prev_total_usage if self._prev_total_usage is not None else self._turn_total_base
+        usage = self._normalize_usage(self._turn_usage, baseline)
+        return compute_cost(self.model, usage, self._backend.codex.pricing) or 0.0
 
     def _capture_turn_total_base(self, usage: dict) -> None:
         """Record the fallback turn-start baseline from the turn's first

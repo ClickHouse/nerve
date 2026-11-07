@@ -23,6 +23,7 @@ export const NAV_ITEMS: NavItem[] = [
   { path: '/chat', icon: MessageSquare, label: 'Chat' },
   { path: '/notifications', icon: Bell, label: 'Notifs' },
   { path: '/files', icon: FolderOpen, label: 'Files' },
+  { path: '/tasks-code-review', icon: CheckSquare, label: 'Tasks Code Review' },
   { path: '/tasks', icon: CheckSquare, label: 'Tasks' },
   { path: '/plans', icon: Lightbulb, label: 'Plans' },
   { path: '/skills', icon: Sparkles, label: 'Skills' },

@@ -6,6 +6,8 @@ Supports ~ expansion in paths and environment variable references.
 
 from __future__ import annotations
 
+from nerve.code_review.config import CodeReviewConfig
+
 import json
 import logging
 import os
@@ -3982,6 +3984,7 @@ class NerveConfig:
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     ollama: OllamaConfig = field(default_factory=OllamaConfig)
     codex: CodexConfig = field(default_factory=CodexConfig)
+    code_review: CodeReviewConfig = field(default_factory=CodeReviewConfig)
     workflows: WorkflowRunsConfig = field(default_factory=WorkflowRunsConfig)
     houseofagents: HouseOfAgentsConfig = field(default_factory=HouseOfAgentsConfig)
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
@@ -4395,6 +4398,7 @@ class NerveConfig:
             proxy=ProxyConfig.from_dict(d.get("proxy", {})),
             ollama=OllamaConfig.from_dict(d.get("ollama", {})),
             codex=CodexConfig.from_dict(d.get("codex", {})),
+            code_review=CodeReviewConfig.from_dict(d.get("code_review", {})),
             workflows=WorkflowRunsConfig.from_dict(d.get("workflows", {})),
             houseofagents=HouseOfAgentsConfig.from_dict(d.get("houseofagents", {})),
             langfuse=LangfuseConfig.from_dict(d.get("langfuse", {})),

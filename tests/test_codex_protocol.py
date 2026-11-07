@@ -353,7 +353,9 @@ async def test_fallback_to_last_when_total_absent(tmp_path):
         "tokenUsage": {"last": _tok(10, 4, 2), "modelContextWindow": 400_000},
     }) == []
     assert client._turn_total_base is None        # nothing to anchor a delta to
+    assert client.live_parent_cost() > 0
     done = _complete(client)
+    assert client.live_parent_cost() == 0
     assert done.usage.input_tokens == 6           # 10 - 4 cached
     assert done.usage.cache_read_tokens == 4
     assert done.usage.output_tokens == 2
@@ -496,3 +498,28 @@ async def test_context_window_exceeded_reset_rebaselines_to_zero(tmp_path):
     assert done2.usage.input_tokens == 5_000        # 10k - 5k cached
     assert done2.usage.cache_read_tokens == 5_000
     assert done2.usage.output_tokens == 500
+
+
+@pytest.mark.asyncio
+async def test_live_parent_cost_tracks_turn_delta_and_completion(tmp_path):
+    client = _client(tmp_path, pricing={'example': {'input': 10, 'cached_input': 1, 'output': 50}})
+    client.model = 'example'
+    # A resumed thread's earlier usage must not be attributed to this turn.
+    await _feed_usage(client, _tok(1100, 220, 110), _tok(100, 20, 10))
+    assert client.live_parent_cost() == pytest.approx(0.00132)
+    await _feed_usage(client, _tok(1300, 250, 150), _tok(200, 30, 40))
+    assert client.live_parent_cost() == pytest.approx(0.00505)
+    assert client.live_parent_cost() == pytest.approx(0.00505)  # reading is pure
+    done = _complete(client)
+    assert client.live_parent_cost() == 0
+    assert compute_cost(client.model, done.usage, client._backend.codex.pricing) == pytest.approx(0.00505)
+    client._reset_turn_usage_accounting()
+    await _feed_usage(client, _tok(1400, 270, 160), _tok(100, 20, 10))
+    assert client.live_parent_cost() == pytest.approx(0.00132)
+    # Failed turn counter reset and the following fresh turn retain final semantics.
+    await _feed_usage(client, _tok(0, 0, 0), _tok(0, 0, 0))
+    _complete(client, status='failed')
+    assert client.live_parent_cost() == 0
+    client._reset_turn_usage_accounting()
+    await _feed_usage(client, _tok(100, 20, 10), _tok(100, 20, 10))
+    assert client.live_parent_cost() == pytest.approx(0.00132)

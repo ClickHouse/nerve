@@ -14,6 +14,8 @@ import { HostedProblemScreen } from './components/Auth/HostedProblemScreen';
 import { AppShell } from './components/Layout/AppShell';
 import { ChatPage } from './pages/ChatPage';
 import { FilesPage } from './pages/FilesPage';
+import { TasksCodeReviewPage } from './pages/TasksCodeReviewPage';
+import { CodeReviewDetailPage } from './pages/CodeReviewDetailPage';
 import { TasksPage } from './pages/TasksPage';
 import { TaskDetailPage } from './pages/TaskDetailPage';
 import { TaskDetailModal } from './components/Tasks/TaskDetailModal';
@@ -115,6 +117,8 @@ function App() {
           <Route path="/" element={<Home />} />
           <Route path="/chat/:sessionId?" element={<ChatPage />} />
           <Route path="/files/*" element={<FilesPage />} />
+          <Route path="/tasks-code-review" element={<TasksCodeReviewPage />} />
+          <Route path="/tasks-code-review/:prId" element={<CodeReviewDetailPage />} />
           <Route path="/tasks" element={<TasksPage />} />
           <Route path="/tasks/:taskId" element={<TaskDetailPage />} />
           <Route path="/plans" element={<PlansPage />} />
