@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { ws } from '../../api/websocket';
 import { alertsOn, useBrowserAlertStore } from '../../stores/browserAlertStore';
 import { createAlerter, levelWants, tabInFront } from '../../utils/browserAlerts';
+import { OPEN_MESSAGE, registerWorker, workerSupported } from '../../utils/webPush';
 
 const NOTIFICATIONS_PATH = '/notifications';
 const ICON_SIZE = 32;
@@ -13,7 +14,9 @@ const DOT_COLOR = '#e5484d';
 /**
  * The parts of browser alerts that run on every page: system alerts while
  * the tab is not in front, and for the items that arrive while the person
- * is away, "(N)" in the tab title and a dot on the favicon. Renders nothing.
+ * is away, "(N)" in the tab title and a dot on the favicon. It registers the
+ * panel's service worker, which shows the alerts and the push notifications,
+ * and opens the page that the worker names after a click. Renders nothing.
  */
 export function BrowserAlerts() {
   const navigate = useNavigate();
@@ -37,11 +40,20 @@ export function BrowserAlerts() {
       useBrowserAlertStore.getState().refresh();
       if (tabInFront()) setUnseen(0);
     };
+    const worker = workerSupported() ? navigator.serviceWorker : null;
+    const onWorkerMessage = (e: MessageEvent<{ type?: string; url?: unknown }>) => {
+      if (e.data?.type !== OPEN_MESSAGE) return;
+      const url = e.data.url;
+      navigateRef.current(typeof url === 'string' && url.startsWith('/') ? url : NOTIFICATIONS_PATH);
+    };
+    void registerWorker();
+    worker?.addEventListener('message', onWorkerMessage);
     window.addEventListener('focus', onReturn);
     document.addEventListener('visibilitychange', onReturn);
     return () => {
       offMessage();
       alerter.dispose();
+      worker?.removeEventListener('message', onWorkerMessage);
       window.removeEventListener('focus', onReturn);
       document.removeEventListener('visibilitychange', onReturn);
     };

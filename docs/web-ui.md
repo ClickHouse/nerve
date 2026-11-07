@@ -352,7 +352,9 @@ Under lockdown the section is read-only, with one line that says why.
 
 - **Where notifications go**: the Nerve panel (always on), This browser,
   Slack and Telegram. This browser (`ThisBrowserRow`) has the switch and the
-  level of the [browser alerts](#browser-alerts). Slack and Telegram have a
+  level of the [browser alerts](#browser-alerts), the switch of the
+  [push notifications](#push-notifications) and the other devices of the
+  person that get them. Slack and Telegram have a
   switch (`notifications.channels`),
   a destination (the Slack channel ID with the channel name, the Telegram
   chat ID) and "What to send": Everything or Questions and important
@@ -393,7 +395,9 @@ above the list ("Browser alerts are on" or "off") opens the setting.
   while the alert is open, so two tabs that wait the same time give one
   alert. The alert's tag is the notification id.
 - **Click and close:** a click focuses the tab and opens `/notifications`.
-  The alert closes when the item is answered or expires.
+  The alert closes when the item is answered or expires. Where the browser
+  runs the panel's service worker, the worker shows the alert and handles
+  the click (see [Push notifications](#push-notifications)).
 - **Quiet hours:** an item that the server sends with `silent: true` gives an
   alert without sound.
 - **Title and favicon:** while the tab is not in front, its title starts with
@@ -401,9 +405,49 @@ above the list ("Browser alerts are on" or "off") opens the setting.
   dot. Both go away when the tab is in front again. This needs no permission.
 - **Limits:** browsers show alerts only for HTTPS addresses (and
   `localhost`); on plain HTTP the row says "Needs HTTPS". A browser that
-  blocks the site shows "Blocked", and a browser that shows alerts only
-  through a service worker (some phone browsers) shows "Not supported". A
-  tab must be open. The alert has no answer buttons.
+  blocks the site shows "Blocked", and a browser that has no Notification
+  API, or that shows alerts only through a service worker and runs none for
+  the panel, shows "Not supported". A tab must be open. The alert has no
+  answer buttons.
+
+### Push notifications
+
+"Get notifications when no tab is open", in Settings > Notifications > This
+browser, turns on Web Push for the browser. The instance sends each item to
+the push service of the browser, and the panel's service worker (`/sw.js`)
+shows it as a system notification, also when no panel tab is open. A person
+turns it on for each browser, and the server keeps one row for each browser
+(see [api.md](api.md#web-push) and [config.md](config.md#web-push)). Under
+"Your other devices" the row lists the other browsers of the person, with the
+day the person turned push on there and the last notification, and a button
+that removes each one.
+
+- **What arrives:** the level of the row ("What to send") applies to push
+  too. The browser sends it with its subscription.
+- **The notification:** "<agent name>: <title>", the first lines of the
+  body, and the notification id as tag. A click focuses a panel tab, or opens
+  one, at `/notifications`. While a panel tab has focus, the worker shows
+  nothing, because the tab shows the item. At all other times it shows the
+  push, also while a panel tab is open but not in front: browsers require a
+  notification for each push then.
+- **One notification for each item:** the worker also shows the browser
+  alerts of the tabs, with the same tag. The browser keeps one notification
+  for each tag, so an alert and a push for the same item give one
+  notification. The worker also lets phone browsers that show alerts only
+  through a service worker show browser alerts.
+- **Quiet hours:** a push that the server marks `silent` makes no sound.
+- **No offline copy:** the worker has no fetch handler, so every page and
+  asset comes from the server.
+- **Install:** the panel has a web app manifest (`/api/manifest.webmanifest`)
+  with the agent's name, so a browser can install the panel as an app.
+- **Limits:** HTTPS only (and `localhost`). On iPhone and iPad, push works
+  only after "Add to Home Screen" (iOS 16.4 or later), and a Safari tab says
+  so. On Nerve Cloud each agent has its own address, so a device turns push
+  on for each agent. The instance must reach the push services: on Nerve
+  Cloud, an agent in restricted internet mode cannot, so Web Push works only
+  for agents in open mode. With several people on one agent, each person
+  with push on gets every notification. The notification has no answer
+  buttons.
 
 ### Accounts
 

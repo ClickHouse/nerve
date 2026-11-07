@@ -1,8 +1,11 @@
 import { useEffect, useId } from 'react';
+import type { NotificationLevel } from '../../api/settings';
 import { alertsOn, useBrowserAlertStore, type AlertSupport } from '../../stores/browserAlertStore';
+import { thisDevice, usePushStore } from '../../stores/pushStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { Badge, Switch, type BadgeTone } from '../ui';
 import { Globe } from '../ui/icons';
+import { OtherDevices, PushSwitch } from './PushSettings';
 import { LevelChoice, SettingRow } from './SettingsRows';
 
 /** In place of the switch, when this browser cannot show alerts for the panel. */
@@ -26,9 +29,11 @@ const UNAVAILABLE: Partial<Record<AlertSupport, { badge: string; tone: BadgeTone
 
 /**
  * The "This browser" row of the Notifications section: system alerts while
- * a panel tab is open but not in front, and what they include. Kept in this
- * browser (`useBrowserAlertStore`), not on the server, so the row reads and
- * writes none of the section's fields.
+ * a panel tab is open but not in front, push notifications when no tab is
+ * open (`PushSwitch`), what both include, and the other browsers of
+ * this person that get push (`OtherDevices`). The alert choices are kept
+ * in this browser (`useBrowserAlertStore`); push keeps the level with the
+ * browser's subscription. The row writes none of the section's fields.
  */
 export function ThisBrowserRow() {
   const labelId = useId();
@@ -36,10 +41,18 @@ export function ThisBrowserRow() {
   const quietHours = useSettingsStore((s) => Boolean(
     s.notifications?.fields.quiet_start.value && s.notifications.fields.quiet_end.value,
   ));
-  useEffect(() => useBrowserAlertStore.getState().refresh(), []);
+  useEffect(() => {
+    useBrowserAlertStore.getState().refresh();
+    void usePushStore.getState().load();
+  }, []);
 
+  const pushOn = usePushStore((s) => thisDevice(s) !== undefined);
   const unavailable = UNAVAILABLE[alerts.support];
   const on = alertsOn(alerts);
+  const setLevel = (level: NotificationLevel) => {
+    alerts.setLevel(level);
+    void usePushStore.getState().setLevel(level);
+  };
   return (
     <SettingRow
       icon={<Globe size={16} />}
@@ -54,11 +67,13 @@ export function ThisBrowserRow() {
       )}
     >
       {unavailable && <p className="text-xs text-text-dim">{unavailable.help}</p>}
-      {on && <LevelChoice value={alerts.level} disabled={false} busy={false} onChange={alerts.setLevel} />}
-      {on && quietHours && (
+      <PushSwitch />
+      {(on || pushOn) && <LevelChoice value={alerts.level} disabled={false} busy={false} onChange={setLevel} />}
+      {(on || pushOn) && quietHours && (
         <p className="text-xs text-text-dim">During quiet hours, alerts make no sound unless urgent.</p>
       )}
       <p className="text-2xs text-text-faint">Applies to this browser only</p>
+      <OtherDevices />
     </SettingRow>
   );
 }

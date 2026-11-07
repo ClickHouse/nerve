@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   ALERT_BODY_LIMIT, ALERT_CHANNEL, ALERT_DELAY_MS, createAlerter, levelWants, type NotificationEvent,
 } from './browserAlerts';
+import { stubPushBrowser, unstubPushBrowser } from '../test/pushFixtures';
 
 /**
  * BroadcastChannel between the "tabs" of one test: a message reaches every
@@ -85,6 +86,7 @@ beforeEach(() => {
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  unstubPushBrowser();
   Reflect.deleteProperty(navigator, 'locks');
 });
 
@@ -203,6 +205,24 @@ describe('createAlerter', () => {
     expect(focus).toHaveBeenCalled();
     expect(onOpen).toHaveBeenCalledTimes(1);
     expect(FakeNotification.shown[0].closed).toBe(true);
+  });
+
+  it('shows the alert through the service worker when it runs, and closes it by tag', async () => {
+    const worker = stubPushBrowser();
+    const alerter = createAlerter({ inFront: () => false, onOpen: vi.fn() });
+    alerter.receive(event({ silent: true }), true);
+
+    await vi.advanceTimersByTimeAsync(ALERT_DELAY_MS);
+
+    expect(FakeNotification.shown).toHaveLength(0);
+    expect(worker.registration.showNotification).toHaveBeenCalledWith(
+      'Deploy now?', { body: 'The build passed.', tag: 'ask-1', silent: true },
+    );
+    const shown = { close: vi.fn() };
+    worker.registration.getNotifications.mockResolvedValue([shown]);
+    alerter.close('ask-1');
+    await vi.waitFor(() => expect(shown.close).toHaveBeenCalled());
+    expect(worker.registration.getNotifications).toHaveBeenCalledWith({ tag: 'ask-1' });
   });
 
   it('shows nothing when the browser refuses the alert', () => {

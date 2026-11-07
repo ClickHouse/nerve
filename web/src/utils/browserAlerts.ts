@@ -1,5 +1,6 @@
 import type { NotificationLevel } from '../api/settings';
 import type { WSMessage } from '../api/websocket';
+import { activeWorker, workerSupported } from './webPush';
 
 export type NotificationEvent = Extract<WSMessage, { type: 'notification' }>;
 
@@ -51,6 +52,10 @@ export interface Alerter {
  * item's Web Lock: only the tab that gets it shows the alert, and it keeps
  * the lock while the alert is open. Without the Web Locks API, the alert's
  * `tag` (the item id) makes the browser keep one alert per item.
+ *
+ * When the panel's service worker runs, the worker shows the alert, so an
+ * alert and a push notification for the same item share the tag and the
+ * browser keeps one of them. The worker handles the click (see `sw.js`).
  */
 export function createAlerter({ inFront = tabInFront, onOpen }: {
   inFront?: () => boolean;
@@ -74,17 +79,29 @@ export function createAlerter({ inFront = tabInFront, onOpen }: {
   };
   channel?.addEventListener('message', onMessage);
 
-  /** Shows the alert. Resolves when the alert closes. */
-  const show = (event: NotificationEvent, key: string) => new Promise<void>((closed) => {
-    if (handled.has(key) || inFront()) return closed();
+  /** Shows the alert. Resolves when the alert closes, or at once for an alert of the service worker. */
+  const show = async (event: NotificationEvent, key: string) => {
+    const worker = workerSupported() ? await activeWorker() : null;
+    if (handled.has(key) || inFront()) return;
+    const options = {
+      body: event.body.slice(0, ALERT_BODY_LIMIT),
+      tag: event.notification_id,
+      silent: event.silent === true,
+    };
+    if (!worker) return showInPage(event, key, options);
+    try {
+      await worker.showNotification(event.title, options);
+    } catch {
+      return; // the permission went away
+    }
+    tell('shown', key);
+  };
+
+  const showInPage = (event: NotificationEvent, key: string, options: NotificationOptions) => new Promise<void>((closed) => {
     const id = event.notification_id;
     let alert: Notification;
     try {
-      alert = new Notification(event.title, {
-        body: event.body.slice(0, ALERT_BODY_LIMIT),
-        tag: id,
-        silent: event.silent === true,
-      });
+      alert = new Notification(event.title, options);
     } catch {
       // Some phone browsers show alerts only through a service worker.
       return closed();
@@ -126,6 +143,8 @@ export function createAlerter({ inFront = tabInFront, onOpen }: {
       for (const key of [...timers.keys()]) if (key.startsWith(`${id}:`)) cancel(key);
       open.get(id)?.close();
       open.delete(id);
+      void activeWorker().then((worker) => worker?.getNotifications({ tag: id }))
+        .then((shown) => shown?.forEach((alert) => alert.close()));
     },
     dispose: () => {
       for (const key of [...timers.keys()]) cancel(key);
