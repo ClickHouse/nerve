@@ -2,6 +2,7 @@ import type { ReactNode } from 'react';
 import { Repeat } from '../ui/icons';
 import type { ChatMessage } from '../../types/chat';
 import { BlockRenderer } from './BlockRenderer';
+import { PullRequestCards } from './PullRequestCards';
 import { formatMessageTime } from '../../utils/messageTime';
 
 export function AssistantMessage({ message, actions }: {
@@ -35,6 +36,7 @@ export function AssistantMessage({ message, actions }: {
           </div>
           <div className="min-w-0 flex-1">
             <BlockRenderer blocks={message.blocks} rollUpTools />
+            <PullRequestCards blocks={message.blocks} />
           </div>
         </div>
         {message.created_at && (

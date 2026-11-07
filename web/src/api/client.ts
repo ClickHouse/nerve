@@ -6,6 +6,7 @@ import type {
   AgentDetail, AgentOutput, AgentSnapshot, AgentTranscriptPage, ForceStopResult, QueueEntryView,
   StopAgentResponse, StopAllResult, StopTurnResult,
 } from '../types/agents';
+import type { PullRequestResult } from '../types/github';
 
 const API_BASE = '/api';
 
@@ -1327,6 +1328,12 @@ export const api = {
   // One row per person plus the system principal, so a single fetch labels a
   // whole list; re-fetch after a rename rather than caching a name anywhere.
   listActors: () => request<{ actors: ActorRef[] }>('/actors'),
+
+  // GitHub pull requests for the PR cards, read with the server's gh login.
+  getPullRequests: (urls: string[]) =>
+    request<{ pulls: PullRequestResult[] }>(
+      `/github/pulls?${new URLSearchParams(urls.map(url => ['url', url]))}`,
+    ),
 
   // Models — chat models offered to the composer's picker, per backend
   // (the configured Claude list, Codex app-server models, and any
