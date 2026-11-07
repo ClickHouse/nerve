@@ -12,7 +12,7 @@ git-syncable workspace subtree):
 | File | Purpose | Managed by |
 |------|---------|------------|
 | `system.yaml` | Built-in crons (core + productivity) | The Mode step of setup writes it (or `nerve init --terminal`); the Automation step flips its `enabled` flags — safe to regenerate with `nerve init --terminal` |
-| `jobs.yaml` | Your custom crons | You — Nerve never touches this file |
+| `jobs.yaml` | Your custom crons | You. Nerve changes only the `enabled` flag of a job, when you switch it on the Cron page (see [Switching a job on and off](#switching-a-job-on-and-off)) |
 
 > **Location & migration.** New installs write cron config to
 > `<workspace>/config/cron/`. Installs that still have the legacy
@@ -758,7 +758,41 @@ Every cron and source run is logged in the `cron_logs` SQLite table:
   creates has that person as its cause, so the agent's work in it is the
   system actor's for that person. See
   [Attribution](accounts.md#attribution).
+- `records`: for a source run, the number of new records that it stored in
+  the inbox. NULL for agent, workflow and missed runs. A source run with
+  `records = 0` and status `success` found nothing new.
 
 Source runs also log to `source_run_log` with per-source diagnostics (records fetched/processed, errors).
 
-View logs via API: `GET /api/cron/logs?job_id=morning-briefing&limit=10`
+View logs via API: `GET /api/cron/logs?job_id=morning-briefing&limit=10`.
+Add `hide_empty=1` to leave out the source runs that found nothing new.
+
+## The Cron page
+
+The Cron page opens on the sheet of the first job: its name and kind (agent,
+workflow or source), an **Active** switch, **Run now**, the schedule in words
+with the next run, the latest run, and how many of the runs of the last 7 days
+succeeded. Below the sheet, **History** lists the runs, newest first, with ✓,
+✗ or − (missed), the duration and a link to the run's session. The history
+hides the source runs that found nothing new; **Show runs with no new items**
+shows them. **All jobs** in the job list shows the runs of every job.
+
+### Switching a job on and off
+
+The **Active** switch writes `enabled` into the job's YAML file and reloads the
+cron jobs (`PUT /api/cron/jobs/{job_id}/enabled`). The file is the one that
+defines the job: `jobs.yaml` for your own jobs and for a built-in job that
+`jobs.yaml` replaces, `system.yaml` for the other built-in jobs.
+
+Nerve rewrites the file with the same YAML dump that the setup page uses for
+`system.yaml`. That dump keeps the comment block at the top of the file, but
+not other comments or your own formatting (block scalars, quotes,
+indentation). So the switch changes a file only when the dump writes back the
+file unchanged apart from the flag. For a file with comments or formatting of
+its own, the switch is not available, and its tooltip tells you to change
+`enabled` in the file. `system.yaml`, which Nerve writes, can always be
+switched, unless you edited it by hand.
+
+The switch is also not available under [lockdown](config.md#lockdown-remote-only-read-only)
+(change the job in the config repository), for a file that Nerve cannot
+write, and for a source (switch it in its `sync` settings).
