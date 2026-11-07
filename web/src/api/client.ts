@@ -7,6 +7,7 @@ import type {
   StopAgentResponse, StopAllResult, StopTurnResult,
 } from '../types/agents';
 import type { PullRequestResult } from '../types/github';
+import type { NotificationSettingValues, NotificationSettings, NotificationTestResult } from './settings';
 
 const API_BASE = '/api';
 
@@ -1329,6 +1330,15 @@ export const api = {
   setupAgentsDetect: () => request<AgentsDetect>('/setup/agents/detect'),
 
   setupEnvironment: () => request<SetupEnvironment>('/setup/environment'),
+
+  // Settings: the same guards as setup; a PUT answers the whole section.
+  settingsNotifications: () => request<NotificationSettings>('/settings/notifications'),
+  saveSettingsNotifications: (values: NotificationSettingValues) =>
+    request<NotificationSettings>('/settings/notifications', {
+      method: 'PUT', body: JSON.stringify(values),
+    }),
+  testSettingsNotifications: () =>
+    request<NotificationTestResult>('/settings/notifications/test', { method: 'POST', body: '{}' }),
 
   restartSystem: () =>
     request<RestartResponse>('/system/restart', { method: 'POST', body: '{}' }),

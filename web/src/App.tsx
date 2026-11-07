@@ -34,6 +34,7 @@ import { McpServerDetailPage } from './pages/McpServerDetailPage';
 import { NotificationsPage } from './pages/NotificationsPage';
 import { AccountsPage } from './pages/AccountsPage';
 import { SetupPage } from './pages/SetupPage';
+import { SettingsPage } from './pages/SettingsPage';
 import { NotificationToast } from './components/Notifications/NotificationToast';
 import { SetupBanner } from './components/Setup/SetupBanner';
 import { SetupLanding } from './components/Setup/SetupLanding';
@@ -139,6 +140,7 @@ function App() {
               (above) is local-only. */}
           <Route path="/setup" element={<SetupPage />} />
           <Route path="/setup/:stepId" element={<SetupPage />} />
+          <Route path="/settings/:section?" element={<SettingsPage />} />
           <Route path="/diagnostics" element={<DiagnosticsPage />} />
         </Route>
       </Routes>

@@ -101,12 +101,11 @@ describe('the Setup entry', () => {
     expect(screen.getByRole('button', { name: 'Setup' })).toBeInTheDocument();
   });
 
-  it('leaves the rail list once setup is finished and stays one click away in the footer', async () => {
+  it('leaves the rail once setup is finished', async () => {
     useSetupStore.setState({ state: makeState({ finished: true, steps_left: 0 }) });
     await renderNav('rail');
-    // One control only: the footer's gear, not a list entry beside it.
-    await userEvent.click(screen.getByRole('button', { name: 'Setup' }));
-    expect(location()).toHaveTextContent('/setup');
+    // Settings has "Run setup again" for a finished setup.
+    expect(screen.queryByRole('button', { name: 'Setup' })).not.toBeInTheDocument();
   });
 
   it('stays in the phone menu once setup is finished', async () => {
@@ -181,5 +180,20 @@ describe('the phone bottom bar', () => {
     await renderNav('rail');
     expect(screen.queryByRole('button', { name: 'Inbox' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Plans' })).toBeInTheDocument();
+  });
+});
+
+describe('the Settings entry', () => {
+  it('is the gear in the rail footer, whatever the setup state', async () => {
+    await renderNav('rail');
+    await userEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    expect(location()).toHaveTextContent('/settings');
+  });
+
+  it('is a row of the phone menu', async () => {
+    await renderNav('bottom');
+    openMore();
+    await userEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    expect(location()).toHaveTextContent('/settings');
   });
 });

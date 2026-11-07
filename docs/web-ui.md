@@ -32,6 +32,7 @@ web/src/
 ├── components/
 │   ├── Auth/           # Login page and session-expired overlay
 │   ├── Setup/          # Setup wizard: shell, progress rail, step forms, restart overlay, banner
+│   ├── Settings/       # Settings sections, their rows and controls
 │   │   ├── steps/      # ClaimForm, ModeStep, ProviderStep, ProfileStep, …, ReviewStep
 │   │   └── copy.ts     # Every heading, intro and hint of the wizard (no JSX)
 │   ├── Chat/           # Message list, input, session sidebar, diff viewer
@@ -314,8 +315,8 @@ when setup is finished, while the state is unknown, during a restart, and
 after Dismiss (remembered per viewer in `sessionStorage` for the tab session).
 The **Setup** entry in the navigation appears as soon as the checklist has
 been read, in both auth modes, and leaves the rail's list when setup is
-finished. Then a gear button labelled "Setup" in the footer of the nav rail
-opens `/setup`. On a phone the entry stays in the **More** drawer. The
+finished. Then "Run setup again" in [Settings](#settings) opens `/setup`. On
+a phone the entry stays in the **More** drawer. The
 chat page's empty state reads "Connect a model to start a conversation" with a
 link to `/setup/provider` while the server says no provider is configured.
 When a lockdown closed the Model step, it reads "No model is connected" with
@@ -329,6 +330,37 @@ wizard, About you takes the name from the gateway's sign-in and only sets what
 Nerve writes in `USER.md`, the profile step never calls an account endpoint,
 and the reconnect after a restart goes through the hosted adapter's own
 session probe, so no login form can appear.
+
+### Settings
+
+`/settings/:section?`: the settings that people otherwise change in YAML.
+The gear in the nav rail footer opens it (on a phone: Settings in the More
+menu). A desktop shows the section list on the left and opens the first
+section; a phone shows the list at `/settings` and one section at
+`/settings/<id>`. "Run setup again" under the list opens `/setup`; while setup
+is unfinished, Setup also stays in the rail.
+
+Each control saves when it changes (a text field on Enter or when it loses
+focus) through `PUT /api/settings/<section>` (see
+[api.md](api.md#settings)), and the row shows the answer of the server. A
+row says in small text where its changes are saved (`settings.yaml`, or
+`config.yaml` on this machine when that file states the value). A field that
+the environment or the control plane sets shows its reason and no control.
+Under lockdown the section is read-only, with one line that says why.
+
+**Notifications** (`NotificationsSection`):
+
+- **Where notifications go**: the Nerve panel (always on), This browser,
+  Slack and Telegram. Slack and Telegram have a switch (`notifications.channels`),
+  a destination (the Slack channel ID with the channel name, the Telegram
+  chat ID) and "What to send": Everything or Questions and important
+  (`notifications.levels`). A channel that is not connected links to the
+  Channels step of Setup. On Nerve Cloud the Slack destination is read-only.
+- **Send a test** sends one notification to each place that is on. Each row
+  then shows "Test arrived" or "Test did not arrive".
+- **Silences** opens the silences manager (`/notifications?silences=1`).
+- **Advanced**: when an unanswered question expires, and how often a
+  snoozed question comes back.
 
 ### Accounts
 
