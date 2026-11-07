@@ -1758,26 +1758,12 @@ notifications:
 
 ### Web Push
 
-Each item also goes as a push notification (channel `webpush`) to every
-browser where a person turned on "Get notifications when no tab is open"
-(see [web-ui.md](web-ui.md#push-notifications)). `notifications.channels`
-does not list it: a person turns it on for each browser. Each browser has its
-own level, `all` or `important`, and `notifications.levels.webpush:
-important` applies to all browsers. A caller that names its channels sends no
-push. When a push service answers `404` or `410`, the browser dropped the
-subscription, and Nerve deletes it.
-
-The instance signs each push with its VAPID key. Nerve makes the key pair at
-first use and keeps the private key in `nerve.db` (`instance_secrets`), not
-in a configuration file. A backup without secrets does not have the key: after
-a restore, each browser must turn push on again.
-
-The instance sends each push to the push service of the browser:
-`fcm.googleapis.com` (Chrome and most Chromium browsers),
-`updates.push.services.mozilla.com` (Firefox), `*.push.apple.com` (Safari)
-or `*.notify.windows.com` (Edge). It must reach these hosts. On Nerve Cloud,
-an agent in restricted internet mode cannot reach them, so Web Push works
-only for agents in open mode.
+The fan-out also sends each item as a push notification (channel `webpush`)
+to the browsers where a person turned push on. `notifications.channels` does
+not list it, and `notifications.levels.webpush: important` limits all
+browsers. The instance must reach the push services of the browsers; on Nerve
+Cloud that works only for agents in open internet mode. How push works, the
+VAPID key and the hosts: [web-ui.md](web-ui.md#push-notifications).
 
 ## Quiet Hours
 

@@ -416,39 +416,41 @@ above the list ("Browser alerts are on" or "off") opens the setting.
 "Get notifications when no tab is open", in Settings > Notifications > This
 browser, turns on Web Push for the browser. The instance sends each item to
 the push service of the browser, and the panel's service worker (`/sw.js`)
-shows it as a system notification, also when no panel tab is open. A person
-turns it on for each browser, and the server keeps one row for each browser
-(see [api.md](api.md#web-push) and [config.md](config.md#web-push)). Under
-"Your other devices" the row lists the other browsers of the person, with the
-day the person turned push on there and the last notification, and a button
-that removes each one.
+shows it as a system notification, also when no panel tab is open. The server
+keeps one row for each browser (see [api.md](api.md#web-push)). Under "Your
+other devices" the row lists the other browsers of the person, with the day
+the person turned push on there and the last notification, and a button that
+removes each one.
 
-- **What arrives:** the level of the row ("What to send") applies to push
-  too. The browser sends it with its subscription.
-- **The notification:** "<agent name>: <title>", the first lines of the
-  body, and the notification id as tag. A click focuses a panel tab, or opens
-  one, at `/notifications`. While a panel tab has focus, the worker shows
-  nothing, because the tab shows the item. At all other times it shows the
-  push, also while a panel tab is open but not in front: browsers require a
-  notification for each push then.
-- **One notification for each item:** the worker also shows the browser
-  alerts of the tabs, with the same tag. The browser keeps one notification
-  for each tag, so an alert and a push for the same item give one
-  notification. The worker also lets phone browsers that show alerts only
-  through a service worker show browser alerts.
-- **Quiet hours:** a push that the server marks `silent` makes no sound.
-- **No offline copy:** the worker has no fetch handler, so every page and
-  asset comes from the server.
+- **What arrives:** the items at the level of the row ("What to send"),
+  which the browser sends with its subscription; `notifications.levels.webpush`
+  applies too ([config.md](config.md#web-push)). The notification shows
+  "<agent name>: <title>" and the first lines of the body, with the
+  notification id as tag. During quiet hours a push below `urgent` makes no
+  sound. A click focuses a panel tab, or opens one, at `/notifications`.
+- **When it shows:** not while a panel tab has focus, because the tab shows
+  the item; at all other times, also while a panel tab is open but not in
+  front, because browsers require a notification for each push then. The
+  worker also shows the browser alerts of the tabs, with the same tag, so an
+  alert and a push for one item give one notification, and phone browsers
+  that show alerts only through a service worker can show them.
+- **Server side:** the instance signs each push with its VAPID key, made at
+  first use and kept in `nerve.db` (`instance_secrets`), never in a
+  configuration file. A backup without secrets has no key, so after a restore
+  each browser must turn push on again. When a push service answers `404` or
+  `410`, the browser dropped the subscription, and Nerve deletes it.
 - **Install:** the panel has a web app manifest (`/api/manifest.webmanifest`)
-  with the agent's name, so a browser can install the panel as an app.
+  with the agent's name, so a browser can install it as an app. The worker
+  has no fetch handler, so every page comes from the server.
 - **Limits:** HTTPS only (and `localhost`). On iPhone and iPad, push works
   only after "Add to Home Screen" (iOS 16.4 or later), and a Safari tab says
-  so. On Nerve Cloud each agent has its own address, so a device turns push
-  on for each agent. The instance must reach the push services: on Nerve
-  Cloud, an agent in restricted internet mode cannot, so Web Push works only
-  for agents in open mode. With several people on one agent, each person
-  with push on gets every notification. The notification has no answer
-  buttons.
+  so. The instance must reach `fcm.googleapis.com` (Chrome and most Chromium
+  browsers), `updates.push.services.mozilla.com` (Firefox),
+  `*.push.apple.com` (Safari) and `*.notify.windows.com` (Edge). On Nerve
+  Cloud, an agent in restricted internet mode cannot reach them, so Web Push
+  works only for agents in open mode, and each agent has its own address, so
+  a device turns push on for each agent. With several people on one agent,
+  each person with push on gets every notification. No answer buttons.
 
 ### Accounts
 
