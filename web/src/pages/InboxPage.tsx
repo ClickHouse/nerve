@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react';
+import { useCallback, useLayoutEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { Navigate, useNavigate } from 'react-router-dom';
 import { useShallow } from 'zustand/react/shallow';
 import { useChatStore } from '../stores/chatStore';
@@ -28,18 +28,13 @@ function agentNameOf(state: SetupState | null): string {
 export function InboxPage() {
   const isMobile = useIsMobile();
   const navigate = useNavigate();
-  const { sessions, activeSession, agentStatus, loadSessions, createSession, deleteSession } = useChatStore(useShallow(s => ({
+  const { sessions, activeSession, agentStatus, createSession, deleteSession } = useChatStore(useShallow(s => ({
     sessions: s.sessions,
     activeSession: s.activeSession,
     agentStatus: s.agentStatus,
-    loadSessions: s.loadSessions,
     createSession: s.createSession,
     deleteSession: s.deleteSession,
   })));
-
-  // The same refresh as the chat page does on open: a plan or a question
-  // that came while another page was open shows at once.
-  useEffect(() => { void loadSessions(); }, [loadSessions]);
 
   // "New chat": the unsent new chat, opened in the chat page, which shows
   // its settings. `createSession` makes it active before it returns.
