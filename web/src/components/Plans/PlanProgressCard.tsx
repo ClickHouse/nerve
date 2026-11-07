@@ -68,10 +68,11 @@ export function PlanProgressCard({ plan }: { plan: Plan }) {
   return (
     <section
       aria-label="Implementation"
-      className="mb-4 flex items-center gap-3 rounded-lg border border-border-subtle bg-surface px-4 py-3"
+      className="mb-4 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-border-subtle bg-surface px-4 py-3"
     >
-      <div className="min-w-0 flex-1">
-        <p className="truncate text-sm font-medium text-text">
+      {/* On a phone the button wraps under the text, which keeps the full width. */}
+      <div className="min-w-0 flex-1 basis-60">
+        <p className="line-clamp-2 text-sm font-medium text-text">
           {plan.impl_session?.title || 'Implementation session'}
         </p>
         {look && (
@@ -79,7 +80,7 @@ export function PlanProgressCard({ plan }: { plan: Plan }) {
             {state === 'done' ? <CircleCheck size={13} className="shrink-0 text-success" aria-hidden="true" />
               : state === 'failed' ? <CircleX size={13} className="shrink-0 text-error" aria-hidden="true" />
               : <span className={cx('h-2 w-2 shrink-0 rounded-full', look.dot)} aria-hidden="true" />}
-            <span className="truncate">
+            <span>
               {look.label}
               {elapsed && <span className="tabular-nums">{ended ? ` after ${elapsed}` : ` · ${elapsed}`}</span>}
             </span>

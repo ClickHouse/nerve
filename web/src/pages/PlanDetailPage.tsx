@@ -78,7 +78,7 @@ export function PlanDetailPage() {
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
-      <div className="border-b border-border-subtle px-6 py-3 bg-bg shrink-0">
+      <div className="border-b border-border-subtle px-4 md:px-6 py-3 bg-bg shrink-0">
         <div className="flex items-center gap-3 mb-2">
           <IconButton label="Back to plans" size="xs" onClick={() => navigate('/plans')}>
             <ArrowLeft size={16} />
@@ -103,8 +103,8 @@ export function PlanDetailPage() {
             {summary}
           </p>
         )}
-        <div className="flex items-center gap-4 text-xs text-text-faint ml-7">
-          <span>{plan.created_at?.slice(0, 16).replace('T', ' ')}</span>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-text-faint ml-7">
+          <span className="whitespace-nowrap">{plan.created_at?.slice(0, 16).replace('T', ' ')}</span>
           {plan.created_by_actor_id && (
             <span data-testid="plan-author" className="inline-flex items-center gap-1 min-w-0">
               Proposed by{' '}
@@ -136,10 +136,10 @@ export function PlanDetailPage() {
       </div>
 
       {/* Plan content */}
-      <div className="flex-1 overflow-y-auto p-6">
+      <div className="flex-1 overflow-y-auto p-4 md:p-6">
         <div className="max-w-3xl mx-auto">
           <PlanProgressCard plan={plan} />
-          <div className="bg-surface border border-border-subtle rounded-lg p-6">
+          <div className="bg-surface border border-border-subtle rounded-lg p-4 md:p-6">
             <MarkdownContent content={plan.content} />
           </div>
 
