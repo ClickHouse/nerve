@@ -32,7 +32,7 @@ export function NavRail() {
     api.getUltracodeDashboardStatus().then(s => setUltracodeEnabled(s.enabled)).catch(() => {});
   }, []);
 
-  const visibleItems = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown, setupFinished });
+  const visibleItems = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown, setupFinished, phone: false });
 
   return (
     <div className="w-14 bg-surface border-r border-border flex flex-col items-center py-3 shrink-0">
