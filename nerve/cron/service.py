@@ -100,6 +100,10 @@ RunOrigin = Literal["schedule", "catchup", "manual", "delivery"]
 # The window of the run counts that GET /api/cron/jobs gives for each job.
 _STATS_DAYS = 7
 
+# How much of a failed run's error goes into the notice that a job fails.
+_FAILURE_NOTICE_LINES = 5
+_FAILURE_NOTICE_CHARS = 600
+
 # Why the Cron page cannot switch a job on or off. ``{file}`` is the name of
 # the job's YAML file. The keys are CronTogglePlan problems (setup_writer).
 _TOGGLE_LOCKDOWN = "This instance is in lockdown. Change the job in the config repository."
@@ -119,6 +123,13 @@ class CronToggleRefused(Exception):
 
 def _toggle_refusal(problem: str, file: Path) -> str:
     return _TOGGLE_PROBLEMS.get(problem, _TOGGLE_UNREADABLE).format(file=file.name)
+
+
+def _failure_notice_body(error: str | None) -> str:
+    """The first lines of a run's error, as a code block."""
+    lines = (error or "").strip().splitlines()[:_FAILURE_NOTICE_LINES]
+    head = "\n".join(lines)[:_FAILURE_NOTICE_CHARS].replace("```", "'''")
+    return f"```\n{head}\n```" if head else "The run ended with an error."
 
 
 class _RunsInFlight:
@@ -1907,18 +1918,60 @@ class CronService:
                     log_id, "success", output=output, session_id=session_id,
                 )
                 logger.info("Cron job %s completed (%d chars)", job.id, len(response))
+                await self._send_health_notice(job.id, log_id, "success", session_id=session_id)
             else:
                 error = result.outcome.describe()
                 await self.db.log_cron_finish(
                     log_id, "error", output=output, error=error, session_id=session_id,
                 )
                 logger.warning("Cron job %s ended with %s", job.id, error)
+                await self._send_health_notice(
+                    job.id, log_id, "error", error=error, session_id=session_id,
+                )
 
         except Exception as e:
             logger.error("Cron job %s failed: %s", job.id, e, exc_info=True)
             await self.db.log_cron_finish(
                 log_id, "error", error=str(e), session_id=session_id,
             )
+            await self._send_health_notice(
+                job.id, log_id, "error", error=str(e), session_id=session_id,
+            )
+
+    async def _send_health_notice(
+        self, job_id: str, log_id: int, status: str, *,
+        error: str | None = None, session_id: str | None = None,
+    ) -> None:
+        """Tell the user when an agent job starts to fail, and when it works again.
+
+        The job's previous finished run decides. An error after a success, or
+        as the job's first recorded run, sends "Cron job <id> failed" (high);
+        more errors send nothing. The first success after an error sends
+        "Cron job <id> works again" (low). The notice goes through the
+        notification service, so silences and channels apply, and it names the
+        run's session. A notice that fails is logged and does not change the run.
+
+        Agent jobs only: a workflow run and a source runner send their own.
+        """
+        service = self.notification_service
+        if service is None:
+            return
+        try:
+            previous = await self.db.get_previous_cron_status(job_id, log_id)
+            if status == "error" and previous != "error":
+                title = f"Cron job {job_id} failed"
+                body, priority = _failure_notice_body(error), "high"
+            elif status == "success" and previous == "error":
+                title, body, priority = f"Cron job {job_id} works again", "", "low"
+            else:
+                return
+            await service.send_notification(
+                session_id=session_id or "system", title=title, body=body,
+                priority=priority,
+                metadata={"cron_job_id": job_id, "cron_log_id": log_id},
+            )
+        except Exception:
+            logger.warning("Health notice for cron job %s failed", job_id, exc_info=True)
 
     async def _start_workflow_run(
         self, job: CronJob, log_id: int, attribution: Attribution | None = None,

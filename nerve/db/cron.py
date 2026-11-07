@@ -170,6 +170,21 @@ class CronStore:
                 async for row in cursor
             }
 
+    async def get_previous_cron_status(self, job_id: str, log_id: int) -> str | None:
+        """The status of the job's latest finished run other than ``log_id``.
+
+        Only ``success`` and ``error`` count: a missed run did not run, and a
+        run that is still going has no result. None when there is no such run.
+        """
+        async with self.db.execute(
+            "SELECT status FROM cron_logs WHERE job_id = ? AND id != ? "
+            "AND status IN ('success', 'error') "
+            "ORDER BY finished_at DESC, id DESC LIMIT 1",
+            (job_id, log_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row["status"] if row else None
+
     async def get_last_successful_cron_run(self, job_id: str) -> dict | None:
         """Get the most recent successful cron_logs entry for a job."""
         async with self.db.execute(
