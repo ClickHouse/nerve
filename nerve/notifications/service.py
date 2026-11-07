@@ -597,6 +597,7 @@ class NotificationService:
 
         answerer_id = actor_id_of(answerer)
         attribution = {"answered_by_actor": actor} if actor else {}
+        answered_at = await self._answered_at(notification_id)
 
         from nerve.agent.streaming import broadcaster
 
@@ -607,6 +608,7 @@ class NotificationService:
                 "session_id": session_id,
                 "answer": answer,
                 "answered_by": answered_by,
+                "answered_at": answered_at,
                 "actor_id": answerer_id,
                 **attribution,
             })
@@ -655,11 +657,17 @@ class NotificationService:
             "session_id": session_id,
             "answer": answer,
             "answered_by": answered_by,
+            "answered_at": answered_at,
             "actor_id": answerer_id,
             **attribution,
         })
 
         return True
+
+    async def _answered_at(self, notification_id: str) -> str | None:
+        """The stored answer time of a row, for the answer broadcast."""
+        row = await self.db.get_notification(notification_id)
+        return row.get("answered_at") if row else None
 
     async def _handle_approval_answer(
         self,
@@ -822,6 +830,8 @@ class NotificationService:
         }
         if snoozed:
             payload["snooze_until"] = snooze_until
+        else:
+            payload["answered_at"] = await self._answered_at(notification_id)
         await broadcaster.broadcast("__global__", payload)
 
         return True

@@ -362,6 +362,8 @@ class TestSnooze:
         ]
         assert answered and answered[0]["approval_status"] == "snoozed"
         assert answered[0]["snooze_until"] == snooze_until
+        # A snoozed row has no answer time.
+        assert "answered_at" not in answered[0]
 
     async def test_db_snooze_rejects_non_pending(self, db: Database):
         await db.create_session("s1", actor=None)
