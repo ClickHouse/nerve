@@ -25,6 +25,7 @@ from nerve.agent.tools.schemas import (
     PLAN_PROPOSE_SCHEMA,
     PLAN_READ_SCHEMA,
     PLAN_REVISE_SCHEMA,
+    PLAN_SUMMARY_MAX_CHARS,
     PLAN_UPDATE_SCHEMA,
 )
 
@@ -90,9 +91,23 @@ async def _notify_plan_ready(
     return True
 
 
-def _review_summary(moved: bool, notified: bool) -> str:
+def _plan_summary(args: dict) -> tuple[str | None, bool]:
+    """The ``summary`` argument, trimmed, and whether it had to be clipped.
+
+    ``None`` for an empty summary. A summary longer than
+    ``PLAN_SUMMARY_MAX_CHARS`` is clipped to that length, with an ellipsis.
+    """
+    summary = (args.get("summary", "") or "").strip()
+    if len(summary) <= PLAN_SUMMARY_MAX_CHARS:
+        return summary or None, False
+    return summary[:PLAN_SUMMARY_MAX_CHARS - 1].rstrip() + "…", True
+
+
+def _review_summary(moved: bool, notified: bool, clipped: bool = False) -> str:
     """The lines of a plan tool result that say what else happened."""
     lines = []
+    if clipped:
+        lines.append(f"The summary was clipped to {PLAN_SUMMARY_MAX_CHARS} characters.")
     if moved:
         lines.append(f"Task moved to {PLAN_REVIEW_STATUS}.")
     if notified:
@@ -107,6 +122,7 @@ async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
     task_id = args["task_id"]
     content = args["content"]
     plan_type = (args.get("plan_type", "") or "").strip()
+    summary, clipped = _plan_summary(args)
 
     if not ctx.db:
         return ToolResult.text("Database not available.")
@@ -153,6 +169,7 @@ async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
         plan_type=plan_type,
         # Written by the system actor for the session's cause.
         attribution=ctx.attribution,
+        summary=summary,
     )
 
     moved = await _move_to_plan_review(ctx, task_id)
@@ -164,7 +181,7 @@ async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
     return ToolResult.text(
         f"Plan proposed: {plan_id} (v{version}) for task '{task['title']}'. "
-        "Awaiting human review.\n" + _review_summary(moved, notified)
+        "Awaiting human review.\n" + _review_summary(moved, notified, clipped)
     )
 
 
@@ -179,6 +196,8 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
     plan_id = args["plan_id"]
     content = args["content"]
     feedback = (args.get("feedback", "") or "").strip()
+    # The new version's own summary: the old one may no longer match.
+    summary, clipped = _plan_summary(args)
 
     if not ctx.db:
         return ToolResult.text("Database not available.")
@@ -215,6 +234,7 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         parent_plan_id=plan_id,
         plan_type=old_plan.get("plan_type", "generic"),
         attribution=ctx.attribution,
+        summary=summary,
     )
 
     task_id = old_plan["task_id"]
@@ -229,7 +249,7 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult.text(
         f"Plan {plan_id} superseded by {new_plan_id} (v{new_version}). "
         "The new version is pending review.\n"
-        + _review_summary(moved, notified)
+        + _review_summary(moved, notified, clipped)
     )
 
 
@@ -275,6 +295,8 @@ async def plan_read_handler(ctx: ToolContext, args: dict) -> ToolResult:
         f"Task: {task_title} ({plan['task_id']})\n"
         f"Type: {plan.get('plan_type', 'generic')} | Created: {plan['created_at'][:10]}"
     )
+    if plan.get("summary"):
+        header += f"\nSummary: {plan['summary']}"
     if plan.get("feedback"):
         header += f"\nFeedback: {plan['feedback']}"
     if plan.get("impl_session_id"):
