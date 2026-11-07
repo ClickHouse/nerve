@@ -2454,8 +2454,10 @@ def _onboarding_engine(db) -> MagicMock:
     engine.channel = lambda name: None
     engine.run = AsyncMock(return_value="")
 
-    async def _get_or_create(session_id, title=None, source="web", *, actor, cause=None):
-        await db.create_session(session_id, title=title, source=source, actor=actor, cause=cause)
+    async def _get_or_create(session_id, title=None, source="web", *, actor, cause=None, origin=None):
+        await db.create_session(
+            session_id, title=title, source=source, actor=actor, cause=cause, origin=origin,
+        )
         return await db.get_session(session_id)
 
     engine.sessions.get_or_create = _get_or_create

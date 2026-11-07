@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, NoReturn
 
 from nerve.identity import attribution_for
+from nerve.session_origin import plan_origin
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -246,6 +247,7 @@ async def request_plan_revision(
     await engine.sessions.get_or_create(
         session_id, title=session_title, source="cron",
         actor=engine.db.system_actor, cause=cause,
+        origin=plan_origin(plan_id, plan["task_id"]),
     )
     asyncio.create_task(
         engine.run(
@@ -422,6 +424,7 @@ async def approve_plan(
         await engine.sessions.get_or_create(
             impl_session_id, title=f"Implement: {task['title']}", source="web",
             actor=actor, cause=cause,
+            origin=plan_origin(plan_id, plan["task_id"]),
         )
         await task_update_handler(task_ctx, {
             "task_id": plan["task_id"],

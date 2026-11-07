@@ -39,6 +39,7 @@ from nerve.cron.jobs import (
 )
 from nerve.db import Database
 from nerve.identity import CAUSE_FROM_ACTOR, Attribution, CauseArg, attribution_for
+from nerve.session_origin import cron_origin
 from nerve.setup_writer import (
     CRON_FILE_HAND_EDITED,
     CRON_FILE_READ_ONLY,
@@ -1525,7 +1526,7 @@ class CronService:
         session_id = f"cron:{job_id}:{new_cron_run_id()}"
         await self.engine.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron",
-            actor=self.db.system_actor, cause=cause,
+            actor=self.db.system_actor, cause=cause, origin=cron_origin(job_id),
         )
         await self.db.set_channel_session(self._channel_key(job_id), session_id)
         logger.info(
