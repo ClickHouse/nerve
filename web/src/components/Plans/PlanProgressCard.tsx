@@ -23,27 +23,38 @@ const SESSION_EVENTS = new Set<WSMessage['type']>([
   'session_running', 'session_awaiting_input', 'session_agents', 'session_updated',
 ]);
 
+/**
+ * Task events after which the card loads the plan again: `done` (task_done
+ * marks the plan done) and `updated` (sent after the server marks the plan
+ * failed). Comments and other task events leave the plan as it is.
+ */
+const TASK_EVENTS = new Set(['done', 'updated']);
+
 /** Whether a WS event can change the state of this implementation. */
 function concerns(msg: WSMessage, sessionId: string, taskId: string): boolean {
-  if (msg.type === 'task_updated') return msg.task.id === taskId;
+  if (msg.type === 'task_updated') return msg.task.id === taskId && TASK_EVENTS.has(msg.event);
   return SESSION_EVENTS.has(msg.type) && 'session_id' in msg && msg.session_id === sessionId;
 }
 
 /**
  * The implementation session of an approved plan: its title, its state and
- * the time since the approval. While the plan is implementing, the card loads
- * the plan again on each event of the session or the task, and on each
- * reconnect, so it follows the session live.
+ * the time since the approval. The card loads the plan again on each event of
+ * the session or the task, and on each reconnect, so it follows the session
+ * live. It stops once the plan is done and the session's last turn ended,
+ * which gives the final time. A failed plan stays followed: a later turn in
+ * its session can still finish the work.
  */
 export function PlanProgressCard({ plan }: { plan: Plan }) {
   const navigate = useNavigate();
   const refreshPlan = usePlanStore(s => s.refreshPlan);
   const sessionId = plan.impl_session_id;
-  const live = plan.status === 'implementing';
-  const now = useNow(1000, live);
+  const state = implementationState(plan);
+  const ended = state === 'done' || state === 'failed';
+  const listening = plan.status !== 'done' || !!plan.impl_session?.is_running;
+  const now = useNow(1000, !ended);
 
   useEffect(() => {
-    if (!live || !sessionId) return;
+    if (!listening || !sessionId) return;
     const refresh = () => void refreshPlan(plan.id);
     const offMessage = ws.onMessage(msg => {
       if (concerns(msg, sessionId, plan.task_id)) refresh();
@@ -53,12 +64,10 @@ export function PlanProgressCard({ plan }: { plan: Plan }) {
       offMessage();
       offOpen();
     };
-  }, [live, sessionId, plan.id, plan.task_id, refreshPlan]);
+  }, [listening, sessionId, plan.id, plan.task_id, refreshPlan]);
 
   if (!sessionId) return null;
 
-  const state = implementationState(plan);
-  const ended = state === 'done' || state === 'failed';
   const startedAt = plan.reviewed_at ? parseTimestamp(plan.reviewed_at).getTime() : null;
   const endedAt = !ended ? now
     : plan.impl_session?.updated_at ? parseTimestamp(plan.impl_session.updated_at).getTime() : null;

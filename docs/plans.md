@@ -219,11 +219,13 @@ of the same plan can both proceed.
   session**. The state is Running, Waiting on background work (a scheduled
   wake-up or background work, no turn), Waiting for you (a question, or the
   turn ended while the task is open), Done (the plan is `done`) or Failed
-  (the plan is `failed` or the session is in `error`). While the plan is
-  implementing, the page loads the plan again on each `session_running`,
-  `session_awaiting_input`, `session_agents` or `session_updated` event of
-  that session, on each `task_updated` event of the task, and after a
-  reconnect
+  (the plan is `failed` and its session does no work). The page loads the
+  plan again on each `session_running`, `session_awaiting_input`,
+  `session_agents` or `session_updated` event of that session, on each
+  `task_updated` event (`done` or `updated`) of the task, and after a
+  reconnect. It stops when the plan is `done` and the session's last turn
+  ended, so the time is final. A load that answers `implementing` after the
+  page has `done` or `failed` is older and is ignored
 - Who proposed this version and who reviewed the plan, from the writer and
   reviewer columns
 - A decision bar at the bottom of the page for pending plans. It stays in view
