@@ -116,10 +116,12 @@ to GitHub), a state chip (Draft, Open, Merged or Closed), `owner/repo#number`
 with the branches, the checks ("2 failed", "3 running", "12 passed") and the
 review decision. The data comes from `GET /api/github/pulls`, so the server
 needs a `gh` login. Without one, the card shows `owner/repo#number` as the link
-and the reason ("No access to details", "GitHub CLI not available"). While a
-pull request is open with checks running, its card reads it again every 60 s
-(not while the tab is hidden). The card stops when the checks end or the pull
-request merges or closes. A message that still streams shows no cards.
+and the reason ("No access to details", "GitHub CLI not available"). The cards
+of a message read their data the first time they come into view (or within
+200 px of it). While a pull request is open with checks running, its card reads
+it again 60 s after the last read, but only while the card is in view and the
+tab shows. The card stops when the checks end or the pull request merges or
+closes. A message that still streams shows no cards.
 
 ### Modified Files Panel
 GitHub PR-style diff viewer for files modified during a session. Accessible via the `[📁 N]` badge button in the chat header (appears when files have been modified).
