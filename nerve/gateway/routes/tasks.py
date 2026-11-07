@@ -308,6 +308,15 @@ async def _move_task(task_id: str, req: TaskMoveRequest, actor: Actor) -> dict:
     return {"task": moved}
 
 
+@router.get("/api/sessions/{session_id}/tasks")
+async def list_session_tasks(session_id: str):
+    """The tasks that a session created, implemented or updated."""
+    deps = get_deps()
+    if not await deps.db.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"tasks": await deps.db.list_session_tasks(session_id)}
+
+
 @router.get("/api/tasks/{task_id}/events")
 async def list_task_events(task_id: str, limit: int = 200):
     """A task's status history, oldest first."""
@@ -378,7 +387,8 @@ async def get_task(task_id: str):
     content = ""
     if file_path.exists():
         content = await asyncio.to_thread(file_path.read_text, encoding="utf-8")
-    return {**dict(task), "content": content}
+    sessions = await deps.db.list_task_sessions(task_id)
+    return {**dict(task), "content": content, "sessions": sessions}
 
 
 @router.patch("/api/tasks/{task_id}")

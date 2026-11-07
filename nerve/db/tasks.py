@@ -52,6 +52,24 @@ _TRANSITION_FIELDS = frozenset({
     "file_path", "title", "deadline", "tags", "source", "source_url",
 })
 
+# The display name of a session: its title, or its ID when it has no title.
+# ``s`` is the ``sessions`` alias of the query.
+_SESSION_NAME = "COALESCE(NULLIF(s.title, ''), s.id)"
+
+# The columns of a task read: the row ``t`` and ``created_session_title``,
+# the name of the session that created the task. The title is NULL when that
+# session does not exist (any more), so a reader links only to a session that
+# exists.
+_TASK_COLUMNS = (
+    f"t.*, (SELECT {_SESSION_NAME} FROM sessions s "
+    "WHERE s.id = t.created_session_id) AS created_session_title"
+)
+
+# How a session relates to a task, in order of precedence. A session that
+# relates to a task in more than one way gets the first relation that applies.
+# The queries below give each link ``rank``, its index in this tuple.
+SESSION_RELATIONS = ("created", "implemented", "updated")
+
 
 class TaskStore:
     """Mixin providing task CRUD, FTS search, and escalation operations."""
@@ -105,7 +123,9 @@ class TaskStore:
         returns ``True``.
 
         ``actor`` and ``attribution`` go to the status event that a status
-        change records; see :meth:`_record_status_event`.
+        change records; see :meth:`_record_status_event`. An insert also
+        stores ``actor`` as ``created_session_id`` when a session has that
+        ID, and NULL for any other actor (``web``, ``system``).
         """
         now = datetime.now(timezone.utc).isoformat()
         async with self._atomic():
@@ -128,16 +148,19 @@ class TaskStore:
             if position is None:
                 position = await self._resolve_upsert_position(stored, status)
             if expect_revision is None:
+                # ``created_session_id`` is in the INSERT arm only, so an
+                # update never changes it.
                 cursor = await self.db.execute(
-                    """INSERT INTO tasks (id, file_path, title, status, source, source_url, deadline, tags, position, revision, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+                    """INSERT INTO tasks (id, file_path, title, status, source, source_url, deadline, tags, position, revision, created_at, updated_at, created_session_id)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, (SELECT id FROM sessions WHERE id = ?))
                        ON CONFLICT(id) DO UPDATE SET
                            file_path=excluded.file_path, title=excluded.title, status=excluded.status,
                            source=excluded.source, source_url=excluded.source_url,
                            deadline=excluded.deadline, tags=excluded.tags,
                            position=excluded.position, updated_at=?,
                            revision=tasks.revision + 1""",
-                    (task_id, file_path, title, status, source, source_url, deadline, tags, position, now, now, now),
+                    (task_id, file_path, title, status, source, source_url, deadline, tags, position, now, now,
+                     actor, now),
                 )
             else:
                 # A plain UPDATE, not the upsert: an ON CONFLICT guard binds only
@@ -249,9 +272,68 @@ class TaskStore:
         )
 
     async def get_task(self, task_id: str) -> dict | None:
-        async with self.db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)) as cursor:
+        async with self.db.execute(
+            f"SELECT {_TASK_COLUMNS} FROM tasks t WHERE t.id = ?", (task_id,),
+        ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    # ── Sessions of a task (created, implemented, updated) ───────────────
+
+    async def list_task_sessions(self, task_id: str) -> list[dict]:
+        """The existing sessions that created, implemented or updated a task.
+
+        One ``{"id", "title", "relation"}`` per session, ``relation`` from
+        :data:`SESSION_RELATIONS`. Sorted by relation, then by the time of
+        the first link. An actor that is not a session ID (``web``,
+        ``system``) matches no session, so it gives no entry.
+        """
+        async with self.db.execute(
+            f"""SELECT s.id, {_SESSION_NAME} AS title, MIN(link.rank) AS rank
+                FROM (
+                    SELECT created_session_id AS session_id, 0 AS rank, created_at AS at
+                        FROM tasks WHERE id = :task
+                    UNION ALL
+                    SELECT impl_session_id, 1, reviewed_at FROM plans WHERE task_id = :task
+                    UNION ALL
+                    SELECT actor, 2, created_at FROM task_events WHERE task_id = :task
+                ) link
+                JOIN sessions s ON s.id = link.session_id
+                GROUP BY s.id
+                ORDER BY rank, MIN(link.at)""",
+            {"task": task_id},
+        ) as cursor:
+            return [
+                {"id": row["id"], "title": row["title"],
+                 "relation": SESSION_RELATIONS[row["rank"]]}
+                async for row in cursor
+            ]
+
+    async def list_session_tasks(self, session_id: str) -> list[dict]:
+        """The tasks that a session created, implemented or updated.
+
+        Task rows as :meth:`get_task` gives them, each with ``relation``
+        from :data:`SESSION_RELATIONS`, the most recently updated first.
+        """
+        async with self.db.execute(
+            f"""SELECT {_TASK_COLUMNS}, link.rank FROM tasks t
+                JOIN (
+                    SELECT task_id, MIN(rank) AS rank FROM (
+                        SELECT id AS task_id, 0 AS rank FROM tasks
+                            WHERE created_session_id = :session
+                        UNION ALL
+                        SELECT task_id, 1 FROM plans WHERE impl_session_id = :session
+                        UNION ALL
+                        SELECT task_id, 2 FROM task_events WHERE actor = :session
+                    ) GROUP BY task_id
+                ) link ON link.task_id = t.id
+                ORDER BY t.updated_at DESC, t.id""",
+            {"session": session_id},
+        ) as cursor:
+            rows = [dict(row) async for row in cursor]
+        for row in rows:
+            row["relation"] = SESSION_RELATIONS[row.pop("rank")]
+        return rows
 
     # ── Status history (task_events) ─────────────────────────────────────
 
@@ -573,7 +655,7 @@ class TaskStore:
             # the history with rows that say nothing changed.
             await self._record_status_event(task_id, row[0], lane, actor, attribution)
             async with self.db.execute(
-                "SELECT * FROM tasks WHERE id = ?", (task_id,),
+                f"SELECT {_TASK_COLUMNS} FROM tasks t WHERE t.id = ?", (task_id,),
             ) as cursor:
                 moved = await cursor.fetchone()
             return dict(moved) if moved else None
@@ -618,7 +700,7 @@ class TaskStore:
         order_clause = self._SORT_CLAUSES.get(sort, self._SORT_CLAUSES["deadline"])
         params.extend([limit, offset])
         async with self.db.execute(
-            f"SELECT * FROM tasks{where} ORDER BY {order_clause} LIMIT ? OFFSET ?",
+            f"SELECT {_TASK_COLUMNS} FROM tasks t{where} ORDER BY {order_clause} LIMIT ? OFFSET ?",
             tuple(params),
         ) as cursor:
             return [dict(row) async for row in cursor]
@@ -831,7 +913,7 @@ class TaskStore:
             fts_params = [fts_query] + params + [limit]
 
             async with self.db.execute(
-                f"SELECT t.* FROM tasks t "
+                f"SELECT {_TASK_COLUMNS} FROM tasks t "
                 f"JOIN tasks_fts f ON f.task_id = t.id "
                 f"WHERE tasks_fts MATCH ?{where_extra} "
                 f"ORDER BY f.rank LIMIT ?",
@@ -849,7 +931,7 @@ class TaskStore:
             params.append(remaining)
 
             async with self.db.execute(
-                f"SELECT t.* FROM tasks t WHERE {' AND '.join(conditions)} "
+                f"SELECT {_TASK_COLUMNS} FROM tasks t WHERE {' AND '.join(conditions)} "
                 f"ORDER BY t.updated_at DESC LIMIT ?",
                 tuple(params),
             ) as cursor:
@@ -865,7 +947,7 @@ class TaskStore:
             params.append(remaining)
 
             async with self.db.execute(
-                f"SELECT t.* FROM tasks t WHERE {' AND '.join(conditions)} "
+                f"SELECT {_TASK_COLUMNS} FROM tasks t WHERE {' AND '.join(conditions)} "
                 f"ORDER BY t.updated_at DESC LIMIT ?",
                 tuple(params),
             ) as cursor:

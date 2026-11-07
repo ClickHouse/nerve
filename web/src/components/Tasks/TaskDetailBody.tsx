@@ -7,6 +7,7 @@ import { StatusBadge, StatusSelect } from './StatusControls';
 import { MarkdownContent } from '../Chat/MarkdownContent';
 import { TaskComments } from './TaskComments';
 import { TaskPlan } from './TaskPlan';
+import { CreatedInLink, TaskSessions } from './TaskSessions';
 import { TaskTimeline } from './TaskTimeline';
 
 /**
@@ -72,7 +73,9 @@ export function TaskDetailBody({ task }: { task: Task }) {
             <Calendar size={11} /> {task.deadline}
           </span>
         )}
-        {task.source && <span className="text-text-faint">from {task.source}</span>}
+        {task.created_session_title != null
+          ? <CreatedInLink task={task} />
+          : task.source && <span className="text-text-faint">from {task.source}</span>}
         {task.source_url && (
           <a
             href={task.source_url}
@@ -160,6 +163,7 @@ export function TaskDetailBody({ task }: { task: Task }) {
           {localContent
             ? <MarkdownContent content={localContent} />
             : <span className="text-text-faint italic">No content</span>}
+          <TaskSessions sessions={task.sessions} />
           <TaskComments taskId={task.id} refreshKey={task.updated_at} />
         </div>
       )}

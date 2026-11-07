@@ -228,12 +228,13 @@ export type AgentStatus =
   | { state: 'writing' };
 
 export interface PanelTab {
-  id: string;              // toolUseId; 'agents-panel'; `agent:<agentId>`
+  id: string;              // toolUseId; 'agents-panel'; 'tasks-panel'; `agent:<agentId>`
   /** 'agents' is the singleton Agents roster; 'agent' is one agent's live
-   *  transcript; 'subagent' stays for the legacy result-only tab of old
-   *  history (no agent record). */
-  type: 'plan' | 'subagent' | 'files' | 'workflow' | 'agents' | 'agent';
-  label: string;           // "Plan", "Explore", "Agent", "Files", "Workflow"
+   *  transcript; 'tasks' is the singleton list of the session's tasks;
+   *  'subagent' stays for the legacy result-only tab of old history (no
+   *  agent record). */
+  type: 'plan' | 'subagent' | 'files' | 'workflow' | 'agents' | 'agent' | 'tasks';
+  label: string;           // "Plan", "Explore", "Agent", "Files", "Workflow", "Tasks"
   subagentType: string;    // "Plan", "Explore", "general-purpose", "Workflow"
   description: string;
   model?: string;

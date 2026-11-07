@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { useShallow } from 'zustand/react/shallow';
-import { useChatStore } from '../stores/chatStore';
+import { TASKS_PANEL_ID, useChatStore } from '../stores/chatStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
 import { MessageList } from '../components/Chat/MessageList';
 import { ChatInput } from '../components/Chat/ChatInput';
@@ -17,7 +17,7 @@ import { StopAllDialog } from '../components/Chat/agents/StopAllDialog';
 import { StopEscalationBanner } from '../components/Chat/agents/StopEscalationBanner';
 import { ReviewLoopCard } from '../components/Chat/ReviewLoopCard';
 import { SessionCreator } from '../components/Chat/ActorLabel';
-import { Loader2, Files, ExternalLink, GitBranch } from '../components/ui/icons';
+import { Loader2, Files, ExternalLink, GitBranch, ListChecks } from '../components/ui/icons';
 import { Button, PaneToggle } from '../components/ui';
 import { api } from '../api/client';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
@@ -53,10 +53,10 @@ export function ChatPage() {
     isStreaming, loading,
     agentStatus, contextUsage, backendStatus, currentTodos, currentCCTasks,
     sidebarCollapsed, mobileSidebarOpen, panelVisible,
-    modifiedFiles, modifiedFilesCount,
+    modifiedFiles, modifiedFilesCount, sessionTasks,
     backendDefault, newChatBackend,
     loadSessions, switchSession, createSession, deleteSession,
-    sendMessage, stopSession, toggleSessionList, setMobileSidebarOpen, openFilesPanel,
+    sendMessage, stopSession, toggleSessionList, setMobileSidebarOpen, openFilesPanel, openTasksPanel,
   } = useChatStore(useShallow(s => ({
     sessions: s.sessions,
     archivedSessions: s.archivedSessions,
@@ -76,6 +76,7 @@ export function ChatPage() {
     panelVisible: s.panelVisible,
     modifiedFiles: s.modifiedFiles,
     modifiedFilesCount: s.modifiedFilesCount,
+    sessionTasks: s.sessionTasks,
     backendDefault: s.backendDefault,
     newChatBackend: s.newChatBackend,
     loadSessions: s.loadSessions,
@@ -87,9 +88,11 @@ export function ChatPage() {
     toggleSessionList: s.toggleSessionList,
     setMobileSidebarOpen: s.setMobileSidebarOpen,
     openFilesPanel: s.openFilesPanel,
+    openTasksPanel: s.openTasksPanel,
   })));
   const hasPanels = useChatStore(s => s.panels.length > 0);
   const filesPanelActive = useChatStore(s => s.panels.some(p => p.id === 'files-panel'));
+  const tasksPanelActive = useChatStore(s => s.panels.some(p => p.id === TASKS_PANEL_ID));
 
   // The active session row may live in the feed or a lazy archived/system
   // group. A session that none of them has loaded is read by its id.
@@ -313,6 +316,7 @@ export function ChatPage() {
     : STATUS_LABELS[agentStatus.state] || null;
 
   const fileCount = modifiedFiles.length || modifiedFilesCount;
+  const taskCount = sessionTasks?.length ?? 0;
   // SidePanel renders nothing without a tab, so it only covers the column when
   // there is one.
   const panelCoversColumn = isMobile && panelVisible && hasPanels;
@@ -459,6 +463,22 @@ export function ChatPage() {
                 <Button variant="subtle" size="xs" onClick={openFilesPanel} title="Modified files">
                   <Files size={14} className={filesPanelActive ? 'text-hue-teal' : undefined} />
                   <span className="tabular-nums">{fileCount}</span>
+                </Button>
+              )}
+              {taskCount > 0 && (
+                <Button
+                  variant="subtle"
+                  size="xs"
+                  onClick={openTasksPanel}
+                  title="Tasks from this session"
+                  aria-label={`Tasks from this session (${taskCount})`}
+                  // On a phone, the last button of the header: the pseudo-element
+                  // makes the tap target 44 px high (10 px up and down) and wider
+                  // (4 px into the gap, 12 px into the header's padding).
+                  className="relative max-md:before:absolute max-md:before:-inset-y-2.5 max-md:before:-left-1 max-md:before:-right-3 max-md:before:content-['']"
+                >
+                  <ListChecks size={14} className={tasksPanelActive ? 'text-hue-blue' : undefined} />
+                  <span className="tabular-nums">{taskCount}</span>
                 </Button>
               )}
               {contextUsage && (
