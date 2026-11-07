@@ -46,14 +46,10 @@ WHERE created_session_id IS NULL
 """
 
 
-async def _has_column(db: aiosqlite.Connection, table: str, column: str) -> bool:
-    async with db.execute(f"PRAGMA table_info({table})") as cursor:
-        rows = await cursor.fetchall()
-    return any(row[1] == column for row in rows)
-
-
 async def up(db: aiosqlite.Connection) -> None:
-    if not await _has_column(db, "tasks", "created_session_id"):
+    async with db.execute("PRAGMA table_info(tasks)") as cursor:
+        columns = {row[1] for row in await cursor.fetchall()}
+    if "created_session_id" not in columns:
         await db.execute("ALTER TABLE tasks ADD COLUMN created_session_id TEXT")
     await db.executescript(INDEXES)
     cursor = await db.execute(BACKFILL)
