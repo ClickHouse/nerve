@@ -46,13 +46,15 @@ export interface Alerter {
  * Every tab gets each item through its WebSocket. A tab in front tells the
  * others that the person sees the item. A tab in the background waits
  * `ALERT_DELAY_MS`, then shows the alert unless another tab told it about
- * the item, and tells the others that it showed it. The alert's `tag` is
- * the item id, so the browser keeps one alert per item if two tabs show it
- * at the same time.
+ * the item, and tells the others that it showed it. Two tabs can wait the
+ * same time, and the channel delivers later, so a tab first takes the
+ * item's Web Lock: only the tab that gets it shows the alert, and it keeps
+ * the lock while the alert is open. Without the Web Locks API, the alert's
+ * `tag` (the item id) makes the browser keep one alert per item.
  */
 export function createAlerter({ inFront = tabInFront, onOpen }: {
   inFront?: () => boolean;
-  onOpen: (id: string) => void;
+  onOpen: () => void;
 }): Alerter {
   const channel = typeof BroadcastChannel === 'function' ? new BroadcastChannel(ALERT_CHANNEL) : null;
   // Keys of the items that another tab took care of. A re-delivered item has
@@ -72,7 +74,9 @@ export function createAlerter({ inFront = tabInFront, onOpen }: {
   };
   channel?.addEventListener('message', onMessage);
 
-  const show = (event: NotificationEvent, key: string) => {
+  /** Shows the alert. Resolves when the alert closes. */
+  const show = (event: NotificationEvent, key: string) => new Promise<void>((closed) => {
+    if (handled.has(key) || inFront()) return closed();
     const id = event.notification_id;
     let alert: Notification;
     try {
@@ -83,16 +87,26 @@ export function createAlerter({ inFront = tabInFront, onOpen }: {
       });
     } catch {
       // Some phone browsers show alerts only through a service worker.
-      return;
+      return closed();
     }
     alert.onclick = () => {
       window.focus();
-      onOpen(id);
+      onOpen();
       alert.close();
     };
-    alert.onclose = () => { if (open.get(id) === alert) open.delete(id); };
+    alert.onclose = () => {
+      if (open.get(id) === alert) open.delete(id);
+      closed();
+    };
     open.set(id, alert);
     tell('shown', key);
+  });
+
+  const claim = (event: NotificationEvent, key: string) => {
+    if (!navigator.locks) return void show(event, key);
+    void navigator.locks.request(`${ALERT_CHANNEL}:${key}`, { ifAvailable: true }, (lock) => (
+      lock ? show(event, key) : undefined
+    ));
   };
 
   return {
@@ -105,7 +119,7 @@ export function createAlerter({ inFront = tabInFront, onOpen }: {
       if (!wanted || handled.has(key) || timers.has(key)) return;
       timers.set(key, setTimeout(() => {
         timers.delete(key);
-        if (!handled.has(key) && !inFront()) show(event, key);
+        claim(event, key);
       }, ALERT_DELAY_MS));
     },
     close: (id) => {
