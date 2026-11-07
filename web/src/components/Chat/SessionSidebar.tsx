@@ -74,18 +74,25 @@ type RowDnd = {
   onDrop: (id: string) => void;
 };
 
-export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate, onDelete, collapsed, mobile = false, onRequestClose }: {
+/**
+ * Where the list is laid out: `column` is the resizable column next to the
+ * chat (desktop), `drawer` an off-canvas drawer over the chat (phone), and
+ * `page` the whole page above a composer (the phone's Inbox).
+ */
+export type SessionListLayout = 'column' | 'drawer' | 'page';
+
+export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate, onDelete, collapsed, layout = 'column', onRequestClose }: {
   sessions: Session[];
   activeSession: string;
   agentStatus: AgentStatus;
   onCreate: () => void;
   onDelete: (id: string) => void;
   collapsed?: boolean;
-  /** Render as an off-canvas drawer instead of an inline column. */
-  mobile?: boolean;
+  layout?: SessionListLayout;
   /** Drawer mode only — tapping the scrim asks the parent to close. */
   onRequestClose?: () => void;
 }) {
+  const drawer = layout === 'drawer';
   const [systemExpanded, setSystemExpanded] = useState(false);
   // Archived group: collapsed by default and NOT persisted (mirrors System), so every reload starts collapsed and fetches nothing until expanded.
   const [archivedExpanded, setArchivedExpanded] = useState(false);
@@ -155,14 +162,14 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   // containment, Escape, and focus restoration. Declared before the search
   // effects below so that when Cmd+K opens the drawer and asks for search
   // focus in the same tick, the search input wins the race.
-  const drawerOpen = mobile && !collapsed;
+  const drawerOpen = drawer && !collapsed;
   const { dialogProps } = useModalSurface<HTMLDivElement>(drawerOpen, onRequestClose);
 
   // Opening a conversation should reveal it, so every row dismisses the
   // drawer. Leaving this to the parent's `activeSession` watcher isn't enough:
   // re-tapping the conversation that is already open never changes the route,
   // and the drawer would stay parked over the transcript.
-  const handleSelect = mobile ? onRequestClose : undefined;
+  const handleSelect = drawer ? onRequestClose : undefined;
 
   // Drag-to-resize the session list. It is left-anchored against the nav rail,
   // so the width tracks the cursor 1:1. The width transition is disabled while
@@ -493,21 +500,28 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
         />
       )}
     <div
-      {...(mobile ? dialogProps : {})}
-      aria-label={mobile ? 'Conversations' : undefined}
-      className={mobile
+      {...(drawer ? dialogProps : {})}
+      aria-label={drawer ? 'Conversations' : undefined}
+      // In page mode the list is a whole phone page: the
+      // `in-data-[layout=page]:` classes below give each row a touch target
+      // of about 44 px and the text size of a page, with no prop through
+      // each row.
+      data-layout={layout}
+      className={drawer
         ? `bg-surface border-r border-border-subtle flex flex-col overflow-hidden fixed inset-y-0 left-0 z-50 w-[85vw] max-w-[320px] transition-transform duration-200 outline-none ${collapsed ? '-translate-x-full' : 'translate-x-0'}`
+        : layout === 'page'
+        ? 'bg-bg flex flex-col flex-1 min-h-0 overflow-hidden'
         : `bg-surface border-r border-border-subtle flex flex-col shrink-0 overflow-hidden relative ${collapsed ? 'border-r-0' : ''} ${isDragging ? '' : 'transition-all duration-200'}`}
       // Fixed in drawer mode, so the shell's safe-area padding does not reach
       // it: without this its first controls sit under the status bar.
-      style={mobile ? safeAreaInsets('left') : { width: collapsed ? 0 : sidebarWidth }}
+      style={drawer ? safeAreaInsets('left') : layout === 'page' ? undefined : { width: collapsed ? 0 : sidebarWidth }}
       // Keep the closed drawer out of the tab order: it stays mounted so the
       // slide transition has something to animate, but it is off-canvas.
-      inert={mobile && collapsed ? true : undefined}
+      inert={drawer && collapsed ? true : undefined}
     >
       {/* Drag-to-resize handle on the right edge (hidden when collapsed).
-          Pointer-driven and mouse-only, so it has no place in drawer mode. */}
-      {!collapsed && !mobile && (
+          Pointer-driven and mouse-only, so only the column has it. */}
+      {!collapsed && layout === 'column' && (
         <div
           onMouseDown={handleResizeStart}
           className="group/resize absolute top-0 right-0 bottom-0 z-20 w-2 cursor-col-resize"
@@ -631,7 +645,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
               <Link
                 to={`/chat/${virtualSession.id}`}
                 onClick={handleSelect}
-                className={`group flex items-center gap-2 px-3 py-1.5 mx-1 mt-1 rounded-md cursor-pointer text-xs transition-colors no-underline
+                className={`group flex items-center gap-2 px-3 py-1.5 in-data-[layout=page]:py-3 mx-1 mt-1 rounded-md cursor-pointer text-xs transition-colors no-underline
                   ${virtualSession.id === activeSession
                     ? 'bg-accent/10 text-text'
                     : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
@@ -639,7 +653,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
               >
                 <MessageSquare size={13} className="shrink-0 opacity-50" />
                 <div className="flex-1 min-w-0">
-                  <div className="truncate text-xs leading-tight italic">New chat</div>
+                  <div className="truncate text-xs in-data-[layout=page]:text-sm leading-tight italic">New chat</div>
                 </div>
                 {virtualSession.id === activeSession && activeIsRunning && (
                   <Loader2 size={12} className="shrink-0 text-accent animate-spin" />
@@ -779,7 +793,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                         key={s.id}
                         to={`/chat/${s.id}`}
                         onClick={handleSelect}
-                        className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-xs leading-tight transition-colors no-underline
+                        className={`group flex items-center gap-2 px-3 py-1.5 in-data-[layout=page]:py-3 mx-1 rounded-md cursor-pointer text-xs in-data-[layout=page]:text-sm leading-tight transition-colors no-underline
                           ${s.id === activeSession
                             ? 'bg-accent/10 text-text-muted'
                             : 'text-text-faint hover:bg-surface-raised hover:text-text-muted'
@@ -905,13 +919,13 @@ function GroupHeader({ label, count, collapsed, tone, onToggle }: {
       fullWidth
       onClick={onToggle}
       aria-expanded={!collapsed}
-      className="justify-start gap-1 px-3 pt-2 pb-0.5 rounded-none text-left"
+      className="justify-start gap-1 px-3 pt-2 pb-0.5 in-data-[layout=page]:pt-4 in-data-[layout=page]:pb-1 rounded-none text-left"
     >
       {collapsed
         ? <ChevronRight size={10} className="shrink-0 text-text-faint" />
         : <ChevronDown size={10} className="shrink-0 text-text-faint" />
       }
-      <span className={`text-2xs font-medium ${tone ?? 'text-text-faint'}`}>{label}</span>
+      <span className={`text-2xs in-data-[layout=page]:text-xs font-medium ${tone ?? 'text-text-faint'}`}>{label}</span>
       {collapsed && count > 0 && (
         <span className="text-2xs text-text-faint tabular-nums">{count}</span>
       )}
@@ -1236,7 +1250,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
       onDragLeave={dnd ? () => dnd.onDragLeave(session.id) : undefined}
       onDrop={dnd ? (e) => { e.preventDefault(); e.stopPropagation(); dnd.onDrop(session.id); } : undefined}
       style={depth ? { paddingLeft: 12 + depth * 16 } : undefined}
-      className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-xs transition-colors no-underline
+      className={`group flex items-center gap-2 px-3 py-1.5 in-data-[layout=page]:py-3 mx-1 rounded-md cursor-pointer text-xs transition-colors no-underline
         ${isActive
           ? 'bg-accent/10 text-text'
           : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
@@ -1261,7 +1275,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
         <MessageSquare size={13} className="shrink-0 opacity-50" />
       )}
       <div className="flex-1 min-w-0">
-        <div className={`truncate text-xs leading-tight${isUnread ? ' font-semibold text-text' : ''}`}>{cleanTitle(session)}</div>
+        <div className={`truncate text-xs in-data-[layout=page]:text-sm leading-tight${isUnread ? ' font-semibold text-text' : ''}`}>{cleanTitle(session)}</div>
         <AttentionReason session={session} />
       </div>
 

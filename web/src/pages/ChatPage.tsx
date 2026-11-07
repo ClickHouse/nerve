@@ -322,7 +322,7 @@ export function ChatPage() {
         onCreate={handleCreateSession}
         onDelete={handleDeleteSession}
         collapsed={!sessionListOpen}
-        mobile={isMobile}
+        layout={isMobile ? 'drawer' : 'column'}
         onRequestClose={() => setMobileSidebarOpen(false)}
       />
 
