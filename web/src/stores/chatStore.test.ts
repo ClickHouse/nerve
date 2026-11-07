@@ -383,6 +383,95 @@ describe('socket open', () => {
   });
 });
 
+describe('catching up after a reconnect', () => {
+  const userRow = (id: number, text: string) => ({ id, role: 'user', content: text });
+  const replyRow = (id: number, text: string) => ({ id, role: 'assistant', content: text, blocks: [{ type: 'text', content: text }] });
+  const texts = () => useChatStore.getState().messages.map(m => m.blocks.map(b => ('content' in b ? b.content : '')).join(''));
+  const shown = (id: number, role: 'user' | 'assistant', text: string) =>
+    ({ id, role, blocks: [{ type: 'text' as const, content: text }] });
+
+  it('loads the messages of the open chat on a reconnect', async () => {
+    onSession({ messages: [shown(1, 'user', 'hi')] });
+    vi.mocked(api.getMessages).mockImplementation(async () => ({ messages: [userRow(1, 'hi'), replyRow(2, 'stored while away')] }));
+    try {
+      // The first open of the module loads nothing; every later open is a reconnect.
+      onSocketOpen?.();
+      onSocketOpen?.();
+      await vi.waitFor(() => expect(texts()).toEqual(['hi', 'stored while away']));
+      expect(api.getMessages).toHaveBeenCalledWith(SID);
+    } finally {
+      vi.mocked(api.getMessages).mockImplementation(async () => ({ messages: [] }));
+    }
+  });
+
+  it('keeps the view when nothing changed', async () => {
+    const before = [shown(1, 'user', 'hi'), shown(2, 'assistant', 'hello')];
+    onSession({ messages: before });
+    vi.mocked(api.getMessages).mockResolvedValueOnce({ messages: [userRow(1, 'hi'), replyRow(2, 'hello')] });
+
+    await useChatStore.getState().catchUp();
+
+    expect(useChatStore.getState().messages).toBe(before);
+    expect(api.getModifiedFiles).not.toHaveBeenCalled();
+  });
+
+  it('keeps a message sent during the reconnect until the server stores it', async () => {
+    onSession({ messages: [shown(1, 'user', 'hi')] });
+    await useChatStore.getState().sendMessage('run the tests');
+    vi.mocked(api.getMessages).mockResolvedValueOnce({ messages: [userRow(1, 'hi'), replyRow(2, 'hello')] });
+
+    await useChatStore.getState().catchUp();
+
+    expect(texts()).toEqual(['hi', 'hello', 'run the tests']);
+    expect(useChatStore.getState().messages[2].client_msg_id).toBeTruthy();
+  });
+
+  it('reads again when a live event changes the rows during the read', async () => {
+    onSession({ messages: [shown(1, 'user', 'hi')] });
+    let answer: (value: { messages: unknown[] }) => void = () => {};
+    vi.mocked(api.getMessages)
+      .mockReturnValueOnce(new Promise((done) => { answer = done; }))
+      .mockResolvedValueOnce({ messages: [userRow(1, 'hi'), replyRow(2, 'done reply'), userRow(3, 'next')] });
+
+    const run = useChatStore.getState().catchUp();
+    dispatch({ type: 'user_message', session_id: SID, content: 'next', actor_id: null });
+    answer({ messages: [userRow(1, 'hi')] });
+    await run;
+
+    expect(api.getMessages).toHaveBeenCalledTimes(2);
+    expect(texts()).toEqual(['hi', 'done reply', 'next']);
+  });
+
+  it('drops the read when another chat opens meanwhile', async () => {
+    onSession({ messages: [shown(1, 'user', 'hi')] });
+    let answer: (value: { messages: unknown[] }) => void = () => {};
+    vi.mocked(api.getMessages).mockReturnValueOnce(new Promise((done) => { answer = done; }));
+
+    const run = useChatStore.getState().catchUp();
+    useChatStore.setState({ activeSession: 's-other', messages: [] });
+    answer({ messages: [userRow(1, 'hi'), replyRow(2, 'hello')] });
+    await run;
+
+    expect(useChatStore.getState().messages).toEqual([]);
+  });
+
+  it('shows the stored reply when the turn ended while the socket was down', async () => {
+    onSession({
+      messages: [shown(1, 'user', 'hi')],
+      isStreaming: true,
+      streamingBlocks: [{ type: 'text', content: 'half a rep' }],
+      agentStatus: { state: 'thinking' },
+    });
+    vi.mocked(api.getMessages).mockResolvedValueOnce({ messages: [userRow(1, 'hi'), replyRow(2, 'the whole reply')] });
+
+    dispatch({ type: 'session_status', session_id: SID, is_running: false });
+
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    expect(useChatStore.getState().streamingBlocks).toEqual([]);
+    await vi.waitFor(() => expect(texts()).toEqual(['hi', 'the whole reply']));
+  });
+});
+
 describe('switching sessions', () => {
   it('resets the agent store and loads the roster', async () => {
     onSession();

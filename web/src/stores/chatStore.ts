@@ -13,6 +13,7 @@ import { useAgentStore } from './agentStore';
 // Helpers
 import { MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
+import { mergeCatchUp, sameRows } from './helpers/catchUp';
 import { loadDrafts, persistDraft, removeDraft, pruneDrafts } from './helpers/draftStorage';
 import { loadReads, persistRead, removeRead, loadBaseline } from './helpers/readStorage';
 import { removeSeen } from './helpers/agentSeen';
@@ -89,6 +90,28 @@ const QUOTE_DEFAULTS: Record<QuoteAction, string> = {
 };
 
 let _quoteId = 0;
+
+/** The catch-up read that runs (see `catchUp`); `again` asks it to read again. */
+let catchUpRun: { session: string; again: boolean } | null = null;
+
+type LastUsage = NonNullable<Awaited<ReturnType<typeof api.getMessages>>['last_usage']>;
+
+/** The context bar's numbers from the usage of the last stored turn. */
+function contextUsageFrom(usage: LastUsage): NonNullable<ChatState['contextUsage']> {
+  const cc = usage.cache_creation as
+    | { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }
+    | undefined;
+  return {
+    input_tokens: usage.input_tokens || 0,
+    output_tokens: usage.output_tokens || 0,
+    cache_creation_input_tokens: usage.cache_creation_input_tokens || 0,
+    cache_read_input_tokens: usage.cache_read_input_tokens || 0,
+    cache_creation_5m_input_tokens: cc?.ephemeral_5m_input_tokens ?? 0,
+    cache_creation_1h_input_tokens: cc?.ephemeral_1h_input_tokens ?? 0,
+    max_context_tokens: usage.max_context_tokens || 200_000,
+    num_turns: usage.num_turns || 1,
+  };
+}
 
 // WS event types that mutate the *active* chat view — stream tokens, panels,
 // interaction prompts, file changes. They're dropped when their session_id
@@ -255,6 +278,12 @@ interface ChatState {
 
   loadSessions: () => Promise<void>;
   switchSession: (id: string) => Promise<void>;
+  /**
+   * Load the messages of the open chat again after the socket was down, so
+   * that the view shows what happened meanwhile. A call while one runs makes
+   * that one read again.
+   */
+  catchUp: () => Promise<void>;
   createSession: () => Promise<void>;
   /**
    * Materialize the virtual "new chat" in the API and adopt the server-minted
@@ -785,21 +814,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         loading: false,
       };
       // Restore context usage from last turn (for context bar)
-      if (data.last_usage) {
-        const cc = data.last_usage.cache_creation as
-          | { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }
-          | undefined;
-        update.contextUsage = {
-          input_tokens: data.last_usage.input_tokens || 0,
-          output_tokens: data.last_usage.output_tokens || 0,
-          cache_creation_input_tokens: data.last_usage.cache_creation_input_tokens || 0,
-          cache_read_input_tokens: data.last_usage.cache_read_input_tokens || 0,
-          cache_creation_5m_input_tokens: cc?.ephemeral_5m_input_tokens ?? 0,
-          cache_creation_1h_input_tokens: cc?.ephemeral_1h_input_tokens ?? 0,
-          max_context_tokens: data.last_usage.max_context_tokens || 200_000,
-          num_turns: data.last_usage.num_turns || 1,
-        };
-      }
+      if (data.last_usage) update.contextUsage = contextUsageFrom(data.last_usage);
       // Restore todos from last TodoWrite call in history (legacy)
       update.currentTodos = extractTodosFromMessages(hydrated);
       // Restore Claude Code 2.1+ task panel from history
@@ -809,6 +824,48 @@ export const useChatStore = create<ChatState>((set, get) => ({
       get().fetchModifiedFiles(id);
     } catch {
       set({ loading: false });
+    }
+  },
+
+  catchUp: async () => {
+    const session = get().activeSession;
+    if (!session || session === get().virtualSession?.id) return;
+    if (catchUpRun?.session === session) {
+      catchUpRun.again = true;
+      return;
+    }
+    const run = { session, again: false };
+    catchUpRun = run;
+    try {
+      // Live events can change the rows during the read. Then the read can
+      // be older than the rows on screen, so read again.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        run.again = false;
+        const before = get().messages;
+        let data: Awaited<ReturnType<typeof api.getMessages>>;
+        try {
+          data = await api.getMessages(session);
+        } catch (e) {
+          console.error('Failed to load messages:', e);
+          return;
+        }
+        if (get().activeSession !== session) return;
+        if (run.again || get().messages !== before) continue;
+        const merged = mergeCatchUp(data.messages.map(hydrateMessage), before);
+        if (sameRows(merged, before)) return;
+        const update: Partial<ChatState> = { messages: merged };
+        // While a turn runs, its replayed events own the todos and the usage.
+        if (!get().isStreaming) {
+          if (data.last_usage) update.contextUsage = contextUsageFrom(data.last_usage);
+          update.currentTodos = extractTodosFromMessages(merged);
+          update.currentCCTasks = extractCCTasksFromMessages(merged);
+        }
+        set(update);
+        get().fetchModifiedFiles(session);
+        return;
+      }
+    } finally {
+      if (catchUpRun === run) catchUpRun = null;
     }
   },
 
@@ -1574,10 +1631,14 @@ if (typeof ws.onOpen === 'function') {
       ws.switchSession(s.activeSession);
       useAgentStore.getState().resubscribeAll();
     }
-    // A reconnect (a gateway restart, a dropped network) missed the global
-    // events sent meanwhile, and a restarted server never re-sends the zero
-    // counts: the sidebar rows come back from the server.
-    if (socketOpenedBefore) void s.loadSessions();
+    // A reconnect (a gateway restart, a dropped network, a phone that slept)
+    // missed the events sent meanwhile, and a restarted server never re-sends
+    // the zero counts: the sidebar rows and the open chat's messages come
+    // back from the server.
+    if (socketOpenedBefore) {
+      void s.loadSessions();
+      void s.catchUp();
+    }
     socketOpenedBefore = true;
   });
 }

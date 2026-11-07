@@ -259,6 +259,58 @@ describe('handleSessionStatus — the agent roster', () => {
   });
 });
 
+describe('handleSessionStatus: a turn that ended while the socket was down', () => {
+  const idle: Extract<WSMessage, { type: 'session_status' }> = {
+    type: 'session_status', session_id: 's1', is_running: false,
+  };
+  const planTab: PanelTab = {
+    id: 'plan-1', type: 'plan', label: 'Plan', subagentType: 'Plan', description: '', content: 'x', prompt: '',
+    streaming: true, status: 'running', startedAt: 1, blocks: [],
+  };
+
+  function streamingStore() {
+    const store = fakeStore([row('s1')], 's1');
+    const catchUp = vi.fn(async () => {});
+    const updatePanelTab = vi.fn();
+    store.set({
+      isStreaming: true,
+      streamingBlocks: [{ type: 'text', content: 'half a rep' }],
+      agentStatus: { state: 'thinking' },
+      pendingInteraction: { interactionId: 'i-1', interactionType: 'question', toolName: 'AskUserQuestion', toolInput: {}, agent: null },
+      panels: [planTab],
+      catchUp,
+      updatePanelTab,
+    });
+    return { store, catchUp, updatePanelTab };
+  }
+
+  it('leaves streaming mode and loads the stored reply', () => {
+    const { store, catchUp, updatePanelTab } = streamingStore();
+
+    handleSessionStatus(idle, store.get, store.set);
+
+    const s = store.current();
+    expect(s.isStreaming).toBe(false);
+    expect(s.agentStatus).toEqual({ state: 'idle' });
+    // The streamed part is not kept: the stored reply replaces it.
+    expect(s.streamingBlocks).toEqual([]);
+    expect(s.messages).toEqual([]);
+    expect(s.pendingInteraction).toBeNull();
+    expect(updatePanelTab).toHaveBeenCalledWith('plan-1', expect.objectContaining({ status: 'complete', streaming: false }));
+    expect(catchUp).toHaveBeenCalledOnce();
+  });
+
+  it('changes nothing when the tab does not stream', () => {
+    const { store, catchUp } = streamingStore();
+    store.set({ isStreaming: false });
+
+    handleSessionStatus(idle, store.get, store.set);
+
+    expect(store.current().pendingInteraction).not.toBeNull();
+    expect(catchUp).not.toHaveBeenCalled();
+  });
+});
+
 describe('handleSessionRunning — the agent count', () => {
   it('copies background_count onto the row', () => {
     const store = fakeStore([row('s1'), row('s2', { background_count: 4 })]);
