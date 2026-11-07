@@ -4,7 +4,7 @@ import {
 } from '../components/ui/icons';
 import type { SessionTrigger } from '../types/chat';
 import {
-  FORK_ICON, ORIGIN_ICONS, originIcon, originLink, showsOrigin, startedByPerson,
+  FORK_ICON, ORIGIN_ICONS, originIcon, originLink, originPhrase, showsOrigin,
 } from './sessionOrigin';
 
 describe('origin icons', () => {
@@ -45,15 +45,25 @@ describe('showsOrigin', () => {
   });
 });
 
-describe('startedByPerson', () => {
-  it('names the creator for channel input, the API and Run later only', () => {
-    for (const trigger of ['slack', 'telegram', 'email', 'api'] as const) {
-      expect(startedByPerson({ trigger }), trigger).toBe(true);
-    }
-    expect(startedByPerson({ trigger: 'cron', origin_detail: { run_later: '1h' } })).toBe(true);
-    for (const trigger of ['cron', 'plan', 'workflow', 'external', 'chat'] as const) {
-      expect(startedByPerson({ trigger }), trigger).toBe(false);
-    }
+describe('originPhrase', () => {
+  it('names the origin with its details', () => {
+    expect(originPhrase({ trigger: 'slack', origin_detail: { channel: 'C1', channel_name: 'general' } }))
+      .toBe('From Slack #general');
+    expect(originPhrase({ trigger: 'slack', origin_detail: { channel: 'D1' } }))
+      .toBe('From a Slack direct message');
+    expect(originPhrase({ trigger: 'cron', origin_detail: { cron_job: 'daily-digest' } }))
+      .toBe('From cron job daily-digest');
+    expect(originPhrase({ trigger: 'cron', origin_detail: { run_later: '1h' } })).toBe('From Run later');
+    expect(originPhrase({ trigger: 'api', origin_detail: { hook: 'deploy' } })).toBe('From webhook deploy');
+    expect(originPhrase({ trigger: 'external', origin_detail: { client: 'codex' } })).toBe('From codex');
+  });
+
+  it('has a phrase for each trigger without details', () => {
+    expect(originPhrase({ trigger: 'api' })).toBe('From the API');
+    expect(originPhrase({ trigger: 'plan', origin_detail: { plan_id: 'plan-1' } })).toBe('From a plan');
+    expect(originPhrase({ trigger: 'telegram' })).toBe('From Telegram');
+    expect(originPhrase({ trigger: 'system' })).toBe('From Nerve');
+    expect(originPhrase({})).toBe('From an unknown origin');
   });
 });
 
