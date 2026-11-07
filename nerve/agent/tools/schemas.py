@@ -483,14 +483,16 @@ READ_SOURCE_SCHEMA = {
 # ----- Plan tools -----
 
 #: The plan summary, the text that the plan page shows under the title. The
-#: handlers clip a longer one.
+#: handlers clip a longer one. The schema has no ``maxLength``: the MCP
+#: endpoint checks arguments against it, and a long summary must not refuse
+#: the whole plan.
 PLAN_SUMMARY_MAX_CHARS = 400
 
 PLAN_SUMMARY_PROPERTY = {
     "type": "string",
-    "maxLength": PLAN_SUMMARY_MAX_CHARS,
     "description": (
-        "Optional, recommended. Up to 3 short plain-text lines for the reviewer: "
+        f"Optional, recommended. At most {PLAN_SUMMARY_MAX_CHARS} characters, "
+        "up to 3 short plain-text lines for the reviewer: "
         "what the plan changes, where (repositories, number of PRs), and what it "
         "will need from the user later. Shown under the plan title. Without it, "
         "the page shows the first lines of the plan."

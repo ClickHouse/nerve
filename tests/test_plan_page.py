@@ -17,11 +17,12 @@ from fastapi.testclient import TestClient
 
 from nerve.agent import tools as tools_mod
 from nerve.agent.tools.handlers.plans import (
+    PLAN_PROPOSE_SPEC,
     plan_propose_handler,
     plan_read_handler,
     plan_update_handler,
 )
-from nerve.agent.tools.registry import ToolContext
+from nerve.agent.tools.registry import ToolContext, ToolRegistry
 from nerve.agent.tools.schemas import (
     PLAN_PROPOSE_SCHEMA,
     PLAN_SUMMARY_MAX_CHARS,
@@ -30,7 +31,9 @@ from nerve.agent.tools.schemas import (
 from nerve.db.migrations import v062_plan_summary
 from nerve.gateway.routes import plans as plans_routes
 from nerve.gateway.routes._deps import init_deps
+from nerve.mcp_server.server import build_mcp_server
 from tests.actor_rows import ensure_system_principal
+from tests.test_mcp_server import _invoke_call_tool
 
 TASK_ID = "t-summary"
 SUMMARY = "Adds a dark mode toggle to the settings page.\nOne PR in example/repo."
@@ -64,7 +67,8 @@ def test_both_tools_offer_a_summary():
     for schema in (PLAN_PROPOSE_SCHEMA, PLAN_UPDATE_SCHEMA):
         prop = schema["properties"]["summary"]
         assert prop["type"] == "string"
-        assert prop["maxLength"] == PLAN_SUMMARY_MAX_CHARS
+        # No maxLength: the handler clips a longer summary, the call goes on.
+        assert "maxLength" not in prop
         assert "summary" not in schema["required"]
 
 
@@ -93,13 +97,23 @@ class TestTools:
         assert (await _pending(db))["summary"] is None
 
     async def test_a_long_summary_is_clipped_and_the_agent_is_told(self, db, ctx):
-        result = await plan_propose_handler(ctx, {
+        # Through the MCP endpoint, which checks the arguments against the
+        # input schema before the handler runs.
+        registry = ToolRegistry()
+        registry.register(PLAN_PROPOSE_SPEC)
+
+        async def resolve(_rctx=None) -> ToolContext:
+            return ctx
+
+        server = build_mcp_server(registry, ctx_resolver=resolve)
+        result = await _invoke_call_tool(server, "plan_propose", {
             "task_id": TASK_ID, "content": "Step one.", "summary": "word " * 200,
         })
+        assert result.is_error is False
         summary = (await _pending(db))["summary"]
         assert len(summary) <= PLAN_SUMMARY_MAX_CHARS
         assert summary.endswith("…")
-        assert f"clipped to {PLAN_SUMMARY_MAX_CHARS} characters" in result.content[0]["text"]
+        assert f"clipped to {PLAN_SUMMARY_MAX_CHARS} characters" in result.content[0].text
 
     async def test_update_stores_its_own_summary_and_copies_none(self, db, ctx):
         await plan_propose_handler(ctx, {"task_id": TASK_ID, "content": "v1", "summary": SUMMARY})
