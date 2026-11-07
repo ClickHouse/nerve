@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { api } from '../api/client';
+import { api, type SessionTask } from '../api/client';
 import { setBeforeReenter } from '../api/hosted';
 import { ws } from '../api/websocket';
 import type { WSMessage } from '../api/websocket';
@@ -132,6 +132,16 @@ const VIEW_SCOPED_EVENTS = new Set<WSMessage['type']>([
 
 /** The singleton Agents roster tab. */
 export const AGENTS_PANEL_ID = 'agents-panel';
+/** The singleton tab of the open session's tasks. */
+export const TASKS_PANEL_ID = 'tasks-panel';
+/**
+ * The `task_updated` events that can change the session's task list. The
+ * event does not name the session that made the change, so each of these
+ * reads the list again.
+ */
+const SESSION_TASK_EVENTS = new Set(['created', 'updated', 'moved', 'done']);
+/** The newest read of the session's tasks; an older answer is dropped. */
+let sessionTasksRequest = 0;
 /** The tab of one agent's transcript. */
 export const agentTabId = (agentId: string) => `agent:${agentId}`;
 /** At most this many agent tabs stay open (the least recently focused closes). */
@@ -232,6 +242,10 @@ interface ChatState {
   // Modified files tracking
   modifiedFiles: ModifiedFileSummary[];
   modifiedFilesCount: number;
+  /** The tasks that the open session created, implemented or updated; null until they load. */
+  sessionTasks: SessionTask[] | null;
+  /** The last read of `sessionTasks` failed. */
+  sessionTasksFailed: boolean;
 
   // Feed pagination: the server sends one page of conversations (page size = sessions.sidebar_page_size, 0 = unlimited) plus every starred session.
   sessionsHasMore: boolean;
@@ -400,6 +414,10 @@ interface ChatState {
   // Modified files
   fetchModifiedFiles: (sessionId: string) => Promise<void>;
   openFilesPanel: () => void;
+  // Tasks of the session
+  fetchSessionTasks: (sessionId: string) => Promise<void>;
+  /** Open (or focus) the Tasks tab, and read the list again. */
+  openTasksPanel: () => void;
 }
 
 /**
@@ -469,6 +487,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   mobileSidebarOpen: false,
   modifiedFiles: [],
   modifiedFilesCount: 0,
+  sessionTasks: null,
+  sessionTasksFailed: false,
   searchQuery: '',
   searchResults: null,
   searchLoading: false,
@@ -728,6 +748,40 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   // ------------------------------------------------------------------ //
+  //  Tasks of the session                                                //
+  // ------------------------------------------------------------------ //
+
+  fetchSessionTasks: async (sessionId: string) => {
+    // A new chat is not on the server until its first message.
+    if (!sessionId || sessionId === get().virtualSession?.id) return;
+    const request = ++sessionTasksRequest;
+    const current = () => request === sessionTasksRequest && get().activeSession === sessionId;
+    try {
+      const { tasks } = await api.getSessionTasks(sessionId);
+      if (current()) set({ sessionTasks: tasks, sessionTasksFailed: false });
+    } catch {
+      if (current()) set({ sessionTasksFailed: true });
+    }
+  },
+
+  openTasksPanel: () => {
+    get().openPanelTab({
+      id: TASKS_PANEL_ID,
+      type: 'tasks',
+      label: 'Tasks',
+      subagentType: 'tasks',
+      description: '',
+      content: null,
+      prompt: '',
+      streaming: false,
+      status: 'complete',
+      startedAt: Date.now(),
+      blocks: [],
+    });
+    void get().fetchSessionTasks(get().activeSession);
+  },
+
+  // ------------------------------------------------------------------ //
   //  Session management                                                  //
   // ------------------------------------------------------------------ //
 
@@ -796,6 +850,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       planSummaries: {}, planEditRequest: null,
       panels: [], activePanelId: null, panelVisible: false,
       modifiedFiles: [], modifiedFilesCount: 0,
+      sessionTasks: null, sessionTasksFailed: false,
     });
     // The agent roster follows the view (it unsubscribes the old transcripts).
     useAgentStore.getState().reset(id);
@@ -830,8 +885,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Restore Claude Code 2.1+ task panel from history
       update.currentCCTasks = extractCCTasksFromMessages(hydrated);
       set(update);
-      // Fetch modified files for this session (non-blocking)
+      // Fetch the modified files and the tasks of this session (non-blocking)
       get().fetchModifiedFiles(id);
+      void get().fetchSessionTasks(id);
     } catch {
       set({ loading: false });
     }
@@ -1634,6 +1690,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         void import('./taskStore').then(({ useTaskStore }) =>
           useTaskStore.getState().handleTaskEvent(msg.task)
         );
+        if (SESSION_TASK_EVENTS.has(msg.event)) void get().fetchSessionTasks(get().activeSession);
         return;
       // Auxiliary
       case 'interaction':              return handleInteraction(msg, get, set);

@@ -10,7 +10,7 @@ import { finalizeRunningPanels } from './streamingHandlers';
 import type { Get, Set } from './types';
 
 /** Tabs the person opened that a replayed buffer knows nothing about. */
-const KEPT_ON_REPLAY: ReadonlySet<PanelTab['type']> = new Set(['agents', 'agent', 'files']);
+const KEPT_ON_REPLAY: ReadonlySet<PanelTab['type']> = new Set(['agents', 'agent', 'files', 'tasks']);
 
 /**
  * Leave streaming mode: running tool calls complete and the streamed blocks
