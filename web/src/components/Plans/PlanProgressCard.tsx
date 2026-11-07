@@ -76,12 +76,13 @@ export function PlanProgressCard({ plan }: { plan: Plan }) {
           {plan.impl_session?.title || 'Implementation session'}
         </p>
         {look && (
-          <p aria-live="polite" className="mt-1 flex items-center gap-1.5 text-xs text-text-muted">
+          <p className="mt-1 flex items-center gap-1.5 text-xs text-text-muted">
             {state === 'done' ? <CircleCheck size={13} className="shrink-0 text-success" aria-hidden="true" />
               : state === 'failed' ? <CircleX size={13} className="shrink-0 text-error" aria-hidden="true" />
               : <span className={cx('h-2 w-2 shrink-0 rounded-full', look.dot)} aria-hidden="true" />}
+            {/* Announced when the state changes; the ticking time is not. */}
             <span>
-              {look.label}
+              <span aria-live="polite">{look.label}</span>
               {elapsed && <span className="tabular-nums">{ended ? ` after ${elapsed}` : ` · ${elapsed}`}</span>}
             </span>
           </p>
