@@ -256,7 +256,7 @@ A reload is always explicit. Two things cause one:
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
 | `telegram.dm_policy`, `.stream_mode` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
-| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
+| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source and the events of the other hosted providers included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
 | **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`, `codex.models`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, `agent.subagents.*`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.base_url`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
@@ -1366,7 +1366,10 @@ hosted mode the switch is ignored, with a warning.
 
 Nerve accepts events from every Slack connection that the gateway serves
 for this agent. For each conversation, Nerve records the connection of the
-latest accepted event.
+latest accepted event. When the gateway names the provider of each
+connection, the Slack channel uses only the Slack connections for its
+replies, notifications, and limits. A connection whose provider the gateway
+does not name serves every hosted chat channel.
 
 Each event that starts a turn or answers a notification names the person that
 the gateway resolved from the Slack user. In external mode, the turn runs as
@@ -1388,7 +1391,8 @@ gateway's inbox until a reload sets `enabled` to `true`. While it is paused,
 Nerve sends no notifications and refuses `send_channel_message`. A turn that
 is already running still sends its reply. Nerve reads nothing from the
 gateway's inbox while Slack is paused, so the records of a hosted GitHub
-source wait there too (see below).
+source and the events of the other hosted providers wait there too (see
+below and [Connection behaviour](#connection-behaviour)).
 
 Replies, reactions, and `send_channel_message` go to Slack as operations on
 a gateway stream that advertises them for the connection. A reply goes on the
@@ -1458,6 +1462,41 @@ the gateway's limit of stored records the oldest are dropped. Keep a hosted
 Slack switched on while GitHub is hosted; `nerve doctor` warns when it is off.
 This is a known limitation: a read for each provider on its own, which would
 keep GitHub records arriving while hosted Slack is off, is a follow-up.
+
+#### Connection behaviour
+
+Nerve builds one hosted channel for each chat provider in hosted mode; Slack
+is the only hosted chat provider of this version. The capabilities that the
+gateway sends for a connection can name the connection's provider and a
+behaviour, which tells Nerve how to answer the turns of its events and which
+session they go to:
+
+| Member | Values | Default | Effect |
+|--------|--------|---------|--------|
+| `answer` | `post`, `tool` | `post` | `post`: Nerve posts the turn's answer in the conversation, with the typing indicator, the streamed placeholder, and an `Error:` message when the turn fails. `tool`: Nerve posts nothing in the conversation for the turn. The answer stays in the session, and the agent answers only with a tool |
+| `reply_tool` | tool name | none | Only with `tool`: the tool that the agent can answer with |
+| `session` | `rotate`, `keep` | `rotate` | `rotate`: a conversation gets a new session after `sessions.sticky_period_minutes` of idle time. `keep`: a conversation continues its last session, however long it was idle, until that session is archived or deleted |
+
+Slack connections post and rotate, so a gateway that sends no behaviour
+changes nothing. A connection whose capabilities Nerve does not have posts
+and rotates too. In `tool` mode, Nerve puts one line before the text of the
+turn: "This message came through *provider*. Your answer in this session is
+not sent to anyone. To answer, use the *reply tool* tool." Without a reply
+tool, the line ends with "This channel does not send answers."
+
+Each hosted chat provider has its own switch. Because the gateway keeps the
+events of every provider in one ordered inbox, a provider that is switched
+off either holds the events of all providers or refuses its own events.
+Hosted Slack holds them: while `slack.enabled` is `false`, Nerve reads
+nothing, and the events of the other hosted providers wait in the gateway
+inbox too. Any other hosted chat provider refuses: while it is switched off,
+Nerve rejects its events and continues to read the events of the other
+providers. Nerve also stops reading, for every provider, while one hosted
+channel has 100 turns in progress, and continues when one of them ends.
+
+An event on a connection whose capabilities name another provider is
+rejected, and Nerve sends no operation of a channel through such a
+connection.
 
 ### Setting up the Slack app
 

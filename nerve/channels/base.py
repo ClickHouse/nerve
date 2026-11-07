@@ -54,6 +54,11 @@ class InboundMessage:
     turn as that person. A self-hosted channel has no mapping from a provider
     user to a person, so it leaves ``actor`` empty. A hosted channel sets the
     person that the channel gateway resolved.
+
+    ``post_answer`` tells the router to show the turn in the channel. When it
+    is ``False``, the router sends nothing to the channel for the turn: no
+    typing indicator, no streamed or final answer, and no error message. The
+    answer stays in the session, and the agent can answer with a tool.
     """
 
     channel_name: str                               # "telegram", "web", "discord"
@@ -63,6 +68,7 @@ class InboundMessage:
     session_id: str | None = None                   # Explicit session override (web sends this)
     metadata: dict[str, Any] = field(default_factory=dict)
     actor: Actor | None = None
+    post_answer: bool = True
 
 
 @dataclass
