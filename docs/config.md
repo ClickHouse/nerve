@@ -1154,7 +1154,8 @@ config like anything else under `config/`, so a config repo carries it to every
 instance that syncs, and a fleet can be told apart by its browser tabs. Nothing
 is copied into the web bundle — the file is read per request, so one that arrives
 by sync appears without a restart, and removing it goes back to the browser
-default.
+default. The panel draws a coloured dot on the icon while something waits for
+the person (see [Browser alerts](web-ui.md#browser-alerts)).
 
 Use one. If several are present the first of `.svg`, `.png`, `.ico` wins.
 
