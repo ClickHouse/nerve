@@ -391,12 +391,14 @@ above the list ("Browser alerts are on" or "off") opens the setting.
 - **Quiet hours:** an item that the server sends with `silent: true` gives an
   alert without sound.
 - **Title and favicon:** on every panel tab, in front or not, the title
-  starts with "!" while a session waits for an answer from the person (a
-  question in the turn, a pending question or approval, or a review loop on a
-  decision). Otherwise it starts with "(N)", the number of pending
-  notifications that the Notifs badge shows. The favicon gets a red dot for "!" and a
-  blue dot for "(N)". A page that sets its own title gets the prefix again.
-  This needs no permission and no setting.
+  starts with "!" while an answer from the person waits (a question in the
+  turn, a pending question or approval, or a review loop on a decision).
+  Otherwise it starts with "(N)", the number of pending notifications that
+  the Notifs badge shows. The favicon gets a red dot for "!" and a blue dot
+  for "(N)". A page that sets its own title gets the prefix again. The server
+  sends no event for a dismissal, so a tab that dismisses notifications tells
+  the other tabs on the same `BroadcastChannel`, and they read the count
+  again. This needs no permission and no setting.
 - **Limits:** browsers show alerts only for HTTPS addresses (and
   `localhost`); on plain HTTP the row says "Needs HTTPS". A browser that
   blocks the site shows "Blocked", and a browser that has no Notification

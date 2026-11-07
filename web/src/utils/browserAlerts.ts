@@ -27,10 +27,18 @@ export function tabInFront(): boolean {
   return document.visibilityState === 'visible' && document.hasFocus();
 }
 
-/** `seen`: a tab in front shows the item. `shown`: a tab showed the alert. */
-interface TabMessage {
-  kind: 'seen' | 'shown';
-  key: string;
+/**
+ * `seen`: a tab in front shows the item. `shown`: a tab showed the alert.
+ * `changed`: a tab dismissed items. The server sends no event for a dismissal.
+ */
+type TabMessage = { kind: 'seen' | 'shown'; key: string } | { kind: 'changed' };
+
+/** Tells the other panel tabs of this browser to read the notifications again. */
+export function tellNotificationsChanged(): void {
+  if (typeof BroadcastChannel !== 'function') return;
+  const channel = new BroadcastChannel(ALERT_CHANNEL);
+  channel.postMessage({ kind: 'changed' } satisfies TabMessage);
+  channel.close();
 }
 
 export interface Alerter {
@@ -56,10 +64,13 @@ export interface Alerter {
  * When the panel's service worker runs, the worker shows the alert, so an
  * alert and a push notification for the same item share the tag and the
  * browser keeps one of them. The worker handles the click (see `sw.js`).
+ *
+ * `onChanged` runs when another tab dismissed items (`tellNotificationsChanged`).
  */
-export function createAlerter({ inFront = tabInFront, onOpen }: {
+export function createAlerter({ inFront = tabInFront, onOpen, onChanged }: {
   inFront?: () => boolean;
   onOpen: () => void;
+  onChanged?: () => void;
 }): Alerter {
   const channel = typeof BroadcastChannel === 'function' ? new BroadcastChannel(ALERT_CHANNEL) : null;
   // Keys of the items that another tab took care of. A re-delivered item has
@@ -72,8 +83,9 @@ export function createAlerter({ inFront = tabInFront, onOpen }: {
     clearTimeout(timers.get(key));
     timers.delete(key);
   };
-  const tell = (kind: TabMessage['kind'], key: string) => channel?.postMessage({ kind, key } satisfies TabMessage);
+  const tell = (kind: 'seen' | 'shown', key: string) => channel?.postMessage({ kind, key } satisfies TabMessage);
   const onMessage = (e: MessageEvent<TabMessage>) => {
+    if (e.data.kind === 'changed') return onChanged?.();
     handled.add(e.data.key);
     cancel(e.data.key);
   };

@@ -32,7 +32,10 @@ export function BrowserAlerts() {
   const { prefix, dot } = tabAttention(sessions, notifications, unread);
 
   useEffect(() => {
-    const alerter = createAlerter({ onOpen: () => navigateRef.current(NOTIFICATIONS_PATH) });
+    const alerter = createAlerter({
+      onOpen: () => navigateRef.current(NOTIFICATIONS_PATH),
+      onChanged: () => void useNotificationStore.getState().loadNotifications(),
+    });
     const offMessage = ws.onMessage((msg) => {
       if (msg.type === 'notification' && !msg.silenced) {
         const alerts = useBrowserAlertStore.getState();
