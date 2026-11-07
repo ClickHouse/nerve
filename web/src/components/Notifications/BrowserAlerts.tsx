@@ -27,8 +27,9 @@ export function BrowserAlerts() {
   const navigateRef = useRef(navigate);
   useEffect(() => { navigateRef.current = navigate; }, [navigate]);
   const sessions = useChatStore((s) => s.sessions);
+  const notifications = useNotificationStore((s) => s.notifications);
   const unread = useNotificationStore((s) => s.pendingCount);
-  const { prefix, dot } = tabAttention(sessions, unread);
+  const { prefix, dot } = tabAttention(sessions, notifications, unread);
 
   useEffect(() => {
     const alerter = createAlerter({ onOpen: () => navigateRef.current(NOTIFICATIONS_PATH) });

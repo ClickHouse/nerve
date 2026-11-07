@@ -109,11 +109,11 @@ describe('BrowserAlerts', () => {
     renderAlerts();
     expect(document.title).toBe('Nerve');
 
-    // A question arrives: the Notifs badge counts it at once, the session list on its reload.
+    // A question arrives: its row in the notification list gives "!" before the session list reloads.
     act(() => useNotificationStore.getState().handleWSNotification({
       notification_id: 'ask-1', notification_type: 'question', session_id: 's1', title: 'Deploy now?', priority: 'normal',
     }));
-    expect(document.title).toBe('(1) Nerve');
+    expect(document.title).toBe('! Nerve');
     setSessions({ questions: 1 });
     expect(document.title).toBe('! Nerve');
 
