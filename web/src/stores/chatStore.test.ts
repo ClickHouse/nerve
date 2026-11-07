@@ -25,6 +25,7 @@ installStorage();
 vi.mock('../api/client', () => ({
   api: {
     listSessions: vi.fn(),
+    listNotifications: vi.fn(async () => ({ notifications: [], pending_count: 0 })),
     listArchivedSessions: vi.fn(),
     listSystemSessions: vi.fn(),
     getViewer: vi.fn(async () => { throw new Error("401"); }),
@@ -480,7 +481,7 @@ describe('sending while a turn runs', () => {
 });
 
 describe('socket open', () => {
-  it('re-binds the session on screen and resubscribes its transcripts', () => {
+  it('re-binds the session on screen and resubscribes its transcripts', async () => {
     onSession();
     const resubscribeAll = vi.fn();
     const original = useAgentStore.getState().resubscribeAll;
@@ -490,10 +491,14 @@ describe('socket open', () => {
       expect(ws.switchSession).toHaveBeenCalledWith(SID);
       expect(resubscribeAll).toHaveBeenCalledOnce();
       // The first open loads nothing more; a reconnect fetches the sidebar
-      // again (its counts may have changed while the socket was down).
+      // and the notifications again (they may have changed while the socket
+      // was down).
+      await new Promise((resolve) => setTimeout(resolve, 0));
       expect(api.listSessions).not.toHaveBeenCalled();
+      expect(api.listNotifications).not.toHaveBeenCalled();
       onSocketOpen?.();
       expect(api.listSessions).toHaveBeenCalled();
+      await vi.waitFor(() => expect(api.listNotifications).toHaveBeenCalledOnce());
 
       vi.mocked(ws.switchSession).mockClear();
       useChatStore.setState({ activeSession: 'v-1', virtualSession: { id: 'v-1', title: '', source: 'web', updated_at: '' } });

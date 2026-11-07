@@ -1758,11 +1758,13 @@ if (typeof ws.onOpen === 'function') {
     }
     // A reconnect (a gateway restart, a dropped network, a phone that slept)
     // missed the events sent meanwhile, and a restarted server never re-sends
-    // the zero counts: the sidebar rows and the open chat's messages come
-    // back from the server.
+    // the zero counts: the sidebar rows, the open chat's messages and the
+    // notifications (the badge count, the questions that put "!" in the tab
+    // title) come back from the server.
     if (socketOpenedBefore) {
       void s.loadSessions();
       void s.catchUp();
+      void import('./notificationStore').then(({ useNotificationStore }) => useNotificationStore.getState().loadNotifications());
     }
     socketOpenedBefore = true;
   });
