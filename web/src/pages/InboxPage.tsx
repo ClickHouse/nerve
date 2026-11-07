@@ -6,7 +6,7 @@ import { useSetupStore } from '../stores/setupStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
 import { stepOf } from '../components/Setup/navigation';
 import { IconButton, PageHeader } from '../components/ui';
-import { ArrowUp } from '../components/ui/icons';
+import { ArrowUp, MessagesSquare } from '../components/ui/icons';
 import { useIsMobile, useIsTouch } from '../hooks/useMediaQuery';
 import type { SetupProfileDetail, SetupState } from '../api/client';
 
@@ -56,7 +56,7 @@ export function InboxPage() {
 
   return (
     <div className="h-full flex flex-col">
-      <PageHeader title="Inbox" />
+      <PageHeader icon={<MessagesSquare size={18} className="text-accent shrink-0" />} title="Inbox" />
       <SessionSidebar
         layout="page"
         sessions={sessions}
