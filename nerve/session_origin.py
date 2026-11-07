@@ -10,10 +10,10 @@ partly set by REST callers, and one value can belong to different triggers
 example the Slack channel or the cron job. Its keys are the ``DETAIL_*``
 constants below. Each key is optional.
 
-A row from before the column existed has no trigger. :func:`derive_origin`
-gives its origin at read time from ``source``, the session ID, the parent
-session, the metadata and the channel mapping. ``create_session`` uses the
-same function when its caller gives no origin.
+A row from before the column existed has no trigger, and neither has a row
+whose creator gave no origin. :func:`derive_origin` gives the origin of such
+a row at read time from ``source``, the session ID, the parent session, the
+metadata and the channel mapping.
 """
 
 from __future__ import annotations

@@ -29,12 +29,12 @@ from nerve.session_origin import (
     origin_label,
     session_origin,
 )
-from tests.test_cause_attribution import (  # noqa: F401 - fixture
-    _client,
-    _pending_plan,
-    _record_runs,
-    install,
-)
+from tests import test_cause_attribution
+from tests.test_cause_attribution import _client, _pending_plan, _record_runs
+
+# The install of test_cause_attribution: real routes, engine and database,
+# with the people alice and bob.
+install = test_cause_attribution.install
 
 # --------------------------------------------------------------------------- #
 #  The vocabulary, the derivation and the labels                              #
@@ -166,17 +166,18 @@ async def test_v065_adds_the_columns_once(install):
 
 
 @pytest.mark.asyncio
-async def test_create_session_stores_the_origin_or_derives_it(install):
+async def test_create_session_stores_the_given_origin_only(install):
     db = install.db
-    await db.create_session(
+    given = await db.create_session(
         "given", source="cron", actor=None, origin=Origin("plan", {"plan_id": "p1"}),
     )
-    await db.create_session("cron:nightly:1", source="cron", actor=None)
-    await db.create_session("plain", source="slack", actor=None)
+    unstated = await db.create_session("cron:nightly:1", source="cron", actor=None)
 
     assert await _origin_of(db, "given") == ("plan", {"plan_id": "p1"})
-    assert await _origin_of(db, "cron:nightly:1") == ("cron", {"cron_job": "nightly"})
-    assert await _origin_of(db, "plain") == ("slack", {})
+    assert (given["trigger"], given["origin_detail"]) == ("plan", '{"plan_id": "p1"}')
+    # No origin: NULL columns, and a reader derives the origin.
+    assert await _origin_of(db, "cron:nightly:1") == (None, {})
+    assert session_origin(unstated) == cron_origin("nightly")
 
 
 @pytest.mark.asyncio
