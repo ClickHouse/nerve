@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { useNotificationStore, type Notification } from '../../stores/notificationStore';
 import { IconButton } from '../ui';
 import { Bell, HelpCircle, ShieldCheck, X } from '../ui/icons';
+import { BrowserAlertOffer } from './BrowserAlertOffer';
 import { NotificationBody, NotificationLinks } from './NotificationParts';
 import { NotificationOptions } from './NotificationOptions';
 
@@ -74,6 +75,7 @@ function Toast({ notif }: { notif: Notification }) {
           )}
           <NotificationLinks notif={notif} size="xs" onOpen={close} />
           <NotificationOptions notif={notif} onAnswered={close} />
+          <BrowserAlertOffer notif={notif} />
         </div>
       </div>
     </div>

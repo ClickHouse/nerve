@@ -7,6 +7,7 @@ import { PageHeader } from '../components/ui/PageHeader';
 import { ActorAttribution } from '../components/Chat/ActorLabel';
 import { NotificationBody, NotificationLinks } from '../components/Notifications/NotificationParts';
 import { NotificationOptions } from '../components/Notifications/NotificationOptions';
+import { BrowserAlertsLink } from '../components/Notifications/BrowserAlertOffer';
 
 /** Lifecycle state — a status, so it takes a `Badge` tone. */
 const STATUS_TONES: Record<string, BadgeTone> = {
@@ -368,6 +369,7 @@ export function NotificationsPage() {
         }
         actions={
           <>
+          <BrowserAlertsLink />
           {/* A toggle, not a filter chip, so it keeps the rounded-lg button
               shape — `pill` supplies the same active treatment either way. */}
           <Button variant="pill" active={showSilences}
