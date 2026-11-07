@@ -28,6 +28,7 @@ export function ChatHeaderMenu({ sessionId }: { sessionId: string }) {
   const [tasks, setTasks] = useState<SessionTask[] | null>(null);
   const [failed, setFailed] = useState(false);
   const menuRef = useRef<HTMLDivElement>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
   const loadStatuses = useTaskStatusStore((s) => s.load);
 
   const load = useCallback(() => {
@@ -37,14 +38,26 @@ export function ChatHeaderMenu({ sessionId }: { sessionId: string }) {
       .catch(() => setFailed(true));
   }, [sessionId]);
 
-  // Close the menu on an outside click (mirrors the composer's menu).
+  // Close on an outside press, and on Escape, which must not also reach the
+  // global Escape that stops the turn (the same as the model menu).
   useEffect(() => {
     if (!menuOpen) return;
     const onDown = (e: MouseEvent) => {
       if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
     };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      e.stopPropagation();
+      setMenuOpen(false);
+      triggerRef.current?.focus();
+    };
     document.addEventListener('mousedown', onDown);
-    return () => document.removeEventListener('mousedown', onDown);
+    document.addEventListener('keydown', onKey, true);
+    return () => {
+      document.removeEventListener('mousedown', onDown);
+      document.removeEventListener('keydown', onKey, true);
+    };
   }, [menuOpen]);
 
   const toggleMenu = () => {
@@ -61,6 +74,7 @@ export function ChatHeaderMenu({ sessionId }: { sessionId: string }) {
   return (
     <div className="relative shrink-0" ref={menuRef}>
       <IconButton
+        ref={triggerRef}
         label="More actions"
         size="xs"
         active={menuOpen}
