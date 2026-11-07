@@ -282,3 +282,22 @@ describe('PlanDetailPage decision bar', () => {
     quiet.mockRestore();
   });
 });
+
+describe('PlanDetailPage implementation', () => {
+  it('shows the progress card of an approved plan, and no decision', async () => {
+    getPlan.mockResolvedValue(plan({
+      status: 'implementing', impl_session_id: 'impl-1', reviewed_at: '2026-01-02T10:30:00+00:00',
+      impl_session: {
+        id: 'impl-1', title: 'Implement: Write the report', status: 'active',
+        updated_at: '2026-01-02T10:30:00+00:00', is_running: true, awaiting_input: false, parked: false,
+      },
+    }));
+    renderPage();
+    const card = await screen.findByRole('region', { name: 'Implementation' });
+    expect(card).toHaveTextContent('Implement: Write the report');
+    expect(card).toHaveTextContent('Running');
+    expect(screen.queryByRole('region', { name: 'Plan decision' })).not.toBeInTheDocument();
+    await userEvent.click(within(card).getByRole('button', { name: 'Open session' }));
+    expect(await screen.findByText('Chat page')).toBeInTheDocument();
+  });
+});

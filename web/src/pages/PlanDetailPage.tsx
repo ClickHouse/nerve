@@ -1,8 +1,9 @@
 import { useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, MessageSquare, ExternalLink } from '../components/ui/icons';
+import { ArrowLeft, ExternalLink } from '../components/ui/icons';
 import { Badge, Button, IconButton } from '../components/ui';
 import { PlanStatusBadge } from '../components/Plans/PlanStatusBadge';
+import { PlanProgressCard } from '../components/Plans/PlanProgressCard';
 import { usePlanStore, type Plan } from '../stores/planStore';
 import { MarkdownContent } from '../components/Chat/MarkdownContent';
 import { ActorAttribution } from '../components/Chat/ActorLabel';
@@ -61,7 +62,6 @@ export function PlanDetailPage() {
   }
 
   const isPending = plan.status === 'pending';
-  const isImplementing = plan.status === 'implementing';
   const summary = planSummaryText(plan);
 
   const handleApprove = async () => {
@@ -132,19 +132,13 @@ export function PlanDetailPage() {
           <Button variant="link" size="xs" onClick={() => navigate(`/tasks/${plan.task_id}`)}>
             <ExternalLink size={11} /> View task
           </Button>
-          {isImplementing && plan.impl_session_id && (
-            // House convention for a tinted inline action: the identity hue
-            // rides the icon, the label stays neutral.
-            <Button variant="ghost" size="xs" onClick={() => navigate(`/chat/${plan.impl_session_id}`)}>
-              <MessageSquare size={11} className="text-hue-blue" /> Watch implementation
-            </Button>
-          )}
         </div>
       </div>
 
       {/* Plan content */}
       <div className="flex-1 overflow-y-auto p-6">
         <div className="max-w-3xl mx-auto">
+          <PlanProgressCard plan={plan} />
           <div className="bg-surface border border-border-subtle rounded-lg p-6">
             <MarkdownContent content={plan.content} />
           </div>

@@ -105,6 +105,8 @@ User reviews (via /plans UI or chat tools)
 | `pending` | Awaiting human review |
 | `approved` | Approved (briefly, before implementation starts) |
 | `implementing` | Implementation session is running |
+| `done` | The task of the plan was marked done |
+| `failed` | The implementation session stopped with an error |
 | `declined` | Rejected by user |
 | `superseded` | Replaced by a newer version |
 
@@ -211,7 +213,17 @@ of the same plan can both proceed.
 - Under the title, the plan's `summary` in up to 3 lines. A plan without one
   shows its first heading and the two lines after it
 - Rendered markdown plan content
-- Task link + implementation session link (when applicable)
+- Task link
+- For an approved plan, a progress card above the plan: the implementation
+  session's title, its state and the time since the approval, and **Open
+  session**. The state is Running, Waiting on background work (a scheduled
+  wake-up or background work, no turn), Waiting for you (a question, or the
+  turn ended while the task is open), Done (the plan is `done`) or Failed
+  (the plan is `failed` or the session is in `error`). While the plan is
+  implementing, the page loads the plan again on each `session_running`,
+  `session_awaiting_input`, `session_agents` or `session_updated` event of
+  that session, on each `task_updated` event of the task, and after a
+  reconnect
 - Who proposed this version and who reviewed the plan, from the writer and
   reviewer columns
 - A decision bar at the bottom of the page for pending plans. It stays in view
@@ -251,11 +263,17 @@ task updates and sessions have no actor or cause.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/plans` | List plans (query: `status`, `task_id`) |
-| GET | `/api/plans/:id` | Get plan detail |
+| GET | `/api/plans/:id` | Get plan detail, with `impl_session` (see below) |
 | PATCH | `/api/plans/:id` | Update status/feedback |
 | POST | `/api/plans/:id/approve` | Approve + spawn implementation |
 | POST | `/api/plans/:id/revise` | Send revision feedback to planner |
 | GET | `/api/tasks/:id/plans` | Plans for a specific task |
+
+`GET /api/plans/:id` adds `impl_session`: `null` without an implementation
+session (or when its row is gone), else `{id, title, status, updated_at,
+is_running, awaiting_input, parked}`. `status` is the session row's status,
+and `parked` is true when no turn runs but a wake-up is scheduled or
+background work still runs.
 
 Plan rows include `reviewed_by_actor_id`, `reviewed_caused_by_actor_id`,
 `created_by_actor_id` and `caused_by_actor_id`. Approve, `PATCH` and revise

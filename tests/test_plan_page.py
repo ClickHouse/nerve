@@ -1,14 +1,19 @@
-"""The data of the plan page: the plan summary.
+"""The data of the plan page: the plan summary and the implementation session.
 
 ``plan_propose`` and ``plan_update`` take an optional ``summary`` and store it
 in ``plans.summary``. ``plan_update`` does not copy the summary of the version
-it replaces.
+it replaces. ``GET /api/plans/{id}`` returns the summary and, for an approved
+plan, the implementation session's title and live state.
 """
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import pytest_asyncio
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
 from nerve.agent import tools as tools_mod
 from nerve.agent.tools.handlers.plans import (
@@ -23,6 +28,8 @@ from nerve.agent.tools.schemas import (
     PLAN_UPDATE_SCHEMA,
 )
 from nerve.db.migrations import v062_plan_summary
+from nerve.gateway.routes import plans as plans_routes
+from nerve.gateway.routes._deps import init_deps
 from tests.actor_rows import ensure_system_principal
 
 TASK_ID = "t-summary"
@@ -104,3 +111,78 @@ class TestTools:
 
         await plan_update_handler(ctx, {"plan_id": second["id"], "content": "v3", "summary": "Now two PRs."})
         assert (await _pending(db))["summary"] == "Now two PRs."
+
+
+class _Engine:
+    """The engine reads of the route: running turns, wake-ups, background work."""
+
+    def __init__(self) -> None:
+        self.running: set[str] = set()
+        self.wakeups: dict[str, dict] = {}
+        self.background: set[str] = set()
+
+    def is_session_running(self, session_id: str) -> bool:
+        return session_id in self.running
+
+    async def pending_wakeup(self, session_id: str) -> dict | None:
+        return self.wakeups.get(session_id)
+
+    def has_live_background_tasks(self, session_id: str) -> bool:
+        return session_id in self.background
+
+
+@pytest_asyncio.fixture
+async def page(db, ctx, bypass_auth, monkeypatch):
+    await plan_propose_handler(ctx, {"task_id": TASK_ID, "content": "Step one.", "summary": SUMMARY})
+    engine = _Engine()
+    awaiting: set[str] = set()
+    monkeypatch.setattr(plans_routes, "get_awaiting_ids", lambda: awaiting)
+    init_deps(engine=engine, db=db)  # type: ignore[arg-type]
+    app = FastAPI()
+    app.include_router(plans_routes.router)
+    bypass_auth(app)
+    plan = await _pending(db)
+    client = TestClient(app)
+    return SimpleNamespace(
+        db=db, engine=engine, awaiting=awaiting, plan_id=plan["id"],
+        get=lambda: client.get(f"/api/plans/{plan['id']}").json(),
+    )
+
+
+@pytest.mark.asyncio
+class TestPlanRoute:
+    async def test_a_pending_plan_has_its_summary_and_no_session(self, page):
+        body = page.get()
+        assert body["summary"] == SUMMARY
+        assert body["impl_session"] is None
+
+    async def test_an_approved_plan_has_the_session_state(self, page):
+        await page.db.create_session("impl-1", title="Implement: Add dark mode", actor=None)
+        await page.db.update_plan(page.plan_id, status="implementing", impl_session_id="impl-1")
+
+        def state() -> tuple:
+            s = page.get()["impl_session"]
+            return s["is_running"], s["awaiting_input"], s["parked"]
+
+        session = page.get()["impl_session"]
+        assert session["id"] == "impl-1"
+        assert session["title"] == "Implement: Add dark mode"
+        assert session["updated_at"]
+        assert state() == (False, False, False)
+
+        page.engine.running.add("impl-1")
+        page.awaiting.add("impl-1")
+        assert state() == (True, True, False)
+
+        page.engine.running.clear()
+        page.awaiting.clear()
+        page.engine.wakeups["impl-1"] = {"fire_at": "2026-01-01T10:00:00+00:00"}
+        assert state() == (False, False, True)
+
+        page.engine.wakeups.clear()
+        page.engine.background.add("impl-1")
+        assert state() == (False, False, True)
+
+    async def test_a_deleted_session_gives_no_session(self, page):
+        await page.db.update_plan(page.plan_id, status="implementing", impl_session_id="impl-gone")
+        assert page.get()["impl_session"] is None
