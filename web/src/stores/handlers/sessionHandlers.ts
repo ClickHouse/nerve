@@ -2,6 +2,7 @@ import type { WSMessage } from '../../api/websocket';
 import type { PanelTab, Session } from '../../types/chat';
 import { applyStreamEvent, rebuildPanelTabsFromBuffer, deriveStatus, extractTodosFromBuffer, extractCCTasksFromBuffer } from '../helpers/bufferReplay';
 import { hydrateMessage } from '../../utils/hydrateMessage';
+import { reloadSessionsSoon } from '../helpers/sessionsReload';
 import { useAgentStore } from '../agentStore';
 import type { ChatState } from '../chatStore';
 import { planOpensPanel } from './panelHandlers';
@@ -79,6 +80,10 @@ export function handleReviewLoopUpdate(
       sess.id === msg.session_id ? { ...sess, review_loop: chip } : sess,
     ) ?? null,
   }));
+  // A loop that starts or stops waiting moves its session into or out of
+  // "Needs you"; only the server list adds or drops a session from outside
+  // the feed.
+  reloadSessionsSoon();
   if (msg.message && msg.session_id && msg.session_id === get().activeSession) {
     const content = msg.message.content || '';
     set((s) => ({
@@ -388,6 +393,9 @@ export function handleSessionAwaitingInput(
         : sess,
     ) ?? null,
   }));
+  // As for a review loop: the server list adds or drops a session from
+  // outside the feed (a cron session, a later page).
+  reloadSessionsSoon();
 }
 
 export function handleAnswerInjected(

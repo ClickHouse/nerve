@@ -56,6 +56,7 @@ const { useChatStore, registerComposerFlush, AGENTS_PANEL_ID, MAX_AGENT_TABS } =
 const { reenter, setAuthMode, useHostedStore } = await import('../api/hosted');
 const { useAgentStore } = await import('./agentStore');
 const fx = await import('../test/agentFixtures');
+const { needsYou } = await import('../utils/sessionAttention');
 // chatStore registers its socket-open handler once, at module init.
 const onSocketOpen = vi.mocked(ws.onOpen).mock.calls[0]?.[0] as (() => void) | undefined;
 
@@ -138,6 +139,42 @@ describe('the sessions that need you', () => {
     expect(ids.length).toBe(2 * PAGE);
     expect(new Set(ids).size).toBe(2 * PAGE);
     expect(useChatStore.getState().sessionsNextOffset).toBe(2 * PAGE);
+  });
+
+  // The server list after the reload, and the store before the event.
+  const listed = (sessions: unknown[]) => vi.mocked(api.listSessions).mockResolvedValue(
+    { sessions, archived_count: 0, system_count: 0, has_more: false, next_offset: 1 } as never);
+  const feed = (sessions: unknown[]) => useChatStore.setState({
+    sessions: sessions as never, sessionsNextOffset: 0, sessionsHasMore: false,
+    archivedSessions: null, systemSessions: null, activeSession: '', virtualSession: null,
+  });
+  const chat = { id: 'chat-1', title: 'chat', source: 'web', updated_at: '2026-11-07T04:00:00Z' };
+  const cron = { ...chat, id: 'cron-1', source: 'cron' };
+
+  it('a session from outside the feed that starts to wait enters Needs you', async () => {
+    vi.useFakeTimers();
+    feed([chat]);
+    listed([chat, { ...cron, awaiting_input: true }]);
+
+    dispatch({ type: 'session_awaiting_input', session_id: 'cron-1', awaiting: true });
+    await vi.advanceTimersByTimeAsync(500);
+
+    const added = useChatStore.getState().sessions.find(s => s.id === 'cron-1');
+    expect(added && needsYou(added)).toBe(true);
+  });
+
+  it('a session from outside the feed leaves when its review loop stops waiting', async () => {
+    vi.useFakeTimers();
+    const loop = { id: 'rvl-1', status: 'awaiting_user', iteration: 1, max_iterations: 3 };
+    feed([chat, { ...cron, review_loop: loop }]);
+    listed([chat]);
+
+    dispatch({ type: 'review_loop_update', session_id: 'cron-1', loop: { ...loop, status: 'implementing' } } as never);
+    // The row is patched at once and dropped by the reload.
+    expect(needsYou(useChatStore.getState().sessions.find(s => s.id === 'cron-1')!)).toBe(false);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(useChatStore.getState().sessions.map(s => s.id)).toEqual(['chat-1']);
   });
 
   it('a burst of notification events reloads the list once', async () => {
