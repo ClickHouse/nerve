@@ -481,10 +481,15 @@ export function ChatPage() {
                   <span className="tabular-nums">{taskCount}</span>
                 </Button>
               )}
-              {contextUsage && (
-                <div className="hidden md:flex">
-                  <ContextBar usage={contextUsage} sessionCostUsd={activeSessionRow?.total_cost_usd} />
-                </div>
+              {contextUsage && activeSession && (
+                <ContextBar
+                  key={activeSession}
+                  usage={contextUsage}
+                  sessionId={activeSession}
+                  backend={activeSessionRow?.backend ?? 'claude'}
+                  busy={isStreaming}
+                  sessionCostUsd={activeSessionRow?.total_cost_usd}
+                />
               )}
               {langfuseUrl && (
                 <a

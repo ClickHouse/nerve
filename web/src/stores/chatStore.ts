@@ -163,8 +163,10 @@ interface ChatState {
     cache_creation_1h_input_tokens?: number;
     max_context_tokens: number;
     num_turns: number;
+    // Measured after a compact; the bar shows it instead of its estimate.
+    context_tokens?: number;
   } | null;
-  backendStatus: { subtype: string; data: Record<string, unknown> } | null;
+  backendStatus:{ subtype: string; data: Record<string, unknown> } | null;
   // TodoWrite panel state (legacy Claude Code todos)
   currentTodos: TodoItem[];
   // Claude Code 2.1+ task panel state (TaskCreate / TaskUpdate / TaskList)
@@ -861,6 +863,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           cache_creation_1h_input_tokens: cc?.ephemeral_1h_input_tokens ?? 0,
           max_context_tokens: data.last_usage.max_context_tokens || 200_000,
           num_turns: data.last_usage.num_turns || 1,
+          context_tokens: data.last_usage.context_tokens,
         };
       }
       // Restore todos from last TodoWrite call in history (legacy)
