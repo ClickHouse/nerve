@@ -5,11 +5,13 @@ import type {
 } from '../../api/settings';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { Badge, Button, Switch } from '../ui';
-import { BellOff, Check, ChevronRight, Monitor, Moon, Send, Slack, X } from '../ui/icons';
+import { BellOff, Check, ChevronRight, Monitor, Moon, Send, Slack } from '../ui/icons';
 import { QUIET_HOURS_PREFILL } from '../Setup/copy';
 import { Notice } from '../Setup/Notice';
 import { canEdit } from './sections';
-import { CommitField, FileNote, LevelChoice, ManagedNote, SettingRow, SettingsGroup } from './SettingsRows';
+import {
+  CommitField, FileNote, LevelChoice, ManagedNote, SettingRow, SettingsGroup, TestResult,
+} from './SettingsRows';
 import { ThisBrowserRow } from './ThisBrowserRow';
 
 const CHANNELS = 'notifications.channels' as const;
@@ -258,19 +260,6 @@ function ChatChannelRow({ data, channel }: { data: NotificationSettings; channel
       <ManagedNote field={channels.field} />
       <FileNote fields={[channels.field, ...(on ? [...(fixed ? [] : [target.field]), level.field] : [])]} />
     </SettingRow>
-  );
-}
-
-/** "Test arrived" or "Test did not arrive" on a row, after a test. */
-function TestResult({ channel }: { channel: string }) {
-  const entry = useSettingsStore((s) => s.testResult?.results.find((r) => r.channel === channel));
-  if (!entry) return null;
-  return (
-    <div>
-      {entry.delivered
-        ? <Badge tone="success"><Check size={11} aria-hidden="true" />Test arrived</Badge>
-        : <Badge tone="danger"><X size={11} aria-hidden="true" />Test did not arrive</Badge>}
-    </div>
   );
 }
 

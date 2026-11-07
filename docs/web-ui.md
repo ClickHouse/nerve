@@ -367,7 +367,8 @@ Under lockdown the section is read-only, with one line that says why.
   channel that an admin sets in the control plane. With no channel set
   there, Slack gets none."
 - **Send a test** sends one notification to each place that is on. Each row
-  then shows "Test arrived" or "Test did not arrive".
+  then shows "Test arrived" or "Test did not arrive". This browser shows it
+  for push while push is on there: whether a push service took the test.
 - **Quiet hours**: a switch and a start and end time (`quiet_start`,
   `quiet_end`), in the instance's time zone, which the row names. On fills in
   22:00 to 07:00; off empties both times. During them, notifications below `urgent` arrive without sound (see

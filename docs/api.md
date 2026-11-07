@@ -846,8 +846,9 @@ PUT /api/settings/notifications  { "notifications.channels": ["web", "telegram"]
 Sends one `high` "Test notification" through the normal fan-out (so a
 channel at `important` gets it too) and answers
 `{notification_id, silenced, results: [{channel, delivered}]}`, one result
-for each channel in `notifications.channels`. `silenced` is true when a
-silence rule matched, so only the panel shows it.
+for each channel in `notifications.channels`, and one for `webpush` when a
+browser has push on (`delivered`: a push service took it). `silenced` is true
+when a silence rule matched, so only the panel shows it.
 
 ### Web Push
 

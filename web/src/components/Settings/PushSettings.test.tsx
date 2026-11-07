@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../../api/hosted';
 import { useBrowserAlertStore } from '../../stores/browserAlertStore';
+import { useSettingsStore } from '../../stores/settingsStore';
 import { stubBrowser } from '../../test/browserAlertFixtures';
 import {
   PUBLIC_KEY, device, fakeSubscription, stubPushBrowser, unstubPushBrowser,
@@ -34,6 +35,7 @@ beforeEach(() => {
   localStorage.clear();
   useBrowserAlertStore.setState({ enabled: false, level: 'important', offerDone: false });
   usePushStore.setState(usePushStore.getInitialState(), true);
+  useSettingsStore.setState(useSettingsStore.getInitialState(), true);
   serverHas();
   api.deletePushDevice.mockResolvedValue({ deleted: true });
 });
@@ -78,6 +80,18 @@ describe('Push in the This browser row', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Not saved.');
     expect(useBrowserAlertStore.getState().level).toBe('important');
     expect(screen.getByRole('radio', { name: 'Questions and important' })).toHaveAttribute('aria-checked', 'true');
+  });
+
+  it('shows whether the test reached a push service', async () => {
+    stubBrowser({ permission: 'granted' });
+    stubPushBrowser({ subscription: fakeSubscription() });
+    serverHas(device());
+    useSettingsStore.setState({
+      testResult: { notification_id: 'n-1', silenced: false, results: [{ channel: 'webpush', delivered: true }] },
+    });
+    renderRow();
+    await waitFor(() => expect(pushSwitch()).toHaveAttribute('aria-checked', 'true'));
+    expect(screen.getByText('Test arrived')).toBeInTheDocument();
   });
 
   it('lists the other devices of the person, and removes one', async () => {
