@@ -22,6 +22,7 @@ const { FX_OWNER_ACTOR, FX_WAVE, makeAgentStoreSeed, makeQueueEntry } = await im
 const { QueuedMessages } = await import('./QueuedMessages');
 
 const cancelQueued = vi.fn(async () => {});
+const reorderQueue = vi.fn(async () => {});
 
 function chips() {
   return within(screen.getByRole('list', { name: 'Queued messages' })).getAllByRole('listitem');
@@ -29,11 +30,12 @@ function chips() {
 
 beforeEach(() => {
   cancelQueued.mockClear();
+  reorderQueue.mockClear();
   useAuthStore.setState({
     viewer: { id: FX_OWNER_ACTOR, kind: 'human', display_name: 'Owner', username: null } as never,
   });
   useChatStore.setState({ messages: [] });
-  useAgentStore.setState({ ...makeAgentStoreSeed(FX_WAVE), cancelQueued });
+  useAgentStore.setState({ ...makeAgentStoreSeed(FX_WAVE), cancelQueued, reorderQueue });
 });
 
 describe('QueuedMessages', () => {
@@ -54,7 +56,7 @@ describe('QueuedMessages', () => {
     expect(within(first).getByRole('button', { name: 'Cancel the queued message' })).toBeInTheDocument();
     expect(second).toHaveTextContent('deploy after');
     expect(second).toHaveTextContent('telegram');
-    expect(within(second).queryByRole('button')).toBeNull();
+    expect(within(second).getAllByRole('button').map(b => b.getAttribute('aria-label'))).toEqual(['Move up', 'Move down']);
   });
 
   it('mutes internal entries and gives them no actions', () => {
@@ -104,5 +106,54 @@ describe('QueuedMessages', () => {
     await act(async () => {});
     expect(cancelQueued).toHaveBeenCalledWith(entry.queue_id);
     expect(document.activeElement).toBe(document.getElementById('nerve-chat-input'));
+  });
+
+  describe('reorder', () => {
+    const three = () => ['a', 'b', 'c'].map(n => makeQueueEntry({ queue_id: `q_${n}`, preview: n }));
+    const button = (row: HTMLElement, name: string) => within(row).getByRole('button', { name });
+
+    it('moves a message up or down and sends the whole new order', async () => {
+      useAgentStore.setState({ queue: three() });
+      render(<QueuedMessages />);
+      const [first, , last] = chips();
+      expect(button(first, 'Move up')).toBeDisabled();
+      expect(button(last, 'Move down')).toBeDisabled();
+
+      await userEvent.click(button(first, 'Move down'));
+      expect(reorderQueue).toHaveBeenLastCalledWith(['q_b', 'q_a', 'q_c']);
+      await userEvent.click(button(last, 'Move up'));
+      expect(reorderQueue).toHaveBeenLastCalledWith(['q_a', 'q_c', 'q_b']);
+    });
+
+    it('offers no move for a single message or a send on its way', () => {
+      useAgentStore.setState({
+        queue: [makeQueueEntry()],
+        pendingSends: { 'local-1': { clientMsgId: 'local-1', content: 'on its way', blocks: [], at: 1 } },
+      });
+      render(<QueuedMessages />);
+      expect(screen.queryByRole('button', { name: 'Move up' })).toBeNull();
+    });
+
+    it('moves past the next row shown here; a hidden entry keeps its place', async () => {
+      const [a, hidden, c] = three();
+      useAgentStore.setState({ queue: [a, hidden, c] });
+      useChatStore.setState({
+        messages: [{ role: 'user', blocks: [{ type: 'text', content: 'b' }], client_msg_id: hidden.client_msg_id }],
+      });
+      render(<QueuedMessages />);
+      expect(chips()).toHaveLength(2);
+      await userEvent.click(button(chips()[0], 'Move down'));
+      expect(reorderQueue).toHaveBeenLastCalledWith(['q_b', 'q_c', 'q_a']);
+    });
+
+    it('keeps the keyboard focus on the moved message', async () => {
+      // The real store action: the order changes at once.
+      useAgentStore.setState({ queue: three(), reorderQueue: useAgentStore.getInitialState().reorderQueue });
+      render(<QueuedMessages />);
+      await userEvent.click(button(chips()[1], 'Move down'));
+      expect(chips().map(row => row.textContent)).toEqual(['a', 'c', 'b'].map(t => expect.stringContaining(t)));
+      // The moved row is the last row: its "Move down" is off, so focus is on "Move up".
+      expect(document.activeElement).toBe(button(chips()[2], 'Move up'));
+    });
   });
 });
