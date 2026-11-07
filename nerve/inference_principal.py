@@ -18,6 +18,11 @@ builds the API client for a request: one ``Name: Value`` header per line,
 lines split on ``\\n`` or ``\\r\\n``, name and value split on the first ``:``
 and trimmed. The environment of a CLI process is fixed when it starts. That is
 enough, because the session's cause never changes.
+
+Codex sends the header only to ``codex.base_url``: the provider that Nerve
+gives Codex for it reads the value from an environment variable of the Codex
+process (``env_http_headers``). See ``nerve.agent.backends.codex.backend``.
+One Codex process serves one session, so the same rule applies.
 """
 
 from __future__ import annotations
