@@ -5,6 +5,7 @@ import { hydrateMessage } from '../../utils/hydrateMessage';
 import { useAgentStore } from '../agentStore';
 import type { ChatState } from '../chatStore';
 import { planOpensPanel } from './panelHandlers';
+import { finalizeRunningPanels } from './streamingHandlers';
 import type { Get, Set } from './types';
 
 /** Tabs the person opened that a replayed buffer knows nothing about. */
@@ -111,7 +112,23 @@ export function handleSessionStatus(
       set((s) => ({ sessions: s.sessions.map(patch), searchResults: s.searchResults?.map(patch) ?? null }));
     }
   }
-  if (!msg.is_running) return;
+  if (!msg.is_running) {
+    // The turn on screen ended while the socket was down (a phone that slept,
+    // a dropped network), so its done never came. Leave streaming mode and
+    // read the stored reply, which replaces the part that streamed. A
+    // question of that turn has no turn to answer any more.
+    if (get().isStreaming) {
+      set({
+        streamingBlocks: [],
+        isStreaming: false,
+        agentStatus: { state: 'idle' },
+        pendingInteraction: null,
+      });
+      finalizeRunningPanels(get);
+      void get().catchUp();
+    }
+    return;
+  }
 
   // Rebuild streaming state from buffered events
   let blocks = get().streamingBlocks.length > 0 ? [...get().streamingBlocks] : [];
