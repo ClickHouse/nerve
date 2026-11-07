@@ -379,7 +379,10 @@ Under lockdown the section is read-only, with one line that says why.
 A panel tab that is open but not in front can show a system alert for a new
 notification. The choice is per browser, in localStorage
 (`nerve-browser-alerts`), not on the server. It is made in Settings >
-Notifications > This browser.
+Notifications > This browser, or with "Turn on" in the offer on the first
+toast that waits for an answer ("Turn on · Not now", shown until the person
+answers it). The Notifications page shows "Alerts on" or "Alerts off" and
+links to Settings.
 
 - **What alerts:** "Questions and important" (questions, approvals, `high`
   and `urgent`; the default) or "Everything". A silenced item never alerts.
