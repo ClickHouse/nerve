@@ -3,15 +3,27 @@ import { useParams, useNavigate } from 'react-router-dom';
 import { ArrowLeft, Check, X, MessageSquare, ExternalLink } from '../components/ui/icons';
 import { Badge, Button, IconButton, TextArea } from '../components/ui';
 import { PlanStatusBadge } from '../components/Plans/PlanStatusBadge';
-import { usePlanStore } from '../stores/planStore';
+import { usePlanStore, type Plan } from '../stores/planStore';
 import { MarkdownContent } from '../components/Chat/MarkdownContent';
 import { ActorAttribution } from '../components/Chat/ActorLabel';
+import { planSummaryFallback } from '../components/Chat/planDecision';
 
 /** Plan type is identity, not status — hence `purple` rather than a feedback tone. */
 const TYPE_LABELS: Record<string, string> = {
   'skill-create': 'Skill',
   'skill-update': 'Skill Update',
 };
+
+/**
+ * The text under the title: the summary from the agent that wrote the plan,
+ * else the plan's first heading and the two lines after it.
+ */
+function planSummaryText(plan: Plan): string {
+  const own = plan.summary?.trim();
+  if (own) return own;
+  const { heading, lines } = planSummaryFallback(plan.content);
+  return [heading, ...lines].filter(Boolean).join('\n');
+}
 
 export function PlanDetailPage() {
   const { planId } = useParams<{ planId: string }>();
@@ -48,6 +60,7 @@ export function PlanDetailPage() {
 
   const isPending = plan.status === 'pending';
   const isImplementing = plan.status === 'implementing';
+  const summary = planSummaryText(plan);
 
   const handleApprove = async () => {
     const result = await approvePlan(plan.id);
@@ -90,6 +103,15 @@ export function PlanDetailPage() {
           )}
           <span className="text-xs text-text-faint">v{plan.version}</span>
         </div>
+        {summary && (
+          <p
+            data-testid="plan-summary"
+            title={summary}
+            className="ml-7 mb-2 max-w-3xl text-sm leading-snug text-text-secondary whitespace-pre-line line-clamp-3"
+          >
+            {summary}
+          </p>
+        )}
         <div className="flex items-center gap-4 text-xs text-text-faint ml-7">
           <span>{plan.created_at?.slice(0, 16).replace('T', ' ')}</span>
           {plan.created_by_actor_id && (

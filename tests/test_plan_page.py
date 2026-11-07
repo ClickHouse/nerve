@@ -1,0 +1,106 @@
+"""The data of the plan page: the plan summary.
+
+``plan_propose`` and ``plan_update`` take an optional ``summary`` and store it
+in ``plans.summary``. ``plan_update`` does not copy the summary of the version
+it replaces.
+"""
+
+from __future__ import annotations
+
+import pytest
+import pytest_asyncio
+
+from nerve.agent import tools as tools_mod
+from nerve.agent.tools.handlers.plans import (
+    plan_propose_handler,
+    plan_read_handler,
+    plan_update_handler,
+)
+from nerve.agent.tools.registry import ToolContext
+from nerve.agent.tools.schemas import (
+    PLAN_PROPOSE_SCHEMA,
+    PLAN_SUMMARY_MAX_CHARS,
+    PLAN_UPDATE_SCHEMA,
+)
+from nerve.db.migrations import v062_plan_summary
+from tests.actor_rows import ensure_system_principal
+
+TASK_ID = "t-summary"
+SUMMARY = "Adds a dark mode toggle to the settings page.\nOne PR in example/repo."
+
+
+@pytest_asyncio.fixture
+async def db(db):  # noqa: F811 - the conftest database, with an identity
+    await ensure_system_principal(db)
+    return db
+
+
+@pytest_asyncio.fixture
+async def ctx(db, tmp_path) -> ToolContext:
+    (tmp_path / "task.md").write_text("# Add dark mode\n\n## Updates\n", encoding="utf-8")
+    await db.upsert_task(
+        task_id=TASK_ID, file_path="task.md", title="Add dark mode",
+        status="pending", content="# Add dark mode\n",
+    )
+    tools_mod.init_tools(workspace=tmp_path, db=db)
+    return ToolContext(
+        session_id="sess-planner", workspace=tmp_path, db=db, actor=db.system_actor,
+    )
+
+
+async def _pending(db) -> dict:
+    (plan,) = [p for p in await db.get_plans_for_task(TASK_ID) if p["status"] == "pending"]
+    return plan
+
+
+def test_both_tools_offer_a_summary():
+    for schema in (PLAN_PROPOSE_SCHEMA, PLAN_UPDATE_SCHEMA):
+        prop = schema["properties"]["summary"]
+        assert prop["type"] == "string"
+        assert prop["maxLength"] == PLAN_SUMMARY_MAX_CHARS
+        assert "summary" not in schema["required"]
+
+
+@pytest.mark.asyncio
+async def test_the_migration_adds_the_column_and_reruns(db):
+    await v062_plan_summary.up(db.db)
+    async with db.db.execute("PRAGMA table_info(plans)") as cursor:
+        columns = [row[1] for row in await cursor.fetchall()]
+    assert columns.count("summary") == 1
+
+
+@pytest.mark.asyncio
+class TestTools:
+    async def test_propose_stores_the_summary(self, db, ctx):
+        result = await plan_propose_handler(ctx, {
+            "task_id": TASK_ID, "content": "# Plan\n\nStep one.", "summary": f"  {SUMMARY}  ",
+        })
+        assert (await _pending(db))["summary"] == SUMMARY
+        assert "clipped" not in result.content[0]["text"]
+
+        read = await plan_read_handler(ctx, {"plan_id": (await _pending(db))["id"]})
+        assert f"Summary: {SUMMARY}" in read.content[0]["text"]
+
+    async def test_propose_without_a_summary_stores_null(self, db, ctx):
+        await plan_propose_handler(ctx, {"task_id": TASK_ID, "content": "Step one.", "summary": "  "})
+        assert (await _pending(db))["summary"] is None
+
+    async def test_a_long_summary_is_clipped_and_the_agent_is_told(self, db, ctx):
+        result = await plan_propose_handler(ctx, {
+            "task_id": TASK_ID, "content": "Step one.", "summary": "word " * 200,
+        })
+        summary = (await _pending(db))["summary"]
+        assert len(summary) <= PLAN_SUMMARY_MAX_CHARS
+        assert summary.endswith("…")
+        assert f"clipped to {PLAN_SUMMARY_MAX_CHARS} characters" in result.content[0]["text"]
+
+    async def test_update_stores_its_own_summary_and_copies_none(self, db, ctx):
+        await plan_propose_handler(ctx, {"task_id": TASK_ID, "content": "v1", "summary": SUMMARY})
+        first = await _pending(db)
+
+        await plan_update_handler(ctx, {"plan_id": first["id"], "content": "v2"})
+        second = await _pending(db)
+        assert second["summary"] is None
+
+        await plan_update_handler(ctx, {"plan_id": second["id"], "content": "v3", "summary": "Now two PRs."})
+        assert (await _pending(db))["summary"] == "Now two PRs."

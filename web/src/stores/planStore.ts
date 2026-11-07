@@ -9,6 +9,8 @@ export interface Plan {
   impl_session_id: string | null;
   status: string;
   content: string;
+  /** Up to 3 short lines from the agent that wrote the plan. Null when it gave none. */
+  summary?: string | null;
   feedback: string | null;
   version: number;
   parent_plan_id: string | null;

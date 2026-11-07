@@ -22,19 +22,22 @@ class PlanStore:
         plan_type: str = "generic",
         *,
         attribution: Attribution = UNATTRIBUTED,
+        summary: str | None = None,
     ) -> dict:
         """Insert a plan version.
 
         ``attribution`` is who wrote this version and on whose behalf:
         written to ``created_by_actor_id`` and ``caused_by_actor_id``.
+        ``summary`` is the short text that the plan page shows under the
+        title; ``None`` when the writer gave none.
         """
         now = datetime.now(timezone.utc).isoformat()
         await self._write(
             """INSERT INTO plans (id, task_id, session_id, content, model, version, parent_plan_id, plan_type, created_at,
-                                  created_by_actor_id, caused_by_actor_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                  created_by_actor_id, caused_by_actor_id, summary)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (plan_id, task_id, session_id, content, model, version, parent_plan_id, plan_type, now,
-             attribution.actor_id, attribution.caused_by_actor_id),
+             attribution.actor_id, attribution.caused_by_actor_id, summary),
         )
         return {"id": plan_id, "task_id": task_id, "version": version, "plan_type": plan_type}
 
