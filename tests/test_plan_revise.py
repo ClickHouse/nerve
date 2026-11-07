@@ -54,6 +54,7 @@ class FakeSessionManager:
         *,
         actor: Actor | None,
         cause=None,
+        origin=None,
     ) -> dict:
         self.calls.append({
             "session_id": session_id,
