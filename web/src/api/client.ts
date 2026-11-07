@@ -682,7 +682,28 @@ export interface Task {
   updated_at: string;
   /** Number of comments. Server-maintained. */
   comment_count?: number;
+  /** The session that created the task; null when it was not a session. */
+  created_session_id?: string | null;
+  /** That session's title (its id when untitled); null once it is deleted. */
+  created_session_title?: string | null;
   content?: string;
+  /** The sessions of the task. Only `GET /api/tasks/{id}` returns it. */
+  sessions?: TaskSession[];
+}
+
+/** How a session relates to a task, in order of precedence. */
+export type TaskSessionRelation = 'created' | 'implemented' | 'updated';
+
+/** A session that created, implemented or updated a task. */
+export interface TaskSession {
+  id: string;
+  title: string;
+  relation: TaskSessionRelation;
+}
+
+/** A task of a session, from `GET /api/sessions/{id}/tasks`. */
+export interface SessionTask extends Task {
+  relation: TaskSessionRelation;
 }
 
 export interface UltracodeUsage {
@@ -1558,6 +1579,9 @@ export const api = {
       method: 'DELETE',
     }),
   getTask: (id: string) => request<any>(`/tasks/${id}`),
+  /** The tasks that a session created, implemented or updated. */
+  getSessionTasks: (sessionId: string) =>
+    request<{ tasks: SessionTask[] }>(`/sessions/${encodeURIComponent(sessionId)}/tasks`),
   createTask: (data: {
     title: string; content?: string; deadline?: string;
     tags?: string; status?: string; confirm_duplicate?: boolean;
