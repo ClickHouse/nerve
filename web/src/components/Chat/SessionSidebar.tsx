@@ -1,6 +1,6 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, StarFilled, Pencil, Trash2, Archive, ArchiveRestore, Repeat, Unlink, GitBranch } from '../ui/icons';
+import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, MoreHorizontal, Star, StarFilled, Pencil, Trash2, Archive, ArchiveRestore, Repeat, Unlink, GitBranch } from '../ui/icons';
 import { Button, IconButton, TextField } from '../ui';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp, loadCollapsedGroups, saveCollapsedGroups, loadExpandedParents, saveExpandedParents } from '../../utils/dateGroups';
@@ -9,6 +9,7 @@ import { useChatStore } from '../../stores/chatStore';
 import { useVisibleActorIds } from '../../stores/actorStore';
 import { useAuthStore } from '../../stores/authStore';
 import { SessionCreatorMarker } from './ActorLabel';
+import { SessionOriginIcon } from './SessionOrigin';
 import { useActorAttributionLabel } from '../../hooks/useActorAttribution';
 import { useModalSurface } from '../../hooks/useModalSurface';
 import { safeAreaInsets } from '../../utils/safeArea';
@@ -20,11 +21,6 @@ import { AttentionReason, SessionListSummary, WaitingMark } from './SessionAtten
 function cleanTitle(session: Session): string {
   const raw = session.title || session.id;
   return raw.replace(/^#+\s*/, '').replace(/^Implement:\s*/i, '');
-}
-
-/** Check if this session is an async plan implementation. */
-function isImplementSession(session: Session): boolean {
-  return /^(#+\s*)?Implement:\s/i.test(session.title || '');
 }
 
 /** Format a date string as a short relative/absolute label. */
@@ -1267,12 +1263,8 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
         </button>
       ) : session.review_loop ? (
         <Repeat size={13} className={`shrink-0 ${reviewLoopIconTone(session.review_loop.status)}`} />
-      ) : isImplementSession(session) ? (
-        <Hammer size={13} className="shrink-0 text-hue-cyan/70" />
-      ) : session.id.startsWith('fork-') ? (
-        <GitBranch size={13} className="shrink-0 text-hue-violet/70" />
       ) : (
-        <MessageSquare size={13} className="shrink-0 opacity-50" />
+        <SessionOriginIcon session={session} />
       )}
       <div className="flex-1 min-w-0">
         <div className={`truncate text-xs in-data-[layout=page]:text-sm leading-tight${isUnread ? ' font-semibold text-text' : ''}`}>{cleanTitle(session)}</div>
