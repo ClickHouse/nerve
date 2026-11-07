@@ -1261,7 +1261,8 @@ Queued messages are never touched. Errors: `404 session_not_found`;
 `422 bad_scope`.
 
 #### `GET /api/sessions/{id}/queue`
-Messages waiting for the session's current turn to end.
+Messages waiting for the session's current turn to end, in run order (the
+first one runs next).
 
 ```json
 Response: { "items": [QueueEntryView] }
@@ -1280,6 +1281,22 @@ Response: { "cancelled": true, "content": "also run the e2e suite" }
 Errors: `404 queue_entry_not_found`; `409 already_started` (it holds the
 turn now); `403 not_owner` (someone else's message, a channel relay or an
 internal trigger).
+
+#### `PUT /api/sessions/{id}/queue/order`
+Set the run order of the queued messages. Any queued message can move,
+whoever sent it. `queue_ids` lists them from the one that runs next to the
+last. An id that is not queued any more (it started or was cancelled
+meanwhile) is skipped; a queued message that the list does not name keeps its
+place relative to the others, after the named ones. Every client of the
+session gets the new order in `queue_update`.
+
+```json
+Request:  { "queue_ids": ["q_9c1d2e3f", "q_1a2b3c4d"] }
+Response: { "items": [QueueEntryView] }
+```
+
+Errors: `404 session_not_found`; `422 bad_order` (not a list of at most 500
+strings).
 
 ### Tasks
 

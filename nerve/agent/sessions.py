@@ -619,13 +619,6 @@ class SessionManager:
             return None
         return task
 
-    def registered_task(self, session_id: str) -> asyncio.Task | None:
-        """The live task registered with :meth:`register_task`, or ``None``."""
-        task = self._running_tasks.get(session_id)
-        if task is None or task.done():
-            return None
-        return task
-
     def has_running_work(self, session_id: str) -> bool:
         """True while a turn of the session runs or its registered task lives."""
         task = self._running_tasks.get(session_id)

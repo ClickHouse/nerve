@@ -134,6 +134,13 @@ then runs nothing and stores nothing, and its text comes back. A message
 sent with a `client_msg_id` that the session already saw in the last 10
 minutes (a retry after a dropped connection) runs once.
 
+The queue runs in its listed order: when a turn ends, the session's run lock
+goes directly to the first queued message, and new messages go to the end.
+The order can change (`PUT /api/sessions/{id}/queue/order`) for any queued
+message, whoever sent it: also messages of other people, channel relays and
+internal triggers. A queued message stays in Nerve until its turn starts:
+the model never sees it during an earlier turn.
+
 ## Restarts, reloads and teardown
 
 - Records and transcripts are stored (`session_agents`,
