@@ -1909,7 +1909,8 @@ those for another session. Events marked *global* go to every socket.
 
 // Notifications (global)
 { type: "notification", notification_id: "…", notification_type: "notify" | "question" | …, session_id: "…", title: "…", body: "…", priority: "normal", options: [...] | null }
-{ type: "notification_answered", notification_id: "…", session_id: "…", answer: "…", answered_by: "…", actor_id: "…" }
+{ type: "notification_answered", notification_id: "…", session_id: "…", answer: "…", answered_by: "…", answered_at: "…" | null, actor_id: "…" }
+// answered_at: the stored answer time (ISO 8601). A snoozed approval has approval_status: "snoozed" and snooze_until instead.
 { type: "notification_expired", notification_id: "…", session_id: "…", notification_type: "question", title: "…" }
 // An answer was relayed into the session as a message
 { type: "answer_injected", session_id: "…", notification_id: "…", title: "…", answer: "…", answered_by: "…", content: "…", actor_id: "…" }
