@@ -10,7 +10,6 @@ remove the browsers of that person. Delivery is in
 from __future__ import annotations
 
 import asyncio
-import struct
 from pathlib import Path
 from typing import Literal
 
@@ -18,7 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from nerve.config import NOTIFY_LEVEL_IMPORTANT, get_config, workspace_favicon
+from nerve.config import NOTIFY_LEVEL_IMPORTANT, get_config
 from nerve.db.push_subscriptions import MAX_PUSH_SUBSCRIPTIONS
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
@@ -31,44 +30,17 @@ router = APIRouter()
 MANIFEST_MEDIA_TYPE = "application/manifest+json"
 #: The background of the dark theme: the start screen of the installed app.
 APP_BACKGROUND = "#1f1f1c"
-#: Nerve's own icons in the web bundle (``web/public``).
+#: Nerve's icons in the web bundle (``web/public``): the 192 and 512 px PNGs
+#: that installing needs.
 NERVE_ICONS = (
     {"src": "/nerve-icon-192.png", "sizes": "192x192", "type": "image/png"},
     {"src": "/nerve-icon-512.png", "sizes": "512x512", "type": "image/png"},
     {"src": "/nerve-icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable"},
 )
-#: The smallest PNG favicon that the manifest gives as the app icon.
-MIN_ICON_PX = 192
-_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 USER_AGENT_CHARS = 300
 
 _PERSON_ONLY = "Push notifications are for a person, not for a system or MCP token."
 _TOO_MANY = f"Push is on in {MAX_PUSH_SUBSCRIPTIONS} browsers already. Remove one first."
-
-
-def _png_size(path: Path) -> tuple[int, int] | None:
-    try:
-        with path.open("rb") as f:
-            head = f.read(24)
-    except OSError:
-        return None
-    if len(head) < 24 or head[:8] != _PNG_SIGNATURE or head[12:16] != b"IHDR":
-        return None
-    return struct.unpack(">II", head[16:24])
-
-
-def _app_icons(workspace: Path) -> list[dict]:
-    """The instance favicon when it is an SVG or a square PNG of at least
-    :data:`MIN_ICON_PX`, else Nerve's icons. Blocking file I/O."""
-    found = workspace_favicon(workspace)
-    if found is not None:
-        path, content_type = found
-        if content_type == "image/svg+xml":
-            return [{"src": "/favicon.ico", "sizes": "any", "type": content_type}]
-        size = _png_size(path) if content_type == "image/png" else None
-        if size and size[0] == size[1] >= MIN_ICON_PX:
-            return [{"src": "/favicon.ico", "sizes": f"{size[0]}x{size[1]}", "type": content_type}]
-    return [dict(icon) for icon in NERVE_ICONS]
 
 
 @router.get("/api/manifest.webmanifest", include_in_schema=False)
@@ -84,7 +56,7 @@ async def manifest():
         "display": "standalone",
         "background_color": APP_BACKGROUND,
         "theme_color": APP_BACKGROUND,
-        "icons": await asyncio.to_thread(_app_icons, workspace),
+        "icons": NERVE_ICONS,
     }
     return JSONResponse(body, media_type=MANIFEST_MEDIA_TYPE, headers={"Cache-Control": "no-cache"})
 
