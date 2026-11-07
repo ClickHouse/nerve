@@ -29,6 +29,17 @@ export function needsYou(session: Session): boolean {
   return attentionReasons(session).length > 0;
 }
 
+/**
+ * True when the agent cannot go on without the user: a question in the
+ * turn, a pending question or approval, or a review loop on a decision.
+ * A plan to review does not block the session.
+ */
+export function blockedOnYou(session: Session): boolean {
+  const a = session.attention;
+  return !!session.awaiting_input || !!a?.questions || !!a?.approvals
+    || session.review_loop?.status === 'awaiting_user';
+}
+
 /** "2 need you", "1 needs you". */
 export function needsYouLabel(count: number): string {
   return `${count} need${count === 1 ? 's' : ''} you`;

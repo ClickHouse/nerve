@@ -109,6 +109,35 @@ describe('the Needs you group', () => {
   });
 });
 
+describe('the status mark of a session that is blocked on you', () => {
+  const loop = (status: string) => ({ review_loop: { id: 'rvl-1', status, iteration: 1, max_iterations: 3 } });
+
+  it('is a red "!" with the reason as its tooltip', () => {
+    renderSidebar([
+      session('turn', { awaiting_input: true, is_running: true }),
+      session('asks', {}, { questions: 1 }),
+      session('approve', {}, { approvals: 2 }),
+      session('loop', loop('awaiting_user')),
+    ]);
+
+    const marks = screen.getAllByRole('img', { name: 'Waiting for you' });
+    expect(marks.map(m => m.getAttribute('title')).sort()).toEqual(
+      ['2 approvals', 'Question', 'Review loop', 'Waiting for input'],
+    );
+  });
+
+  it('is not shown for a plan to review or while the turn runs', () => {
+    renderSidebar([
+      session('plan', {}, { plans: 1 }),
+      session('busy', { is_running: true }, { questions: 1 }),
+    ]);
+
+    expect(screen.queryByRole('img', { name: 'Waiting for you' })).toBeNull();
+    expect(screen.getByText('Plan to review')).toBeInTheDocument();
+    expect(screen.getByText('Question')).toBeInTheDocument();
+  });
+});
+
 describe('the summary line', () => {
   it('counts the sessions that need you and the running ones', () => {
     renderSidebar([
