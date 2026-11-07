@@ -176,6 +176,24 @@ export interface Session {
     spent_usd?: number;
     updated_at?: string;
   };
+  /** What waits for the user in this session (GET /api/sessions). */
+  attention?: SessionAttention;
+}
+
+/** The pending items of a session that need the user. The two booleans
+    are true at fetch time; the live `awaiting_input` and
+    `review_loop.status` of the session take precedence over them. */
+export interface SessionAttention {
+  /** Pending ask_user questions. */
+  questions: number;
+  /** Pending approvals (propose_action). */
+  approvals: number;
+  /** Pending plans that this session proposed. */
+  plans: number;
+  /** A question inside a running turn. */
+  awaiting_input: boolean;
+  /** The newest review loop waits for a decision. */
+  review: boolean;
 }
 
 export type AgentStatus =
