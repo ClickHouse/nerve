@@ -189,6 +189,17 @@ describe('the sessions that need you', () => {
     await vi.advanceTimersByTimeAsync(500);
     expect(api.listSessions).toHaveBeenCalledTimes(1);
   });
+
+  it('a task event reloads the list: a plan decided in another place clears "Plan to review"', async () => {
+    vi.useFakeTimers();
+    useChatStore.setState({ sessionsNextOffset: 0, sessionsHasMore: false, archivedSessions: null, systemSessions: null });
+    const task = { id: 't1', title: 'Upgrade CI runners', status: 'done' };
+    dispatch({ type: 'task_updated', session_id: null, event: 'done', task } as never);
+    expect(api.listSessions).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(api.listSessions).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe('unsent work on re-entry', () => {

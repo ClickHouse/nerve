@@ -19,7 +19,7 @@ import { loadReads, persistRead, removeRead, loadBaseline } from './helpers/read
 import { removeSeen } from './helpers/agentSeen';
 import { loadVirtualSession, persistVirtualSession, clearVirtualSession } from './helpers/virtualSessionStorage';
 import { onViewerStorageChange } from './helpers/viewerStorage';
-import { registerSessionsLoader } from './helpers/sessionsReload';
+import { registerSessionsLoader, reloadSessionsSoon } from './helpers/sessionsReload';
 // Handlers
 import { discardStreamDeltas, flushStreamDeltas, handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate, exitStreaming } from './handlers/sessionHandlers';
@@ -1590,6 +1590,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // reflects a change made by the agent in any session, by another
       // tab, or over the API. Must stay out of VIEW_SCOPED_EVENTS.
       case 'task_updated':
+        // A plan decision from any place (another tab, Telegram, the API)
+        // writes the plan's task, and this event is its only broadcast. The
+        // reload clears the session's "Plan to review".
+        reloadSessionsSoon();
         void import('./taskStore').then(({ useTaskStore }) =>
           useTaskStore.getState().handleTaskEvent(msg.task)
         );
