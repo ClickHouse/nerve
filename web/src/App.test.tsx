@@ -47,6 +47,7 @@ vi.mock('./stores/chatStore', () => {
 // shell is replaced by its outlet so routing still resolves through it.
 vi.mock('./components/Layout/AppShell', () => ({ AppShell: () => <Outlet /> }));
 vi.mock('./pages/ChatPage', () => ({ ChatPage: () => <div>the chat page</div> }));
+vi.mock('./pages/InboxPage', () => ({ InboxPage: () => <div>the inbox page</div> }));
 vi.mock('./pages/AccountsPage', () => ({
   AccountsPage: () => <div>the accounts page</div>,
 }));
@@ -60,6 +61,7 @@ import {
 } from './api/hosted';
 import { ws } from './api/websocket';
 import App from './App';
+import { MOBILE_QUERY } from './hooks/useMediaQuery';
 import { useAuthStore } from './stores/authStore';
 import { useChatStore } from './stores/chatStore';
 import { useSetupStore } from './stores/setupStore';
@@ -144,6 +146,22 @@ describe('startup with a token already in storage', () => {
     renderApp();
 
     expect(await screen.findByText('the chat page')).toBeInTheDocument();
+  });
+
+  it('lands on the inbox on a phone', async () => {
+    authStatus.mockResolvedValue(status());
+    const stub = window.matchMedia;
+    const matchMedia = vi.spyOn(window, 'matchMedia').mockImplementation(
+      (query: string) => ({ ...stub(query), matches: query === MOBILE_QUERY }),
+    );
+
+    try {
+      renderApp();
+      expect(await screen.findByText('the inbox page')).toBeInTheDocument();
+    } finally {
+      // Restore only this spy. vi.restoreAllMocks() also undoes setup.ts's spies.
+      matchMedia.mockRestore();
+    }
   });
 
   it('renders nothing at all until both answers are in', async () => {
