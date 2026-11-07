@@ -105,8 +105,8 @@ User reviews (via /plans UI or chat tools)
 | `pending` | Awaiting human review |
 | `approved` | Approved (briefly, before implementation starts) |
 | `implementing` | Implementation session is running |
-| `done` | The task of the plan was marked done |
-| `failed` | The implementation session stopped with an error |
+| `done` | The task of the plan was marked done. A `failed` plan becomes `done` too when its own implementation session marks the task done |
+| `failed` | The first implementation turn failed: it raised, or it ended with a failed outcome. A task event (`updated`) follows the write |
 | `declined` | Rejected by user |
 | `superseded` | Replaced by a newer version |
 
@@ -153,7 +153,7 @@ Plans from the `skill-extractor` and `skill-reviser` cron jobs (`plan_type` `ski
 2. `skill-create` → it calls `skill_create` with the name, description and body; `skill-update` → it calls `skill_update` with the full SKILL.md content
 3. It then calls `task_done` with a note describing what was done
 
-The plan is marked `implementing` on approval and `failed` if the session raises.
+The plan is marked `implementing` on approval and `failed` if the first implementation turn fails.
 
 ## Database
 
@@ -270,10 +270,9 @@ task updates and sessions have no actor or cause.
 | GET | `/api/tasks/:id/plans` | Plans for a specific task |
 
 `GET /api/plans/:id` adds `impl_session`: `null` without an implementation
-session (or when its row is gone), else `{id, title, status, updated_at,
-is_running, awaiting_input, parked}`. `status` is the session row's status,
-and `parked` is true when no turn runs but a wake-up is scheduled or
-background work still runs.
+session (or when its row is gone), else `{id, title, updated_at,
+is_running, awaiting_input, parked}`. `parked` is true when no turn runs but
+a wake-up is scheduled or background work still runs.
 
 Plan rows include `reviewed_by_actor_id`, `reviewed_caused_by_actor_id`,
 `created_by_actor_id` and `caused_by_actor_id`. Approve, `PATCH` and revise

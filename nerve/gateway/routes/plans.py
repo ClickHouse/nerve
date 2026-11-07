@@ -71,7 +71,6 @@ async def _impl_session(deps, session_id: str | None) -> dict | None:
     return {
         "id": session_id,
         "title": session.get("title"),
-        "status": session.get("status"),
         "updated_at": session.get("updated_at"),
         "is_running": engine.is_session_running(session_id),
         "awaiting_input": session_id in get_awaiting_ids(),

@@ -3,11 +3,14 @@
 ``plan_propose`` and ``plan_update`` take an optional ``summary`` and store it
 in ``plans.summary``. ``plan_update`` does not copy the summary of the version
 it replaces. ``GET /api/plans/{id}`` returns the summary and, for an approved
-plan, the implementation session's title and live state.
+plan, the implementation session's title and live state. A failed
+implementation turn marks the plan ``failed``; a later ``task_done`` from the
+same session marks it ``done``.
 """
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -15,13 +18,17 @@ import pytest_asyncio
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from nerve.agent import streaming
 from nerve.agent import tools as tools_mod
+from nerve.agent.engine import TurnOutcome
+from nerve.agent.plan_service import approve_plan
 from nerve.agent.tools.handlers.plans import (
     PLAN_PROPOSE_SPEC,
     plan_propose_handler,
     plan_read_handler,
     plan_update_handler,
 )
+from nerve.agent.tools.handlers.tasks import task_done_handler
 from nerve.agent.tools.registry import ToolContext, ToolRegistry
 from nerve.agent.tools.schemas import (
     PLAN_PROPOSE_SCHEMA,
@@ -32,6 +39,7 @@ from nerve.db.migrations import v062_plan_summary
 from nerve.gateway.routes import plans as plans_routes
 from nerve.gateway.routes._deps import init_deps
 from nerve.mcp_server.server import build_mcp_server
+from tests import test_plan_actions as plan_tests
 from tests.actor_rows import ensure_system_principal
 from tests.test_mcp_server import _invoke_call_tool
 
@@ -200,3 +208,85 @@ class TestPlanRoute:
     async def test_a_deleted_session_gives_no_session(self, page):
         await page.db.update_plan(page.plan_id, status="implementing", impl_session_id="impl-gone")
         assert page.get()["impl_session"] is None
+
+
+async def _until(read, expected, within: float = 2.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + within
+    while await read() != expected:
+        if loop.time() > deadline:
+            pytest.fail(f"never became {expected!r}")
+        await asyncio.sleep(0.005)
+
+
+@pytest.mark.asyncio
+class TestFailedImplementation:
+    """``engine.run`` returns normally for a failed turn; its outcome counts."""
+
+    @pytest_asyncio.fixture
+    async def approved(self, db, tmp_path, monkeypatch):
+        engine, task_id = await plan_tests._setup(db, tmp_path)
+        events: list[tuple[str, str, str]] = []
+
+        async def record(task, event):
+            # The plan status when the broadcast goes out.
+            events.append((task["id"], event, (await db.get_plan("plan-act"))["status"]))
+
+        monkeypatch.setattr(streaming, "emit_task_event", record)
+
+        async def approve(outcome: TurnOutcome) -> str:
+            engine.turn_outcome = outcome
+            result = await approve_plan(db=db, engine=engine, plan_id="plan-act", **plan_tests.BY_APPROVER)
+            events.clear()  # the approval's own task write; the run has not started yet
+            await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
+            return result["impl_session_id"]
+
+        return SimpleNamespace(db=db, engine=engine, task_id=task_id, events=events, approve=approve,
+                               status=lambda: _status_of(db, "plan-act"))
+
+    async def test_a_failed_turn_marks_the_plan_failed_then_broadcasts(self, approved):
+        await approved.approve(TurnOutcome("failed", "Agent error: boom"))
+        await _until(approved.status, "failed")
+        await _until(lambda: _len(approved.events), 1)
+        assert approved.events == [(approved.task_id, "updated", "failed")]
+
+    async def test_a_completed_turn_keeps_the_plan_implementing(self, approved):
+        await approved.approve(TurnOutcome("completed"))
+        await asyncio.sleep(0.05)
+        assert await approved.status() == "implementing"
+        assert approved.events == []
+
+    async def test_a_plan_done_in_the_failed_turn_stays_done(self, approved):
+        async def done_then_fail(session_id, *args, **kwargs):
+            await approved.db.update_plan("plan-act", status="done")
+            approved.engine.run_event.set()
+            raise RuntimeError("crashed after task_done")
+
+        approved.engine.run = done_then_fail
+        await approved.approve(TurnOutcome())
+        await asyncio.sleep(0.05)
+        assert await approved.status() == "done"
+
+    async def test_task_done_from_the_implementation_session_marks_it_done(self, approved, tmp_path):
+        impl = await approved.approve(TurnOutcome("failed", "Agent error: boom"))
+        await _until(approved.status, "failed")
+
+        ctx = ToolContext(session_id=impl, workspace=tmp_path, db=approved.db, actor=approved.db.system_actor)
+        await task_done_handler(ctx, {"task_id": approved.task_id, "note": "Finished on the second try."})
+        assert await approved.status() == "done"
+
+    async def test_task_done_from_another_session_keeps_it_failed(self, approved, tmp_path):
+        await approved.approve(TurnOutcome("failed", "Agent error: boom"))
+        await _until(approved.status, "failed")
+
+        ctx = ToolContext(session_id="web", workspace=tmp_path, db=approved.db, actor=approved.db.system_actor)
+        await task_done_handler(ctx, {"task_id": approved.task_id, "note": ""})
+        assert await approved.status() == "failed"
+
+
+async def _status_of(db, plan_id: str) -> str:
+    return (await db.get_plan(plan_id))["status"]
+
+
+async def _len(items: list) -> int:
+    return len(items)
