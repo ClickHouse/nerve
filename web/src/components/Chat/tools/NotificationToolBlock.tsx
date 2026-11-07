@@ -2,6 +2,8 @@ import { useState } from 'react';
 import { Bell, HelpCircle, Loader2, ChevronRight, ChevronDown } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { Badge, type BadgeTone } from '../../ui';
+import { toolBaseName } from '../../../utils/toolNames';
+import { parseAskOptions } from '../../Notifications/askOptions';
 
 /** Extract readable text from MCP content blocks. */
 function extractText(result: string): string {
@@ -26,13 +28,14 @@ const PRIORITY_TONES: Record<string, BadgeTone> = {
 export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
   const [expanded, setExpanded] = useState(false);
   const isRunning = block.status === 'running';
-  const isNotify = block.tool === 'notify';
-  const isAsk = block.tool === 'ask_user';
+  // Nerve's tools arrive as `mcp__nerve__notify` and `mcp__nerve__ask_user`.
+  const baseName = toolBaseName(block.tool);
+  const isNotify = baseName === 'notify';
+  const isAsk = baseName === 'ask_user';
 
   const title = String(block.input.title || '');
   const priority = String(block.input.priority || 'normal');
-  const optionsRaw = String(block.input.options || '');
-  const options = optionsRaw ? optionsRaw.split(',').map(o => o.trim()).filter(Boolean) : [];
+  const options = parseAskOptions(block.input.options);
   const wait = String(block.input.wait || 'false').toLowerCase() === 'true';
   const body = String(block.input.body || '');
 
@@ -80,8 +83,8 @@ export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
             {/* Options for questions */}
             {isAsk && options.length > 0 && (
               <div className="flex flex-wrap gap-1.5 mt-2">
-                {options.map(opt => (
-                  <Badge key={opt} tone="info" size="sm" outline>{opt}</Badge>
+                {options.map((opt, i) => (
+                  <Badge key={i} tone="info" size="sm" outline>{opt}</Badge>
                 ))}
               </div>
             )}
