@@ -15,13 +15,23 @@ import pytest_asyncio
 
 from nerve.config import NerveConfig, NotificationsConfig
 from nerve.notifications import quiet_hours
-from nerve.notifications.quiet_hours import deliver_silently, in_quiet_hours
+from nerve.notifications.quiet_hours import deliver_silently, in_quiet_hours, minutes_of_day
 from nerve.notifications.service import NotificationService
 from tests.actor_rows import ensure_system_principal
 
 
 def _at(hour: int, minute: int = 0) -> datetime:
     return datetime(2026, 10, 11, hour, minute, tzinfo=UTC)
+
+
+def _clock(fixed: datetime) -> type[datetime]:
+    """A ``datetime`` whose ``now()`` is ``fixed``."""
+    class _Fixed(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed.astimezone(tz)
+
+    return _Fixed
 
 
 def _config(start: str | None, end: str | None, timezone: str = "UTC") -> NerveConfig:
@@ -56,17 +66,24 @@ class TestInQuietHours:
 
     @pytest.mark.parametrize(("start", "end", "timezone"), [
         ("2am", "8am", "UTC"), ("02:00:00", "08:00", "UTC"), ("02:00", "08:00", "Not/AZone"),
+        ("24:00", "08:00", "UTC"), ("25:00", "08:00", "UTC"), ("02:00", "08:60", "UTC"), ("2:00", "08:00", "UTC"),
     ])
     def test_an_unreadable_value_is_not_quiet(self, start, end, timezone):
         assert in_quiet_hours(_config(start, end, timezone), _at(3)) is False
 
-    def test_without_a_time_it_reads_the_clock(self, monkeypatch):
-        class _Fixed(datetime):
-            @classmethod
-            def now(cls, tz=None):
-                return _at(3).astimezone(tz)
 
-        monkeypatch.setattr(quiet_hours, "datetime", _Fixed)
+@pytest.mark.parametrize(("text", "minutes"), [("00:00", 0), ("07:30", 450), ("23:59", 1439)])
+def test_a_24_hour_time_gives_its_minutes(text, minutes):
+    assert minutes_of_day(text) == minutes
+
+
+@pytest.mark.parametrize("text", ["24:00", "25:00", "08:60", "8:00", "08:00:00", "", " 08:00", "٠٨:٠٠"])
+def test_any_other_text_is_refused(text):
+    with pytest.raises(ValueError):
+        minutes_of_day(text)
+
+    def test_without_a_time_it_reads_the_clock(self, monkeypatch):
+        monkeypatch.setattr(quiet_hours, "datetime", _clock(_at(3)))
         assert in_quiet_hours(_config("02:00", "08:00")) is True
 
 
@@ -122,6 +139,14 @@ class TestFanout:
     async def test_an_urgent_item_still_makes_a_sound(self, service, broadcasts, monkeypatch):
         _quiet(monkeypatch, True)
         await service.send_notification("s1", "Disk full", priority="urgent")
+        assert service._deliver_telegram.await_args.kwargs["silent"] is False
+        assert "silent" not in broadcasts[0]
+
+    @pytest.mark.parametrize(("start", "end"), [("24:00", "07:00"), ("25:00", "07:00"), ("22:00", "08:60")])
+    async def test_an_out_of_range_time_keeps_the_sound(self, service, broadcasts, monkeypatch, start, end):
+        service.config.quiet_start, service.config.quiet_end = start, end
+        monkeypatch.setattr(quiet_hours, "datetime", _clock(_at(3)))
+        await service.send_notification("s1", "Build finished")
         assert service._deliver_telegram.await_args.kwargs["silent"] is False
         assert "silent" not in broadcasts[0]
 

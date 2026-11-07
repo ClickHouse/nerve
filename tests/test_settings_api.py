@@ -325,7 +325,9 @@ class TestQuietHours:
         assert "quiet_start" not in inst.settings_yaml()
 
     @pytest.mark.parametrize("body, field", [
+        ({"quiet_start": "24:00"}, "quiet_start"),
         ({"quiet_start": "25:00"}, "quiet_start"),
+        ({"quiet_end": "08:60"}, "quiet_end"),
         ({"quiet_end": "7am"}, "quiet_end"),
         ({"quiet_start": 2200}, "quiet_start"),
         ({"quiet_start": None}, "quiet_start"),

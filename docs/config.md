@@ -1765,7 +1765,8 @@ notifications:
 
 Quiet hours are optional. Both values empty (`''`) means there are none;
 otherwise both are `HH:MM`, and the window may cross midnight (`22:00` to
-`07:00`). The setup writers (the setup page's Mode step, `nerve init
+`07:00`). A value that is not a 24-hour time from `00:00` to `23:59` also
+means no quiet hours. The setup writers (the setup page's Mode step, `nerve init
 --terminal` and `--non-interactive`) state the mode's default in
 `settings.yaml`: `02:00`/`08:00` for a personal install, and empty values for
 a worker, so a worker has no quiet hours until someone turns them on (the
