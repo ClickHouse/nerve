@@ -292,7 +292,8 @@ def _iso_now() -> str:
 class QueuedTurn:
     """A run waiting for the session's run lock (a message sent while a turn
     streams). Listed in ``queue_update`` and the snapshot until it starts or
-    is cancelled."""
+    is cancelled. The lock goes to the first entry of the session's queue
+    (``AgentEngine._pass_run_lock``), so the queue order is the run order."""
 
     queue_id: str                 # "q_" + 8 hex
     session_id: str
@@ -303,6 +304,8 @@ class QueuedTurn:
     actor_id: str | None
     created_at: str
     task: asyncio.Task
+    # Gets a result when the run lock is handed to this run.
+    granted: asyncio.Future
     cancelled_by_request: bool = False
 
 
@@ -2183,17 +2186,12 @@ class AgentEngine:
                 session_id, kills_background=bool(killable) and not spares,
             )
         lock = self._session_locks.get(session_id)
-        # A queued run counts as behind the lock even in the instant the lock
-        # passes between runs (released, the next waiter not resumed yet).
-        registered = getattr(self.sessions, "registered_task", lambda _sid: None)(session_id)
-        queued = registered is not None and any(
-            entry.task is registered
-            for entry in self._queue_state()[0].get(session_id, ())
-        )
+        # The lock stays held while runs are queued (_pass_run_lock hands it
+        # over), so a queued run always counts as behind the lock.
         outcome = await self.sessions.interrupt_turn(
             session_id,
             allow_hard_cancel=force or not live,
-            lock_held=bool(lock is not None and lock.locked()) or queued,
+            lock_held=bool(lock is not None and lock.locked()),
             wait_s=self._STOP_WAIT_SECONDS,
         )
         if had_work:
@@ -2469,8 +2467,8 @@ class AgentEngine:
 
     def queue_view(self, session_id: str) -> list[dict]:
         """The session's server-visible turn queue (``QueueEntryView`` list,
-        oldest first). Internal entries never show their prompt: they carry a
-        fixed label by source."""
+        in run order: the first entry runs next). Internal entries never show
+        their prompt: they carry a fixed label by source."""
         queues, _started, _msgs = self._queue_state()
         out = []
         for entry in queues.get(session_id, ()):
@@ -2508,9 +2506,52 @@ class AgentEngine:
             actor_id=actor.actor_id if actor is not None else None,
             created_at=_iso_now(),
             task=task,
+            granted=asyncio.get_running_loop().create_future(),
         )
         queues.setdefault(session_id, []).append(entry)
         return entry
+
+    def _pass_run_lock(self, session_id: str, lock: asyncio.Lock) -> None:
+        """Give the held run lock to the first run in the session's queue, or
+        release it when no run waits. The lock stays held across the
+        handover, so no new run and no idle drain can take it in between.
+        Every holder of the run lock releases it here."""
+        queues, _started, _msgs = self._queue_state()
+        for entry in list(queues.get(session_id, ())):
+            if entry.granted.done():
+                continue  # cancelled while it waited; its run dequeues it
+            self._dequeue_turn(session_id, entry, started=True)
+            entry.granted.set_result(None)
+            return
+        lock.release()
+
+    @contextlib.asynccontextmanager
+    async def _holding_run_lock(self, session_id: str, lock: asyncio.Lock):
+        """Hold the session's run lock for work that is not a run (an idle
+        drain, a client reap), then pass it to the queue."""
+        await lock.acquire()
+        try:
+            yield
+        finally:
+            self._pass_run_lock(session_id, lock)
+
+    async def reorder_queue(self, session_id: str, queue_ids: list[str]) -> list[dict]:
+        """Put the session's queued runs in the order of ``queue_ids``; the
+        first one runs next. Ids that are not queued any more (the run started
+        or was cancelled meanwhile) are skipped. Queued runs that the list does
+        not name keep their order, after the named ones. Returns the new queue
+        view, which also goes to every client in ``queue_update``."""
+        queues, _started, _msgs = self._queue_state()
+        queue = queues.get(session_id)
+        if queue:
+            rank: dict[str, int] = {}
+            for position, queue_id in enumerate(queue_ids):
+                rank.setdefault(queue_id, position)
+            # A stable sort: entries with the same rank keep their order.
+            queue.sort(key=lambda entry: rank.get(entry.queue_id, len(queue_ids)))
+        view = self.queue_view(session_id)
+        await self._emit_queue_update(session_id)
+        return view
 
     def _dequeue_turn(
         self, session_id: str, entry: QueuedTurn, *, started: bool = False,
@@ -3744,8 +3785,9 @@ class AgentEngine:
 
         Runs of one session are serialized by its run lock. A run that finds
         the lock held is listed in the session's turn queue (``queue_update``
-        to every client) until it gets the lock; its sender may cancel it
-        there (:meth:`cancel_queued_turn`), and then it returns ``""`` having
+        to every client) until it gets the lock; the queue runs in its order
+        (:meth:`reorder_queue` changes it). Its sender may cancel it there
+        (:meth:`cancel_queued_turn`), and then it returns ``""`` having
         persisted nothing. Stop never touches queued runs.
 
         Args:
@@ -3852,25 +3894,30 @@ class AgentEngine:
         if not self._accepting_turns:
             await self._refuse_turn(session_id, client_msg_id=client_msg_id)
         # Serialize runs per session — messages for the same session wait
-        # in order instead of failing with "already running", and are listed
-        # while they wait.
+        # in the session's queue instead of failing with "already running",
+        # and are listed while they wait. The run lock goes to the first
+        # entry of the queue (_pass_run_lock), so the queue order is the run
+        # order. The lock stays held while runs are queued.
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         entry: QueuedTurn | None = None
-        queues, _started, _msgs = self._queue_state()
-        # Behind a held lock, or behind runs still waiting for it (a lock just
-        # released passes to the oldest waiter before it reads as held).
-        if lock.locked() or queues.get(session_id):
+        if lock.locked():
             entry = self._enqueue_turn(
                 session_id, content=user_message, client_msg_id=client_msg_id,
                 source=origin or source, internal=internal, actor=actor,
             )
         try:
-            if entry is not None:
+            if entry is None:
+                await lock.acquire()  # free: returns at once
+            else:
                 # Inside the try: a cancel here still dequeues.
                 await self._emit_queue_update(session_id)
-            await lock.acquire()
+                await entry.granted
         except asyncio.CancelledError:
             if entry is not None:
+                if entry.granted.done() and not entry.granted.cancelled():
+                    # The lock came to this run in the same instant as the
+                    # cancel: give it to the next run.
+                    self._pass_run_lock(session_id, lock)
                 self._dequeue_turn(session_id, entry)
                 await self._emit_queue_update(session_id, removed=[{
                     "queue_id": entry.queue_id, "client_msg_id": entry.client_msg_id,
@@ -3890,16 +3937,12 @@ class AgentEngine:
             # Check again: a drain can start while this run waits in the
             # queue. Its entry then leaves the queue as refused, not started.
             if not self._accepting_turns:
-                if entry is not None:
-                    self._dequeue_turn(session_id, entry)
                 await self._refuse_turn(
                     session_id, entry=entry, client_msg_id=client_msg_id,
                 )
             # The Stop target from the moment this run holds the run lock:
             # Stop reaches the turn, never a message queued behind it.
             self.sessions.set_turn_task(session_id, turn_task)
-            if entry is not None:
-                self._dequeue_turn(session_id, entry, started=True)
             if entry is not None or client_msg_id:
                 await self._emit_queue_update(session_id, removed=[{
                     "queue_id": entry.queue_id if entry is not None else None,
@@ -3916,7 +3959,7 @@ class AgentEngine:
             )
         finally:
             self.sessions.clear_turn_task(session_id, turn_task)
-            lock.release()
+            self._pass_run_lock(session_id, lock)
 
     async def _run_locked(
         self,
@@ -4933,7 +4976,7 @@ class AgentEngine:
                 if lock.locked():
                     continue  # a run is starting; its pre-query drain covers this
 
-                async with lock:
+                async with self._holding_run_lock(session_id, lock):
                     if self.sessions.get_client(session_id) is not client:
                         return
 
@@ -5002,7 +5045,7 @@ class AgentEngine:
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         if lock.locked() or self.sessions.get_client(session_id) is not client:
             return
-        async with lock:
+        async with self._holding_run_lock(session_id, lock):
             if self.sessions.get_client(session_id) is not client:
                 return
             logger.info(

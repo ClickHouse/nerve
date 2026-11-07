@@ -2,7 +2,8 @@
 
 A message sent while a turn runs waits for the run lock; while it waits it is
 listed in ``queue_update`` (every client sees it), its sender can cancel it,
-and Stop never touches it: it runs after the stopped turn.
+and Stop never touches it: it runs after the stopped turn. The queue runs in
+its order, and a reorder changes that order.
 """
 
 from __future__ import annotations
@@ -424,9 +425,10 @@ async def test_stop_all_leaves_queued_messages(db, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_a_run_behind_a_woken_waiter_is_listed(db, tmp_path):
-    """A lock that was just released belongs to its oldest waiter before it
-    reads as held: a run arriving in that window waits behind it, listed."""
+async def test_the_handover_instant_is_safe(db, tmp_path):
+    """The lock goes to the first queued run before that run resumes. In
+    that instant a new run waits behind it, listed; a reorder or a cancel
+    request cannot reach it any more."""
     alice = db.system_actor
     client = _Client()
     engine = await _engine(db, tmp_path, client)
@@ -434,16 +436,211 @@ async def test_a_run_behind_a_woken_waiter_is_listed(db, tmp_path):
     await lock.acquire()                          # a turn holds the lock
     async with _listening() as seen:
         b = asyncio.create_task(engine.run(SID, "b", actor=alice, client_msg_id="mb"))
-        await _wait_queued(engine, 1)
         c = asyncio.create_task(engine.run(SID, "c", actor=alice, client_msg_id="mc"))
-        lock.release()                            # b is woken; c runs first
+        await _wait_queued(engine, 2)
+        b_id, c_id = (v["queue_id"] for v in engine.queue_view(SID))
+        engine._pass_run_lock(SID, lock)          # the turn ends: b gets the lock
+        late = asyncio.create_task(engine.run(SID, "late", actor=alice, client_msg_id="ml"))
         try:
+            assert lock.locked()
+            assert [v["queue_id"] for v in await engine.reorder_queue(SID, [c_id, b_id])] == [c_id]
+            with pytest.raises(AlreadyStarted):
+                engine.cancel_queued_turn(SID, b_id, actor=alice)
             await client.wait_turns(1)
             listed = {
                 e["client_msg_id"] for u in _queue_updates(seen) for e in u["queue"]
             }
-            assert listed == {"mb", "mc"}
-            await _drain(client, b, c)
-            assert client.prompts == ["b", "c"]
+            assert listed == {"mb", "mc", "ml"}
+            await _drain(client, b, c, late)
+            assert client.prompts == ["b", "c", "late"]
         finally:
-            await _drain(client, b, c)
+            await _drain(client, b, c, late)
+
+
+async def _queue_three(engine: AgentEngine, client: _Client, actor) -> tuple[asyncio.Task, list[asyncio.Task]]:
+    """A running turn "first" and the runs "b", "c", "d" queued behind it."""
+    first = asyncio.create_task(engine.run(SID, "first", actor=actor))
+    await client.wait_turns(1)
+    queued = []
+    for text in ("b", "c", "d"):
+        queued.append(asyncio.create_task(engine.run(SID, text, actor=actor)))
+        await _wait_queued(engine, len(queued))
+    return first, queued
+
+
+def _ids(view: list[dict]) -> list[str]:
+    return [v["queue_id"] for v in view]
+
+
+@pytest.mark.asyncio
+async def test_the_new_order_is_the_run_order(db, tmp_path):
+    alice = db.system_actor
+    client = _Client()
+    engine = await _engine(db, tmp_path, client)
+    async with _listening() as seen:
+        first, queued = await _queue_three(engine, client, alice)
+        try:
+            b, c, d = _ids(engine.queue_view(SID))
+            view = await engine.reorder_queue(SID, [d, b, c])
+            assert _ids(view) == [d, b, c]
+            assert engine.queue_view(SID) == view
+            # Every client gets the new order.
+            assert _queue_updates(seen)[-1] == {
+                "type": "queue_update", "session_id": SID, "queue": view,
+            }
+            await _drain(client, first, *queued)
+            assert client.prompts == ["first", "d", "b", "c"]
+            assert await _user_messages(db) == ["first", "d", "b", "c"]
+        finally:
+            await _drain(client, first, *queued)
+
+
+@pytest.mark.asyncio
+async def test_two_quick_sends_keep_their_order(db, tmp_path):
+    alice = db.system_actor
+    client = _Client()
+    engine = await _engine(db, tmp_path, client)
+    # Both in the same loop step: on an idle session, then behind a turn.
+    tasks = [asyncio.create_task(engine.run(SID, t, actor=alice)) for t in ("a", "b")]
+    await client.wait_turns(1)
+    tasks += [asyncio.create_task(engine.run(SID, t, actor=alice)) for t in ("c", "d")]
+    await _wait_queued(engine, 3)
+    try:
+        assert [v["preview"] for v in engine.queue_view(SID)] == ["b", "c", "d"]
+        await _drain(client, *tasks)
+        assert client.prompts == ["a", "b", "c", "d"]
+    finally:
+        await _drain(client, *tasks)
+
+
+@pytest.mark.asyncio
+async def test_a_reorder_moves_only_what_is_still_queued(db, tmp_path):
+    """Ids that left the queue are skipped; entries the list does not name
+    keep their order after the named ones."""
+    alice = db.system_actor
+    client = _Client()
+    engine = await _engine(db, tmp_path, client)
+    first, queued = await _queue_three(engine, client, alice)
+    try:
+        b, c, d = _ids(engine.queue_view(SID))
+        assert _ids(await engine.reorder_queue(SID, ["q_00000000", d, d])) == [d, b, c]
+        assert _ids(await engine.reorder_queue(SID, [])) == [d, b, c]
+    finally:
+        await _drain(client, first, *queued)
+
+
+@pytest.mark.asyncio
+async def test_a_reorder_racing_the_next_start_is_safe(db, tmp_path):
+    """The client still shows "b" queued when "b" has already started."""
+    alice = db.system_actor
+    client = _Client()
+    engine = await _engine(db, tmp_path, client)
+    first, (b_task, c_task, d_task) = await _queue_three(engine, client, alice)
+    try:
+        b, c, d = _ids(engine.queue_view(SID))
+        client.release()
+        await client.wait_turns(2)
+        assert _ids(await engine.reorder_queue(SID, [d, c, b])) == [d, c]
+        assert engine.sessions.turn_task(SID) is b_task
+        await _drain(client, first, b_task, c_task, d_task)
+        assert client.prompts == ["first", "b", "d", "c"]
+    finally:
+        await _drain(client, first, b_task, c_task, d_task)
+
+
+@pytest.mark.asyncio
+async def test_cancel_still_works_after_a_reorder(db, tmp_path):
+    alice = db.system_actor
+    client = _Client()
+    engine = await _engine(db, tmp_path, client)
+    first, (b_task, c_task, d_task) = await _queue_three(engine, client, alice)
+    try:
+        b, c, d = _ids(engine.queue_view(SID))
+        await engine.reorder_queue(SID, [d, c, b])
+        engine.cancel_queued_turn(SID, c, actor=alice)
+        assert await asyncio.wait_for(c_task, timeout=5) == ""
+        assert _ids(engine.queue_view(SID)) == [d, b]
+        await _drain(client, first, b_task, d_task)
+        assert client.prompts == ["first", "d", "b"]
+        assert await _user_messages(db) == ["first", "d", "b"]
+    finally:
+        await _drain(client, first, b_task, c_task, d_task)
+
+
+@pytest.mark.asyncio
+async def test_stop_after_a_reorder_runs_the_new_first_next(db, tmp_path):
+    alice = db.system_actor
+    client = _Client()
+    engine = await _engine(db, tmp_path, client)
+    first, (b_task, c_task, d_task) = await _queue_three(engine, client, alice)
+    try:
+        b, c, d = _ids(engine.queue_view(SID))
+        await engine.reorder_queue(SID, [c, b, d])
+        assert (await engine.stop_turn(SID))["turn"] == "stopped"
+        await asyncio.wait_for(first, timeout=5)
+        await client.wait_turns(2)
+        assert client.prompts == ["first", "c"]
+        assert engine.sessions.turn_task(SID) is c_task
+        assert _ids(engine.queue_view(SID)) == [b, d]
+    finally:
+        await _drain(client, first, b_task, c_task, d_task)
+
+
+@pytest.mark.asyncio
+async def test_a_run_cancelled_as_it_gets_the_lock_passes_it_on(db, tmp_path):
+    alice = db.system_actor
+    client = _Client()
+    engine = await _engine(db, tmp_path, client)
+    lock = engine._session_locks.setdefault(SID, asyncio.Lock())
+    await lock.acquire()
+    b = asyncio.create_task(engine.run(SID, "b", actor=alice))
+    c = asyncio.create_task(engine.run(SID, "c", actor=alice))
+    await _wait_queued(engine, 2)
+    try:
+        engine._pass_run_lock(SID, lock)          # b gets the lock ...
+        b.cancel()                                # ... and is cancelled before it resumes
+        with pytest.raises(asyncio.CancelledError):
+            await b
+        await client.wait_turns(1)
+        assert client.prompts == ["c"]
+    finally:
+        await _drain(client, b, c)
+
+
+@pytest.mark.asyncio
+async def test_a_run_cancelled_while_it_waits_never_gets_the_lock(db, tmp_path):
+    alice = db.system_actor
+    client = _Client()
+    engine = await _engine(db, tmp_path, client)
+    lock = engine._session_locks.setdefault(SID, asyncio.Lock())
+    await lock.acquire()
+    b = asyncio.create_task(engine.run(SID, "b", actor=alice))
+    c = asyncio.create_task(engine.run(SID, "c", actor=alice))
+    await _wait_queued(engine, 2)
+    try:
+        b.cancel()                                # b's run has not cleaned up yet ...
+        engine._pass_run_lock(SID, lock)          # ... when the turn ends
+        with pytest.raises(asyncio.CancelledError):
+            await b
+        await client.wait_turns(1)
+        assert client.prompts == ["c"]
+    finally:
+        await _drain(client, b, c)
+
+
+@pytest.mark.asyncio
+async def test_work_that_holds_the_lock_between_turns_passes_it_to_the_queue(db, tmp_path):
+    """An idle drain or a client reap holds the run lock; a run queued
+    behind it starts when it ends."""
+    alice = db.system_actor
+    client = _Client()
+    engine = await _engine(db, tmp_path, client)
+    lock = engine._session_locks.setdefault(SID, asyncio.Lock())
+    async with engine._holding_run_lock(SID, lock):
+        queued = asyncio.create_task(engine.run(SID, "b", actor=alice))
+        await _wait_queued(engine, 1)
+    try:
+        await client.wait_turns(1)
+        assert client.prompts == ["b"]
+    finally:
+        await _drain(client, queued)
