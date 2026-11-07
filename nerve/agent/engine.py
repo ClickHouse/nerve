@@ -2539,8 +2539,8 @@ class AgentEngine:
         """Put the session's queued runs in the order of ``queue_ids``; the
         first one runs next. Ids that are not queued any more (the run started
         or was cancelled meanwhile) are skipped. Queued runs that the list does
-        not name keep their order, after the named ones. Returns the new queue
-        view, which also goes to every client in ``queue_update``."""
+        not name keep their order, after the named ones. Returns the queue view
+        that went to every client in ``queue_update``."""
         queues, _started, _msgs = self._queue_state()
         queue = queues.get(session_id)
         if queue:
@@ -2549,9 +2549,7 @@ class AgentEngine:
                 rank.setdefault(queue_id, position)
             # A stable sort: entries with the same rank keep their order.
             queue.sort(key=lambda entry: rank.get(entry.queue_id, len(queue_ids)))
-        view = self.queue_view(session_id)
-        await self._emit_queue_update(session_id)
-        return view
+        return await self._emit_queue_update(session_id)
 
     def _dequeue_turn(
         self, session_id: str, entry: QueuedTurn, *, started: bool = False,
@@ -2592,21 +2590,30 @@ class AgentEngine:
 
     async def _emit_queue_update(
         self, session_id: str, *, removed: list[dict] | None = None,
-    ) -> None:
+    ) -> list[dict]:
         """Broadcast ``queue_update``: the full queue, plus what just left it
         (``started`` / ``cancelled`` / ``duplicate``). Never buffered for turn
-        replay: a reconnecting client gets the queue from its snapshot."""
-        message: dict[str, Any] = {
-            "type": "queue_update",
-            "session_id": session_id,
-            "queue": self.queue_view(session_id),
-        }
-        if removed:
-            message["removed"] = removed
-        try:
-            await broadcaster.broadcast(session_id, message, buffer=False)
-        except Exception:  # noqa: BLE001 — the queue never breaks a run
-            logger.debug("queue_update broadcast failed for %s", session_id, exc_info=True)
+        replay: a reconnecting client gets the queue from its snapshot.
+
+        The updates of one session go out one at a time, and each one reads
+        the queue only when it goes out. So a slow listener cannot make a
+        client get an older queue after a newer one. Returns the queue that
+        was sent."""
+        locks = self.__dict__.setdefault("_queue_emit_locks", {})
+        async with locks.setdefault(session_id, asyncio.Lock()):
+            queue = self.queue_view(session_id)
+            message: dict[str, Any] = {
+                "type": "queue_update",
+                "session_id": session_id,
+                "queue": queue,
+            }
+            if removed:
+                message["removed"] = removed
+            try:
+                await broadcaster.broadcast(session_id, message, buffer=False)
+            except Exception:  # noqa: BLE001 (the queue never breaks a run)
+                logger.debug("queue_update broadcast failed for %s", session_id, exc_info=True)
+        return queue
 
     def cancel_queued_turn(
         self, session_id: str, queue_id: str, *, actor: Actor | None,
