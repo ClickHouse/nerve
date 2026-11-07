@@ -38,7 +38,6 @@ function job(overrides: Partial<CronJob> = {}): CronJob {
     next_run: '2030-01-01T09:00:00+00:00',
     last_run: null,
     stats_7d: { runs: 0, success: 0, error: 0, missed: 0 },
-    toggle_blocked: null,
     ...overrides,
   };
 }
@@ -155,18 +154,9 @@ describe('the Active switch', () => {
     expect(listCronJobs).not.toHaveBeenCalled();
   });
 
-  it('cannot be used on a job that the API refuses, and says why', () => {
-    renderSheet({ toggle_blocked: 'Switch this job in jobs.yaml.' });
-
-    const toggle = screen.getByRole('switch', { name: 'Active' });
-    expect(toggle).toBeDisabled();
-    expect(toggle).toHaveAccessibleDescription('Switch this job in jobs.yaml.');
-  });
-
   it('is not there for a source', () => {
-    renderSheet({ id: 'source:mail', type: 'source', kind: 'source', toggle_blocked: 'A source.' });
+    renderSheet({ id: 'source:mail', type: 'source', kind: 'source' });
     expect(screen.queryByRole('switch')).toBeNull();
-    expect(screen.queryByText('A source.')).toBeNull();
   });
 });
 

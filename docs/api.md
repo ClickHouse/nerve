@@ -1690,22 +1690,23 @@ also has:
 | `kind` | `agent`, `workflow` (a workflow-run job) or `source` |
 | `last_run` | `{status, started_at, finished_at}` of the latest run, or `null`. `status` is `null` while the run goes on |
 | `stats_7d` | `{runs, success, error, missed}`: the runs that started in the last 7 days |
-| `toggle_blocked` | why `PUT /api/cron/jobs/{job_id}/enabled` refuses the job (lockdown, a file with comments or formatting of its own, a file Nerve cannot write, a source), or `null` |
 
 ```json
 Response: { "jobs": [ { "id": "daily-digest", "type": "cron", "kind": "agent", "enabled": true,
   "schedule": "0 8 * * *", "next_run": "2026-03-02T08:00:00+00:00",
   "last_run": { "status": "success", "started_at": "2026-03-01 08:00:00", "finished_at": "2026-03-01T08:00:41+00:00" },
-  "stats_7d": { "runs": 7, "success": 6, "error": 1, "missed": 0 }, "toggle_blocked": null, ... } ] }
+  "stats_7d": { "runs": 7, "success": 6, "error": 1, "missed": 0 }, ... } ] }
 ```
 
 #### `PUT /api/cron/jobs/{job_id}/enabled`
 Switch a cron job on or off. Writes `enabled` into the job's YAML file and
 reloads the cron jobs (see
 [Switching a job on and off](cron.md#switching-a-job-on-and-off)). A person's
-action: a system or MCP token gets `403`. `404` for an unknown job or a
-source; `409` with the reason under lockdown or for a file that the rewrite
-cannot change; `400` when the reload refuses the files.
+action: a system or MCP token gets `403`. Only the job's `enabled:` line
+changes. `404` for an unknown job or a source; `409` with the reason under
+lockdown, for a file that Nerve cannot write, and for a layout where one line
+cannot make the change; `400` when the reload refuses the files, which then
+get their old text back.
 
 ```json
 Request:  { "enabled": false }

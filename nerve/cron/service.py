@@ -43,7 +43,6 @@ from nerve.setup_writer import (
     CRON_FILE_HAND_EDITED,
     CRON_FILE_READ_ONLY,
     CRON_JOB_MISSING,
-    cron_file_problem,
     plan_cron_job_enabled,
     publish_text,
 )
@@ -109,13 +108,12 @@ _FAILURE_NOTICE_CHARS = 600
 # the job's YAML file. The keys are CronTogglePlan problems (setup_writer).
 _TOGGLE_LOCKDOWN = "This instance is in lockdown. Change the job in the config repository."
 _TOGGLE_PROBLEMS = {
-    CRON_FILE_HAND_EDITED: "Switch this job in {file}. Nerve does not rewrite a file "
-                           "that has your own comments or formatting.",
+    CRON_FILE_HAND_EDITED: "Nerve could not change only the enabled line of this "
+                           "job in {file}. Change it in the file.",
     CRON_FILE_READ_ONLY: "Nerve cannot write {file}.",
     CRON_JOB_MISSING: "{file} does not have this job.",
 }
 _TOGGLE_UNREADABLE = "Nerve cannot read {file}."
-_TOGGLE_SOURCE = "A source is switched on and off in its sync settings."
 
 
 class CronToggleRefused(Exception):
@@ -2423,8 +2421,7 @@ class CronService:
         """List all registered jobs (cron + sources) with their next run times.
 
         Each job also has its kind (``agent``, ``workflow`` or ``source``), its
-        latest run, its run counts of the last 7 days, and ``toggle_blocked``:
-        why :meth:`set_job_enabled` cannot switch it, or None when it can.
+        latest run and its run counts of the last 7 days.
         """
         last_runs = await self.db.get_last_cron_runs()
         stats = await self.db.get_cron_job_stats(_STATS_DAYS)
@@ -2435,10 +2432,6 @@ class CronService:
                 "stats_7d": stats.get(job_id, {"runs": 0, "success": 0, "error": 0, "missed": 0}),
             }
 
-        # Each file is checked once, not once for each of its jobs.
-        file_problems = {
-            path: cron_file_problem(path) for path in {self._job_file(job) for job in self._jobs}
-        }
         result = []
         for job in self._jobs:
             sched_job = self.scheduler.get_job(job.id)
@@ -2447,13 +2440,6 @@ class CronService:
                 last_session_id = await self.db.get_latest_cron_session_id(job.id)
             except Exception:
                 last_session_id = None
-            path = self._job_file(job)
-            if self.config.lockdown:
-                toggle_blocked = _TOGGLE_LOCKDOWN
-            elif file_problems[path]:
-                toggle_blocked = _toggle_refusal(file_problems[path], path)
-            else:
-                toggle_blocked = None
             result.append({
                 "id": job.id,
                 "type": "cron",
@@ -2468,7 +2454,6 @@ class CronService:
                 "gates": [gate.describe() for gate in job.gates],
                 "next_run": next_run.isoformat() if next_run else None,
                 "last_session_id": last_session_id,
-                "toggle_blocked": toggle_blocked,
                 **health(job.id),
             })
 
@@ -2492,7 +2477,6 @@ class CronService:
                 "enabled": True,
                 "next_run": next_run.isoformat() if next_run else None,
                 "last_session_id": None,
-                "toggle_blocked": _TOGGLE_SOURCE,
                 **health(runner.job_id),
             })
 
@@ -2508,10 +2492,10 @@ class CronService:
     async def set_job_enabled(self, job_id: str, enabled: bool) -> dict:
         """Write ``enabled`` into the job's YAML file, then reload.
 
-        The file is changed with the setup page's cron rewrite
+        Only the job's ``enabled:`` line changes
         (:func:`nerve.setup_writer.plan_cron_job_enabled`). Raises ValueError
         for an unknown job, CronToggleRefused under lockdown or for a file
-        that the rewrite cannot change, and the reload's ConfigError. A reload
+        in which that one line cannot be changed, and the reload's ConfigError. A reload
         that fails leaves the schedule as it was, so the file gets its old
         text back before the error goes on. Returns the reload summary, as
         :meth:`reload` does.

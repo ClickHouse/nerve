@@ -1,4 +1,4 @@
-"""Switching a cron job on and off: the YAML rewrite, the service and the route."""
+"""Switching a cron job on and off: the YAML edit, the service and the route."""
 
 from __future__ import annotations
 
@@ -30,6 +30,32 @@ def _job(job_id: str, **kwargs) -> dict:
     return {"id": job_id, "schedule": "1h", "prompt": "do it", **kwargs}
 
 
+# The layout of docs/cron.md: indented list items, comments, a block scalar
+# (with a nested line that looks like a key), and a job without `enabled`.
+DOCUMENTED = """\
+# Custom cron jobs for alice
+
+jobs:
+  # The morning digest.
+  - id: morning-digest
+    schedule: "30 11 * * *"        # 11:30 daily
+    prompt: |
+      Write a short digest of example/repo.
+        enabled: false
+      Keep it under ten lines.
+    enabled: true   # on for now
+
+  - id: system-monitor
+    schedule: "30m"                  # every 30 minutes
+    prompt: "Check system health."
+    session_mode: persistent         # keeps context
+"""
+
+
+# A missing `enabled:` goes under the job's `id:` line.
+_MONITOR = "  - id: system-monitor\n"
+
+
 def _enabled(path: Path) -> dict[str, object]:
     jobs = yaml.safe_load(path.read_text(encoding="utf-8"))["jobs"]
     return {job["id"]: job.get("enabled") for job in jobs}
@@ -51,6 +77,30 @@ class TestPlanCronJobEnabled:
 
         assert path.read_text() == _dump([_job("a", enabled=False), _job("b", enabled=True)])
 
+    def test_the_documented_layout_keeps_its_comments_and_formatting(self, tmp_path):
+        path = tmp_path / "jobs.yaml"
+        path.write_text(DOCUMENTED)
+
+        setup_writer.plan_cron_job_enabled(path, "morning-digest", False).publish()
+        assert path.read_text() == DOCUMENTED.replace(
+            "    enabled: true   # on for now", "    enabled: false   # on for now",
+        )
+
+        setup_writer.plan_cron_job_enabled(path, "system-monitor", False).publish()
+        assert path.read_text() == DOCUMENTED.replace(
+            "    enabled: true   # on for now", "    enabled: false   # on for now",
+        ).replace(_MONITOR, _MONITOR + "    enabled: false\n")
+        assert _enabled(path) == {"morning-digest": False, "system-monitor": False}
+
+    def test_a_job_whose_id_is_not_its_first_key(self, tmp_path):
+        path = tmp_path / "jobs.yaml"
+        text = "jobs:\n- schedule: 1h\n  id: 'a'\n  prompt: do it\n- id: b\n  schedule: 2h\n  prompt: p\n"
+        path.write_text(text)
+
+        setup_writer.plan_cron_job_enabled(path, "a", False).publish()
+
+        assert path.read_text() == text.replace("  id: 'a'\n", "  id: 'a'\n  enabled: false\n")
+
     def test_a_job_without_the_key_gets_it(self, tmp_path):
         path = tmp_path / "jobs.yaml"
         path.write_text(_dump([_job("a")]))
@@ -68,18 +118,17 @@ class TestPlanCronJobEnabled:
         assert plan.ok and not plan.changes_anything
 
     @pytest.mark.parametrize("text", [
-        HEADER + "jobs:\n# the digest\n- id: a\n  schedule: 1h\n  prompt: do it\n",
-        HEADER + "jobs:\n  - id: a\n    schedule: 1h\n    prompt: |\n      do it\n",
-        HEADER + "jobs:\n- id: a\n  schedule: 1h  # hourly\n  prompt: do it\n",
+        "jobs: [{id: a, schedule: 1h, prompt: do it}]\n",
+        "jobs:\n- {id: a, schedule: 1h, prompt: do it}\n",
+        "jobs:\n- id: a\n  schedule: 1h\n  prompt: do it\n  enabled:\n    true\n",
     ])
-    def test_a_hand_edited_file_is_refused_and_left_alone(self, tmp_path, text):
+    def test_a_layout_that_one_line_cannot_change_is_refused(self, tmp_path, text):
         path = tmp_path / "jobs.yaml"
         path.write_text(text)
 
         plan = setup_writer.plan_cron_job_enabled(path, "a", False)
 
         assert plan.problem == setup_writer.CRON_FILE_HAND_EDITED
-        assert setup_writer.cron_file_problem(path) == setup_writer.CRON_FILE_HAND_EDITED
         assert path.read_text() == text
 
     def test_a_file_without_the_job_is_refused(self, tmp_path):
@@ -183,13 +232,26 @@ class TestSetJobEnabled:
         assert svc.config.cron.jobs_file.read_text() == before
 
     @pytest.mark.asyncio
-    async def test_a_hand_edited_file_is_refused(self, svc):
-        svc.config.cron.jobs_file.write_text(
-            svc.config.cron.jobs_file.read_text() + "# a note\n",
-        )
+    async def test_a_hand_written_jobs_yaml_keeps_its_comments(self, svc):
+        svc.config.cron.jobs_file.write_text(DOCUMENTED)
+        await svc.reload()
 
-        with pytest.raises(CronToggleRefused, match="Switch this job in jobs.yaml"):
+        await svc.set_job_enabled("system-monitor", False)
+
+        assert svc.config.cron.jobs_file.read_text() == DOCUMENTED.replace(
+            _MONITOR, _MONITOR + "    enabled: false\n",
+        )
+        assert svc.scheduler.get_job("system-monitor") is None
+
+    @pytest.mark.asyncio
+    async def test_a_flow_style_file_is_refused(self, svc):
+        text = "jobs: [{id: digest, schedule: 1h, prompt: p, enabled: false}]\n"
+        svc.config.cron.jobs_file.write_text(text)
+        await svc.reload()
+
+        with pytest.raises(CronToggleRefused, match="only the enabled line"):
             await svc.set_job_enabled("digest", True)
+        assert svc.config.cron.jobs_file.read_text() == text
 
     @pytest.mark.asyncio
     async def test_a_refused_reload_puts_the_file_back(self, svc, monkeypatch):
@@ -208,20 +270,6 @@ class TestSetJobEnabled:
     async def test_an_unknown_job_is_a_value_error(self, svc):
         with pytest.raises(ValueError):
             await svc.set_job_enabled("nope", True)
-
-    @pytest.mark.asyncio
-    async def test_the_job_list_says_which_jobs_cannot_be_switched(self, svc):
-        svc.config.cron.jobs_file.write_text(
-            svc.config.cron.jobs_file.read_text() + "# a note\n",
-        )
-
-        rows = {row["id"]: row for row in await svc.list_jobs()}
-
-        assert rows["memory-maintenance"]["toggle_blocked"] is None
-        assert "jobs.yaml" in rows["digest"]["toggle_blocked"]
-        svc.config.lockdown = True
-        rows = {row["id"]: row for row in await svc.list_jobs()}
-        assert "lockdown" in rows["memory-maintenance"]["toggle_blocked"]
 
 
 # --------------------------------------------------------------------------- #
