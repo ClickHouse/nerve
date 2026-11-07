@@ -387,7 +387,7 @@ def init(
     # In external mode there are no local accounts to claim, so the hint
     # would point at a token that is never generated.
     if not _external_auth_in_this_shell() and read_setup_required(
-        paths.db_path(), configured_password=bool(config.auth.password_hash),
+        paths.db_path(), configured_password=bool(config.auth.password_hash), config=config,
     ):
         click.echo(
             "  Setup is not complete: no password was set and a passwordless "
@@ -428,7 +428,9 @@ def _setup_unclaimed(config, external: bool | None = None) -> bool:
         external = _external_auth_in_this_shell()
     if external:
         return False
-    return read_setup_required(paths.db_path(), configured_password=bool(config.auth.password_hash))
+    return read_setup_required(
+        paths.db_path(), configured_password=bool(config.auth.password_hash), config=config,
+    )
 
 
 def _setup_summary(config) -> dict | None:
@@ -904,7 +906,7 @@ def _slim_init(
         from nerve.db.accounts import read_instance_secret
         from nerve.setup_token import SETUP_TOKEN_NAME
 
-        token = read_instance_secret(paths.db_path(), SETUP_TOKEN_NAME) or None
+        token = read_instance_secret(paths.db_path(), SETUP_TOKEN_NAME, config=config) or None
     copied = bool(token) and clipboard and _copy_to_clipboard(token)
     _print_setup_block(url, token, copied=copied, external=external)
 
@@ -1177,7 +1179,7 @@ def _echo_setup_token(config) -> None:
     from nerve.db.accounts import read_instance_secret
     from nerve.setup_token import SETUP_TOKEN_NAME
 
-    token = read_instance_secret(paths.db_path(), SETUP_TOKEN_NAME)
+    token = read_instance_secret(paths.db_path(), SETUP_TOKEN_NAME, config=config)
     if not token:
         return
     host = config.gateway.host if config is not None else "localhost"
@@ -1516,7 +1518,7 @@ def _config_source_label(source: str) -> str:
     }.get(source, source)
 
 
-def _probe_principal_id() -> str | None:
+def _probe_principal_id(config=None) -> str | None:
     """The principal that the doctor's model probe names: the system actor.
 
     External mode only (``NERVE_AUTH_MODE`` in this shell). The doctor opens
@@ -1532,7 +1534,7 @@ def _probe_principal_id() -> str | None:
             return None
     except ConfigError:
         return None
-    return read_system_actor_id(paths.db_path())
+    return read_system_actor_id(paths.db_path(), config=config)
 
 
 def _check_api_connectivity(config) -> tuple[bool, str]:
@@ -1544,7 +1546,7 @@ def _check_api_connectivity(config) -> tuple[bool, str]:
     model = config.agent.title_model
     try:
         client = config.create_anthropic_client(
-            timeout=15.0, principal_id=_probe_principal_id(),
+            timeout=15.0, principal_id=_probe_principal_id(config),
         )
         client.messages.create(
             model=model,
@@ -1812,7 +1814,7 @@ def _telegram_sync_lines(config, warnings: list[str]) -> list[str]:
     return lines
 
 
-def _system_principal_report(*, external: bool) -> tuple[list[str], list[str]]:
+def _system_principal_report(*, external: bool, config=None) -> tuple[list[str], list[str]]:
     """Doctor lines about ``NERVE_SYSTEM_PRINCIPAL_ID``: ``(lines, warnings)``.
 
     Like the auth mode, the value comes from this shell, not from the running
@@ -1836,7 +1838,7 @@ def _system_principal_report(*, external: bool) -> tuple[list[str], list[str]]:
         return [], [f"[WARN] {label}: {e}. The server keeps the current system actor ID."]
     if wanted is None:
         return [], []
-    state = inspect_system_actor(paths.db_path(), wanted)
+    state = inspect_system_actor(paths.db_path(), wanted, config=config)
     if state is None:
         return [f"[--] {label}: no system actor yet; the next start gives it {wanted}"], []
     current, blocker = state
@@ -2294,7 +2296,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         lines.extend(_actor_context_lines(config, errors, warnings))
 
     configured = bool(config.auth.password_hash)
-    identity_state = inspect_bootstrap_state(paths.db_path())
+    identity_state = inspect_bootstrap_state(paths.db_path(), config=config)
     sources = identity_state[0] if identity_state is not None else None
     usable = [
         source for source in (sources or [])
@@ -2310,7 +2312,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     elif not sources:
         warnings.append("[WARN] No local account yet — the next start creates one")
     elif not usable and read_setup_required(
-        paths.db_path(), configured_password=configured,
+        paths.db_path(), configured_password=configured, config=config,
     ):
         warnings.append(
             "[WARN] Setup is not complete — sign-in is refused until it is. "
@@ -2339,7 +2341,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                 "account has its own password now; the configured value does nothing"
             )
     if mode is not None:
-        ok, warn = _system_principal_report(external=external)
+        ok, warn = _system_principal_report(external=external, config=config)
         lines.extend(ok)
         warnings.extend(warn)
 
@@ -2403,7 +2405,9 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
 
     # Check DB
     db_path = paths.db_path()
-    if db_path.exists():
+    if config.use_postgresql:
+        lines.append("[OK] Storage configured: PostgreSQL")
+    elif db_path.exists():
         lines.append(f"[OK] Database: {db_path} ({db_path.stat().st_size / 1024:.1f} KB)")
     else:
         lines.append(f"[--] Database will be created at: {db_path}")
@@ -2579,7 +2583,7 @@ def _signing_secret(config) -> str:
         return config.auth.jwt_secret
     from nerve.db.accounts import JWT_SECRET_NAME, read_instance_secret
 
-    return read_instance_secret(paths.db_path(), JWT_SECRET_NAME)
+    return read_instance_secret(paths.db_path(), JWT_SECRET_NAME, config=config)
 
 
 def _gateway_url(config, path: str) -> str:
@@ -3316,6 +3320,8 @@ def backup(ctx: click.Context, output: str | None, state_only: bool, no_secrets:
     from nerve import backup as backup_mod
 
     config = ctx.obj["config"]
+    if config.use_postgresql:
+        raise click.ClickException("Use PostgreSQL backups (pg_dump/PITR); local bundles do not contain PostgreSQL state")
     config_dir = Path(ctx.obj["config_dir"])
 
     target = output or config.backup.target_dir
@@ -3471,7 +3477,8 @@ def migrate_openclaw(ctx: click.Context, sessions_dir: str, dry_run: bool, min_m
     try:
         import sqlite3
         db_path = config.memory.sqlite_dsn.replace("sqlite:///", "")
-        db = sqlite3.connect(db_path)
+        from nerve.memory.memu_bridge import MemUBridge
+        db = MemUBridge(config)._memory_sql_connection(db_path)
         for (url,) in db.execute("SELECT url FROM memu_resources WHERE url LIKE '%/session-%'"):
             # url looks like /home/.../.nerve/memu-conversations/session-{uuid}-{ts}.json
             fname = Path(url).stem  # session-{uuid}-{ts}
@@ -3600,12 +3607,13 @@ def backfill_timestamps(ctx: click.Context, dry_run: bool) -> None:
     config = ctx.obj["config"]
     db_path = config.memory.sqlite_dsn.replace("sqlite:///", "")
 
-    if not Path(db_path).exists():
+    if not config.use_postgresql and not Path(db_path).exists():
         click.echo(f"[ERR] memU database not found: {db_path}")
         ctx.exit(1)
         return
 
-    db = sqlite3.connect(db_path)
+    from nerve.memory.memu_bridge import MemUBridge
+    db = MemUBridge(config)._memory_sql_connection(db_path)
     db.row_factory = sqlite3.Row
 
     # Find items without happened_at that have a linked resource
@@ -3741,7 +3749,7 @@ def db_prune(ctx: click.Context, dry_run: bool) -> None:
 
     config = ctx.obj["config"]
     db_path = paths.db_path()
-    if not db_path.exists():
+    if not ctx.obj["config"].use_postgresql and not db_path.exists():
         click.echo(f"[ERR] Database not found: {db_path}")
         ctx.exit(1)
         return
@@ -3795,8 +3803,10 @@ def db_vacuum(ctx: click.Context) -> None:
     from nerve.migrate import open_production_db
 
     config = ctx.obj["config"]
+    if config.use_postgresql:
+        raise click.ClickException("PostgreSQL vacuum is managed by the database administrator")
     db_path = paths.db_path()
-    if not db_path.exists():
+    if not ctx.obj["config"].use_postgresql and not db_path.exists():
         click.echo(f"[ERR] Database not found: {db_path}")
         ctx.exit(1)
         return
@@ -3850,7 +3860,7 @@ def _format_workflow_run(run: dict) -> str:
 
 def _workflow_db_path(ctx: click.Context) -> Path:
     db_path = paths.db_path()
-    if not db_path.exists():
+    if not ctx.obj["config"].use_postgresql and not db_path.exists():
         click.echo(f"[ERR] Database not found: {db_path}")
         ctx.exit(1)
     return db_path

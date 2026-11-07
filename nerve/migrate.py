@@ -1705,11 +1705,11 @@ def _inspect_identity(
     from nerve.db.accounts import inspect_bootstrap_state
     from nerve.gateway.auth import is_external_mode
 
-    state = inspect_bootstrap_state(db_path)
+    state = inspect_bootstrap_state(db_path, config=config)
     sources, stored = state if state is not None else ([], False)
     if is_external_mode():
         if system_principal:
-            _inspect_system_principal(db_path, report)
+            _inspect_system_principal(db_path, report, config=config)
     else:
         _inspect_accounts(config, sources, report)
     if config.auth.jwt_secret:
@@ -1721,7 +1721,7 @@ def _inspect_identity(
         report.identity_actions.append(_secret_action(dry_run=True))
 
 
-def _inspect_system_principal(db_path: Path, report: MigrationReport) -> None:
+def _inspect_system_principal(db_path: Path, report: MigrationReport, *, config=None) -> None:
     """Report the system actor step of :func:`bootstrap_identity`, read-only."""
     from nerve.db.accounts import inspect_system_actor
     from nerve.identity import InvalidSystemPrincipalId, system_principal_id_from_env
@@ -1733,7 +1733,7 @@ def _inspect_system_principal(db_path: Path, report: MigrationReport) -> None:
         return
     if new_id is None:
         return
-    state = inspect_system_actor(db_path, new_id)
+    state = inspect_system_actor(db_path, new_id, config=config)
     if state is None:
         # No system actor yet: the next start creates one and gives it the ID.
         report.rekeyed_system_actor = True
@@ -1837,10 +1837,10 @@ async def _bootstrap_with_own_connection(
     *,
     system_principal: bool = True,
 ) -> None:
-    from nerve.db import Database
+    from nerve.db import create_database
     from nerve.gateway.auth import is_external_mode
 
-    db = Database(db_path, workspace=config.workspace)
+    db = create_database(config, db_path=db_path, workspace=config.workspace)
     await db.connect()
     try:
         await bootstrap_identity(
@@ -1883,9 +1883,9 @@ async def open_production_db(
     loading the secret fails, the connection is closed before the error
     propagates.
     """
-    from nerve.db import Database
+    from nerve.db import create_database
 
-    db = Database(db_path or paths.db_path(), workspace=config.workspace)
+    db = create_database(config, db_path=db_path, workspace=config.workspace)
     await db.connect()
     report = MigrationReport()
     try:

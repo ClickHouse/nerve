@@ -75,8 +75,7 @@ class TestRecallGate:
 
         async def _submit(coro):
             calls.append(coro)
-            coro.close()
-            return {"items": [], "categories": []}
+            return await coro
 
         bridge._submit = _submit  # type: ignore[method-assign]
         bridge._calls = calls  # type: ignore[attr-defined]

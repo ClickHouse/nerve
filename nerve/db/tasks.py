@@ -241,6 +241,8 @@ class TaskStore:
         # The FTS5 tokenizer already splits the hyphenated slug into words
         # ("2026-03-10-distribution" → 2026, 03, 10, distribution), so slug
         # search works without rewriting the key — and the key stays joinable.
+        if getattr(self, "persistent_task_content", False):
+            await self.db.execute("UPDATE tasks SET content=? WHERE id=?", (content, task_id))
         fts_content = f"{content} {tags.replace(',', ' ')}" if tags else content
         await self.db.execute("DELETE FROM tasks_fts WHERE task_id = ?", (task_id,))
         await self.db.execute(
