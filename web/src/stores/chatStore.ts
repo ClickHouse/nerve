@@ -294,9 +294,9 @@ interface ChatState {
   loadSessions: () => Promise<void>;
   switchSession: (id: string) => Promise<void>;
   /**
-   * Load the messages of the open chat again after the socket was down, so
-   * that the view shows what happened meanwhile. A call while one runs makes
-   * that one read again.
+   * Load the messages and the tasks of the open chat again after the socket
+   * was down, so that the view shows what happened meanwhile. A call while
+   * one runs makes that one read the messages again.
    */
   catchUp: () => Promise<void>;
   createSession: () => Promise<void>;
@@ -902,6 +902,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
     const run = { session, again: false };
     catchUpRun = run;
+    // The task events sent while the socket was down are lost too.
+    void get().fetchSessionTasks(session);
     try {
       // Live events can change the rows during the read. Then the read can
       // be older than the rows on screen, so read again.

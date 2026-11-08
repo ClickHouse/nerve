@@ -35,6 +35,7 @@ vi.mock('../api/client', () => ({
     archiveSession: vi.fn(),
     stopSession: vi.fn(),
     createSession: vi.fn(),
+    getSessionTasks: vi.fn(async () => ({ tasks: [] })),
   },
   apiErrorCode: () => null,
   // chatStore reads these authStore dependencies when it stamps optimistic rows.
@@ -486,6 +487,20 @@ describe('catching up after a reconnect', () => {
       expect(api.getMessages).toHaveBeenCalledWith(SID);
     } finally {
       vi.mocked(api.getMessages).mockImplementation(async () => ({ messages: [] }));
+    }
+  });
+
+  it('reads the tasks of the open chat again on a reconnect', async () => {
+    const task = { id: 't-1', title: 'Write the report', status: 'pending', relation: 'created' } as never;
+    onSession({ sessionTasks: [] });
+    vi.mocked(api.getSessionTasks).mockImplementation(async () => ({ tasks: [task] }));
+    try {
+      onSocketOpen?.();
+      onSocketOpen?.();
+      await vi.waitFor(() => expect(useChatStore.getState().sessionTasks).toEqual([task]));
+      expect(api.getSessionTasks).toHaveBeenCalledWith(SID);
+    } finally {
+      vi.mocked(api.getSessionTasks).mockImplementation(async () => ({ tasks: [] }));
     }
   });
 
