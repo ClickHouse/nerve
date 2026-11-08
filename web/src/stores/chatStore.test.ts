@@ -341,6 +341,30 @@ describe('agent events in the dispatcher', () => {
     expect(useChatStore.getState().messages.map(m => m.client_msg_id)).toEqual(['c-3']);
   });
 
+  it('moves the echo of a message that starts after the replies before it', () => {
+    const user = (content: string, client_msg_id?: string) => ({
+      role: 'user' as const, blocks: [{ type: 'text' as const, content }], created_at: '2026-02-27T02:00:00Z', client_msg_id,
+    });
+    const reply = (content: string) => ({ role: 'assistant' as const, blocks: [{ type: 'text' as const, content }] });
+    const texts = () => useChatStore.getState().messages.map(m => (m.blocks[0] as { content: string }).content);
+    // Two sends from another tab wait behind a turn; the second one was moved up.
+    onSession({ messages: [user('run the tests'), user('first', 'c-1'), user('second', 'c-2'), reply('tests pass')] });
+
+    dispatch({ type: 'queue_update', session_id: SID, queue: [fx.makeQueueEntry()], removed: [
+      { queue_id: 'q_2', client_msg_id: 'c-2', reason: 'started' },
+    ] });
+    expect(texts()).toEqual(['run the tests', 'first', 'tests pass', 'second']);
+    const moved = useChatStore.getState().messages[3];
+    expect(moved.client_msg_id).toBe('c-2');
+    expect(moved.created_at).not.toBe('2026-02-27T02:00:00Z');
+
+    useChatStore.setState(s => ({ messages: [...s.messages, reply('second done')] }));
+    dispatch({ type: 'queue_update', session_id: SID, queue: [], removed: [
+      { queue_id: 'q_1', client_msg_id: 'c-1', reason: 'started' },
+    ] });
+    expect(texts()).toEqual(['run the tests', 'tests pass', 'second', 'second done', 'first']);
+  });
+
   it('drops the agent events of a session that is not on screen', () => {
     dispatch({ type: 'agent_update', session_id: 's-other', agents: [{ ...fx.FX_RUNNING, session_id: 's-other' }], summary: fx.makeSummary([]) });
     dispatch({ type: 'queue_update', session_id: 's-other', queue: [fx.makeQueueEntry()] });

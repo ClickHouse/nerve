@@ -1647,29 +1647,34 @@ export const useChatStore = create<ChatState>((set, get) => ({
         useAgentStore.getState().applyAgentEvent(msg);
         return;
       case 'queue_update': {
-        // A send this tab queued while a turn ran has started: its bubble
-        // appears now, in the order the server runs it.
         const { started } = useAgentStore.getState().applyQueueUpdate(msg);
+        const removed = msg.removed ?? [];
+        const idsOf = (reasons: string[]) => removed
+          .filter(r => r.client_msg_id && reasons.includes(r.reason))
+          .map(r => r.client_msg_id as string);
         // A queued message that never ran (cancelled by its sender, refused
         // at shutdown) keeps no bubble: drop the echo of another tab's send.
-        const unsent = new Set((msg.removed ?? [])
-          .filter(r => r.reason === 'cancelled' || r.reason === 'refused')
-          .map(r => r.client_msg_id));
-        if (msg.session_id === get().activeSession
-          && get().messages.some(m => m.role === 'user' && m.client_msg_id && unsent.has(m.client_msg_id))) {
-          set((s) => ({
-            messages: s.messages.filter(m => m.role !== 'user' || !m.client_msg_id || !unsent.has(m.client_msg_id)),
-          }));
-        }
-        if (started.length > 0) {
-          const now = new Date().toISOString();
-          const actor = selfActorId();
-          set((s) => ({
-            messages: [...s.messages, ...started.map((p) => ({
-              role: 'user' as const, blocks: p.blocks, created_at: now, actor_id: actor, client_msg_id: p.clientMsgId,
-            }))],
-          }));
-        }
+        const unsent = idsOf(['cancelled', 'refused']);
+        // A message that starts runs after every reply on screen: its bubble
+        // goes to the end, in the order the server runs it, in every tab,
+        // with the start time that the stored message gets. The bubble is the
+        // echo of the send, or a new one for a send that this tab queued.
+        const startedIds = idsOf(['started']);
+        if (unsent.length === 0 && startedIds.length === 0) return;
+        const queuedHere = new Map(started.map(p => [p.clientMsgId, p]));
+        const gone = new Set([...unsent, ...startedIds]);
+        const now = new Date().toISOString();
+        const actor = selfActorId();
+        set((s) => {
+          const moved = startedIds.flatMap((id): ChatMessage[] => {
+            const echo = s.messages.find(m => m.role === 'user' && m.client_msg_id === id);
+            if (echo) return [{ ...echo, created_at: now }];
+            const p = queuedHere.get(id);
+            return p ? [{ role: 'user', blocks: p.blocks, created_at: now, actor_id: actor, client_msg_id: id }] : [];
+          });
+          const kept = s.messages.filter(m => m.role !== 'user' || !m.client_msg_id || !gone.has(m.client_msg_id));
+          return { messages: [...kept, ...moved] };
+        });
         return;
       }
       // Global: the sidebar row's agent count between turns.
