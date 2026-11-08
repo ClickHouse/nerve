@@ -2910,6 +2910,8 @@ class SessionsConfig:
     star_project_hook: bool = False  # opt-in; fire an internal agent turn on star/unstar transition
     # Rows per sidebar request; caps the conversation feed and sizes one lazy Archived/System page (0 = unlimited, starred exempt).
     sidebar_page_size: int = 50
+    # Days a pending plan puts its session in the sidebar's "Needs you" group, counted from the proposal (0 = no limit). The Plans page still lists older plans.
+    plan_attention_days: int = 7
 
     @classmethod
     @_coerced
@@ -2924,6 +2926,7 @@ class SessionsConfig:
             client_idle_timeout_minutes=d.get("client_idle_timeout_minutes", 60),
             star_project_hook=d.get("star_project_hook", False),
             sidebar_page_size=max(0, _lenient_int(d.get("sidebar_page_size"), 50)),
+            plan_attention_days=max(0, _lenient_int(d.get("plan_attention_days"), 7)),
         )
 
 
