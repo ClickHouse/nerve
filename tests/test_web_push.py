@@ -377,6 +377,32 @@ class TestDeliver:
         for secret in ("device-one", NOT_A_POINT, bad.keys["auth"]):
             assert secret not in caplog.text
 
+    async def test_a_disabled_account_gets_no_push_until_it_is_enabled_again(
+        self, people, push_service, tmp_path,
+    ):
+        await _subscribe(people.db, people.alice, Browser(FCM))
+        await _subscribe(people.db, people.bob, Browser(MOZILLA))
+        config = _config(tmp_path)
+
+        await people.db.disable_account(people.bob_account)
+        assert await _deliver(people, config)
+        assert [r["url"] for r in push_service.requests] == [FCM]
+        assert len(await people.db.list_push_subscriptions(people.bob)) == 1
+
+        push_service.requests.clear()
+        await people.db.enable_account(people.bob_account)
+        assert await _deliver(people, config)
+        assert sorted(r["url"] for r in push_service.requests) == sorted([FCM, MOZILLA])
+
+    async def test_a_person_without_a_local_account_gets_push(self, people, push_service, tmp_path):
+        # External mode: the gateway names the person, who has no accounts row.
+        carol = "00000000-0000-4000-8000-000000000001"
+        await people.db.upsert_external_actor(carol, "Carol")
+        await _subscribe(people.db, carol, Browser())
+        await people.db.disable_account(people.bob_account)
+        assert await _deliver(people, _config(tmp_path))
+        assert [r["url"] for r in push_service.requests] == [FCM]
+
     async def test_nothing_is_sent_without_subscriptions(self, people, push_service, tmp_path):
         assert not await _deliver(people, _config(tmp_path))
         assert push_service.requests == []
@@ -529,6 +555,12 @@ class TestRoutes:
             assert (await http.delete(f"{URL}/{bobs['id']}")).status_code == 404
             assert (await http.delete(f"{URL}/{alices['id']}")).status_code == 200
         assert [r["endpoint"] for r in await api.db.list_push_subscriptions()] == [MOZILLA]
+
+    async def test_a_disabled_account_cannot_turn_push_on(self, api):
+        await api.db.disable_account(api.bob_account)
+        async with api.client(api.bob_account) as http:
+            assert (await http.post(URL, json=Browser().json())).status_code == 401
+        assert await api.db.list_push_subscriptions(api.bob) == []
 
     async def test_a_token_is_required_and_must_be_a_person(self, api):
         async with api.client() as http:

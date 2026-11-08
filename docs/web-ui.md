@@ -427,7 +427,11 @@ removes each one.
   applies too ([config.md](config.md#web-push)). The notification shows
   "<agent name>: <title>" and the first lines of the body, with the
   notification id as tag. During quiet hours a push below `urgent` makes no
-  sound. A click focuses a panel tab, or opens one, at `/notifications`.
+  sound. A click focuses a panel tab, or opens one, at `/notifications`. The
+  browsers of a disabled account get no push (see
+  [Request identity](accounts.md#request-identity), and
+  [External mode](accounts.md#external-mode) for a person who loses access
+  at the gateway).
 - **When it shows:** not while a panel tab has focus, because the tab shows
   the item; at all other times, also while a panel tab is open but not in
   front, because browsers require a notification for each push then. The

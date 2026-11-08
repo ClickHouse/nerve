@@ -119,7 +119,10 @@ installation's system actor.
 | Backend and external MCP token | The system actor |
 
 Disabling an account blocks its next HTTP or MCP request and any new WebSocket
-connection, and closes its open WebSocket connections. Autonomous work, including cron jobs and background agents, uses the
+connection, and closes its open WebSocket connections. It also stops the
+[push notifications](web-ui.md#push-notifications) to the browsers of the
+account. Nerve keeps their subscriptions, so push starts again when the
+account is enabled again. Autonomous work, including cron jobs and background agents, uses the
 system actor rather than a human account.
 
 ### External mode
@@ -184,6 +187,13 @@ In external mode:
 - Startup can give the system actor the ID of the agent's system principal.
   See [The system actor in external mode](#the-system-actor-in-external-mode).
 - Accounts and history from an earlier local mode stay in `nerve.db`.
+- Nerve does not know when the gateway removes the access of a person. The
+  browsers where that person turned on
+  [push notifications](web-ui.md#push-notifications) continue to show them.
+  This stops when the person blocks the notifications of the panel in each
+  browser, or when somebody with access to `nerve.db` deletes the rows of
+  that person from `push_subscriptions` (`actor_id` is the principal ID). No
+  route removes the browsers of a different person.
 - Each model request names the principal that caused the work, in the
   `X-Nerve-Inference-Principal` header: the session's cause, or the system
   actor for Nerve's own model calls. See

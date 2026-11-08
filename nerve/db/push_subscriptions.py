@@ -8,6 +8,10 @@ from datetime import datetime, timezone
 MAX_PUSH_SUBSCRIPTIONS = 20
 
 _SELECT = "SELECT * FROM push_subscriptions"
+#: The rows that get push: not those of a disabled account. A person that
+#: the gateway names in external mode has no ``accounts`` row, so their rows
+#: get push. ``accounts.actor_id`` is NOT NULL, so ``NOT IN`` is safe.
+_GETS_PUSH = "actor_id NOT IN (SELECT actor_id FROM accounts WHERE enabled = 0)"
 
 
 class PushSubscriptionStore:
@@ -55,8 +59,11 @@ class PushSubscriptionStore:
         return dict(saved) if saved else None
 
     async def list_push_subscriptions(self, actor_id: str | None = None) -> list[dict]:
-        """The rows of one person, or every row when ``actor_id`` is ``None``, oldest first."""
-        sql, params = (f"{_SELECT} ORDER BY id", ()) if actor_id is None else (
+        """The rows of one person; or, when ``actor_id`` is ``None``, the rows
+        that get push (:data:`_GETS_PUSH`). Oldest first. The rows of a
+        disabled account stay, so push starts again when the account is
+        enabled again."""
+        sql, params = (f"{_SELECT} WHERE {_GETS_PUSH} ORDER BY id", ()) if actor_id is None else (
             f"{_SELECT} WHERE actor_id = ? ORDER BY id", (actor_id,),
         )
         async with self.db.execute(sql, params) as cursor:

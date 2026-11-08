@@ -169,8 +169,9 @@ async def deliver(
     silent: bool,
 ) -> bool:
     """Push one notification to every subscribed browser whose level wants
-    it. True when at least one push service took it. A subscription that
-    the push service reports gone is deleted."""
+    it, except the browsers of a disabled account. True when at least one
+    push service took it. A subscription that the push service reports gone
+    is deleted."""
     subscriptions = [
         row for row in await db.list_push_subscriptions()
         if level_wants(row["level"], notif_type, priority)

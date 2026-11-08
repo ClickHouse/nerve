@@ -139,6 +139,7 @@ Failures:
 | `409` | Username or account-state conflict; the response explains the conflict |
 
 Disabling an account affects its next request and closes its open WebSockets.
+While it is disabled, its browsers get no [Web Push](#web-push).
 
 ### Setup
 
