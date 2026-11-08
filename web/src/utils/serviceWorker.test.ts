@@ -10,10 +10,17 @@ interface FakeWindow {
 
 type Listener = (event: Record<string, unknown>) => void;
 
-/** Runs `public/sw.js` against a fake worker scope with these panel windows. */
-function loadWorker(windows: FakeWindow[] = []) {
+const SAFARI_MAC = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15';
+const IPHONE_HOME_SCREEN_APP = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148';
+const CHROME_IOS = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/130.0.6723.90 Mobile/15E148 Safari/604.1';
+const CHROME_DESKTOP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36';
+const CHROME_ANDROID = 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Mobile Safari/537.36';
+
+/** Runs `public/sw.js` against a fake worker scope with these panel windows, in a browser with this User-Agent. */
+function loadWorker(windows: FakeWindow[] = [], userAgent = CHROME_DESKTOP) {
   const listeners = new Map<string, Listener>();
   const scope = {
+    navigator: { userAgent },
     addEventListener: (type: string, listener: Listener) => listeners.set(type, listener),
     skipWaiting: vi.fn(),
     clients: {
@@ -50,9 +57,23 @@ describe('the service worker', () => {
   });
 
   it('shows nothing while the person looks at the panel', async () => {
-    const { scope, dispatch } = loadWorker([panelWindow(false), panelWindow(true)]);
-    await dispatch('push', pushEvent(PAYLOAD));
-    expect(scope.registration.showNotification).not.toHaveBeenCalled();
+    for (const userAgent of [CHROME_DESKTOP, CHROME_ANDROID]) {
+      const { scope, dispatch } = loadWorker([panelWindow(false), panelWindow(true)], userAgent);
+      await dispatch('push', pushEvent(PAYLOAD));
+      expect(scope.registration.showNotification).not.toHaveBeenCalled();
+    }
+  });
+
+  it('on WebKit shows each push, without sound while the person looks at the panel', async () => {
+    for (const userAgent of [SAFARI_MAC, IPHONE_HOME_SCREEN_APP, CHROME_IOS]) {
+      for (const focused of [true, false]) {
+        const { scope, dispatch } = loadWorker([panelWindow(focused)], userAgent);
+        await dispatch('push', pushEvent({ ...PAYLOAD, silent: false }));
+        expect(scope.registration.showNotification).toHaveBeenCalledWith(
+          'Ada: Deploy now?', expect.objectContaining({ tag: 'ask-1234', silent: focused }),
+        );
+      }
+    }
   });
 
   it('shows a push that is not JSON without a text', async () => {

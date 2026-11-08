@@ -434,7 +434,10 @@ removes each one.
   at the gateway).
 - **When it shows:** not while a panel tab has focus, because the tab shows
   the item; at all other times, also while a panel tab is open but not in
-  front, because browsers require a notification for each push then. The
+  front, because browsers require a notification for each push then. On
+  WebKit (Safari, and a Home Screen app on iPhone and iPad), the worker also
+  shows the push while a panel tab has focus, with `silent: true`, because
+  WebKit removes the subscription after three pushes that show nothing. The
   worker also shows the browser alerts of the tabs, with the same tag, so an
   alert and a push for one item give one notification, and phone browsers
   that show alerts only through a service worker can show them.

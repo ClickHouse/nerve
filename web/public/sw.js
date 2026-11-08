@@ -11,6 +11,15 @@ const OPEN_MESSAGE = 'nerve-open';
 const ICON = '/nerve-icon-192.png';
 const BADGE = '/nerve-badge.png';
 
+// WebKit (Safari, and a Home Screen app on iPhone and iPad) removes the push
+// subscription after three pushes that show no notification, also while a
+// panel tab has focus, so there the worker shows each push. Chrome on iOS is
+// WebKit too, and a Home Screen app has no "Safari" token.
+function showsEveryPush(userAgent) {
+  return userAgent.includes('AppleWebKit') && !/Chrome\/|Chromium\/|Android/.test(userAgent);
+}
+const SHOWS_EVERY_PUSH = showsEveryPush(self.navigator.userAgent);
+
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (event) => event.waitUntil(self.clients.claim()));
 
@@ -31,14 +40,16 @@ async function showPush(event) {
   } catch {
     // Not JSON: show the notification without a text.
   }
-  // The person looks at the panel, which shows the item itself.
-  if ((await panelWindows()).some((client) => client.focused)) return;
+  // While the person looks at the panel, the panel shows the item: show no
+  // notification, or on WebKit one without sound.
+  const focused = (await panelWindows()).some((client) => client.focused);
+  if (focused && !SHOWS_EVERY_PUSH) return;
   await self.registration.showNotification(data.title || 'Nerve', {
     body: data.body || '',
     icon: ICON,
     badge: BADGE,
     tag: data.tag,
-    silent: data.silent === true,
+    silent: focused || data.silent === true,
     data: { url: data.url },
   });
 }
