@@ -388,7 +388,8 @@ System status dashboard (`/diagnostics`) with:
 ### Cron Page
 `/cron` opens on the sheet of the first job: the **Active** switch, **Run
 now**, the schedule in words (`cronstrue` for crontab expressions), the next
-run with its forecast, the latest run and the 7-day success count. **History**
+run with its forecast, the latest run and the 7-day success count (for a
+workflow job, the number of starts). **History**
 lists the runs with ✓, ✗ or −, the duration and a link to the run's session,
 and hides the source runs that found nothing new until you select **Show runs
 with no new items**. See [The Cron page](cron.md#the-cron-page).

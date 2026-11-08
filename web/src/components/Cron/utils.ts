@@ -97,6 +97,17 @@ export function formatSuccess(stats: CronJobStats): string | null {
   return finished > 0 ? `${stats.success} of ${finished} succeeded` : null;
 }
 
+/**
+ * "Started 5 times" over the runs of the last 7 days of a workflow job, or
+ * null without runs. The run of a workflow job ends when the workflow run
+ * starts, so its `success` count is the number of starts.
+ */
+export function formatStarts(stats: CronJobStats): string | null {
+  if (stats.success + stats.error + stats.missed === 0) return null;
+  if (stats.success === 0) return 'No starts';
+  return stats.success === 1 ? 'Started once' : `Started ${stats.success} times`;
+}
+
 /** Display label: always the job name (id) — descriptions go in tooltips. */
 export function jobLabel(job: CronJob): string {
   // Source runner ids are prefixed (e.g. "source:gmail:user@x") — strip it.

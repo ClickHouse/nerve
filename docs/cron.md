@@ -774,7 +774,10 @@ Add `hide_empty=1` to leave out the source runs that found nothing new.
 The Cron page opens on the sheet of the first job: its name and kind (agent,
 workflow or source), an **Active** switch, **Run now**, the schedule in words
 with the next run, the latest run, and how many of the runs of the last 7 days
-succeeded. Below the sheet, **History** lists the runs, newest first, with ✓,
+succeeded. For a workflow job, the sheet shows when the workflow run started
+and how many runs started, not whether they succeeded: the workflow run sends
+its own notifications when it finishes, fails or runs out of budget. Below the
+sheet, **History** lists the runs, newest first, with ✓,
 ✗ or − (missed), the duration and a link to the run's session. The history
 hides the source runs that found nothing new; **Show runs with no new items**
 shows them. **All jobs** in the job list shows the runs of every job.

@@ -96,6 +96,49 @@ describe('the job sheet', () => {
     expect(within(fact('Last 7 days')).getByText('1 failed')).toBeInTheDocument();
   });
 
+  it('says that the workflow run of a workflow job started, not that it succeeded', () => {
+    renderSheet({
+      kind: 'workflow',
+      last_run: { status: 'success', started_at: '2030-01-01 08:00:00', finished_at: '2030-01-01T08:00:01+00:00' },
+      stats_7d: { runs: 6, success: 5, error: 1, missed: 0 },
+    });
+    const last = within(fact('Last run'));
+    expect(last.queryByRole('img')).toBeNull();
+    expect(screen.getByTestId('cron-last-run').textContent).toMatch(/^Started \S/);
+    expect(last.queryByText(/^Took/)).toBeNull();
+    expect(screen.getByTestId('cron-success').textContent).toBe('Started 5 times');
+    expect(within(fact('Last 7 days')).getByText('1 failed')).toBeInTheDocument();
+  });
+
+  it.each([
+    [1, 0, 'Started once'],
+    [0, 2, 'No starts'],
+  ])('counts %i started and %i failed workflow runs', (success, error, text) => {
+    renderSheet({ kind: 'workflow', stats_7d: { runs: success + error, success, error, missed: 0 } });
+    expect(screen.getByTestId('cron-success').textContent).toBe(text);
+  });
+
+  it('shows a workflow run that failed to start as failed', () => {
+    renderSheet({
+      kind: 'workflow',
+      last_run: { status: 'error', started_at: '2030-01-01 08:00:00', finished_at: '2030-01-01T08:00:01+00:00' },
+    });
+    expect(within(fact('Last run')).getByRole('img', { name: 'Failed' })).toBeInTheDocument();
+    expect(screen.getByTestId('cron-last-run').textContent).not.toMatch(/Started/);
+  });
+
+  it.each(['agent', 'source', 'other'])('shows a run of a job of kind %s that succeeded with its result', (kind) => {
+    renderSheet({
+      kind: kind as CronJob['kind'],
+      last_run: { status: 'success', started_at: '2030-01-01 08:00:00', finished_at: '2030-01-01T08:00:12+00:00' },
+      stats_7d: { runs: 2, success: 2, error: 0, missed: 0 },
+    });
+    const last = within(fact('Last run'));
+    expect(last.getByRole('img', { name: 'Succeeded' })).toBeInTheDocument();
+    expect(last.getByText('Took 12.0s')).toBeInTheDocument();
+    expect(screen.getByTestId('cron-success').textContent).toBe('2 of 2 succeeded');
+  });
+
   it('shows a forecast skip with its reason, and a run', () => {
     renderSheet({ forecast: 'skip', forecast_reason: SKIP_REASON });
     expect(screen.getByTestId('cron-forecast').textContent).toBe(`Will skip: ${SKIP_REASON}`);

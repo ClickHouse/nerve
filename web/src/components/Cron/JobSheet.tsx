@@ -1,10 +1,10 @@
 import { useId, type ReactNode } from 'react';
 import { useCronStore, type CronJob } from '../../stores/cronStore';
 import { Badge, Switch } from '../ui';
-import { Filter, FileText } from '../ui/icons';
+import { Filter, FileText, Play } from '../ui/icons';
 import {
   describeSchedule, formatDuration, formatForecast, formatRelativeTime, formatRunTime,
-  formatSuccess, isCrontab, jobLabel, parseUTC,
+  formatStarts, formatSuccess, isCrontab, jobLabel, parseUTC,
 } from './utils';
 import {
   ChatLink, JobTypeBadge, JobTypeIcon, RotateButton, RunStatusIcon, TriggerButton,
@@ -37,7 +37,12 @@ export function JobSheet({ job }: { job: CronJob }) {
   const forecast = job.enabled && (job.forecast === 'skip' || (job.gates ?? []).length > 0)
     ? formatForecast(job) : null;
   const last = job.last_run;
-  const success = formatSuccess(job.stats_7d);
+  // The run of a workflow job ends when the workflow run starts, and the
+  // workflow run sends its own notices when it ends. A success of such a run
+  // tells only that the workflow run started.
+  const workflow = job.kind === 'workflow';
+  const started = workflow && last?.status === 'success';
+  const recent = workflow ? formatStarts(job.stats_7d) : formatSuccess(job.stats_7d);
   const failures = [
     job.stats_7d.error > 0 && `${job.stats_7d.error} failed`,
     job.stats_7d.missed > 0 && `${job.stats_7d.missed} missed`,
@@ -92,19 +97,23 @@ export function JobSheet({ job }: { job: CronJob }) {
             <span title={absolute(job.next_run)}>{formatRelativeTime(job.next_run)}</span>
           ) : 'Not scheduled'}
         </Fact>
-        <Fact label="Last run" detail={last?.finished_at && last.status !== 'missed'
+        <Fact label="Last run" detail={last?.finished_at && last.status !== 'missed' && !started
           ? `Took ${formatDuration(last.started_at, last.finished_at)}` : undefined}>
           {last ? (
             <span className="flex items-center gap-1.5" data-testid="cron-last-run">
-              <RunStatusIcon status={last.status} />
+              {started
+                ? <Play size={14} aria-hidden="true" className="text-text-dim shrink-0" />
+                : <RunStatusIcon status={last.status} />}
               <span title={absolute(last.started_at)}>
-                {last.status === null ? 'Running' : formatRunTime(last.started_at)}
+                {last.status === null ? 'Running'
+                  : started ? `Started ${formatRunTime(last.started_at)}`
+                    : formatRunTime(last.started_at)}
               </span>
             </span>
           ) : 'No runs yet'}
         </Fact>
         <Fact label="Last 7 days" detail={failures || undefined}>
-          <span data-testid="cron-success">{success ?? 'No runs'}</span>
+          <span data-testid="cron-success">{recent ?? 'No runs'}</span>
         </Fact>
       </dl>
 
