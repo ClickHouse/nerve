@@ -60,7 +60,7 @@ beforeEach(() => {
   useSetupStore.getState().reset();
   // The store's own actions talk to the server; these stand in for them.
   createSession = vi.fn(async () => { useChatStore.setState({ activeSession: 'local-1' }); });
-  startChat = vi.fn(async () => 'abc123');
+  startChat = vi.fn(async () => ({ sessionId: 'abc123', sent: true }));
   loadSessions = vi.fn(async () => {});
   useChatStore.setState({
     sessions: [
@@ -101,7 +101,7 @@ describe('the Inbox on a phone', () => {
     // Another chat became active meanwhile: the page still opens the new one.
     startChat.mockImplementation(async () => {
       useChatStore.setState({ activeSession: 'other' });
-      return 'abc123';
+      return { sessionId: 'abc123', sent: true };
     });
     renderInbox();
     const send = screen.getByRole('button', { name: 'Send' });
@@ -110,7 +110,7 @@ describe('the Inbox on a phone', () => {
     await userEvent.type(screen.getByRole('textbox', { name: 'Message Nerve' }), '  Plan my week  ');
     await userEvent.click(send);
 
-    expect(startChat).toHaveBeenCalledWith('Plan my week');
+    expect(startChat).toHaveBeenCalledWith('Plan my week', undefined);
     // Not the unsent new chat of the chat page, with its settings.
     expect(createSession).not.toHaveBeenCalled();
     await waitFor(() => expect(location()).toHaveTextContent('/chat/abc123'));
@@ -142,6 +142,21 @@ describe('the Inbox on a phone', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not send. Try again.');
     await userEvent.type(box, '!');
     expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('sends a retry to the chat that the failed send created', async () => {
+    startChat.mockResolvedValueOnce({ sessionId: 'abc123', sent: false });
+    renderInbox();
+    const box = screen.getByRole('textbox', { name: 'Message Nerve' });
+
+    await userEvent.type(box, 'Plan my week');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not send. Try again.');
+    expect(box).toHaveValue('Plan my week');
+    await userEvent.click(screen.getByRole('button', { name: 'Send' }));
+
+    expect(startChat).toHaveBeenLastCalledWith('Plan my week', 'abc123');
+    await waitFor(() => expect(location()).toHaveTextContent('/chat/abc123'));
   });
 
   it('names the agent from the setup checklist', () => {

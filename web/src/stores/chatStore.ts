@@ -335,9 +335,11 @@ interface ChatState {
   ) => Promise<string | null>;
   /** Start a new chat with the default backend and model, open it and send
    *  `content` to it. The unsent new chat, its draft and its settings stay
-   *  as they are. Resolves to the new session's id, or null when the chat
-   *  could not be created or the message could not be sent. */
-  startChat: (content: string) => Promise<string | null>;
+   *  as they are. `retryId` is the chat that an earlier call created but
+   *  could not send to: while it is in the session list, the call sends to
+   *  it and creates no chat. Resolves to the chat and whether the message
+   *  was sent, or null when the chat could not be created. */
+  startChat: (content: string, retryId?: string) => Promise<{ sessionId: string; sent: boolean } | null>;
   /** Defer a composed prompt into a new session without running the model
    *  now. ``delay`` is one of "30m" | "1h" | "24h" | "none". */
   runLater: (
@@ -1411,25 +1413,29 @@ export const useChatStore = create<ChatState>((set, get) => ({
     return session;
   },
 
-  startChat: async (content: string) => {
-    let created: Session;
-    try {
-      created = await api.createSession();
-    } catch (e) {
-      console.error('Failed to create session:', e);
-      return null;
+  startChat: async (content: string, retryId?: string) => {
+    let id = retryId && get().sessions.some(s => s.id === retryId) ? retryId : null;
+    if (!id) {
+      let created: Session;
+      try {
+        created = await api.createSession();
+      } catch (e) {
+        console.error('Failed to create session:', e);
+        return null;
+      }
+      set((state) => ({
+        // POST /api/sessions returns a partial row; fill what the list needs.
+        sessions: [
+          { ...created, title: 'New chat', is_running: false, updated_at: new Date().toISOString() },
+          ...state.sessions,
+        ],
+      }));
+      id = created.id;
     }
-    set((state) => ({
-      // POST /api/sessions returns a partial row; fill what the list needs.
-      sessions: [
-        { ...created, title: 'New chat', is_running: false, updated_at: new Date().toISOString() },
-        ...state.sessions,
-      ],
-    }));
-    await get().switchSession(created.id);
+    await get().switchSession(id);
     // The view moved to another chat while the messages loaded: do not send there.
-    if (get().activeSession !== created.id) return null;
-    return get().sendMessage(content);
+    const sent = get().activeSession === id && (await get().sendMessage(content)) !== null;
+    return { sessionId: id, sent };
   },
 
   runLater: async (content, delay, fileIds, imageBlocks) => {

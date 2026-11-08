@@ -572,9 +572,9 @@ describe('starting a chat from the Inbox', () => {
   it('opens a new default chat and leaves the unsent chat, its draft and its settings alone', async () => {
     vi.mocked(api.createSession).mockResolvedValueOnce({ id: 'n-1', source: 'web' });
 
-    const id = await useChatStore.getState().startChat('Plan my week');
+    const started = await useChatStore.getState().startChat('Plan my week');
 
-    expect(id).toBe('n-1');
+    expect(started).toEqual({ sessionId: 'n-1', sent: true });
     // No backend, model, work directory or review loop: the defaults.
     expect(api.createSession).toHaveBeenCalledWith();
     expect(ws.sendMessage).toHaveBeenCalledWith('Plan my week', 'n-1', undefined, expect.any(String));
@@ -598,11 +598,23 @@ describe('starting a chat from the Inbox', () => {
     expect(ws.sendMessage).not.toHaveBeenCalled();
   });
 
-  it('reports a message that could not be sent', async () => {
+  it('reports a message that could not be sent, and sends a retry to the same chat', async () => {
     vi.mocked(api.createSession).mockResolvedValueOnce({ id: 'n-1', source: 'web' });
     vi.mocked(ws.sendMessage).mockReturnValueOnce('dropped');
 
-    expect(await useChatStore.getState().startChat('Plan my week')).toBeNull();
+    expect(await useChatStore.getState().startChat('Plan my week')).toEqual({ sessionId: 'n-1', sent: false });
+    expect(await useChatStore.getState().startChat('Plan my week', 'n-1')).toEqual({ sessionId: 'n-1', sent: true });
+
+    expect(api.createSession).toHaveBeenCalledTimes(1);
+    expect(ws.sendMessage).toHaveBeenLastCalledWith('Plan my week', 'n-1', undefined, expect.any(String));
+    expect(useChatStore.getState().sessions.map(r => r.id)).toEqual(['n-1']);
+  });
+
+  it('starts a new chat when the chat of the failed send is gone', async () => {
+    vi.mocked(api.createSession).mockResolvedValueOnce({ id: 'n-2', source: 'web' });
+
+    expect(await useChatStore.getState().startChat('Plan my week', 'n-1')).toEqual({ sessionId: 'n-2', sent: true });
+    expect(api.createSession).toHaveBeenCalledTimes(1);
   });
 });
 

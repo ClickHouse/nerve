@@ -64,12 +64,15 @@ export function InboxPage() {
 /**
  * A message box that starts a new chat with its text. When the chat cannot
  * be started, the text stays in the box and a line under it says so, until
- * the person types or sends again.
+ * the person types or sends again. The next send goes to the chat that the
+ * failed send created, if there is one.
  */
 function NewChatComposer({ onStarted }: { onStarted: (sessionId: string) => void }) {
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
   const [failed, setFailed] = useState(false);
+  // The chat that a failed send created, for the next send.
+  const unsentChat = useRef<string | undefined>(undefined);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const agentName = useSetupStore(s => agentNameOf(s.state));
   // As in the chat composer: on a touch device Enter types a new line and
@@ -88,10 +91,11 @@ function NewChatComposer({ onStarted }: { onStarted: (sessionId: string) => void
     if (!canSend) return;
     setSending(true);
     setFailed(false);
-    const sessionId = await useChatStore.getState().startChat(text.trim());
-    if (sessionId) {
-      onStarted(sessionId);
+    const started = await useChatStore.getState().startChat(text.trim(), unsentChat.current);
+    if (started?.sent) {
+      onStarted(started.sessionId);
     } else {
+      unsentChat.current = started?.sessionId;
       setSending(false);
       setFailed(true);
     }
