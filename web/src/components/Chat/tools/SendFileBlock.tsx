@@ -3,10 +3,11 @@ import { Download, FileText, Loader2 } from '../../ui/icons';
 import { Modal } from '../../ui';
 import { authUrl } from '../../../api/hosted';
 import type { ToolCallBlockData } from '../../../types/chat';
+import { extractResultText } from '../../../utils/extractResultText';
 
 /** The file names that show as an image. An `<img>` element runs no script, also for an SVG file. */
 const IMAGE_FILE = /\.(png|jpe?g|gif|webp|avif|svg)$/i;
-/** The handler gives a refused or missing file as a normal result that starts with this. */
+/** The handler gives a refused or missing file as a normal result whose text starts with this. */
 const ERROR_RESULT = /^Error:\s*/;
 
 const CARD_CLASS = 'inline-flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-surface '
@@ -14,7 +15,8 @@ const CARD_CLASS = 'inline-flex items-center gap-2 px-3 py-2 rounded-lg border b
 
 /** The reason that a call failed, or null when the file was sent. */
 function failure(block: ToolCallBlockData): string | null {
-  const result = block.result ?? '';
+  // The text of the MCP content blocks. A result in plain text stays as it is.
+  const result = block.result ? extractResultText(block.result) : '';
   if (block.isError) return result;
   return ERROR_RESULT.test(result) ? result.replace(ERROR_RESULT, '') : null;
 }

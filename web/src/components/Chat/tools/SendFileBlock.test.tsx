@@ -4,18 +4,23 @@ import { describe, expect, it } from 'vitest';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { SendFileBlock } from './SendFileBlock';
 
+/** The result of a Nerve MCP tool as the chat gets it from each backend. */
+const claude = (text: string) => JSON.stringify([{ type: 'text', text }]);
+const codex = (text: string) => JSON.stringify({ content: [{ type: 'text', text }] });
+const BACKENDS: [string, (text: string) => string][] = [['Claude', claude], ['Codex', codex]];
+
 function call(filePath: string, overrides: Partial<ToolCallBlockData> = {}): ToolCallBlockData {
   return {
     type: 'tool_call', toolUseId: 'tu-1', tool: 'mcp__nerve__send_file', input: { file_path: filePath },
-    result: 'File ready: x (1 bytes).', status: 'complete', ...overrides,
+    result: claude('Sent file: x (1 bytes)'), status: 'complete', ...overrides,
   };
 }
 
 const DOWNLOAD = '/api/files/download?path=%2Fws%2Fshots%2Fchart%20one.png';
 
 describe('SendFileBlock', () => {
-  it('shows an image file in the chat, with its name and a download link', () => {
-    render(<SendFileBlock block={call('/ws/shots/chart one.png')} />);
+  it.each(BACKENDS)('shows an image file in the chat, with its name and a download link (%s)', (_, result) => {
+    render(<SendFileBlock block={call('/ws/shots/chart one.png', { result: result('Sent file: chart one.png (2,048 bytes)') })} />);
     expect(screen.getByRole('img', { name: 'chart one.png' })).toHaveAttribute('src', DOWNLOAD);
     expect(screen.getByRole('link', { name: 'Download chart one.png' })).toHaveAttribute('href', DOWNLOAD);
   });
@@ -41,14 +46,19 @@ describe('SendFileBlock', () => {
     expect(screen.getByRole('link', { name: /gone\.webp/ })).toHaveAttribute('download', 'gone.webp');
   });
 
-  it('says why the file was not sent, with no link', () => {
-    render(<SendFileBlock block={call('/tmp/a.png', { result: 'Error: file must be within the workspace.' })} />);
+  it.each(BACKENDS)('says why the file was not sent, with no link (%s)', (_, result) => {
+    render(<SendFileBlock block={call('/tmp/a.png', { result: result('Error: file must be within the workspace.') })} />);
     expect(screen.getByRole('status')).toHaveTextContent('Could not send a.png: file must be within the workspace.');
     expect(screen.queryByRole('link')).not.toBeInTheDocument();
     expect(screen.queryByRole('img')).not.toBeInTheDocument();
   });
 
-  it('says that a failed call sent nothing', () => {
+  it.each(BACKENDS)('says that a failed call sent nothing, with the text of the reason (%s)', (_, result) => {
+    render(<SendFileBlock block={call('/ws/a.png', { result: result('Tool timed out'), isError: true })} />);
+    expect(screen.getByRole('status')).toHaveTextContent(/^Could not send a\.png: Tool timed out$/);
+  });
+
+  it('says that a failed call sent nothing, with a reason in plain text', () => {
     render(<SendFileBlock block={call('/ws/a.png', { result: 'tool timed out', isError: true })} />);
     expect(screen.getByRole('status')).toHaveTextContent('Could not send a.png: tool timed out');
   });
