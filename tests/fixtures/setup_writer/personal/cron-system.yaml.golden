@@ -55,9 +55,10 @@ jobs:
     \ on and produce an implementation plan.\n\n1. Use task_list(status=\"pending\"\
     ) to browse the tasks that are ready for work\n2. Use plan_list to see which tasks\
     \ already have plans \u2014 skip those\n3. Pick ONE task and explore the relevant\
-    \ codebase\n4. Call plan_propose(task_id, content) with your plan\n\nIf all tasks\
-    \ have plans or none are actionable, say so and stop.\n\nplan_propose notifies\
-    \ the user with a link to the plan. Do not send another notification about it.\n"
+    \ codebase\n4. Call plan_propose(task_id, content, summary) with your plan and\
+    \ a summary of up to 3 short lines for the reviewer\n\nIf all tasks have plans\
+    \ or none are actionable, say so and stop.\n\nplan_propose notifies the user with\
+    \ a link to the plan. Do not send another notification about it.\n"
   description: "Every 4 hours, reviews your open tasks and proposes implementation\
     \ plans. Plans go through an approval flow \u2014 nothing is executed without\
     \ your OK."

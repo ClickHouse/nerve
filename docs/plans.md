@@ -10,7 +10,7 @@ Nerve includes a proactive planner that autonomously picks open tasks, explores 
 Cron (every 4h) → persistent "task-planner" job
   → agent browses tasks, checks memory, picks one worth planning
   → explores codebase with Read, Glob, Grep, Bash, etc.
-  → calls plan_propose(task_id, content) to store the proposal
+  → calls plan_propose(task_id, content, summary) to store the proposal and its short summary
   → the task moves to plan_review, and one notification links to the plan
   → plan appears in /plans UI for review
 
@@ -128,7 +128,7 @@ When the user requests a revision:
 1. User writes feedback in the plan detail page
 2. API sends feedback as a new message to the session that proposed the plan (the persistent `cron:task-planner` session for its plans)
 3. The agent sees its prior planning context + the feedback
-4. Agent calls `plan_update(plan_id, content, feedback)` — old version becomes `superseded`, new version (v+1) is pending review
+4. Agent calls `plan_update(plan_id, content, summary, feedback)`: the old version becomes `superseded`, and the new version (v+1) waits for review
 5. The two plans stay linked via `parent_plan_id` so reviewers can see what changed
 
 This works because the planner uses a **persistent session** — the agent retains conversation history across triggers and revision requests. The same flow works for any agent refining its own plan in chat — call `plan_update` directly instead of `plan_decline + plan_propose`.

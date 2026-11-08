@@ -54,8 +54,9 @@ _REVISION_PROMPT_TEMPLATE = (
     'Revise plan {plan_id} for task "{task_title}" based on this feedback:\n\n'
     "{feedback}\n\n"
     "Explore the codebase again if needed, then call "
-    'plan_update(plan_id="{plan_id}", content="...", feedback="<short summary>") '
-    "with the revised plan."
+    'plan_update(plan_id="{plan_id}", content="...", summary="...", '
+    'feedback="<what changed>") with the revised plan and a summary of it '
+    "in up to 3 short lines for the reviewer."
 )
 
 
@@ -166,7 +167,7 @@ async def request_plan_revision(
           (``plan.session_id``), falling back to ``cron:task-planner``
           if the proposer is unknown/deleted.
         - The planner is instructed to call
-          ``plan_update(plan_id=..., content=..., feedback=<summary>)``
+          ``plan_update(plan_id=..., content=..., summary=..., feedback=...)``
           so version history stays linked.
     """
     # Import here to avoid a circular import: tool handlers import

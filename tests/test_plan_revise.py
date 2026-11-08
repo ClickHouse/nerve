@@ -12,6 +12,7 @@ come back.
 from __future__ import annotations
 
 import asyncio
+import re
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,6 +26,7 @@ from nerve.agent.plan_service import (
     TaskNotFound,
     request_plan_revision,
 )
+from nerve.agent.tools.schemas import PLAN_UPDATE_SCHEMA
 from nerve.db import Database
 from nerve.identity import Actor
 
@@ -146,6 +148,12 @@ class TestRequestPlanRevision:
         # Crucial: plan_update with the plan_id, NOT plan_propose with the task_id.
         assert 'plan_update(plan_id="plan-orig"' in prompt
         assert "plan_propose(" not in prompt
+        # The summary of the old version is not copied, so the prompt asks
+        # for a new one with the parameter names of the tool schema.
+        call = re.search(r"plan_update\(([^)]*)\)", prompt)
+        params = [arg.split("=", 1)[0].strip() for arg in call.group(1).split(", ")]
+        assert "summary" in params
+        assert set(params) <= set(PLAN_UPDATE_SCHEMA["properties"])
         # Feedback is embedded verbatim.
         assert "be more specific about edge cases" in prompt
 
