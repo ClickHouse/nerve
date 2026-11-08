@@ -237,6 +237,11 @@ async def _last_usage(db) -> dict:
     return json.loads(session["metadata"])["last_usage"]
 
 
+async def _compacted_events(db) -> list[dict]:
+    rows = await db.get_session_events(SID)
+    return [r for r in rows if r["event_type"] == "compacted"]
+
+
 @pytest.mark.asyncio
 async def test_context_of_a_live_claude_session_has_its_categories(api):
     api.engine.sessions.set_client(SID, _Client())
@@ -324,6 +329,12 @@ async def test_compact_runs_as_a_turn_and_returns_the_new_context(api):
     # Nothing in the transcript.
     assert await api.db.get_messages(SID) == []
 
+    # One session event names who compacted, for whom.
+    (event,) = await _compacted_events(api.db)
+    assert event["actor_id"] == api.db.system_actor_id
+    assert event["caused_by_actor_id"] == api.db.system_actor_id
+    assert event["details"] is None
+
 
 @pytest.mark.asyncio
 async def test_compact_with_nothing_to_compact_shows_no_reply(api):
@@ -342,6 +353,7 @@ async def test_compact_with_nothing_to_compact_shows_no_reply(api):
     # The bar shows the measured use, which did not change.
     (done,) = [m for m in api.sent if m["type"] == "done"]
     assert done["usage"]["context_tokens"] == BREAKDOWN["total_tokens"]
+    assert await _compacted_events(api.db) == []
 
 
 @pytest.mark.asyncio
@@ -356,6 +368,7 @@ async def test_a_failed_compact_is_502_and_shows_no_reply(api):
     assert not [m for m in api.sent if m["type"] == "token"]
     assert await api.db.get_messages(SID) == []
     assert (await _last_usage(api.db))["context_tokens"] == BREAKDOWN["total_tokens"]
+    assert await _compacted_events(api.db) == []
 
 
 @pytest.mark.asyncio
@@ -400,6 +413,7 @@ async def test_stop_ends_a_compact_that_hangs(api):
     assert _detail(response)["code"] == "stopped"
     # The runtime can be mid-compact: the next message starts a new one.
     assert api.engine.sessions.get_client(SID) is None
+    assert await _compacted_events(api.db) == []
 
 
 @pytest.mark.asyncio

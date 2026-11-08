@@ -354,6 +354,7 @@ work uses the system actor.
 | `starred`, `unstarred` | The session is starred or unstarred | |
 | `model_changed` | The model changes | `model`, `previous` |
 | `parent_changed` | The session moves under another session, or back to the top level | `parent_session_id`, `previous` |
+| `compacted` | A Compact compacts the conversation. A Compact that stops, fails or has nothing to compact records no event | |
 | `archived`, `unarchived` | The session is archived or restored | `cascade_root` for a session that an archive of an ancestor archives; `reason` for an automatic archive (`idle_interactive`, `stale`, `overflow`, `codex_thread_archived`) |
 | `stop_requested` | A stop request reaches a running turn; each request is one event | `scope` (`turn`), `outcome` (`stopped`, `killed`, `not_stopped`, …), `live_agents` |
 | `agent_stop_requested` | One agent is stopped (with the agents it started) | `agent_ids`, `task_ids`, `cascade` |

@@ -1043,6 +1043,8 @@ compact runs as a turn: it takes the session's run lock, the session shows
 as running, and Stop ends it. Its cost and usage are recorded as for any
 turn, with no message. Its usage (the `done` event and the session's last
 usage) has `context_tokens`, the context use measured after the compact.
+A compact that compacts records the session event `compacted` with the
+person as actor and cause (see [Session changes](accounts.md#session-changes)).
 Responds with the `GET /api/sessions/{id}/context` shape, measured again.
 
 Errors are `{"detail": {"code": "…", "message": "…"}}`: `404`

@@ -2771,7 +2771,9 @@ class AgentEngine:
         as running, and Stop reaches it. Its frames are not shown and it adds
         no message to the transcript; its cost and usage are recorded as for
         any turn. Its usage and ``done`` event carry the context use measured
-        after the compact (``usage.context_tokens``).
+        after the compact (``usage.context_tokens``). A compact that compacts
+        records ``compacted`` with ``actor`` as actor and cause; a compact
+        that stops, fails or has nothing to compact records no event.
 
         Raises:
             CompactError: the session did not compact (see its ``code``).
@@ -2792,6 +2794,9 @@ class AgentEngine:
         )
         outcome = result.outcome
         if outcome.ok:
+            await self.db.log_session_event(
+                session_id, "compacted", attribution=attribution_for(actor),
+            )
             return
         if outcome.status == "interrupted":
             raise CompactError("stopped", "Compact stopped.")
