@@ -18,12 +18,14 @@ describe('findPullRequests', () => {
   it('finds links in markdown, angle brackets and JSON tool results', () => {
     expect(urls([
       text('See [the PR](https://github.com/example/repo/pull/1) and <https://github.com/example/repo/pull/2>.'),
-      tool('[{"type":"text","text":"https://github.com/example/other-repo/pull/3\\n"}]'),
     ])).toEqual([
       'https://github.com/example/repo/pull/1',
       'https://github.com/example/repo/pull/2',
-      'https://github.com/example/other-repo/pull/3',
     ]);
+    expect(urls([
+      tool('[{"type":"text","text":"https://github.com/example/other-repo/pull/3\\n"}]'),
+      text('Opened the pull request.'),
+    ])).toEqual(['https://github.com/example/other-repo/pull/3']);
   });
 
   it('cuts a longer address to the pull request URL', () => {
@@ -56,15 +58,22 @@ describe('findPullRequests', () => {
     expect(urls([text(`https://github.com/example/repo/pull/${tail}`)])).toEqual([]);
   });
 
-  it('lists text links before tool result links, each pull request once', () => {
+  it('lists each pull request once', () => {
     expect(urls([
-      tool('https://github.com/example/repo/pull/7 created'),
       text('Done: https://github.com/example/repo/pull/9 and https://github.com/Example/Repo/pull/7'),
-      text('Again https://github.com/example/repo/pull/9'),
+      text('Again https://github.com/example/repo/pull/9 and https://github.com/example/repo/pull/7'),
     ])).toEqual([
       'https://github.com/example/repo/pull/9',
       'https://github.com/Example/Repo/pull/7',
     ]);
+  });
+
+  it('reads the tool results only when the text links to no pull request', () => {
+    const list = tool([7, 8, 9].map(n => `https://github.com/example/repo/pull/${n}`).join('\n'));
+    expect(urls([list, text('Merge https://github.com/example/repo/pull/12 first.')]))
+      .toEqual(['https://github.com/example/repo/pull/12']);
+    expect(urls([tool('https://github.com/example/repo/pull/13'), text('Opened the pull request.')]))
+      .toEqual(['https://github.com/example/repo/pull/13']);
   });
 
   it(`stops at ${MAX_PR_CARDS}`, () => {

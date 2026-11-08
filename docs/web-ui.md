@@ -109,12 +109,13 @@ Tool calls are collapsed by default with specialized renderers:
 
 ### PR Cards
 An assistant message that links to GitHub pull requests
-(`https://github.com/<owner>/<repo>/pull/<number>`, in its text or its tool
-results) shows one card for each pull request below its content. A message
-shows at most 5 cards, links in the text first. A card shows the title (a link
-to GitHub), a state chip (Draft, Open, Merged or Closed), `owner/repo#number`
-with the branches, the checks ("2 failed", "3 running", "12 passed") and the
-review decision. The data comes from `GET /api/github/pulls`, so the server
+(`https://github.com/<owner>/<repo>/pull/<number>`) shows one card for each
+pull request below its content. The links come from the message text. Only
+when the text has no such link, they come from its tool results, for example
+the URL that `gh pr create` prints. A message shows at most 5 cards. A card
+shows the title (a link to GitHub), a state chip (Draft, Open, Merged or
+Closed), `owner/repo#number` with the branches, the checks ("2 failed",
+"3 running", "12 passed") and the review decision. The data comes from `GET /api/github/pulls`, so the server
 needs a `gh` login. Without one, the card shows `owner/repo#number` as the link
 and the reason ("No access to details", "GitHub CLI not available"). The cards
 of a message read their data the first time they come into view (or within
