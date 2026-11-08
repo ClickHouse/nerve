@@ -28,7 +28,7 @@ Call tools as `mcp__nerve__<name>`. The system prompt lists what is live; this i
 - `plan_update`: version n+1 of your own pending plan (instead of decline and propose); moves and notifies like `plan_propose`
 - `plan_list`/`plan_read`: browse; the full plan with version and feedback
 - `plan_approve`: pending → implementing; spawns an `impl-<id>` session, task → `in_progress`
-- `plan_approve(implement_here=true)`: the user approved in this chat and this session does the work; pending → implementing (or done for a done task), linked to this session, no new session, task status unchanged
+- `plan_approve(implement_here=true)`: the user approved in this chat and this session does the work; pending → implementing (or done for a done task), linked to this session, no new session; task `plan_review` → `in_progress`, other statuses unchanged
 - `plan_decline`: pending → declined; **moves the task to done**
 - `plan_revise`: feedback to the planner session, which answers with `plan_update`
 

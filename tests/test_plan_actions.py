@@ -199,6 +199,7 @@ class TestRecordPlanApproval:
         )
 
         assert "No new session started" in result.content[0]["text"]
+        assert "The task status did not change" in result.content[0]["text"]
         plan = await db.get_plan("plan-act")
         assert plan["status"] == "implementing"
         assert plan["impl_session_id"] == "sess-chat"
@@ -214,6 +215,24 @@ class TestRecordPlanApproval:
         assert [e for e in await db.list_task_events(task_id) if e["to_status"] != "pending"] == []
         text = (tmp_path / "task.md").read_text(encoding="utf-8")
         assert "approved in the chat of session [sess-chat](/chat/sess-chat)" in text
+
+    async def test_a_task_in_plan_review_starts(self, db, tmp_path):
+        """No plan waits for a decision after the approval, so the task leaves
+        plan_review, as it does for an approval that starts a session."""
+        from nerve.agent.tools.handlers.plans import plan_approve_handler
+
+        engine, task_id = await _setup(db, tmp_path)
+        await db.db.execute("UPDATE tasks SET status = 'plan_review' WHERE id = ?", (task_id,))
+        await db.db.commit()
+
+        result = await plan_approve_handler(
+            _ctx(db, engine, "sess-chat"), {"plan_id": "plan-act", "implement_here": True},
+        )
+
+        assert "moved from plan_review to in_progress" in result.content[0]["text"]
+        assert (await db.get_task(task_id))["status"] == "in_progress"
+        assert _in_progress_by(await db.list_task_events(task_id)) == ["sess-chat"]
+        assert engine.sessions.calls == []
 
     async def test_needs_no_engine(self, db, tmp_path):
         from nerve.agent.tools.handlers.plans import plan_approve_handler

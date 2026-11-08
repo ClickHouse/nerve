@@ -73,7 +73,7 @@ For a plan that the user approved in the chat of the session that does the work.
 - Guards: only pending plans; needs a calling session
 - Marks the plan `implementing` with `impl_session_id` = the calling session, or `done` when the task is already done
 - Starts no session and runs no turn
-- Does not change the task status. Writes a task note with links to the plan and the session, and dismisses the task's pending plan notifications
+- Moves a task in `plan_review` to `in_progress`; any other task status does not change. Writes a task note with links to the plan and the session, and dismisses the task's pending plan notifications
 - Returns the plan ID and the new plan status
 
 ### `plan_update(plan_id, content, feedback?, summary?)`

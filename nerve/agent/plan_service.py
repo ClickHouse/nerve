@@ -540,7 +540,10 @@ async def record_plan_approval(
         cause: On whose behalf (see ``approve_plan``).
 
     Returns:
-        ``{"plan_id", "task_id", "impl_session_id", "status"}``.
+        ``{"plan_id", "task_id", "impl_session_id", "status",
+        "task_started"}``. ``status`` is the new plan status;
+        ``task_started`` is true when the task went from ``plan_review``
+        to ``in_progress``.
 
     Raises:
         PlanNotFound: No plan with that ID.
@@ -553,14 +556,16 @@ async def record_plan_approval(
           transition, or → ``done`` when the task is already done
           (``task_done`` marks only an ``implementing`` plan done).
         - No session starts and no turn runs.
-        - The task status does not change: the session sets it as the work
+        - A task in ``plan_review`` goes to ``in_progress``, as for
+          ``approve_plan``: no plan waits for a decision now. Any other task
+          status does not change, because the session sets it as the work
           goes on. The task gets a note with links to the plan and the
           session, and its pending plan notifications are dismissed.
     """
     from dataclasses import replace
     from nerve.agent.tools import _legacy_ctx
     from nerve.agent.tools.handlers.tasks import task_update_handler
-    from nerve.db.task_statuses import TERMINAL_STATUS
+    from nerve.db.task_statuses import PLAN_REVIEW_STATUS, TERMINAL_STATUS
 
     plan = await db.get_plan(plan_id)
     if not plan:
@@ -586,14 +591,17 @@ async def record_plan_approval(
         _legacy_ctx(session_id), db=db, engine=engine,
         actor=actor, cause=cause,
     )
+    update = {
+        "task_id": plan["task_id"],
+        "note": (
+            f"Plan {plan_link(plan_id)} approved in the chat of session "
+            f"{session_link(session_id)}, which does the work."
+        ),
+    }
+    if task.get("status") == PLAN_REVIEW_STATUS:
+        update["status"] = "in_progress"
     try:
-        await task_update_handler(task_ctx, {
-            "task_id": plan["task_id"],
-            "note": (
-                f"Plan {plan_link(plan_id)} approved in the chat of session "
-                f"{session_link(session_id)}, which does the work."
-            ),
-        })
+        await task_update_handler(task_ctx, update)
     except Exception:
         await _revert_plan(
             db, plan, status, impl_session_id=plan.get("impl_session_id"),
@@ -613,6 +621,7 @@ async def record_plan_approval(
         "task_id": plan["task_id"],
         "impl_session_id": session_id,
         "status": status,
+        "task_started": "status" in update,
     }
 
 

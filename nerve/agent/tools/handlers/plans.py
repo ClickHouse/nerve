@@ -376,10 +376,14 @@ async def _record_plan_approval(ctx: ToolContext, plan_id: str) -> ToolResult:
     except PlanNotPending as exc:
         return ToolResult.text(str(exc))
 
+    task_text = (
+        "The task moved from plan_review to in_progress. "
+        if result["task_started"] else "The task status did not change. "
+    )
     return ToolResult.text(
         f"Plan {result['plan_id']} approved and linked to this session "
         f"(plan status: {result['status']}). No new session started. "
-        f"Update the task status with task_update as the work goes on."
+        f"{task_text}Update the task status with task_update as the work goes on."
     )
 
 

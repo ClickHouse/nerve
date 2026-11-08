@@ -565,8 +565,9 @@ PLAN_APPROVE_SCHEMA = {
             "description": (
                 "Set true when the user approved the plan in this conversation and "
                 "this session does the work. The plan is recorded as approved and "
-                "linked to this session, no new session starts, and the task status "
-                "does not change. Default false: start a new implementation session."
+                "linked to this session, and no new session starts. A task in "
+                "plan_review goes to in_progress; any other task status does not "
+                "change. Default false: start a new implementation session."
             ),
         },
     },
