@@ -272,6 +272,8 @@ async def disable_account(account_id: str, actor: Actor = Depends(require_accoun
     Takes effect at the account's *next* request, not retroactively: a token
     issued before this is still signed and unexpired, and the account row is
     what stops it — at every door. Its open WebSockets are closed.
+
+    Web Push skips its browsers while it is disabled (``list_push_subscriptions``).
     """
     from nerve.gateway.server import close_account_sockets
 

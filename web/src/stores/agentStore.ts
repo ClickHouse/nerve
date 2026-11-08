@@ -76,6 +76,8 @@ export interface AgentStoreState {
   stopAll(opts?: { includeShells?: boolean }): Promise<StopAllResult | null>;
   forceStop(): Promise<ForceStopResult | null>;
   cancelQueued(queueId: string): Promise<void>;
+  /** Set the run order of the queue: `queueIds` from the one that runs next to the last. */
+  reorderQueue(queueIds: string[]): Promise<void>;
   markSeen(agentIds: string[]): void;
   setStopDialog(d: 'all' | 'force' | null): void;
   dismissEscalation(): void;
@@ -770,6 +772,30 @@ export const useAgentStore = create<AgentStoreState>((set, get) => {
           if (gen === generation) dropEntry();
         } else if (code !== 'already_started' && code !== 'not_owner') {
           console.error('Failed to cancel the queued message:', e);
+        }
+      }
+    },
+
+    reorderQueue: async (queueIds) => {
+      const s = get();
+      const sessionId = s.sessionId;
+      if (!sessionId) return;
+      const gen = generation;
+      // The new order shows at once, sorted as the server sorts it (entries
+      // not named keep their order, last). The queue_update that every tab
+      // gets then carries the server's order.
+      const rank = (q: QueueEntryView) => {
+        const at = queueIds.indexOf(q.queue_id);
+        return at < 0 ? queueIds.length : at;
+      };
+      set({ queue: [...s.queue].sort((a, b) => rank(a) - rank(b)) });
+      try {
+        await api.reorderQueue(sessionId, queueIds);
+      } catch (e) {
+        console.error('Failed to reorder the queue:', e);
+        const res = await api.getQueue(sessionId).catch(() => null);
+        if (res && gen === generation) {
+          set({ queue: res.items.filter(q => !removedQueueIds.has(q.queue_id)) });
         }
       }
     },

@@ -33,6 +33,7 @@ from nerve.channels.stream_adapter import StreamAdapter
 from nerve.db.observations import DEFAULT_MAX_ROWS
 from nerve.gateway.auth import is_external_mode
 from nerve.identity import ACTOR_KIND_HUMAN, UNATTRIBUTED, Actor, actor_id_of
+from nerve.session_origin import channel_origin
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -213,6 +214,7 @@ class ChannelRouter:
         else:
             session_id = await self.engine.sessions.get_active_session(
                 msg.channel_key, source=msg.channel_name, actor=msg.actor,
+                conversation_title=msg.conversation_title,
             )
 
         # Store message context for reaction support
@@ -570,7 +572,7 @@ class ChannelRouter:
         session_id = str(uuid.uuid4())[:8]
         await self.engine.sessions.get_or_create(
             session_id, title=title, source=source,
-            actor=None,
+            actor=None, origin=channel_origin(source, channel_key),
         )
         await self.engine.sessions.set_active_session(
             channel_key, session_id,

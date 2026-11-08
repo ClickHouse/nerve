@@ -1,4 +1,5 @@
 import type { WSMessage } from '../../api/websocket';
+import { reloadSessionsSoon } from '../helpers/sessionsReload';
 import type { Get, Set } from './types';
 
 // ------------------------------------------------------------------ //
@@ -78,6 +79,8 @@ export function handleFileChanged(
   });
 }
 
+// A notification event can change the pending counts of the session list
+// ("Needs you"), so each of the three reloads it.
 export function handleNotification(
   msg: Extract<WSMessage, { type: 'notification' }>,
   _get: Get,
@@ -86,6 +89,7 @@ export function handleNotification(
   import('../notificationStore').then(({ useNotificationStore }) =>
     useNotificationStore.getState().handleWSNotification(msg)
   );
+  reloadSessionsSoon();
 }
 
 export function handleNotificationAnswered(
@@ -96,6 +100,7 @@ export function handleNotificationAnswered(
   import('../notificationStore').then(({ useNotificationStore }) =>
     useNotificationStore.getState().handleWSNotificationAnswered(msg)
   );
+  reloadSessionsSoon();
 }
 
 export function handleNotificationExpired(
@@ -106,4 +111,5 @@ export function handleNotificationExpired(
   import('../notificationStore').then(({ useNotificationStore }) =>
     useNotificationStore.getState().handleWSNotificationExpired(msg)
   );
+  reloadSessionsSoon();
 }

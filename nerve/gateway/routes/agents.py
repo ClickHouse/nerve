@@ -31,6 +31,7 @@ SNAPSHOT_LIMIT_MAX = 500
 TRANSCRIPT_LIMIT_MAX = 500
 OUTPUT_TAIL_DEFAULT = 65_536
 OUTPUT_TAIL_MAX = 262_144
+QUEUE_ORDER_MAX = 500
 # A CLI task id (the output file is named after it).
 _TASK_ID_RE = re.compile(r"^[a-z][0-9a-z]{7,31}$")
 
@@ -297,3 +298,26 @@ async def cancel_queued(
     # An internal entry's text is a system prompt (a scheduled run, a hook):
     # never handed to a client, its own owner included.
     return {"cancelled": True, "content": "" if entry.internal else entry.content}
+
+
+@router.put("/api/sessions/{session_id}/queue/order")
+async def reorder_queue(
+    session_id: str,
+    body: dict | None = Body(default=None),
+    actor: Actor = Depends(require_auth),
+):
+    """Set the run order of the queued messages: ``queue_ids`` from the one
+    that runs next to the last. Any queued message can move, whoever sent
+    it; nothing is removed. Ids that are not queued any more are skipped."""
+    deps = get_deps()
+    await _require_session(deps, session_id)
+    ids = body.get("queue_ids") if isinstance(body, dict) else None
+    if (
+        not isinstance(ids, list) or len(ids) > QUEUE_ORDER_MAX
+        or not all(isinstance(i, str) for i in ids)
+    ):
+        raise _error(
+            422, "bad_order",
+            f"queue_ids must be a list of at most {QUEUE_ORDER_MAX} queue ids",
+        )
+    return {"items": await deps.engine.reorder_queue(session_id, ids)}

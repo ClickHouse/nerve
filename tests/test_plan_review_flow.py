@@ -261,15 +261,13 @@ class TestNotification:
     async def test_quiet_hours_send_it_without_sound(
         self, db, tmp_path, broadcasts, monkeypatch,
     ):
-        from nerve.agent.tools.handlers import plans as plans_mod
+        from nerve.notifications import quiet_hours
 
         await _task(db, tmp_path)
-        service = _service(db, tmp_path)
-        sent = AsyncMock(wraps=service.send_notification)
-        monkeypatch.setattr(service, "send_notification", sent)
-        monkeypatch.setattr(plans_mod, "_is_quiet_hour", lambda config: True)
-        await _propose(_ctx(db, tmp_path, service))
-        assert sent.await_args.kwargs["silent"] is True
+        monkeypatch.setattr(quiet_hours, "in_quiet_hours", lambda config, now=None: True)
+        await _propose(_ctx(db, tmp_path, _service(db, tmp_path)))
+        assert broadcasts[0]["priority"] == "high"
+        assert broadcasts[0]["silent"] is True
 
     async def test_a_silenced_notification_keeps_the_plan(self, db, tmp_path, broadcasts):
         await _task(db, tmp_path)

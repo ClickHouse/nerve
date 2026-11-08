@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import type { ChatMessage } from '../../types/chat';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -25,7 +25,10 @@ vi.mock('../../api/websocket', () => ({
 }));
 
 const { useSetupStore } = await import('../../stores/setupStore');
+const { useChatStore } = await import('../../stores/chatStore');
+const { useAgentStore } = await import('../../stores/agentStore');
 const { makeState, step, withStep } = await import('../../test/setupFixtures');
+const { makeQueueEntry } = await import('../../test/agentFixtures');
 const { MessageList } = await import('./MessageList');
 
 function renderEmpty() {
@@ -38,6 +41,7 @@ function renderEmpty() {
 
 beforeEach(() => {
   useSetupStore.getState().reset();
+  useAgentStore.setState({ queue: [] });
 });
 
 describe('empty transcript', () => {
@@ -75,6 +79,81 @@ describe('empty transcript', () => {
     useSetupStore.setState({ state: withStep(makeState(), step('provider', { status: 'done' })) });
     renderEmpty();
     expect(screen.getByText('Start a conversation')).toBeInTheDocument();
+  });
+});
+
+describe('origin line', () => {
+  it('leads the transcript of a session that a cron job started', () => {
+    useChatStore.setState({
+      activeSession: 'cron:nightly:1', archivedSessions: null, systemSessions: null,
+      sessions: [{
+        id: 'cron:nightly:1', title: 'Cron: nightly', source: 'cron', updated_at: '2026-01-01T00:00:00Z',
+        trigger: 'cron', origin_label: 'Started by cron job nightly', origin_detail: { cron_job: 'nightly' },
+      }],
+    });
+    render(
+      <MemoryRouter>
+        <MessageList
+          messages={[{ role: 'user', blocks: [{ type: 'text', content: 'tidy up' }] }]}
+          isStreaming={false}
+        />
+      </MemoryRouter>,
+    );
+    const line = screen.getByTestId('session-origin');
+    expect(line).toHaveTextContent('From cron job nightly');
+    expect(line.compareDocumentPosition(screen.getByText('tidy up')))
+      .toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  });
+
+  it('uses the row that the page read for a session that no list has', () => {
+    useChatStore.setState({
+      activeSession: 'cron:nightly:2', sessions: [], archivedSessions: null, systemSessions: null,
+    });
+    render(
+      <MemoryRouter>
+        <MessageList
+          messages={[{ role: 'user', blocks: [{ type: 'text', content: 'tidy up' }] }]}
+          isStreaming={false}
+          unlistedSession={{
+            id: 'cron:nightly:2', title: 'Cron: nightly', source: 'cron',
+            updated_at: '2026-01-01T00:00:00Z', trigger: 'cron',
+            origin_label: 'Started by cron job nightly', origin_detail: { cron_job: 'nightly' },
+          }}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByTestId('session-origin')).toHaveTextContent('From cron job nightly');
+  });
+});
+
+describe('a message waiting in the turn queue', () => {
+  const bubble = (content: string, client_msg_id: string | null) => ({
+    role: 'user' as const, blocks: [{ type: 'text' as const, content }],
+    created_at: '2026-02-27T02:06:00Z', client_msg_id,
+  });
+
+  function renderList(messages: ReturnType<typeof bubble>[]) {
+    return render(
+      <MemoryRouter>
+        <MessageList messages={messages} isStreaming />
+      </MemoryRouter>,
+    );
+  }
+
+  it('has no bubble while it waits (another tab sent it), and one when it starts', () => {
+    useAgentStore.setState({ queue: [makeQueueEntry({ client_msg_id: 'c-other-tab' })] });
+    renderList([bubble('earlier message', null), bubble('from the other tab', 'c-other-tab')]);
+    expect(screen.getByText('earlier message')).toBeInTheDocument();
+    expect(screen.queryByText('from the other tab')).toBeNull();
+
+    act(() => useAgentStore.setState({ queue: [] }));
+    expect(screen.getByText('from the other tab')).toBeInTheDocument();
+  });
+
+  it('always shows history, which has no client id', () => {
+    useAgentStore.setState({ queue: [makeQueueEntry({ client_msg_id: null })] });
+    renderList([bubble('stored message', null)]);
+    expect(screen.getByText('stored message')).toBeInTheDocument();
   });
 });
 

@@ -308,6 +308,34 @@ def _result_outcome(message: ResultMessage) -> tuple[ev.TurnStatus, str | None]:
     return "failed", detail
 
 
+# Categories of the CLI's context report that are not part of its
+# ``totalTokens``: the room that is still free and the room kept back for
+# auto-compact. Deferred categories (``isDeferred``, tools that load only
+# when the model searches for them) are not part of it either.
+_CONTEXT_ROOM_CATEGORIES = frozenset({"Free space", "Autocompact buffer"})
+
+
+def context_breakdown(report: dict[str, Any]) -> dict[str, Any]:
+    """The ``AgentClient.context_usage`` shape of the CLI's context report
+    (``get_context_usage``). Categories with no tokens are left out."""
+    categories = [
+        {"name": str(c.get("name") or ""), "tokens": int(c.get("tokens") or 0)}
+        for c in report.get("categories") or []
+        if not c.get("isDeferred")
+        and c.get("name") not in _CONTEXT_ROOM_CATEGORIES
+        and (c.get("tokens") or 0) > 0
+    ]
+    threshold = report.get("autoCompactThreshold")
+    return {
+        "total_tokens": int(report.get("totalTokens") or 0),
+        "max_tokens": int(report.get("rawMaxTokens") or report.get("maxTokens") or 0),
+        "auto_compact_threshold": (
+            int(threshold) if threshold and report.get("isAutoCompactEnabled") else None
+        ),
+        "categories": categories,
+    }
+
+
 def _translate_tool_result(
     block: ToolResultBlock, parent_id: str | None,
     *, structured: dict[str, Any] | None = None,
@@ -504,6 +532,7 @@ class ClaudeBackend:
         reports_context_window=False,
         supports_task_stop=True,
         supports_agent_transcripts=True,
+        supports_compact=True,
     )
 
     def __init__(self, deps: Any):
@@ -708,6 +737,7 @@ class ClaudeBackend:
             env=self._build_env(
                 cache_ttl=spec.cache_ttl,
                 inference_principal=spec.inference_principal,
+                inference_trigger=spec.inference_trigger,
             ),
             cwd=spec.cwd,
             # Load no filesystem settings/memory: Nerve owns the entire
@@ -812,11 +842,13 @@ class ClaudeBackend:
 
     def _build_env(
         self, cache_ttl: str = "5m", inference_principal: str | None = None,
+        inference_trigger: str | None = None,
     ) -> dict[str, str]:
         """Build environment variables for the SDK subprocess.
 
-        ``inference_principal``: the principal that every model request of
-        the process names (external mode; see nerve.inference_principal).
+        ``inference_principal`` and ``inference_trigger``: the principal and
+        the trigger that every model request of the process names (external
+        mode; see nerve.inference_principal).
         """
         config = self.config
         env: dict[str, str] = {}
@@ -889,7 +921,7 @@ class ClaudeBackend:
                 env[env_name] = str(target)
         # The SDK merges this dict over Nerve's own environment, so an
         # inherited ANTHROPIC_CUSTOM_HEADERS is kept and extended here.
-        env.update(custom_headers_env(inference_principal))
+        env.update(custom_headers_env(inference_principal, trigger=inference_trigger))
         return env
 
     def _build_mcp_servers(self, session_id: str) -> dict[str, Any]:
@@ -1209,6 +1241,10 @@ def _build_transport(options: ClaudeAgentOptions, extras: dict[str, Any]) -> Any
 STOP_TASK_TIMEOUT = 10.0
 # The raw interrupt control request (cancel_queued) waits at most this long.
 INTERRUPT_TIMEOUT = 10.0
+# The get_context_usage control request waits at most this long.
+CONTEXT_USAGE_TIMEOUT = 10.0
+# The CLI command that replaces the conversation with a summary.
+COMPACT_COMMAND = "/compact"
 
 
 class ClaudeClient(AgentClient):
@@ -1280,6 +1316,25 @@ class ClaudeClient(AgentClient):
                 await self._sdk.query(_prompt())
             else:
                 await self._sdk.query(self._escape_slash(turn.text))
+        except CLIConnectionError as e:
+            raise TransportDiedError(str(e)) from e
+
+    async def context_usage(self) -> dict[str, Any]:
+        """The CLI's context report, idle or while a turn runs."""
+        try:
+            report = await asyncio.wait_for(
+                self._sdk.get_context_usage(), timeout=CONTEXT_USAGE_TIMEOUT,
+            )
+        except CLIConnectionError as e:
+            raise TransportDiedError(str(e)) from e
+        return context_breakdown(report)
+
+    async def start_compact(self) -> None:
+        # The CLI's own slash command, so not through _escape_slash. It ends
+        # with one result. A ``compact_boundary`` system frame comes before
+        # the result only when the CLI compacted something.
+        try:
+            await self._sdk.query(COMPACT_COMMAND)
         except CLIConnectionError as e:
             raise TransportDiedError(str(e)) from e
 

@@ -505,6 +505,32 @@ class TestMessageEvents:
         assert msg.metadata["message_id"] == "1.1"
 
     @pytest.mark.asyncio
+    async def test_a_channel_message_names_its_channel_from_a_cached_lookup(self):
+        channel = _channel(allow_users=["U1"])
+        channel._web.conversations_info = AsyncMock(
+            return_value={"channel": {"name": "design-review"}},
+        )
+        for ts in ("1.1", "2.1"):
+            await channel._handle_message_event({
+                "type": "message", "channel": "C1", "channel_type": "channel",
+                "user": "U1", "ts": ts, "text": "<@U0BOT> hi",
+            })
+            msg = channel.router.handle_message.await_args[0][0]
+            assert msg.conversation_title == "design-review"
+        channel._web.conversations_info.assert_awaited_once_with(channel="C1")
+
+    @pytest.mark.asyncio
+    async def test_a_direct_message_has_no_channel_name(self):
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
+        channel._web.conversations_info = AsyncMock()
+        await channel._handle_message_event({
+            "type": "message", "channel": "D1", "channel_type": "im",
+            "user": "U1", "ts": "1.1", "text": "hello",
+        })
+        assert channel.router.handle_message.await_args[0][0].conversation_title == ""
+        channel._web.conversations_info.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_a_message_refused_by_a_drain_posts_no_second_error(self):
         """The stream adapter sends the engine's error. The handler posts nothing."""
         channel = _channel(allow_users=["U1"], allow_direct_messages=True)

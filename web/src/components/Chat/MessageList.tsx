@@ -1,7 +1,8 @@
 import { useEffect, useLayoutEffect, useRef, useCallback, useState, memo } from 'react';
 import { Link } from 'react-router-dom';
-import type { ChatMessage } from '../../types/chat';
+import type { ChatMessage, Session } from '../../types/chat';
 import { useVisibleActorIds } from '../../stores/actorStore';
+import { useAgentStore } from '../../stores/agentStore';
 import { useAuthStore } from '../../stores/authStore';
 import { useChatStore } from '../../stores/chatStore';
 import { providerConfigured, stepById, useSetupStore } from '../../stores/setupStore';
@@ -12,13 +13,17 @@ import { AssistantMessage } from './AssistantMessage';
 import { StreamingMessage } from './StreamingMessage';
 import { SelectionToolbar } from './SelectionToolbar';
 import { MessageActions } from './MessageActions';
+import { SessionOriginLine } from './SessionOrigin';
 import { GitBranch } from '../ui/icons';
 import { followScrollEnd } from '../../utils/followScrollEnd';
 import { recentMessageStart } from '../../utils/recentMessageWindow';
 
-function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }: {
+function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks, unlistedSession }: {
   messages: ChatMessage[];
   isStreaming: boolean;
+  /** The open session's row when no loaded session list has it, for the
+      origin line. */
+  unlistedSession?: Session | null;
   /** Fork the chat from a specific message (undefined = feature unavailable
       for this session, e.g. a virtual chat). */
   onForkMessage?: (messageId: number) => void;
@@ -60,6 +65,11 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
   // A message-anchored fork resolves to a backend-native turn; sessions
   // predating turn recording can only be forked whole (header action).
   const hasForkAnchors = messages.some(m => m.native_turn_id != null);
+
+  // A message waiting in the turn queue (an echo from another tab) shows as
+  // a queue row above the composer, not as a bubble, until it starts.
+  const queue = useAgentStore(s => s.queue);
+  const queuedMsgIds = new Set(queue.map(q => q.client_msg_id));
 
   const viewerActorId = useAuthStore((s) => s.viewer?.id ?? null);
   const namedSenders = useVisibleActorIds(
@@ -155,6 +165,8 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
         )
       )}
 
+      {messages.length > 0 && <SessionOriginLine unlisted={unlistedSession} />}
+
       {visibleStart > 0 && (
         <div className="flex justify-center py-3">
           <button
@@ -168,6 +180,7 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
       )}
 
       {visibleMessages.map((msg, i) => {
+        if (msg.role === 'user' && msg.client_msg_id && queuedMsgIds.has(msg.client_msg_id)) return null;
         // "Fork from here" needs a persisted row id (live-streamed messages
         // gain one on the next reload) and at least one native turn mapping
         // in the transcript to anchor the branch to.

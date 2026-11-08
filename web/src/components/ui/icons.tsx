@@ -18,7 +18,7 @@ export type { LucideIcon as Icon } from 'lucide-react';
 
 export {
   Activity, AlertCircle, AlertTriangle, Archive, ArchiveRestore, ArrowLeft,
-  ArrowRight, ArrowUpRight, Ban, BarChart3, Bell, BellOff, BookOpen, Bot, Brain,
+  ArrowRight, ArrowUp, ArrowUpRight, Ban, BarChart3, Bell, BellOff, BellRing, BookOpen, Bot, Brain,
   Calendar, Check, CheckCheck, CheckCircle, CheckCircle2, CheckSquare,
   ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Circle, CircleCheck, Cloud,
   KeyRound, ListChecks, ListTree, LocateFixed, PartyPopper,
@@ -26,9 +26,10 @@ export {
   Columns3, Copy, CornerDownLeft, Cpu, Database, DollarSign, Download,
   Edit3, ExternalLink, Eye, EyeOff, File, FileCheck, FileDiff, FileEdit,
   FilePlus, FileText, FileX, Files, Filter, Folder, FolderOpen, GitBranch,
+  GitMerge, GitPullRequest, GitPullRequestClosed, GitPullRequestDraft,
   Github, Globe, GripVertical, Hammer, HardDrive, HelpCircle, History,
   Hourglass, Inbox, Lightbulb, List, ListTodo, Loader2, Lock, LogOut, Mail,
-  Maximize2, MessageCircle, MessageCircleQuestion, MessageSquare, Monitor,
+  Maximize2, MessageCircle, MessageCircleQuestion, MessageSquare, MessagesSquare, Minus, Monitor,
   Moon, MoreHorizontal, OctagonX, PanelLeftClose, PanelLeftOpen, Paperclip,
   Pause, Pencil, Play, Plug, Plus, Radio, RefreshCw, Repeat, Reply, Rocket,
   RotateCcw, RotateCw, Save, Search, SearchCheck, Send, Server, Settings,
