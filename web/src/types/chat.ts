@@ -120,10 +120,35 @@ export interface ChatMessage {
   client_msg_id?: string | null;
 }
 
+/** The kind of event that started a session: a closed vocabulary that the
+    server sets once, when it creates the session. */
+export type SessionTrigger =
+  | 'chat' | 'api' | 'slack' | 'telegram' | 'email' | 'cron' | 'plan'
+  | 'workflow' | 'external' | 'system' | 'unknown';
+
+/** Details of where a session comes from. Each key is optional. */
+export interface SessionOriginDetail {
+  channel?: string;
+  channel_name?: string;
+  thread?: string;
+  cron_job?: string;
+  run_later?: string;
+  plan_id?: string;
+  task_id?: string;
+  fork_of?: string;
+  workflow_run?: string;
+  client?: string;
+  hook?: string;
+}
+
 export interface Session {
   id: string;
   title: string;
   source: string;
+  trigger?: SessionTrigger;
+  /** One short sentence, for example "Started from Slack #general". */
+  origin_label?: string;
+  origin_detail?: SessionOriginDetail;
   /** Who created this session: an actor id to resolve against
       GET /api/actors. Null for legacy sessions and unidentified external
       people. This is an actor id, not an account id. */
@@ -176,6 +201,24 @@ export interface Session {
     spent_usd?: number;
     updated_at?: string;
   };
+  /** What waits for the user in this session (GET /api/sessions). */
+  attention?: SessionAttention;
+}
+
+/** The pending items of a session that need the user. The two booleans
+    are true at fetch time; the live `awaiting_input` and
+    `review_loop.status` of the session take precedence over them. */
+export interface SessionAttention {
+  /** Pending ask_user questions. */
+  questions: number;
+  /** Pending approvals (propose_action). */
+  approvals: number;
+  /** Pending plans that this session proposed. */
+  plans: number;
+  /** A question inside a running turn. */
+  awaiting_input: boolean;
+  /** The newest review loop waits for a decision. */
+  review: boolean;
 }
 
 export type AgentStatus =
@@ -185,12 +228,13 @@ export type AgentStatus =
   | { state: 'writing' };
 
 export interface PanelTab {
-  id: string;              // toolUseId; 'agents-panel'; `agent:<agentId>`
+  id: string;              // toolUseId; 'agents-panel'; 'tasks-panel'; `agent:<agentId>`
   /** 'agents' is the singleton Agents roster; 'agent' is one agent's live
-   *  transcript; 'subagent' stays for the legacy result-only tab of old
-   *  history (no agent record). */
-  type: 'plan' | 'subagent' | 'files' | 'workflow' | 'agents' | 'agent';
-  label: string;           // "Plan", "Explore", "Agent", "Files", "Workflow"
+   *  transcript; 'tasks' is the singleton list of the session's tasks;
+   *  'subagent' stays for the legacy result-only tab of old history (no
+   *  agent record). */
+  type: 'plan' | 'subagent' | 'files' | 'workflow' | 'agents' | 'agent' | 'tasks';
+  label: string;           // "Plan", "Explore", "Agent", "Files", "Workflow", "Tasks"
   subagentType: string;    // "Plan", "Explore", "general-purpose", "Workflow"
   description: string;
   model?: string;

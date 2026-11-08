@@ -15,6 +15,12 @@
     <!-- Served from the workspace config subtree when a favicon is tracked
          there, 404 otherwise. Not a bundled asset: it is per-instance config. -->
     <link rel="icon" href="/favicon.ico" />
+    <!-- The manifest names the installed panel after the agent (a backend
+         route, like the favicon). use-credentials: a sign-in gateway in
+         front of the instance gets its cookie. -->
+    <link rel="manifest" href="/api/manifest.webmanifest" crossorigin="use-credentials" />
+    <!-- The Home Screen icon on iPhone and iPad. -->
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
     <title>Nerve</title>
     <!-- Pre-paint theme stamp. Must mirror themeStore's getInitialPreference()
          and resolve() exactly, or the first frame disagrees with the app.

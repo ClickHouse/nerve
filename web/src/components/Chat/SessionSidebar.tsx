@@ -1,6 +1,6 @@
 import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, Hammer, MoreHorizontal, Star, StarFilled, Pencil, Trash2, Archive, ArchiveRestore, Repeat, Unlink, GitBranch } from '../ui/icons';
+import { Plus, X, MessageSquare, ChevronRight, ChevronDown, Bot, Loader2, Search, MoreHorizontal, Star, StarFilled, Pencil, Trash2, Archive, ArchiveRestore, Repeat, Unlink, GitBranch } from '../ui/icons';
 import { Button, IconButton, TextField } from '../ui';
 import type { Session, AgentStatus } from '../../types/chat';
 import { groupByDate, parseTimestamp, loadCollapsedGroups, saveCollapsedGroups, loadExpandedParents, saveExpandedParents } from '../../utils/dateGroups';
@@ -9,20 +9,18 @@ import { useChatStore } from '../../stores/chatStore';
 import { useVisibleActorIds } from '../../stores/actorStore';
 import { useAuthStore } from '../../stores/authStore';
 import { SessionCreatorMarker } from './ActorLabel';
+import { SessionOriginIcon } from './SessionOrigin';
 import { useActorAttributionLabel } from '../../hooks/useActorAttribution';
 import { useModalSurface } from '../../hooks/useModalSurface';
 import { safeAreaInsets } from '../../utils/safeArea';
 import { forkChat } from '../../utils/forkChat';
+import { ATTENTION_TONE, blockedOnYou, needsYou } from '../../utils/sessionAttention';
+import { AttentionReason, SessionListSummary, WaitingMark } from './SessionAttention';
 
 /** Strip leading '#' and 'Implement: ' prefixes from generated titles. */
 function cleanTitle(session: Session): string {
   const raw = session.title || session.id;
   return raw.replace(/^#+\s*/, '').replace(/^Implement:\s*/i, '');
-}
-
-/** Check if this session is an async plan implementation. */
-function isImplementSession(session: Session): boolean {
-  return /^(#+\s*)?Implement:\s/i.test(session.title || '');
 }
 
 /** Format a date string as a short relative/absolute label. */
@@ -44,6 +42,9 @@ function formatShortDate(dateStr: string): string {
 // Collapsed-group persistence (Running / Starred / date buckets, keyed by the
 // group's visible label) lives in utils/dateGroups next to the bucket
 // taxonomy and its default-collapsed set.
+
+/** Label (and collapsed-state key) of the group of sessions that wait for the user. */
+const NEEDS_YOU = 'Needs you';
 
 /** Order by last message activity, newest first (opening/starring doesn't bump it). */
 const byUpdatedDesc = (a: Session, b: Session) =>
@@ -69,18 +70,25 @@ type RowDnd = {
   onDrop: (id: string) => void;
 };
 
-export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate, onDelete, collapsed, mobile = false, onRequestClose }: {
+/**
+ * Where the list is laid out: `column` is the resizable column next to the
+ * chat (desktop), `drawer` an off-canvas drawer over the chat (phone), and
+ * `page` the whole page above a composer (the phone's Inbox).
+ */
+export type SessionListLayout = 'column' | 'drawer' | 'page';
+
+export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate, onDelete, collapsed, layout = 'column', onRequestClose }: {
   sessions: Session[];
   activeSession: string;
   agentStatus: AgentStatus;
   onCreate: () => void;
   onDelete: (id: string) => void;
   collapsed?: boolean;
-  /** Render as an off-canvas drawer instead of an inline column. */
-  mobile?: boolean;
+  layout?: SessionListLayout;
   /** Drawer mode only — tapping the scrim asks the parent to close. */
   onRequestClose?: () => void;
 }) {
+  const drawer = layout === 'drawer';
   const [systemExpanded, setSystemExpanded] = useState(false);
   // Archived group: collapsed by default and NOT persisted (mirrors System), so every reload starts collapsed and fetches nothing until expanded.
   const [archivedExpanded, setArchivedExpanded] = useState(false);
@@ -150,14 +158,14 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   // containment, Escape, and focus restoration. Declared before the search
   // effects below so that when Cmd+K opens the drawer and asks for search
   // focus in the same tick, the search input wins the race.
-  const drawerOpen = mobile && !collapsed;
+  const drawerOpen = drawer && !collapsed;
   const { dialogProps } = useModalSurface<HTMLDivElement>(drawerOpen, onRequestClose);
 
   // Opening a conversation should reveal it, so every row dismisses the
   // drawer. Leaving this to the parent's `activeSession` watcher isn't enough:
   // re-tapping the conversation that is already open never changes the route,
   // and the drawer would stay parked over the transcript.
-  const handleSelect = mobile ? onRequestClose : undefined;
+  const handleSelect = drawer ? onRequestClose : undefined;
 
   // Drag-to-resize the session list. It is left-anchored against the nav rail,
   // so the width tracks the cursor 1:1. The width transition is disabled while
@@ -290,14 +298,15 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   // to whatever depth the data carries — no client-side cap). A session whose
   // parent isn't in the feed (not returned under the page limit, archived, or
   // deleted) stays top-level, so the client draws exactly the hierarchy the
-  // server sent and nothing more.
+  // server sent and nothing more. A session that needs you is never nested:
+  // it shows in the "Needs you" group, not inside a collapsed parent.
   const { childrenByParent, topLevel } = useMemo(() => {
     const byId = new Map(conversations.map(s => [s.id, s]));
     const kids = new Map<string, Session[]>();
     const top: Session[] = [];
     for (const s of conversations) {
       const pid = s.parent_session_id;
-      if (pid && pid !== s.id && byId.has(pid)) {
+      if (pid && pid !== s.id && byId.has(pid) && !needsYou(s)) {
         const arr = kids.get(pid);
         if (arr) arr.push(s); else kids.set(pid, [s]);
       } else {
@@ -308,24 +317,28 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
     return { childrenByParent: kids, topLevel: top };
   }, [conversations]);
 
-  // Split TOP-LEVEL conversations into pinned Running / Starred / rest. Children
+  // Split TOP-LEVEL conversations into pinned Needs you / Running / Starred /
+  // rest. Each session is in one group only, the first that applies. Children
   // never appear here — they ride under their parent wherever it renders,
   // including inside the pinned Starred group.
-  const { pinnedRunning, pinnedStarred, restConversations } = useMemo(() => {
+  const { pinnedNeedsYou, pinnedRunning, pinnedStarred, restConversations } = useMemo(() => {
+    const waiting: Session[] = [];
     const running: Session[] = [];
     const starred: Session[] = [];
     const rest: Session[] = [];
     for (const s of topLevel) {
       const isRunning = s.id === activeSession ? activeIsRunning : !!s.is_running;
+      if (needsYou(s)) waiting.push(s);
       // Parked sessions count as running: work is still pending, it just
       // isn't executing this second.
-      if (isRunning || isParked(s)) running.push(s);
+      else if (isRunning || isParked(s)) running.push(s);
       else if (s.starred) starred.push(s);
       else rest.push(s);
     }
+    waiting.sort(byUpdatedDesc);
     starred.sort(byUpdatedDesc);
     rest.sort(byUpdatedDesc);
-    return { pinnedRunning: running, pinnedStarred: starred, restConversations: rest };
+    return { pinnedNeedsYou: waiting, pinnedRunning: running, pinnedStarred: starred, restConversations: rest };
   }, [topLevel, activeSession, activeIsRunning]);
 
   const groupedConversations = useMemo(() => groupByDate(restConversations), [restConversations]);
@@ -428,7 +441,8 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
   useEffect(() => {
     if (!activeSession || autoExpandedForRef.current === activeSession) return;
     let label: string | null = null;
-    if (pinnedRunning.some(s => s.id === activeSession)) label = 'Running';
+    if (pinnedNeedsYou.some(s => s.id === activeSession)) label = NEEDS_YOU;
+    else if (pinnedRunning.some(s => s.id === activeSession)) label = 'Running';
     else if (pinnedStarred.some(s => s.id === activeSession)) label = 'Starred';
     else label = groupedConversations.find(g => g.items.some(s => s.id === activeSession))?.group ?? null;
     if (!label) return; // not located yet (sessions still loading) — retry on the next update
@@ -441,7 +455,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
       saveCollapsedGroups(next);
       return next;
     });
-  }, [activeSession, pinnedRunning, pinnedStarred, groupedConversations]);
+  }, [activeSession, pinnedNeedsYou, pinnedRunning, pinnedStarred, groupedConversations]);
 
   // Never leave the active session hidden inside a collapsed parent: expand its
   // whole ancestor chain when it (or the feed) changes. The seen-set guards any
@@ -482,21 +496,28 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
         />
       )}
     <div
-      {...(mobile ? dialogProps : {})}
-      aria-label={mobile ? 'Conversations' : undefined}
-      className={mobile
+      {...(drawer ? dialogProps : {})}
+      aria-label={drawer ? 'Conversations' : undefined}
+      // In page mode the list is a whole phone page: the
+      // `in-data-[layout=page]:` classes below give each row a touch target
+      // of about 44 px and the text size of a page, with no prop through
+      // each row.
+      data-layout={layout}
+      className={drawer
         ? `bg-surface border-r border-border-subtle flex flex-col overflow-hidden fixed inset-y-0 left-0 z-50 w-[85vw] max-w-[320px] transition-transform duration-200 outline-none ${collapsed ? '-translate-x-full' : 'translate-x-0'}`
+        : layout === 'page'
+        ? 'bg-bg flex flex-col flex-1 min-h-0 overflow-hidden'
         : `bg-surface border-r border-border-subtle flex flex-col shrink-0 overflow-hidden relative ${collapsed ? 'border-r-0' : ''} ${isDragging ? '' : 'transition-all duration-200'}`}
       // Fixed in drawer mode, so the shell's safe-area padding does not reach
       // it: without this its first controls sit under the status bar.
-      style={mobile ? safeAreaInsets('left') : { width: collapsed ? 0 : sidebarWidth }}
+      style={drawer ? safeAreaInsets('left') : layout === 'page' ? undefined : { width: collapsed ? 0 : sidebarWidth }}
       // Keep the closed drawer out of the tab order: it stays mounted so the
       // slide transition has something to animate, but it is off-canvas.
-      inert={mobile && collapsed ? true : undefined}
+      inert={drawer && collapsed ? true : undefined}
     >
       {/* Drag-to-resize handle on the right edge (hidden when collapsed).
-          Pointer-driven and mouse-only, so it has no place in drawer mode. */}
-      {!collapsed && !mobile && (
+          Pointer-driven and mouse-only, so only the column has it. */}
+      {!collapsed && layout === 'column' && (
         <div
           onMouseDown={handleResizeStart}
           className="group/resize absolute top-0 right-0 bottom-0 z-20 w-2 cursor-col-resize"
@@ -610,13 +631,17 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
           </div>
         ) : (
           <>
+            {conversations.length > 0 && (
+              <SessionListSummary needsYou={pinnedNeedsYou.length} running={pinnedRunning.length} />
+            )}
+
             {/* Virtual "new chat" — pinned at the very top until the first
                 message materializes it server-side. */}
             {virtualSession && (
               <Link
                 to={`/chat/${virtualSession.id}`}
                 onClick={handleSelect}
-                className={`group flex items-center gap-2 px-3 py-1.5 mx-1 mt-1 rounded-md cursor-pointer text-xs transition-colors no-underline
+                className={`group flex items-center gap-2 px-3 py-1.5 in-data-[layout=page]:py-3 mx-1 mt-1 rounded-md cursor-pointer text-xs transition-colors no-underline
                   ${virtualSession.id === activeSession
                     ? 'bg-accent/10 text-text'
                     : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
@@ -624,7 +649,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
               >
                 <MessageSquare size={13} className="shrink-0 opacity-50" />
                 <div className="flex-1 min-w-0">
-                  <div className="truncate text-xs leading-tight italic">New chat</div>
+                  <div className="truncate text-xs in-data-[layout=page]:text-sm leading-tight italic">New chat</div>
                 </div>
                 {virtualSession.id === activeSession && activeIsRunning && (
                   <Loader2 size={12} className="shrink-0 text-accent animate-spin" />
@@ -638,6 +663,21 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                   <X size={13} />
                 </IconButton>
               </Link>
+            )}
+
+            {/* Sessions with a question, an approval, a plan or a review
+                loop that waits for the user */}
+            {pinnedNeedsYou.length > 0 && (
+              <div>
+                <GroupHeader
+                  label={NEEDS_YOU}
+                  count={pinnedNeedsYou.length}
+                  collapsed={collapsedGroups.has(NEEDS_YOU)}
+                  tone={ATTENTION_TONE}
+                  onToggle={() => toggleGroup(NEEDS_YOU)}
+                />
+                {!collapsedGroups.has(NEEDS_YOU) && pinnedNeedsYou.map(renderTree)}
+              </div>
             )}
 
             {/* Pinned running sessions */}
@@ -670,7 +710,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
             )}
 
             {/* Normal date-grouped view */}
-            {groupedConversations.length === 0 && pinnedRunning.length === 0 && pinnedStarred.length === 0 && !virtualSession && (
+            {groupedConversations.length === 0 && pinnedNeedsYou.length === 0 && pinnedRunning.length === 0 && pinnedStarred.length === 0 && !virtualSession && (
               <div className="px-3 py-2 text-xs text-text-faint">No conversations yet</div>
             )}
 
@@ -749,13 +789,13 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                         key={s.id}
                         to={`/chat/${s.id}`}
                         onClick={handleSelect}
-                        className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-xs leading-tight transition-colors no-underline
+                        className={`group flex items-center gap-2 px-3 py-1.5 in-data-[layout=page]:py-3 mx-1 rounded-md cursor-pointer text-xs in-data-[layout=page]:text-sm leading-tight transition-colors no-underline
                           ${s.id === activeSession
                             ? 'bg-accent/10 text-text-muted'
                             : 'text-text-faint hover:bg-surface-raised hover:text-text-muted'
                           }`}
                       >
-                        <Bot size={11} className="shrink-0" />
+                        <SessionOriginIcon session={s} />
                         <div className="flex-1 min-w-0">
                           <div className="truncate">{cleanTitle(s)}</div>
                         </div>
@@ -875,13 +915,13 @@ function GroupHeader({ label, count, collapsed, tone, onToggle }: {
       fullWidth
       onClick={onToggle}
       aria-expanded={!collapsed}
-      className="justify-start gap-1 px-3 pt-2 pb-0.5 rounded-none text-left"
+      className="justify-start gap-1 px-3 pt-2 pb-0.5 in-data-[layout=page]:pt-4 in-data-[layout=page]:pb-1 rounded-none text-left"
     >
       {collapsed
         ? <ChevronRight size={10} className="shrink-0 text-text-faint" />
         : <ChevronDown size={10} className="shrink-0 text-text-faint" />
       }
-      <span className={`text-2xs font-medium ${tone ?? 'text-text-faint'}`}>{label}</span>
+      <span className={`text-2xs in-data-[layout=page]:text-xs font-medium ${tone ?? 'text-text-faint'}`}>{label}</span>
       {collapsed && count > 0 && (
         <span className="text-2xs text-text-faint tabular-nums">{count}</span>
       )}
@@ -957,27 +997,11 @@ function StatusIndicator({ session, isActive, isRunning }: {
   isActive: boolean;
   isRunning: boolean;
 }) {
-  // Waiting for user input (AskUserQuestion / plan mode): pulsing blue dot.
-  // Takes priority over the running spinner/dot — the session is paused, not
-  // working, and needs the user's attention.
-  if (session.awaiting_input) {
-    return (
-      <span className="relative flex h-2 w-2 shrink-0" title="Waiting for your input">
-        <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-blue opacity-75" />
-        <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-blue" />
-      </span>
-    );
-  }
-
-  // Review loop parked on a decision: pulsing orange dot — same "needs you"
-  // urgency class as awaiting_input.
-  if (session.review_loop?.status === 'awaiting_user') {
-    return (
-      <span className="relative flex h-2 w-2 shrink-0" title="Review loop needs your decision">
-        <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-orange opacity-75" />
-        <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-orange" />
-      </span>
-    );
+  // Blocked on the user (a question, an approval, a review loop on a
+  // decision): a red "!" in place of the dot. A running turn keeps its dot,
+  // except when the turn itself waits (AskUserQuestion / plan mode).
+  if (session.awaiting_input || (!isRunning && blockedOnYou(session))) {
+    return <WaitingMark session={session} />;
   }
 
   // Review loop leg working: the observer session itself is idle (legs run
@@ -1121,7 +1145,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
   /** Feed-only: light up an "unread" marker when updated since last opened. */
   showUnread?: boolean;
   /** Nesting: depth (0 = top level) indents the row; a parent shows a
-      chevron in place of its icon that toggles its children. */
+      chevron before its icon that toggles its children. */
   depth?: number;
   hasChildren?: boolean;
   /** Direct-child count, shown as a badge when the parent is collapsed. */
@@ -1222,32 +1246,29 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
       onDragLeave={dnd ? () => dnd.onDragLeave(session.id) : undefined}
       onDrop={dnd ? (e) => { e.preventDefault(); e.stopPropagation(); dnd.onDrop(session.id); } : undefined}
       style={depth ? { paddingLeft: 12 + depth * 16 } : undefined}
-      className={`group flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md cursor-pointer text-xs transition-colors no-underline
+      className={`group flex items-center gap-2 px-3 py-1.5 in-data-[layout=page]:py-3 mx-1 rounded-md cursor-pointer text-xs transition-colors no-underline
         ${isActive
           ? 'bg-accent/10 text-text'
           : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
         }${isDropTarget ? ' ring-2 ring-inset ring-accent bg-accent/10' : ''}${isDragSource ? ' opacity-50' : ''}`}
     >
-      {hasChildren ? (
+      {hasChildren && (
         <button
           type="button"
           onClick={(e) => { e.preventDefault(); e.stopPropagation(); onToggleExpand?.(session.id); }}
-          className="shrink-0 -ml-0.5 p-0.5 rounded text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer"
+          className="shrink-0 -ml-0.5 -mr-1 p-0.5 rounded text-text-faint hover:text-text-muted hover:bg-surface-hover cursor-pointer"
           title={expanded ? 'Collapse children' : 'Expand children'}
         >
           {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         </button>
-      ) : session.review_loop ? (
+      )}
+      <SessionOriginIcon session={session} />
+      {session.review_loop && (
         <Repeat size={13} className={`shrink-0 ${reviewLoopIconTone(session.review_loop.status)}`} />
-      ) : isImplementSession(session) ? (
-        <Hammer size={13} className="shrink-0 text-hue-cyan/70" />
-      ) : session.id.startsWith('fork-') ? (
-        <GitBranch size={13} className="shrink-0 text-hue-violet/70" />
-      ) : (
-        <MessageSquare size={13} className="shrink-0 opacity-50" />
       )}
       <div className="flex-1 min-w-0">
-        <div className={`truncate text-xs leading-tight${isUnread ? ' font-semibold text-text' : ''}`}>{cleanTitle(session)}</div>
+        <div className={`truncate text-xs in-data-[layout=page]:text-sm leading-tight${isUnread ? ' font-semibold text-text' : ''}`}>{cleanTitle(session)}</div>
+        <AttentionReason session={session} />
       </div>
 
       {session.created_by_actor_id && namedCreators?.has(session.created_by_actor_id) && (

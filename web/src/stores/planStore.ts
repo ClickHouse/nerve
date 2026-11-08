@@ -1,5 +1,17 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { reloadSessionsSoon } from './helpers/sessionsReload';
+
+/** The implementation session of an approved plan: GET /api/plans/{id} only. */
+export interface ImplSession {
+  id: string;
+  title: string | null;
+  updated_at: string | null;
+  is_running: boolean;
+  awaiting_input: boolean;
+  /** No turn runs, but a wake-up is scheduled or background work runs. */
+  parked: boolean;
+}
 
 export interface Plan {
   id: string;
@@ -9,6 +21,8 @@ export interface Plan {
   impl_session_id: string | null;
   status: string;
   content: string;
+  /** Up to 3 short lines from the agent that wrote the plan. Null when it gave none. */
+  summary?: string | null;
   feedback: string | null;
   version: number;
   parent_plan_id: string | null;
@@ -23,6 +37,8 @@ export interface Plan {
   // Who wrote this version and on whose behalf. Null on older rows.
   created_by_actor_id?: string | null;
   caused_by_actor_id?: string | null;
+  /** Null when the plan has no implementation session or its row is gone. */
+  impl_session?: ImplSession | null;
 }
 
 interface PlanState {
@@ -37,10 +53,11 @@ interface PlanState {
   loadPlans: () => Promise<void>;
   setFilter: (f: string) => void;
   loadPlan: (id: string) => Promise<void>;
+  /** Load the open plan again, without the loading state. */
+  refreshPlan: (id: string) => Promise<void>;
   updatePlan: (id: string, status: string, feedback?: string) => Promise<void>;
   approvePlan: (id: string) => Promise<{ impl_session_id: string } | null>;
   revisePlan: (id: string, feedback: string) => Promise<boolean>;
-  clearActionError: () => void;
   clearSelectedPlan: () => void;
 }
 
@@ -63,13 +80,20 @@ function extractErrorMessage(err: unknown, fallback: string): string {
   return body || fallback;
 }
 
+/** Plan statuses after implementing. */
+const TERMINAL = new Set(['done', 'failed']);
+
 export const usePlanStore = create<PlanState>((set, get) => {
   // After a decision, install the plan as the server stored it: the
   // reviewer columns and a status that another decision set come from there.
   async function reloadSelected(id: string): Promise<void> {
     try {
       const plan = await api.getPlan(id);
-      if (get().selectedPlan?.id === id) set({ selectedPlan: plan });
+      const open = get().selectedPlan;
+      // Loads can overlap. A plan never goes back to implementing from done
+      // or failed, so such an answer is older than the plan on screen.
+      const stale = plan.status === 'implementing' && TERMINAL.has(open?.status ?? '');
+      if (open?.id === id && !stale) set({ selectedPlan: plan });
     } catch (e) {
       console.error('Failed to reload plan:', e);
     }
@@ -111,10 +135,14 @@ export const usePlanStore = create<PlanState>((set, get) => {
       }
     },
 
+    refreshPlan: reloadSelected,
+
     updatePlan: async (id: string, status: string, feedback?: string) => {
-      set({ actionLoading: true });
+      set({ actionLoading: true, actionError: null });
       try {
         await api.updatePlan(id, { status, feedback });
+        // The plan leaves the "Needs you" group of the session list.
+        reloadSessionsSoon();
         const sel = get().selectedPlan;
         if (sel && sel.id === id) {
           set({ selectedPlan: { ...sel, status, ...(feedback ? { feedback } : {}) } });
@@ -123,15 +151,18 @@ export const usePlanStore = create<PlanState>((set, get) => {
         get().loadPlans();
       } catch (e) {
         console.error('Failed to update plan:', e);
+        set({ actionError: extractErrorMessage(e, 'Failed to update the plan') });
       } finally {
         set({ actionLoading: false });
       }
     },
 
     approvePlan: async (id: string) => {
-      set({ actionLoading: true });
+      set({ actionLoading: true, actionError: null });
       try {
         const result = await api.approvePlan(id);
+        // The plan leaves the "Needs you" group of the session list.
+        reloadSessionsSoon();
         const sel = get().selectedPlan;
         if (sel && sel.id === id) {
           set({ selectedPlan: { ...sel, status: 'implementing', impl_session_id: result.impl_session_id } });
@@ -141,6 +172,7 @@ export const usePlanStore = create<PlanState>((set, get) => {
         return result;
       } catch (e) {
         console.error('Failed to approve plan:', e);
+        set({ actionError: extractErrorMessage(e, 'Failed to approve the plan') });
         return null;
       } finally {
         set({ actionLoading: false });
@@ -166,7 +198,6 @@ export const usePlanStore = create<PlanState>((set, get) => {
       }
     },
 
-    clearActionError: () => set({ actionError: null }),
     clearSelectedPlan: () => set({ selectedPlan: null, actionError: null }),
   };
 });

@@ -89,6 +89,8 @@ describe('ChatPage with a wave of agents', () => {
     expect(dock).toHaveTextContent('4 running');
     expect(dock).toHaveAttribute('aria-expanded', 'false');
 
+    // The finished turn folds the spawn calls to one line; it opens to the live lines.
+    fireEvent.click(screen.getByRole('button', { name: 'Started 2 sub-agents' }));
     const running = container.querySelector<HTMLElement>(`[data-agent-spawn="${FX_RUNNING.spawn_tool_use_id}"]`)!;
     expect(within(running).getByText('build-api')).toBeInTheDocument();
     expect(within(running).getByRole('button', { name: 'Stop build-api' })).toBeInTheDocument();

@@ -408,7 +408,7 @@ async def send_file_handler(ctx: ToolContext, args: dict) -> ToolResult:
     """Deliver a file via the channel router.
 
     Telegram → ``send_document``; web panel renders the persisted tool_call
-    block as a download card. Falls back to a web-panel message when the
+    block as the image (image files) or a download card. Falls back to a web-panel message when the
     bound channel cannot deliver files natively.
 
     Workspace containment is enforced via :py:meth:`Path.relative_to` —
@@ -586,8 +586,10 @@ SEND_FILE_SPEC = ToolSpec(
     name="send_file",
     description=(
         "Send a file to the user as a downloadable attachment in the chat. "
-        "On Telegram the file is delivered as a document; on the web panel it appears as an inline "
-        "download card. Use this when the user asks you to share, export, or send them a file."
+        "On Telegram the file is delivered as a document. On the web panel an image (PNG, JPEG, "
+        "GIF, WebP, AVIF, SVG) shows in the chat, and another file shows as a download card. "
+        "Use this when the user asks you to share, export, or send them a file, or to show "
+        "them an image such as a screenshot or a chart."
     ),
     input_schema=SEND_FILE_SCHEMA,
     handler=send_file_handler,

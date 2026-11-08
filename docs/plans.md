@@ -10,7 +10,7 @@ Nerve includes a proactive planner that autonomously picks open tasks, explores 
 Cron (every 4h) → persistent "task-planner" job
   → agent browses tasks, checks memory, picks one worth planning
   → explores codebase with Read, Glob, Grep, Bash, etc.
-  → calls plan_propose(task_id, content) to store the proposal
+  → calls plan_propose(task_id, content, summary) to store the proposal and its short summary
   → the task moves to plan_review, and one notification links to the plan
   → plan appears in /plans UI for review
 
@@ -32,9 +32,10 @@ User reviews (via /plans UI or chat tools)
 | `plan_decline` | Decline a pending plan with optional feedback. Moves the related task to `done` (declining is treated as abandoning the effort, not pausing it). |
 | `plan_revise` | Request revision of a pending plan — sends feedback to the session that proposed it (the planner session for cron-made plans; `cron:task-planner` when the plan records no session), which calls `plan_update` to produce v+1. |
 
-### `plan_propose(task_id, content, plan_type?)`
+### `plan_propose(task_id, content, plan_type?, summary?)`
 
 - Validates the task exists
+- Stores the optional `summary`: up to 3 short lines for the reviewer, at most 400 characters. The tool clips a longer summary and says so in its result. The plan page shows the summary under the title, or the first lines of the plan when there is none.
 - Checks no pending/implementing plan already exists → returns error if duplicate
 - Auto-detects `plan_type` from task source (`skill-extractor` → `skill-create`, etc.)
 - Auto-increments version if previous plans exist for the same task
@@ -65,9 +66,10 @@ User reviews (via /plans UI or chat tools)
 - Spawns `engine.run()` in background (unchanged — the agent decides how to implement)
 - Returns `{ plan_id, impl_session_id }`
 
-### `plan_update(plan_id, content, feedback?)`
+### `plan_update(plan_id, content, feedback?, summary?)`
 
 - Guards: only pending plans can be updated
+- Stores the optional `summary` on the new version, as `plan_propose` does. The summary of the old version is not copied, because it can describe the old content.
 - Marks the old plan as `superseded` (and stores optional `feedback` on it explaining the change)
 - Creates a new plan record: `version = old.version + 1`, `parent_plan_id = old.id`, same `task_id`/`plan_type`, fresh `session_id` from the updating agent
 - Writes a "Plan updated: …" note to task history, with links to both versions
@@ -103,6 +105,8 @@ User reviews (via /plans UI or chat tools)
 | `pending` | Awaiting human review |
 | `approved` | Approved (briefly, before implementation starts) |
 | `implementing` | Implementation session is running |
+| `done` | The task of the plan was marked done. A `failed` plan becomes `done` too when its own implementation session marks the task done |
+| `failed` | The first implementation turn failed: it raised, or it ended with a failed outcome. A task event (`updated`) follows the write |
 | `declined` | Rejected by user |
 | `superseded` | Replaced by a newer version |
 
@@ -124,7 +128,7 @@ When the user requests a revision:
 1. User writes feedback in the plan detail page
 2. API sends feedback as a new message to the session that proposed the plan (the persistent `cron:task-planner` session for its plans)
 3. The agent sees its prior planning context + the feedback
-4. Agent calls `plan_update(plan_id, content, feedback)` — old version becomes `superseded`, new version (v+1) is pending review
+4. Agent calls `plan_update(plan_id, content, summary, feedback)`: the old version becomes `superseded`, and the new version (v+1) waits for review
 5. The two plans stay linked via `parent_plan_id` so reviewers can see what changed
 
 This works because the planner uses a **persistent session** — the agent retains conversation history across triggers and revision requests. The same flow works for any agent refining its own plan in chat — call `plan_update` directly instead of `plan_decline + plan_propose`.
@@ -149,7 +153,7 @@ Plans from the `skill-extractor` and `skill-reviser` cron jobs (`plan_type` `ski
 2. `skill-create` → it calls `skill_create` with the name, description and body; `skill-update` → it calls `skill_update` with the full SKILL.md content
 3. It then calls `task_done` with a note describing what was done
 
-The plan is marked `implementing` on approval and `failed` if the session raises.
+The plan is marked `implementing` on approval and `failed` if the first implementation turn fails.
 
 ## Database
 
@@ -163,6 +167,7 @@ Plans are stored in the `plans` SQLite table (schema v12):
 | `impl_session_id` | TEXT | Implementation session (after approval) |
 | `status` | TEXT | pending/approved/declined/superseded/implementing |
 | `content` | TEXT | Plan markdown |
+| `summary` | TEXT | Short summary from `plan_propose` or `plan_update`; NULL when the agent gave none |
 | `feedback` | TEXT | User revision feedback |
 | `version` | INTEGER | Version number (increments on revision) |
 | `parent_plan_id` | TEXT | Previous version's ID |
@@ -205,14 +210,35 @@ of the same plan can both proceed.
 
 ### Plan Detail (`/plans/:planId`)
 
+- Under the title, the plan's `summary` in up to 3 lines. A plan without one
+  shows its first heading and the two lines after it
 - Rendered markdown plan content
-- Task link + implementation session link (when applicable)
+- Task link
+- For an approved plan, a progress card above the plan: the implementation
+  session's title, its state and the time since the approval, and **Open
+  session**. The state is Running, Waiting on background work (a scheduled
+  wake-up or background work, no turn), Waiting for you (a question, or the
+  turn ended while the task is open), Done (the plan is `done`) or Failed
+  (the plan is `failed` and its session does no work). The page loads the
+  plan again on each `session_running`, `session_awaiting_input`,
+  `session_agents` or `session_updated` event of that session, on each
+  `task_updated` event (`done` or `updated`) of the task, and after a
+  reconnect. It stops when the plan is `done` and the session's last turn
+  ended, so the time is final. A load that answers `implementing` after the
+  page has `done` or `failed` is older and is ignored
 - Who proposed this version and who reviewed the plan, from the writer and
   reviewer columns
-- Action bar for pending plans:
-  - **Approve & Implement** — spawns implementation session, redirects to Chat
-  - **Decline** — marks plan as declined
-  - **Request Revision** — quote-style feedback input, sends to planner session
+- A decision bar at the bottom of the page for pending plans. It stays in view
+  at every scroll position, above the bottom nav on a phone. It uses the
+  decision controls of the chat's plan card (`PlanDecisionControls`):
+  - **Approve & implement** starts the implementation session and opens it
+    in Chat
+  - **Request revision…** opens a required "What should change?" field in the
+    bar; **Send** sends it to the session that proposed the plan
+  - **Decline…** opens an optional reason field in the bar; **Decline plan**
+    declines the plan and closes its task
+  - Cmd/Ctrl+Enter sends a field, Escape closes it. The buttons are disabled
+    while a decision is sent, and an error shows above them
 - Previous feedback shown as blockquote
 
 ## Telegram
@@ -239,11 +265,16 @@ task updates and sessions have no actor or cause.
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/plans` | List plans (query: `status`, `task_id`) |
-| GET | `/api/plans/:id` | Get plan detail |
+| GET | `/api/plans/:id` | Get plan detail, with `impl_session` (see below) |
 | PATCH | `/api/plans/:id` | Update status/feedback |
 | POST | `/api/plans/:id/approve` | Approve + spawn implementation |
 | POST | `/api/plans/:id/revise` | Send revision feedback to planner |
 | GET | `/api/tasks/:id/plans` | Plans for a specific task |
+
+`GET /api/plans/:id` adds `impl_session`: `null` without an implementation
+session (or when its row is gone), else `{id, title, updated_at,
+is_running, awaiting_input, parked}`. `parked` is true when no turn runs but
+a wake-up is scheduled or background work still runs.
 
 Plan rows include `reviewed_by_actor_id`, `reviewed_caused_by_actor_id`,
 `created_by_actor_id` and `caused_by_actor_id`. Approve, `PATCH` and revise

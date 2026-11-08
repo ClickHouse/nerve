@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { api } from '../api/client';
+import { api, type SessionTask } from '../api/client';
 import { setBeforeReenter } from '../api/hosted';
 import { ws } from '../api/websocket';
 import type { WSMessage } from '../api/websocket';
@@ -19,6 +19,7 @@ import { loadReads, persistRead, removeRead, loadBaseline } from './helpers/read
 import { removeSeen } from './helpers/agentSeen';
 import { loadVirtualSession, persistVirtualSession, clearVirtualSession } from './helpers/virtualSessionStorage';
 import { onViewerStorageChange } from './helpers/viewerStorage';
+import { registerSessionsLoader, reloadSessionsSoon } from './helpers/sessionsReload';
 // Handlers
 import { discardStreamDeltas, flushStreamDeltas, handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate, exitStreaming } from './handlers/sessionHandlers';
@@ -110,6 +111,7 @@ function contextUsageFrom(usage: LastUsage): NonNullable<ChatState['contextUsage
     cache_creation_1h_input_tokens: cc?.ephemeral_1h_input_tokens ?? 0,
     max_context_tokens: usage.max_context_tokens || 200_000,
     num_turns: usage.num_turns || 1,
+    context_tokens: usage.context_tokens,
   };
 }
 
@@ -131,6 +133,16 @@ const VIEW_SCOPED_EVENTS = new Set<WSMessage['type']>([
 
 /** The singleton Agents roster tab. */
 export const AGENTS_PANEL_ID = 'agents-panel';
+/** The singleton tab of the open session's tasks. */
+export const TASKS_PANEL_ID = 'tasks-panel';
+/**
+ * The `task_updated` events that can change the session's task list. The
+ * event does not name the session that made the change, so each of these
+ * reads the list again.
+ */
+const SESSION_TASK_EVENTS = new Set(['created', 'updated', 'moved', 'done']);
+/** The newest read of the session's tasks; an older answer is dropped. */
+let sessionTasksRequest = 0;
 /** The tab of one agent's transcript. */
 export const agentTabId = (agentId: string) => `agent:${agentId}`;
 /** At most this many agent tabs stay open (the least recently focused closes). */
@@ -175,8 +187,10 @@ interface ChatState {
     cache_creation_1h_input_tokens?: number;
     max_context_tokens: number;
     num_turns: number;
+    // Measured after a compact; the bar shows it instead of its estimate.
+    context_tokens?: number;
   } | null;
-  backendStatus: { subtype: string; data: Record<string, unknown> } | null;
+  backendStatus:{ subtype: string; data: Record<string, unknown> } | null;
   // TodoWrite panel state (legacy Claude Code todos)
   currentTodos: TodoItem[];
   // Claude Code 2.1+ task panel state (TaskCreate / TaskUpdate / TaskList)
@@ -231,6 +245,10 @@ interface ChatState {
   // Modified files tracking
   modifiedFiles: ModifiedFileSummary[];
   modifiedFilesCount: number;
+  /** The tasks that the open session created, implemented or updated; null until they load. */
+  sessionTasks: SessionTask[] | null;
+  /** The last read of `sessionTasks` failed. */
+  sessionTasksFailed: boolean;
 
   // Feed pagination: the server sends one page of conversations (page size = sessions.sidebar_page_size, 0 = unlimited) plus every starred session.
   sessionsHasMore: boolean;
@@ -279,9 +297,9 @@ interface ChatState {
   loadSessions: () => Promise<void>;
   switchSession: (id: string) => Promise<void>;
   /**
-   * Load the messages of the open chat again after the socket was down, so
-   * that the view shows what happened meanwhile. A call while one runs makes
-   * that one read again.
+   * Load the messages and the tasks of the open chat again after the socket
+   * was down, so that the view shows what happened meanwhile. A call while
+   * one runs makes that one read the messages again.
    */
   catchUp: () => Promise<void>;
   createSession: () => Promise<void>;
@@ -324,12 +342,21 @@ interface ChatState {
   /** Trigger the sidebar to mount + focus the search input (used by Cmd+K). */
   requestSearchFocus: () => void;
   /** Send a message. While a turn streams it is queued on the server (the
-   *  agent store tracks it as a pending send) instead of opening a turn. */
+   *  agent store tracks it as a pending send) instead of opening a turn.
+   *  Resolves to the id of the session that got the message, or null when
+   *  the message could not be sent. */
   sendMessage: (
     content: string,
     fileIds?: string[],
     imageBlocks?: Array<{ url: string; filename: string; media_type: string }>,
-  ) => Promise<void>;
+  ) => Promise<string | null>;
+  /** Start a new chat with the default backend and model, open it and send
+   *  `content` to it. The unsent new chat, its draft and its settings stay
+   *  as they are. `retryId` is the chat that an earlier call created but
+   *  could not send to: while it is in the session list, the call sends to
+   *  it and creates no chat. Resolves to the chat and whether the message
+   *  was sent, or null when the chat could not be created. */
+  startChat: (content: string, retryId?: string) => Promise<{ sessionId: string; sent: boolean } | null>;
   /** Defer a composed prompt into a new session without running the model
    *  now. ``delay`` is one of "30m" | "1h" | "24h" | "none". */
   runLater: (
@@ -390,6 +417,10 @@ interface ChatState {
   // Modified files
   fetchModifiedFiles: (sessionId: string) => Promise<void>;
   openFilesPanel: () => void;
+  // Tasks of the session
+  fetchSessionTasks: (sessionId: string) => Promise<void>;
+  /** Open (or focus) the Tasks tab, and read the list again. */
+  openTasksPanel: () => void;
 }
 
 /**
@@ -459,6 +490,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   mobileSidebarOpen: false,
   modifiedFiles: [],
   modifiedFilesCount: 0,
+  sessionTasks: null,
+  sessionTasksFailed: false,
   searchQuery: '',
   searchResults: null,
   searchLoading: false,
@@ -718,6 +751,40 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   // ------------------------------------------------------------------ //
+  //  Tasks of the session                                                //
+  // ------------------------------------------------------------------ //
+
+  fetchSessionTasks: async (sessionId: string) => {
+    // A new chat is not on the server until its first message.
+    if (!sessionId || sessionId === get().virtualSession?.id) return;
+    const request = ++sessionTasksRequest;
+    const current = () => request === sessionTasksRequest && get().activeSession === sessionId;
+    try {
+      const { tasks } = await api.getSessionTasks(sessionId);
+      if (current()) set({ sessionTasks: tasks, sessionTasksFailed: false });
+    } catch {
+      if (current()) set({ sessionTasksFailed: true });
+    }
+  },
+
+  openTasksPanel: () => {
+    get().openPanelTab({
+      id: TASKS_PANEL_ID,
+      type: 'tasks',
+      label: 'Tasks',
+      subagentType: 'tasks',
+      description: '',
+      content: null,
+      prompt: '',
+      streaming: false,
+      status: 'complete',
+      startedAt: Date.now(),
+      blocks: [],
+    });
+    void get().fetchSessionTasks(get().activeSession);
+  },
+
+  // ------------------------------------------------------------------ //
   //  Session management                                                  //
   // ------------------------------------------------------------------ //
 
@@ -786,6 +853,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       planSummaries: {}, planEditRequest: null,
       panels: [], activePanelId: null, panelVisible: false,
       modifiedFiles: [], modifiedFilesCount: 0,
+      sessionTasks: null, sessionTasksFailed: false,
     });
     // The agent roster follows the view (it unsubscribes the old transcripts).
     useAgentStore.getState().reset(id);
@@ -820,8 +888,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // Restore Claude Code 2.1+ task panel from history
       update.currentCCTasks = extractCCTasksFromMessages(hydrated);
       set(update);
-      // Fetch modified files for this session (non-blocking)
+      // Fetch the modified files and the tasks of this session (non-blocking)
       get().fetchModifiedFiles(id);
+      void get().fetchSessionTasks(id);
     } catch {
       set({ loading: false });
     }
@@ -836,6 +905,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
     const run = { session, again: false };
     catchUpRun = run;
+    // The task events sent while the socket was down are lost too.
+    void get().fetchSessionTasks(session);
     try {
       // Live events can change the rows during the read. Then the read can
       // be older than the rows on screen, so read again.
@@ -1137,11 +1208,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Feed '...': append the next page of conversations (starred already arrived in full on page 1).
     try {
       const { sessions, has_more, next_offset } = await api.listSessions(get().sessionsNextOffset);
-      set(s => ({
-        sessions: [...s.sessions, ...sessions],
-        sessionsHasMore: !!has_more,
-        sessionsNextOffset: next_offset ?? s.sessionsNextOffset + sessions.length,
-      }));
+      set(s => {
+        // Page 1 also holds the sessions that need you, so a later page
+        // can repeat one of them.
+        const listed = new Set(s.sessions.map(x => x.id));
+        return {
+          sessions: [...s.sessions, ...sessions.filter(x => !listed.has(x.id))],
+          sessionsHasMore: !!has_more,
+          sessionsNextOffset: next_offset ?? s.sessionsNextOffset + sessions.length,
+        };
+      });
     } catch (e) {
       console.error('Failed to load more sessions:', e);
     }
@@ -1333,8 +1409,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
             blocks: [{ type: 'text', content: 'Error: Message could not be sent. The connection is closed; please retry.' }],
           }],
         }));
+        return null;
       }
-      return;
+      return session;
     }
     // Optimistic update: append the user message, flip to streaming. If the
     // socket isn't open, send() returns 'queued' (will flush on reconnect)
@@ -1367,7 +1444,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           isStreaming: false,
           agentStatus: { state: 'idle' },
         }));
-        return;
+        return null;
       }
     }
     // No per-message model override: the session row is the source of
@@ -1392,7 +1469,34 @@ export const useChatStore = create<ChatState>((set, get) => ({
         isStreaming: false,
         agentStatus: { state: 'idle' },
       }));
+      return null;
     }
+    return session;
+  },
+
+  startChat: async (content: string, retryId?: string) => {
+    let id = retryId && get().sessions.some(s => s.id === retryId) ? retryId : null;
+    if (!id) {
+      let created: Session;
+      try {
+        created = await api.createSession();
+      } catch (e) {
+        console.error('Failed to create session:', e);
+        return null;
+      }
+      set((state) => ({
+        // POST /api/sessions returns a partial row; fill what the list needs.
+        sessions: [
+          { ...created, title: 'New chat', is_running: false, updated_at: new Date().toISOString() },
+          ...state.sessions,
+        ],
+      }));
+      id = created.id;
+    }
+    await get().switchSession(id);
+    // The view moved to another chat while the messages loaded: do not send there.
+    const sent = get().activeSession === id && (await get().sendMessage(content)) !== null;
+    return { sessionId: id, sent };
   },
 
   runLater: async (content, delay, fileIds, imageBlocks) => {
@@ -1543,18 +1647,34 @@ export const useChatStore = create<ChatState>((set, get) => ({
         useAgentStore.getState().applyAgentEvent(msg);
         return;
       case 'queue_update': {
-        // A send this tab queued while a turn ran has started: its bubble
-        // appears now, in the order the server runs it.
         const { started } = useAgentStore.getState().applyQueueUpdate(msg);
-        if (started.length > 0) {
-          const now = new Date().toISOString();
-          const actor = selfActorId();
-          set((s) => ({
-            messages: [...s.messages, ...started.map((p) => ({
-              role: 'user' as const, blocks: p.blocks, created_at: now, actor_id: actor, client_msg_id: p.clientMsgId,
-            }))],
-          }));
-        }
+        const removed = msg.removed ?? [];
+        const idsOf = (reasons: string[]) => removed
+          .filter(r => r.client_msg_id && reasons.includes(r.reason))
+          .map(r => r.client_msg_id as string);
+        // A queued message that never ran (cancelled by its sender, refused
+        // at shutdown) keeps no bubble: drop the echo of another tab's send.
+        const unsent = idsOf(['cancelled', 'refused']);
+        // A message that starts runs after every reply on screen: its bubble
+        // goes to the end, in the order the server runs it, in every tab,
+        // with the start time that the stored message gets. The bubble is the
+        // echo of the send, or a new one for a send that this tab queued.
+        const startedIds = idsOf(['started']);
+        if (unsent.length === 0 && startedIds.length === 0) return;
+        const queuedHere = new Map(started.map(p => [p.clientMsgId, p]));
+        const gone = new Set([...unsent, ...startedIds]);
+        const now = new Date().toISOString();
+        const actor = selfActorId();
+        set((s) => {
+          const moved = startedIds.flatMap((id): ChatMessage[] => {
+            const echo = s.messages.find(m => m.role === 'user' && m.client_msg_id === id);
+            if (echo) return [{ ...echo, created_at: now }];
+            const p = queuedHere.get(id);
+            return p ? [{ role: 'user', blocks: p.blocks, created_at: now, actor_id: actor, client_msg_id: id }] : [];
+          });
+          const kept = s.messages.filter(m => m.role !== 'user' || !m.client_msg_id || !gone.has(m.client_msg_id));
+          return { messages: [...kept, ...moved] };
+        });
         return;
       }
       // Global: the sidebar row's agent count between turns.
@@ -1584,9 +1704,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // reflects a change made by the agent in any session, by another
       // tab, or over the API. Must stay out of VIEW_SCOPED_EVENTS.
       case 'task_updated':
+        // A plan decision from any place (another tab, Telegram, the API)
+        // writes the plan's task, and this event is its only broadcast. The
+        // reload clears the session's "Plan to review".
+        reloadSessionsSoon();
         void import('./taskStore').then(({ useTaskStore }) =>
           useTaskStore.getState().handleTaskEvent(msg.task)
         );
+        if (SESSION_TASK_EVENTS.has(msg.event)) void get().fetchSessionTasks(get().activeSession);
         return;
       // Auxiliary
       case 'interaction':              return handleInteraction(msg, get, set);
@@ -1633,15 +1758,19 @@ if (typeof ws.onOpen === 'function') {
     }
     // A reconnect (a gateway restart, a dropped network, a phone that slept)
     // missed the events sent meanwhile, and a restarted server never re-sends
-    // the zero counts: the sidebar rows and the open chat's messages come
-    // back from the server.
+    // the zero counts: the sidebar rows, the open chat's messages and the
+    // notifications (the badge count, the questions that put "!" in the tab
+    // title) come back from the server.
     if (socketOpenedBefore) {
       void s.loadSessions();
       void s.catchUp();
+      void import('./notificationStore').then(({ useNotificationStore }) => useNotificationStore.getState().loadNotifications());
     }
     socketOpenedBefore = true;
   });
 }
+
+registerSessionsLoader(() => void useChatStore.getState().loadSessions());
 
 onViewerStorageChange(() => {
   tabFocus.clear();

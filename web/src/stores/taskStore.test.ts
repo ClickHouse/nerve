@@ -8,6 +8,7 @@ vi.mock('../api/client', () => ({
     listTaskTags: vi.fn(),
     listTasks: vi.fn(),
     searchTasks: vi.fn(),
+    getTask: vi.fn(async () => ({})),
   },
 }));
 
@@ -317,6 +318,35 @@ describe('handleTaskEvent', () => {
     // The broadcast carries the row, not the file — merging must not blank
     // the markdown the detail view already fetched.
     expect(sel.content).toBe('# loaded markdown');
+  });
+
+  it('reads the sessions of the open detail task again and keeps its content', async () => {
+    useTaskStore.setState({
+      selectedTask: {
+        ...task('a'), content: '# edited here',
+        sessions: [{ id: 's-1', title: 'Plan the release', relation: 'created' }],
+      },
+    });
+    const sessions = [
+      { id: 's-1', title: 'Plan the release', relation: 'created' as const },
+      { id: 's-2', title: 'Weekly triage', relation: 'updated' as const },
+    ];
+    vi.mocked(api.getTask).mockResolvedValue({
+      ...task('a', 'in_progress'), content: '# from the server', sessions,
+    });
+
+    useTaskStore.getState().handleTaskEvent(task('a', 'in_progress', 1024));
+
+    expect(api.getTask).toHaveBeenCalledWith('a');
+    await vi.waitFor(() =>
+      expect(useTaskStore.getState().selectedTask!.sessions).toEqual(sessions));
+    expect(useTaskStore.getState().selectedTask!.content).toBe('# edited here');
+  });
+
+  it('does not read the detail for a broadcast of another task', () => {
+    useTaskStore.setState({ selectedTask: task('b') });
+    useTaskStore.getState().handleTaskEvent(task('a', 'in_progress', 1024));
+    expect(api.getTask).not.toHaveBeenCalled();
   });
 });
 

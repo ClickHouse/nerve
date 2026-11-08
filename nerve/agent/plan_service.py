@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, NoReturn
 
 from nerve.identity import attribution_for
+from nerve.session_origin import plan_origin
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -54,8 +55,9 @@ _REVISION_PROMPT_TEMPLATE = (
     'Revise plan {plan_id} for task "{task_title}" based on this feedback:\n\n'
     "{feedback}\n\n"
     "Explore the codebase again if needed, then call "
-    'plan_update(plan_id="{plan_id}", content="...", feedback="<short summary>") '
-    "with the revised plan."
+    'plan_update(plan_id="{plan_id}", content="...", summary="...", '
+    'feedback="<what changed>") with the revised plan and a summary of it '
+    "in up to 3 short lines for the reviewer."
 )
 
 
@@ -166,7 +168,7 @@ async def request_plan_revision(
           (``plan.session_id``), falling back to ``cron:task-planner``
           if the proposer is unknown/deleted.
         - The planner is instructed to call
-          ``plan_update(plan_id=..., content=..., feedback=<summary>)``
+          ``plan_update(plan_id=..., content=..., summary=..., feedback=...)``
           so version history stays linked.
     """
     # Import here to avoid a circular import: tool handlers import
@@ -245,6 +247,7 @@ async def request_plan_revision(
     await engine.sessions.get_or_create(
         session_id, title=session_title, source="cron",
         actor=engine.db.system_actor, cause=cause,
+        origin=plan_origin(plan_id, plan["task_id"]),
     )
     asyncio.create_task(
         engine.run(
@@ -309,6 +312,22 @@ async def _revert_plan(
         )
     except Exception:
         logger.exception("Failed to restore plan %s after an error", plan_id)
+
+
+async def _mark_failed(db: "Database", plan: dict) -> None:
+    """Mark an implementing plan ``failed`` and push its task row.
+
+    Only from ``implementing``: a plan that ``task_done`` marked done in the
+    same turn stays done. The task event is the broadcast that an open plan
+    page follows, as for the other plan status writes.
+    """
+    from nerve.agent.streaming import emit_task_event
+
+    try:
+        if await db.compare_and_update_plan(plan["id"], expect_status="implementing", status="failed"):
+            await emit_task_event(await db.get_task(plan["task_id"]), "updated")
+    except Exception:
+        logger.exception("Failed to mark plan %s as failed", plan["id"])
 
 
 async def approve_plan(
@@ -405,6 +424,7 @@ async def approve_plan(
         await engine.sessions.get_or_create(
             impl_session_id, title=f"Implement: {task['title']}", source="web",
             actor=actor, cause=cause,
+            origin=plan_origin(plan_id, plan["task_id"]),
         )
         await task_update_handler(task_ctx, {
             "task_id": plan["task_id"],
@@ -443,14 +463,17 @@ async def approve_plan(
         from nerve.agent.engine import NotAcceptingTurnsError
 
         try:
-            await engine.run(
-                session_id=impl_session_id, user_message=prompt, source="web",
-                # Nerve assembles the prompt from the task file and the
-                # approved plan, so the turn is the instance's own work even
-                # though an approval started it. The session carries who
-                # approved.
-                actor=db.system_actor,
-            )
+            # ``run`` returns normally for a failed turn too; the watch has
+            # the turn's outcome.
+            with engine.watch_turns(impl_session_id) as turn:
+                await engine.run(
+                    session_id=impl_session_id, user_message=prompt, source="web",
+                    # Nerve assembles the prompt from the task file and the
+                    # approved plan, so the turn is the instance's own work
+                    # even though an approval started it. The session
+                    # carries who approved.
+                    actor=db.system_actor,
+                )
         except NotAcceptingTurnsError:
             # A drain started after the check above. The implementation did
             # not start, so the plan can be approved again after the restart.
@@ -461,10 +484,13 @@ async def approve_plan(
             )
         except Exception:
             logger.exception("Implementation session %s failed", impl_session_id)
-            try:
-                await db.update_plan(plan_id, status="failed")
-            except Exception:
-                logger.exception("Failed to mark plan %s as failed", plan_id)
+            await _mark_failed(db, plan)
+        else:
+            if turn.outcome is not None and turn.outcome.status == "failed":
+                logger.warning(
+                    "Plan %s: implementation turn failed: %s", plan_id, turn.outcome.error,
+                )
+                await _mark_failed(db, plan)
 
     impl_task = asyncio.create_task(_run_impl())
     # Register with the engine so a manual /stop can cancel a stuck impl

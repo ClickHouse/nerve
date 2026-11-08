@@ -162,14 +162,13 @@ def is_slack_id(pattern: str) -> bool:
     return bool(_SLACK_ID_RE.match(pattern))
 
 
-def notification_target(config: NerveConfig, *, warn_unset: bool = True) -> str | None:
-    """The conversation for notification cards, or ``None``.
+def notification_target(config: NerveConfig) -> str | None:
+    """The conversation for notification cards in Socket Mode, or ``None``.
 
     That is ``notifications.slack_channel_id``, else the first literal
-    conversation ID in ``slack.allow_channels``. The hosted channel uses the
-    same choice first. When the config names no conversation, the channel
-    gateway can choose one, so the hosted channel sets *warn_unset* to
-    false: then no warning is logged for that case.
+    conversation ID in ``slack.allow_channels``. In hosted mode the config
+    does not choose the conversation: the gateway posts each card in the
+    agent's notification channel, which an admin sets in the control plane.
     """
     configured = config.notifications.slack_channel_id.strip()
     if configured:
@@ -183,11 +182,10 @@ def notification_target(config: NerveConfig, *, warn_unset: bool = True) -> str 
     for entry in config.slack.allow_channels:
         if is_slack_id(entry) and entry[0] in "CG":
             return entry
-    if warn_unset:
-        logger.warning(
-            "No notifications.slack_channel_id is set and slack.allow_channels "
-            "has no literal conversation id",
-        )
+    logger.warning(
+        "No notifications.slack_channel_id is set and slack.allow_channels "
+        "has no literal conversation id",
+    )
     return None
 
 
@@ -879,6 +877,12 @@ class SlackChannel(BaseChannel):
         )
         return identity
 
+    async def conversation_name(self, channel_id: str) -> str | None:
+        """The name of a channel (``conversations.info``, cached), or
+        ``None`` for a direct message or when Slack does not answer."""
+        identity = await self._identify_conversation(channel_id, "channel", True)
+        return identity.names[0] if identity.names else None
+
     async def _identify_conversation(
         self, channel_id: str, channel_type: str, resolve: bool,
     ) -> Identity:
@@ -1235,6 +1239,11 @@ class SlackChannel(BaseChannel):
         if images:
             metadata["images"] = images
         self._remember(self._last_inbound_ts, target, ts, _INBOUND_TS_MAX)
+        # The channel name for the origin of a new session. The lookup is
+        # cached, and a direct message has no name.
+        conversation = await self._identify_conversation(
+            channel_id, channel_type, True,
+        )
 
         msg = InboundMessage(
             channel_name="slack",
@@ -1242,6 +1251,7 @@ class SlackChannel(BaseChannel):
             sender_id=target,
             text=text,
             metadata=metadata,
+            conversation_title=next(iter(conversation.names), ""),
         )
 
         try:

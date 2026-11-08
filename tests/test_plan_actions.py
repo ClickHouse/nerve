@@ -9,11 +9,13 @@ can't drift apart (the same rationale as ``test_plan_revise.py``).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
 
 import pytest
 
 from nerve.agent import tools as tools_mod
+from nerve.agent.engine import TurnOutcome, TurnWatch
 from nerve.agent.plan_service import (
     PlanNotFound,
     PlanNotPending,
@@ -43,7 +45,7 @@ class FakeSessionManager:
 
     async def get_or_create(
         self, session_id, title=None, source="web", metadata=None,
-        *, actor: Actor | None, cause=None,
+        *, actor: Actor | None, cause=None, origin=None,
     ) -> dict:
         self.calls.append({
             "session_id": session_id, "title": title, "source": source,
@@ -53,7 +55,10 @@ class FakeSessionManager:
 
 
 class FakeEngine:
-    """Mimics AgentEngine.run + .sessions + .register_task for approve tests."""
+    """Mimics AgentEngine.run + .sessions + .register_task + .watch_turns for approve tests.
+
+    ``turn_outcome`` is how each run ends its turn, as ``watch_turns`` reports it.
+    """
 
     accepting_turns = True
 
@@ -63,6 +68,16 @@ class FakeEngine:
         self.runs: list[dict] = []
         self.registered: list[str] = []
         self.run_event = asyncio.Event()
+        self.turn_outcome = TurnOutcome()
+        self._watches: dict[str, TurnWatch] = {}
+
+    @contextlib.contextmanager
+    def watch_turns(self, session_id):
+        watch = self._watches[session_id] = TurnWatch()
+        try:
+            yield watch
+        finally:
+            self._watches.pop(session_id, None)
 
     async def run(
         self, session_id, user_message, source="web", *, actor: Actor | None,
@@ -71,6 +86,8 @@ class FakeEngine:
             "session_id": session_id, "user_message": user_message,
             "source": source, "actor": actor,
         })
+        if session_id in self._watches:
+            self._watches[session_id].outcome = self.turn_outcome
         self.run_event.set()
 
     def register_task(self, session_id, task) -> None:

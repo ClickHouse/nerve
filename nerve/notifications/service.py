@@ -21,7 +21,9 @@ from typing import TYPE_CHECKING, Any
 
 from nerve.identity import actor_id_of, attribution_for
 from nerve.notifications import handlers as _handlers
+from nerve.notifications import webpush
 from nerve.notifications.date_render import render_iso_dates
+from nerve.notifications.quiet_hours import deliver_silently
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -270,6 +272,8 @@ class NotificationService:
         Args:
             channels: Override default notification channels (e.g. ["telegram"]).
             silent: If True, deliver without sound (Telegram disable_notification).
+                During quiet hours the fan-out does this for each item that
+                is not ``urgent``.
             force: If True, bypass silence matching and deliver normally.
                 A forced send that *still* matched a rule is delivered but
                 stamped + counted as an override for audit.
@@ -597,6 +601,7 @@ class NotificationService:
 
         answerer_id = actor_id_of(answerer)
         attribution = {"answered_by_actor": actor} if actor else {}
+        answered_at = await self._answered_at(notification_id)
 
         from nerve.agent.streaming import broadcaster
 
@@ -607,6 +612,7 @@ class NotificationService:
                 "session_id": session_id,
                 "answer": answer,
                 "answered_by": answered_by,
+                "answered_at": answered_at,
                 "actor_id": answerer_id,
                 **attribution,
             })
@@ -655,11 +661,17 @@ class NotificationService:
             "session_id": session_id,
             "answer": answer,
             "answered_by": answered_by,
+            "answered_at": answered_at,
             "actor_id": answerer_id,
             **attribution,
         })
 
         return True
+
+    async def _answered_at(self, notification_id: str) -> str | None:
+        """The stored answer time of a row, for the answer broadcast."""
+        row = await self.db.get_notification(notification_id)
+        return row.get("answered_at") if row else None
 
     async def _handle_approval_answer(
         self,
@@ -822,6 +834,8 @@ class NotificationService:
         }
         if snoozed:
             payload["snooze_until"] = snooze_until
+        else:
+            payload["answered_at"] = await self._answered_at(notification_id)
         await broadcaster.broadcast("__global__", payload)
 
         return True
@@ -972,8 +986,23 @@ class NotificationService:
 
         ``plan_id`` names the plan of a ``notify`` row. Telegram adds an
         "Open plan" button for it.
+
+        Without ``channels`` the configured list goes out, with the panel
+        in it (:meth:`NotificationsConfig.delivery_channels`), and Web Push
+        to the browsers that turned it on (:func:`webpush.deliver`). A channel whose
+        ``notifications.levels`` entry is ``important`` skips an item below
+        that level (:meth:`NotificationsConfig.wants`).
+
+        During quiet hours an item that is not ``urgent`` goes out without
+        sound (:func:`deliver_silently`): Telegram gets
+        ``disable_notification`` and the web event gets ``silent: true``.
         """
-        target_channels = channels or self.config.notifications.channels
+        silent = silent or deliver_silently(self.config, priority)
+        settings = self.config.notifications
+        target_channels = [
+            name for name in (channels or [*settings.delivery_channels(), webpush.PUSH_CHANNEL])
+            if settings.wants(name, notif_type, priority)
+        ]
 
         async def _deliver(channel_name: str) -> str | None:
             """Deliver to a single channel, return name on success."""
@@ -983,7 +1012,7 @@ class NotificationService:
                         notification_id, session_id, notif_type,
                         title, body, priority, options,
                         option_labels=option_labels,
-                        extra=extra_web,
+                        extra={**(extra_web or {}), "silent": True} if silent else extra_web,
                     )
                     await self.db.record_notification_delivery(
                         notification_id, "web",
@@ -1011,6 +1040,13 @@ class NotificationService:
                     if not msg_id:
                         return None
                     return "slack"
+                elif channel_name == webpush.PUSH_CHANNEL:
+                    pushed = await webpush.deliver(
+                        self.db, self.config, notification_id=notification_id,
+                        notif_type=notif_type, title=title, body=body,
+                        priority=priority, silent=silent,
+                    )
+                    return webpush.PUSH_CHANNEL if pushed else None
                 else:
                     logger.warning(
                         "notifications.channels names %r, which nothing "

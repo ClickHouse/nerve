@@ -37,6 +37,7 @@ import pytest
 import yaml
 
 from nerve import setup_writer
+from nerve.agent.tools.schemas import PLAN_PROPOSE_SCHEMA
 from nerve.bootstrap import SetupChoices, SetupWizard, run_non_interactive
 from nerve.config import DEFAULT_MODEL, NerveConfig
 from nerve.onboarding_catalog import WorkSelection
@@ -1174,6 +1175,16 @@ class TestMachineMaintenance:
         }
         assert not {name for name in memory_tools if re.search(rf"\b{name}\b", job["prompt"])}
         assert setup_writer._cron_prompt(job, "loom") == job["prompt"]
+
+
+def test_task_planner_asks_for_a_plan_summary() -> None:
+    """The plan page shows the summary under the plan title. The planner
+    prompt asks for it with the parameter names of the tool schema."""
+    job = next(c for c in setup_writer.PRODUCTIVITY_CRONS if c["id"] == "task-planner")
+    call = re.search(r"plan_propose\(([^)]*)\)", job["prompt"])
+    params = [p.strip() for p in call.group(1).split(",")]
+    assert "summary" in params
+    assert set(params) <= set(PLAN_PROPOSE_SCHEMA["properties"])
 
 
 class TestHostedGitHubKeepsTheEventsSourceOff:

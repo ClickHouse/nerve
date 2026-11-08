@@ -20,6 +20,14 @@ from nerve.gateway.routes._deps import get_deps
 from nerve.gateway.routes.files import session_upload_dir
 from nerve.identity import Actor, attribution_for
 from nerve.platform.activity import LEASE_MEMORIZE, keep_awake
+from nerve.session_origin import (
+    DETAIL_RUN_LATER,
+    TRIGGER_API,
+    TRIGGER_CHAT,
+    TRIGGER_CRON,
+    Origin,
+    origin_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -137,27 +145,78 @@ def _loop_summary(lp: dict) -> dict:
     }
 
 
-async def _attach_review_loops(deps, sessions: list[dict]) -> None:
-    """Stamp each observer session with its newest loop's summary — the
-    sidebar icon, status dot, and header chip rehydrate from this (the
+async def _newest_review_loops(deps) -> dict[str, dict]:
+    """``session_id -> newest loop`` of each observer session. The sidebar
+    icon, status dot, and header chip rehydrate from this (the
     review_loop_update WS event only covers the live tab)."""
     try:
         from nerve.workflows import get_review_loop_service
 
         if get_review_loop_service() is None:
-            return
-        loops = await deps.db.list_review_loops(limit=100)
+            return {}
+        recent = await deps.db.list_review_loops(limit=100)
+        # An open loop older than the recent ones can still wait for the
+        # user, so it counts too (oldest first, so reversed below).
+        open_loops = await deps.db.get_open_review_loops()
     except Exception:  # noqa: BLE001 — enrichment must never break listing
-        return
+        return {}
     newest: dict[str, dict] = {}
-    for lp in loops:  # newest first
+    for lp in [*recent, *reversed(open_loops)]:  # newest first
         sid = lp.get("session_id")
         if sid and sid not in newest:
             newest[sid] = lp
+    return newest
+
+
+async def _attention_map(deps, loops: dict[str, dict]) -> dict[str, dict]:
+    """``session_id -> attention`` for each session that waits for the user.
+
+    ``questions`` and ``approvals`` count pending ``ask_user`` and
+    ``propose_action`` notifications, ``plans`` counts the pending plans
+    that the session proposed, ``awaiting_input`` is a question inside a
+    running turn, and ``review`` is a newest review loop that waits for a
+    decision. A failed count leaves its fields at zero: enrichment must
+    never fail the listing.
+    """
+    try:
+        asks = await deps.db.count_pending_by_session()
+        plans = await deps.db.count_pending_plans_by_session()
+    except Exception:  # noqa: BLE001 - enrichment must never break listing
+        logger.warning("attention counts failed", exc_info=True)
+        asks, plans = {}, {}
+    awaiting = get_awaiting_ids()
+    review = {sid for sid, lp in loops.items() if lp.get("status") == "awaiting_user"}
+    return {
+        sid: {
+            "questions": asks.get(sid, {}).get("question", 0),
+            "approvals": asks.get(sid, {}).get("approval", 0),
+            "plans": plans.get(sid, 0),
+            "awaiting_input": sid in awaiting,
+            "review": sid in review,
+        }
+        for sid in asks.keys() | plans.keys() | awaiting | review
+    }
+
+
+# The ``attention`` of a session that waits for nothing.
+_NO_ATTENTION = {
+    "questions": 0, "approvals": 0, "plans": 0, "awaiting_input": False, "review": False,
+}
+
+
+async def _attach_origins(deps, sessions: list[dict]) -> None:
+    """Stamp each row with ``trigger``, ``origin_label`` and ``origin_detail``.
+
+    A row from before the trigger column gets a derived origin, which also
+    reads the row's channel mapping.
+    """
+    legacy = [s["id"] for s in sessions if not s.get("trigger")]
+    try:
+        channel_keys = await deps.db.channel_keys_for_sessions(legacy)
+    except Exception:  # noqa: BLE001 - enrichment must never break listing
+        channel_keys = {}
     for s in sessions:
-        lp = newest.get(s["id"])
-        if lp:
-            s["review_loop"] = _loop_summary(lp)
+        s.update(origin_fields(s, channel_keys.get(s["id"])))
 
 
 def _page_size() -> int | None:
@@ -180,18 +239,30 @@ async def _pending_wakeup_map(deps) -> dict[str, dict]:
     return {r["session_id"]: r for r in rows if r.get("session_id")}
 
 
-async def _decorate(deps, sessions: list[dict]) -> list[dict]:
-    """Attach the live per-row bits every sidebar list needs."""
+async def _decorate(deps, sessions: list[dict], *, add_needs_you: bool = False) -> list[dict]:
+    """Attach the live per-row bits every sidebar list needs.
+
+    With ``add_needs_you``, first append to ``sessions`` each non-archived
+    session of any source that waits for the user and is not in the list,
+    so that the sidebar's "Needs you" group is complete.
+    """
+    loops = await _newest_review_loops(deps)
+    attention = await _attention_map(deps, loops)
+    if add_needs_you:
+        listed = {s["id"] for s in sessions}
+        sessions += await deps.db.list_unarchived_sessions(
+            [sid for sid in attention if sid not in listed],
+        )
     running_ids = deps.engine.sessions.get_running_ids()
-    awaiting_ids = get_awaiting_ids()
     # Pending work: no turn is in flight, yet the session isn't idle either —
     # a wakeup is scheduled, or a background task is still running inside its
     # CLI. The sidebar keeps those parked sessions in the "Running" group
     # (with their own dot colour) instead of dropping them to idle.
     wakeups = await _pending_wakeup_map(deps)
     for s in sessions:
+        s["attention"] = dict(attention.get(s["id"], _NO_ATTENTION))
         s["is_running"] = s["id"] in running_ids
-        s["awaiting_input"] = s["id"] in awaiting_ids
+        s["awaiting_input"] = s["attention"]["awaiting_input"]
         wakeup = wakeups.get(s["id"]) or {}
         s["pending_wakeup_at"] = wakeup.get("fire_at")
         # Who scheduled the wakeup (a person, or the system actor for the
@@ -201,7 +272,9 @@ async def _decorate(deps, sessions: list[dict]) -> list[dict]:
         s["has_background_tasks"] = deps.engine.has_live_background_tasks(s["id"])
         # How many agents still run (the sidebar's count).
         s["background_count"] = _background_count(deps, s["id"], s["has_background_tasks"])
-    await _attach_review_loops(deps, sessions)
+        if s["id"] in loops:
+            s["review_loop"] = _loop_summary(loops[s["id"]])
+    await _attach_origins(deps, sessions)
     return sessions
 
 
@@ -226,13 +299,13 @@ def _page_meta(page: list[dict], offset: int, total: int, limit: int | None) -> 
 
 @router.get("/api/sessions")
 async def list_sessions(offset: int = 0, actor: Actor = Depends(require_auth)):
-    """Sidebar feed: one page of conversations, plus every starred session (starred ride along in full on offset=0)."""
+    """Sidebar feed: one page of conversations. On offset=0 every starred session and every session that needs the user (any source) ride along in full."""
     deps = get_deps()
     limit = _page_size()
     page = await deps.engine.sessions.list_conversation_sessions(limit=limit, offset=offset)
     total = await deps.engine.sessions.count_conversation_sessions()
     sessions = page if offset else await deps.engine.sessions.list_starred_sessions() + page
-    await _decorate(deps, sessions)
+    await _decorate(deps, sessions, add_needs_you=not offset)
     return {
         "sessions": sessions,
         "archived_count": await deps.engine.sessions.count_archived_sessions(),
@@ -329,9 +402,12 @@ async def create_session(req: SessionCreateRequest, actor: Actor = Depends(requi
         session_id, title=req.title, source=req.source, metadata=metadata,
         backend=backend, model=model, cwd=cwd,
         actor=actor,
+        # The web UI sends no source. Another value is a REST caller.
+        origin=Origin(TRIGGER_CHAT if req.source == "web" else TRIGGER_API),
     )
     if req.review_loop is not None:
         session = await _attach_review_loop(deps, session, session_id, cwd, req, actor)
+    await _attach_origins(deps, [session])
     return session
 
 
@@ -397,6 +473,7 @@ async def get_session(session_id: str, actor: Actor = Depends(require_auth)):
     session = await deps.db.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
+    await _attach_origins(deps, [session])
     return session
 
 
@@ -678,6 +755,7 @@ async def fork_session(req: ForkRequest, actor: Actor = Depends(require_auth)):
             req.source_session_id, req.at_message_id, req.title,
             actor=actor,
         )
+        await _attach_origins(deps, [fork])
         return fork
     except ValueError as e:
         status = 404 if "not found" in str(e).lower() else 409
@@ -720,6 +798,15 @@ async def run_later(req: RunLaterRequest, actor: Actor = Depends(require_auth)):
             status_code=400,
             detail=f"Unknown delay {delay!r} (want one of: 30m, 1h, 24h, none)",
         )
+    # The panel creates an empty session for each deferred prompt. With a
+    # timed option its first turn comes from the schedule, so a session
+    # without messages gets the cron trigger. With "none" the person runs the
+    # turn from the chat, so it gets the trigger of a web chat.
+    await deps.db.set_session_origin(
+        req.session_id,
+        Origin(TRIGGER_CRON, {DETAIL_RUN_LATER: delay}) if delay in _RUN_LATER_TIMED
+        else Origin(TRIGGER_CHAT),
+    )
 
     # Pending user message — mirror the block shape a normal send persists:
     # a text block plus one block per uploaded attachment. Resolve file_ids
@@ -993,6 +1080,12 @@ async def chat(req: MessageRequest, actor: Actor = Depends(require_auth)):
     if session_id is None:
         session_id = await deps.engine.sessions.get_active_session(
             "api:default", source="api", actor=actor,
+        )
+    elif deps.engine.accepting_turns:
+        # A new session id from the caller: a session of the API. A draining
+        # engine creates nothing: run() refuses the turn with a 503.
+        await deps.engine.sessions.get_or_create(
+            session_id, source="web", actor=actor, origin=Origin(TRIGGER_API),
         )
     response = await deps.engine.run(
         session_id=session_id,

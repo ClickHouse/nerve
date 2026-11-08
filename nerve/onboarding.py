@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from nerve.identity import ACTOR_KIND_HUMAN, Actor, actor_id_of
+from nerve.session_origin import TRIGGER_CHAT, TRIGGER_SYSTEM, Origin
 from nerve.setup_writer import (
     TASK_ONBOARDING_MARKER,
     publish_text,
@@ -160,8 +161,9 @@ def _prompt_inputs(workspace: Path, mode: str) -> "tuple[str, str, WorkSelection
 _IDENTITY_NAME = "- **Name:**"
 
 
-def _agent_name(workspace: Path) -> str:
-    """The name the agent gives itself in its first message, else ``""``.
+def read_agent_name(workspace: Path) -> str:
+    """The agent's name, else ``""``: the name it gives itself in its first
+    message, the name of the installed panel and of its push notifications.
     Blocking file I/O.
 
     The name line of ``IDENTITY.md`` once it is filled in (About you), else
@@ -287,14 +289,17 @@ async def start(
         ):
             return await read_state(db, workspace)
         source = "web" if kind == CONVERSATION else "cron"
+        # The conversation is a web chat with a person. The autonomous
+        # onboarding is Nerve's own work.
         await engine.sessions.get_or_create(
             session_id, title=SESSION_TITLE, source=source, actor=actor, cause=cause,
+            origin=Origin(TRIGGER_CHAT if kind == CONVERSATION else TRIGGER_SYSTEM),
         )
     mode = workspace_mode(Path(workspace)) or "personal"
     description, guide, work = await asyncio.to_thread(_prompt_inputs, workspace, mode)
     if kind == CONVERSATION:
         name = await _person_name(db, cause)
-        agent_name = await asyncio.to_thread(_agent_name, workspace)
+        agent_name = await asyncio.to_thread(read_agent_name, workspace)
         # The first turn calls no tool before its message: Nerve hands the
         # agent what is configured, and from where, instead.
         facts = await _instance_facts(engine, workspace)
