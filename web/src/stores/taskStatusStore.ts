@@ -91,3 +91,17 @@ export function statusBadgeStyle(color: string | undefined): CSSProperties {
     borderColor: `${c}33`,     // ~20% opacity
   };
 }
+
+/**
+ * Inline style for a form control in the colour of a status: a tinted
+ * background and border, and no text colour. A user-chosen colour on its
+ * own tint can be below the 4.5:1 contrast that small text needs, so the
+ * text keeps the colour of the theme.
+ */
+export function statusTintStyle(color: string | undefined): CSSProperties {
+  const c = color || FALLBACK_COLOR;
+  return {
+    backgroundColor: `${c}1a`, // ~10% opacity
+    borderColor: `${c}99`,     // ~60% opacity
+  };
+}
