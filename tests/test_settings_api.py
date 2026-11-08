@@ -324,6 +324,14 @@ class TestQuietHours:
         assert inst.machine_yaml()["quiet_start"] == "21:00"
         assert "quiet_start" not in inst.settings_yaml()
 
+    async def test_an_unquoted_time_in_a_hand_edited_file_shows_as_that_time(self, inst):
+        path = inst.config_dir / "config.yaml"
+        path.write_text((path.read_text() if path.exists() else "") + "quiet_start: 22:00\nquiet_end: 9:30\n")
+        assert (inst.machine_yaml()["quiet_start"], inst.machine_yaml()["quiet_end"]) == (1320, 570)
+        inst.reload()
+        fields = (await _get(inst))["fields"]
+        assert (fields["quiet_start"]["value"], fields["quiet_end"]["value"]) == ("22:00", "09:30")
+
     @pytest.mark.parametrize("body, field", [
         ({"quiet_start": "24:00"}, "quiet_start"),
         ({"quiet_start": "25:00"}, "quiet_start"),

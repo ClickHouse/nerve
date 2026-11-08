@@ -4002,6 +4002,23 @@ def default_timezone() -> str:
     return FALLBACK_TIMEZONE
 
 
+_MINUTES_PER_HOUR = 60
+
+
+def _as_clock_time(value: Any) -> Any:
+    """``quiet_start`` or ``quiet_end`` as ``HH:MM`` text.
+
+    YAML 1.1 reads an unquoted time that does not start with ``0`` as a
+    base-60 integer: ``22:00`` is 1320 (22 * 60 + 0), ``9:30`` is 570;
+    ``08:00`` stays text. This gives such an integer as ``HH:MM`` text (1320
+    is ``22:00``, 570 is ``09:30``). Any other value stays as it is.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        hours, minutes = divmod(value, _MINUTES_PER_HOUR)
+        return f"{hours:02d}:{minutes:02d}"
+    return value
+
+
 @dataclass
 class NerveConfig:
     workspace: Path = field(default_factory=paths.default_workspace)
@@ -4425,8 +4442,8 @@ class NerveConfig:
             timezone=d["timezone"] if "timezone" in d else default_timezone(),
             lockdown=locked,
             deployment=d.get("deployment", "server"),
-            quiet_start=d.get("quiet_start", "02:00"),
-            quiet_end=d.get("quiet_end", "08:00"),
+            quiet_start=_as_clock_time(d.get("quiet_start", "02:00")),
+            quiet_end=_as_clock_time(d.get("quiet_end", "08:00")),
             provider=ProviderConfig.from_dict(d.get("provider", {})),
             gateway=GatewayConfig.from_dict(d.get("gateway", {})),
             agent=AgentConfig.from_dict(d.get("agent", {})),

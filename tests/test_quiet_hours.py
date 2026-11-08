@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import pytest_asyncio
+import yaml
 
 from nerve.config import NerveConfig, NotificationsConfig
 from nerve.notifications import quiet_hours
@@ -70,6 +71,14 @@ class TestInQuietHours:
     ])
     def test_an_unreadable_value_is_not_quiet(self, start, end, timezone):
         assert in_quiet_hours(_config(start, end, timezone), _at(3)) is False
+
+    def test_an_unquoted_yaml_time_is_the_time_written(self):
+        data = yaml.safe_load("timezone: UTC\nquiet_start: 22:00\nquiet_end: 9:30\n")
+        assert (data["quiet_start"], data["quiet_end"]) == (1320, 570)
+        config = NerveConfig.from_dict(data)
+        assert (config.quiet_start, config.quiet_end) == ("22:00", "09:30")
+        assert in_quiet_hours(config, _at(23)) is True
+        assert in_quiet_hours(config, _at(9, 30)) is False
 
 
 @pytest.mark.parametrize(("text", "minutes"), [("00:00", 0), ("07:30", 450), ("23:59", 1439)])
