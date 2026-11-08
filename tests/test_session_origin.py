@@ -288,6 +288,24 @@ async def test_run_later_gives_a_new_session_the_cron_trigger(install):
 
 
 @pytest.mark.asyncio
+async def test_run_later_without_a_delay_gives_the_web_chat_trigger(install):
+    """The option "Just accept it" schedules nothing: the person runs the turn
+    from the chat, so the session gets the trigger of a web chat."""
+    headers = install.headers("alice")
+    async with _client(install.app()) as client:
+        session_id = (await client.post("/api/sessions", headers=headers, json={})).json()["id"]
+        response = await client.post(
+            "/api/sessions/run-later", headers=headers,
+            json={"session_id": session_id, "message": "later", "delay": "none"},
+        )
+        assert response.status_code == 200
+        single = (await client.get(f"/api/sessions/{session_id}", headers=headers)).json()
+
+    assert await _origin_of(install.db, session_id) == ("chat", {})
+    assert (single["trigger"], single["origin_label"]) == ("chat", "Started in the web chat")
+
+
+@pytest.mark.asyncio
 async def test_an_old_row_gets_a_derived_origin_with_its_channel(install):
     """A row from before the column has a NULL trigger and no details."""
     db = install.db

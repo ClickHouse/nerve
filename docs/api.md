@@ -883,7 +883,7 @@ Session payloads also carry where the session comes from:
 - `trigger`: the kind of event that started the session. One of `chat` (a
   person in the web UI, also the onboarding conversation and forks), `api`
   (`/api/chat`, other REST callers, webhooks), `slack`, `telegram`, `email`,
-  `cron` (cron jobs and "Run later"), `plan` (plan implementation and planner
+  `cron` (cron jobs and "Run later" with a delay), `plan` (plan implementation and planner
   sessions), `workflow` (workflow runs and review loop legs), `external` (MCP
   satellite sessions and imported threads), `system` (the autonomous
   onboarding) and `unknown`. The code path that
@@ -899,7 +899,7 @@ Session payloads also carry where the session comes from:
 `POST /api/sessions` gives `chat` when `source` is `web` (the default) and
 `api` for another `source`. `POST /api/chat` with a new `session_id` gives
 `api`. `POST /api/sessions/run-later` changes a session
-without messages to `cron`.
+without messages to `cron` for a delay, and to `chat` for `none`.
 
 Rows also carry `is_running` (the orchestrator's turn is in flight),
 `has_background_tasks` (sub-agents or background tasks are still live) and

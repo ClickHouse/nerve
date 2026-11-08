@@ -29,7 +29,7 @@ TRIGGER_API = "api"
 TRIGGER_SLACK = "slack"
 TRIGGER_TELEGRAM = "telegram"
 TRIGGER_EMAIL = "email"
-# Cron jobs and "Run later".
+# Cron jobs and "Run later" with a delay.
 TRIGGER_CRON = "cron"
 # Plan implementation and planner sessions.
 TRIGGER_PLAN = "plan"

@@ -798,11 +798,14 @@ async def run_later(req: RunLaterRequest, actor: Actor = Depends(require_auth)):
             status_code=400,
             detail=f"Unknown delay {delay!r} (want one of: 30m, 1h, 24h, none)",
         )
-    # The panel creates an empty session for each deferred prompt. Its first
-    # turn comes from the schedule, so a session without messages gets the
-    # cron trigger.
+    # The panel creates an empty session for each deferred prompt. With a
+    # timed option its first turn comes from the schedule, so a session
+    # without messages gets the cron trigger. With "none" the person runs the
+    # turn from the chat, so it gets the trigger of a web chat.
     await deps.db.set_session_origin(
-        req.session_id, Origin(TRIGGER_CRON, {DETAIL_RUN_LATER: delay}),
+        req.session_id,
+        Origin(TRIGGER_CRON, {DETAIL_RUN_LATER: delay}) if delay in _RUN_LATER_TIMED
+        else Origin(TRIGGER_CHAT),
     )
 
     # Pending user message — mirror the block shape a normal send persists:
