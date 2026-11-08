@@ -93,15 +93,24 @@ export function statusBadgeStyle(color: string | undefined): CSSProperties {
 }
 
 /**
- * Inline style for a form control in the colour of a status: a tinted
- * background and border, and no text colour. A user-chosen colour on its
- * own tint can be below the 4.5:1 contrast that small text needs, so the
- * text keeps the colour of the theme.
+ * The colours of a status for a form control, as CSS variables:
+ * `--status-tint-bg` and `--status-tint-border`. Set them inline and apply
+ * them with classes (see `STATUS_TINT_CLASSES`). An inline `borderColor`
+ * would override the control's `focus:` border, which is its only focus
+ * indicator. A class leaves the `focus:` variant in effect.
+ *
+ * No text colour: a user-chosen colour on its own tint can be below the
+ * 4.5:1 contrast that small text needs, so the text keeps the colour of the
+ * theme.
  */
 export function statusTintStyle(color: string | undefined): CSSProperties {
   const c = color || FALLBACK_COLOR;
   return {
-    backgroundColor: `${c}1a`, // ~10% opacity
-    borderColor: `${c}99`,     // ~60% opacity
-  };
+    '--status-tint-bg': `${c}1a`,     // ~10% opacity
+    '--status-tint-border': `${c}99`, // ~60% opacity
+  } as CSSProperties;
 }
+
+/** The classes that apply the variables of `statusTintStyle`. */
+export const STATUS_TINT_CLASSES =
+  'bg-[color:var(--status-tint-bg)] border-[color:var(--status-tint-border)]';

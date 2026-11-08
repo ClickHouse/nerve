@@ -1,4 +1,6 @@
-import { useTaskStatusStore, statusBadgeStyle, statusTintStyle } from '../../stores/taskStatusStore';
+import {
+  STATUS_TINT_CLASSES, useTaskStatusStore, statusBadgeStyle, statusTintStyle,
+} from '../../stores/taskStatusStore';
 import { Badge, Select } from '../ui';
 
 /** Colored pill showing a task's status label (falls back to the raw name). */
@@ -47,7 +49,7 @@ export function StatusSelect({ value, onChange, className = '', tinted = false }
       options={statuses.map((s) => ({ value: s.name, label: s.label }))}
       className={
         tinted
-          ? `font-medium [&_option]:bg-surface-raised ${className}`
+          ? `font-medium ${STATUS_TINT_CLASSES} [&_option]:bg-surface-raised ${className}`
           : className
       }
     />
