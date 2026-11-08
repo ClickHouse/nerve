@@ -23,10 +23,16 @@ from telegram import (
     Update,
     User,
 )
-from telegram.error import RetryAfter
+from telegram.error import BadRequest, RetryAfter
 
 from nerve.channels.base import OutboundMessage
-from nerve.channels.telegram import TelegramChannel, format_target, parse_target
+from nerve.channels.telegram import (
+    ClosedTopic,
+    SessionTopic,
+    TelegramChannel,
+    format_target,
+    parse_target,
+)
 from nerve.config import ChannelSourceConfig, NerveConfig, TelegramConfig, TelegramTopicsConfig
 
 OWNER = 4242
@@ -1034,3 +1040,517 @@ def test_topic_names_fit_telegram():
 def test_lifecycle_config(raw, expected):
     topics = TelegramConfig.from_dict(raw).topics
     assert (topics.enabled, topics.new_session_creates_topic, topics.auto_rename) == expected
+
+
+# --------------------------------------------------------------------------- #
+#  A session's topic from code: open_session_topic / close_session_topic       #
+# --------------------------------------------------------------------------- #
+
+
+def _web_session(router, sid="web00001", title="Quarterly taxes", **fields):
+    """A session that never touched Telegram: no channel binding at all."""
+    router.sessions[sid] = {
+        "id": sid, "title": title, "status": "idle", "source": "web", **fields,
+    }
+    return sid
+
+
+@pytest.mark.asyncio
+async def test_open_gives_a_web_session_a_topic_in_the_notification_chat():
+    router = _Router()
+    sid = _web_session(router)
+    ch = _channel(router)
+    ch.config.notifications.telegram_chat_id = CHAT
+    bot = ch._app.bot
+
+    result = await ch.open_session_topic(sid)
+
+    key = f"telegram:{CHAT}:501"
+    assert result == SessionTopic(key, opened=True)
+    assert bot.named("create_forum_topic") == [{"chat_id": CHAT, "name": "Quarterly taxes"}]
+    assert router.bound == {key: sid}
+    (card,) = bot.named("send_message")
+    assert (card["chat_id"], card["message_thread_id"]) == (CHAT, 501)
+    assert router.stopped == []
+
+
+@pytest.mark.asyncio
+async def test_open_falls_back_to_the_first_allowed_users_dm():
+    router = _Router()
+    sid = _web_session(router)
+    ch = _channel(router, dm_topics=True)
+
+    result = await ch.open_session_topic(sid)
+
+    assert result.channel_key == f"telegram:{OWNER}:501"
+    assert ch._app.bot.named("create_forum_topic")[0]["chat_id"] == OWNER
+
+
+@pytest.mark.asyncio
+async def test_open_takes_a_chat_and_a_title():
+    router = _Router()
+    sid = _web_session(router, title=None)
+    ch = _channel(router)
+    ch.config.notifications.telegram_chat_id = -100777
+
+    result = await ch.open_session_topic(sid, title="INC-1234 Keeper", chat_id=CHAT)
+
+    assert result.channel_key == f"telegram:{CHAT}:501"
+    assert ch._app.bot.named("create_forum_topic") == [
+        {"chat_id": CHAT, "name": "INC-1234 Keeper"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_open_names_an_untitled_session_after_its_id():
+    router = _Router()
+    sid = _web_session(router, title=None)
+    ch = _channel(router)
+
+    await ch.open_session_topic(sid)
+
+    assert ch._app.bot.named("create_forum_topic")[0]["name"] == f"Session {sid}"
+
+
+@pytest.mark.asyncio
+async def test_open_is_idempotent():
+    router = _Router()
+    sid = _web_session(router)
+    ch = _channel(router)
+    bot = ch._app.bot
+
+    first = await ch.open_session_topic(sid)
+    again = await ch.open_session_topic(sid)
+
+    assert first == SessionTopic(f"telegram:{OWNER}:501", opened=True)
+    assert again == SessionTopic(f"telegram:{OWNER}:501", opened=False)
+    assert len(bot.named("create_forum_topic")) == 1
+    assert [card["message_thread_id"] for card in bot.named("send_message")] == [501, 501]
+
+
+@pytest.mark.asyncio
+async def test_open_replaces_a_topic_that_was_deleted():
+    router = _Router()
+    sid = _web_session(router)
+    router.bound[f"telegram:{OWNER}:77"] = sid
+    ch = _channel(router)
+    ch._app.bot.refuse_threads = {77}
+
+    result = await ch.open_session_topic(sid)
+
+    assert result == SessionTopic(f"telegram:{OWNER}:501", opened=True)
+    assert router.bound == {f"telegram:{OWNER}:501": sid}
+
+
+@pytest.mark.asyncio
+async def test_open_opens_another_topic_for_a_session_with_one_in_another_chat():
+    router = _Router()
+    sid = _web_session(router)
+    router.bound[f"telegram:{CHAT}:77"] = sid
+    ch = _channel(router)
+
+    result = await ch.open_session_topic(sid)
+
+    assert result.channel_key == f"telegram:{OWNER}:501"
+    assert router.bound == {f"telegram:{CHAT}:77": sid, f"telegram:{OWNER}:501": sid}
+
+
+@pytest.mark.asyncio
+async def test_open_releases_the_chat_that_was_on_the_session():
+    router = _Router()
+    sid = _web_session(router)
+    router.bound.update({f"telegram:{OWNER}": sid, "web:default": sid})
+    ch = _channel(router)
+
+    await ch.open_session_topic(sid)
+
+    # The chat's next message starts a new session; the web UI is not a chat.
+    assert router.bound == {f"telegram:{OWNER}:501": sid, "web:default": sid}
+
+
+@pytest.mark.asyncio
+async def test_open_keeps_a_chat_that_is_on_another_session():
+    router = _Router()
+    sid = _web_session(router)
+    router.bound[f"telegram:{OWNER}"] = "other01"
+    ch = _channel(router)
+
+    await ch.open_session_topic(sid)
+
+    assert router.bound[f"telegram:{OWNER}"] == "other01"
+
+
+@pytest.mark.parametrize("fields, error", [
+    (None, "That session is no longer available"),
+    ({"status": "archived"}, "That session is no longer available"),
+    ({"source": "external"}, "An external client's session cannot live in a topic"),
+])
+@pytest.mark.asyncio
+async def test_open_refuses_a_session_that_cannot_have_a_topic(fields, error):
+    router = _Router()
+    if fields is not None:
+        _web_session(router, **fields)
+    ch = _channel(router)
+
+    result = await ch.open_session_topic("web00001")
+
+    assert result == SessionTopic(None, error=error)
+    assert ch._app.bot.calls == [] and router.bound == {}
+
+
+@pytest.mark.asyncio
+async def test_open_refuses_with_topics_off_without_a_chat_or_without_telegram():
+    router = _Router()
+    sid = _web_session(router)
+
+    off = _channel(router, topics=False)
+    assert (await off.open_session_topic(sid)).error == (
+        "Telegram topics are off (telegram.topics.enabled)"
+    )
+    nowhere = _channel(router)
+    nowhere.config.telegram.allowed_users = []
+    assert (await nowhere.open_session_topic(sid)).error.startswith("No chat to open a topic in")
+    stopped = _channel(router)
+    stopped._app = None
+    assert (await stopped.open_session_topic(sid)).error == "Telegram is not running"
+    assert router.bound == {}
+
+
+@pytest.mark.asyncio
+async def test_open_reports_a_topic_telegram_refused():
+    router = _Router()
+    sid = _web_session(router)
+    ch = _channel(router)
+    ch._app.bot.refuse_topics = BadRequest("Not enough rights to create a topic")
+
+    result = await ch.open_session_topic(sid)
+
+    assert result == SessionTopic(
+        None, error="Couldn't open a topic: Not enough rights to create a topic",
+    )
+    assert router.bound == {}
+
+
+@pytest.mark.asyncio
+async def test_open_passes_a_rate_limit_on():
+    router = _Router()
+    sid = _web_session(router)
+    ch = _channel(router)
+    ch._app.bot.refuse_topics = RetryAfter(12)
+
+    result = await ch.open_session_topic(sid)
+
+    assert (result.channel_key, result.retry_after) == (None, 12.0)
+    assert "retry in 12 s" in result.error
+    assert router.bound == {}
+
+
+@pytest.mark.asyncio
+async def test_a_rate_limit_on_the_card_keeps_the_topic_the_session_has():
+    # Rate limited is not gone: forgetting the topic would open a second one.
+    router = _Router()
+    sid = _web_session(router)
+    router.bound[f"telegram:{OWNER}:77"] = sid
+    ch = _channel(router)
+    ch._app.bot.fail_next = [RetryAfter(5)]
+
+    result = await ch.open_session_topic(sid)
+
+    assert result.retry_after == 5.0
+    assert router.bound == {f"telegram:{OWNER}:77": sid}
+    assert ch._app.bot.named("create_forum_topic") == []
+
+
+@pytest.mark.asyncio
+async def test_a_new_topic_opens_even_when_its_card_is_rate_limited():
+    router = _Router()
+    sid = _web_session(router)
+    ch = _channel(router)
+    ch._app.bot.fail_next = [RetryAfter(40)]  # the card is the first message
+
+    result = await ch.open_session_topic(sid)
+
+    assert result == SessionTopic(f"telegram:{OWNER}:501", opened=True)
+    assert router.bound == {f"telegram:{OWNER}:501": sid}
+
+
+@pytest.mark.asyncio
+async def test_two_opens_at_once_open_one_topic():
+    router = _Router()
+    sid = _web_session(router)
+    ch = _channel(router)
+    bot = ch._app.bot
+    create = bot.create_forum_topic
+
+    async def slow_create(**kwargs):
+        await asyncio.sleep(0)  # Telegram takes a moment; the other call runs
+        return await create(**kwargs)
+
+    bot.create_forum_topic = slow_create
+
+    results = await asyncio.gather(ch.open_session_topic(sid), ch.open_session_topic(sid))
+
+    assert len(bot.named("create_forum_topic")) == 1
+    assert sorted(r.opened for r in results) == [False, True]
+    assert {r.channel_key for r in results} == {f"telegram:{OWNER}:501"}
+
+
+@pytest.mark.parametrize("status, toast", [
+    ("idle", "Opened in a new topic"),
+    ("archived", "That session is no longer available"),
+])
+@pytest.mark.asyncio
+async def test_open_in_topic_answers_the_tap(status, toast):
+    router = _Router()
+    router.sessions["abcd1234"] = {"id": "abcd1234", "title": "Work", "status": status}
+    ch = _channel(router)
+    query = _card_query(data="sesstopic:abcd1234")
+
+    await ch._handle_session_button(query)
+
+    query.answer.assert_awaited_once()
+    assert query.answer.await_args.args[0] == toast
+
+
+@pytest.mark.asyncio
+async def test_open_in_topic_opens_in_the_chat_it_was_tapped_in():
+    router = _Router()
+    router.sessions["abcd1234"] = {"id": "abcd1234", "title": "Work", "status": "idle"}
+    ch = _channel(router)
+    ch.config.notifications.telegram_chat_id = -100555  # not where the tap was
+
+    await ch._handle_session_button(_card_query(data="sesstopic:abcd1234"))
+
+    assert ch._app.bot.named("create_forum_topic")[0]["chat_id"] == CHAT
+
+
+@pytest.mark.asyncio
+async def test_open_in_topic_shows_why_telegram_refused():
+    router = _Router()
+    router.sessions["abcd1234"] = {"id": "abcd1234", "title": "Work", "status": "idle"}
+    ch = _channel(router)
+    ch._app.bot.refuse_topics = BadRequest("Not enough rights to create a topic")
+    query = _card_query(data="sesstopic:abcd1234")
+
+    await ch._handle_session_button(query)
+
+    query.answer.assert_awaited_once_with(
+        "Couldn't open a topic: Not enough rights to create a topic", show_alert=True,
+    )
+
+
+def _recording_close(bot, router):
+    """Have ``close_forum_topic`` record the bindings it saw when it ran."""
+    seen: list[dict] = []
+    close = bot.close_forum_topic
+
+    async def closing(**kwargs):
+        seen.append(dict(router.bound))
+        return await close(**kwargs)
+
+    bot.close_forum_topic = closing
+    return seen
+
+
+@pytest.mark.asyncio
+async def test_close_posts_the_note_unbinds_then_closes():
+    router = _Router()
+    key = f"telegram:{CHAT}:{TOPIC}"
+    router.bound.update({key: "topic01", f"telegram:{CHAT}": "topic01"})
+    ch = _channel(router)
+    bot = ch._app.bot
+    seen = _recording_close(bot, router)
+
+    topics, error = await ch.close_session_topic("topic01", note="Resolved: **no action**")
+
+    assert (topics, error) == ([ClosedTopic(key, "closed")], "")
+    (note,) = bot.texts_sent()
+    assert note["message_thread_id"] == TOPIC
+    assert "Resolved" in note["rich_message"]["markdown"]
+    assert bot.named("close_forum_topic") == [{"chat_id": CHAT, "message_thread_id": TOPIC}]
+    names = [name for name, _ in bot.calls]
+    assert names.index("sendRichMessage") < names.index("close_forum_topic")
+    assert key not in seen[0]  # unbound before Telegram closed it
+    # The chat itself is no topic, and the session goes on.
+    assert router.bound == {f"telegram:{CHAT}": "topic01"}
+    assert router.stopped == []
+
+
+@pytest.mark.asyncio
+async def test_close_without_a_note_posts_nothing():
+    router = _Router()
+    key = f"telegram:{CHAT}:{TOPIC}"
+    router.bound[key] = "topic01"
+    ch = _channel(router)
+
+    topics, error = await ch.close_session_topic("topic01", note="  ")
+
+    assert (topics, error) == ([ClosedTopic(key, "closed")], "")
+    assert ch._app.bot.texts_sent() == []
+    assert router.bound == {}
+
+
+@pytest.mark.asyncio
+async def test_close_a_session_without_a_topic_does_nothing():
+    router = _Router()
+    router.bound.update({f"telegram:{CHAT}": "web00001", "web:default": "web00001"})
+    ch = _channel(router)
+
+    assert await ch.close_session_topic("web00001", note="Done") == ([], "")
+    assert ch._app.bot.calls == []
+    assert router.bound == {f"telegram:{CHAT}": "web00001", "web:default": "web00001"}
+
+
+@pytest.mark.asyncio
+async def test_close_counts_a_topic_closed_already_as_closed():
+    router = _Router()
+    key = f"telegram:{CHAT}:{TOPIC}"
+    router.bound[key] = "topic01"
+    ch = _channel(router)
+    ch._app.bot.fail_next = [BadRequest("Topic_not_modified")]
+
+    assert await ch.close_session_topic("topic01") == ([ClosedTopic(key, "closed")], "")
+    assert router.bound == {}
+
+
+@pytest.mark.parametrize("note, failure", [
+    ("Done", None),                                  # the note finds the topic gone
+    (None, BadRequest("Topic_id_invalid")),          # so does the close
+])
+@pytest.mark.asyncio
+async def test_close_unbinds_a_topic_that_was_deleted(note, failure):
+    router = _Router()
+    key = f"telegram:{CHAT}:{TOPIC}"
+    router.bound[key] = "topic01"
+    ch = _channel(router)
+    bot = ch._app.bot
+    bot.refuse_threads = {TOPIC}
+    if failure is not None:
+        bot.fail_next = [failure]
+
+    assert await ch.close_session_topic("topic01", note=note) == ([ClosedTopic(key, "gone")], "")
+    assert router.bound == {}
+    if note:
+        assert bot.named("close_forum_topic") == []
+
+
+@pytest.mark.asyncio
+async def test_close_in_a_private_chat_posts_and_unbinds_but_cannot_close():
+    router = _Router()
+    key = f"telegram:{OWNER}:{TOPIC}"
+    router.bound[key] = "topic01"
+    ch = _channel(router, dm_topics=True)
+    bot = ch._app.bot
+
+    topics, error = await ch.close_session_topic("topic01", note="Done")
+
+    assert (topics, error) == ([ClosedTopic(key, "left_open")], "")
+    assert len(bot.texts_sent()) == 1
+    assert bot.named("close_forum_topic") == []  # Telegram closes forum topics only
+    assert router.bound == {}
+
+
+@pytest.mark.asyncio
+async def test_a_refused_close_keeps_the_topic_bound():
+    router = _Router()
+    key = f"telegram:{CHAT}:{TOPIC}"
+    router.bound[key] = "topic01"
+    ch = _channel(router)
+    ch._app.bot.fail_next = [BadRequest("Not enough rights to manage topics")]
+
+    topics, error = await ch.close_session_topic("topic01")
+
+    assert topics == []
+    assert error == f"Couldn't close {key}: Not enough rights to manage topics"
+    assert router.bound == {key: "topic01"}
+
+
+@pytest.mark.asyncio
+async def test_a_note_that_fails_leaves_the_topic_open_and_bound():
+    router = _Router()
+    key = f"telegram:{CHAT}:{TOPIC}"
+    router.bound[key] = "topic01"
+    ch = _channel(router)
+    bot = ch._app.bot
+    # The rich message, then its HTML and plain-text fallbacks
+    bot.fail_next = [RuntimeError("Bad Gateway")] * 3
+
+    topics, error = await ch.close_session_topic("topic01", note="Done")
+
+    assert topics == []
+    assert error == f"Couldn't post the note in {key}: Bad Gateway"
+    assert bot.named("close_forum_topic") == []
+    assert router.bound == {key: "topic01"}
+
+
+@pytest.mark.asyncio
+async def test_close_lets_go_of_every_topic_and_reports_the_one_it_could_not():
+    router = _Router()
+    forum, dm = f"telegram:{CHAT}:{TOPIC}", f"telegram:{OWNER}:7"
+    router.bound.update({forum: "topic01", dm: "topic01"})
+    ch = _channel(router)
+    ch._app.bot.fail_next = [BadRequest("Not enough rights to manage topics")]
+
+    topics, error = await ch.close_session_topic("topic01")
+
+    assert topics == [ClosedTopic(dm, "left_open")]
+    assert error == f"Couldn't close {forum}: Not enough rights to manage topics"
+    assert router.bound == {forum: "topic01"}
+
+
+@pytest.mark.asyncio
+async def test_closing_does_not_come_back_as_a_stop():
+    """Telegram may report the close as a forum_topic_closed service message.
+
+    The topic is unbound by then, so it finds no session to stop, whoever
+    Telegram says closed it.
+    """
+    router = _Router()
+    router.bound[f"telegram:{CHAT}:{TOPIC}"] = "topic01"
+    ch = _channel(router)
+
+    await ch.close_session_topic("topic01", note="Done")
+    for user_id in (BOT_ID, OWNER):
+        await ch._handle_topic_service(
+            _service(user_id=user_id, forum_topic_closed=ForumTopicClosed()), None,
+        )
+
+    assert router.stopped == []
+
+
+@pytest.mark.asyncio
+async def test_close_without_telegram():
+    router = _Router()
+    router.bound[f"telegram:{CHAT}:{TOPIC}"] = "topic01"
+    ch = _channel(router)
+    ch._app = None
+
+    assert await ch.close_session_topic("topic01") == ([], "Telegram is not running")
+    assert router.bound == {f"telegram:{CHAT}:{TOPIC}": "topic01"}
+
+
+@pytest.mark.asyncio
+async def test_open_and_close_against_the_real_store(db):
+    """The router and the database, not the dict stand-in: bindings persist."""
+    from nerve.agent.sessions import SessionManager
+    from nerve.channels.router import ChannelRouter
+
+    await db.create_session("web00001", title="Taxes", source="web", actor=None)
+    await db.add_message("web00001", "user", "hello", actor=None)
+    await db.set_channel_session(f"telegram:{OWNER}", "web00001")
+    router = ChannelRouter(SimpleNamespace(db=db, sessions=SessionManager(db)))
+    ch = _channel(router, dm_topics=True)
+
+    opened = await ch.open_session_topic("web00001")
+    again = await ch.open_session_topic("web00001")
+
+    key = f"telegram:{OWNER}:501"
+    assert opened == SessionTopic(key, opened=True)
+    assert again == SessionTopic(key, opened=False)
+    assert await db.get_channel_keys_for_session("web00001") == [key]
+
+    assert await ch.close_session_topic("web00001", note="Done") == (
+        [ClosedTopic(key, "left_open")], "",
+    )
+    assert await db.get_channel_keys_for_session("web00001") == []
+    assert (await db.get_session("web00001"))["status"] != "archived"

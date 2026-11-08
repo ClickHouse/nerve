@@ -22,7 +22,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, NamedTuple, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
 from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
@@ -87,6 +87,10 @@ GENERAL_TOPIC_ID = 1
 NEW_TOPIC_NAME = "New session"
 # Telegram's limit for a topic name
 _TOPIC_NAME_MAX = 128
+# What Telegram's errors say (lower-cased) about a topic that is gone, and
+# about closing a topic that is closed already
+_TOPIC_GONE_ERRORS = ("thread not found", "topic_id_invalid", "topic_deleted")
+_TOPIC_UNCHANGED_ERRORS = ("topic_not_modified",)
 # Messages in a "Send transcript" document, newest kept when a session has more
 _TRANSCRIPT_MAX_MESSAGES = 10_000
 # Watchdog: check every 30s, log heartbeat every ~5 min
@@ -177,6 +181,30 @@ def _address_of_key(channel_key: str) -> _Address | None:
         return _Address(*parse_target(target))
     except ValueError:
         return None
+
+
+def _error_says(exc: BaseException, phrases: tuple[str, ...]) -> bool:
+    """Whether Telegram's error *exc* contains one of *phrases* (lower case)."""
+    text = str(exc).lower()
+    return any(phrase in text for phrase in phrases)
+
+
+class SessionTopic(NamedTuple):
+    """What :meth:`TelegramChannel.open_session_topic` did."""
+
+    channel_key: str | None  # ``telegram:<chat>:<thread>``; None when it failed
+    opened: bool = False     # a topic opened now, not the one the session had
+    error: str = ""          # why it failed, in words a person can read
+    retry_after: float | None = None  # seconds Telegram asked to wait, if rate limited
+
+
+class ClosedTopic(NamedTuple):
+    """A topic :meth:`TelegramChannel.close_session_topic` let go of."""
+
+    channel_key: str
+    # "closed"; "left_open" in a private chat, where Telegram cannot close a
+    # topic; "gone" when the topic had been deleted already
+    outcome: str
 
 
 def _md_to_tg_html(text: str) -> str:
@@ -1232,6 +1260,9 @@ class TelegramChannel(BaseChannel):
         # Updates run concurrently, so two quick messages in a new topic would
         # otherwise each create a session.
         self._topic_locks: dict[str, asyncio.Lock] = {}
+        # Opening a session's topic in a chat: "<chat>:<session>" -> lock, so
+        # two calls at once (a retried request, a tap and a call) open one.
+        self._open_topic_locks: dict[str, asyncio.Lock] = {}
         # Streaming edit budget per chat: chat_id -> monotonic ts of last edit
         self._last_chat_edit: collections.OrderedDict[int, float] = (
             collections.OrderedDict()
@@ -2206,11 +2237,16 @@ class TelegramChannel(BaseChannel):
         )
 
     async def _open_topic(self, chat_id: int, name: str | None) -> tuple[int | None, str]:
-        """Create a topic; ``(thread_id, "")``, or ``(None, why Telegram refused)``."""
+        """Create a topic; ``(thread_id, "")``, or ``(None, why Telegram refused)``.
+
+        A rate limit is raised instead, for a caller that can wait it out.
+        """
         try:
             topic = await self._app.bot.create_forum_topic(
                 chat_id=chat_id, name=_topic_name(name),
             )
+        except RetryAfter:
+            raise
         except Exception as exc:
             logger.info("Telegram refused a topic in chat %s: %s", chat_id, exc)
             return None, str(exc) or type(exc).__name__
@@ -2224,7 +2260,10 @@ class TelegramChannel(BaseChannel):
 
         The chat's own session is left alone: the new session lives in the topic.
         """
-        thread_id, error = await self._open_topic(chat_id, title)
+        try:
+            thread_id, error = await self._open_topic(chat_id, title)
+        except RetryAfter as exc:  # the session starts in the chat instead
+            thread_id, error = None, str(exc)
         if thread_id is None:
             return None, None, error
         topic = _Address(chat_id, thread_id)
@@ -2242,7 +2281,8 @@ class TelegramChannel(BaseChannel):
         """Post the session's catch-up card into *topic*; False if Telegram refuses.
 
         Telegram cannot move history into a topic, so the card shows the last
-        messages and offers the whole conversation as a document.
+        messages and offers the whole conversation as a document. A rate
+        limit is raised, since it says nothing about whether the topic exists.
         """
         sid = session["id"]
         messages = await self.router.get_session_messages(sid, limit=_TAIL_WINDOW)
@@ -2263,48 +2303,176 @@ class TelegramChannel(BaseChannel):
                 reply_markup=InlineKeyboardMarkup(rows),
                 **_in_thread(topic.thread_id),
             )
+        except RetryAfter:
+            raise
         except Exception as exc:
             logger.info("Could not post into %s: %s", topic.channel_key, exc)
             return False
         return True
 
-    async def _open_in_topic(self, query: Any, session_id: str) -> None:
-        """The ``↗ Topic`` button: show a session in a topic of its own.
+    def _home_chat(self) -> int | None:
+        """The chat a session gets its topic in when no chat is named.
 
-        A session already open in a topic of this chat is brought up there. A
-        session the chat itself was on moves to the topic, and the chat's next
-        message starts a new session, so one session never has two windows
-        in the same chat.
+        The notification chat, else the first allowed user's DM: the chat
+        the notification service delivers to (``_resolve_telegram_chat_id``).
         """
-        chat_id = query.message.chat.id
+        chat_id = self.config.notifications.telegram_chat_id
+        if chat_id:
+            return int(chat_id)
+        allowed = self.config.telegram.allowed_users
+        return int(allowed[0]) if allowed else None
+
+    async def open_session_topic(
+        self, session_id: str, title: str | None = None, chat_id: int | None = None,
+    ) -> SessionTopic:
+        """Show a session in a topic of its own, opening one if it has none there.
+
+        The ``↗ Topic`` button, ``POST /api/sessions/{id}/telegram-topic`` and
+        the ``session_open_topic`` tool all come here. The chat is *chat_id*,
+        else :meth:`_home_chat`, so a session that never touched Telegram (a
+        web one, or one an API call started) gets a topic too. A new topic is
+        named *title*, else after the session, and starts with the session's
+        catch-up card.
+
+        Idempotent per chat: a session that has a topic there already gets
+        its card posted in it again, and a topic that was deleted is
+        replaced. A chat that was itself on the session lets go of it, and
+        its next message starts a new session, so one session never has two
+        windows in the same chat.
+        """
+        if self._app is None:
+            return SessionTopic(None, error="Telegram is not running")
+        if not self._topics_enabled():
+            return SessionTopic(None, error="Telegram topics are off (telegram.topics.enabled)")
+        chat = chat_id if chat_id is not None else self._home_chat()
+        if chat is None:
+            return SessionTopic(None, error=(
+                "No chat to open a topic in: set notifications.telegram_chat_id "
+                "or telegram.allowed_users"
+            ))
         session = await self.router.get_session(session_id)
         if not session or session.get("status") == "archived":
-            await query.answer("That session is no longer available", show_alert=True)
-            return
+            return SessionTopic(None, error="That session is no longer available")
+        if session.get("source") == "external":
+            # An MCP client's own session: Nerve runs no turns there, so
+            # nothing could answer a message in its topic.
+            return SessionTopic(None, error="An external client's session cannot live in a topic")
+        lock = self._open_topic_locks.setdefault(f"{chat}:{session_id}", asyncio.Lock())
+        try:
+            async with lock:
+                return await self._show_in_topic(chat, session, title)
+        except RetryAfter as exc:
+            wait = _retry_after_seconds(exc)
+            return SessionTopic(
+                None, error=f"Telegram is rate limiting this chat; retry in {wait:.0f} s",
+                retry_after=wait,
+            )
+
+    async def _show_in_topic(
+        self, chat_id: int, session: dict, title: str | None,
+    ) -> SessionTopic:
+        """:meth:`open_session_topic` once its checks pass; a rate limit is raised."""
+        session_id = session["id"]
         for key in await self.router.channel_keys_for_session(session_id):
             topic = _address_of_key(key)
             if topic is None or topic.chat_id != chat_id or topic.thread_id is None:
                 continue
             if await self._post_session_card(topic, session):
-                await query.answer("It is open in a topic already. Posted it there.")
-                return
+                return SessionTopic(key)
             await self.router.forget_channel(key)  # the topic is gone
         thread_id, error = await self._open_topic(
-            chat_id, session.get("title") or f"Session {session_id}",
+            chat_id, title or session.get("title") or f"Session {session_id}",
         )
         if thread_id is None:
-            await query.answer(
-                _fit_text(f"Couldn't open a topic: {error}", _TOAST_MAX_LEN),
-                show_alert=True,
-            )
-            return
+            return SessionTopic(None, error=f"Couldn't open a topic: {error}")
         topic = _Address(chat_id, thread_id)
         await self.router.switch_session(topic.channel_key, session_id)
         root_key = _Address(chat_id).channel_key
         if await self.router.get_last_session(root_key) == session_id:
             await self.router.forget_channel(root_key)
-        await query.answer("Opened in a new topic")
-        await self._post_session_card(topic, session)
+        try:
+            await self._post_session_card(topic, session)
+        except RetryAfter:  # the topic is open and bound; only its card is missing
+            logger.info("Rate limited: %s opened without its card", topic.channel_key)
+        return SessionTopic(topic.channel_key, opened=True)
+
+    async def _open_in_topic(self, query: Any, session_id: str) -> None:
+        """The ``↗ Topic`` button: :meth:`open_session_topic` in the chat it was tapped in."""
+        result = await self.open_session_topic(session_id, chat_id=query.message.chat.id)
+        if result.channel_key is None:
+            await query.answer(_fit_text(result.error, _TOAST_MAX_LEN), show_alert=True)
+        elif result.opened:
+            await query.answer("Opened in a new topic")
+        else:
+            await query.answer("It is open in a topic already. Posted it there.")
+
+    async def close_session_topic(
+        self, session_id: str, note: str | None = None,
+    ) -> tuple[list[ClosedTopic], str]:
+        """Let go of a session's topics: post *note* in each, unbind it, close it.
+
+        For ``DELETE /api/sessions/{id}/telegram-topic`` and the
+        ``session_close_topic`` tool. The session itself goes on: it is not
+        stopped or archived. Each topic is unbound before it is closed, so
+        the ``forum_topic_closed`` update that may follow finds no session
+        to stop. A topic closed already counts as closed, and one deleted
+        already is only unbound.
+
+        Telegram closes topics in forums only. In a private chat the topic
+        stays open and unbound, and a message in it starts a new session.
+
+        Returns the topics let go of, and what went wrong with the others
+        (``""`` if nothing): a note that did not post, or a close Telegram
+        refused. Such a topic keeps its session.
+        """
+        if self._app is None:
+            return [], "Telegram is not running"
+        done: list[ClosedTopic] = []
+        errors: list[str] = []
+        for key in await self.router.channel_keys_for_session(session_id):
+            topic = _address_of_key(key)
+            if topic is None or topic.thread_id is None:
+                continue  # the chat itself, or another channel
+            # The binding lock: a message arriving meanwhile waits rather
+            # than binding the topic to a new session.
+            async with self._topic_locks.setdefault(key, asyncio.Lock()):
+                outcome, error = await self._close_topic(topic, session_id, note)
+            if error:
+                errors.append(error)
+            else:
+                done.append(ClosedTopic(key, outcome))
+        return done, "; ".join(errors)
+
+    async def _close_topic(
+        self, topic: _Address, session_id: str, note: str | None,
+    ) -> tuple[str, str]:
+        """Post *note* in *topic*, unbind it, close it: ``(outcome, "")`` or ``("", why not)``."""
+        key = topic.channel_key
+        if note and note.strip():
+            try:
+                await self.send(OutboundMessage(
+                    target=topic.target, text=note, session_id=session_id,
+                ))
+            except Exception as exc:
+                if not _error_says(exc, _TOPIC_GONE_ERRORS):
+                    return "", f"Couldn't post the note in {key}: {exc}"
+                await self.router.forget_channel(key)
+                return "gone", ""
+        await self.router.forget_channel(key)
+        if topic.chat_id > 0:  # a private chat: Telegram has no closing there
+            return "left_open", ""
+        try:
+            await self._app.bot.close_forum_topic(
+                chat_id=topic.chat_id, message_thread_id=topic.thread_id,
+            )
+        except Exception as exc:
+            if _error_says(exc, _TOPIC_UNCHANGED_ERRORS):
+                return "closed", ""
+            if _error_says(exc, _TOPIC_GONE_ERRORS):
+                return "gone", ""
+            await self.router.switch_session(key, session_id)  # still open: keep it
+            return "", f"Couldn't close {key}: {exc}"
+        return "closed", ""
 
     async def _send_transcript(self, query: Any, session_id: str) -> None:
         """The ``📄 Send transcript`` button: the whole conversation as a ``.md`` file."""

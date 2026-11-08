@@ -1413,6 +1413,16 @@ as one Markdown file. The agent in the topic has the session's full history.
 Nothing changes on upgrade: existing sessions get a topic only when you open
 one this way.
 
+Code can do the same for any session, one that never touched Telegram
+included: `POST /api/sessions/{id}/telegram-topic` and the agent tool
+`session_open_topic` open it in a topic of the notification chat
+(`notifications.telegram_chat_id`, else the first allowed user's DM).
+`DELETE` on the same path and `session_close_topic` post a last note, close
+the topic and unbind it, and leave the session running. Telegram closes
+topics only in forums, so in a private chat the topic is unbound and stays
+open. The tools are offered when Telegram has a bot token and `topics` is on.
+See [the API](api.md#post-apisessionsidtelegram-topic).
+
 Notifications follow the session. A push from a session that lives in a topic
 (`notify`, a question, an approval) is delivered into that topic, without the
 "Session:" footer, and is answered there: a button on the card, or `/reply`
