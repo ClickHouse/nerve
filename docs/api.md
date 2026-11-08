@@ -781,12 +781,13 @@ instance.
 ```json
 {
   "read_only_reason": null,
+  "hosted": false,
   "fields": {
     "notifications.channels": { "value": ["web", "slack"], "state": "editable", "file": "settings.yaml", "reason": null },
     "notifications.levels.slack": { "value": "important", "state": "machine", "file": "config.yaml", "reason": null },
-    "notifications.slack_channel_id": { "value": null, "state": "managed", "file": null, "reason": "Set by an admin in the control plane." }
+    "notifications.slack_channel_id": { "value": "C0123ABCD", "state": "editable", "file": "settings.yaml", "reason": null }
   },
-  "slack": { "connected": true, "channel_name": null },
+  "slack": { "connected": true, "channel_name": "alerts" },
   "telegram": { "connected": false }
 }
 ```
@@ -800,11 +801,23 @@ The fields are `notifications.channels`, `notifications.levels.slack`,
 |---|---|
 | `editable` | `settings.yaml` states the value, or no file does. A change goes to `settings.yaml` |
 | `machine` | `config.yaml` or `config.local.yaml` on this machine states it. A change goes to that file (`file`) |
-| `managed` | a `${VAR}` reference sets it, or the control plane does (the Slack destination with `slack.mode: hosted`). `reason` says which; the page cannot change it |
+| `managed` | a `${VAR}` reference sets it, or the instance is hosted (see below). `reason` says which; the page cannot change it |
 | `read_only` | lockdown, or no configuration directory. `read_only_reason` and `reason` say why |
 
-`slack.channel_name` is the name of the configured channel when Slack runs
-and answers `conversations.info`, else `null`.
+`hosted` is `true` when the control plane's channel gateway carries the chat
+channels (`slack.mode: hosted`). Then:
+
+- `slack.connected` is `true` while the agent has a Slack app that the
+  control plane connected and a gateway stream can send for it. Notification
+  cards go to the agent's notification channel, which an admin sets in the
+  control plane, so `notifications.slack_channel_id` is `managed` and
+  `slack.channel_name` is `null`.
+- `notifications.levels.telegram` and `notifications.telegram_chat_id` are
+  `managed`: a hosted instance has no Telegram.
+
+In Socket Mode, `slack.connected` is `true` when Slack is on and has both
+tokens, and `slack.channel_name` is the name of the configured channel when
+Slack runs and answers `conversations.info`, else `null`.
 
 #### `PUT /api/settings/notifications`
 

@@ -62,6 +62,7 @@ SETTINGS_FILE = "settings.yaml"
 _MACHINE_FILE, _LOCAL_FILE = "config.yaml", "config.local.yaml"
 
 CONTROL_PLANE_TEXT = "Set by an admin in the control plane."
+HOSTED_TELEGRAM_TEXT = "Telegram is not available on this hosted instance."
 _UNKNOWN_FIELD = "This is not a setting of this section."
 _NOT_VALID = "With this value the configuration is not valid: {}"
 
@@ -145,6 +146,8 @@ def _level_field(channel: str) -> SettingField:
 
 
 SLACK_DESTINATION = "notifications.slack_channel_id"
+#: The fields of the Telegram row. A hosted instance has no Telegram.
+TELEGRAM_FIELDS = frozenset({"notifications.levels.telegram", "notifications.telegram_chat_id"})
 
 NOTIFICATION_FIELDS: tuple[SettingField, ...] = (
     SettingField("notifications.channels", lambda c: c.notifications.delivery_channels(), _parse_channels),
@@ -165,9 +168,17 @@ NOTIFICATION_FIELDS: tuple[SettingField, ...] = (
 )
 
 
+def _hosted(config: NerveConfig) -> bool:
+    """Whether the control plane's channel gateway carries the chat channels
+    (``slack.mode: hosted``, which the platform sets on each hosted agent)."""
+    return config.slack.mode == "hosted"
+
+
 def _managed_reason(path: str, layers: setup_provenance.RawLayers, config: NerveConfig) -> str | None:
-    if path == SLACK_DESTINATION and config.slack.mode == "hosted":
+    if _hosted(config) and path == SLACK_DESTINATION:
         return CONTROL_PLANE_TEXT
+    if _hosted(config) and path in TELEGRAM_FIELDS:
+        return HOSTED_TELEGRAM_TEXT
     if setup_provenance.source_of(path, layers) == setup_provenance.SOURCE_ENVIRONMENT:
         return _MANAGED_DETAIL[setup_provenance.SOURCE_ENVIRONMENT]
     return None
@@ -269,21 +280,28 @@ async def _save(ctx: _Context, values: dict[str, Any]) -> dict[str, str]:
     return reload_failures(await _reload(Path(ctx.config.config_dir)))
 
 
-def _slack_connected(config: NerveConfig) -> bool:
-    slack = config.slack
-    if slack.mode == "hosted":
-        return bool(slack.enabled)
-    return bool(slack.enabled and slack.bot_token and slack.app_token)
-
-
-async def _slack_channel_name(config: NerveConfig) -> str | None:
-    """The name of the configured notification channel, when Slack runs."""
-    channel_id = config.notifications.slack_channel_id.strip()
-    if not channel_id:
-        return None
+def _running_slack() -> Any | None:
+    """The registered Slack channel (Socket Mode or hosted), or ``None``."""
     try:
-        slack = get_deps().engine.channel("slack")
+        return get_deps().engine.channel("slack")
     except (RuntimeError, AttributeError):
+        return None
+
+
+def _slack_connected(config: NerveConfig, slack: Any | None) -> bool:
+    """Socket Mode: Slack is on and has both tokens. Hosted: the hosted
+    channel is available, that is, a gateway stream can send for a Slack
+    app that the control plane connected."""
+    if _hosted(config):
+        return bool(getattr(slack, "is_available", False))
+    return bool(config.slack.enabled and config.slack.bot_token and config.slack.app_token)
+
+
+async def _slack_channel_name(config: NerveConfig, slack: Any | None) -> str | None:
+    """The name of the configured notification channel, when Slack runs in
+    Socket Mode. Hosted mode does not read the key."""
+    channel_id = config.notifications.slack_channel_id.strip()
+    if not channel_id or _hosted(config):
         return None
     lookup = getattr(slack, "conversation_name", None)
     if lookup is None or not getattr(slack, "is_available", False):
@@ -296,12 +314,14 @@ async def _slack_channel_name(config: NerveConfig) -> str | None:
 
 async def _notifications_body(ctx: _Context) -> dict[str, Any]:
     config = ctx.config
+    slack = _running_slack()
     return {
         "read_only_reason": ctx.facts.writable_problem,
+        "hosted": _hosted(config),
         "fields": _fields(ctx, NOTIFICATION_FIELDS),
         "slack": {
-            "connected": _slack_connected(config),
-            "channel_name": await _slack_channel_name(config),
+            "connected": _slack_connected(config, slack),
+            "channel_name": await _slack_channel_name(config, slack),
         },
         "telegram": {"connected": bool(config.telegram.enabled and config.telegram.bot_token)},
     }

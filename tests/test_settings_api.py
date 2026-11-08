@@ -49,6 +49,13 @@ async def _put(inst, body: dict):
         return await http.put(URL, json=body)
 
 
+def _run_slack(monkeypatch, inst, slack) -> None:
+    """Register *slack* as the engine's running Slack channel."""
+    engine = MagicMock()
+    engine.channel.side_effect = lambda name: slack if name == "slack" else None
+    monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=inst.db))
+
+
 @pytest.mark.asyncio
 class TestStates:
     async def test_every_field_is_editable_in_settings_yaml_on_a_fresh_install(self, inst):
@@ -59,6 +66,7 @@ class TestStates:
         }
         assert body["fields"]["notifications.channels"]["value"] == ["web", "telegram", "slack"]
         assert body["fields"]["notifications.slack_channel_id"]["value"] is None
+        assert body["hosted"] is False
         assert body["slack"] == {"connected": False, "channel_name": None}
         assert body["telegram"] == {"connected": False}
 
@@ -92,19 +100,55 @@ class TestStates:
         assert response.json()["field"] == LEVEL_SLACK
         assert inst.settings_yaml()["notifications"]["levels"]["slack"] == "${NOTIFY_SLACK_LEVEL}"
 
-    async def test_a_hosted_slack_destination_is_set_by_the_control_plane(self, inst):
+    async def test_a_hosted_slack_destination_is_set_by_the_control_plane(self, inst, monkeypatch):
         merge_settings_paths(inst.workspace, {"slack.mode": "hosted"})
         inst.reload()
+        _run_slack(monkeypatch, inst, MagicMock(is_available=True))
         body = await _get(inst)
+        assert body["hosted"] is True
         field = body["fields"]["notifications.slack_channel_id"]
         assert field["state"] == "managed"
         assert field["reason"] == settings_routes.CONTROL_PLANE_TEXT
         assert body["slack"]["connected"] is True
-        # The other Slack fields stay this page's.
-        assert body["fields"][LEVEL_SLACK]["state"] == "editable"
 
         response = await _put(inst, {"notifications.slack_channel_id": "C0123ABCD"})
         assert response.status_code == 409
+        assert response.json()["field"] == "notifications.slack_channel_id"
+        assert "notifications" not in inst.settings_yaml()
+
+        # The switch and the level of the Slack row stay this page's.
+        response = await _put(inst, {"notifications.channels": ["web", "slack"], LEVEL_SLACK: "important"})
+        assert response.status_code == 200, response.text
+        assert inst.settings_yaml()["notifications"] == {"channels": ["web", "slack"], "levels": {"slack": "important"}}
+
+    @pytest.mark.parametrize("available", [True, False])
+    async def test_hosted_slack_is_connected_while_the_hosted_channel_is_available(
+        self, inst, monkeypatch, available,
+    ):
+        merge_settings_paths(inst.workspace, {"slack.mode": "hosted", "notifications.slack_channel_id": "C0123ABCD"})
+        inst.reload()
+        slack = MagicMock(is_available=available)
+        slack.conversation_name = AsyncMock(return_value="general")
+        _run_slack(monkeypatch, inst, slack)
+
+        body = await _get(inst)
+
+        assert body["slack"] == {"connected": available, "channel_name": None}
+        slack.conversation_name.assert_not_awaited()
+
+    async def test_a_hosted_instance_has_no_telegram_settings(self, inst):
+        merge_settings_paths(inst.workspace, {"slack.mode": "hosted"})
+        inst.reload()
+        body = await _get(inst)
+        for path in ("notifications.levels.telegram", "notifications.telegram_chat_id"):
+            assert body["fields"][path]["state"] == "managed"
+            assert body["fields"][path]["reason"] == settings_routes.HOSTED_TELEGRAM_TEXT
+
+        for path, value in (("notifications.levels.telegram", "important"), ("notifications.telegram_chat_id", 42)):
+            response = await _put(inst, {path: value})
+            assert response.status_code == 409
+            assert response.json()["field"] == path
+        assert "notifications" not in inst.settings_yaml()
 
     async def test_lockdown_makes_every_field_read_only_and_refuses_a_write(self, inst, monkeypatch):
         _lock(inst, monkeypatch)
@@ -127,9 +171,7 @@ class TestStates:
         inst.reload()
         slack = MagicMock(is_available=True)
         slack.conversation_name = AsyncMock(return_value="general")
-        engine = MagicMock()
-        engine.channel.side_effect = lambda name: slack if name == "slack" else None
-        monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(engine=engine, db=inst.db))
+        _run_slack(monkeypatch, inst, slack)
         body = await _get(inst)
         assert body["fields"]["notifications.slack_channel_id"]["value"] == "C0123ABCD"
         assert body["slack"]["channel_name"] == "general"
