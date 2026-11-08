@@ -403,7 +403,8 @@ above the list ("Browser alerts are on" or "off") opens the setting.
   alert without sound.
 - **Title and favicon:** on every panel tab, in front or not, the title
   starts with "!" while an answer from the person waits (a question in the
-  turn, a pending question or approval, or a review loop on a decision).
+  turn, a pending question or approval from any session, or a review loop on
+  a decision). The filters on the Notifications page do not change this.
   Otherwise it starts with "(N)", the number of pending notifications that
   the Notifs badge shows. The favicon gets a red dot for "!" and a blue dot
   for "(N)". A page that sets its own title gets the prefix again. The server

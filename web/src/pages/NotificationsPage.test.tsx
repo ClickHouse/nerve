@@ -115,7 +115,7 @@ describe('NotificationsPage attribution', () => {
   it('names the person who answered and keeps the transport', async () => {
     listNotifications.mockResolvedValue({
       notifications: [notification({ answered_by_actor_id: ALICE })],
-      pending_count: 0,
+      pending_count: 0, pending_answer_count: 0,
     });
     renderPage();
     await waitFor(() => expect(attributions()).toEqual(['Alice']));
@@ -127,7 +127,7 @@ describe('NotificationsPage attribution', () => {
   it('shows only the transport for a chat-channel answer', async () => {
     listNotifications.mockResolvedValue({
       notifications: [notification({ answered_by: 'telegram' })],
-      pending_count: 0,
+      pending_count: 0, pending_answer_count: 0,
     });
     renderPage();
     await screen.findByText(/via telegram/);
@@ -141,7 +141,7 @@ describe('NotificationsPage attribution', () => {
         type: 'notify', status: 'dismissed', answer: null, answered_by: null,
         dismissed_by_actor_id: BOB,
       })],
-      pending_count: 0,
+      pending_count: 0, pending_answer_count: 0,
     });
     renderPage();
     await waitFor(() => expect(attributions()).toEqual(['Bob']));
@@ -149,7 +149,7 @@ describe('NotificationsPage attribution', () => {
   });
 
   it('names who created a silence, and for whom', async () => {
-    listNotifications.mockResolvedValue({ notifications: [], pending_count: 0 });
+    listNotifications.mockResolvedValue({ notifications: [], pending_count: 0, pending_answer_count: 0 });
     listSilences.mockResolvedValue({
       silences: [
         silence({ id: 'sil-web', created_by_actor_id: ALICE, caused_by_actor_id: ALICE }),
@@ -167,7 +167,7 @@ describe('NotificationsPage attribution', () => {
   });
 
   it('opens the silences manager for a link from Settings', async () => {
-    listNotifications.mockResolvedValue({ notifications: [], pending_count: 0 });
+    listNotifications.mockResolvedValue({ notifications: [], pending_count: 0, pending_answer_count: 0 });
     listSilences.mockResolvedValue({ silences: [silence({ id: 'sil-web', created_by_actor_id: ALICE })] });
     render(<MemoryRouter initialEntries={['/notifications?silences=1']}><NotificationsPage /></MemoryRouter>);
     expect(await screen.findByRole('heading', { name: 'Silences' })).toBeInTheDocument();
@@ -179,7 +179,7 @@ describe('NotificationsPage attribution', () => {
         id: 'notif-live', status: 'pending', answer: null, answered_by: null,
         answered_at: null,
       })],
-      pending_count: 1,
+      pending_count: 1, pending_answer_count: 1,
     });
     renderPage();
     await screen.findByText('Pick one');
@@ -198,7 +198,7 @@ describe('NotificationsPage attribution', () => {
         answered_at: null, options: ['approve', 'decline', 'snooze_24h'],
         redeliver_at: '2999-01-01T00:00:00+00:00', answered_by_actor_id: BOB,
       })],
-      pending_count: 1,
+      pending_count: 1, pending_answer_count: 1,
     });
     renderPage();
     await waitFor(() => expect(attributions()).toEqual(['Bob']));
@@ -211,7 +211,7 @@ describe('NotificationsPage attribution', () => {
         id: 'notif-snooze', type: 'approval', status: 'pending', answer: null,
         answered_by: null, answered_at: null, options: ['approve', 'snooze_24h'],
       })],
-      pending_count: 1,
+      pending_count: 1, pending_answer_count: 1,
     });
     renderPage();
     await screen.findByText('Pick one');
@@ -249,7 +249,7 @@ const PLAN_NOTICE = {
 describe('NotificationsPage links', () => {
   it('opens the plan and the task that a notification names', async () => {
     listNotifications.mockResolvedValue({
-      notifications: [notification(PLAN_NOTICE)], pending_count: 1,
+      notifications: [notification(PLAN_NOTICE)], pending_count: 1, pending_answer_count: 0,
     });
     renderAt(<NotificationsPage />);
     await userEvent.click(await screen.findByRole('button', { name: 'Open plan' }));
@@ -261,7 +261,7 @@ describe('NotificationsPage links', () => {
   it('shows no plan link on a notification without one', async () => {
     listNotifications.mockResolvedValue({
       notifications: [notification({ type: 'notify', status: 'pending', title: 'Build finished' })],
-      pending_count: 1,
+      pending_count: 1, pending_answer_count: 0,
     });
     renderAt(<NotificationsPage />);
     await screen.findByText('Build finished');
@@ -274,7 +274,7 @@ describe('NotificationsPage links', () => {
         type: 'notify', status: 'pending', title: 'Done',
         body: 'See **the plan**: [plan-2](/plans/plan-2) or [docs](https://example.com/docs)',
       })],
-      pending_count: 1,
+      pending_count: 1, pending_answer_count: 0,
     });
     renderAt(<NotificationsPage />);
     expect((await screen.findByText('the plan')).tagName).toBe('STRONG');
@@ -311,7 +311,7 @@ describe('NotificationsPage options', () => {
         id: 'ask-1', status: 'pending', answer: null, answered_by: null, answered_at: null,
         options: '["Yes, all of these","No"]' as unknown as string[],
       })],
-      pending_count: 1,
+      pending_count: 1, pending_answer_count: 1,
     });
     answerNotification.mockResolvedValue({ answered: true });
     getNotification.mockResolvedValue(notification({ id: 'ask-1', answer: 'Yes, all of these' }));
@@ -329,7 +329,7 @@ describe('NotificationsPage options', () => {
         id: 'approval-1', type: 'approval', status: 'pending', answer: null, answered_by: null,
         answered_at: null, options: ['approve', 'decline'],
       })],
-      pending_count: 1,
+      pending_count: 1, pending_answer_count: 1,
     });
     renderPage();
     const list = within(await screen.findByRole('group', { name: 'Pick one' }));
@@ -340,7 +340,7 @@ describe('NotificationsPage options', () => {
   it('folds an answered approval to its label', async () => {
     listNotifications.mockResolvedValue({
       notifications: [notification({ type: 'approval', options: ['approve', 'decline'], answer: 'decline' })],
-      pending_count: 0,
+      pending_count: 0, pending_answer_count: 0,
     });
     renderPage();
     expect((await screen.findByText('Answer:')).parentElement).toHaveTextContent('Answer: Decline');
@@ -394,7 +394,7 @@ describe('NotificationToast options', () => {
   });
 
   it('folds after an answer from the page, without the answer event', async () => {
-    listNotifications.mockResolvedValue({ notifications: [], pending_count: 0 });
+    listNotifications.mockResolvedValue({ notifications: [], pending_count: 0, pending_answer_count: 0 });
     answerNotification.mockResolvedValue({ answered: true });
     getNotification.mockResolvedValue(notification({
       id: 'ask-live', title: 'Which region?', answer: 'East', answered_by: 'web',
@@ -407,7 +407,7 @@ describe('NotificationToast options', () => {
   });
 
   it('closes the notify toasts on Dismiss all and keeps the questions', async () => {
-    listNotifications.mockResolvedValue({ notifications: [], pending_count: 0 });
+    listNotifications.mockResolvedValue({ notifications: [], pending_count: 0, pending_answer_count: 0 });
     dismissAllNotifications.mockResolvedValue({ dismissed: 1 });
     renderAt(<NotificationToast />);
     push(ASK);

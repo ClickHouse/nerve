@@ -851,6 +851,29 @@ for each channel in `notifications.channels`, and one for `webpush` when a
 browser has push on (`delivered`: a push service took it). `silenced` is true
 when a silence rule matched, so only the panel shows it.
 
+### Notifications
+
+#### `GET /api/notifications?status=&type=&session_id=&limit=50`
+
+The notifications that the web channel got, newest first. `status`
+(`pending`, `answered`, `dismissed`, `expired`, `silenced`), `type`
+(`notify`, `question`, `approval`) and `session_id` filter the list. `limit`
+is at most 200.
+
+```json
+Response: {
+  "notifications": [{ "id": "…", "session_id": "…", "session_title": "…", "type": "question", "title": "Deploy now?", "status": "pending", ... }],
+  "pending_count": 3,
+  "pending_answer_count": 1
+}
+```
+
+`pending_count` is the number of pending notifications, the number that the
+Notifs badge shows. `pending_answer_count` is the number of pending questions
+and approvals among them. While it is more than 0, the tab title starts with
+"!" (see [web-ui.md](web-ui.md#browser-alerts)). The filters and the limit do
+not apply to the two counts.
+
 ### Web Push
 
 The installable panel and its push notifications (see

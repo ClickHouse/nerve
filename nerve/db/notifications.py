@@ -496,13 +496,19 @@ class NotificationStore:
                 counts.setdefault(session_id, {})[kind] = count
         return counts
 
-    async def count_pending_notifications(self, channel: str | None = None) -> int:
+    async def count_pending_notifications(
+        self, channel: str | None = None, types: tuple[str, ...] = (),
+    ) -> int:
+        """Pending rows delivered to ``channel``, of ``types`` when given."""
         sql = "SELECT COUNT(*) FROM notifications WHERE status = 'pending'"
-        params: tuple = ()
+        params: list = []
         if channel:
             sql += ' AND (channels_delivered IS NULL OR channels_delivered LIKE ?)'
-            params = (f'%"{channel}"%',)
-        async with self.db.execute(sql, params) as cursor:
+            params.append(f'%"{channel}"%')
+        if types:
+            sql += f" AND type IN ({', '.join('?' for _ in types)})"
+            params.extend(types)
+        async with self.db.execute(sql, tuple(params)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
 

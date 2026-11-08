@@ -1857,7 +1857,7 @@ export const api = {
     if (type) qs.set('type', type);
     if (sessionId) qs.set('session_id', sessionId);
     const q = qs.toString();
-    return request<{ notifications: any[]; pending_count: number }>(
+    return request<{ notifications: any[]; pending_count: number; pending_answer_count: number }>(
       `/notifications${q ? '?' + q : ''}`
     );
   },

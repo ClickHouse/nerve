@@ -82,7 +82,10 @@ export interface Silence {
 
 interface NotificationState {
   notifications: Notification[];
+  /** Pending rows, also those that the filters and the limit leave out of `notifications`. */
   pendingCount: number;
+  /** The pending questions and approvals among `pendingCount`. */
+  pendingAnswerCount: number;
   filter: string;
   typeFilter: string;
   loading: boolean;
@@ -113,6 +116,11 @@ interface NotificationState {
   removeSilence: (id: string) => Promise<void>;
 }
 
+/** A question or an approval: a row that waits for an answer from the person. */
+function waitsForAnswer(type: Notification['type']): boolean {
+  return type === 'question' || type === 'approval';
+}
+
 /** The rows that `fetchNotification` is reading, so that it reads each row once. */
 const reading = new Set<string>();
 
@@ -132,6 +140,7 @@ function patchCopies(s: Copies, id: string, patch: Partial<Notification>): Copie
 export const useNotificationStore = create<NotificationState>((set, get) => ({
   notifications: [],
   pendingCount: 0,
+  pendingAnswerCount: 0,
   filter: 'pending',
   typeFilter: '',
   loading: true,
@@ -146,6 +155,7 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       set({
         notifications: data.notifications,
         pendingCount: data.pending_count,
+        pendingAnswerCount: data.pending_answer_count,
         loading: false,
       });
     } catch (e) {
@@ -276,6 +286,9 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
         // row was already pending (snooze never decremented it), so it
         // must not count twice.
         pendingCount: silenced || redelivered ? s.pendingCount : s.pendingCount + 1,
+        pendingAnswerCount: silenced || redelivered || !waitsForAnswer(notif.type)
+          ? s.pendingAnswerCount
+          : s.pendingAnswerCount + 1,
         toastQueue: silenced ? s.toastQueue : [...s.toastQueue, notif],
       };
     });
@@ -301,20 +314,22 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
         answered_by_actor_id: data.actor_id ?? null,
         answered_at: data.answered_at ?? null,
       }),
+      // Only a question or an approval takes an answer.
       pendingCount: Math.max(0, s.pendingCount - 1),
+      pendingAnswerCount: Math.max(0, s.pendingAnswerCount - 1),
     }));
   },
 
   handleWSNotificationExpired: (data: any) => {
     set(s => {
-      const wasPending = s.notifications.some(
-        n => n.id === data.notification_id && n.status === 'pending'
-      );
+      // The server sends this event for a question or an approval that was
+      // pending. A filter or the limit can leave the row out of the list.
+      const row = s.notifications.find(n => n.id === data.notification_id);
+      const removed = !row || row.status === 'pending' ? 1 : 0;
       return {
         ...patchCopies(s, data.notification_id, { status: 'expired' }),
-        pendingCount: wasPending
-          ? Math.max(0, s.pendingCount - 1)
-          : s.pendingCount,
+        pendingCount: Math.max(0, s.pendingCount - removed),
+        pendingAnswerCount: Math.max(0, s.pendingAnswerCount - removed),
       };
     });
   },

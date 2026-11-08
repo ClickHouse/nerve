@@ -20,7 +20,7 @@ vi.mock('../../api/websocket', () => ({
 vi.mock('../../api/client', async (orig) => ({
   ...(await orig<typeof import('../../api/client')>()),
   api: {
-    listNotifications: vi.fn(async () => ({ notifications: [], pending_count: 0 })),
+    listNotifications: vi.fn(async () => ({ notifications: [], pending_count: 0, pending_answer_count: 0 })),
     dismissNotification: vi.fn(async () => ({})),
     dismissAllNotifications: vi.fn(async () => ({})),
   },
@@ -94,7 +94,7 @@ beforeEach(() => {
   localStorage.clear();
   useBrowserAlertStore.setState({ enabled: false, level: 'important', offerDone: false });
   useChatStore.setState({ sessions: [] });
-  useNotificationStore.setState({ pendingCount: 0, notifications: [], toastQueue: [] });
+  useNotificationStore.setState({ pendingCount: 0, pendingAnswerCount: 0, notifications: [], toastQueue: [], filter: 'pending' });
   FakeChannel.all = [];
 });
 
@@ -120,7 +120,7 @@ describe('BrowserAlerts', () => {
     renderAlerts();
     expect(document.title).toBe('Nerve');
 
-    // A question arrives: its row in the notification list gives "!" before the session list reloads.
+    // A question arrives: the count of pending answers gives "!" before the session list reloads.
     act(() => useNotificationStore.getState().handleWSNotification({
       notification_id: 'ask-1', notification_type: 'question', session_id: 's1', title: 'Deploy now?', priority: 'normal',
     }));
@@ -150,6 +150,18 @@ describe('BrowserAlerts', () => {
     expect(document.title).toBe('(1) Fix the login test');
     setUnread(0);
     expect(document.title).toBe('Fix the login test');
+  });
+
+  it('puts "!" before the title for a pending question that the list leaves out', async () => {
+    // A cron session asks, and the Notifications page shows the answered rows only.
+    vi.mocked(api.listNotifications).mockResolvedValueOnce({ notifications: [], pending_count: 1, pending_answer_count: 1 });
+    renderAlerts();
+
+    act(() => useNotificationStore.getState().setFilter('answered'));
+    await act(async () => { await Promise.resolve(); });
+
+    expect(api.listNotifications).toHaveBeenCalledWith('answered', undefined);
+    expect(document.title).toBe('! Nerve');
   });
 
   it('reads the notifications again when another tab of the browser dismissed items', async () => {
