@@ -83,8 +83,9 @@ interface Loaded {
 /**
  * The results for `urls`. They are read the first time `visible` is true,
  * then again `REFRESH_MS` after each read while one of them is open with
- * checks running and `visible` stays true. A failed refresh keeps the last
- * results and tries again.
+ * checks running and `visible` stays true. After a failed read, they are
+ * read again `REFRESH_MS` later while `visible` is true. A failed refresh
+ * keeps the last results.
  */
 function usePullRequests(urls: string[], visible: boolean): { results: Map<string, PullRequestResult> | null; failed: boolean } {
   const key = urls.join('\n');
@@ -95,7 +96,7 @@ function usePullRequests(urls: string[], visible: boolean): { results: Map<strin
     if (!visible) return;
     const results = current?.results ?? null;
     const live = !!results && [...results.values()].some(isLive);
-    if (current && !live) return;
+    if (current && !live && !current.failed) return;
     const wait = current ? Math.max(0, current.at + REFRESH_MS - Date.now()) : 0;
     const timer = setTimeout(() => {
       void api.getPullRequests(key.split('\n')).then(

@@ -193,6 +193,21 @@ describe('refresh', () => {
     expect(getPullRequests).toHaveBeenCalledTimes(3);
   });
 
+  it('tries again a minute after a failed first read', async () => {
+    getPullRequests.mockRejectedValueOnce(new Error('502'));
+    answer(ok(URL_12, pull({ state: 'merged' })));
+    render(<PullRequestCards blocks={message(URL_12)} />);
+    await flush();
+    expect(screen.getByText('Could not load details')).toBeInTheDocument();
+    await wait(59_000);
+    expect(getPullRequests).toHaveBeenCalledTimes(1);
+    await wait(1_000);
+    expect(getPullRequests).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('Merged')).toBeInTheDocument();
+    await wait(180_000);
+    expect(getPullRequests).toHaveBeenCalledTimes(2);
+  });
+
   it('stops reading when the cards unmount', async () => {
     getPullRequests.mockResolvedValue({ pulls: [ok(URL_12, pull({ checks: { passed: 0, failed: 0, running: 1 } }))] });
     const { unmount } = render(<PullRequestCards blocks={message(URL_12)} />);

@@ -122,7 +122,9 @@ of a message read their data the first time they come into view (or within
 200 px of it). While a pull request is open with checks running, its card reads
 it again 60 s after the last read, but only while the card is in view and the
 tab shows. The card stops when the checks end or the pull request merges or
-closes. A message that still streams shows no cards.
+closes. When the request fails, the card shows "Could not load details" and
+reads again 60 s later, also only while it is in view and the tab shows. A
+message that still streams shows no cards.
 
 ### Modified Files Panel
 GitHub PR-style diff viewer for files modified during a session. Accessible via the `[📁 N]` badge button in the chat header (appears when files have been modified).
