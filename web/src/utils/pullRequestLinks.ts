@@ -22,14 +22,18 @@ export interface PullRequestRef {
 /**
  * The GitHub pull requests that a message links to, at most `limit`, each one
  * once. They come from its text. Only when the text links to none, they come
- * from its tool results, for example the URL that `gh pr create` prints. Thus
- * a reply that links to a pull request gets no cards for the URLs in the
- * output of a command that lists pull requests.
+ * from each tool result that links to exactly one pull request, for example
+ * the URL that `gh pr create` prints. The output of a command that lists pull
+ * requests thus gives no cards.
  */
 export function findPullRequests(blocks: MessageBlock[], limit = MAX_PR_CARDS): PullRequestRef[] {
   const inText = scan(blocks.flatMap(b => (b.type === 'text' ? [b.content] : [])), limit);
   if (inText.length > 0) return inText;
-  return scan(blocks.flatMap(b => (b.type === 'tool_call' && b.result ? [b.result] : [])), limit);
+  const single = blocks.flatMap(b => {
+    const prs = b.type === 'tool_call' && b.result ? scan([b.result], 2) : [];
+    return prs.length === 1 ? [prs[0].url] : [];
+  });
+  return scan(single, limit);
 }
 
 /** The pull requests in `texts`, in order of first link, at most `limit`, each one once. */

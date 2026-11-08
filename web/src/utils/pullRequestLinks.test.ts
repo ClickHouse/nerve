@@ -76,6 +76,16 @@ describe('findPullRequests', () => {
       .toEqual(['https://github.com/example/repo/pull/13']);
   });
 
+  it('reads only a tool result that links to exactly one pull request', () => {
+    const listed = [7, 8, 9].map(n => `{"url":"https://github.com/example/repo/pull/${n}"}`).join(',');
+    expect(urls([tool(`[${listed}]`), text('There are three open pull requests.')])).toEqual([]);
+    expect(urls([
+      tool(`[${listed}]`),
+      tool('https://github.com/example/repo/pull/13\nhttps://github.com/example/repo/pull/13'),
+      text('Opened the pull request.'),
+    ])).toEqual(['https://github.com/example/repo/pull/13']);
+  });
+
   it(`stops at ${MAX_PR_CARDS}`, () => {
     const many = Array.from({ length: 8 }, (_, i) => `https://github.com/example/repo/pull/${i + 1}`).join(' ');
     expect(urls([text(many)])).toHaveLength(MAX_PR_CARDS);

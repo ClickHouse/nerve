@@ -110,21 +110,23 @@ Tool calls are collapsed by default with specialized renderers:
 ### PR Cards
 An assistant message that links to GitHub pull requests
 (`https://github.com/<owner>/<repo>/pull/<number>`) shows one card for each
-pull request below its content. The links come from the message text. Only
-when the text has no such link, they come from its tool results, for example
-the URL that `gh pr create` prints. A message shows at most 5 cards. A card
-shows the title (a link to GitHub), a state chip (Draft, Open, Merged or
-Closed), `owner/repo#number` with the branches, the checks ("2 failed",
-"3 running", "12 passed") and the review decision. The data comes from `GET /api/github/pulls`, so the server
-needs a `gh` login. Without one, the card shows `owner/repo#number` as the link
-and the reason ("No access to details", "GitHub CLI not available"). The cards
-of a message read their data the first time they come into view (or within
-200 px of it). While a pull request is open with checks running, its card reads
-it again 60 s after the last read, but only while the card is in view and the
-tab shows. The card stops when the checks end or the pull request merges or
-closes. When the request fails, the card shows "Could not load details" and
-reads again 60 s later, also only while it is in view and the tab shows. A
-message that still streams shows no cards.
+pull request below its content. The links come from the message text. Only when
+the text has no such link, they come from each tool result that links to
+exactly one pull request, for example the URL that `gh pr create` prints. A
+tool result that lists more pull requests gives no cards. A message shows at
+most 5 cards. A card shows the title (a link to GitHub), a state chip (Draft,
+Open, Merged or Closed), `owner/repo#number` with the branches, the checks
+("2 failed", "3 running", "12 passed") and the review decision. The data comes
+from `GET /api/github/pulls`, so the server needs a `gh` login. Without one,
+the card shows `owner/repo#number` as the link and the reason
+("No access to details", "GitHub CLI not available"). The cards of a message
+read their data the first time they come into view (or within 200 px of it).
+While a pull request is open with checks running, its card reads it again 60 s
+after the last read, but only while the card is in view and the tab shows. The
+card stops when the checks end or the pull request merges or closes. When the
+request fails, the card shows "Could not load details" and reads again 60 s
+later, also only while it is in view and the tab shows. A message that still
+streams shows no cards.
 
 ### Modified Files Panel
 GitHub PR-style diff viewer for files modified during a session. Accessible via the `[📁 N]` badge button in the chat header (appears when files have been modified).
