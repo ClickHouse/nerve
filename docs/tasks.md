@@ -304,11 +304,11 @@ Full-page markdown editor for task content:
 
 - **Edit / Preview toggle** — raw markdown editing or rendered preview
 - **Ctrl+S / Cmd+S** to save; Save button appears when content is modified
-- **Status dropdown** — change status inline in the header
-- **Metadata** — deadline, source, external link displayed in header
+- **Status dropdown** — change status inline in the header. It is the only display of the status, with the status colour on its background and border
+- **Metadata** — deadline, source, external link displayed in header. On a phone, they go in a second row under the status and the buttons
 - **Created in**: when the session that created the task exists, "from <session title>" links to its chat in place of the source. Task cards on the board and in the list show the same link
 - **Sessions**: below the content in preview mode, the sessions that created, implemented or updated the task, each with a link to its chat
-- **Plan**: the latest plan of the task (`GET /api/tasks/{id}/plans`), with its version, its status and **Open plan**. A pending plan with no revision request shows "A plan waits for your review". The section reads the plans again when the task changes, for example when `plan_propose` writes its note
+- **Plan**: the latest plan of the task (`GET /api/tasks/{id}/plans`), with its version, its status and **Open plan**. A pending plan with no revision request shows one row, "Plan vN waits for your review", with **Review**; the full row opens the plan. The section reads the plans again when the task changes, for example when `plan_propose` writes its note
 - **Comments**: below the content in preview mode. Each comment shows its author ("Nerve for <person>" for an agent comment), its age and its markdown text. **Comment** (or Ctrl+Enter / Cmd+Enter) adds one; the delete button shows on your own comments only. The list reads the comments again when the task changes, so a comment by another person or by the agent shows without a reload. Board cards show the comment count
 - **Back button** — returns to the task list
 
