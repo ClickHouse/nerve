@@ -8,6 +8,8 @@ here once and each surface is a thin adapter:
 
 - ``approve_plan`` — mark implementing, spawn an implementation session,
   flip the task to in_progress, and dispatch the build prompt.
+- ``record_plan_approval`` - mark implementing for a plan that the user
+  approved in the chat of the session that does the work; no new session.
 - ``decline_plan`` — mark declined and close the task as done.
 - ``request_plan_revision`` — persist feedback and dispatch a
   ``plan_update`` prompt to the original proposer session (not
@@ -508,6 +510,109 @@ async def approve_plan(
         "plan_id": plan_id,
         "task_id": plan["task_id"],
         "impl_session_id": impl_session_id,
+    }
+
+
+async def record_plan_approval(
+    db: "Database",
+    engine: "AgentEngine | None",
+    plan_id: str,
+    *,
+    session_id: str,
+    actor: "ActorOrId | None",
+    cause: "ActorOrId | None",
+) -> dict:
+    """Record the approval of a pending plan that a session implements itself.
+
+    For a plan that the user approved in the chat of the session that does
+    the work. ``approve_plan`` would start a second session for the same
+    work. Without a record, the plan stays ``pending``: it waits on the
+    Plans page and keeps its session in the sidebar's "Needs you" group.
+
+    Args:
+        db: Database instance.
+        engine: AgentEngine, only for the task-handler context.
+        plan_id: The pending plan.
+        session_id: The calling session. It becomes the plan's
+            ``impl_session_id``, so the task lists it as the session that
+            implemented the plan.
+        actor: Who records the approval (see ``approve_plan``).
+        cause: On whose behalf (see ``approve_plan``).
+
+    Returns:
+        ``{"plan_id", "task_id", "impl_session_id", "status"}``.
+
+    Raises:
+        PlanNotFound: No plan with that ID.
+        PlanNotPending: The plan is not ``pending``, including when a
+            concurrent decision got to it first.
+        TaskNotFound: The plan's task no longer exists.
+
+    Behavior contract:
+        - The plan goes ``pending`` → ``implementing`` in one atomic
+          transition, or → ``done`` when the task is already done
+          (``task_done`` marks only an ``implementing`` plan done).
+        - No session starts and no turn runs.
+        - The task status does not change: the session sets it as the work
+          goes on. The task gets a note with links to the plan and the
+          session, and its pending plan notifications are dismissed.
+    """
+    from dataclasses import replace
+    from nerve.agent.tools import _legacy_ctx
+    from nerve.agent.tools.handlers.tasks import task_update_handler
+    from nerve.db.task_statuses import TERMINAL_STATUS
+
+    plan = await db.get_plan(plan_id)
+    if not plan:
+        raise PlanNotFound(f"Plan not found: {plan_id}")
+
+    if plan["status"] != "pending":
+        await _raise_not_pending(db, plan_id, "approved")
+
+    task = await db.get_task(plan["task_id"])
+    if not task:
+        raise TaskNotFound(f"Task not found for plan {plan_id}: {plan['task_id']}")
+
+    status = "done" if task.get("status") == TERMINAL_STATUS else "implementing"
+    if not await db.compare_and_update_plan(
+        plan_id, expect_status="pending",
+        status=status, reviewed_at=datetime.now(timezone.utc).isoformat(),
+        impl_session_id=session_id,
+        attribution=attribution_for(actor, cause),
+    ):
+        await _raise_not_pending(db, plan_id, "approved")
+
+    task_ctx = replace(
+        _legacy_ctx(session_id), db=db, engine=engine,
+        actor=actor, cause=cause,
+    )
+    try:
+        await task_update_handler(task_ctx, {
+            "task_id": plan["task_id"],
+            "note": (
+                f"Plan {plan_link(plan_id)} approved in the chat of session "
+                f"{session_link(session_id)}, which does the work."
+            ),
+        })
+    except Exception:
+        await _revert_plan(
+            db, plan, status, impl_session_id=plan.get("impl_session_id"),
+        )
+        raise
+    await db.dismiss_plan_notifications(
+        plan["task_id"], attribution=attribution_for(actor, cause),
+    )
+
+    logger.info(
+        "Plan approval recorded: plan=%s task=%s session=%s status=%s",
+        plan_id, plan["task_id"], session_id, status,
+    )
+
+    return {
+        "plan_id": plan_id,
+        "task_id": plan["task_id"],
+        "impl_session_id": session_id,
+        "status": status,
     }
 
 

@@ -28,7 +28,7 @@ User reviews (via /plans UI or chat tools)
 | `plan_update` | Revise a pending plan in place — supersedes the old version and creates v+1 linked via `parent_plan_id`. Preferred over decline+propose for self-refinement. |
 | `plan_list` | List existing plans. Used to check which tasks already have pending plans. |
 | `plan_read` | Read full plan content. Used to review details before approving/declining. |
-| `plan_approve` | Approve a pending plan and spawn an implementation session. |
+| `plan_approve` | Approve a pending plan and spawn an implementation session. With `implement_here=true`, record the approval for the calling session and start nothing. |
 | `plan_decline` | Decline a pending plan with optional feedback. Moves the related task to `done` (declining is treated as abandoning the effort, not pausing it). |
 | `plan_revise` | Request revision of a pending plan — sends feedback to the session that proposed it (the planner session for cron-made plans; `cron:task-planner` when the plan records no session), which calls `plan_update` to produce v+1. |
 
@@ -65,6 +65,16 @@ User reviews (via /plans UI or chat tools)
 - Builds skill-aware prompt (skill plans use `skill_create`/`skill_update` tools)
 - Spawns `engine.run()` in background (unchanged — the agent decides how to implement)
 - Returns `{ plan_id, impl_session_id }`
+
+### `plan_approve(plan_id, implement_here=true)`
+
+For a plan that the user approved in the chat of the session that does the work. Without it, such a plan stays `pending`: it waits on the Plans page, and its session stays in the sidebar's "Needs you" group.
+
+- Guards: only pending plans; needs a calling session
+- Marks the plan `implementing` with `impl_session_id` = the calling session, or `done` when the task is already done
+- Starts no session and runs no turn
+- Does not change the task status. Writes a task note with links to the plan and the session, and dismisses the task's pending plan notifications
+- Returns the plan ID and the new plan status
 
 ### `plan_update(plan_id, content, feedback?, summary?)`
 
