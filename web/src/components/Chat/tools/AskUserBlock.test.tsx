@@ -103,6 +103,20 @@ describe('AskUserBlock', () => {
     expect((await options()).getByRole('button', { name: 'No' })).toBeEnabled();
   });
 
+  it('folds to the answer from a different place when the server refuses the answer', async () => {
+    const answered = row({ status: 'answered', answer: 'No', answered_by: 'telegram', answered_at: ANSWERED_AT });
+    getNotification.mockResolvedValueOnce(row()).mockResolvedValue(answered);
+    answerNotification.mockRejectedValue(new Error('409'));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    useNotificationStore.setState({ toastQueue: [row()] });
+    renderCall();
+    await userEvent.click((await options()).getByRole('button', { name: /Yes, all of these/ }));
+    expect((await screen.findByText('Answer:')).parentElement).toHaveTextContent('Answer: No');
+    expect(screen.getByText('via telegram')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(useNotificationStore.getState().toastQueue[0]).toMatchObject({ status: 'answered', answer: 'No' });
+  });
+
   it('folds to the answer from any place, with who, when and the channel', async () => {
     getNotification.mockResolvedValue(row());
     renderCall();

@@ -178,19 +178,22 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
   },
 
   answerNotification: async (id: string, answer: string) => {
+    let ok = true;
     try {
       await api.answerNotification(id, answer);
     } catch (e) {
       console.error('Failed to answer notification:', e);
-      return false;
+      ok = false;
     }
     get().loadNotifications();
     // Read the row again and update every copy: the answer event does not
-    // come while the socket is down.
-    api.getNotification(id)
+    // come while the socket is down. When the server refuses the answer, the
+    // row can have an answer from a different place, so wait for the row.
+    const reread = api.getNotification(id)
       .then(row => set(s => patchCopies(s, id, row)))
       .catch(e => console.error('Failed to reload notification:', e));
-    return true;
+    if (!ok) await reread;
+    return ok;
   },
 
   dismissNotification: async (id: string) => {
