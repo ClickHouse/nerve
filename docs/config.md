@@ -1415,24 +1415,22 @@ files are unpacked one level. One file is read up to 16 MiB less one byte.
 The files of one message are read up to 32 MiB together, and the content
 unpacked from ZIP files counts against the same limit.
 
-Notifications go to the same conversation as in Socket Mode
-(`notifications.slack_channel_id`, else the first literal conversation ID in
-`slack.allow_channels`), with one button for each answer. A button press
-answers the notification only in the conversation where it was delivered,
-and the card then shows the answer without buttons. A press that answers
-nothing, for example a second press, gets a short notice and the card stays.
-An expired card is edited without buttons.
+A notification card has one button for each answer. Nerve sends it through
+the gateway's `notify` operation, and the gateway posts it in the agent's
+notification channel, which an administrator sets in the control plane.
+Nerve does not read `notifications.slack_channel_id` or the conversation IDs
+in `slack.allow_channels` to choose this conversation. The notification
+channel must allow posts in the agent's Slack access rules, and the agent's
+Slack app must be a member of it. Nerve uses `notify` only when exactly one
+connection advertises it. A gateway that does not advertise it gets no card.
+When the control plane sets no notification channel, the gateway refuses the
+card, and Nerve logs one INFO line for each card. Any other failure logs one
+warning.
 
-When the config names no conversation, Nerve sends the card through the
-gateway's `notify` operation. The gateway posts it in the agent's
-notification channel, which an administrator sets in the hosted platform's
-console. That channel must allow posts in the agent's Slack access rules, and
-the agent's Slack app must be a member of it. A conversation in the config
-takes precedence. Nerve uses `notify` only when exactly one connection
-advertises it. A gateway that does not advertise it gets no card, and Nerve
-logs no warning about the missing `notifications.slack_channel_id`. When the
-console sets no notification channel, the gateway refuses the card, and Nerve
-logs one INFO line for each card. Any other failure logs one warning.
+A button press answers the notification only in the conversation where it
+was delivered, and the card then shows the answer without buttons. A press
+that answers nothing, for example a second press, gets a short notice and
+the card stays. An expired card is edited without buttons.
 
 `/nerve` commands, including the host commands
 `doctor` and `restart`, are not available in hosted mode; `nerve doctor`
@@ -1689,7 +1687,7 @@ Question and approval cards go to Slack by default.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `notifications.channels` | list | `[web, telegram, slack]` | Where `notify`, `ask_user`, and `propose_action` deliver |
-| `notifications.slack_channel_id` | string | `""` | Target channel ID; defaults to the first literal ID in `slack.allow_channels` |
+| `notifications.slack_channel_id` | string | `""` | Target channel ID; defaults to the first literal ID in `slack.allow_channels`. Not read in hosted mode |
 
 `notifications.channels` replaces the default rather than adding to it, so
 list every transport you want. The panel (`web`) is always in the list: Nerve
@@ -1698,8 +1696,9 @@ warning. Slack in the list costs nothing while Slack is off.
 
 Names and globs are not resolved for the `slack_channel_id` fallback. Without
 a literal channel ID, delivery is skipped with a warning. In
-[hosted mode](#hosted-mode), the channel gateway can post the card in the
-notification channel set in the console instead, so there is no warning.
+[hosted mode](#hosted-mode), Nerve does not read these keys to choose the
+conversation: the channel gateway posts each card in the notification channel
+that an administrator sets in the control plane.
 
 ### Outbound Slack message tool
 

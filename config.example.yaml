@@ -275,7 +275,8 @@ slack:
 notifications:
   channels: [web, telegram, slack]
   # Target conversation for Slack cards. Without this, the first literal ID
-  # in slack.allow_channels is used; names and globs are not resolved.
+  # in slack.allow_channels is used; names and globs are not resolved. In
+  # hosted mode the control plane's notification channel is used instead.
   # slack_channel_id: "C0456DEF"
 
 # Quiet hours (local timezone). Optional: set both to "" for none, which is
