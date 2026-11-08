@@ -29,6 +29,7 @@ function field<T>(value: T, over: Partial<SettingField<T>> = {}): SettingField<T
 function settings(over: Partial<NotificationSettings> = {}, fields: Partial<NotificationSettings['fields']> = {}): NotificationSettings {
   return {
     read_only_reason: null,
+    hosted: false,
     fields: {
       'notifications.channels': field(['web', 'slack', 'telegram']),
       'notifications.levels.slack': field('all' as const),
@@ -118,17 +119,56 @@ describe('NotificationsSection', () => {
     expect(screen.getByRole('link', { name: 'Connect Slack in Setup' })).toHaveAttribute('href', '/setup/channels');
   });
 
-  it('shows a destination the control plane sets, with no field for it', async () => {
+  it('shows a destination the environment sets, with no field for it', async () => {
+    const reason = 'This value is configured by your operator from the environment and cannot be changed here.';
     await renderSection(settings(
       { slack: { connected: true, channel_name: null } },
-      { 'notifications.slack_channel_id': field<string | null>(null, {
-        state: 'managed', file: null, reason: 'Set by an admin in the control plane.',
-      }) },
+      { 'notifications.slack_channel_id': field<string | null>('C0456DEFG', { state: 'managed', file: null, reason }) },
     ));
     const slack = row('Slack');
     expect(within(slack).queryByLabelText('Channel')).not.toBeInTheDocument();
-    expect(within(slack).getByText('Set by an admin in the control plane.')).toBeInTheDocument();
+    expect(within(slack).getByText('C0456DEFG')).toBeInTheDocument();
+    expect(within(slack).getByText(reason)).toBeInTheDocument();
     expect(screen.getByRole('switch', { name: 'Slack' })).toBeEnabled();
+  });
+
+  describe('on a hosted instance', () => {
+    const managed = (reason: string) => ({ state: 'managed' as const, file: null, reason });
+    const hosted = (connected: boolean) => settings(
+      { hosted: true, slack: { connected, channel_name: null } },
+      {
+        'notifications.slack_channel_id': field<string | null>(null, managed('Set by an admin in the control plane.')),
+        'notifications.levels.telegram': field('all' as const, managed('Telegram is not available on this hosted instance.')),
+        'notifications.telegram_chat_id': field<number | null>(null, managed('Telegram is not available on this hosted instance.')),
+      },
+    );
+
+    it('shows Slack with its switch and level, and a line in place of the destination', async () => {
+      await renderSection(hosted(true));
+      const slack = row('Slack');
+      expect(screen.getByRole('switch', { name: 'Slack' })).toBeEnabled();
+      expect(within(slack).getByRole('radio', { name: 'Everything' })).toHaveAttribute('aria-checked', 'true');
+      expect(within(slack).getByText(
+        'Cards go to the notification channel that an admin sets in the control plane. With no channel set there, Slack gets none.',
+      )).toBeInTheDocument();
+      expect(within(slack).queryByLabelText('Channel')).not.toBeInTheDocument();
+      expect(within(slack).queryByText('Set by an admin in the control plane.')).not.toBeInTheDocument();
+      expect(within(slack).getByText('Saved in settings.yaml')).toBeInTheDocument();
+    });
+
+    it('shows no Telegram row', async () => {
+      await renderSection(hosted(true));
+      expect(screen.queryByText('Telegram', { selector: 'p' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('switch', { name: 'Telegram' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('link', { name: 'Connect Telegram in Setup' })).not.toBeInTheDocument();
+    });
+
+    it('shows no Slack row while the control plane has no Slack app connected', async () => {
+      await renderSection(hosted(false));
+      expect(screen.queryByText('Slack', { selector: 'p' })).not.toBeInTheDocument();
+      expect(screen.queryByRole('link', { name: 'Connect Slack in Setup' })).not.toBeInTheDocument();
+      expect(screen.getByText('Nerve panel')).toBeInTheDocument();
+    });
   });
 
   it('is read-only under lockdown, with one line that says why', async () => {

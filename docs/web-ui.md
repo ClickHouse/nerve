@@ -355,7 +355,13 @@ Under lockdown the section is read-only, with one line that says why.
   a destination (the Slack channel ID with the channel name, the Telegram
   chat ID) and "What to send": Everything or Questions and important
   (`notifications.levels`). A channel that is not connected links to the
-  Channels step of Setup. On Nerve Cloud the Slack destination is read-only.
+  Channels step of Setup.
+- On a hosted instance (`hosted` in the API, `slack.mode: hosted`), there is
+  no Telegram row. The Slack row shows only while the control plane has a
+  Slack app connected for the agent. It has the switch and "What to send",
+  and in place of the destination one line: "Cards go to the notification
+  channel that an admin sets in the control plane. With no channel set
+  there, Slack gets none."
 - **Send a test** sends one notification to each place that is on. Each row
   then shows "Test arrived" or "Test did not arrive".
 - **Silences** opens the silences manager (`/notifications?silences=1`).

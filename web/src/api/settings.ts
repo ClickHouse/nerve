@@ -35,11 +35,13 @@ export type NotificationSettingValues = Partial<Record<NotificationSettingPath, 
 export interface NotificationSettings {
   /** Why nothing here can change (lockdown), or null. */
   read_only_reason: string | null;
+  /** The control plane's channel gateway carries the chat channels: no Telegram, no Slack destination. */
+  hosted: boolean;
   fields: NotificationSettingFields;
   slack: {
-    /** Tokens are set (or the channel gateway holds them) and Slack is on. */
+    /** Slack is on with both tokens; hosted: the control plane connected a Slack app and it can send. */
     connected: boolean;
-    /** The name of the configured channel, when Slack answered. */
+    /** The name of the configured channel, when Slack answered (Socket Mode only). */
     channel_name: string | null;
   };
   telegram: { connected: boolean };

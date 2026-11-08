@@ -14,6 +14,8 @@ import { ThisBrowserRow } from './ThisBrowserRow';
 const CHANNELS = 'notifications.channels' as const;
 const SETUP_CHANNELS = '/setup/channels';
 const SILENCES_PATH = '/notifications?silences=1';
+const HOSTED_SLACK_DESTINATION = 'Cards go to the notification channel that an admin sets in the control plane. '
+  + 'With no channel set there, Slack gets none.';
 
 /** One field of the section, with its save state and a save for it. */
 function useSetting<P extends NotificationSettingPath>(data: NotificationSettings, path: P) {
@@ -135,21 +137,28 @@ interface ChatChannel {
   help: string;
   /** The destination as text, for a destination set elsewhere. */
   shown: string;
+  /** One read-only line in place of the destination, for a destination this page does not choose. */
+  fixedDestination?: string;
   inputMode?: 'numeric';
 }
 
+/**
+ * The Slack and Telegram rows. A hosted instance has no Telegram, and shows
+ * Slack only while the control plane has a Slack app connected; the control
+ * plane also chooses where its cards go.
+ */
 function chatChannels(data: NotificationSettings): ChatChannel[] {
   const slackName = data.slack.channel_name;
   const slackId = data.fields['notifications.slack_channel_id'].value;
   const chatId = data.fields['notifications.telegram_chat_id'].value;
-  return [
+  const [slack, telegram]: ChatChannel[] = [
     {
       name: 'slack', title: 'Slack', icon: <Slack size={16} />, connected: data.slack.connected,
       description: 'Cards in a Slack channel, with answer buttons.',
       level: 'notifications.levels.slack', destination: 'notifications.slack_channel_id',
       label: 'Channel', placeholder: 'C0123ABCD',
       help: slackName ? `Posts in #${slackName}.` : 'A channel ID. Empty: the first channel ID in the Slack allow list.',
-      shown: slackName ? `#${slackName}` : slackId ?? 'The agent\'s notification channel',
+      shown: slackName ? `#${slackName}` : slackId ?? 'The first channel ID in the Slack allow list',
     },
     {
       name: 'telegram', title: 'Telegram', icon: <Send size={16} />, connected: data.telegram.connected,
@@ -160,6 +169,8 @@ function chatChannels(data: NotificationSettings): ChatChannel[] {
       shown: chatId === null ? 'Your direct messages' : String(chatId),
     },
   ];
+  if (!data.hosted) return [slack, telegram];
+  return data.slack.connected ? [{ ...slack, fixedDestination: HOSTED_SLACK_DESTINATION }] : [];
 }
 
 /**
@@ -192,6 +203,7 @@ function ChatChannelRow({ data, channel }: { data: NotificationSettings; channel
     if (!channels.busy) void channels.save(next ? [...list, channel.name] : list.filter((c) => c !== channel.name));
   };
   const value = target.field.value === null ? '' : String(target.field.value);
+  const fixed = channel.fixedDestination;
   return (
     <SettingRow
       icon={channel.icon}
@@ -209,7 +221,8 @@ function ChatChannelRow({ data, channel }: { data: NotificationSettings; channel
       )}
     >
       <TestResult channel={channel.name} />
-      {on && (target.field.state === 'managed' ? (
+      {on && fixed && <p className="text-xs text-text-dim">{fixed}</p>}
+      {on && !fixed && (target.field.state === 'managed' ? (
         <div className="flex flex-col gap-1">
           <span className="text-xs font-medium text-text-muted">{channel.label}</span>
           <span className="text-sm text-text">{channel.shown}</span>
@@ -240,7 +253,7 @@ function ChatChannelRow({ data, channel }: { data: NotificationSettings; channel
       {on && <ManagedNote field={level.field} />}
       {channels.error && <p role="alert" className="text-xs text-error">{channels.error}</p>}
       <ManagedNote field={channels.field} />
-      <FileNote fields={[channels.field, ...(on ? [target.field, level.field] : [])]} />
+      <FileNote fields={[channels.field, ...(on ? [...(fixed ? [] : [target.field]), level.field] : [])]} />
     </SettingRow>
   );
 }
