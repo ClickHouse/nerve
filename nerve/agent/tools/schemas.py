@@ -560,6 +560,16 @@ PLAN_APPROVE_SCHEMA = {
             "type": "string",
             "description": "The plan ID to approve (e.g. plan-abc12345)",
         },
+        "implement_here": {
+            "type": "boolean",
+            "description": (
+                "Set true when the user approved the plan in this conversation and "
+                "this session does the work. The plan is recorded as approved and "
+                "linked to this session, and no new session starts. A task in "
+                "plan_review goes to in_progress; any other task status does not "
+                "change. Default false: start a new implementation session."
+            ),
+        },
     },
     "required": ["plan_id"],
 }

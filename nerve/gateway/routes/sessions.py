@@ -168,19 +168,35 @@ async def _newest_review_loops(deps) -> dict[str, dict]:
     return newest
 
 
+def _plan_attention_since() -> str | None:
+    """Oldest proposal time of a plan that still counts as attention.
+
+    ``None`` when ``sessions.plan_attention_days`` is 0: every pending plan
+    counts. A plan waits on the Plans page for as long as it is pending,
+    but a session only stays in "Needs you" for this window, so plans that
+    nobody will review (an old cron proposal, a plan that the user approved
+    in a chat) do not hold sessions there for good.
+    """
+    days = get_config().sessions.plan_attention_days
+    if days <= 0:
+        return None
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
 async def _attention_map(deps, loops: dict[str, dict]) -> dict[str, dict]:
     """``session_id -> attention`` for each session that waits for the user.
 
     ``questions`` and ``approvals`` count pending ``ask_user`` and
     ``propose_action`` notifications, ``plans`` counts the pending plans
-    that the session proposed, ``awaiting_input`` is a question inside a
-    running turn, and ``review`` is a newest review loop that waits for a
-    decision. A failed count leaves its fields at zero: enrichment must
-    never fail the listing.
+    that the session proposed in the last ``sessions.plan_attention_days``
+    days (all of them when the setting is 0), ``awaiting_input`` is a
+    question inside a running turn, and ``review`` is a newest review loop
+    that waits for a decision. A failed count leaves its fields at zero:
+    enrichment must never fail the listing.
     """
     try:
         asks = await deps.db.count_pending_by_session()
-        plans = await deps.db.count_pending_plans_by_session()
+        plans = await deps.db.count_pending_plans_by_session(_plan_attention_since())
     except Exception:  # noqa: BLE001 - enrichment must never break listing
         logger.warning("attention counts failed", exc_info=True)
         asks, plans = {}, {}

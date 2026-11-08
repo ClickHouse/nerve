@@ -321,6 +321,8 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
     if not ctx.db:
         return ToolResult.text("Database not available.")
+    if args.get("implement_here"):
+        return await _record_plan_approval(ctx, plan_id)
     if not ctx.engine:
         return ToolResult.text("Engine not available — cannot spawn implementation session.")
 
@@ -342,6 +344,46 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult.text(
         f"Plan {result['plan_id']} approved. "
         f"Implementation session started: {result['impl_session_id']}"
+    )
+
+
+async def _record_plan_approval(ctx: ToolContext, plan_id: str) -> ToolResult:
+    """``plan_approve`` with ``implement_here``: record, start nothing."""
+    from nerve.agent.plan_service import (
+        PlanNotFound,
+        PlanNotPending,
+        TaskNotFound,
+        record_plan_approval,
+    )
+
+    if not ctx.session_id:
+        return ToolResult.text(
+            "implement_here needs a calling session. Approve without it to "
+            "start an implementation session."
+        )
+    try:
+        result = await record_plan_approval(
+            db=ctx.db, engine=ctx.engine, plan_id=plan_id,
+            session_id=ctx.session_id,
+            # As for approve: the agent records the approval through its own
+            # tool, for the cause of the calling session.
+            actor=ctx.db.system_actor, cause=ctx.cause_id,
+        )
+    except PlanNotFound:
+        return ToolResult.text(f"Plan not found: {plan_id}")
+    except TaskNotFound:
+        return ToolResult.text("Task not found for this plan.")
+    except PlanNotPending as exc:
+        return ToolResult.text(str(exc))
+
+    task_text = (
+        "The task moved from plan_review to in_progress. "
+        if result["task_started"] else "The task status did not change. "
+    )
+    return ToolResult.text(
+        f"Plan {result['plan_id']} approved and linked to this session "
+        f"(plan status: {result['status']}). No new session started. "
+        f"{task_text}Update the task status with task_update as the work goes on."
     )
 
 
@@ -453,7 +495,12 @@ PLAN_READ_SPEC = ToolSpec(
 
 PLAN_APPROVE_SPEC = ToolSpec(
     name="plan_approve",
-    description="Approve a pending plan and spawn an implementation session. Use when the user approves a proposed plan.",
+    description=(
+        "Approve a pending plan and spawn an implementation session. Use when the user "
+        "approves a proposed plan. When the user approved it in this conversation and "
+        "this session does the work, set implement_here=true: the plan is recorded as "
+        "approved and linked to this session, and no new session starts."
+    ),
     input_schema=PLAN_APPROVE_SCHEMA,
     handler=plan_approve_handler,
 )

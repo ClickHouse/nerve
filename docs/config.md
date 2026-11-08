@@ -2480,6 +2480,7 @@ The proxy binary is automatically downloaded from [CLIProxyAPI](https://github.c
 | `sessions.max_sessions` | int | `500` | Max active (non-archived) sessions before cleanup |
 | `sessions.cron_session_mode` | string | `per_run` | `per_run` (unique session per cron run) or `reuse` (shared session per job) |
 | `sessions.sidebar_page_size` | int | `50` | Rows per sidebar request: caps the conversation feed and sizes one lazy Archived/System page. `0` = unlimited (a group loads in a single request). Starred sessions are exempt and always returned in full. |
+| `sessions.plan_attention_days` | int | `7` | Days a pending plan puts its proposing session in the sidebar's "Needs you" group, counted from the proposal (a new version with `plan_update` starts the count again). `0` = no limit. The Plans page still lists older pending plans. Questions and approvals are not affected: they expire on their own (`notifications.default_expiry_hours`). |
 
 **Starred sessions are exempt from all auto-archival.** A session starred via
 the star toggle (web sidebar, or the Telegram `/sessions` list / `/star`) is
