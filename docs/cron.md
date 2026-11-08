@@ -799,8 +799,12 @@ and the error tells you to change `enabled` in the file. When the reload after
 the change fails, the file gets its old text back and the error is shown.
 
 Nerve also refuses the change under [lockdown](config.md#lockdown-remote-only-read-only)
-(change the job in the config repository) and for a file that it cannot
-write. A source has no switch: switch it in its `sync` settings.
+and, while [workspace sync](config.md#git-backed-workspace-sync) is on, for a
+file in the workspace's `config/`, because sync refuses to merge while a file
+there has a local change. In both cases, change the job in the config
+repository. A file outside the workspace, such as `~/.nerve/cron/jobs.yaml`,
+keeps its switch. A file that Nerve cannot write is refused too. A source has
+no switch: switch it in its `sync` settings.
 
 ### Failure notices
 

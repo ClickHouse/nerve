@@ -29,7 +29,7 @@ from apscheduler.triggers.interval import IntervalTrigger
 from nerve import paths
 from nerve.agent.engine import AgentEngine, NotAcceptingTurnsError
 from nerve.agent.sessions import new_cron_run_id
-from nerve.config import ConfigError, NerveConfig
+from nerve.config import ConfigError, NerveConfig, _is_within, workspace_reviewed_paths
 from nerve.cron.jobs import (
     CronJob,
     describe_reserved_job_ids,
@@ -107,6 +107,7 @@ _FAILURE_NOTICE_CHARS = 600
 # Why the Cron page cannot switch a job on or off. ``{file}`` is the name of
 # the job's YAML file. The keys are CronTogglePlan problems (setup_writer).
 _TOGGLE_LOCKDOWN = "This instance is in lockdown. Change the job in the config repository."
+_TOGGLE_SYNCED = "This workspace syncs from a config repository. Change the job there."
 _TOGGLE_PROBLEMS = {
     CRON_FILE_HAND_EDITED: "Nerve could not change only the enabled line of this "
                            "job in {file}. Change it in the file.",
@@ -2489,13 +2490,25 @@ class CronService:
             return Path(self.config.cron.jobs_file)
         return Path(self.config.cron.system_file)
 
+    def _synced_from_config_repo(self, path: Path) -> bool:
+        """Whether workspace sync owns ``path``: it is in the reviewed surface
+        of a workspace that syncs. Sync refuses to merge while a file there has
+        a local change, so a change must go through the config repository."""
+        if not self.config.workspace_sync.enabled:
+            return False
+        return any(
+            _is_within(path, reviewed)
+            for reviewed in workspace_reviewed_paths(self.config.workspace)
+        )
+
     async def set_job_enabled(self, job_id: str, enabled: bool) -> dict:
         """Write ``enabled`` into the job's YAML file, then reload.
 
         Only the job's ``enabled:`` line changes
         (:func:`nerve.setup_writer.plan_cron_job_enabled`). Raises ValueError
-        for an unknown job, CronToggleRefused under lockdown or for a file
-        in which that one line cannot be changed, and the reload's ConfigError. A reload
+        for an unknown job, CronToggleRefused under lockdown, for a file that
+        workspace sync owns or for a file in which that one line cannot be
+        changed, and the reload's ConfigError. A reload
         that fails leaves the schedule as it was, so the file gets its old
         text back before the error goes on. Returns the reload summary, as
         :meth:`reload` does.
@@ -2507,6 +2520,8 @@ class CronService:
             if self.config.lockdown:
                 raise CronToggleRefused(_TOGGLE_LOCKDOWN)
             path = self._job_file(job)
+            if self._synced_from_config_repo(path):
+                raise CronToggleRefused(_TOGGLE_SYNCED)
             plan = plan_cron_job_enabled(path, job_id, enabled)
             if not plan.ok:
                 raise CronToggleRefused(_toggle_refusal(plan.problem, path))

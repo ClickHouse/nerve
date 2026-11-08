@@ -165,8 +165,8 @@ class TestPlanCronJobEnabled:
 
 @pytest_asyncio.fixture
 async def svc(tmp_path):
-    cron_dir = tmp_path / "cron"
-    cron_dir.mkdir()
+    cron_dir = tmp_path / "ws" / "config" / "cron"
+    cron_dir.mkdir(parents=True)
     (cron_dir / "system.yaml").write_text(_dump([
         _job("memory-maintenance", enabled=True),
         _job("task-planner", enabled=False),
@@ -178,6 +178,8 @@ async def svc(tmp_path):
     config = MagicMock()
     config.timezone = "UTC"
     config.lockdown = False
+    config.workspace = tmp_path / "ws"
+    config.workspace_sync.enabled = False
     config.cron.jobs_file = cron_dir / "jobs.yaml"
     config.cron.system_file = cron_dir / "system.yaml"
     config.cron.gate_plugins_dir = cron_dir / "gates"
@@ -230,6 +232,33 @@ class TestSetJobEnabled:
             await svc.set_job_enabled("digest", True)
 
         assert svc.config.cron.jobs_file.read_text() == before
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("job_id", ["digest", "memory-maintenance"])
+    async def test_a_workspace_that_syncs_refuses_and_writes_nothing(self, svc, job_id):
+        """Sync refuses to merge while a file in the reviewed surface has a
+        local change, so a switch there would stop every later sync."""
+        svc.config.workspace_sync.enabled = True
+        files = (svc.config.cron.jobs_file, svc.config.cron.system_file)
+        before = [path.read_text() for path in files]
+
+        with pytest.raises(CronToggleRefused, match="config repository"):
+            await svc.set_job_enabled(job_id, job_id == "digest")
+
+        assert [path.read_text() for path in files] == before
+
+    @pytest.mark.asyncio
+    async def test_a_jobs_file_outside_the_synced_workspace_can_switch(self, svc, tmp_path):
+        outside = tmp_path / "home" / "cron" / "jobs.yaml"
+        outside.parent.mkdir(parents=True)
+        outside.write_text(svc.config.cron.jobs_file.read_text())
+        svc.config.cron.jobs_file = outside
+        svc.config.workspace_sync.enabled = True
+        await svc.reload()
+
+        await svc.set_job_enabled("digest", True)
+
+        assert _enabled(outside)["digest"] is True
 
     @pytest.mark.asyncio
     async def test_a_hand_written_jobs_yaml_keeps_its_comments(self, svc):
@@ -314,6 +343,20 @@ async def test_the_switch_is_refused_under_lockdown(svc, bypass_auth, monkeypatc
 
     assert response.status_code == 409
     assert "lockdown" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_the_switch_is_refused_in_a_workspace_that_syncs(svc, bypass_auth, monkeypatch):
+    monkeypatch.setattr("nerve.gateway.server._cron_service", svc)
+    svc.config.workspace_sync.enabled = True
+
+    async with _client(bypass_auth) as client:
+        response = await client.put("/api/cron/jobs/digest/enabled", json={"enabled": True})
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == (
+        "This workspace syncs from a config repository. Change the job there."
+    )
 
 
 @pytest.mark.asyncio

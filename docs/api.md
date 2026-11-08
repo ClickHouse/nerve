@@ -1704,7 +1704,8 @@ reloads the cron jobs (see
 [Switching a job on and off](cron.md#switching-a-job-on-and-off)). A person's
 action: a system or MCP token gets `403`. Only the job's `enabled:` line
 changes. `404` for an unknown job or a source; `409` with the reason under
-lockdown, for a file that Nerve cannot write, and for a layout where one line
+lockdown, for a file in the workspace's `config/` while workspace sync is on,
+for a file that Nerve cannot write, and for a layout where one line
 cannot make the change; `400` when the reload refuses the files, which then
 get their old text back.
 
