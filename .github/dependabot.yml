@@ -63,13 +63,36 @@ updates:
     # stop all major updates, because a major is outside each "^" or "~"
     # range.
     versioning-strategy: "increase-if-necessary"
-    # One PR for all minor and patch updates. Each major update gets its own
-    # PR.
+    # Hold TypeScript below 7. typescript-eslint accepts TypeScript below 6.1
+    # only, and CI installs with --strict-peer-deps. Remove this rule when a
+    # typescript-eslint release accepts TypeScript 7.
+    ignore:
+      - dependency-name: "typescript"
+        versions: [">=7.0.0"]
+    # A dependency goes into the first group that it matches. A group with no
+    # update-types also takes major updates.
     groups:
+      # @eslint/js needs the eslint of the same major (peer dependency), so
+      # the two update in one PR.
+      eslint:
+        patterns:
+          - "eslint"
+          - "@eslint/js"
+      # @vitest/coverage-v8 needs the same vitest version (peer dependency).
+      vitest:
+        patterns:
+          - "vitest"
+          - "@vitest/*"
+      # One PR for all other minor and patch updates. Each other major update
+      # gets its own PR. @clickhouse/click-ui also gets its own PR: its 0.x
+      # minors can change the UI, and CI does not check styles (Vitest runs
+      # with css: false).
       npm-minor-patch:
         update-types:
           - "minor"
           - "patch"
+        exclude-patterns:
+          - "@clickhouse/click-ui"
 
   - package-ecosystem: "github-actions"
     directory: "/"
