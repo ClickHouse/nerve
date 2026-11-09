@@ -52,7 +52,7 @@
     "eslint": "^10.14.0",
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.5.7",
-    "globals": "^16.5.0",
+    "globals": "^17.14.0",
     "jsdom": "^30.0.1",
     "react-markdown": "^10.1.0",
     "tailwindcss": "^4.2.1",
