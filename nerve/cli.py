@@ -1564,12 +1564,12 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
 
     The gateway decides admission and where the agent may post, so only the
     send tool switch, its local conversation limit, the channel source's
-    local grant, and the notification conversation are reported. A config
-    without a notification conversation is not a problem: the gateway can
-    then post the cards in the notification channel set in the console.
-    Slash commands do not reach Nerve.
+    local grant, and where notification cards go are reported. The gateway
+    posts the cards in the notification channel set in the control plane;
+    ``notifications.slack_channel_id`` is not read. Slash commands do not
+    reach Nerve.
     """
-    from nerve.channels.slack import is_slack_id, notification_target
+    from nerve.channels.slack import is_slack_id
     from nerve.config import SLACK_HOST_COMMANDS
 
     slack = config.slack
@@ -1611,18 +1611,11 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
             "[WARN] Slack channel source collects nothing: set slack.source.gateway_grant, "
             "or list channel ids in slack.source.allow_channels"
         )
-    target = notification_target(config, warn_unset=False)
-    if target:
-        lines.append(f"[OK] Slack notifications go to {target}")
-    elif config.notifications.slack_channel_id.strip():
+    lines.append("[--] Slack notifications go to the notification channel set in the control plane")
+    if config.notifications.slack_channel_id.strip():
         warnings.append(
-            "[WARN] notifications.slack_channel_id is not a Slack conversation id; "
-            "the gateway chooses the notification conversation instead"
-        )
-    else:
-        lines.append(
-            "[--] Slack notifications: the config names no conversation; the gateway "
-            "can post them in the notification channel set in the console"
+            "[WARN] notifications.slack_channel_id is not read in hosted mode; "
+            "set the notification channel in the control plane"
         )
     lines.append("[--] Slack /nerve commands are not available in hosted mode")
     host = [name for name in slack.commands or () if name in SLACK_HOST_COMMANDS]

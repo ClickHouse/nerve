@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { tellNotificationsChanged } from '../utils/browserAlerts';
 
 export interface Notification {
   id: string;
@@ -81,17 +82,29 @@ export interface Silence {
 
 interface NotificationState {
   notifications: Notification[];
+  /** Pending rows, also those that the filters and the limit leave out of `notifications`. */
   pendingCount: number;
+  /** The pending questions and approvals among `pendingCount`. */
+  pendingAnswerCount: number;
   filter: string;
   typeFilter: string;
   loading: boolean;
   toastQueue: Notification[];
   silences: Silence[];
+  /**
+   * Rows read one at a time, for the questions in a chat transcript. Null:
+   * the row could not be read. The answer and expiry events update these
+   * rows, the list and the toasts alike.
+   */
+  byId: Record<string, Notification | null>;
 
   loadNotifications: () => Promise<void>;
   setFilter: (f: string) => void;
   setTypeFilter: (f: string) => void;
-  answerNotification: (id: string, answer: string) => Promise<void>;
+  /** Reads a row into `byId`, once. */
+  fetchNotification: (id: string) => Promise<void>;
+  /** Resolves true when the server took the answer. */
+  answerNotification: (id: string, answer: string) => Promise<boolean>;
   dismissNotification: (id: string) => Promise<void>;
   dismissAll: () => Promise<void>;
   handleWSNotification: (data: any) => void;
@@ -103,14 +116,37 @@ interface NotificationState {
   removeSilence: (id: string) => Promise<void>;
 }
 
+/** A question or an approval: a row that waits for an answer from the person. */
+function waitsForAnswer(type: Notification['type']): boolean {
+  return type === 'question' || type === 'approval';
+}
+
+/** The rows that `fetchNotification` is reading, so that it reads each row once. */
+const reading = new Set<string>();
+
+type Copies = Pick<NotificationState, 'notifications' | 'toastQueue' | 'byId'>;
+
+/** The same change on every copy of a row: the list, the toasts and `byId`. */
+function patchCopies(s: Copies, id: string, patch: Partial<Notification>): Copies {
+  const update = (n: Notification) => (n.id === id ? { ...n, ...patch } : n);
+  const row = s.byId[id];
+  return {
+    notifications: s.notifications.map(update),
+    toastQueue: s.toastQueue.map(update),
+    byId: row ? { ...s.byId, [id]: { ...row, ...patch } } : s.byId,
+  };
+}
+
 export const useNotificationStore = create<NotificationState>((set, get) => ({
   notifications: [],
   pendingCount: 0,
+  pendingAnswerCount: 0,
   filter: 'pending',
   typeFilter: '',
   loading: true,
   toastQueue: [],
   silences: [],
+  byId: {},
 
   loadNotifications: async () => {
     try {
@@ -119,6 +155,7 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
       set({
         notifications: data.notifications,
         pendingCount: data.pending_count,
+        pendingAnswerCount: data.pending_answer_count,
         loading: false,
       });
     } catch (e) {
@@ -137,19 +174,45 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
     get().loadNotifications();
   },
 
+  fetchNotification: async (id: string) => {
+    if (id in get().byId || reading.has(id)) return;
+    reading.add(id);
+    let row: Notification | null = null;
+    try {
+      row = await api.getNotification(id);
+    } catch (e) {
+      console.error('Failed to load notification:', e);
+    } finally {
+      reading.delete(id);
+    }
+    set(s => ({ byId: { ...s.byId, [id]: row } }));
+  },
+
   answerNotification: async (id: string, answer: string) => {
+    let ok = true;
     try {
       await api.answerNotification(id, answer);
-      get().loadNotifications();
     } catch (e) {
       console.error('Failed to answer notification:', e);
+      ok = false;
     }
+    get().loadNotifications();
+    // Read the row again and update every copy: the answer event does not
+    // come while the socket is down. When the server refuses the answer, the
+    // row can have an answer from a different place, so wait for the row.
+    const reread = api.getNotification(id)
+      .then(row => set(s => patchCopies(s, id, row)))
+      .catch(e => console.error('Failed to reload notification:', e));
+    if (!ok) await reread;
+    return ok;
   },
 
   dismissNotification: async (id: string) => {
     try {
       await api.dismissNotification(id);
+      set(s => patchCopies(s, id, { status: 'dismissed' }));
       get().loadNotifications();
+      tellNotificationsChanged();
     } catch (e) {
       console.error('Failed to dismiss notification:', e);
     }
@@ -158,7 +221,10 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
   dismissAll: async () => {
     try {
       await api.dismissAllNotifications();
+      // The server dismisses the pending `notify` rows only.
+      set(s => ({ toastQueue: s.toastQueue.filter(n => n.type !== 'notify') }));
       get().loadNotifications();
+      tellNotificationsChanged();
     } catch (e) {
       console.error('Failed to dismiss all:', e);
     }
@@ -220,6 +286,9 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
         // row was already pending (snooze never decremented it), so it
         // must not count twice.
         pendingCount: silenced || redelivered ? s.pendingCount : s.pendingCount + 1,
+        pendingAnswerCount: silenced || redelivered || !waitsForAnswer(notif.type)
+          ? s.pendingAnswerCount
+          : s.pendingAnswerCount + 1,
         toastQueue: silenced ? s.toastQueue : [...s.toastQueue, notif],
       };
     });
@@ -230,48 +299,37 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
     // the row actionable, stamp when it will resurface, leave the
     // pending count alone (matches the server's pending_count).
     if (data.approval_status === 'snoozed') {
-      set(s => ({
-        notifications: s.notifications.map(n =>
-          n.id === data.notification_id
-            ? {
-                ...n,
-                status: 'pending',
-                redeliver_at: data.snooze_until ?? null,
-                answered_by_actor_id: data.actor_id ?? null,
-              }
-            : n
-        ),
+      set(s => patchCopies(s, data.notification_id, {
+        status: 'pending',
+        redeliver_at: data.snooze_until ?? null,
+        answered_by_actor_id: data.actor_id ?? null,
       }));
       return;
     }
     set(s => ({
-      notifications: s.notifications.map(n =>
-        n.id === data.notification_id
-          ? {
-              ...n,
-              status: 'answered',
-              answer: data.answer,
-              answered_by: data.answered_by,
-              answered_by_actor_id: data.actor_id ?? null,
-            }
-          : n
-      ),
+      ...patchCopies(s, data.notification_id, {
+        status: 'answered',
+        answer: data.answer,
+        answered_by: data.answered_by,
+        answered_by_actor_id: data.actor_id ?? null,
+        answered_at: data.answered_at ?? null,
+      }),
+      // Only a question or an approval takes an answer.
       pendingCount: Math.max(0, s.pendingCount - 1),
+      pendingAnswerCount: Math.max(0, s.pendingAnswerCount - 1),
     }));
   },
 
   handleWSNotificationExpired: (data: any) => {
     set(s => {
-      const wasPending = s.notifications.some(
-        n => n.id === data.notification_id && n.status === 'pending'
-      );
+      // The server sends this event for a question or an approval that was
+      // pending. A filter or the limit can leave the row out of the list.
+      const row = s.notifications.find(n => n.id === data.notification_id);
+      const removed = !row || row.status === 'pending' ? 1 : 0;
       return {
-        notifications: s.notifications.map(n =>
-          n.id === data.notification_id ? { ...n, status: 'expired' } : n
-        ),
-        pendingCount: wasPending
-          ? Math.max(0, s.pendingCount - 1)
-          : s.pendingCount,
+        ...patchCopies(s, data.notification_id, { status: 'expired' }),
+        pendingCount: Math.max(0, s.pendingCount - removed),
+        pendingAnswerCount: Math.max(0, s.pendingAnswerCount - removed),
       };
     });
   },

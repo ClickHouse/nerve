@@ -964,7 +964,7 @@ export const mountMermaid: Mount = async (stage, source, { theme, width }) => {
       await mermaid.parse(source);
       parsed = await mermaid.mermaidAPI.getDiagramFromText(source);
     } catch (err) {
-      throw new Error(describe(err));
+      throw new Error(describe(err), { cause: err });
     }
     const url = fetchedWhileDrawing(parsed.db);
     if (url) {

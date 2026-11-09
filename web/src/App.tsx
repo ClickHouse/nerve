@@ -7,12 +7,14 @@ import { clearUnavailable, stopsApp, useHostedStore } from './api/hosted';
 import { useChatStore } from './stores/chatStore';
 import { useUIStore } from './stores/uiStore';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
+import { useIsMobile } from './hooks/useMediaQuery';
 import type { ShortcutDef } from './utils/keyboard';
 import { LoginPage } from './components/Auth/LoginPage';
 import { SessionExpiredOverlay } from './components/Auth/SessionExpiredOverlay';
 import { HostedProblemScreen } from './components/Auth/HostedProblemScreen';
 import { AppShell } from './components/Layout/AppShell';
 import { ChatPage } from './pages/ChatPage';
+import { InboxPage } from './pages/InboxPage';
 import { FilesPage } from './pages/FilesPage';
 import { TasksPage } from './pages/TasksPage';
 import { TaskDetailPage } from './pages/TaskDetailPage';
@@ -32,6 +34,8 @@ import { McpServerDetailPage } from './pages/McpServerDetailPage';
 import { NotificationsPage } from './pages/NotificationsPage';
 import { AccountsPage } from './pages/AccountsPage';
 import { SetupPage } from './pages/SetupPage';
+import { SettingsPage } from './pages/SettingsPage';
+import { BrowserAlerts } from './components/Notifications/BrowserAlerts';
 import { NotificationToast } from './components/Notifications/NotificationToast';
 import { SetupBanner } from './components/Setup/SetupBanner';
 import { SetupLanding } from './components/Setup/SetupLanding';
@@ -113,6 +117,7 @@ function App() {
       <Routes location={background ?? location}>
         <Route element={<AppShell />}>
           <Route path="/" element={<Home />} />
+          <Route path="/inbox" element={<InboxPage />} />
           <Route path="/chat/:sessionId?" element={<ChatPage />} />
           <Route path="/files/*" element={<FilesPage />} />
           <Route path="/tasks" element={<TasksPage />} />
@@ -136,6 +141,7 @@ function App() {
               (above) is local-only. */}
           <Route path="/setup" element={<SetupPage />} />
           <Route path="/setup/:stepId" element={<SetupPage />} />
+          <Route path="/settings/:section?" element={<SettingsPage />} />
           <Route path="/diagnostics" element={<DiagnosticsPage />} />
         </Route>
       </Routes>
@@ -147,6 +153,7 @@ function App() {
       )}
 
       <NotificationToast />
+      <BrowserAlerts />
       <SetupLanding />
       <SetupBanner />
       <ShortcutsModal />
@@ -154,8 +161,10 @@ function App() {
   );
 }
 
+/** A phone starts on the Inbox, desktop on the chat page. */
 function Home() {
-  return <Navigate to="/chat" replace />;
+  const isMobile = useIsMobile();
+  return <Navigate to={isMobile ? '/inbox' : '/chat'} replace />;
 }
 
 /**

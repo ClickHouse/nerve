@@ -312,7 +312,7 @@ Workers communicate through the notification system:
 - **`notify`** — status updates, completion alerts, issues found
 - **`ask_user`** — questions that need decisions (rendered as buttons in web UI and Telegram)
 
-Priority levels: `urgent`, `high`, `normal`, `low`. Quiet hours are optional and off for a worker by default (`quiet_start` and `quiet_end` empty in `<workspace>/config/settings.yaml`; see [Configuration → Quiet Hours](config.md#quiet-hours)). When set, they record the human's quiet window but gate nothing the agent sends; `notify` is not held back by them, so have the worker apply quiet hours itself for anything below `urgent` (see [Personal Best Practices → Notifications](personal-best-practices.md#notifications)).
+Priority levels: `urgent`, `high`, `normal`, `low`. Quiet hours are optional and off for a worker by default (`quiet_start` and `quiet_end` empty in `<workspace>/config/settings.yaml`; see [Configuration → Quiet Hours](config.md#quiet-hours)). When set, Nerve sends each notification below `urgent` without sound during them, but holds nothing back; `notify` still goes out, so have the worker apply quiet hours itself for anything below `urgent` (see [Personal Best Practices → Notifications](personal-best-practices.md#notifications)).
 
 ### Logs
 

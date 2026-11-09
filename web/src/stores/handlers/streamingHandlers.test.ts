@@ -203,3 +203,33 @@ describe('agent spawns and subagent events', () => {
     ]);
   });
 });
+
+describe('context usage', () => {
+  const usage = {
+    input_tokens: 10, output_tokens: 400, cache_read_input_tokens: 60000,
+    cache_creation_input_tokens: 6000,
+  };
+
+  it('keeps the context use measured after a compact from done', () => {
+    send({ type: 'done', session_id: 's1', usage: { ...usage, context_tokens: 17862 }, max_context_tokens: 200000, num_turns: 2 });
+    expect(useChatStore.getState().contextUsage).toMatchObject({ context_tokens: 17862, num_turns: 2 });
+
+    send({ type: 'done', session_id: 's1', usage, max_context_tokens: 200000, num_turns: 1 });
+    expect(useChatStore.getState().contextUsage?.context_tokens).toBeUndefined();
+  });
+
+  it('keeps the input of the last call that Codex reports on done', () => {
+    send({ type: 'done', session_id: 's1', usage, max_context_tokens: 272000, num_turns: 3, context_tokens: 180000 });
+    expect(useChatStore.getState().contextUsage).toMatchObject({ context_tokens: 180000, num_turns: 3 });
+  });
+
+  it('keeps it from the last usage when a session opens', async () => {
+    const { api } = await import('../../api/client');
+    vi.mocked(api.getMessages).mockResolvedValueOnce({
+      messages: [{ role: 'user', content: 'hi' }],
+      last_usage: { ...usage, context_tokens: 17862, max_context_tokens: 200000, num_turns: 2 },
+    });
+    await useChatStore.getState().switchSession('s2');
+    expect(useChatStore.getState().contextUsage).toMatchObject({ context_tokens: 17862, max_context_tokens: 200000 });
+  });
+});

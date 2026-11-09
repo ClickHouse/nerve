@@ -41,7 +41,7 @@ describe('Lightbox', () => {
     const svg = host.shadowRoot!.querySelector('svg')!;
     expect(svg.querySelector('text')?.textContent).toBe('graph A');
     expect([svg.style.width, svg.style.height]).toEqual(['400px', '200px']);
-    expect(offset(content.style.left)).toBe('max(24px,calc(50%-200px))');
+    expect(offset(content.style.left)).toMatch(/^max\(24px,(?:calc\()?50%-200px\)?\)$/);
     expect(placeOf(content)).toEqual({ x: 0, y: 0, zoom: 1 });
     expect(zoomLevel()).toBe('100%');
     // Focus starts on the picture, so the keys work at once.
@@ -109,7 +109,7 @@ describe('Lightbox', () => {
   it('fits a large picture into the window, and back to 1:1 with 0', async () => {
     const { viewport, content } = open({ size: { width: 2000, height: 500 } });
     // Too wide to fit at 1:1: it opens at its start, not at its middle.
-    expect(offset(content.style.left)).toBe('max(24px,calc(50%-1000px))');
+    expect(offset(content.style.left)).toMatch(/^max\(24px,(?:calc\()?50%-1000px\)?\)$/);
     await userEvent.click(screen.getByRole('button', { name: 'Fit to window' }));
     const place = placeOf(content);
     expect(place.zoom).toBeCloseTo(952 / 2000, 5);

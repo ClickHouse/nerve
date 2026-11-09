@@ -580,6 +580,11 @@ describe('RichCodeBlock', () => {
       expect(rich).toMatch(/@media \(hover: none\) \{[^@]*\.rich-figure-toolbar \{[^}]*position: static;[^}]*opacity: 1;/);
       // The source view's buttons take the same focus ring as the toolbar's.
       expect(rich).toMatch(/\.rich-figure-toolbar button:focus-visible,\n\.rich-source-bar button:focus-visible,/);
+      // Part of the security boundary: a model-written picture cannot lay a
+      // `position: fixed` surface over the page — the canvas and every stage
+      // are the containing block of any positioned descendant and clip to it.
+      expect(rich).toMatch(/\.rich-figure-canvas \{[^}]*contain: layout paint;/);
+      expect(rich).toMatch(/\.rich-stage \{ contain: layout paint; \}/);
     });
 
     it('leaves room above and below a picture too short to share its corner', async () => {

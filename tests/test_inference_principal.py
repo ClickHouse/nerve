@@ -35,10 +35,13 @@ from nerve.identity import Actor
 from nerve.inference_principal import (
     CUSTOM_HEADERS_ENV,
     INFERENCE_PRINCIPAL_HEADER,
+    INFERENCE_TRIGGER_HEADER,
     custom_headers_env,
     inference_principal,
+    inference_trigger,
     principal_headers,
 )
+from nerve.session_origin import Origin
 from tests.actor_rows import ensure_actor_row
 
 ALICE = Actor(
@@ -71,6 +74,13 @@ def _principals(env: dict[str, str]) -> list[str]:
     return [
         value for name, value in _cli_headers(env.get(CUSTOM_HEADERS_ENV, ""))
         if name.lower() == INFERENCE_PRINCIPAL_HEADER.lower()
+    ]
+
+
+def _triggers(env: dict[str, str]) -> list[str]:
+    return [
+        value for name, value in _cli_headers(env.get(CUSTOM_HEADERS_ENV, ""))
+        if name.lower() == INFERENCE_TRIGGER_HEADER.lower()
     ]
 
 
@@ -117,6 +127,19 @@ class TestPrincipal:
         with caplog.at_level(logging.WARNING, logger="nerve.inference_principal"):
             assert inference_principal(bad) is None
         assert "not a canonical lower-case UUID" in caplog.text
+
+
+class TestTrigger:
+    def test_local_mode_names_no_trigger(self):
+        assert inference_trigger("slack") is None
+
+    def test_external_mode_names_a_trigger_of_the_vocabulary(self, external):
+        assert inference_trigger("slack") == "slack"
+        assert inference_trigger("system") == "system"
+
+    @pytest.mark.parametrize("bad", [None, "", "web", "cron\nX-Injected: 1"])
+    def test_a_value_outside_the_vocabulary_names_no_trigger(self, external, bad):
+        assert inference_trigger(bad) is None
 
 
 class TestCliEnvironment:
@@ -174,6 +197,32 @@ class TestCliEnvironment:
 
     def test_a_value_that_is_not_a_canonical_uuid_is_never_written(self, external):
         assert custom_headers_env(f"{ALICE.actor_id}\nX-Injected: 1", {}) == {}
+
+    def test_one_header_line_for_the_trigger(self, external):
+        env = custom_headers_env(ALICE.actor_id, {}, trigger="slack")
+        assert _cli_headers(env[CUSTOM_HEADERS_ENV]) == [
+            (INFERENCE_PRINCIPAL_HEADER, ALICE.actor_id), (INFERENCE_TRIGGER_HEADER, "slack"),
+        ]
+        assert _cli_headers(custom_headers_env(None, {}, trigger="cron")[CUSTOM_HEADERS_ENV]) == [
+            (INFERENCE_TRIGGER_HEADER, "cron"),
+        ]
+
+    def test_an_inherited_trigger_is_replaced_or_removed(self, external):
+        environ = {CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue\nx-nerve-inference-trigger: api"}
+        env = custom_headers_env(None, environ, trigger="cron")
+        assert _cli_headers(env[CUSTOM_HEADERS_ENV]) == [
+            ("X-Proxy-Tag", "blue"), (INFERENCE_TRIGGER_HEADER, "cron"),
+        ]
+        assert custom_headers_env(None, environ) == {CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue"}
+
+    def test_local_mode_removes_an_inherited_trigger(self):
+        environ = {CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue\nX-Nerve-Inference-Trigger: api"}
+        assert custom_headers_env(None, environ, trigger="cron") == {
+            CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue",
+        }
+
+    def test_a_trigger_outside_the_vocabulary_is_never_written(self, external):
+        assert custom_headers_env(None, {}, trigger="cron\nX-Injected: 1") == {}
 
     def test_the_process_environment_is_the_default(self, external, monkeypatch):
         monkeypatch.setenv(CUSTOM_HEADERS_ENV, "X-Proxy-Tag: blue")
@@ -339,7 +388,9 @@ async def test_a_session_with_no_cause_names_no_principal(
     )
 
     (process,) = cli
-    assert process.env[CUSTOM_HEADERS_ENV] == ""
+    assert _cli_headers(process.env[CUSTOM_HEADERS_ENV]) == [
+        (INFERENCE_TRIGGER_HEADER, "telegram"),
+    ]
     assert _principals(process.env) == []
     assert process.spec.inference_principal is None
 
@@ -380,6 +431,7 @@ async def test_inherited_custom_headers_reach_the_cli(external, engine, cli, mon
     (process,) = cli
     assert _cli_headers(process.env[CUSTOM_HEADERS_ENV]) == [
         ("X-Proxy-Tag", "blue"), (INFERENCE_PRINCIPAL_HEADER, ALICE.actor_id),
+        (INFERENCE_TRIGGER_HEADER, "chat"),
     ]
 
 
@@ -407,7 +459,10 @@ async def _process_env(options, monkeypatch) -> dict[str, str]:
     return captured
 
 
-_INHERITED = f"X-Proxy-Tag: blue\nx-nerve-inference-principal: {BOB.actor_id}"
+_INHERITED = (
+    f"X-Proxy-Tag: blue\nx-nerve-inference-principal: {BOB.actor_id}\n"
+    "x-nerve-inference-trigger: api"
+)
 
 
 @pytest.mark.asyncio
@@ -429,7 +484,25 @@ async def test_external_mode_cli_process_names_only_the_sessions_cause(
     env = await _process_env(cli[0].options, monkeypatch)
     assert _cli_headers(env[CUSTOM_HEADERS_ENV]) == [
         ("X-Proxy-Tag", "blue"), (INFERENCE_PRINCIPAL_HEADER, ALICE.actor_id),
+        (INFERENCE_TRIGGER_HEADER, "chat"),
     ]
+
+
+@pytest.mark.asyncio
+async def test_each_session_names_its_trigger(external, engine, cli, db):
+    await engine.run_cron(job_id="nightly", prompt="tidy up")
+    await db.create_session(
+        "slack-1", source="slack", actor=ALICE,
+        origin=Origin("slack", {"channel": "C1", "channel_name": "general"}),
+    )
+    await _turn(engine, "slack-1", ALICE)
+    # A row from before the trigger column names its derived trigger.
+    await db.create_session("impl-1", source="web", actor=ALICE)
+    await db._write("UPDATE sessions SET trigger = NULL WHERE id = 'impl-1'")
+    await _turn(engine, "impl-1", ALICE)
+
+    assert [_triggers(process.env) for process in cli] == [["cron"], ["slack"], ["plan"]]
+    assert cli[1].spec.inference_trigger == "slack"
 
 
 @pytest.mark.asyncio
@@ -519,6 +592,7 @@ def test_memory_bedrock_clients_name_the_system_actor(external, global_db):
     assert client._bedrock.default_headers[INFERENCE_PRINCIPAL_HEADER] == (
         global_db.system_actor_id
     )
+    assert client._bedrock.default_headers[INFERENCE_TRIGGER_HEADER] == "system"
 
 
 class _MemoryService:
@@ -591,6 +665,7 @@ async def test_memory_openai_clients_name_the_system_actor(external, global_db):
     assert [r.headers.get(INFERENCE_PRINCIPAL_HEADER) for r in sent] == (
         [global_db.system_actor_id] * 2
     )
+    assert [r.headers.get(INFERENCE_TRIGGER_HEADER) for r in sent] == ["system"] * 2
     assert INFERENCE_PRINCIPAL_HEADER not in embedding.client.default_headers
 
 
@@ -647,6 +722,13 @@ def _principal_values(headers: list[tuple[str, str]]) -> list[str]:
     ]
 
 
+def _trigger_values(headers: list[tuple[str, str]]) -> list[str]:
+    return [
+        value for name, value in headers
+        if name.lower() == INFERENCE_TRIGGER_HEADER.lower()
+    ]
+
+
 def test_direct_requests_in_local_mode_drop_an_inherited_principal(
     global_db, monkeypatch,
 ):
@@ -654,6 +736,7 @@ def test_direct_requests_in_local_mode_drop_an_inherited_principal(
     for client in _direct_clients(_keyed_config()):
         headers = _sent_headers(client)
         assert _principal_values(headers) == []
+        assert _trigger_values(headers) == []
         assert ("x-proxy-tag", "blue") in headers
 
 
@@ -664,6 +747,7 @@ def test_direct_requests_in_external_mode_name_the_system_actor_once(
     for client in _direct_clients(_keyed_config()):
         headers = _sent_headers(client)
         assert _principal_values(headers) == [global_db.system_actor_id]
+        assert _trigger_values(headers) == ["system"]
         assert ("x-proxy-tag", "blue") in headers
 
 
@@ -744,6 +828,7 @@ async def test_the_doctor_probe_names_the_stored_system_actor(
     assert ok
     (headers,) = _MessagesApi.received
     assert _principal_values(headers) == [system_actor_id]
+    assert _trigger_values(headers) == ["system"]
 
 
 @pytest.mark.asyncio
@@ -760,6 +845,7 @@ async def test_the_doctor_probe_names_no_principal_in_local_mode(
     assert ok
     (headers,) = _MessagesApi.received
     assert _principal_values(headers) == []
+    assert _trigger_values(headers) == []
 
 
 def test_the_doctor_probe_without_a_database_names_no_principal(
@@ -822,3 +908,125 @@ async def test_a_cli_command_with_its_own_connection_names_the_system_actor(
 
     (headers,) = _MessagesApi.received
     assert _principal_values(headers) == [system_actor_id]
+
+
+# --------------------------------------------------------------------------- #
+#  Codex: the endpoint provider names the principal                           #
+# --------------------------------------------------------------------------- #
+
+_CODEX_ENDPOINT = "http://127.0.0.1:4000/v1"
+_CODEX_PRINCIPAL_ENV = "NERVE_CODEX_INFERENCE_PRINCIPAL"
+
+
+def _codex_principals(overrides: list[str], env: dict[str, str]) -> list[str]:
+    """The principal headers that Codex sends for these overrides and this env.
+
+    Codex 0.164.0 reads the ``http_headers`` and ``env_http_headers`` tables
+    of the selected provider. ``env_http_headers`` maps a header name to the
+    name of an environment variable, and Codex sends the header when the
+    variable is set and not empty. A later ``--config`` value of a key
+    replaces an earlier one.
+    """
+    import tomllib
+
+    values: dict[str, object] = {}
+    for line in overrides:
+        key, _, raw = line.partition("=")
+        values[key] = tomllib.loads(f"value = {raw}")["value"]
+    provider = values.get("model_provider")
+    if provider is None:
+        return []
+    base = f"model_providers.{provider}"
+    headers: dict[str, str] = {}
+    for name, value in (values.get(f"{base}.http_headers") or {}).items():
+        headers[name.lower()] = value
+    for name, variable in (values.get(f"{base}.env_http_headers") or {}).items():
+        if env.get(variable):
+            headers[name.lower()] = env[variable]
+    wanted = INFERENCE_PRINCIPAL_HEADER.lower()
+    return [value for name, value in headers.items() if name == wanted]
+
+
+def _codex_process(tmp_path, principal: str | None, **codex):
+    """The argv overrides and environment of the Codex process of a session."""
+    from nerve.agent.backends.codex import CodexBackend
+    from nerve.agent.backends.codex.backend import CodexClient
+    from tests.test_codex_appserver import _config, _deps, _spec
+
+    config = _config(tmp_path, **({"base_url": _CODEX_ENDPOINT} | codex))
+    backend = CodexBackend(_deps(config))
+    client = CodexClient(backend, _spec(config, inference_principal=principal))
+    return client._transport._config_overrides, client._transport._env
+
+
+class TestCodexEndpoint:
+    def test_a_session_names_its_cause_in_the_environment(self, external, tmp_path):
+        for actor in (ALICE, BOB):
+            overrides, env = _codex_process(tmp_path, actor.actor_id)
+            assert _codex_principals(overrides, env) == [actor.actor_id]
+            assert env[_CODEX_PRINCIPAL_ENV] == actor.actor_id
+            # The value is not in argv, which every local user can read.
+            assert not any(actor.actor_id in line for line in overrides)
+
+    def test_an_inherited_variable_does_not_reach_codex(
+        self, external, monkeypatch, tmp_path,
+    ):
+        monkeypatch.setenv(_CODEX_PRINCIPAL_ENV, BOB.actor_id)
+        overrides, env = _codex_process(tmp_path, ALICE.actor_id)
+        assert _codex_principals(overrides, env) == [ALICE.actor_id]
+
+        overrides, env = _codex_process(tmp_path, None)
+        assert _codex_principals(overrides, env) == []
+        assert _CODEX_PRINCIPAL_ENV not in env
+        assert not any("env_http_headers" in line for line in overrides)
+
+    def test_local_mode_names_no_principal(self, monkeypatch, tmp_path):
+        monkeypatch.setenv(_CODEX_PRINCIPAL_ENV, BOB.actor_id)
+        overrides, env = _codex_process(tmp_path, ALICE.actor_id)
+        assert _codex_principals(overrides, env) == []
+        assert _CODEX_PRINCIPAL_ENV not in env
+
+    def test_codex_without_an_endpoint_names_no_principal(
+        self, external, monkeypatch, tmp_path,
+    ):
+        """Codex's own provider is not a Nerve proxy."""
+        monkeypatch.setenv(_CODEX_PRINCIPAL_ENV, BOB.actor_id)
+        overrides, env = _codex_process(tmp_path, ALICE.actor_id, base_url="")
+        assert not any(line.startswith("model_provider") for line in overrides)
+        assert _CODEX_PRINCIPAL_ENV not in env
+
+    def test_an_id_that_is_not_a_canonical_uuid_names_no_principal(
+        self, external, tmp_path,
+    ):
+        for bad in (ALICE.actor_id.upper(), f"{ALICE.actor_id}\nX-Other: 1"):
+            overrides, env = _codex_process(tmp_path, bad)
+            assert _codex_principals(overrides, env) == []
+            assert _CODEX_PRINCIPAL_ENV not in env
+
+    @pytest.mark.asyncio
+    async def test_the_preflight_names_the_system_actor(
+        self, external, global_db, monkeypatch, tmp_path,
+    ):
+        """The setup check and the model catalogue are Nerve's own calls."""
+        from nerve.agent.backends.codex import CodexBackend
+        from nerve.agent.backends.codex import backend as codex_backend
+        from tests.test_codex_appserver import _config, _deps
+
+        spawned: list[dict] = []
+
+        class _Recorded(codex_backend.CodexAppServerClient):
+            def __init__(self, **kw):
+                super().__init__(**kw)
+                spawned.append(kw)
+
+        monkeypatch.setattr(codex_backend, "CodexAppServerClient", _Recorded)
+        monkeypatch.setenv("FAKE_CODEX_MODE", "basic")
+        monkeypatch.setenv(_CODEX_PRINCIPAL_ENV, BOB.actor_id)
+        config = _config(tmp_path, base_url=_CODEX_ENDPOINT)
+        status = await CodexBackend(_deps(config)).preflight(force=True)
+
+        assert status["available"] is True, status
+        (process,) = spawned
+        assert _codex_principals(process["config_overrides"], process["env"]) == [
+            global_db.system_actor_id,
+        ]

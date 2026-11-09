@@ -11,7 +11,9 @@ requires-python = ">=3.13"
 license = { text = "Apache-2.0" }
 
 dependencies = [
-    "fastapi>=0.115.0",
+    # 0.142.0 is the first release with the `telemetry` argument, which
+    # nerve/gateway/server.py passes to each app.
+    "fastapi>=0.142.0",
     "uvicorn[standard]>=0.34.0",
     "aiosqlite>=0.21.0",
     "pyyaml>=6.0",
@@ -61,6 +63,9 @@ dependencies = [
     "memu-py==1.4.0",  # pinned — nerve monkey-patches memU internals (see memu_bridge._patch_sqlite_bugs)
     "watchfiles>=1.0.0",
     "html2text>=2024.2.26",
+    # Web Push: VAPID signing and payload encryption for the panel's push
+    # notifications (nerve/notifications/webpush.py).
+    "pywebpush>=2.5.0",
     # Optional xmemory.ai structured-memory layer — only active when an
     # xmemory api_key + instance_id are configured (see XmemoryConfig).
     "xmemory-ai>=0.10.0",

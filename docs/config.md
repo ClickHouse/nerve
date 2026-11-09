@@ -982,6 +982,7 @@ Backups follow the same rule:
 |-----|------|---------|-------------|
 | `agent.model` | string | `claude-opus-5-5` | Primary model for conversations. The default (and every other default model id) is defined once, in the constants block at the top of `nerve/config.py` |
 | `agent.cron_model` | string | `claude-sonnet-5-5` | Model for cron jobs. The setup page's Model step sets it to the model you pick, so scheduled work runs on the chosen model; set a cheaper one here afterwards if you want it |
+| `agent.outcome_titles` | bool | `true` | Rename a session when the agent's answer to its first message ends (when that turn leaves background work running, the turn that settles it), with `agent.title_model`, from the first request and the agent's reply, in the style of titles people gave other sessions. A fork's first message renames it too, from what the fork does. A later message never does, nor is a session renamed that someone renamed; a first turn that fails or is stopped, a second message before it settles, or a restart in between leave the first title. Needs an API key, Bedrock or the proxy (a subscription token does not reach the API). `false` keeps the first-message title; the onboarding conversation asks about it. Hot: read when a first message arrives |
 | `agent.models` | list | `[]` | Claude models offered in the composer's model picker. `agent.model` always leads; entries extend the list. Empty → the discovered catalog (see `agent.model_discovery`), else a built-in current-generation list (opus / fable / sonnet / haiku); on Bedrock only configured models are offered |
 | `agent.model_discovery` | bool | `true` | Ask the Anthropic Models API (`GET /v1/models`) which models the configured credentials' catalog endpoint advertises, and offer those in the picker — so a newly released model needs no config edit. Catalog membership is not a serving guarantee (an advertised ID can still 404 on send; discovery runs no serving probe — see `agent.model_discovery_excluded_models`). Primed at gateway startup, cached in-process (6h) and refreshed in the background. Best-effort: ignored when `agent.models` is set, on Bedrock (the Bedrock client has no Models API), without an API key, or when the API is unreachable — the built-in list applies |
 | `agent.model_discovery_excluded_models` | list | `[]` | Model-ID substrings pruned from **discovery** results before the picker sees them (case-insensitive; empty/whitespace patterns ignored). A proxy/provider catalog is not a serving guarantee — e.g. a retired ID that `GET /v1/models` still advertises but that 404s on send — so this drops such entries without a code change, and hot-reloads (read at pick time, not baked into the 6h discovery cache). Applied only to discovered entries: `agent.model` and an explicit `agent.models` list are never filtered, so naming a model in config overrides an exclusion. Excluding everything discovery returns just leaves the configured default (not a fallback to the built-in list) |
@@ -1109,6 +1110,9 @@ codex:
   `${PROXY_API_KEY:-}` when the key is optional. In this mode Nerve does not
   read `codex.api_key_env` or the top-level `openai_api_key`, because they
   can hold an OpenAI key.
+- In external mode, each request names the principal that caused the work
+  in the `X-Nerve-Inference-Principal` header. See
+  [Inference principal header](#inference-principal-header).
 - Codex needs no login, and `codex.auth` has no effect. Preflight does not
   require an account and uses the same provider. `nerve codex doctor` and
   `GET /api/codex/status` show the endpoint in `preflight.base_url`.
@@ -1154,7 +1158,8 @@ config like anything else under `config/`, so a config repo carries it to every
 instance that syncs, and a fleet can be told apart by its browser tabs. Nothing
 is copied into the web bundle — the file is read per request, so one that arrives
 by sync appears without a restart, and removing it goes back to the browser
-default.
+default. The panel draws a coloured dot on the icon while something waits for
+the person (see [Browser alerts](web-ui.md#browser-alerts)).
 
 Use one. If several are present the first of `.svg`, `.png`, `.ico` wins.
 
@@ -1415,24 +1420,22 @@ files are unpacked one level. One file is read up to 16 MiB less one byte.
 The files of one message are read up to 32 MiB together, and the content
 unpacked from ZIP files counts against the same limit.
 
-Notifications go to the same conversation as in Socket Mode
-(`notifications.slack_channel_id`, else the first literal conversation ID in
-`slack.allow_channels`), with one button for each answer. A button press
-answers the notification only in the conversation where it was delivered,
-and the card then shows the answer without buttons. A press that answers
-nothing, for example a second press, gets a short notice and the card stays.
-An expired card is edited without buttons.
+A notification card has one button for each answer. Nerve sends it through
+the gateway's `notify` operation, and the gateway posts it in the agent's
+notification channel, which an administrator sets in the control plane.
+Nerve does not read `notifications.slack_channel_id` or the conversation IDs
+in `slack.allow_channels` to choose this conversation. The notification
+channel must allow posts in the agent's Slack access rules, and the agent's
+Slack app must be a member of it. Nerve uses `notify` only when exactly one
+connection advertises it. A gateway that does not advertise it gets no card.
+When the control plane sets no notification channel, the gateway refuses the
+card, and Nerve logs one INFO line for each card. Any other failure logs one
+warning.
 
-When the config names no conversation, Nerve sends the card through the
-gateway's `notify` operation. The gateway posts it in the agent's
-notification channel, which an administrator sets in the hosted platform's
-console. That channel must allow posts in the agent's Slack access rules, and
-the agent's Slack app must be a member of it. A conversation in the config
-takes precedence. Nerve uses `notify` only when exactly one connection
-advertises it. A gateway that does not advertise it gets no card, and Nerve
-logs no warning about the missing `notifications.slack_channel_id`. When the
-console sets no notification channel, the gateway refuses the card, and Nerve
-logs one INFO line for each card. Any other failure logs one warning.
+A button press answers the notification only in the conversation where it
+was delivered, and the card then shows the answer without buttons. A press
+that answers nothing, for example a second press, gets a short notice and
+the card stays. An expired card is edited without buttons.
 
 `/nerve` commands, including the host commands
 `doctor` and `restart`, are not available in hosted mode; `nerve doctor`
@@ -1689,16 +1692,18 @@ Question and approval cards go to Slack by default.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `notifications.channels` | list | `[web, telegram, slack]` | Where `notify`, `ask_user`, and `propose_action` deliver |
-| `notifications.slack_channel_id` | string | `""` | Target channel ID; defaults to the first literal ID in `slack.allow_channels` |
+| `notifications.slack_channel_id` | string | `""` | Target channel ID; defaults to the first literal ID in `slack.allow_channels`. Not read in hosted mode |
 
 `notifications.channels` replaces the default rather than adding to it, so
-list every transport you want. A name nothing delivers to is skipped with a
+list every transport you want. The panel (`web`) is always in the list: Nerve
+adds it to a list without it. A name nothing delivers to is skipped with a
 warning. Slack in the list costs nothing while Slack is off.
 
 Names and globs are not resolved for the `slack_channel_id` fallback. Without
 a literal channel ID, delivery is skipped with a warning. In
-[hosted mode](#hosted-mode), the channel gateway can post the card in the
-notification channel set in the console instead, so there is no warning.
+[hosted mode](#hosted-mode), Nerve does not read these keys to choose the
+conversation: the channel gateway posts each card in the notification channel
+that an administrator sets in the control plane.
 
 ### Outbound Slack message tool
 
@@ -1729,6 +1734,42 @@ Three differences from the inbound policy:
   `G` target costs one cached lookup; a lookup that cannot answer is refused
   rather than guessed.
 
+## Notification delivery
+
+`notify`, `ask_user` and `propose_action` go to each channel in
+`notifications.channels` (see [Slack](#notifications) and
+[Telegram](#notification-sink) for the destinations). The Notifications
+section of the panel's Settings page changes these keys (see
+[web-ui.md](web-ui.md#settings)).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `notifications.levels` | map | `{}` | For each channel, `all` or `important` |
+| `notifications.default_expiry_hours` | int | `48` | Hours until an unanswered question or approval expires, when the agent gives no time |
+| `notifications.max_redeliveries` | int | `3` | How often one snoozed item comes back, at most. At this count it expires |
+
+A channel at `important` gets questions, approvals, and items with priority
+`high` or `urgent`. It does not get other items. The panel (`web`) gets every
+item. A channel without an entry gets every item, and so does a channel with
+an unknown level (Nerve logs a warning).
+
+```yaml
+notifications:
+  channels: [web, slack, telegram]
+  levels:
+    slack: all
+    telegram: important
+```
+
+### Web Push
+
+The fan-out also sends each item as a push notification (channel `webpush`)
+to the browsers where a person turned push on. `notifications.channels` does
+not list it, and `notifications.levels.webpush: important` limits all
+browsers. The instance must reach the push services of the browsers; on Nerve
+Cloud that works only for agents in open internet mode. How push works, the
+VAPID key and the hosts: [web-ui.md](web-ui.md#push-notifications).
+
 ## Quiet Hours
 
 | Key | Type | Default | Description |
@@ -1738,20 +1779,33 @@ Three differences from the inbound policy:
 
 Quiet hours are optional. Both values empty (`''`) means there are none;
 otherwise both are `HH:MM`, and the window may cross midnight (`22:00` to
-`07:00`). The setup writers (the setup page's Mode step, `nerve init
+`07:00`). A value that is not a 24-hour time from `00:00` to `23:59` also
+means no quiet hours. An unquoted time such as `quiet_start: 22:00` is read
+as `22:00` too: YAML reads it as the number 1320 (the minutes after
+midnight), and Nerve changes that number back to the time. The setup writers (the setup page's Mode step, `nerve init
 --terminal` and `--non-interactive`) state the mode's default in
 `settings.yaml`: `02:00`/`08:00` for a personal install, and empty values for
 a worker, so a worker has no quiet hours until someone turns them on (the
 setup page's Operator step, or these two keys). A key that no layer sets falls
 back to `02:00`/`08:00`.
 
-Nerve stores quiet hours for the agent; it does not enforce them. On a
-personal install the setup page also fills the `Quiet hours:` line of
-`USER.md`, and `AGENTS.md` tells the agent to hold anything below `urgent`
-during them. A worker's brain files do not mention them, so state the rule in
-`TASK.md` if the worker should keep them. No built-in delivery gating is
-attached today: `notify`, `ask_user` and cron runs go out whenever they
-happen.
+During quiet hours, each notification (`notify`, `ask_user`,
+`propose_action`, and a re-delivered snoozed item) with a priority other than
+`urgent` goes out without sound: Telegram sends it with
+`disable_notification`, and the panel's `notification` event has
+`silent: true`, so a browser alert of the panel makes no sound either. Nerve
+still delivers it at once. An `urgent` item makes a
+sound. Slack has no such option for one message, so Slack follows its own
+notification settings. The Notifications section of the panel's Settings page
+changes the two keys (see [web-ui.md](web-ui.md#settings)).
+
+Nerve holds nothing back during quiet hours: `notify`, `ask_user` and cron
+runs go out whenever they happen. On a personal install the setup page also
+fills the `Quiet hours:` line of `USER.md`, and `AGENTS.md` tells the agent to
+hold anything below `urgent` during them. A worker's brain files do not
+mention them, so state the rule in `TASK.md` if the worker should keep them.
+The deadline escalation check pauses during quiet hours (see
+[tasks.md](tasks.md)).
 
 ## Sources (sync)
 
@@ -2302,8 +2356,39 @@ environment only when it starts. The session's cause never changes, so a CLI
 process keeps its header for its whole life, and a process that Nerve starts
 again for the session (after a model change or a crash) gets the same header.
 
+Codex sends the header only to `codex.base_url` (see
+[Codex through an OpenAI-compatible endpoint](#codex-through-an-openai-compatible-endpoint)).
+Nerve gives the value to each Codex process in the environment variable
+`NERVE_CODEX_INFERENCE_PRINCIPAL`, and the `nerve-endpoint` provider reads it
+through `env_http_headers`. The value is not in the arguments of the process.
+One Codex process serves one session, and it keeps its header for its whole
+life, as the Claude CLI does. Nerve removes `NERVE_CODEX_INFERENCE_PRINCIPAL`
+from the environment that a Codex process inherits, so a session with no
+cause and local mode send no header. The Codex preflight (setup check and
+model catalogue) names the system actor.
+
 These requests have no header: memory embedding requests to the OpenAI API,
-and Codex sessions.
+and Codex requests to Codex's own provider (no `codex.base_url`).
+
+#### Inference trigger header
+
+In external mode, Nerve also adds one `X-Nerve-Inference-Trigger` header to
+each model request of a session, also a session with no cause, and to each of
+its own model calls. The value is the kind of event that started the work:
+
+| Requests | Trigger |
+|---|---|
+| The model requests of an agent session | The session's `trigger`: `chat`, `api`, `slack`, `telegram`, `email`, `cron`, `plan`, `workflow`, `external`, `system` (the autonomous onboarding) or `unknown`. See `trigger` in [api.md](api.md#sessions) |
+| Nerve's own model calls (the second row of the table above) | `system` |
+
+Nerve sets a session's trigger when it creates the session, from the code
+path that creates it, and never changes it. A session from before the
+trigger field sends the value that Nerve derives from its source and its
+id. The header has the same rules as the principal header: local mode sends
+none, Nerve removes an inherited line for it from `ANTHROPIC_CUSTOM_HEADERS`,
+and a CLI process keeps it for its whole life. Nerve does not prove the
+value. The same requests as above have no header, and Codex requests to
+`codex.base_url` have no trigger header.
 
 ### System principal ID
 
@@ -2411,6 +2496,7 @@ The proxy binary is automatically downloaded from [CLIProxyAPI](https://github.c
 | `sessions.max_sessions` | int | `500` | Max active (non-archived) sessions before cleanup |
 | `sessions.cron_session_mode` | string | `per_run` | `per_run` (unique session per cron run) or `reuse` (shared session per job) |
 | `sessions.sidebar_page_size` | int | `50` | Rows per sidebar request: caps the conversation feed and sizes one lazy Archived/System page. `0` = unlimited (a group loads in a single request). Starred sessions are exempt and always returned in full. |
+| `sessions.plan_attention_days` | int | `7` | Days a pending plan puts its proposing session in the sidebar's "Needs you" group, counted from the proposal (a new version with `plan_update` starts the count again). `0` = no limit. The Plans page still lists older pending plans. Questions and approvals are not affected: they expire on their own (`notifications.default_expiry_hours`). |
 
 **Starred sessions are exempt from all auto-archival.** A session starred via
 the star toggle (web sidebar, or the Telegram `/sessions` list / `/star`) is

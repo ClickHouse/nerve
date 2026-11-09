@@ -22,19 +22,22 @@ class PlanStore:
         plan_type: str = "generic",
         *,
         attribution: Attribution = UNATTRIBUTED,
+        summary: str | None = None,
     ) -> dict:
         """Insert a plan version.
 
         ``attribution`` is who wrote this version and on whose behalf:
         written to ``created_by_actor_id`` and ``caused_by_actor_id``.
+        ``summary`` is the short text that the plan page shows under the
+        title; ``None`` when the writer gave none.
         """
         now = datetime.now(timezone.utc).isoformat()
         await self._write(
             """INSERT INTO plans (id, task_id, session_id, content, model, version, parent_plan_id, plan_type, created_at,
-                                  created_by_actor_id, caused_by_actor_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                  created_by_actor_id, caused_by_actor_id, summary)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (plan_id, task_id, session_id, content, model, version, parent_plan_id, plan_type, now,
-             attribution.actor_id, attribution.caused_by_actor_id),
+             attribution.actor_id, attribution.caused_by_actor_id, summary),
         )
         return {"id": plan_id, "task_id": task_id, "version": version, "plan_type": plan_type}
 
@@ -133,3 +136,21 @@ class PlanStore:
             "SELECT DISTINCT task_id FROM plans WHERE status IN ('pending', 'implementing')"
         ) as cursor:
             return [row[0] async for row in cursor]
+
+    async def count_pending_plans_by_session(
+        self, created_since: str | None = None,
+    ) -> dict[str, int]:
+        """Pending plans per proposing session: ``{session_id: count}``.
+
+        With ``created_since`` (an ISO timestamp in UTC, the format that
+        ``created_at`` has), only plans proposed at or after it count.
+        """
+        sql = """SELECT session_id, COUNT(*) FROM plans
+                 WHERE status = 'pending' AND session_id IS NOT NULL"""
+        params: tuple = ()
+        if created_since is not None:
+            sql += " AND created_at >= ?"
+            params = (created_since,)
+        sql += " GROUP BY session_id"
+        async with self.db.execute(sql, params) as cursor:
+            return {session_id: count async for session_id, count in cursor}

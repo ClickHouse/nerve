@@ -40,9 +40,9 @@ a send is a refusal, not a transport failure.
 Files go out through ``file_send``. The attachments of a message that starts
 a turn are read through ``file_read`` before the turn and use the
 self-hosted extraction rules. A notification is a message with one button
-for each answer. It goes to the conversation that the config names. When the
-config names none, it goes through ``notify``, and the gateway chooses the
-conversation that the control plane set for the agent. A button press
+for each answer. It goes through ``notify``, and the gateway posts it in the
+notification channel that the control plane set for the agent. The config
+does not choose this conversation. A button press
 arrives as an invoke ``interaction`` event: it answers the notification when
 the card was delivered in that conversation, and the ``interaction``
 operation then replaces the card without its buttons.
@@ -274,7 +274,6 @@ class HostedChannel(BaseChannel):
         operations: OperationRunner | None = None,
         reaction_names: Mapping[str, str] | None = None,
         notifications: Any | None = None,
-        notification_target: Callable[[NerveConfig], str | None] | None = None,
         button_style: Callable[[str], str] | None = None,
     ) -> None:
         self._provider = provider
@@ -284,10 +283,8 @@ class HostedChannel(BaseChannel):
         self._is_id = is_id
         self._operations = operations
         self._reaction_names = dict(reaction_names or {})
-        # The notification service, the choice of the notification
-        # conversation, and the style of an answer button.
+        # The notification service and the style of an answer button.
         self._notifications = notifications
-        self._notification_target = notification_target
         self._button_style = button_style or (lambda value: "")
         self._running = False
         # conversation -> the connection it last arrived on.
@@ -692,47 +689,37 @@ class HostedChannel(BaseChannel):
     ) -> tuple[str, str] | None:
         """Post a notification card: its text and one button for each option.
 
-        When the config names a conversation, the card goes there with
-        ``send``, the same as with the self-hosted channel. Otherwise the
-        card goes with ``notify`` to the conversation that the gateway
-        chooses, when exactly one connection advertises ``notify``. Returns
+        The card goes with ``notify``, and the gateway posts it in the
+        agent's notification channel, which an admin sets in the control
+        plane. The config does not choose the conversation. Nerve sends the
+        card only when exactly one connection advertises ``notify``. Returns
         ``(target, message_id)``, where the target is the card's
         conversation, or ``None`` when there is no conversation or the post
         fails.
         """
-        config = self._config()
-        target = self._notification_target(config) if self._notification_target else None
         if not self.is_available:
             return None
         actions = notification_actions(notification_id, options, self._button_style)
-
-        def card(body: str) -> SendOperation | NotifyOperation:
-            content = _markdown(body) + actions
-            if target:
-                return SendOperation(destination=container_for(target, None), content=content)
-            return NotifyOperation(content=content)
-
         try:
-            if target:
-                kind, connection = "send", await self._connection(target, "send")
-            else:
-                kind, connection = "notify", self._notify_connection()
+            connection = self._notify_connection()
             if connection is None:
                 logger.debug(
-                    "Hosted %s notification %s has no conversation: the config names none, "
-                    "and no connection advertises notify", self._provider, notification_id,
+                    "Hosted %s notification %s has no conversation: no connection advertises notify",
+                    self._provider, notification_id,
                 )
                 return None
             result, body = await self._fitting(
-                kind, truncate_text(text, self._limits(connection).text_characters),
-                lambda body: self._perform(connection, kind, card(body)),
+                "notify", truncate_text(text, self._limits(connection).text_characters),
+                lambda body: self._perform(
+                    connection, "notify", NotifyOperation(content=_markdown(body) + actions),
+                ),
             )
         except OperationFailed as error:
             log = logger.info if _expected_card_failure(error) else logger.warning
             log("Hosted %s notification %s was not posted: %s", self._provider, notification_id, _why(error))
             return None
         located = result.target
-        conversation = target or located.conversation.id
+        conversation = located.conversation.id
         message_id = located.message.id
         _remember(self._targets, (conversation, message_id), (connection, located), _TARGET_CACHE_MAX)
         _remember(self._notification_texts, (conversation, message_id), body, _TARGET_CACHE_MAX)
@@ -921,6 +908,11 @@ class HostedChannel(BaseChannel):
             sender_id=target,
             text=body if event.attachments else text,
             metadata=metadata,
+            # Untrusted presentation text, for the origin of a new session.
+            conversation_title=(
+                event.conversation.display_name
+                if event.conversation.kind != "direct" else ""
+            ),
         ), event, attachments=bool(event.attachments))
 
     async def _add_attachments(self, message: InboundMessage, event: Event) -> None:

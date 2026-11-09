@@ -1091,6 +1091,7 @@ class AgentConfig:
     model: str = DEFAULT_MODEL
     cron_model: str = DEFAULT_CRON_MODEL
     title_model: str = DEFAULT_TITLE_MODEL  # Session title generation
+    outcome_titles: bool = True  # Retitle a session from what its first answer did
     # Model-alias remapping for the Claude CLI subprocess: alias → model ID,
     # emitted as ANTHROPIC_DEFAULT_<ALIAS>_MODEL env vars so short aliases
     # ("opus" in Agent/Workflow tool calls, skill frontmatter, cron model
@@ -1230,6 +1231,7 @@ class AgentConfig:
             model=d.get("model", DEFAULT_MODEL),
             cron_model=d.get("cron_model", DEFAULT_CRON_MODEL),
             title_model=d.get("title_model", DEFAULT_TITLE_MODEL),
+            outcome_titles=d.get("outcome_titles", True),
             model_aliases={
                 str(k): str(v or "")
                 for k, v in (d.get("model_aliases") or {}).items()
@@ -2910,6 +2912,8 @@ class SessionsConfig:
     star_project_hook: bool = False  # opt-in; fire an internal agent turn on star/unstar transition
     # Rows per sidebar request; caps the conversation feed and sizes one lazy Archived/System page (0 = unlimited, starred exempt).
     sidebar_page_size: int = 50
+    # Days a pending plan puts its session in the sidebar's "Needs you" group, counted from the proposal (0 = no limit). The Plans page still lists older plans.
+    plan_attention_days: int = 7
 
     @classmethod
     @_coerced
@@ -2924,6 +2928,7 @@ class SessionsConfig:
             client_idle_timeout_minutes=d.get("client_idle_timeout_minutes", 60),
             star_project_hook=d.get("star_project_hook", False),
             sidebar_page_size=max(0, _lenient_int(d.get("sidebar_page_size"), 50)),
+            plan_attention_days=max(0, _lenient_int(d.get("plan_attention_days"), 7)),
         )
 
 
@@ -3074,12 +3079,53 @@ class SetupConfig:
         return cls(local_secrets=_as_local_secrets(d["local_secrets"]))
 
 
+#: ``notifications.levels`` values: a channel gets every item, or only the
+#: important ones (questions, approvals, and ``high`` or ``urgent`` items).
+NOTIFY_LEVEL_ALL = "all"
+NOTIFY_LEVEL_IMPORTANT = "important"
+NOTIFY_LEVELS = (NOTIFY_LEVEL_ALL, NOTIFY_LEVEL_IMPORTANT)
+_IMPORTANT_PRIORITIES = frozenset({"high", "urgent"})
+#: The channel that gets every item whatever its level: the panel is the record.
+NOTIFY_RECORD_CHANNEL = "web"
+#: The names ``notifications.channels`` can list (the channels the fan-out delivers to).
+NOTIFY_CHANNELS = (NOTIFY_RECORD_CHANNEL, "telegram", "slack")
+
+
+def level_wants(level: str, notif_type: str, priority: str) -> bool:
+    """Whether a channel at ``level`` gets an item of this type and priority:
+    ``important`` gets questions, approvals, and ``high`` or ``urgent`` items."""
+    if level != NOTIFY_LEVEL_IMPORTANT:
+        return True
+    return notif_type in ("question", "approval") or priority in _IMPORTANT_PRIORITIES
+
+
+def _notification_levels(raw: Any) -> dict[str, str]:
+    """``notifications.levels`` as ``{channel: level}``. An unknown level is
+    logged and read as ``all``, so a typo holds nothing back."""
+    if not isinstance(raw, dict):
+        if raw:
+            logger.warning("notifications.levels is not a mapping; every channel gets every item")
+        return {}
+    levels: dict[str, str] = {}
+    for channel, level in raw.items():
+        value = str(level or "").strip().lower()
+        if value not in NOTIFY_LEVELS:
+            logger.warning(
+                "notifications.levels.%s: unknown level %r, using %r", channel, level, NOTIFY_LEVEL_ALL,
+            )
+            value = NOTIFY_LEVEL_ALL
+        levels[str(channel)] = value
+    return levels
+
+
 @dataclass
 class NotificationsConfig:
     """Async notification delivery settings."""
     channels: list[str] = field(
         default_factory=lambda: ["web", "telegram", "slack"],
     )
+    # Per channel, ``all`` (the default) or ``important``: see :meth:`wants`.
+    levels: dict[str, str] = field(default_factory=dict)
     telegram_chat_id: int | None = None       # Target chat; falls back to first allowed_user
     # Opt-in, default off = backward compatible. When true AND telegram_chat_id
     # is a non-private group/supergroup, that chat is DELIVERY-ONLY: notifications
@@ -3100,11 +3146,29 @@ class NotificationsConfig:
     # from may be in any language. Unknown values fall back to English.
     date_locale: str = "en"
 
+    def delivery_channels(self) -> list[str]:
+        """``channels`` with the panel first when the list leaves it out. The
+        panel is the record and the place to answer, so a list written
+        without ``web`` (for example ``[telegram]``) still delivers there."""
+        channels = list(self.channels)
+        return channels if NOTIFY_RECORD_CHANNEL in channels else [NOTIFY_RECORD_CHANNEL, *channels]
+
+    def wants(self, channel: str, notif_type: str, priority: str) -> bool:
+        """Whether ``channel`` gets an item of this type and priority.
+
+        A channel at ``important`` gets questions, approvals, and ``high`` or
+        ``urgent`` items. The panel gets every item.
+        """
+        if channel == NOTIFY_RECORD_CHANNEL:
+            return True
+        return level_wants(self.levels.get(channel, NOTIFY_LEVEL_ALL), notif_type, priority)
+
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> NotificationsConfig:
         return cls(
             channels=d.get("channels", ["web", "telegram", "slack"]),
+            levels=_notification_levels(d.get("levels")),
             telegram_chat_id=d.get("telegram_chat_id"),
             delivery_only_sink=d.get("delivery_only_sink", False),
             slack_channel_id=str(d.get("slack_channel_id") or ""),
@@ -3949,6 +4013,23 @@ def default_timezone() -> str:
     return FALLBACK_TIMEZONE
 
 
+_MINUTES_PER_HOUR = 60
+
+
+def _as_clock_time(value: Any) -> Any:
+    """``quiet_start`` or ``quiet_end`` as ``HH:MM`` text.
+
+    YAML 1.1 reads an unquoted time that does not start with ``0`` as a
+    base-60 integer: ``22:00`` is 1320 (22 * 60 + 0), ``9:30`` is 570;
+    ``08:00`` stays text. This gives such an integer as ``HH:MM`` text (1320
+    is ``22:00``, 570 is ``09:30``). Any other value stays as it is.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        hours, minutes = divmod(value, _MINUTES_PER_HOUR)
+        return f"{hours:02d}:{minutes:02d}"
+    return value
+
+
 @dataclass
 class NerveConfig:
     workspace: Path = field(default_factory=paths.default_workspace)
@@ -4372,8 +4453,8 @@ class NerveConfig:
             timezone=d["timezone"] if "timezone" in d else default_timezone(),
             lockdown=locked,
             deployment=d.get("deployment", "server"),
-            quiet_start=d.get("quiet_start", "02:00"),
-            quiet_end=d.get("quiet_end", "08:00"),
+            quiet_start=_as_clock_time(d.get("quiet_start", "02:00")),
+            quiet_end=_as_clock_time(d.get("quiet_end", "08:00")),
             provider=ProviderConfig.from_dict(d.get("provider", {})),
             gateway=GatewayConfig.from_dict(d.get("gateway", {})),
             agent=AgentConfig.from_dict(d.get("agent", {})),

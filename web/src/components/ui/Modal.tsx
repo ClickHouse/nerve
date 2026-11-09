@@ -244,11 +244,22 @@ export function Modal({
         className={`modal-panel bg-surface-raised border border-border-subtle rounded-xl flex flex-col ${size === 'full' ? 'max-h-full' : 'max-h-[85vh]'} outline-none ${SIZES[size]} ${className}`}
       >
         {title && (
-          <div className="flex items-center justify-between px-5 py-3 border-b border-border shrink-0">
-            <h2 id={titleId} className="text-base font-semibold">
+          <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-border shrink-0">
+            {/* `min-w-0` lets a title wider than the panel shrink (it wraps,
+                or truncates when the caller asks for that), so the close
+                button stays inside the panel on a phone. */}
+            <h2 id={titleId} className="min-w-0 flex-1 text-base font-semibold break-words">
               {title}
             </h2>
-            <IconButton label="Close dialog" size="xs" onClick={onClose}>
+            <IconButton
+              label="Close dialog"
+              size="xs"
+              onClick={onClose}
+              // On a phone, the pseudo-element makes the tap target 46 px
+              // square around the 26 px button. It stays inside the header
+              // padding and the gap to the title.
+              className="relative max-md:before:absolute max-md:before:-inset-2.5 max-md:before:content-['']"
+            >
               <X size={18} />
             </IconButton>
           </div>

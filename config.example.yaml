@@ -61,6 +61,7 @@ agent:
   # Note: ~2x the cost of Opus ($10/$50 per MTok in/out).
   cron_model: claude-sonnet-5-5  # Cheaper model for cron jobs
   title_model: claude-haiku-5-5  # Session title generation
+  # outcome_titles: false        # Keep the first-message title instead of renaming once the first answer ends
   # Model-alias remapping for the CLI: short aliases ("opus") used in
   # Agent/Workflow tool model options and skill frontmatter resolve to the
   # mapped ID. Supported: opus, sonnet, haiku, fable. opus → claude-opus-5-5
@@ -270,12 +271,13 @@ slack:
 #     max_streams: 8
 
 # Where notify, ask_user, and propose_action deliver. The list replaces the
-# default rather than adding to it, so name every transport you want. A
-# transport that is off costs nothing here.
+# default rather than adding to it, so name every transport you want. The
+# panel (web) is always in it. A transport that is off costs nothing here.
 notifications:
   channels: [web, telegram, slack]
   # Target conversation for Slack cards. Without this, the first literal ID
-  # in slack.allow_channels is used; names and globs are not resolved.
+  # in slack.allow_channels is used; names and globs are not resolved. In
+  # hosted mode the control plane's notification channel is used instead.
   # slack_channel_id: "C0456DEF"
 
 # Quiet hours (local timezone). Optional: set both to "" for none, which is

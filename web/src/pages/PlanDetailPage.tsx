@@ -1,17 +1,37 @@
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { ArrowLeft, Check, X, MessageSquare, ExternalLink } from '../components/ui/icons';
-import { Badge, Button, IconButton, TextArea } from '../components/ui';
+import { ArrowLeft, ExternalLink } from '../components/ui/icons';
+import { Badge, Button, IconButton } from '../components/ui';
 import { PlanStatusBadge } from '../components/Plans/PlanStatusBadge';
-import { usePlanStore } from '../stores/planStore';
+import { PlanProgressCard } from '../components/Plans/PlanProgressCard';
+import { usePlanStore, type Plan } from '../stores/planStore';
 import { MarkdownContent } from '../components/Chat/MarkdownContent';
 import { ActorAttribution } from '../components/Chat/ActorLabel';
+import { planSummaryFallback } from '../components/Chat/planDecision';
+import { PlanDecisionControls } from '../components/Chat/PlanDecisionControls';
 
 /** Plan type is identity, not status — hence `purple` rather than a feedback tone. */
 const TYPE_LABELS: Record<string, string> = {
   'skill-create': 'Skill',
   'skill-update': 'Skill Update',
 };
+
+/**
+ * The bar's words. Approving starts the implementation session; a revision
+ * goes to the session that proposed the plan.
+ */
+const DECISION_LABELS = { approve: 'Approve & implement', requestChanges: 'Request revision…' };
+
+/**
+ * The text under the title: the summary from the agent that wrote the plan,
+ * else the plan's first heading and the two lines after it.
+ */
+function planSummaryText(plan: Plan): string {
+  const own = plan.summary?.trim();
+  if (own) return own;
+  const { heading, lines } = planSummaryFallback(plan.content);
+  return [heading, ...lines].filter(Boolean).join('\n');
+}
 
 export function PlanDetailPage() {
   const { planId } = useParams<{ planId: string }>();
@@ -25,13 +45,8 @@ export function PlanDetailPage() {
     updatePlan,
     approvePlan,
     revisePlan,
-    clearActionError,
     clearSelectedPlan,
   } = usePlanStore();
-  const [feedback, setFeedback] = useState('');
-  const [showFeedback, setShowFeedback] = useState(false);
-  const [declineFeedback, setDeclineFeedback] = useState('');
-  const [showDeclineFeedback, setShowDeclineFeedback] = useState(false);
 
   useEffect(() => {
     if (planId) loadPlan(planId);
@@ -47,7 +62,7 @@ export function PlanDetailPage() {
   }
 
   const isPending = plan.status === 'pending';
-  const isImplementing = plan.status === 'implementing';
+  const summary = planSummaryText(plan);
 
   const handleApprove = async () => {
     const result = await approvePlan(plan.id);
@@ -56,25 +71,14 @@ export function PlanDetailPage() {
     }
   };
 
-  const handleDecline = () => {
-    updatePlan(plan.id, 'declined', declineFeedback.trim() || undefined);
-    setDeclineFeedback('');
-    setShowDeclineFeedback(false);
-  };
+  const handleDecline = (reason: string) => updatePlan(plan.id, 'declined', reason || undefined);
 
-  const handleRevise = async () => {
-    if (!feedback.trim()) return;
-    const ok = await revisePlan(plan.id, feedback.trim());
-    if (ok) {
-      setFeedback('');
-      setShowFeedback(false);
-    }
-  };
+  const handleRevise = (feedback: string) => revisePlan(plan.id, feedback);
 
   return (
     <div className="h-full flex flex-col">
       {/* Header */}
-      <div className="border-b border-border-subtle px-6 py-3 bg-bg shrink-0">
+      <div className="border-b border-border-subtle px-4 md:px-6 py-3 bg-bg shrink-0">
         <div className="flex items-center gap-3 mb-2">
           <IconButton label="Back to plans" size="xs" onClick={() => navigate('/plans')}>
             <ArrowLeft size={16} />
@@ -90,8 +94,17 @@ export function PlanDetailPage() {
           )}
           <span className="text-xs text-text-faint">v{plan.version}</span>
         </div>
-        <div className="flex items-center gap-4 text-xs text-text-faint ml-7">
-          <span>{plan.created_at?.slice(0, 16).replace('T', ' ')}</span>
+        {summary && (
+          <p
+            data-testid="plan-summary"
+            title={summary}
+            className="ml-7 mb-2 max-w-3xl text-sm leading-snug text-text-secondary whitespace-pre-line line-clamp-3"
+          >
+            {summary}
+          </p>
+        )}
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-text-faint ml-7">
+          <span className="whitespace-nowrap">{plan.created_at?.slice(0, 16).replace('T', ' ')}</span>
           {plan.created_by_actor_id && (
             <span data-testid="plan-author" className="inline-flex items-center gap-1 min-w-0">
               Proposed by{' '}
@@ -119,20 +132,14 @@ export function PlanDetailPage() {
           <Button variant="link" size="xs" onClick={() => navigate(`/tasks/${plan.task_id}`)}>
             <ExternalLink size={11} /> View task
           </Button>
-          {isImplementing && plan.impl_session_id && (
-            // House convention for a tinted inline action: the identity hue
-            // rides the icon, the label stays neutral.
-            <Button variant="ghost" size="xs" onClick={() => navigate(`/chat/${plan.impl_session_id}`)}>
-              <MessageSquare size={11} className="text-hue-blue" /> Watch implementation
-            </Button>
-          )}
         </div>
       </div>
 
       {/* Plan content */}
-      <div className="flex-1 overflow-y-auto p-6">
+      <div className="flex-1 overflow-y-auto p-4 md:p-6">
         <div className="max-w-3xl mx-auto">
-          <div className="bg-surface border border-border-subtle rounded-lg p-6">
+          <PlanProgressCard plan={plan} />
+          <div className="bg-surface border border-border-subtle rounded-lg p-4 md:p-6">
             <MarkdownContent content={plan.content} />
           </div>
 
@@ -146,97 +153,26 @@ export function PlanDetailPage() {
               </div>
             </div>
           )}
-
-          {/* Action bar for pending plans */}
-          {isPending && (
-            <div className="mt-6 space-y-3">
-              <div className="flex items-center gap-3">
-                {/* Approving is this page's one committing action, so it takes
-                    the `primary` treatment. The alternatives do not hold:
-                    `success` is tinted, which would leave the affirmative
-                    action quieter than the `dangerSolid` Decline beside it, and
-                    there is no solid-success pair to build one from —
-                    `--theme-success` is a feedback *foreground*. */}
-                <Button variant="primary" size="md" onClick={handleApprove} disabled={actionLoading}>
-                  <Check size={14} />
-                  Approve &amp; Implement
-                </Button>
-                <Button
-                  variant="dangerSolid"
-                  size="md"
-                  onClick={() => setShowDeclineFeedback(!showDeclineFeedback)}
-                  disabled={actionLoading}
-                >
-                  <X size={14} /> Decline
-                </Button>
-                <Button variant="secondary" size="md" onClick={() => setShowFeedback(!showFeedback)}>
-                  <MessageSquare size={14} /> Request Revision
-                </Button>
-              </div>
-
-              {showDeclineFeedback && (
-                <div className="space-y-2">
-                  <div className="flex gap-0">
-                    <div className="w-1 bg-error/40 rounded-full shrink-0" />
-                    <div className="flex-1 pl-3">
-                      {/* No red focus border here: FIELD_BASE is the app's one
-                          focus treatment and it is accent. */}
-                      <TextArea
-                        value={declineFeedback}
-                        onChange={e => setDeclineFeedback(e.target.value)}
-                        placeholder="Optional: why is this plan being declined? (leave empty to close without a reason)"
-                        rows={3}
-                        autoFocus
-                      />
-                    </div>
-                  </div>
-                  <div className="flex justify-end">
-                    <Button variant="dangerSolid" size="md" onClick={handleDecline} disabled={actionLoading}>
-                      Confirm Decline
-                    </Button>
-                  </div>
-                </div>
-              )}
-
-              {showFeedback && (
-                <div className="space-y-2">
-                  <div className="flex gap-0">
-                    <div className="w-1 bg-accent/30 rounded-full shrink-0" />
-                    <div className="flex-1 pl-3">
-                      <TextArea
-                        value={feedback}
-                        onChange={e => {
-                          setFeedback(e.target.value);
-                          if (actionError) clearActionError();
-                        }}
-                        placeholder="Describe what to change..."
-                        rows={3}
-                        autoFocus
-                      />
-                    </div>
-                  </div>
-                  {actionError && (
-                    <div className="flex gap-0">
-                      <div className="w-1 bg-error/40 rounded-full shrink-0" />
-                      <div className="pl-3 py-1 text-xs text-hue-red">{actionError}</div>
-                    </div>
-                  )}
-                  <div className="flex justify-end">
-                    <Button
-                      variant="primary"
-                      size="md"
-                      onClick={handleRevise}
-                      disabled={actionLoading || !feedback.trim()}
-                    >
-                      Send Revision Request
-                    </Button>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
         </div>
       </div>
+
+      {/* The decision stays in view at every scroll position: the plan
+          scrolls above it, and on a phone the bottom nav sits below it. */}
+      {isPending && (
+        <section aria-label="Plan decision" className="shrink-0 border-t border-border-subtle bg-bg px-4 md:px-6 py-3">
+          <div className="max-w-3xl mx-auto space-y-2">
+            {actionError && <p role="alert" className="text-xs text-hue-red">{actionError}</p>}
+            <PlanDecisionControls
+              layout="bar"
+              labels={DECISION_LABELS}
+              disabled={actionLoading}
+              onApprove={handleApprove}
+              onRequestChanges={handleRevise}
+              onDecline={handleDecline}
+            />
+          </div>
+        </section>
+      )}
     </div>
   );
 }

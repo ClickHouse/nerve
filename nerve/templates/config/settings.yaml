@@ -65,4 +65,4 @@
 #   effort: high
 
 # notifications:
-#   channels: [telegram]
+#   channels: [web, telegram]

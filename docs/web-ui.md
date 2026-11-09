@@ -32,10 +32,11 @@ web/src/
 ├── components/
 │   ├── Auth/           # Login page and session-expired overlay
 │   ├── Setup/          # Setup wizard: shell, progress rail, step forms, restart overlay, banner
+│   ├── Settings/       # Settings sections, their rows and controls
 │   │   ├── steps/      # ClaimForm, ModeStep, ProviderStep, ProfileStep, …, ReviewStep
 │   │   └── copy.ts     # Every heading, intro and hint of the wizard (no JSX)
 │   ├── Chat/           # Message list, input, session sidebar, diff viewer
-│   │   ├── agents/     # Agent lines, dock, Agents panel, transcripts, stop controls, queue chips
+│   │   ├── agents/     # Agent lines, dock, Agents panel, transcripts, stop controls, queued messages
 │   │   ├── tools/      # Specialized tool call renderers
 │   │   ├── FileChangesPanel.tsx  # Modified files list + detail navigation
 │   │   └── DiffView.tsx          # GitHub PR-style unified diff renderer
@@ -70,22 +71,35 @@ web/src/
 └──────────┴────────────────────────────────┴──────────────────────┘
 ```
 
-The sidebar is collapsible (toggle in header, persists via localStorage). The side panel holds the Agents roster, one tab per opened agent, plan and workflow tabs and the modified files; it opens when you open something in it (spawning an agent opens nothing by itself). Panel is resizable via drag handle (width persists in localStorage). Toggle with `Cmd/Ctrl + \`.
+The sidebar is collapsible (toggle in header, persists via localStorage). The side panel holds the Agents roster, one tab per opened agent, plan and workflow tabs, the modified files and the session's tasks; it opens when you open something in it (spawning an agent opens nothing by itself). Panel is resizable via drag handle (width persists in localStorage). Toggle with `Cmd/Ctrl + \`.
+
+On a phone (narrower than 768 px), a bar at the bottom replaces the nav rail: **Inbox**, **Chat**, **Tasks**, **Notifs** (with the count of pending notifications) and **More** (all other pages, Plans included). On the chat page the session list is a drawer over the chat.
 
 ## Features
 
 ### Session Management
 - **Sidebar** — Collapsible sidebar with sessions split into four groups: **Starred** (pinned, any source), **Conversations** (the feed, grouped by date and paginated with a "…" load-more), **Archived** (lazy, collapsed — archived conversations only; cron/hook sessions are excluded), and **System** (lazy, collapsed — live cron/hook sessions). The Archived and System groups fetch on first expand and drop their rows again on collapse. Toggle the sidebar via header button; state persists in localStorage.
-- **Auto-naming** — New sessions get AI-generated titles via Haiku (e.g. "Italy Summer Vacation Planning" instead of the first message text)
+- **Needs you:** the first group of the sidebar holds each session that waits for you, of any source: a pending question or approval, a pending plan that it proposed, a question inside a turn, or a review loop that waits for a decision. Each row tells why in a second line ("Question", "2 approvals", "Plan to review", "Waiting for input", "Review loop"). When the agent is blocked on you (a question, an approval, a review loop on a decision), the row shows a red "!" in place of its status dot; a plan to review does not block the agent and keeps the normal dot. A session in this group is not in Running, Starred or its parent. One line above the list counts the groups, for example "2 need you · 3 running". The list reloads 500 ms after a notification event, after a session starts or stops waiting for input or for a review loop decision, after a plan decision in the tab, and after a `task_updated` event (a plan decision from another tab, Telegram or the API writes the plan's task).
+- **Inbox (phone):** `/inbox` shows the session list on the full page, with the Needs you group first, and a composer at the bottom ("Message Nerve...", with the agent name from `IDENTITY.md`). Sending starts a new chat with the message and opens it. When the message cannot be sent, the text stays in the box with "Could not send. Try again.", and the next send goes to the chat that the failed send created. On a phone `/` opens the Inbox. On desktop `/inbox` opens `/chat`, which shows the same list next to the chat.
+- **Origin**: the leading icon of a session row tells where the session comes from: Slack, Telegram, email, the API or an external client (plug), a cron job or "Run later" with a delay (clock), a plan (hammer), a workflow run, or a fork (branch). A plain web chat keeps the chat icon. The tooltip is the origin as a sentence, for example "Started from Slack #general". Above the first message, one line names the origin, for example "From Slack #general" or "From cron job daily-digest", and links to the plan, the cron jobs or the workflow runs. It names no person: the header names who started the session. A fork keeps its own "Forked from" line under the header. See `trigger` in [api.md](api.md#sessions)
+- **Tasks from this session**: when a session created, implemented or updated tasks, the chat header shows a tasks button with their count, next to the modified files button. It opens the **Tasks** tab of the side panel: each task with its title, what the session did ("Created", "Implemented", "Updated") and its status (`GET /api/sessions/{id}/tasks`). Click a task to open it in the task dialog over the chat; closing the dialog goes back to the chat with the panel open. The list loads when the session opens and when the tab opens, and loads again on each `task_updated` event that changes a task, and after a reconnect
+- **Auto-naming** — New sessions get AI-generated titles via Haiku (e.g. "Italy Summer Vacation Planning" instead of the first message text). Unless `agent.outcome_titles` is off, a session is renamed once more when the agent's answer to its first message ends, from what the agent did; a fork too, which otherwise keeps "Fork of …". A session you renamed is never renamed by Nerve. **Regenerate name** in a session's menu makes such a title on demand
 - **Resumable sessions** — Sessions persist across server restarts via SDK `--resume` flag; full conversation context is restored
 - **Stop button** — While a turn streams, a split red Stop replaces send. The button stops the orchestrator's turn only: background agents keep running. Its caret offers "Stop turn and send" (stop, then send the composer's text) and "Stop all agents…". If the turn does not end within 5 s while agents run, a banner offers "Force stop…" (it restarts the runtime and lists what ends); on a runtime that cannot spare background agents, the banner asks before stopping them. See [agents.md](agents.md#stopping)
-- **Queued messages** — The composer always sends. While a turn streams, Enter queues the message: a chip above the composer shows it (also in other tabs, with its source when it came from a channel or the API) until the turn ends and it runs. Your own chips can be edited (✎: cancel it and continue editing its text in the composer) or cancelled (×); either way its text comes back into the composer, so nothing typed is lost
+- **Queued messages**: The composer always sends. While a turn streams, Enter queues the message: a row above the composer shows it (also in other tabs, with its source when it came from a channel or the API) until it runs, and its bubble shows at the end of the transcript when it starts, in every tab. The rows are in run order, the top one runs next; the arrows on a row move it up or down, for any queued message. Your own rows can be edited (✎: cancel it and continue editing its text in the composer) or cancelled (×); either way its text comes back into the composer, so nothing typed is lost
 
 ### Agent Status
 - **Live indicator** — Header shows current agent state: "Thinking...", "Writing...", "Using Read...", etc.
 - **Per-session** — Sidebar shows spinner on the active session when agent is working
 
+### Context window
+- **Context bar**: the chat header shows the context use of the last turn and how full the window is (on a phone, the percentage). A `~` marks an estimate from the last turn's usage.
+- **Context popover**: a click on the bar opens it (Escape or a click outside closes it). For a Claude session with a live runtime it shows a bar with one segment per category (system prompt, system tools, MCP tools, skills, messages, and so on), the tokens of each category and the auto-compact threshold. For a Codex session, or a Claude session with no live runtime, it shows the totals only. Below that are the last turn's tokens and the session cost.
+- **Compact**: in a live Claude session, **Compact…** asks first ("Summarizes earlier messages to free context. The full transcript stays in Nerve.") and then runs the compact as a turn. Compact is available when the agent is idle; while a turn runs, the button is disabled. The popover then shows the new categories and the tokens it freed. When the runtime has nothing to compact, the popover says so; nothing goes into the chat. See [`POST /api/sessions/{id}/compact`](api.md#post-apisessionsidcompact).
+
 ### Tool Call Rendering
+In the chat, each run of tool calls and thinking between two text blocks of a message is one **tool burst**. A finished burst with a tool call and at least two blocks shows as one muted line that names the work, for example "Read 3 files, ran 4 commands, searched 2 times, edited 2 files" (reads and edits count distinct files; MCP tools count per server, "used 2 nerve tools"), with "1 failed" in red when calls failed. A click opens the rows. While a turn runs, its last burst stays open, so the newest calls show; it folds when text follows or the turn ends. Question cards (`ask_user`, AskUserQuestion, `ask_form`), the ExitPlanMode decision card, files that the agent sends (`send_file`) and the first card of a workflow run are never in a burst. Agent tabs and plan tabs show the rows without bursts.
+
 Tool calls are collapsed by default with specialized renderers:
 - **Edit** — Unified diff with red/green highlighting
 - **Bash** — Terminal-styled with `$` prompt and output
@@ -97,6 +111,8 @@ Tool calls are collapsed by default with specialized renderers:
 - **Background continuation** — An autonomous turn (the runtime resumed after background work settled) starts with a divider naming what settled ("Background · build-chart finished").
 - **AskUserQuestion** — Interactive question card with clickable options (radio for single-select, checkboxes for multi-select). Each question also offers **Other…**, which opens a "Your answer" field: the typed text (required once chosen) is that question's answer — it replaces the option in a single-select question and is appended to the chosen labels in a multi-select one. A card with one single-select question still answers on one click of an option. Multiple questions grouped in one card with a shared Submit button. Markdown previews on hover. When the agent is paused mid-turn (via `can_use_tool`), answers are sent through the interaction protocol (`answer_interaction` WebSocket message), injecting them into the SDK's `answers` field so the agent continues seamlessly. Once the question is no longer pending (answered here or in another tab, after a reload, or closed by a timeout), the card is read-only and shows the chosen answers; it never posts an answer as a chat message.
 - **ask_form** (Nerve's form tool, `mcp__nerve__ask_form`) — One card for up to six questions while the agent's tool call waits for the answers (up to an hour). The call's optional intro (Markdown, the agent's explanation of why it asks) shows above the card as chat text, and stays there after the card is answered and folds. In the card: an optional title, then each question with its label chip (`*` when required, or "Optional"), the question and the agent's reason in muted text. By kind: `choice` is option rows to pick one and `multi` option rows to pick any, each with **Other…** for the person's own words unless the agent turned it off (in `multi` the Other… text is one more answer); `text` is a two-row box that grows (Enter is a new line); `url` is checked to be http(s) with a host and no spaces; `list` is chips (a comma or Enter adds one, Backspace in the empty field removes the last, a paste splits at commas and line breaks, and leaving the field keeps the typed text); `repos` is chips like `list`, each `owner/name` (a pasted GitHub URL becomes `owner/name`; an invalid one is red with a hint and blocks Submit). Defaults are prefilled. **Submit** (or Cmd/Ctrl+Enter anywhere in the card) is enabled once every required question has an answer and nothing is invalid; Escape inside the card never stops the waiting turn. The answers go back through `answer_interaction` (`result: { answers }`), and the agent gets one line per question plus the same answers as JSON. The card answers only while its own form waits; after an answer here or in another tab, a timeout or a reload it is read-only. Answered cards fold, `ask_form` and AskUserQuestion alike: an answered or closed card shows one line per question, `LABEL → answer` (chips for a list, "—" for no answer); **Show questions** opens the full card, read-only, and **Hide** folds it again. Cards start folded, also after a reload, where the answers are read from the tool result; a card that still waits is shown in full. "Closed" means it ended without an answer (a timeout, the form was closed, or the session stopped).
+- **ask_user** (Nerve's question tool, `mcp__nerve__ask_user`): the question and its options, answerable in the chat while it waits. The card reads the question's notification, so the chat, the Notifications page and the toast show the same question with the same option list: one full-width row per option with a letter key (A, B, C). While focus is in the list, a letter or a digit 1 to 9 chooses that row. An option that ends in "(recommended)" shows first with a "Recommended" tag. The last row, **Other…**, opens a field for an answer in your own words (Enter sends, Escape closes the field). An approval (`propose_action`, on the Notifications page and in the toast) has no Other… row and says "Nothing happens until you choose."; a question does not, because the agent can continue without the answer. In an approval, Approve (green, ✓), Decline (red, ✕) and Snooze 24h (moon) show their icon in place of the letter, and the answer line shows that icon in place of `✓`. The letter keys also choose these rows. After an answer from any place (the chat, the Notifications page, the toast, Telegram, Slack), each place shows `✓ <answer>` with who answered, when, and through which channel; **Show options** opens the list, read-only. When the server refuses an answer, the card reads the question again and shows the answer from a different place, if there is one; if not, "Could not send the answer. Try again." shows under the options. A question that expired shows "Expired without an answer". The toast shows all options and stays open until you answer or dismiss it; when the question is answered in another place, the toast shows the answer and closes after 5 seconds. A `notify` call shows as a "Notify" row.
+- **send_file** (`mcp__nerve__send_file`): an image file (PNG, JPEG, GIF, WebP, AVIF or SVG) shows in the chat, at most 320 px high, with its name and a download link below it. A click on the image opens it at full size, with a download card. Another file, or an image that does not load (for example, a file that was deleted later), shows as a download card. A call that sent nothing shows "Could not send `<name>`" and the reason, for example a file outside the workspace. The image comes from `GET /api/files/download`, the same as the download card.
 - **EnterPlanMode** — A status line, "Entering plan mode…" while it runs and "Entered plan mode" when complete ("Plan mode declined" on an error), with no buttons: entering plan mode only restricts the agent, so no approval is involved (the Claude CLI switches the mode itself; if a CLI asks, the server allows it at once).
 - **ExitPlanMode** — The decision card. The agent pauses mid-turn until the person decides. The card shows an autogenerated summary, not the plan itself: up to six short bullets that the server writes with `agent.title_model` when the pause starts (the `plan_summary` event), with "Summarizing…" until they arrive and the plan's first heading and two lines when no summary can be made; the full plan (the interaction's `tool_input.plan`, which the CLI fills with the plan file's text) is in the side panel, which **Read the plan** opens. **Approve** lets the agent go on (it starts on the plan in the same turn) and closes the plan tab. **Request changes…** opens a required "What should change?" field; **Send** refuses the plan with that text, which reaches the agent verbatim: it stays in plan mode, revises the plan and asks again with a new card. **Edit**, offered when the pause carries the plan text, opens the side panel with the plan as a text field ("Edit the plan"); there **Apply edited plan** (enabled once the text changed) approves the person's text instead (`answer_interaction` with `result: { plan }`): the CLI saves it to the plan file and tells the agent the plan was approved with the person's edits. **Cancel** drops the edits. A decided card keeps its outcome line and a **Read the plan** link that opens that plan read-only (the edited text, for an edited approval). In the onboarding conversation the card is titled "Setup proposal" with **Apply setup**, **Change something…** and "Edit the setup proposal". After an approval, while that turn still runs, the card reads "Approved — applying…" ("Approved with your edits — applying…"; "Applying the setup…" in the onboarding conversation), then "Approved" or "Approved with your edits"; a change request reads "Changes requested" with the first line of the feedback, and an error that is not the person's feedback (a timeout, a stopped session, a CLI validation error) reads "Closed" with its reason.
 
@@ -108,6 +124,27 @@ A rendered block is a figure, not a code block: a bordered panel on the app's su
 Mermaid diagrams use mermaid's `base` theme with every variable taken from the app's tokens (node fill and border, text, arrows, clusters, the categorical palette for slices, series and branches, tinted fills kept at WCAG AA against their text), Inter at 14 px, rounded nodes, no drop shadows. Vega charts get a config from the same tokens (palette as the category range, a quiet grid, no plotting box, Inter, themed tooltips), take the column's width unless the spec sets one, and re-lay out when it changes. Theme switches re-render both.
 
 While a reply streams, a block renders once its text has stopped changing for a moment; a parse error during the stream shows the source without comment (the text may simply not be complete yet), a failure after it shows the source with the renderer's message, and the previous picture stays on screen until the next one has rendered. Rendered content loads nothing from the network — the source is model output, and model output can carry what a tool result put in front of the model: mermaid runs with `securityLevel: strict`, its diagrams cannot set `themeCSS`/`fontFamily`, label HTML is cleaned before rendering, and a source that would fetch (`img:` nodes, image URLs, external `url()`s) is refused and shown as source; Vega gets a loader that refuses every request, a spec with `url` data is rejected before it is compiled (inline `values` only), its `usermeta.embedOptions` are dropped, the action menu is off, and tooltips render fields as text (vega-tooltip would turn an `image` field into a remote `<img>`); SVG goes through DOMPurify's SVG profile with `<image>`, `<feImage>`, `<foreignObject>` and `<style>` elements removed (an inline SVG stylesheet is document-scoped and would style the page), `href`s restricted to `#fragment`s, `style` attributes dropped when they carry a `url()` (or a CSS escape that could spell one) or CSS positioning (`position`, `inset`, `z-index`, `transform`), and the longest side capped at 8192 px; the figure's canvas and each stage use `contain: layout paint`, so nothing a picture does with CSS can reach outside its block. Links inside a diagram open in a new tab without an opener, like links in the text around them. The renderers are their own chunks, fetched the first time a chat shows such a block. Blocks over 200,000 characters stay source. The implementation lives in `web/src/components/Chat/rich/`; the inbox's message renderer (`Sources/`) is a different component and does not render these.
+
+### PR Cards
+An assistant message that links to GitHub pull requests
+(`https://github.com/<owner>/<repo>/pull/<number>`) shows one card for each
+pull request below its content. The links come from the message text. Only when
+the text has no such link, they come from each tool result that links to
+exactly one pull request, for example the URL that `gh pr create` prints. A
+tool result that lists more pull requests gives no cards. A message shows at
+most 5 cards. A card shows the title (a link to GitHub), a state chip (Draft,
+Open, Merged or Closed), `owner/repo#number` with the branches, the checks
+("2 failed", "3 running", "12 passed") and the review decision. The data comes
+from `GET /api/github/pulls`, so the server needs a `gh` login. Without one,
+the card shows `owner/repo#number` as the link and the reason
+("No access to details", "GitHub CLI not available"). The cards of a message
+read their data the first time they come into view (or within 200 px of it).
+While a pull request is open with checks running, its card reads it again 60 s
+after the last read, but only while the card is in view and the tab shows. The
+card stops when the checks end or the pull request merges or closes. When the
+request fails, the card shows "Could not load details" and reads again 60 s
+later, also only while it is in view and the tab shows. A message that still
+streams shows no cards.
 
 ### Modified Files Panel
 GitHub PR-style diff viewer for files modified during a session. Accessible via the `[📁 N]` badge button in the chat header (appears when files have been modified).
@@ -129,7 +166,7 @@ Sub-agents and background tasks (shells, monitors, workflows) of the session; se
 - **Sidebar** — A session whose agents still run between turns stays in the Running group with a violet "parked" dot ("N agents running"; the count shows when two or more run).
 
 ### Side Panel
-Generic tabbed panel for the Agents roster, agent transcripts, plans, workflows and modified files:
+Generic tabbed panel for the Agents roster, agent transcripts, plans, workflows, modified files and the session's tasks:
 
 - **Tabbed interface** — Tab bar appears when multiple tabs exist. Each tab has its own labelled close button.
 - **Plan actions** — While `ExitPlanMode` waits, the plan tab's footer offers the same decision as the chat card, with the same labels, feedback field and Edit: Approve resolves the interaction and closes the tab (from either surface); Request changes… denies it with the person's text and keeps the tab, so the revised plan updates in place. With no `ExitPlanMode` waiting and no turn running, the footer's Approve sends "Looks good — implement it." as a message and closes the tab; the onboarding conversation has no such fallback, because its setup proposal is decided once, on its pause.
@@ -288,8 +325,8 @@ when setup is finished, while the state is unknown, during a restart, and
 after Dismiss (remembered per viewer in `sessionStorage` for the tab session).
 The **Setup** entry in the navigation appears as soon as the checklist has
 been read, in both auth modes, and leaves the rail's list when setup is
-finished. Then a gear button labelled "Setup" in the footer of the nav rail
-opens `/setup`. On a phone the entry stays in the **More** drawer. The
+finished. Then "Run setup again" in [Settings](#settings) opens `/setup`. On
+a phone the entry stays in the **More** drawer. The
 chat page's empty state reads "Connect a model to start a conversation" with a
 link to `/setup/provider` while the server says no provider is configured.
 When a lockdown closed the Model step, it reads "No model is connected" with
@@ -303,6 +340,144 @@ wizard, About you takes the name from the gateway's sign-in and only sets what
 Nerve writes in `USER.md`, the profile step never calls an account endpoint,
 and the reconnect after a restart goes through the hosted adapter's own
 session probe, so no login form can appear.
+
+### Settings
+
+`/settings/:section?`: the settings that people otherwise change in YAML.
+The gear in the nav rail footer opens it (on a phone: Settings in the More
+menu). A desktop shows the section list on the left and opens the first
+section; a phone shows the list at `/settings` and one section at
+`/settings/<id>`. "Run setup again" under the list opens `/setup`; while setup
+is unfinished, Setup also stays in the rail.
+
+Each control saves when it changes (a text field on Enter or when it loses
+focus) through `PUT /api/settings/<section>` (see
+[api.md](api.md#settings)), and the row shows the answer of the server. A
+row says in small text where its changes are saved (`settings.yaml`, or
+`config.yaml` on this machine when that file states the value). A field that
+the environment or the control plane sets shows its reason and no control.
+Under lockdown the section is read-only, with one line that says why.
+
+**Notifications** (`NotificationsSection`):
+
+- **Where notifications go**: the Nerve panel (always on), This browser,
+  Slack and Telegram. This browser (`ThisBrowserRow`) has the switch and the
+  level of the [browser alerts](#browser-alerts), the switch of the
+  [push notifications](#push-notifications) and the other devices of the
+  person that get them. Slack and Telegram have a
+  switch (`notifications.channels`),
+  a destination (the Slack channel ID with the channel name, the Telegram
+  chat ID) and "What to send": Everything or Questions and important
+  (`notifications.levels`). A channel that is not connected links to the
+  Channels step of Setup.
+- On a hosted instance (`hosted` in the API, `slack.mode: hosted`), there is
+  no Telegram row. The Slack row shows only while the control plane has a
+  Slack app connected for the agent. It has the switch and "What to send",
+  and in place of the destination one line: "Cards go to the notification
+  channel that an admin sets in the control plane. With no channel set
+  there, Slack gets none."
+- **Send a test** sends one notification to each place that is on. Each row
+  then shows "Test arrived" or "Test did not arrive". This browser shows it
+  for push while push is on there: whether a push service took the test.
+- **Quiet hours**: a switch and a start and end time (`quiet_start`,
+  `quiet_end`), in the instance's time zone, which the row names. On fills in
+  22:00 to 07:00; off empties both times. During them, notifications below `urgent` arrive without sound (see
+  [config.md](config.md#quiet-hours)).
+- **Silences** opens the silences manager (`/notifications?silences=1`).
+- **Advanced**: when an unanswered question expires, and how often a
+  snoozed question comes back.
+
+### Browser alerts
+
+A panel tab that is open but not in front can show a system alert for a new
+notification. The choice is per browser, in localStorage
+(`nerve-browser-alerts`), not on the server. It is made in Settings >
+Notifications > This browser ("Alerts while a tab is open"), or with "Turn
+on" in the offer on the first toast that waits for an answer ("Turn on · Not
+now", shown until the person answers it). On the Notifications page, a line
+above the list ("Browser alerts are on" or "off") opens the setting.
+
+- **What alerts:** "Questions and important" (questions, approvals, `high`
+  and `urgent`; the default) or "Everything". A silenced item never alerts.
+- **One alert across tabs:** the tabs of a browser share a `BroadcastChannel`.
+  A tab in front tells the others that the person sees the item; a tab in
+  the background waits a moment, then shows the alert and tells the others.
+  Before it shows the alert, a tab takes a Web Lock for the item and keeps it
+  while the alert is open, so two tabs that wait the same time give one
+  alert. The alert's tag is the notification id.
+- **Click and close:** a click focuses the tab and opens `/notifications`.
+  The alert closes when the item is answered or expires. Where the browser
+  runs the panel's service worker, the worker shows the alert and handles
+  the click (see [Push notifications](#push-notifications)).
+- **Quiet hours:** an item that the server sends with `silent: true` gives an
+  alert without sound.
+- **Title and favicon:** on every panel tab, in front or not, the title
+  starts with "!" while an answer from the person waits (a question in the
+  turn, a pending question or approval from any session, or a review loop on
+  a decision). The filters on the Notifications page do not change this.
+  Otherwise it starts with "(N)", the number of pending notifications that
+  the Notifs badge shows. The favicon gets a red dot for "!" and a blue dot
+  for "(N)". A page that sets its own title gets the prefix again. The server
+  sends no event for a dismissal, so a tab that dismisses notifications tells
+  the other tabs on the same `BroadcastChannel`, and they read the count
+  again. This needs no permission and no setting.
+- **Limits:** browsers show alerts only for HTTPS addresses (and
+  `localhost`); on plain HTTP the row says "Needs HTTPS". A browser that
+  blocks the site shows "Blocked", and a browser that has no Notification
+  API, or that shows alerts only through a service worker and runs none for
+  the panel, shows "Not supported". A tab must be open. The alert has no
+  answer buttons.
+
+### Push notifications
+
+"Alerts when no tab is open", in Settings > Notifications > This browser,
+turns on Web Push for the browser. The instance sends each item to
+the push service of the browser, and the panel's service worker (`/sw.js`)
+shows it as a system notification, also when no panel tab is open. The server
+keeps one row for each browser (see [api.md](api.md#web-push)). Under "Your
+other devices" the row lists the other browsers of the person, with the day
+the person turned push on there and the last notification, and a button that
+removes each one.
+
+- **What arrives:** the items at the level of the row ("What to send"),
+  which the browser sends with its subscription; `notifications.levels.webpush`
+  applies too ([config.md](config.md#web-push)). The notification shows
+  "<agent name>: <title>" and the first lines of the body, with the
+  notification id as tag. During quiet hours a push below `urgent` makes no
+  sound. A click focuses a panel tab, or opens one, at `/notifications`. The
+  browsers of a disabled account get no push (see
+  [Request identity](accounts.md#request-identity), and
+  [External mode](accounts.md#external-mode) for a person who loses access
+  at the gateway).
+- **When it shows:** not while a panel tab has focus, because the tab shows
+  the item; at all other times, also while a panel tab is open but not in
+  front, because browsers require a notification for each push then. On
+  WebKit (Safari, and a Home Screen app on iPhone and iPad), the worker also
+  shows the push while a panel tab has focus, with `silent: true`, because
+  WebKit removes the subscription after three pushes that show nothing. The
+  worker also shows the browser alerts of the tabs, with the same tag, so an
+  alert and a push for one item give one notification, and phone browsers
+  that show alerts only through a service worker can show them.
+- **Server side:** the instance signs each push with its VAPID key, made at
+  first use and kept in `nerve.db` (`instance_secrets`), never in a
+  configuration file. A backup without secrets has no key, so after a restore
+  each browser must turn push on again. When a push service answers `404` or
+  `410`, the browser dropped the subscription, and Nerve deletes it.
+- **Install:** the panel has a web app manifest (`/api/manifest.webmanifest`)
+  with the agent's name and Nerve's app icon, so a browser can install it as an
+  app. `apple-touch-icon.png` is the Home Screen icon on iPhone and iPad. Push
+  notifications and browser alerts show the app icon, and Android shows a white
+  N in the status bar. The worker
+  has no fetch handler, so every page comes from the server.
+- **Limits:** HTTPS only (and `localhost`). On iPhone and iPad, push works
+  only after "Add to Home Screen" (iOS 16.4 or later), and a Safari tab says
+  so. The instance must reach `fcm.googleapis.com` (Chrome and most Chromium
+  browsers), `updates.push.services.mozilla.com` (Firefox),
+  `*.push.apple.com` (Safari) and `*.notify.windows.com` (Edge). On Nerve
+  Cloud, an agent in restricted internet mode cannot reach them, so Web Push
+  works only for agents in open mode, and each agent has its own address, so
+  a device turns push on for each agent. With several people on one agent,
+  each person with push on gets every notification. No answer buttons.
 
 ### Accounts
 
@@ -365,6 +540,15 @@ System status dashboard (`/diagnostics`) with:
 - **Tasks / FTS Index** — Active/done counts, FTS indexed vs total, in-sync status indicator (green ✓ / red ✗)
 - **Memory service** — memU's status, item counts and operations; with `memory.backend: loom`, Loom's: the gateway it is reached through, the org and namespace, where the namespace came from, the last error and when it was checked, and a link to Loom's dashboard when `memory.loom.dashboard_url` is set
 - **Recent Cron Logs** — Job ID, status, timestamps, errors
+
+### Cron Page
+`/cron` opens on the sheet of the first job: the **Active** switch, **Run
+now**, the schedule in words (`cronstrue` for crontab expressions), the next
+run with its forecast, the latest run and the 7-day success count (for a
+workflow job, the number of starts). **History**
+lists the runs with ✓, ✗ or −, the duration and a link to the run's session,
+and hides the source runs that found nothing new until you select **Show runs
+with no new items**. See [The Cron page](cron.md#the-cron-page).
 
 ### Reload Resilience
 - Server buffers streaming events per session

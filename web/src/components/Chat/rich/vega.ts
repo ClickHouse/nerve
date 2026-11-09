@@ -52,7 +52,7 @@ export function parseSpec(source: string): Record<string, unknown> {
   try {
     parsed = JSON.parse(source);
   } catch (err) {
-    throw new Error(`the spec is not valid JSON (${(err as Error).message})`);
+    throw new Error(`the spec is not valid JSON (${(err as Error).message})`, { cause: err });
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     throw new Error('the spec must be a JSON object');

@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import type { ReviewLoopDecisionResult } from './client';
 
 // Node can expose a non-jsdom localStorage. Install the storage the client
@@ -41,7 +41,7 @@ function response(status: number, refreshedToken?: string): Response {
 }
 
 let fetchMock: ReturnType<typeof vi.fn>;
-let unauthorized: ReturnType<typeof vi.fn>;
+let unauthorized: Mock<() => void>;
 
 beforeEach(() => {
   data.clear();

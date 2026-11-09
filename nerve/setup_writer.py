@@ -48,6 +48,7 @@ import re
 import secrets
 import shutil
 import stat
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -161,7 +162,8 @@ PRODUCTIVITY_CRONS = [
             "1. Use task_list(status=\"pending\") to browse the tasks that are ready for work\n"
             "2. Use plan_list to see which tasks already have plans — skip those\n"
             "3. Pick ONE task and explore the relevant codebase\n"
-            "4. Call plan_propose(task_id, content) with your plan\n\n"
+            "4. Call plan_propose(task_id, content, summary) with your plan and a summary "
+            "of up to 3 short lines for the reviewer\n\n"
             "If all tasks have plans or none are actionable, say so and stop.\n\n"
             "plan_propose notifies the user with a link to the plan. "
             "Do not send another notification about it.\n"
@@ -1534,9 +1536,8 @@ def system_cron_file(workspace: Path) -> Path:
     return Path(workspace) / "config" / "cron" / "system.yaml"
 
 
-def _read_system_crons(workspace: Path) -> tuple[dict[str, Any] | None, str, str]:
-    """``(document, raw_text, problem)`` for the generated cron file."""
-    path = system_cron_file(workspace)
+def _read_cron_file(path: Path) -> tuple[dict[str, Any] | None, str, str]:
+    """``(document, raw_text, problem)`` for a cron file."""
     if not path.exists():
         return None, "", "missing"
     raw = path.read_text(encoding="utf-8")
@@ -1575,7 +1576,7 @@ def list_optional_crons(workspace: Path) -> list[CronToggle]:
     step has nothing to offer rather than inventing jobs that were never
     written.
     """
-    document, _raw, problem = _read_system_crons(workspace)
+    document, _raw, problem = _read_cron_file(system_cron_file(workspace))
     if problem or document is None:
         return []
     present = {
@@ -1613,7 +1614,7 @@ def plan_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronTogglePla
     error message is wrong.
     """
     path = system_cron_file(workspace)
-    document, raw, problem = _read_system_crons(workspace)
+    document, raw, problem = _read_cron_file(system_cron_file(workspace))
     if problem or document is None:
         return CronTogglePlan(path=path, text=None, problem=problem or "unreadable")
 
@@ -1657,6 +1658,119 @@ def set_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronToggleOutc
     one call, for a caller with nothing else to coordinate.
     """
     return plan_optional_crons(workspace, enabled_ids).publish()
+
+
+# --- Turning one job on and off (the Cron page) --------------------------------
+#
+# For one job of any cron file, ``system.yaml`` or ``jobs.yaml``. A person
+# writes ``jobs.yaml``, so the file is not dumped again (that loses comments
+# and formatting): only the job's ``enabled:`` line changes, or one is added
+# under its ``id:`` line. The result is parsed again, and it is written only
+# if the job's ``enabled`` is the one difference from the file as it was.
+
+#: ``CronTogglePlan.problem`` values of :func:`plan_cron_job_enabled`, beside
+#: ``missing`` and ``unreadable: ...``.
+CRON_FILE_HAND_EDITED = "hand-edited"
+CRON_FILE_READ_ONLY = "read-only"
+CRON_JOB_MISSING = "no such job"
+
+# A job's ``id:`` line and ``enabled:`` line (``- id: x`` or ``id: x``), with
+# what comes before the key; the ``- `` that starts a list item.
+_ID_LINE = re.compile(r"""^(?P<lead>[ \t]*(?:-[ \t]+)?)id:[ \t]*(?P<q>["']?)(?P<id>[^#\r\n]*?)(?P=q)[ \t]*(?:#.*)?$""")
+_ENABLED_LINE = re.compile(r"^(?P<lead>[ \t]*(?:-[ \t]+)?)enabled:(?P<value>[^#\r\n]*)(?P<comment>#.*)?$")
+_ITEM_START = re.compile(r"^[ \t]*-[ \t]+")
+
+
+def _indent(line: str) -> int | None:
+    """The indentation of a line with content; None for a blank or comment line."""
+    stripped = line.lstrip(" ")
+    return None if not stripped.strip() or stripped.startswith("#") else len(line) - len(stripped)
+
+
+def _item_bounds(lines: list[str], i: int, column: int) -> tuple[int, int] | None:
+    """``(first, end)`` lines of the list item whose keys are at ``column`` and
+    which has line ``i``, or None when line ``i`` is in no such item."""
+    start = i
+    while not ((dash := _ITEM_START.match(lines[start])) and len(dash.group(0)) == column):
+        start -= 1
+        if start < 0:
+            return None
+        indent = _indent(lines[start])
+        if indent is not None and indent < column - 2:
+            return None
+    end = start + 1
+    while end < len(lines) and (_indent(lines[end]) is None or _indent(lines[end]) >= column):
+        end += 1
+    return start, end
+
+
+def _enabled_edits(raw: str, job_id: str, enabled: bool) -> Iterator[str]:
+    """Each text that ``raw`` becomes when the ``enabled:`` line of a list item
+    with ``id: <job_id>`` is set, or added under the ``id:`` line.
+
+    One text for each ``id:`` line that names the job; the caller keeps the
+    first one that parses as intended. A layout this cannot read (a flow
+    mapping, say) gives no text.
+    """
+    lines = raw.splitlines(keepends=True)
+    value = "true" if enabled else "false"
+    for i, line in enumerate(lines):
+        match = _ID_LINE.match(line.rstrip("\r\n"))
+        if not match or match["id"] != job_id:
+            continue
+        column = len(match["lead"])
+        bounds = _item_bounds(lines, i, column)
+        if bounds is None:
+            continue
+        edited = list(lines)
+        for k in range(*bounds):
+            found = _ENABLED_LINE.match(lines[k].rstrip("\r\n"))
+            if found and len(found["lead"]) == column:
+                old = found["value"]
+                rest = old[len(old.rstrip()):] + (found["comment"] or "")
+                eol = lines[k][len(lines[k].rstrip("\r\n")):]
+                edited[k] = f"{found['lead']}enabled: {value}{rest}{eol}"
+                break
+        else:
+            eol = line[len(line.rstrip("\r\n")):] or "\n"
+            edited[i] = line.rstrip("\r\n") + eol
+            edited.insert(i + 1, f"{' ' * column}enabled: {value}{eol}")
+        yield "".join(edited)
+
+
+def plan_cron_job_enabled(path: Path, job_id: str, enabled: bool) -> CronTogglePlan:
+    """Set ``enabled`` of the job ``job_id`` in the cron file ``path``.
+
+    Nothing is written: :meth:`CronTogglePlan.publish` does that. ``problem``
+    is set for a file without the job, a file that cannot be written, and a
+    file in which no edit of one line gives the intended change
+    (``CRON_FILE_HAND_EDITED``).
+    """
+    document, raw, problem = _read_cron_file(path)
+    if problem or document is None:
+        return CronTogglePlan(path=path, text=None, problem=problem or "unreadable")
+    jobs = [
+        job for job in document["jobs"]
+        if isinstance(job, dict) and str(job.get("id") or "") == job_id
+    ]
+    if not jobs:
+        return CronTogglePlan(path=path, text=None, problem=CRON_JOB_MISSING)
+    names = {"enabled": (job_id,)} if enabled else {"disabled": (job_id,)}
+    # A job without the key is enabled (CronJob.enabled defaults to True).
+    if all(bool(job.get("enabled", True)) == enabled for job in jobs):
+        return CronTogglePlan(path=path, text=None, **names)
+    # publish_text writes a temporary file beside the file, then renames it.
+    if not (os.access(path, os.W_OK) and os.access(path.parent, os.W_OK)):
+        return CronTogglePlan(path=path, text=None, problem=CRON_FILE_READ_ONLY)
+    for job in jobs:
+        job["enabled"] = enabled
+    for text in _enabled_edits(raw, job_id, enabled):
+        try:
+            if yaml.safe_load(text) == document:
+                return CronTogglePlan(path=path, text=text, **names)
+        except yaml.YAMLError:
+            continue
+    return CronTogglePlan(path=path, text=None, problem=CRON_FILE_HAND_EDITED)
 
 
 _WEEKDAYS = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")

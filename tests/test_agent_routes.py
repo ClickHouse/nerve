@@ -541,6 +541,55 @@ async def test_queue_routes(api):
                 await task
 
 
+@pytest.mark.asyncio
+async def test_queue_order_route(api):
+    client = _Client()
+
+    async def _get(sid, source, model, **_kw):
+        api.engine.sessions.set_client(sid, client)
+        return client
+
+    api.engine._get_or_create_client = _get
+    me = api.db.system_actor
+    first = asyncio.create_task(api.engine.run(SID, "first", actor=me))
+    await asyncio.wait_for(client.turn_started.wait(), timeout=5)
+    mine = asyncio.create_task(api.engine.run(SID, "mine", actor=me))
+    relay = asyncio.create_task(api.engine.run(SID, "from a channel", actor=None, origin="telegram"))
+    try:
+        for _ in range(100):
+            if len(api.engine.queue_view(SID)) == 2:
+                break
+            await asyncio.sleep(0.01)
+        own, theirs = (v["queue_id"] for v in api.engine.queue_view(SID))
+        url = f"/api/sessions/{SID}/queue/order"
+        # A message of someone else can move too.
+        moved = await api.client.put(url, json={"queue_ids": [theirs, own]})
+        assert moved.status_code == 200
+        body = moved.json()
+        assert set(body) == {"items"}
+        assert [set(i) for i in body["items"]] == [QUEUE_KEYS, QUEUE_KEYS]
+        assert [i["queue_id"] for i in body["items"]] == [theirs, own]
+        assert api.engine.queue_view(SID) == body["items"]
+
+        for bad in ({}, {"queue_ids": "q_1"}, {"queue_ids": [1]}, {"queue_ids": ["q"] * 501}):
+            refused = await api.client.put(url, json=bad)
+            assert refused.status_code == 422
+            assert _detail(refused)["code"] == "bad_order"
+        missing = await api.client.put("/api/sessions/s-unknown/queue/order", json={"queue_ids": []})
+        assert missing.status_code == 404
+        assert _detail(missing)["code"] == "session_not_found"
+    finally:
+        for task in (first, relay, mine):
+            for _ in range(3):
+                if client._turn_end is not None:
+                    client._turn_end.set()
+                await asyncio.sleep(0.01)
+            if not task.done():
+                task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+
+
 # --------------------------------------------------------------------------- #
 #  Changed session endpoints                                                   #
 # --------------------------------------------------------------------------- #
