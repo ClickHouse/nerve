@@ -135,6 +135,7 @@ Powered by `python-telegram-bot` v21+.
 - Streaming responses via edit-in-place
 - Inline keyboard buttons for interactive tool questions
 - `/reply` command for free-text answers
+- Replying to a message continues the session it belongs to; `/new [message]` starts a fresh one
 - Configurable DM policy (`open` or `pairing`)
 
 ### 💬 Slack Bot

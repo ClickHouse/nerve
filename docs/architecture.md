@@ -233,7 +233,7 @@ idle-stream support, cache-TTL policy) gate engine behavior — never
 
 ### User Message (Telegram)
 1. User sends message via Telegram
-2. `TelegramChannel` receives it, resolves active session
+2. `TelegramChannel` receives it and resolves the session: a reply goes to the session that produced the replied-to message, `/new [message]` to a fresh one, anything else to the chat's active session
 3. `AgentEngine.run()` is called with the message
 4. System prompt is built (SOUL.md + IDENTITY.md + MEMORY.md — identical across sessions); the session id and pre-recalled memories are prepended to the first message
 5. Claude Agent SDK processes the message with tools
