@@ -39,7 +39,7 @@ dependencies = [
     # nerve/mcp_server/ is written against the 2.x lowlevel API (constructor
     # callbacks, request context as a handler argument), which does not exist
     # in 1.x, and 3.x has not been vetted.
-    "mcp>=2,<3",
+    "mcp>=2.2.0,<3",
     # Used directly by nerve/mcp_server/server.py to validate tool arguments
     # against each tool's inputSchema. mcp 1.x's call_tool decorator did this
     # for us; the 2.x callback does not, so the check is ours now and the
