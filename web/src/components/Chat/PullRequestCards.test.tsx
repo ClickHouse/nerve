@@ -99,15 +99,27 @@ describe('PullRequestCards', () => {
   });
 
   it('leaves out check counts that are zero', async () => {
-    answer(ok(URL_12, pull({ state: 'merged', review: 'approved', checks: { passed: 4, failed: 0, running: 0, cancelled: 0 } })));
+    answer(ok(URL_12, pull({ review: 'approved', checks: { passed: 4, failed: 0, running: 0, cancelled: 0 } })));
     render(<PullRequestCards blocks={message(URL_12)} />);
-    await screen.findByText('Merged');
+    await screen.findByText('Open');
     const li = card(/Fix the flaky login test/);
     expect(li).toHaveTextContent('4 passed');
     expect(li).not.toHaveTextContent('failed');
     expect(li).not.toHaveTextContent('running');
     expect(li).not.toHaveTextContent('cancelled');
     expect(within(li).getByText('Approved')).toBeInTheDocument();
+  });
+
+  it('leaves the review decision out once the pull request is merged or closed', async () => {
+    answer(
+      ok(URL_12, pull({ state: 'merged', review: 'review_required' })),
+      ok(URL_13, pull({ number: 13, title: 'Add a retry', state: 'closed', review: 'changes_requested' })),
+    );
+    render(<PullRequestCards blocks={message(URL_12, URL_13)} />);
+    await screen.findByText('Merged');
+    expect(screen.getByText('Closed')).toBeInTheDocument();
+    expect(screen.queryByText('Review required')).not.toBeInTheDocument();
+    expect(screen.queryByText('Changes requested')).not.toBeInTheDocument();
   });
 
   it('shows a closed pull request', async () => {
