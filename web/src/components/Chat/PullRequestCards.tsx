@@ -112,7 +112,10 @@ function usePullRequests(urls: string[], visible: boolean): { results: Map<strin
 
 function Checks({ pull }: { pull: PullRequestSummary }) {
   const { passed, failed, running, cancelled } = pull.checks;
-  const review = pull.review ? REVIEWS[pull.review] : null;
+  // The review decision matters while the pull request is open. A merged or
+  // closed one keeps GitHub's last decision, which would read as still pending.
+  const open = pull.state === 'open' || pull.state === 'draft';
+  const review = open && pull.review ? REVIEWS[pull.review] : null;
   if (!passed && !failed && !running && !cancelled && !review) return null;
   return (
     <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">

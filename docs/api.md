@@ -1929,6 +1929,14 @@ it is not a failure. Every other conclusion counts as failed. A check run that
 has not completed counts as running. A commit status counts as running while it
 is pending or expected.
 
+A cancelled check run that a newer run of the same job replaced is not counted.
+A job is the pair `workflowName` and `name`; a newer run is one that started
+later (`startedAt`) or has not started yet. The head commit of a pull request
+often carries two runs of one workflow — a second trigger fired within seconds
+and the workflow's concurrency group cancelled the first — and the card then
+counts only the second. A run with a result always counts, whichever run is
+newer, and so does a cancelled run that no newer run of its job replaced.
+
 ### Diagnostics
 
 #### `GET /api/diagnostics`
