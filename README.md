@@ -199,7 +199,7 @@ Memory categories adapt to mode — personal agents track relationships, health,
 Markdown files backed by SQLite FTS5 full-text search.
 
 - Statuses: `pending` → `in_progress` → `done` / `deferred`
-- Duplicate detection: exact URL match + fuzzy FTS fallback
+- Duplicate detection: exact URL match + title similarity (near-duplicates refused, look-alikes reported)
 - Escalation reminders: deadline → +30min follow-up → +2h URGENT (respects quiet hours)
 - Full markdown editor in the web UI
 

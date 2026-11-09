@@ -43,6 +43,7 @@ from nerve.db.task_statuses import (
 )
 from nerve.tasks.files import move_task_file, write_task_file
 from nerve.tasks.locks import task_mutation
+from nerve.tasks.similarity import SimilarTask
 
 logger = logging.getLogger(__name__)
 
@@ -294,22 +295,108 @@ async def task_search_handler(ctx: ToolContext, args: dict) -> ToolResult:
     )
 
 
-async def _find_duplicate_tasks(ctx: ToolContext, title: str, source_url: str = "") -> list[dict]:
-    """Check for existing tasks — source_url exact match first, fuzzy FTS fallback.
+# Title-similarity bands for the duplicate guard. The index scores the new
+# title against every existing title by IDF-weighted token overlap (see
+# nerve.tasks.similarity): 1.0 is the same words, 0 is nothing in common
+# beyond the words every title has. Measured on a 12.6K-task worker corpus
+# and a 900-task personal one: a re-filed or reworded copy of a task scores
+# 0.85 and above; same-area tasks that share a template or a few rare words
+# score 0.2–0.8 — worth a mention, not a refusal. A task that shares a rare
+# identifier (a test name, an issue number) is mentioned whatever its score.
+# A match that names a different ticket in its title, or tracks a different
+# source_url, is a different item however alike the words: mentioned, never
+# refused.
+DUPLICATE_SIMILARITY = 0.85
+RELATED_SIMILARITY = 0.5
+MAX_DUPLICATES_LISTED = 10
+MAX_RELATED_LISTED = 5
 
-    Mirror of the legacy helper: prefer an exact ``source_url`` match
-    (most reliable for source-generated tasks), then fall back to OR-based
-    FTS with a relevance threshold that filters out weak shared-word hits.
+
+def _similar_entry(match: SimilarTask, *, same_source: bool = False) -> dict:
+    return {
+        "id": match.id,
+        "title": match.title,
+        "status": match.status,
+        "deadline": match.row.get("deadline") or "",
+        "similarity": match.score,
+        "shared": list(match.shared[:6]),
+        "shared_identifiers": list(match.shared_identifiers),
+        "same_source": same_source,
+        "distinct_by": "",
+    }
+
+
+def _format_similar(entry: dict) -> str:
+    deadline = f" (due: {entry['deadline']})" if entry.get("deadline") else ""
+    notes = []
+    if entry.get("same_source"):
+        notes.append("same source_url")
+    notes.append(f"title similarity {entry['similarity']:.2f}")
+    if entry.get("distinct_by"):
+        notes.append(entry["distinct_by"])
+    if entry.get("shared_identifiers"):
+        notes.append("shares the identifier " + ", ".join(entry["shared_identifiers"]))
+    elif entry.get("shared"):
+        notes.append("shares: " + ", ".join(entry["shared"]))
+    return f"  - [{entry['status']}] {entry['title']}{deadline} — {entry['id']}  ({'; '.join(notes)})"
+
+
+async def _assess_duplicates(
+    ctx: ToolContext, title: str, source_url: str = "",
+) -> tuple[list[dict], list[dict]]:
+    """What a new task with this title and source would double.
+
+    Returns ``(duplicates, related)``. ``duplicates`` refuse the create:
+    every task with the same ``source_url`` — the identity of a
+    source-generated item, whose title the agent may word differently each
+    time — and every task whose title is nearly the same. ``related`` are
+    the remaining look-alikes above RELATED_SIMILARITY and the tasks that
+    share a rare identifier with the title: reported with the outcome so
+    the caller can link or merge, never a reason to refuse.
     """
     if not ctx.db:
-        return []
+        return [], []
+    index = await ctx.db.title_index()
+    duplicates: list[dict] = []
+    seen: set[str] = set()
     if source_url:
-        url_matches = await ctx.db.find_tasks_by_source_url(source_url, limit=10)
-        if url_matches:
-            return url_matches
-    return await ctx.db.search_tasks_similar(
-        query=title, limit=10, rank_threshold=-5.0,
-    )
+        for row in await ctx.db.find_tasks_by_source_url(
+            source_url, limit=MAX_DUPLICATES_LISTED,
+        ):
+            match = index.compare(title, row["id"])
+            if match is None:
+                # Created after the index was built; still the same source.
+                entry = {
+                    "id": row["id"], "title": row["title"], "status": row["status"],
+                    "deadline": row.get("deadline") or "", "similarity": 0.0,
+                    "shared": [], "shared_identifiers": [], "same_source": True,
+                    "distinct_by": "",
+                }
+            else:
+                entry = _similar_entry(match, same_source=True)
+            duplicates.append(entry)
+            seen.add(row["id"])
+    related: list[dict] = []
+    for match in index.similar(
+        title, min_score=RELATED_SIMILARITY,
+        limit=MAX_DUPLICATES_LISTED + MAX_RELATED_LISTED + len(seen),
+    ):
+        if match.id in seen:
+            continue
+        entry = _similar_entry(match)
+        other_source = match.row.get("source_url") or ""
+        if match.conflicting_refs:
+            entry["distinct_by"] = "names a different ticket"
+        elif source_url and other_source and other_source != source_url:
+            entry["distinct_by"] = "different source_url"
+        if match.score >= DUPLICATE_SIMILARITY and not entry["distinct_by"]:
+            duplicates.append(entry)
+        else:
+            related.append(entry)
+    duplicates.sort(key=lambda e: (not e["same_source"], -e["similarity"]))
+    # A shared identifier is the stronger clue; keep those within the cap.
+    related.sort(key=lambda e: (not e["shared_identifiers"], -e["similarity"]))
+    return duplicates[:MAX_DUPLICATES_LISTED], related[:MAX_RELATED_LISTED]
 
 
 async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -332,27 +419,30 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
             err, structured={"created": False, "reason": "invalid_status"},
         )
 
-    # Duplicate check (skip if explicitly confirmed)
-    if not confirm:
-        dupes = await _find_duplicate_tasks(ctx, title, source_url=source_url)
-        if dupes:
-            lines = [f"⚠️ Found {len(dupes)} potentially similar task(s):"]
-            for t in dupes:
-                deadline_str = f" (due: {t['deadline']})" if t.get("deadline") else ""
-                lines.append(f"  - [{t['status']}] {t['title']}{deadline_str} — {t['id']}")
-            lines.append("")
-            lines.append("Task NOT created. To create anyway, call task_create again with confirm_duplicate=true.")
-            return ToolResult.text(
-                "\n".join(lines),
-                structured={
-                    "created": False,
-                    "reason": "duplicate",
-                    "duplicates": [
-                        {"id": t["id"], "title": t["title"], "status": t["status"]}
-                        for t in dupes
-                    ],
-                },
-            )
+    # The duplicate guard. A confirmed create skips the refusal, not the
+    # look-up: the matches still travel with the result as related tasks.
+    duplicates, related = await _assess_duplicates(ctx, title, source_url=source_url)
+    if duplicates and not confirm:
+        lines = [f"⚠️ Found {len(duplicates)} likely duplicate task(s):"]
+        lines.extend(_format_similar(e) for e in duplicates)
+        if related:
+            lines.append("Related, not blocking:")
+            lines.extend(_format_similar(e) for e in related)
+        lines.append("")
+        lines.append(
+            "Task NOT created. If none of these is the same work item, call "
+            "task_create again with confirm_duplicate=true."
+        )
+        return ToolResult.text(
+            "\n".join(lines),
+            structured={
+                "created": False,
+                "reason": "duplicate",
+                "duplicates": duplicates,
+                "related": related,
+            },
+        )
+    mentions = (duplicates + related if confirm else related)[:MAX_RELATED_LISTED]
 
     md_parts = [f"# {title}\n"]
     if source_url:
@@ -413,10 +503,16 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if status == TERMINAL_STATUS and ctx.db:
         await task_done_handler(ctx, {"task_id": task_id, "note": ""})
 
-    return ToolResult.text(
-        f"Task created: {task_id} (status: {status})\nFile: {file_path}",
-        structured={"created": True, "task_id": task_id, "status": status},
-    )
+    text = f"Task created: {task_id} (status: {status})\nFile: {file_path}"
+    structured: dict = {"created": True, "task_id": task_id, "status": status}
+    if mentions:
+        text += (
+            "\nPossibly related tasks (created anyway — if one of them is the "
+            "same work item, close this task as its duplicate):\n"
+            + "\n".join(_format_similar(e) for e in mentions)
+        )
+        structured["related"] = mentions
+    return ToolResult.text(text, structured=structured)
 
 
 async def task_list_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -1020,7 +1116,12 @@ TASK_SEARCH_SPEC = ToolSpec(
 
 TASK_CREATE_SPEC = ToolSpec(
     name="task_create",
-    description="Create a new task. Checks for duplicates first — if similar tasks exist, returns them and refuses unless confirm_duplicate=true.",
+    description=(
+        "Create a new task. Refuses when a task with the same source_url exists "
+        "or an existing title is nearly the same, and lists them; pass "
+        "confirm_duplicate=true to create anyway. Look-alike tasks that do not "
+        "block are listed in the result as related — check them before starting."
+    ),
     input_schema=TASK_CREATE_SCHEMA,
     handler=task_create_handler,
 )

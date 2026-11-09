@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime, timezone
 
 from nerve.identity import UNATTRIBUTED, Attribution
+from nerve.tasks.similarity import TitleIndex
 
 
 # Spacing between task ranks (``tasks.position``). Wide enough that a
@@ -979,8 +981,10 @@ class TaskStore:
         """Find tasks similar to query using OR semantics + FTS5 ranking.
 
         Unlike search_tasks (AND, strict), this uses OR (any word matches)
-        and orders by BM25 relevance.  Designed for duplicate detection —
-        searches all statuses including done.
+        and orders by BM25 relevance, across all statuses including done.
+        No longer the duplicate guard — that is ``title_index()`` — but
+        the one reader that exercises the FTS join alone, which the
+        integrity tests rely on.
 
         Args:
             rank_threshold: If set, only return matches with BM25 rank
@@ -1017,6 +1021,31 @@ class TaskStore:
             (source_url, limit),
         ) as cursor:
             return [dict(row) async for row in cursor]
+
+    async def title_index(self) -> TitleIndex:
+        """The title-similarity index over every task — the duplicate guard.
+
+        Rebuilt only when the corpus changes: every write to ``tasks`` bumps
+        ``updated_at`` and a create or delete changes the row count, so
+        ``(count, max(updated_at))`` identifies the corpus. The index is
+        immutable once built, so one instance serves every caller.
+        """
+        async with self.db.execute(
+            "SELECT COUNT(*), MAX(updated_at) FROM tasks",
+        ) as cursor:
+            key = tuple(await cursor.fetchone())
+        cached = getattr(self, "_title_index_cache", None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        async with self.db.execute(
+            "SELECT id, title, status, deadline, source_url FROM tasks",
+        ) as cursor:
+            rows = [dict(row) async for row in cursor]
+        # Pure-Python tokenizing of every title: off the event loop, so a
+        # create on a large install does not stall every other session.
+        index = await asyncio.to_thread(TitleIndex, rows)
+        self._title_index_cache = (key, index)
+        return index
 
     async def rebuild_fts(self) -> None:
         """Clear the FTS index. Caller must re-populate via upsert_task()."""
