@@ -40,6 +40,9 @@ export {
   XCircle, Zap
 } from 'lucide-react';
 
+// The rendered code blocks' figure toolbar and full-size view (Chat/rich).
+export { CodeXml, ZoomIn, ZoomOut } from 'lucide-react';
+
 /*
  * The icon nodes of Github and Slack are from lucide-react 0.575.0.
  * License: ISC. Copyright (c) for portions of Lucide are held by Cole Bemis

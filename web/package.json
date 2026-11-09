@@ -29,14 +29,19 @@
     "@pierre/diffs": "^1.2.7",
     "cronstrue": "^3.38.0",
     "dayjs": "^1.11.21",
+    "dompurify": "^3.4.17",
     "highlight.js": "^11.11.1",
     "lucide-react": "^1.66.0",
+    "mermaid": "^12.3.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-router-dom": "^7.18.4",
     "rehype-highlight": "^7.0.2",
     "remark-gfm": "^4.0.1",
-    "tailwind-merge": "^3.6.0"
+    "tailwind-merge": "^3.6.0",
+    "vega": "^6.4.0",
+    "vega-embed": "^7.3.0",
+    "vega-lite": "^6.5.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

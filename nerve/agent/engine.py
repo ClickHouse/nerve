@@ -1723,6 +1723,9 @@ class AgentEngine:
                 memory_backend=self.config.memory.backend,
                 memory_tools=self._loom_tools_offered(),
                 config_dir=self.config.config_dir,
+                # The session's own surface decides what renders: a wakeup
+                # turn of a web session is still read in the web chat.
+                rendering_source=(session or {}).get("source"),
             )
 
             # Observer sessions of a review loop get a context block so the

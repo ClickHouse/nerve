@@ -82,7 +82,7 @@ const FOCUSABLE = [
   '[tabindex]:not([tabindex="-1"])',
 ].join(',');
 
-export type ModalSize = 'sm' | 'md' | 'lg' | 'xl' | 'wide';
+export type ModalSize = 'sm' | 'md' | 'lg' | 'xl' | 'wide' | 'full';
 
 const SIZES: Record<ModalSize, string> = {
   sm: 'w-[360px] max-w-[90vw]',
@@ -92,6 +92,10 @@ const SIZES: Record<ModalSize, string> = {
   // For dialogs holding a document rather than a form — a markdown editor
   // at 620px wraps prose into a column too narrow to read or edit.
   wide: 'w-[min(1100px,94vw)]',
+  // Nearly the whole viewport at a fixed height, for content that fills the
+  // panel instead of scrolling in it — the chat's picture viewer, which pans
+  // and zooms inside. Its height cap is the backdrop, not 85vh (see below).
+  full: 'w-[96vw] h-[94vh]',
 };
 
 export interface ModalProps {
@@ -237,7 +241,7 @@ export function Modal({
         aria-labelledby={title ? titleId : undefined}
         aria-label={title ? undefined : ariaLabel}
         tabIndex={-1}
-        className={`modal-panel bg-surface-raised border border-border-subtle rounded-xl flex flex-col max-h-[85vh] outline-none ${SIZES[size]} ${className}`}
+        className={`modal-panel bg-surface-raised border border-border-subtle rounded-xl flex flex-col ${size === 'full' ? 'max-h-full' : 'max-h-[85vh]'} outline-none ${SIZES[size]} ${className}`}
       >
         {title && (
           <div className="flex items-center justify-between gap-3 px-5 py-3 border-b border-border shrink-0">

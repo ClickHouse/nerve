@@ -1,9 +1,12 @@
-import { memo, type ReactNode } from 'react';
-import ReactMarkdown from 'react-markdown';
+import { memo, type ComponentProps, type ReactNode } from 'react';
+import ReactMarkdown, { type ExtraProps, type Options } from 'react-markdown';
 import { Link, useInRouterContext } from 'react-router-dom';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import { CodeBlock } from './CodeBlock';
+import { RICH_LANGUAGES, richKindFor } from './rich/kinds';
+import { RichCodeBlock } from './rich/RichCodeBlock';
+import { MarkdownStreamingContext } from './streamingContext';
 
 /**
  * A page of this app, such as `/plans/plan-1`. `//host` is another site, and
@@ -57,30 +60,70 @@ export const InlineMarkdown = memo(function InlineMarkdown({ content, links = tr
   );
 });
 
+const REMARK_PLUGINS: NonNullable<Options['remarkPlugins']> = [remarkGfm];
+// The rendered languages keep their source as one text node (see RICH_LANGUAGES).
+const REHYPE_PLUGINS: NonNullable<Options['rehypePlugins']> = [[rehypeHighlight, { plainText: RICH_LANGUAGES }]];
+
+interface HastNode {
+  type: string;
+  value?: string;
+  children?: HastNode[];
+}
+
+/** The text of a hast node — a code block's source, however highlighting split it. */
+function hastText(node: HastNode | undefined): string {
+  if (!node) return '';
+  if (node.type === 'text') return node.value ?? '';
+  return (node.children ?? []).map(hastText).join('');
+}
+
+function languageOf(className: string | undefined): string | undefined {
+  return className?.match(/language-([\w+-]+)/)?.[1];
+}
+
+function Pre({ children }: { children?: ReactNode }) {
+  return <>{children}</>;
+}
+
+function Code({ className, children, node, ...props }: ComponentProps<'code'> & ExtraProps) {
+  const kind = richKindFor(languageOf(className));
+  if (kind) {
+    // mdast-util-to-hast ends a code block's text with a newline that is not part of the source.
+    return <RichCodeBlock kind={kind} source={hastText(node).replace(/\n$/, '')} />;
+  }
+  const isBlock = className?.includes('language-') || className?.includes('hljs') || (typeof children === 'string' && children.includes('\n'));
+  if (isBlock) {
+    return <CodeBlock className={className}>{children}</CodeBlock>;
+  }
+  return <code className={className} {...props}>{children}</code>;
+}
+
+function Anchor({ href, children }: { href?: string; children?: ReactNode }) {
+  return <MarkdownLink href={href}>{children}</MarkdownLink>;
+}
+
+// One components object for every render: react-markdown treats a new function
+// as a new element type, which would remount every code block — and a
+// rendering one would start over — on each streamed token batch.
+const COMPONENTS: Options['components'] = { pre: Pre, code: Code, a: Anchor };
+
 // Memoized: react-markdown parses and highlights the full string on each
 // render, and the chat renders again for each streamed token batch.
-export const MarkdownContent = memo(function MarkdownContent({ content }: { content: string }) {
+// `streaming` says the text is still arriving; the blocks that render their
+// source (diagrams, charts) wait for it to settle.
+export const MarkdownContent = memo(function MarkdownContent({ content, streaming = false }: {
+  content: string;
+  streaming?: boolean;
+}) {
   return (
-    <div className="markdown-content">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHighlight]}
-        components={{
-          pre({ children }) {
-            return <>{children}</>;
-          },
-          code({ className, children, ...props }) {
-            const isBlock = className?.includes('language-') || className?.includes('hljs') || (typeof children === 'string' && children.includes('\n'));
-            if (isBlock) {
-              return <CodeBlock className={className}>{children}</CodeBlock>;
-            }
-            return <code className={className} {...props}>{children}</code>;
-          },
-          a({ href, children }) {
-            return <MarkdownLink href={href}>{children}</MarkdownLink>;
-          },
-        }}
-      >{content}</ReactMarkdown>
-    </div>
+    <MarkdownStreamingContext.Provider value={streaming}>
+      <div className="markdown-content">
+        <ReactMarkdown
+          remarkPlugins={REMARK_PLUGINS}
+          rehypePlugins={REHYPE_PLUGINS}
+          components={COMPONENTS}
+        >{content}</ReactMarkdown>
+      </div>
+    </MarkdownStreamingContext.Provider>
   );
 });

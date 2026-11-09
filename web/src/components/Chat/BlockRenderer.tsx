@@ -94,7 +94,7 @@ export function BlockRenderer({
           case 'text': {
             const inner = (
               <>
-                <MarkdownContent content={item.content} />
+                <MarkdownContent content={item.content} streaming={isLast} />
                 {isLast && (
                   <span
                     className={`streaming-cursor inline-block w-1.5 h-4 ${cursorColor} ml-0.5 align-text-bottom`}
