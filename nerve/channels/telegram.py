@@ -1349,16 +1349,25 @@ class TelegramChannel(BaseChannel):
         The key is per-chat, so a ``message_id`` from one chat can never
         route a reply into a session bound to a different chat. A notification
         card delivered before routes were stored has no route row; its
-        delivery record still names the session that raised it.
+        delivery record still names the session that raised it. A failed
+        lookup is logged and resolves to None, which the caller turns into
+        the nudge rather than a dropped message.
         """
         db = self.router.engine.db
         target, provider_id = str(chat_id), str(message_id)
-        session_id = await db.lookup_reply_route("telegram", target, provider_id)
-        if session_id:
-            return session_id
-        delivered = await db.find_notification_for_delivery(
-            "telegram", target, provider_id,
-        )
+        try:
+            session_id = await db.lookup_reply_route("telegram", target, provider_id)
+            if session_id:
+                return session_id
+            delivered = await db.find_notification_for_delivery(
+                "telegram", target, provider_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not look up the reply route for message %s in chat %s: %s",
+                message_id, chat_id, e,
+            )
+            return None
         return (delivered or {}).get("session_id") or None
 
     async def _resolve_reply(
@@ -2419,6 +2428,15 @@ class TelegramChannel(BaseChannel):
         if not handled:
             return
 
+        # A reply to a pending ask_user card is its answer — like a button tap
+        # or /reply — not a message for the agent. Checked before the sink
+        # gate so a card in the notifications group can be answered there too.
+        # An album is a message, not an answer.
+        if not update.message.media_group_id and await self._maybe_answer_question_reply(
+            update, update.message.text or update.message.caption or "",
+        ):
+            return
+
         # Delivery-only notification sink: never start an agent turn on a
         # message that arrives in the notifications group (a one-way channel).
         if self._is_delivery_only_sink(update.effective_chat):
@@ -2443,11 +2461,6 @@ class TelegramChannel(BaseChannel):
 
         # Cache for reaction lookups (raw text, before reply-context prefix)
         self._cache_message(update.message.message_id, chat_id, text)
-
-        # A reply to a pending ask_user card is its answer — like a button tap
-        # or /reply — not a message for the agent.
-        if await self._maybe_answer_question_reply(update, text):
-            return
 
         # Prepend forward origin (if forwarded message)
         forward_context = _format_forward_context(update.message)
@@ -3037,7 +3050,7 @@ class TelegramChannel(BaseChannel):
         through to normal routing: not a reply, no text, no service, a card
         that is not a pending question, or an answer not accepted because the
         question was answered or expired meanwhile. Works whether or not reply
-        routing is enabled.
+        routing is enabled, and in a delivery-only notifications group.
         """
         message = update.message
         reply_to = getattr(message, "reply_to_message", None)

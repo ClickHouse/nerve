@@ -139,6 +139,18 @@ async def test_routes_survive_a_restart(db):
 
 
 @pytest.mark.asyncio
+async def test_lookup_failure_resolves_to_a_refusal(db):
+    # A database error on the lookup must not drop the reply on the floor:
+    # it resolves like an unknown message, so the user gets the nudge.
+    ch = _make_channel(db)
+    ch.router.engine.db = SimpleNamespace(
+        lookup_reply_route=AsyncMock(side_effect=RuntimeError("db unavailable")),
+        find_notification_for_delivery=AsyncMock(),
+    )
+    assert await ch._resolve_reply(100, _CHAT) == ("reject", None)
+
+
+@pytest.mark.asyncio
 async def test_recording_happens_with_routing_disabled(db):
     # The flag gates routing, not recording: a map that only filled while the
     # flag was on would start empty the day it is turned on.
@@ -492,6 +504,38 @@ async def test_handler_answers_a_pending_question_by_reply(db, routing_enabled):
     )
 
     update = _reply_update(500)
+    await ch._handle_message(update, None)
+
+    ch._notification_service.answer_delivered_notification.assert_awaited_once_with(
+        "n-1", "yes, go ahead", channel="telegram", target=str(_CHAT), actor=str(_USER),
+    )
+    update.message.reply_text.assert_awaited_once_with(
+        "Answer recorded for: Deploy to staging?",
+    )
+    ch.router.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_handler_answers_a_question_by_reply_in_a_delivery_only_sink(db):
+    # The notifications group can be made one-way: a message there never
+    # starts a turn. A reply to a card delivered there is still its answer,
+    # as a button tap or /reply would be.
+    ch = _handler_channel(db, {})
+    ch.config.notifications.delivery_only_sink = True
+    ch.config.notifications.telegram_chat_id = _CHAT
+    await _deliver_question(db, "n-1", 500)
+    ch._notification_service = _question_service(
+        return_value={"id": "n-1", "title": "Deploy to staging?", "status": "answered"},
+    )
+
+    plain = _reply_update(None, message_id=901)
+    plain.effective_chat.type = "supergroup"
+    await ch._handle_message(plain, None)
+    ch.router.handle_message.assert_not_awaited()
+    plain.message.reply_text.assert_not_awaited()
+
+    update = _reply_update(500)
+    update.effective_chat.type = "supergroup"
     await ch._handle_message(update, None)
 
     ch._notification_service.answer_delivered_notification.assert_awaited_once_with(
