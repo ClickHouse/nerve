@@ -252,12 +252,15 @@ async def create_task(req: TaskCreateRequest, actor: Actor = Depends(require_aut
                 "message": message,
                 "reason": reason,
                 "duplicates": outcome.get("duplicates", []),
+                "related": outcome.get("related", []),
             },
         )
 
     deps = get_deps()
     task = await deps.db.get_task(outcome["task_id"])
-    return {"task": task, "message": message}
+    # Look-alikes that did not block the create, for a client that wants to
+    # offer "link" or "merge" next to the new card.
+    return {"task": task, "message": message, "related": outcome.get("related", [])}
 
 
 @router.post("/api/tasks/{task_id}/move")

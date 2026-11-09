@@ -1513,8 +1513,10 @@ Response: { "tags": [{ "name": "backend", "count": 7 }] }
 ```
 
 #### `POST /api/tasks`
-Create a task. Returns the created row; **409** if the duplicate guard refuses
-(retry with `confirm_duplicate: true` to override), **422** if `status` names a
+Create a task. Returns the created row plus `related` — look-alike tasks that
+did not block, each with `similarity` and the `shared` words; **409** if the
+duplicate guard refuses (the detail carries `duplicates` and `related`; retry
+with `confirm_duplicate: true` to override), **422** if `status` names a
 status that does not exist — a retry cannot fix that one, so it is kept
 distinct from the collision.
 

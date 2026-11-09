@@ -69,7 +69,7 @@ TASK_CREATE_SCHEMA = {
         },
         "confirm_duplicate": {
             "type": "boolean",
-            "description": "Set to true to force creation even when duplicates exist",
+            "description": "Create even though a task with the same source_url or a nearly identical title exists (the refusal lists them)",
             "default": False,
         },
     },
