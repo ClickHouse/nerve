@@ -39,6 +39,7 @@ from nerve.db.observations import ObservationStore
 from nerve.db.onboarding import OnboardingStore
 from nerve.db.plans import PlanStore
 from nerve.db.push_subscriptions import PushSubscriptionStore
+from nerve.db.reply_routes import ReplyRouteStore
 from nerve.db.review_loops import ReviewLoopStore
 from nerve.db.sessions import SessionStore
 from nerve.db.skills import SkillStore
@@ -350,6 +351,7 @@ class Database(
     PlanStore,
     NotificationStore,
     ObservationStore,
+    ReplyRouteStore,
     SourceStore,
     CronStore,
     SkillStore,
