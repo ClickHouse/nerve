@@ -11,7 +11,9 @@ requires-python = ">=3.13"
 license = { text = "Apache-2.0" }
 
 dependencies = [
-    "fastapi>=0.115.0",
+    # 0.142.0 is the first release with the `telemetry` argument, which
+    # nerve/gateway/server.py passes to each app.
+    "fastapi>=0.142.0",
     "uvicorn[standard]>=0.34.0",
     "aiosqlite>=0.21.0",
     "pyyaml>=6.0",
