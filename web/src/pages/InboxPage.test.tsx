@@ -1,7 +1,7 @@
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
-import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock, type MockInstance } from 'vitest';
 import type { Session } from '../types/chat';
 
 vi.mock('../api/client', async (orig) => ({
@@ -51,9 +51,10 @@ function renderInbox() {
 
 const location = () => screen.getByRole('status', { name: 'Location' });
 
-let createSession: ReturnType<typeof vi.fn>;
-let startChat: ReturnType<typeof vi.fn>;
-let loadSessions: ReturnType<typeof vi.fn>;
+type ChatActions = ReturnType<typeof useChatStore.getState>;
+let createSession: Mock<ChatActions['createSession']>;
+let startChat: Mock<ChatActions['startChat']>;
+let loadSessions: Mock<ChatActions['loadSessions']>;
 
 beforeEach(() => {
   localStorage.clear();
