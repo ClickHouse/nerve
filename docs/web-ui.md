@@ -134,7 +134,9 @@ exactly one pull request, for example the URL that `gh pr create` prints. A
 tool result that lists more pull requests gives no cards. A message shows at
 most 5 cards. A card shows the title (a link to GitHub), a state chip (Draft,
 Open, Merged or Closed), `owner/repo#number` with the branches, the checks
-("2 failed", "1 cancelled", "3 running", "12 passed") and the review decision. The data comes
+("2 failed", "1 cancelled", "3 running", "12 passed"; a cancelled run that a newer run
+of the same job replaced is not counted) and, while the pull request is open, the
+review decision. The data comes
 from `GET /api/github/pulls`, so the server needs a `gh` login. Without one,
 the card shows `owner/repo#number` as the link and the reason
 ("No access to details", "GitHub CLI not available"). The cards of a message
