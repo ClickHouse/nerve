@@ -742,16 +742,6 @@ class TelegramChannel(BaseChannel):
             collections.OrderedDict()
         )
         self._message_cache_max = 200
-        # Reply routing: (chat_id, message_id) -> session_id. Records both
-        # messages the bot sent and the session each inbound message landed in,
-        # so a user REPLY targets that session — a cron/background session's
-        # message, or the user's own earlier message — instead of the chat's
-        # active session. Keyed by (chat_id, message_id) because Telegram
-        # message ids are unique only within a chat, not across chats. Bounded LRU.
-        self._reply_routes: collections.OrderedDict[tuple[int, int], str] = (
-            collections.OrderedDict()
-        )
-        self._reply_routes_max = 2000
         # Rate limiter for replies to unauthorized users: user_id -> monotonic ts
         self._unauth_reply_times: dict[int, float] = {}
         # /plans revise flow: (chat_id, prompt_message_id) ->
@@ -1150,7 +1140,7 @@ class TelegramChannel(BaseChannel):
                     text=chunk,
                 )
             self._cache_message(sent.message_id, chat_id, chunk)
-            self._record_reply_route(sent.message_id, chat_id, message.session_id)
+            await self._record_reply_route(sent.message_id, chat_id, message.session_id)
 
     def format_response(self, text: str) -> str:
         """Return text unchanged.
@@ -1286,7 +1276,7 @@ class TelegramChannel(BaseChannel):
                 filename=path.name,
             )
             if session_id and sent is not None:
-                self._record_reply_route(sent.message_id, chat_id, session_id)
+                await self._record_reply_route(sent.message_id, chat_id, session_id)
             return True
         except Exception as e:
             logger.warning("send_file: send_document failed for %s: %s", target, e)
@@ -1315,39 +1305,61 @@ class TelegramChannel(BaseChannel):
         """Whether reply→origin-session routing is on (a telegram config flag).
 
         Off by default: a reply is then context-only and lands in the active
-        session, and none of the record / resolve / reject machinery runs.
-        Read live per message so a config reload can flip it without a restart.
+        session, and none of the resolve / reject machinery runs. Routes are
+        still recorded (see ``_record_reply_route``), so turning the flag on
+        covers earlier messages too. Read live per message so a config reload
+        can flip it without a restart.
         """
         return bool(self.config.telegram.reply_routes_to_origin_session)
 
-    def _record_reply_route(
+    async def _record_reply_route(
         self, message_id: int, chat_id: int, session_id: str,
     ) -> None:
-        """Remember which session produced an outbound Telegram message.
+        """Remember which session a Telegram message belongs to.
 
-        Lets a later user REPLY to that message route back to the originating
-        session (see ``_resolve_reply``). No-op when routing is disabled or the
-        session is unknown. Bounded LRU keyed by ``(chat_id, message_id)`` —
-        message ids repeat across chats, so keying on the id alone would let one
-        chat clobber another chat's identically-numbered message.
+        Lets a later user REPLY to that message route back to that session
+        (see ``_resolve_reply``). Recorded whether or not routing is enabled:
+        the flag gates routing, and a map that only filled while the flag was
+        on would start empty the day it is turned on. Keyed per chat —
+        message ids repeat across chats, so keying on the id alone would let
+        one chat clobber another chat's identically-numbered message.
+
+        Stored in ``channel_reply_routes`` so it survives a restart. A failed
+        write is logged and otherwise ignored: the route is auxiliary to the
+        message it rides on, and losing it only degrades a later reply to the
+        nudge, whereas raising would abort the send or drop the inbound message.
         """
-        if not session_id or not self._reply_routing_enabled():
+        if not session_id:
             return
-        key = (chat_id, message_id)
-        self._reply_routes[key] = session_id
-        self._reply_routes.move_to_end(key)
-        while len(self._reply_routes) > self._reply_routes_max:
-            self._reply_routes.popitem(last=False)
+        try:
+            await self.router.engine.db.record_reply_route(
+                "telegram", str(chat_id), str(message_id), session_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not record reply route for message %s in chat %s: %s",
+                message_id, chat_id, e,
+            )
 
-    def _lookup_reply_route(
+    async def _lookup_reply_route(
         self, message_id: int, chat_id: int,
     ) -> str | None:
         """Session that produced ``message_id`` in ``chat_id``, or None.
 
         The key is per-chat, so a ``message_id`` from one chat can never
-        route a reply into a session bound to a different chat.
+        route a reply into a session bound to a different chat. A notification
+        card delivered before routes were stored has no route row; its
+        delivery record still names the session that raised it.
         """
-        return self._reply_routes.get((chat_id, message_id))
+        db = self.router.engine.db
+        target, provider_id = str(chat_id), str(message_id)
+        session_id = await db.lookup_reply_route("telegram", target, provider_id)
+        if session_id:
+            return session_id
+        delivered = await db.find_notification_for_delivery(
+            "telegram", target, provider_id,
+        )
+        return (delivered or {}).get("session_id") or None
 
     async def _resolve_reply(
         self, reply_message_id: int | None, chat_id: int,
@@ -1361,14 +1373,14 @@ class TelegramChannel(BaseChannel):
         - ``("route", sid)``  — a reply to a message this bot produced whose
           session is still live; route there and make it active.
         - ``("reject", None)`` — a reply we cannot tie to a live session (the
-          message was never recorded / evicted from the LRU, or its session is
-          gone/archived). The caller nudges the user and drops the message
+          message was never recorded or its route was pruned, or its session
+          is gone/archived). The caller nudges the user and drops the message
           WITHOUT starting a turn — an explicit reply is never silently
           delivered to the active session, which would be a mis-route.
         """
         if reply_message_id is None:
             return ("active", None)
-        session_id = self._lookup_reply_route(reply_message_id, chat_id)
+        session_id = await self._lookup_reply_route(reply_message_id, chat_id)
         if not session_id:
             return ("reject", None)
         try:
@@ -2432,6 +2444,11 @@ class TelegramChannel(BaseChannel):
         # Cache for reaction lookups (raw text, before reply-context prefix)
         self._cache_message(update.message.message_id, chat_id, text)
 
+        # A reply to a pending ask_user card is its answer — like a button tap
+        # or /reply — not a message for the agent.
+        if await self._maybe_answer_question_reply(update, text):
+            return
+
         # Prepend forward origin (if forwarded message)
         forward_context = _format_forward_context(update.message)
         if forward_context:
@@ -2513,10 +2530,14 @@ class TelegramChannel(BaseChannel):
             if routed_session:
                 logger.info("Telegram reply routed to session %s", routed_session)
             target_session = await self._delivery_session(routed_session, channel_key)
-            # Record this inbound message against the session it lands in, so a
-            # later reply to it — including the user replying to their own
-            # message — routes back to the same session.
-            self._record_reply_route(update.message.message_id, chat_id, target_session)
+        # Record this inbound message against the session it lands in, so a
+        # later reply to it — including the user replying to their own
+        # message — routes back to the same session. Recorded with routing
+        # off too, so the map is already complete when the flag is turned on.
+        await self._record_reply_route(
+            update.message.message_id, chat_id,
+            target_session or await self._delivery_session(None, channel_key),
+        )
 
         msg = InboundMessage(
             channel_name="telegram",
@@ -2725,10 +2746,14 @@ class TelegramChannel(BaseChannel):
             if routed_session:
                 logger.info("Telegram reply routed to session %s", routed_session)
             target_session = await self._delivery_session(routed_session, channel_key)
-            # Record this inbound message against the session it lands in, so a
-            # later reply to it — including the user replying to their own
-            # message — routes back to the same session.
-            self._record_reply_route(updates[0].message.message_id, chat_id, target_session)
+        # Record this inbound message against the session it lands in, so a
+        # later reply to it — including the user replying to their own
+        # message — routes back to the same session. Recorded with routing
+        # off too, so the map is already complete when the flag is turned on.
+        await self._record_reply_route(
+            updates[0].message.message_id, chat_id,
+            target_session or await self._delivery_session(None, channel_key),
+        )
 
         msg = InboundMessage(
             channel_name="telegram",
@@ -3001,3 +3026,41 @@ class TelegramChannel(BaseChannel):
             )
         else:
             await update.message.reply_text("No pending questions in this chat.")
+
+    async def _maybe_answer_question_reply(self, update: Update, text: str) -> bool:
+        """Consume a reply to a pending ``ask_user`` card as its answer.
+
+        Returns True (message handled — do not route to the agent) when the
+        replied-to message is a pending question delivered to this chat and
+        the answer was recorded, or refused because the engine is draining
+        (the question stays pending, as with /reply). Anything else falls
+        through to normal routing: not a reply, no text, no service, a card
+        that is not a pending question, or an answer not accepted because the
+        question was answered or expired meanwhile. Works whether or not reply
+        routing is enabled.
+        """
+        message = update.message
+        reply_to = getattr(message, "reply_to_message", None)
+        if reply_to is None or not text or self._notification_service is None:
+            return False
+        target = str(update.effective_chat.id)
+        notif = await self.router.engine.db.find_notification_for_delivery(
+            "telegram", target, str(reply_to.message_id),
+        )
+        if not notif or notif.get("status") != "pending" or notif.get("type") != "question":
+            return False
+        try:
+            result = await self._notification_service.answer_delivered_notification(
+                notif["id"],
+                text,
+                channel="telegram",
+                target=target,
+                actor=str(update.effective_user.id),
+            )
+        except NotAcceptingTurnsError as exc:
+            await message.reply_text(str(exc))
+            return True
+        if not result:
+            return False
+        await message.reply_text(f"Answer recorded for: {result['title']}")
+        return True

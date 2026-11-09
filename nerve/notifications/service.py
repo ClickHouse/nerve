@@ -1265,7 +1265,7 @@ class NotificationService:
             channel = self._get_telegram_channel()
             if channel:
                 channel._cache_message(int(msg_id), chat_id, text)
-                channel._record_reply_route(int(msg_id), chat_id, session_id)
+                await channel._record_reply_route(int(msg_id), chat_id, session_id)
             await self.db.record_notification_delivery(
                 notification_id,
                 "telegram",

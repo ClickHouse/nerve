@@ -255,7 +255,7 @@ A reload is always explicit. Two things cause one:
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
-| `telegram.dm_policy`, `.stream_mode`, `.reply_routes_to_origin_session` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; toggling `reply_routes_to_origin_session` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
+| `telegram.dm_policy`, `.stream_mode`, `.reply_routes_to_origin_session` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; toggling `reply_routes_to_origin_session` takes effect on the next message, and applies to replies to earlier messages too (routes are recorded while it is off); `allowed_users` does not follow it (see the restart table) |
 | `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
@@ -1189,7 +1189,7 @@ carry text. A `.png` or `.ico` has to be committed by a human.
 | `telegram.dm_policy` | string | `pairing` | `pairing` (allowlist + one-time pairing codes) or `open` (anyone — dangerous) |
 | `telegram.allowed_users` | list[int] | `[]` | User IDs allowed to use the bot in private and group chats |
 | `telegram.stream_mode` | string | `partial` | `partial` (edit msgs) or `full` |
-| `telegram.reply_routes_to_origin_session` | bool | `false` | When on, a reply routes to the session that produced the replied-to message (and makes it active); an unresolvable reply is refused. Off = a reply is context-only and lands in the active session |
+| `telegram.reply_routes_to_origin_session` | bool | `false` | When on, a reply routes to the session that produced the replied-to message (and makes it active); an unresolvable reply is refused. Off = a reply is context-only and lands in the active session. The message→session map is stored in the database (`channel_reply_routes`, kept 90 days) whether the flag is on or off, so it survives a restart and turning the flag on covers earlier messages. Either way, a reply to a pending `ask_user` card answers the question, like `/reply` |
 
 ### Notification sink
 

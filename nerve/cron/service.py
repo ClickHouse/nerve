@@ -38,6 +38,7 @@ from nerve.cron.jobs import (
     merge_jobs,
 )
 from nerve.db import Database
+from nerve.db.reply_routes import REPLY_ROUTE_RETENTION_DAYS
 from nerve.identity import CAUSE_FROM_ACTOR, Attribution, CauseArg, attribution_for
 from nerve.session_origin import cron_origin
 from nerve.setup_writer import (
@@ -2119,18 +2120,21 @@ class CronService:
             )
 
     async def _cleanup_expired(self) -> None:
-        """Clean up expired source messages, cursors, cron logs, and observations."""
+        """Clean up expired source messages, cursors, cron logs, observations,
+        and old reply routes."""
         try:
             msg_count = await self.db.cleanup_expired_messages()
             cursor_count = await self.db.cleanup_expired_consumer_cursors()
             cron_log_count = await self.db.cleanup_old_cron_logs(days=14)
             obs_count = await self.db.cleanup_expired_channel_observations()
-            if msg_count or cursor_count or cron_log_count or obs_count:
+            route_count = await self.db.cleanup_old_reply_routes()
+            if msg_count or cursor_count or cron_log_count or obs_count or route_count:
                 logger.info(
                     "Cleanup: %d expired messages, %d expired consumer cursors, "
                     "%d cron logs older than 14 days, %d expired channel "
-                    "observations",
+                    "observations, %d reply routes older than %d days",
                     msg_count, cursor_count, cron_log_count, obs_count,
+                    route_count, REPLY_ROUTE_RETENTION_DAYS,
                 )
         except Exception as e:
             logger.error("Cleanup failed: %s", e, exc_info=True)
