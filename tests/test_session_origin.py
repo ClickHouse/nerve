@@ -25,8 +25,12 @@ from nerve.session_origin import (
     channel_origin,
     cron_origin,
     derive_origin,
+    external_origin,
+    is_origin_tag,
     origin_fields,
     origin_label,
+    origin_tag,
+    plan_origin,
     session_origin,
 )
 from tests import test_cause_attribution
@@ -124,6 +128,97 @@ def test_derive_origin(row, channel_key, expected):
 ])
 def test_origin_label(origin, label):
     assert origin_label(origin) == label
+
+
+@pytest.mark.parametrize("origin, tag", [
+    (cron_origin("nightly"), "cron=nightly"),
+    (channel_origin("slack", "slack:C0123ABCD:1700000000.000100", "general"),
+     "channel=C0123ABCD"),
+    (channel_origin("slack", "slack:D0456"), "channel=D0456"),
+    (channel_origin("telegram", "telegram:-12345"), "channel=-12345"),
+    (Origin("email", {"channel": "conversation-1"}), "channel=conversation-1"),
+    (Origin("api", {"hook": "deploy"}), "hook=deploy"),
+    (plan_origin("plan-1a2b3c4d", "task-1"), "plan=plan-1a2b3c4d"),
+    (Origin("workflow", {"workflow_run": "wfr-1a2b3c4d"}), "workflow=wfr-1a2b3c4d"),
+    (external_origin("claude-code"), "client=claude-code"),
+    # A trigger without a tag, and a session without the detail.
+    (Origin("chat"), None),
+    (Origin("chat", {"fork_of": "p1"}), None),
+    (Origin("system"), None),
+    (Origin("unknown", {"channel": "1"}), None),
+    (Origin("cron", {"run_later": "1h"}), None),
+    (Origin("cron"), None),
+    (Origin("slack", {"thread": "1.1", "channel_name": "general"}), None),
+    (Origin("api"), None),
+    (Origin("plan", {"task_id": "task-1"}), None),
+    (Origin("workflow"), None),
+    (Origin("external"), None),
+    (Origin("cron", {"cron_job": ""}), None),
+])
+def test_origin_tag(origin, tag):
+    assert origin_tag(origin) == tag
+    assert tag is None or is_origin_tag(tag)
+
+
+@pytest.mark.parametrize("detail, value", [
+    ("my@client", "my_client"),
+    ("other-org/other-repo", "other-org_other-repo"),
+    ("a:b,c d", "a_b_c_d"),
+    (" ", "_"),
+    ("line\nX-Injected: 1", "line_X-Injected__1"),
+    # One "_" for each byte of the UTF-8 form.
+    ("caf\u00e9", "caf__"),
+    ("\u4e2d", "___"),
+    # A lone surrogate, which JSON can give.
+    ("\ud800x", "___x"),
+    ("A-z_0.9", "A-z_0.9"),
+])
+def test_origin_tag_replaces_each_other_byte(detail, value):
+    assert origin_tag(external_origin(detail)) == f"client={value}"
+
+
+def test_origin_tag_cuts_the_value():
+    assert origin_tag(cron_origin("j" * 80)) == "cron=" + "j" * 56
+    assert origin_tag(cron_origin("\u00e9" * 40)) == "cron=" + "_" * 56
+    assert origin_tag(Origin("slack", {"channel": "C" * 80})) == "channel=" + "C" * 56
+    # "workflow=" has 9 bytes: the value has 55, the tag 64.
+    assert origin_tag(Origin("workflow", {"workflow_run": "w" * 80})) == (
+        "workflow=" + "w" * 55
+    )
+
+
+@pytest.mark.parametrize("value, valid", [
+    ("cron=nightly", True),
+    ("channel=" + "C" * 56, True),
+    ("workflow=" + "w" * 55, True),
+    ("cron=-._", True),
+    ("workflow=" + "w" * 56, False),
+    ("cron=" + "j" * 57, False),
+    ("cron=", False),
+    ("cron", False),
+    ("chat=x", False),
+    ("CRON=x", False),
+    ("cron=a b", False),
+    ("cron=x\n", False),
+    ("cron=x\nX-Injected: 1", False),
+    ("cron=caf\u00e9", False),
+    ("", False),
+    (None, False),
+])
+def test_is_origin_tag(value, valid):
+    assert is_origin_tag(value) is valid
+
+
+@pytest.mark.parametrize("origin", [
+    cron_origin("j" * 80),
+    Origin("workflow", {"workflow_run": "\u4e2d" * 30}),
+    external_origin("\u00e9" * 50),
+    channel_origin("slack", "slack:" + "C" * 90),
+])
+def test_each_tag_has_the_form_of_a_tag(origin):
+    tag = origin_tag(origin)
+    assert is_origin_tag(tag)
+    assert len(tag.encode()) <= 64
 
 
 def test_a_stored_trigger_wins_over_the_derivation():

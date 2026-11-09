@@ -1,4 +1,4 @@
-"""The principal and the trigger that Nerve names on each model request in external mode.
+"""The principal, trigger and origin that Nerve names on model requests in external mode.
 
 In external mode, a proxy in front of the model API can attribute model usage
 to a person. Nerve gives it the principal that caused the work: one
@@ -14,21 +14,28 @@ started the work: the session's ``trigger`` from the closed vocabulary of
 :mod:`nerve.session_origin`, or ``system`` for Nerve's own model calls. Like
 the cause, the trigger of a session is set when the session is created.
 
+A third header, ``X-Nerve-Inference-Origin``, names where a session comes
+from: the cron job, the channel conversation, the hook, the plan, the
+workflow run or the external client, as a tag such as ``cron=<job id>``
+(:func:`nerve.session_origin.origin_tag`). Like the trigger, it comes from
+the session's origin, which is set when the session is created. A session
+without such a detail, and Nerve's own model calls, send no origin header.
+
 Local mode sends no header, and a NULL cause sends no principal header: Nerve
-also removes a principal line and a trigger line from the
+also removes a principal line, a trigger line and an origin line from the
 ``ANTHROPIC_CUSTOM_HEADERS`` that its own environment gives the CLI.
 
 The Claude CLI reads ``ANTHROPIC_CUSTOM_HEADERS`` from its environment when it
 builds the API client for a request: one ``Name: Value`` header per line,
 lines split on ``\\n`` or ``\\r\\n``, name and value split on the first ``:``
 and trimmed. The environment of a CLI process is fixed when it starts. That is
-enough, because the session's cause and trigger never change.
+enough, because the session's cause, trigger and origin never change.
 
 Codex sends the principal header only to ``codex.base_url``, and sends no
-trigger header: the provider that Nerve gives Codex for it reads the value
-from an environment variable of the Codex process (``env_http_headers``). See
-``nerve.agent.backends.codex.backend``. One Codex process serves one session,
-so the same rule applies.
+trigger or origin header: the provider that Nerve gives Codex for it reads
+the value from an environment variable of the Codex process
+(``env_http_headers``). See ``nerve.agent.backends.codex.backend``. One
+Codex process serves one session, so the same rule applies.
 """
 
 from __future__ import annotations
@@ -39,18 +46,26 @@ import re
 from collections.abc import Mapping
 from uuid import UUID
 
-from nerve.session_origin import TRIGGER_SYSTEM, TRIGGERS
+from nerve.session_origin import (
+    TRIGGER_SYSTEM,
+    TRIGGERS,
+    Origin,
+    is_origin_tag,
+    origin_tag,
+)
 
 logger = logging.getLogger(__name__)
 
 INFERENCE_PRINCIPAL_HEADER = "X-Nerve-Inference-Principal"
 INFERENCE_TRIGGER_HEADER = "X-Nerve-Inference-Trigger"
+INFERENCE_ORIGIN_HEADER = "X-Nerve-Inference-Origin"
 CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
 
 # The headers that Nerve sets, in lower case. Nerve removes an inherited line
 # for each of them.
 _NERVE_HEADERS = frozenset({
     INFERENCE_PRINCIPAL_HEADER.lower(), INFERENCE_TRIGGER_HEADER.lower(),
+    INFERENCE_ORIGIN_HEADER.lower(),
 })
 
 # The CLI splits the variable on these line ends (and on nothing else).
@@ -110,6 +125,17 @@ def inference_trigger(trigger: str | None) -> str | None:
     return trigger
 
 
+def inference_origin(origin: Origin) -> str | None:
+    """The origin to name on the model requests of a session with ``origin``.
+
+    The tag of :func:`nerve.session_origin.origin_tag`. ``None`` in local
+    mode, and for an origin without a tag.
+    """
+    if not _is_external_mode():
+        return None
+    return origin_tag(origin)
+
+
 def _system_trigger_headers() -> dict[str, str]:
     trigger = inference_trigger(TRIGGER_SYSTEM)
     return {INFERENCE_TRIGGER_HEADER: trigger} if trigger else {}
@@ -152,12 +178,13 @@ def direct_client_headers(
 
     The Anthropic SDK also adds the lines of ``ANTHROPIC_CUSTOM_HEADERS`` in
     the environment of Nerve to its default headers, with the name as written.
-    Each such name of the principal or the trigger header gets
+    Each such name of the principal, the trigger or the origin header gets
     ``anthropic.omit``, which removes it. Then, in external mode, the header
     for ``principal_id`` is added, or for the system actor of the global
     database when it is ``None``, and the trigger ``system``
     (:func:`system_inference_headers`). So a request names one principal and
-    one trigger in external mode, and neither in local mode.
+    one trigger in external mode, and neither in local mode. It never names
+    an origin.
     """
     from anthropic import omit
 
@@ -177,18 +204,19 @@ def direct_client_headers(
 
 def custom_headers_env(
     principal: str | None, environ: Mapping[str, str] | None = None,
-    *, trigger: str | None = None,
+    *, trigger: str | None = None, origin: str | None = None,
 ) -> dict[str, str]:
-    """Environment entries that make a Claude CLI process name ``principal``
-    and ``trigger``.
+    """Environment entries that make a Claude CLI process name ``principal``,
+    ``trigger`` and ``origin``.
 
-    ``principal`` comes from :func:`inference_principal` and ``trigger`` from
-    :func:`inference_trigger`. The SDK merges the entries over the
-    environment of Nerve, which the CLI inherits. The value is the inherited
-    ``ANTHROPIC_CUSTOM_HEADERS`` without blank lines and without a line for
-    the principal or the trigger header, plus, in external mode, one line for
-    each of ``principal`` and ``trigger`` that is set. So the CLI sends at
-    most one header of each in external mode, and none in local mode. No
+    ``principal`` comes from :func:`inference_principal`, ``trigger`` from
+    :func:`inference_trigger` and ``origin`` from :func:`inference_origin`.
+    The SDK merges the entries over the environment of Nerve, which the CLI
+    inherits. The value is the inherited ``ANTHROPIC_CUSTOM_HEADERS`` without
+    blank lines and without a line for the principal, the trigger or the
+    origin header, plus, in external mode, one line for each of
+    ``principal``, ``trigger`` and ``origin`` that is set. So the CLI sends
+    at most one header of each in external mode, and none in local mode. No
     entry when that value is the inherited value, and in local mode when the
     inherited value has no line to remove.
     """
@@ -198,7 +226,7 @@ def custom_headers_env(
     if not _is_external_mode():
         if not any(_header_name(line) in _NERVE_HEADERS for line in lines):
             return {}
-        principal = trigger = None
+        principal = trigger = origin = None
     kept = [
         line for line in lines
         if line.strip() and _header_name(line) not in _NERVE_HEADERS
@@ -208,6 +236,8 @@ def custom_headers_env(
         kept.append(f"{INFERENCE_PRINCIPAL_HEADER}: {principal}")
     if trigger in TRIGGERS:
         kept.append(f"{INFERENCE_TRIGGER_HEADER}: {trigger}")
+    if is_origin_tag(origin):
+        kept.append(f"{INFERENCE_ORIGIN_HEADER}: {origin}")
     value = "\n".join(kept)
     if value == inherited:
         return {}
