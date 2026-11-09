@@ -16,7 +16,7 @@ const URL_13 = 'https://github.com/example/repo/pull/13';
 function pull(overrides: Partial<PullRequestSummary> = {}): PullRequestSummary {
   return {
     repo: 'example/repo', number: 12, title: 'Fix the flaky login test', state: 'open',
-    review: null, checks: { passed: 0, failed: 0, running: 0 },
+    review: null, checks: { passed: 0, failed: 0, running: 0, cancelled: 0 },
     head_ref: 'alice/fix-login', base_ref: 'main', ...overrides,
   };
 }
@@ -73,7 +73,7 @@ describe('PullRequestCards', () => {
 
   it('shows the checks and the review decision of an open pull request', async () => {
     answer(ok(URL_12, pull({
-      review: 'changes_requested', checks: { passed: 12, failed: 2, running: 3 },
+      review: 'changes_requested', checks: { passed: 12, failed: 2, running: 3, cancelled: 0 },
     })));
     render(<PullRequestCards blocks={message(URL_12)} />);
     await screen.findByText('Open');
@@ -84,14 +84,29 @@ describe('PullRequestCards', () => {
     expect(within(li).getByText('Changes requested')).toBeInTheDocument();
   });
 
+  it('shows cancelled check runs apart from the failed ones', async () => {
+    answer(ok(URL_12, pull({
+      review: 'review_required', checks: { passed: 30, failed: 0, running: 1, cancelled: 20 },
+    })));
+    render(<PullRequestCards blocks={message(URL_12)} />);
+    await screen.findByText('Open');
+    const li = card(/Fix the flaky login test/);
+    expect(li).toHaveTextContent('20 cancelled');
+    expect(li).not.toHaveTextContent('failed');
+    expect(li).toHaveTextContent('1 running');
+    expect(li).toHaveTextContent('30 passed');
+    expect(within(li).getByText('Review required')).toBeInTheDocument();
+  });
+
   it('leaves out check counts that are zero', async () => {
-    answer(ok(URL_12, pull({ state: 'merged', review: 'approved', checks: { passed: 4, failed: 0, running: 0 } })));
+    answer(ok(URL_12, pull({ state: 'merged', review: 'approved', checks: { passed: 4, failed: 0, running: 0, cancelled: 0 } })));
     render(<PullRequestCards blocks={message(URL_12)} />);
     await screen.findByText('Merged');
     const li = card(/Fix the flaky login test/);
     expect(li).toHaveTextContent('4 passed');
     expect(li).not.toHaveTextContent('failed');
     expect(li).not.toHaveTextContent('running');
+    expect(li).not.toHaveTextContent('cancelled');
     expect(within(li).getByText('Approved')).toBeInTheDocument();
   });
 
@@ -133,10 +148,10 @@ describe('refresh', () => {
   });
 
   it('reads an open pull request with running checks again every minute until it merges', async () => {
-    const running = ok(URL_12, pull({ checks: { passed: 1, failed: 0, running: 2 } }));
+    const running = ok(URL_12, pull({ checks: { passed: 1, failed: 0, running: 2, cancelled: 0 } }));
     answer(running);
     answer(running);
-    answer(ok(URL_12, pull({ state: 'merged', checks: { passed: 3, failed: 0, running: 0 } })));
+    answer(ok(URL_12, pull({ state: 'merged', checks: { passed: 3, failed: 0, running: 0, cancelled: 0 } })));
     render(<PullRequestCards blocks={message(URL_12)} />);
     await flush();
     expect(getPullRequests).toHaveBeenCalledTimes(1);
@@ -152,7 +167,7 @@ describe('refresh', () => {
   });
 
   it('does not read again when no check runs', async () => {
-    answer(ok(URL_12, pull({ checks: { passed: 5, failed: 0, running: 0 } })));
+    answer(ok(URL_12, pull({ checks: { passed: 5, failed: 0, running: 0, cancelled: 0 } })));
     render(<PullRequestCards blocks={message(URL_12)} />);
     await flush();
     await wait(180_000);
@@ -160,7 +175,7 @@ describe('refresh', () => {
   });
 
   it('reads again only while the tab shows', async () => {
-    const running = ok(URL_12, pull({ checks: { passed: 0, failed: 0, running: 1 } }));
+    const running = ok(URL_12, pull({ checks: { passed: 0, failed: 0, running: 1, cancelled: 0 } }));
     getPullRequests.mockResolvedValue({ pulls: [running] });
     const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(false);
     const setHidden = (value: boolean) => act(() => {
@@ -180,7 +195,7 @@ describe('refresh', () => {
   });
 
   it('keeps the cards and tries again after a failed refresh', async () => {
-    const running = ok(URL_12, pull({ checks: { passed: 0, failed: 0, running: 1 } }));
+    const running = ok(URL_12, pull({ checks: { passed: 0, failed: 0, running: 1, cancelled: 0 } }));
     answer(running);
     getPullRequests.mockRejectedValueOnce(new Error('offline'));
     answer(running);
@@ -209,7 +224,7 @@ describe('refresh', () => {
   });
 
   it('stops reading when the cards unmount', async () => {
-    getPullRequests.mockResolvedValue({ pulls: [ok(URL_12, pull({ checks: { passed: 0, failed: 0, running: 1 } }))] });
+    getPullRequests.mockResolvedValue({ pulls: [ok(URL_12, pull({ checks: { passed: 0, failed: 0, running: 1, cancelled: 0 } }))] });
     const { unmount } = render(<PullRequestCards blocks={message(URL_12)} />);
     await flush();
     unmount();
@@ -254,7 +269,7 @@ describe('in view', () => {
   });
 
   it('refreshes only in view, and not within a minute of the last read', async () => {
-    getPullRequests.mockResolvedValue({ pulls: [ok(URL_12, pull({ checks: { passed: 0, failed: 0, running: 1 } }))] });
+    getPullRequests.mockResolvedValue({ pulls: [ok(URL_12, pull({ checks: { passed: 0, failed: 0, running: 1, cancelled: 0 } }))] });
     render(<PullRequestCards blocks={message(URL_12)} />);
     setInView(true);
     await flush();

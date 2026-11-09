@@ -12,6 +12,8 @@ export interface PullRequestChecks {
   passed: number;
   failed: number;
   running: number;
+  /** Check runs that ended without a result: stopped, or set aside by GitHub. */
+  cancelled: number;
 }
 
 export interface PullRequestSummary {

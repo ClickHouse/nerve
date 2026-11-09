@@ -38,6 +38,8 @@ GH_ANSWER = {
         {"__typename": "CheckRun", "name": "unit", "status": "COMPLETED", "conclusion": "FAILURE"},
         {"__typename": "CheckRun", "name": "e2e", "status": "IN_PROGRESS", "conclusion": ""},
         {"__typename": "CheckRun", "name": "build", "status": "QUEUED", "conclusion": ""},
+        # The run of "unit" that a newer run replaced.
+        {"__typename": "CheckRun", "name": "unit", "status": "COMPLETED", "conclusion": "CANCELLED"},
         {"__typename": "StatusContext", "context": "ci/legacy", "state": "SUCCESS"},
         {"__typename": "StatusContext", "context": "ci/deploy", "state": "PENDING"},
         {"__typename": "StatusContext", "context": "ci/scan", "state": "ERROR"},
@@ -140,7 +142,7 @@ class TestSummary:
                 "title": "Fix the flaky login test",
                 "state": "open",
                 "review": "approved",
-                "checks": {"passed": 3, "failed": 2, "running": 3},
+                "checks": {"passed": 3, "failed": 2, "running": 3, "cancelled": 1},
                 "head_ref": "alice/fix-login",
                 "base_ref": "main",
             },
@@ -164,7 +166,28 @@ class TestSummary:
         }
         pull = (await _pulls(client, URL)).json()["pulls"][0]["pull"]
         assert pull["review"] is None
-        assert pull["checks"] == {"passed": 0, "failed": 0, "running": 0}
+        assert pull["checks"] == {"passed": 0, "failed": 0, "running": 0, "cancelled": 0}
+
+    @pytest.mark.parametrize(("conclusion", "bucket"), [
+        ("SUCCESS", "passed"),
+        ("NEUTRAL", "passed"),
+        ("SKIPPED", "passed"),
+        ("CANCELLED", "cancelled"),
+        ("STALE", "cancelled"),
+        ("FAILURE", "failed"),
+        ("TIMED_OUT", "failed"),
+        ("ACTION_REQUIRED", "failed"),
+        ("STARTUP_FAILURE", "failed"),
+    ])
+    async def test_each_conclusion_of_a_completed_check_run_has_its_bucket(
+        self, client, fake_gh, conclusion, bucket,
+    ):
+        fake_gh.answers["12"] = {**GH_ANSWER, "statusCheckRollup": [
+            {"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": conclusion},
+        ]}
+        pull = (await _pulls(client, URL)).json()["pulls"][0]["pull"]
+        none = {"passed": 0, "failed": 0, "running": 0, "cancelled": 0}
+        assert pull["checks"] == {**none, bucket: 1}
 
     async def test_review_decision_is_lower_case(self, client, fake_gh):
         fake_gh.answers["12"] = {**GH_ANSWER, "reviewDecision": "CHANGES_REQUESTED"}
