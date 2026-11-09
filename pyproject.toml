@@ -35,7 +35,13 @@ dependencies = [
     # rejects models released after it with "does not support this model;
     # version 2.1.251 or newer is required". 0.2.150 bundles 2.1.257. Every
     # release in 0.2.141..0.2.150 is a CLI-bundle bump only — no API change.
-    "claude-agent-sdk>=0.2.161",
+    # Floor raised to 0.2.180 (bundles 2.1.321) for Claude Fable 5.2: 0.2.176's
+    # 2.1.316 accepts the id but as an "unrecognized_model" — it reports a
+    # 200K context window (auto-compaction at a fifth of the real 1M) and
+    # prices the turn at Opus 5.5 rates, which is what Nerve records as the
+    # turn's cost. 0.2.177..0.2.180 change no Python API (one optional hook
+    # option added).
+    "claude-agent-sdk>=0.2.180",
     # Declared explicitly because nerve/mcp_server/ imports `mcp` directly
     # rather than only through claude-agent-sdk. Both bounds are load-bearing:
     # nerve/mcp_server/ is written against the 2.x lowlevel API (constructor
