@@ -197,7 +197,10 @@ In external mode:
 - Each model request names the principal that caused the work, in the
   `X-Nerve-Inference-Principal` header: the session's cause, or the system
   actor for Nerve's own model calls. See
-  [Inference principal header](config.md#inference-principal-header).
+  [Inference principal header](config.md#inference-principal-header). The
+  model requests of a cron job's session also name the job, in the
+  `X-Nerve-Inference-Cron-Job` header. See
+  [Inference cron job header](config.md#inference-cron-job-header).
 
 > **Warning:** Without `auth.external.gateway_jwks_file`, Nerve trusts the
 > header. Then use external mode only when the gateway is the only caller that

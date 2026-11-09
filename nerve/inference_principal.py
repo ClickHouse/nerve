@@ -1,4 +1,4 @@
-"""The principal and the trigger that Nerve names on each model request in external mode.
+"""The principal, the trigger and the cron job that Nerve names on model requests in external mode.
 
 In external mode, a proxy in front of the model API can attribute model usage
 to a person. Nerve gives it the principal that caused the work: one
@@ -14,18 +14,24 @@ started the work: the session's ``trigger`` from the closed vocabulary of
 :mod:`nerve.session_origin`, or ``system`` for Nerve's own model calls. Like
 the cause, the trigger of a session is set when the session is created.
 
+A third header, ``X-Nerve-Inference-Cron-Job``, names the cron job of a
+session that a cron job started (``origin_detail.cron_job``), so that the
+proxy can attribute model usage to the job. Job IDs are free text, so Nerve
+sends :func:`cron_job_tag_value` of the ID: 1 to 64 bytes of ASCII letters,
+digits, ``.``, ``_`` and ``-``. Nerve's own model calls send no cron job.
+
 Local mode sends no header, and a NULL cause sends no principal header: Nerve
-also removes a principal line and a trigger line from the
+also removes a principal line, a trigger line and a cron job line from the
 ``ANTHROPIC_CUSTOM_HEADERS`` that its own environment gives the CLI.
 
 The Claude CLI reads ``ANTHROPIC_CUSTOM_HEADERS`` from its environment when it
 builds the API client for a request: one ``Name: Value`` header per line,
 lines split on ``\\n`` or ``\\r\\n``, name and value split on the first ``:``
 and trimmed. The environment of a CLI process is fixed when it starts. That is
-enough, because the session's cause and trigger never change.
+enough, because the session's cause, trigger and cron job never change.
 
 Codex sends the principal header only to ``codex.base_url``, and sends no
-trigger header: the provider that Nerve gives Codex for it reads the value
+trigger header and no cron job header: the provider that Nerve gives Codex for it reads the value
 from an environment variable of the Codex process (``env_http_headers``). See
 ``nerve.agent.backends.codex.backend``. One Codex process serves one session,
 so the same rule applies.
@@ -33,6 +39,7 @@ so the same rule applies.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -45,13 +52,22 @@ logger = logging.getLogger(__name__)
 
 INFERENCE_PRINCIPAL_HEADER = "X-Nerve-Inference-Principal"
 INFERENCE_TRIGGER_HEADER = "X-Nerve-Inference-Trigger"
+INFERENCE_CRON_JOB_HEADER = "X-Nerve-Inference-Cron-Job"
 CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
 
 # The headers that Nerve sets, in lower case. Nerve removes an inherited line
 # for each of them.
 _NERVE_HEADERS = frozenset({
     INFERENCE_PRINCIPAL_HEADER.lower(), INFERENCE_TRIGGER_HEADER.lower(),
+    INFERENCE_CRON_JOB_HEADER.lower(),
 })
+
+# The value rule of the cron job header, which the proxy checks again.
+MAX_CRON_JOB_BYTES = 64
+_CRON_JOB_VALUE = re.compile(rf"[A-Za-z0-9._-]{{1,{MAX_CRON_JOB_BYTES}}}")
+_CRON_JOB_OTHER = re.compile(r"[^A-Za-z0-9._-]+")
+# Length of the hash part of a changed cron job value, in hex digits.
+_CRON_JOB_HASH_HEX = 8
 
 # The CLI splits the variable on these line ends (and on nothing else).
 _LINE_END = re.compile(r"\r?\n")
@@ -110,6 +126,36 @@ def inference_trigger(trigger: str | None) -> str | None:
     return trigger
 
 
+def cron_job_tag_value(job_id: str) -> str:
+    """The value of the cron job header for cron job ``job_id``.
+
+    Each run of characters other than ASCII letters, digits, ``.``, ``_``
+    and ``-`` becomes one ``-``, and ``-`` at the start and the end is
+    removed. An empty result becomes ``job-`` and the first 8 hex digits of
+    the SHA-256 of ``job_id`` (UTF-8). A result longer than 64 bytes becomes
+    its first 55 bytes, ``-`` and the same 8 hex digits. So the value is 1
+    to 64 bytes, and two different IDs give the same value only rarely.
+    """
+    value = _CRON_JOB_OTHER.sub("-", job_id).strip("-")
+    if value and len(value) <= MAX_CRON_JOB_BYTES:
+        return value
+    digest = hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:_CRON_JOB_HASH_HEX]
+    if not value:
+        return f"job-{digest}"
+    return f"{value[:MAX_CRON_JOB_BYTES - _CRON_JOB_HASH_HEX - 1]}-{digest}"
+
+
+def inference_cron_job(job_id: str | None) -> str | None:
+    """The cron job to name on the model requests of a session of ``job_id``.
+
+    ``None`` in local mode and when the session has no cron job; else
+    :func:`cron_job_tag_value` of the ID.
+    """
+    if not job_id or not _is_external_mode():
+        return None
+    return cron_job_tag_value(job_id)
+
+
 def _system_trigger_headers() -> dict[str, str]:
     trigger = inference_trigger(TRIGGER_SYSTEM)
     return {INFERENCE_TRIGGER_HEADER: trigger} if trigger else {}
@@ -152,12 +198,13 @@ def direct_client_headers(
 
     The Anthropic SDK also adds the lines of ``ANTHROPIC_CUSTOM_HEADERS`` in
     the environment of Nerve to its default headers, with the name as written.
-    Each such name of the principal or the trigger header gets
+    Each such name of the principal, the trigger or the cron job header gets
     ``anthropic.omit``, which removes it. Then, in external mode, the header
     for ``principal_id`` is added, or for the system actor of the global
     database when it is ``None``, and the trigger ``system``
     (:func:`system_inference_headers`). So a request names one principal and
-    one trigger in external mode, and neither in local mode.
+    one trigger in external mode, and neither in local mode. It never names
+    a cron job.
     """
     from anthropic import omit
 
@@ -177,20 +224,21 @@ def direct_client_headers(
 
 def custom_headers_env(
     principal: str | None, environ: Mapping[str, str] | None = None,
-    *, trigger: str | None = None,
+    *, trigger: str | None = None, cron_job: str | None = None,
 ) -> dict[str, str]:
-    """Environment entries that make a Claude CLI process name ``principal``
-    and ``trigger``.
+    """Environment entries that make a Claude CLI process name ``principal``,
+    ``trigger`` and ``cron_job``.
 
-    ``principal`` comes from :func:`inference_principal` and ``trigger`` from
-    :func:`inference_trigger`. The SDK merges the entries over the
+    ``principal`` comes from :func:`inference_principal`, ``trigger`` from
+    :func:`inference_trigger` and ``cron_job`` from
+    :func:`inference_cron_job`. The SDK merges the entries over the
     environment of Nerve, which the CLI inherits. The value is the inherited
     ``ANTHROPIC_CUSTOM_HEADERS`` without blank lines and without a line for
-    the principal or the trigger header, plus, in external mode, one line for
-    each of ``principal`` and ``trigger`` that is set. So the CLI sends at
-    most one header of each in external mode, and none in local mode. No
-    entry when that value is the inherited value, and in local mode when the
-    inherited value has no line to remove.
+    the principal, the trigger or the cron job header, plus, in external
+    mode, one line for each of ``principal``, ``trigger`` and ``cron_job``
+    that is set. So the CLI sends at most one header of each in external
+    mode, and none in local mode. No entry when that value is the inherited
+    value, and in local mode when the inherited value has no line to remove.
     """
     env = os.environ if environ is None else environ
     inherited = env.get(CUSTOM_HEADERS_ENV, "")
@@ -198,7 +246,7 @@ def custom_headers_env(
     if not _is_external_mode():
         if not any(_header_name(line) in _NERVE_HEADERS for line in lines):
             return {}
-        principal = trigger = None
+        principal = trigger = cron_job = None
     kept = [
         line for line in lines
         if line.strip() and _header_name(line) not in _NERVE_HEADERS
@@ -208,6 +256,8 @@ def custom_headers_env(
         kept.append(f"{INFERENCE_PRINCIPAL_HEADER}: {principal}")
     if trigger in TRIGGERS:
         kept.append(f"{INFERENCE_TRIGGER_HEADER}: {trigger}")
+    if cron_job and _CRON_JOB_VALUE.fullmatch(cron_job):
+        kept.append(f"{INFERENCE_CRON_JOB_HEADER}: {cron_job}")
     value = "\n".join(kept)
     if value == inherited:
         return {}

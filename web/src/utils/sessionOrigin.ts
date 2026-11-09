@@ -73,7 +73,7 @@ export function originPhrase(session: OriginFields): string {
 export function originLink(session: OriginFields): { to: string; label: string } | null {
   const detail = session.origin_detail ?? {};
   if (detail.plan_id) return { to: `/plans/${encodeURIComponent(detail.plan_id)}`, label: 'Open plan' };
-  if (detail.cron_job) return { to: '/cron', label: 'Open cron jobs' };
   if (detail.workflow_run) return { to: '/workflow-runs', label: 'Open workflow runs' };
+  if (detail.cron_job) return { to: '/cron', label: 'Open cron jobs' };
   return null;
 }

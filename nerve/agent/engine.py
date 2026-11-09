@@ -98,7 +98,11 @@ from nerve.identity import (
     attribution_for,
     resolve_cause,
 )
-from nerve.inference_principal import inference_principal, inference_trigger
+from nerve.inference_principal import (
+    inference_cron_job,
+    inference_principal,
+    inference_trigger,
+)
 from nerve.mcp_gateway import McpGatewayCatalog
 from nerve.memory.backend import (
     MemoryBackendUnavailable,
@@ -107,7 +111,7 @@ from nerve.memory.backend import (
 )
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.platform.activity import LEASE_MEMORIZE, keep_awake
-from nerve.session_origin import cron_origin, session_origin
+from nerve.session_origin import DETAIL_CRON_JOB, cron_origin, session_origin
 from nerve.skills.manager import SkillManager
 from nerve.utils.llm import response_text
 
@@ -1774,6 +1778,9 @@ class AgentEngine:
             # or a newer one (see _mcp_catalog_rebuild_due).
             self._client_mcp_revisions[session_id] = self._mcp_catalog_revision
 
+            # The session's origin, fixed for the session: its trigger and,
+            # for a session of a cron job, the job.
+            origin = session_origin(session or {})
             spec = SessionSpec(
                 session_id=session_id,
                 source=source,
@@ -1801,8 +1808,10 @@ class AgentEngine:
                     (session or {}).get("caused_by_actor_id"),
                 ),
                 # The session's trigger, also fixed for the session.
-                inference_trigger=inference_trigger(
-                    session_origin(session or {}).trigger,
+                inference_trigger=inference_trigger(origin.trigger),
+                # The session's cron job, if a cron job started it.
+                inference_cron_job=inference_cron_job(
+                    origin.detail.get(DETAIL_CRON_JOB),
                 ),
                 extra=(
                     # Per-session codex sandbox override (review-loop verifier

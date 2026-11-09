@@ -77,6 +77,12 @@ describe('originLink', () => {
       .toEqual({ to: '/workflow-runs', label: 'Open workflow runs' });
   });
 
+  it('links the workflow runs for a run that a cron job started', () => {
+    const session = { trigger: 'workflow' as const, origin_detail: { workflow_run: 'wfr-1', cron_job: 'weekly' } };
+    expect(originLink(session)).toEqual({ to: '/workflow-runs', label: 'Open workflow runs' });
+    expect(originPhrase(session)).toBe('From cron job weekly');
+  });
+
   it('has no link for a channel', () => {
     expect(originLink({ origin_detail: { channel: 'C1', channel_name: 'general' } })).toBeNull();
     expect(originLink({})).toBeNull();

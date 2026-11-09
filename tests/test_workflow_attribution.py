@@ -471,6 +471,20 @@ async def test_a_run_without_a_cause_gets_a_session_without_one(install):
 
 
 @pytest.mark.asyncio
+async def test_the_session_of_a_run_that_a_cron_job_started_names_the_job(install):
+    run = await install.runs.start_run(
+        ENGINE_CLAUDE, {"prompt": "p"}, 1.0, created_by="cron:weekly-report",
+    )
+    await install.drain()
+
+    session = await install.db.get_session(f"workflow:{run['id']}")
+    assert session["trigger"] == "workflow"
+    assert json.loads(session["origin_detail"]) == {
+        "workflow_run": run["id"], "cron_job": "weekly-report",
+    }
+
+
+@pytest.mark.asyncio
 async def test_a_rest_kill_records_the_person(install):
     alice, bob = install.actor_id("alice"), install.actor_id("bob")
     async with _client(install.app()) as client:

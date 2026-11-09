@@ -2390,6 +2390,33 @@ and a CLI process keeps it for its whole life. Nerve does not prove the
 value. The same requests as above have no header, and Codex requests to
 `codex.base_url` have no trigger header.
 
+#### Inference cron job header
+
+In external mode, Nerve also adds one `X-Nerve-Inference-Cron-Job` header to
+each model request of a session that a cron job started: the sessions of
+isolated and persistent cron jobs, and the session of a workflow run that a
+cron job started. The value names the job, so that a proxy in front of the
+model API can attribute model usage to it. Other sessions ("Run later" too)
+and Nerve's own model calls send no cron job header.
+
+Cron job IDs are free text, and the value must be a short, safe header
+value. So Nerve changes the job ID:
+
+1. Each run of characters other than ASCII letters, digits, `.`, `_` and `-`
+   becomes one `-`.
+2. Nerve removes `-` at the start and at the end.
+3. An empty result becomes `job-` and the first 8 hex digits of the SHA-256
+   of the job ID (UTF-8).
+4. A result longer than 64 bytes becomes its first 55 bytes, `-`, and the
+   same 8 hex digits.
+
+For example, `daily-digest` stays `daily-digest`, and `Morning briefing`
+becomes `Morning-briefing`. The value is 1 to 64 bytes. The header has the
+same rules as the trigger header: local mode sends none, Nerve removes an
+inherited line for it from `ANTHROPIC_CUSTOM_HEADERS`, and a CLI process keeps
+it for its whole life. Nerve does not prove the value. Codex requests have no
+cron job header.
+
 ### System principal ID
 
 The environment variable `NERVE_SYSTEM_PRINCIPAL_ID` gives the ID of the

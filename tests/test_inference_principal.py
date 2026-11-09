@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import hashlib
 import json
 import logging
 import re
@@ -34,9 +35,12 @@ from nerve.gateway.auth import AUTH_MODE_ENV, AUTH_MODE_EXTERNAL, pin_auth_mode
 from nerve.identity import Actor
 from nerve.inference_principal import (
     CUSTOM_HEADERS_ENV,
+    INFERENCE_CRON_JOB_HEADER,
     INFERENCE_PRINCIPAL_HEADER,
     INFERENCE_TRIGGER_HEADER,
+    cron_job_tag_value,
     custom_headers_env,
+    inference_cron_job,
     inference_principal,
     inference_trigger,
     principal_headers,
@@ -82,6 +86,17 @@ def _triggers(env: dict[str, str]) -> list[str]:
         value for name, value in _cli_headers(env.get(CUSTOM_HEADERS_ENV, ""))
         if name.lower() == INFERENCE_TRIGGER_HEADER.lower()
     ]
+
+
+def _cron_jobs(env: dict[str, str]) -> list[str]:
+    return [
+        value for name, value in _cli_headers(env.get(CUSTOM_HEADERS_ENV, ""))
+        if name.lower() == INFERENCE_CRON_JOB_HEADER.lower()
+    ]
+
+
+def _hash8(job_id: str) -> str:
+    return hashlib.sha256(job_id.encode("utf-8")).hexdigest()[:8]
 
 
 @pytest.fixture
@@ -140,6 +155,64 @@ class TestTrigger:
     @pytest.mark.parametrize("bad", [None, "", "web", "cron\nX-Injected: 1"])
     def test_a_value_outside_the_vocabulary_names_no_trigger(self, external, bad):
         assert inference_trigger(bad) is None
+
+
+_CRON_JOB_RULE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+
+
+class TestCronJob:
+    @pytest.mark.parametrize("job_id", [
+        "nightly", "daily-digest", "inbox_check", "v1.2", "A" * 64,
+    ])
+    def test_an_id_that_obeys_the_rule_is_unchanged(self, job_id):
+        assert cron_job_tag_value(job_id) == job_id
+
+    @pytest.mark.parametrize(("job_id", "value"), [
+        ("Morning briefing", "Morning-briefing"),
+        ("check  /  inbox", "check-inbox"),
+        ("pr-review:main", "pr-review-main"),
+        ("caf\u00e9 report", "caf-report"),
+        ("a,b\nc", "a-b-c"),
+        (" -weekly- ", "weekly"),
+        ("--x--", "x"),
+    ])
+    def test_other_characters_become_one_hyphen(self, job_id, value):
+        assert cron_job_tag_value(job_id) == value
+
+    @pytest.mark.parametrize("job_id", ["\u65e5\u62a5", "---", " ", ":/,"])
+    def test_an_empty_result_becomes_a_hash(self, job_id):
+        assert cron_job_tag_value(job_id) == f"job-{_hash8(job_id)}"
+
+    def test_a_long_result_is_cut_and_gets_a_hash(self):
+        job_id = "b" * 65
+        value = cron_job_tag_value(job_id)
+        assert value == "b" * 55 + "-" + _hash8(job_id)
+        assert len(value) == 64
+
+    def test_a_long_id_is_cut_after_the_transform(self):
+        job_id = "c " * 40
+        value = cron_job_tag_value(job_id)
+        assert value == ("c-" * 28)[:55] + "-" + _hash8(job_id)
+
+    def test_two_long_ids_with_the_same_start_differ(self):
+        assert cron_job_tag_value("d" * 70) != cron_job_tag_value("d" * 71)
+
+    @pytest.mark.parametrize("job_id", [
+        "nightly", "Morning briefing", "\u65e5\u62a5", "x" * 200, "a\r\nX-Injected: 1",
+    ])
+    def test_every_value_obeys_the_rule(self, job_id):
+        assert _CRON_JOB_RULE.fullmatch(cron_job_tag_value(job_id))
+
+    def test_local_mode_names_no_cron_job(self):
+        assert inference_cron_job("nightly") is None
+
+    def test_external_mode_names_the_transformed_id(self, external):
+        assert inference_cron_job("nightly") == "nightly"
+        assert inference_cron_job("Morning briefing") == "Morning-briefing"
+
+    @pytest.mark.parametrize("job_id", [None, ""])
+    def test_no_job_names_no_cron_job(self, external, job_id):
+        assert inference_cron_job(job_id) is None
 
 
 class TestCliEnvironment:
@@ -223,6 +296,32 @@ class TestCliEnvironment:
 
     def test_a_trigger_outside_the_vocabulary_is_never_written(self, external):
         assert custom_headers_env(None, {}, trigger="cron\nX-Injected: 1") == {}
+
+    def test_one_header_line_for_the_cron_job(self, external):
+        env = custom_headers_env(None, {}, trigger="cron", cron_job="nightly")
+        assert _cli_headers(env[CUSTOM_HEADERS_ENV]) == [
+            (INFERENCE_TRIGGER_HEADER, "cron"), (INFERENCE_CRON_JOB_HEADER, "nightly"),
+        ]
+
+    def test_an_inherited_cron_job_is_replaced_or_removed(self, external):
+        environ = {CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue\nx-nerve-inference-cron-job: other"}
+        env = custom_headers_env(None, environ, cron_job="nightly")
+        assert _cli_headers(env[CUSTOM_HEADERS_ENV]) == [
+            ("X-Proxy-Tag", "blue"), (INFERENCE_CRON_JOB_HEADER, "nightly"),
+        ]
+        assert custom_headers_env(None, environ) == {CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue"}
+
+    def test_local_mode_removes_an_inherited_cron_job(self):
+        environ = {CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue\nX-Nerve-Inference-Cron-Job: other"}
+        assert custom_headers_env(None, environ, cron_job="nightly") == {
+            CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue",
+        }
+
+    @pytest.mark.parametrize("bad", [
+        "nightly\nX-Injected: 1", "two words", "a,b", "", "e" * 65, "caf\u00e9",
+    ])
+    def test_a_cron_job_outside_the_rule_is_never_written(self, external, bad):
+        assert custom_headers_env(None, {}, cron_job=bad) == {}
 
     def test_the_process_environment_is_the_default(self, external, monkeypatch):
         monkeypatch.setenv(CUSTOM_HEADERS_ENV, "X-Proxy-Tag: blue")
@@ -461,7 +560,7 @@ async def _process_env(options, monkeypatch) -> dict[str, str]:
 
 _INHERITED = (
     f"X-Proxy-Tag: blue\nx-nerve-inference-principal: {BOB.actor_id}\n"
-    "x-nerve-inference-trigger: api"
+    "x-nerve-inference-trigger: api\nx-nerve-inference-cron-job: other"
 )
 
 
@@ -503,6 +602,38 @@ async def test_each_session_names_its_trigger(external, engine, cli, db):
 
     assert [_triggers(process.env) for process in cli] == [["cron"], ["slack"], ["plan"]]
     assert cli[1].spec.inference_trigger == "slack"
+
+
+@pytest.mark.asyncio
+async def test_each_session_of_a_cron_job_names_its_job(external, engine, cli, db):
+    await engine.run_cron(job_id="nightly", prompt="tidy up")
+    await engine.run_persistent_cron(job_id="Morning briefing", prompt="brief me")
+    await _turn(engine, "s1", ALICE)
+    # The leg of a workflow run that a cron job started.
+    await db.create_session(
+        "workflow:r1", source="workflow", actor=ALICE,
+        origin=Origin("workflow", {"workflow_run": "r1", "cron_job": "weekly"}),
+    )
+    await _turn(engine, "workflow:r1", ALICE)
+
+    assert [_cron_jobs(process.env) for process in cli] == [
+        ["nightly"], ["Morning-briefing"], [], ["weekly"],
+    ]
+    assert [process.spec.inference_cron_job for process in cli] == [
+        "nightly", "Morning-briefing", None, "weekly",
+    ]
+    assert _triggers(cli[3].env) == ["workflow"]
+
+
+@pytest.mark.asyncio
+async def test_a_cron_session_names_no_job_in_local_mode(engine, cli, monkeypatch):
+    monkeypatch.setenv(CUSTOM_HEADERS_ENV, _INHERITED)
+    await engine.run_cron(job_id="nightly", prompt="tidy up")
+
+    (process,) = cli
+    assert process.spec.inference_cron_job is None
+    env = await _process_env(process.options, monkeypatch)
+    assert _cli_headers(env[CUSTOM_HEADERS_ENV]) == [("X-Proxy-Tag", "blue")]
 
 
 @pytest.mark.asyncio
@@ -729,6 +860,13 @@ def _trigger_values(headers: list[tuple[str, str]]) -> list[str]:
     ]
 
 
+def _cron_job_values(headers: list[tuple[str, str]]) -> list[str]:
+    return [
+        value for name, value in headers
+        if name.lower() == INFERENCE_CRON_JOB_HEADER.lower()
+    ]
+
+
 def test_direct_requests_in_local_mode_drop_an_inherited_principal(
     global_db, monkeypatch,
 ):
@@ -737,6 +875,7 @@ def test_direct_requests_in_local_mode_drop_an_inherited_principal(
         headers = _sent_headers(client)
         assert _principal_values(headers) == []
         assert _trigger_values(headers) == []
+        assert _cron_job_values(headers) == []
         assert ("x-proxy-tag", "blue") in headers
 
 
@@ -748,6 +887,7 @@ def test_direct_requests_in_external_mode_name_the_system_actor_once(
         headers = _sent_headers(client)
         assert _principal_values(headers) == [global_db.system_actor_id]
         assert _trigger_values(headers) == ["system"]
+        assert _cron_job_values(headers) == []
         assert ("x-proxy-tag", "blue") in headers
 
 
@@ -829,6 +969,7 @@ async def test_the_doctor_probe_names_the_stored_system_actor(
     (headers,) = _MessagesApi.received
     assert _principal_values(headers) == [system_actor_id]
     assert _trigger_values(headers) == ["system"]
+    assert _cron_job_values(headers) == []
 
 
 @pytest.mark.asyncio

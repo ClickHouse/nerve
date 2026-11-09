@@ -90,6 +90,10 @@ class SessionSpec:
     # The session's trigger for the same proxy (nerve.session_origin), in
     # external mode. None: no trigger. A backend that cannot send it ignores it.
     inference_trigger: str | None = None
+    # The header value of the session's cron job for the same proxy
+    # (nerve.inference_principal.inference_cron_job), in external mode. None:
+    # no cron job. A backend that cannot send it ignores it.
+    inference_cron_job: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 

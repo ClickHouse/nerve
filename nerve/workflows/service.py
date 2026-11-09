@@ -59,7 +59,12 @@ from nerve.agent.streaming import broadcaster
 from nerve.db.usage import estimate_turn_cost
 from nerve.db.workflow_runs import ACTIVE_STATUSES
 from nerve.identity import UNATTRIBUTED, Attribution, attribution_for
-from nerve.session_origin import DETAIL_WORKFLOW_RUN, TRIGGER_WORKFLOW, Origin
+from nerve.session_origin import (
+    DETAIL_CRON_JOB,
+    DETAIL_WORKFLOW_RUN,
+    TRIGGER_WORKFLOW,
+    Origin,
+)
 from nerve.utils.time import utc_now_iso
 
 if TYPE_CHECKING:
@@ -85,6 +90,8 @@ _RESULT_MAX = 4000
 _ERROR_MAX = 2000
 
 _SESSION_PREFIX = "workflow:"
+# ``created_by`` prefix of a run that a cron job started (nerve.cron.service).
+_CRON_CREATED_BY = "cron:"
 
 
 class WorkflowRunError(ValueError):
@@ -446,6 +453,20 @@ class WorkflowRunService:
             return None
         return sid if await self.db.get_session(sid) else None
 
+    @staticmethod
+    def _leg_origin(run: dict) -> Origin:
+        """The origin of the leg session of ``run``.
+
+        The run's ID, and for a run that a cron job started
+        (``created_by`` ``cron:<job>``) the job, so that the model requests
+        of the leg name the job (nerve.inference_principal).
+        """
+        detail = {DETAIL_WORKFLOW_RUN: run["id"]}
+        cb = str(run.get("created_by") or "")
+        if cb.startswith(_CRON_CREATED_BY):
+            detail[DETAIL_CRON_JOB] = cb[len(_CRON_CREATED_BY):]
+        return Origin(TRIGGER_WORKFLOW, detail)
+
     def _default_model(self, backend: str) -> str:
         if backend == "codex":
             return self.config.codex.model
@@ -540,7 +561,7 @@ class WorkflowRunService:
                 cwd=spec.get("cwd") or None,
                 actor=leg_actor,
                 cause=run.get("caused_by_actor_id"),
-                origin=Origin(TRIGGER_WORKFLOW, {DETAIL_WORKFLOW_RUN: run_id}),
+                origin=self._leg_origin(run),
             )
             if origin:
                 await self.db.update_session_fields(
