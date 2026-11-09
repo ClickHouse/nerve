@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 from datetime import datetime, timezone
 
@@ -1040,7 +1041,9 @@ class TaskStore:
             "SELECT id, title, status, deadline, source_url FROM tasks",
         ) as cursor:
             rows = [dict(row) async for row in cursor]
-        index = TitleIndex(rows)
+        # Pure-Python tokenizing of every title: off the event loop, so a
+        # create on a large install does not stall every other session.
+        index = await asyncio.to_thread(TitleIndex, rows)
         self._title_index_cache = (key, index)
         return index
 

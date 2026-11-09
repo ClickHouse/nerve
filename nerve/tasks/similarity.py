@@ -26,7 +26,12 @@ This module scores titles against titles with IDF-weighted token overlap:
 
 Dates, bare small numbers and ``HHMMZ`` time stamps are not tokens: they
 mark *when* a task was written, not *what* it is, and templated titles
-carry them on every line.
+carry them on every line. A ``#``-prefixed number is a ticket reference and
+stays a token whatever its length (``#41``): two templated titles that
+differ only in the ticket they name must not score as the same task, and a
+match that names a *different* ticket is reported as such
+(:attr:`SimilarTask.conflicting_refs`) so the caller never treats it as a
+duplicate.
 
 Overlap misses one kind of duplicate: two titles about the same test, issue
 or function that otherwise say different things ("CI: perf regression on
@@ -46,6 +51,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 _WORD_RE = re.compile(r"\w+")
+_TICKET_REF_RE = re.compile(r"#(\d+)")
 _YEAR_RE = re.compile(r"^(?:19|20)\d\d$")
 # "0930z" / "1745z": the UTC time stamps that notification-derived titles carry.
 _TIME_STAMP_RE = re.compile(r"^\d{3,4}z$")
@@ -74,20 +80,29 @@ def title_tokens(title: str) -> frozenset[str]:
     (``01234_some_test_name`` is one token, and a distinctive
     one). Dropped: one-character tokens, stop words, numbers shorter than
     four digits (days, months, counts), years, and ``HHMMZ`` time stamps.
-    Longer numbers stay: issue and PR numbers identify work.
+    Longer numbers stay: issue and PR numbers identify work. A number
+    written as a ticket reference (``#41``) is kept with its ``#`` at any
+    length, and only in that form.
     """
-    tokens: set[str] = set()
-    for raw in _WORD_RE.findall(title or ""):
+    title = title or ""
+    ticket_numbers = set(_TICKET_REF_RE.findall(title))
+    tokens: set[str] = {f"#{number}" for number in ticket_numbers}
+    for raw in _WORD_RE.findall(title):
         word = raw.lower()
         if len(word) < 2 or word in _STOP_WORDS:
             continue
         if word.isdigit():
-            if len(word) < 4 or _YEAR_RE.match(word):
+            if word in ticket_numbers or len(word) < 4 or _YEAR_RE.match(word):
                 continue
         elif _TIME_STAMP_RE.match(word):
             continue
         tokens.add(word)
     return frozenset(tokens)
+
+
+def ticket_refs(tokens: frozenset[str]) -> frozenset[str]:
+    """The ticket references among a title's tokens (``#41``, ...)."""
+    return frozenset(t for t in tokens if t.startswith("#"))
 
 
 def is_identifier(token: str) -> bool:
@@ -117,6 +132,8 @@ class SimilarTask:
     """Tokens both titles have, most distinctive first."""
     shared_identifiers: tuple[str, ...]
     """The shared tokens that are identifiers appearing in almost no other title."""
+    conflicting_refs: bool
+    """Both titles name tickets and none in common — a different item, however alike the words."""
     row: dict
     """The task row the index was built from (deadline, source_url, ...)."""
 
@@ -174,9 +191,11 @@ class TitleIndex:
         self, tokens: frozenset[str], query_weight: float, task_id: str, shared_weight: float,
     ) -> SimilarTask:
         row = self._rows[task_id]
+        candidate = self._tokens[task_id]
         containment = shared_weight / query_weight
         dice = 2 * shared_weight / (query_weight + self._weight[task_id] or 1.0)
-        shared = sorted(tokens & self._tokens[task_id], key=lambda t: (-self._idf[t], t))
+        shared = sorted(tokens & candidate, key=lambda t: (-self._idf[t], t))
+        query_refs, candidate_refs = ticket_refs(tokens), ticket_refs(candidate)
         return SimilarTask(
             id=task_id,
             title=row.get("title") or "",
@@ -186,6 +205,7 @@ class TitleIndex:
             dice=round(dice, 3),
             shared=tuple(shared),
             shared_identifiers=tuple(t for t in shared if self._is_rare_identifier(t)),
+            conflicting_refs=bool(query_refs and candidate_refs and not (query_refs & candidate_refs)),
             row=row,
         )
 
@@ -193,14 +213,14 @@ class TitleIndex:
         self, title: str, *, min_score: float = 0.0, limit: int = 10,
         exclude: str | None = None,
     ) -> list[SimilarTask]:
-        """Tasks whose title resembles ``title``.
+        """Tasks whose title resembles ``title``, best score first.
 
         Only tasks sharing at least one weighted token are candidates;
         ``min_score`` drops the weak ones, except a task that shares a rare
-        identifier with the title, which stays whatever its score. Tasks
-        sharing a rare identifier come first, then the rest by score;
-        ``limit`` caps the result. ``exclude`` leaves one task out — the
-        task itself, when the title being scored already exists.
+        identifier with the title, which stays whatever its score (see
+        :attr:`SimilarTask.shared_identifiers`). ``limit`` caps the result.
+        ``exclude`` leaves one task out — the task itself, when the title
+        being scored already exists.
         """
         tokens = title_tokens(title)
         if not tokens:
@@ -231,7 +251,7 @@ class TitleIndex:
             )
             if score >= min_score or task_id in rare_hits:
                 matches.append(self._scored(tokens, query_weight, task_id, weight))
-        matches.sort(key=lambda m: (not m.shared_identifiers, -m.score, m.id))
+        matches.sort(key=lambda m: (-m.score, m.id))
         return matches[:limit]
 
     def compare(self, title: str, task_id: str) -> SimilarTask | None:
@@ -245,7 +265,7 @@ class TitleIndex:
             return SimilarTask(
                 id=task_id, title=row.get("title") or "", status=row.get("status") or "",
                 score=0.0, containment=0.0, dice=0.0, shared=(), shared_identifiers=(),
-                row=row,
+                conflicting_refs=False, row=row,
             )
         shared_weight = sum(self._idf[t] for t in tokens & self._tokens[task_id])
         return self._scored(tokens, query_weight, task_id, shared_weight)

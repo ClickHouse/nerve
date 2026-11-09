@@ -303,6 +303,9 @@ async def task_search_handler(ctx: ToolContext, args: dict) -> ToolResult:
 # 0.85 and above; same-area tasks that share a template or a few rare words
 # score 0.2–0.8 — worth a mention, not a refusal. A task that shares a rare
 # identifier (a test name, an issue number) is mentioned whatever its score.
+# A match that names a different ticket in its title, or tracks a different
+# source_url, is a different item however alike the words: mentioned, never
+# refused.
 DUPLICATE_SIMILARITY = 0.85
 RELATED_SIMILARITY = 0.5
 MAX_DUPLICATES_LISTED = 10
@@ -319,6 +322,7 @@ def _similar_entry(match: SimilarTask, *, same_source: bool = False) -> dict:
         "shared": list(match.shared[:6]),
         "shared_identifiers": list(match.shared_identifiers),
         "same_source": same_source,
+        "distinct_by": "",
     }
 
 
@@ -328,6 +332,8 @@ def _format_similar(entry: dict) -> str:
     if entry.get("same_source"):
         notes.append("same source_url")
     notes.append(f"title similarity {entry['similarity']:.2f}")
+    if entry.get("distinct_by"):
+        notes.append(entry["distinct_by"])
     if entry.get("shared_identifiers"):
         notes.append("shares the identifier " + ", ".join(entry["shared_identifiers"]))
     elif entry.get("shared"):
@@ -364,6 +370,7 @@ async def _assess_duplicates(
                     "id": row["id"], "title": row["title"], "status": row["status"],
                     "deadline": row.get("deadline") or "", "similarity": 0.0,
                     "shared": [], "shared_identifiers": [], "same_source": True,
+                    "distinct_by": "",
                 }
             else:
                 entry = _similar_entry(match, same_source=True)
@@ -377,11 +384,18 @@ async def _assess_duplicates(
         if match.id in seen:
             continue
         entry = _similar_entry(match)
-        if match.score >= DUPLICATE_SIMILARITY:
+        other_source = match.row.get("source_url") or ""
+        if match.conflicting_refs:
+            entry["distinct_by"] = "names a different ticket"
+        elif source_url and other_source and other_source != source_url:
+            entry["distinct_by"] = "different source_url"
+        if match.score >= DUPLICATE_SIMILARITY and not entry["distinct_by"]:
             duplicates.append(entry)
         else:
             related.append(entry)
     duplicates.sort(key=lambda e: (not e["same_source"], -e["similarity"]))
+    # A shared identifier is the stronger clue; keep those within the cap.
+    related.sort(key=lambda e: (not e["shared_identifiers"], -e["similarity"]))
     return duplicates[:MAX_DUPLICATES_LISTED], related[:MAX_RELATED_LISTED]
 
 

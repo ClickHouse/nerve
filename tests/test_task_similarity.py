@@ -42,7 +42,7 @@ class TestTitleTokens:
             "GitHub: acme/widgets#4242 — @alice 2026-03-04 0930Z: fix the 3 flaky checks in CI"
         )
         assert tokens == {
-            "github", "acme", "widgets", "4242", "alice", "fix", "flaky", "checks", "ci",
+            "github", "acme", "widgets", "#4242", "alice", "fix", "flaky", "checks", "ci",
         }
 
     def test_keeps_identifiers_and_long_numbers(self):
@@ -56,6 +56,12 @@ class TestTitleTokens:
         assert title_tokens("Fix Backup") == title_tokens("fix backup")
         assert title_tokens("") == frozenset()
         assert title_tokens("2026-01-01 at 10") == frozenset()
+
+    def test_ticket_references_are_kept_at_any_length_and_only_as_references(self):
+        # "#41" would otherwise vanish as a small number, and two templated
+        # titles differing only in the ticket would tokenize identically.
+        assert title_tokens("Review PR #41: bump deps") == {"review", "pr", "#41", "bump", "deps"}
+        assert title_tokens("Follow-up on #130176") == {"follow", "#130176"}
 
 
 class TestTitleIndex:
@@ -98,10 +104,22 @@ class TestTitleIndex:
             {"id": "i2", "status": "pending", "title": "Perf: 00812_cold_start_timing regressed on the arm runner"},
         ]
         index = TitleIndex(rows)
-        matches = index.similar("Follow-up to #12345: add the cold-start regression test", min_score=0.5)
-        assert [m.id for m in matches][:1] == ["i1"]
-        assert matches[0].shared_identifiers == ("12345",)
+        matches = index.similar("Follow-up to #12345: write the release notes", min_score=0.5)
+        assert [m.id for m in matches] == ["i1"]
+        assert matches[0].shared_identifiers == ("#12345",)
         assert matches[0].score < 0.5
+        assert matches[0].conflicting_refs is False
+
+    def test_titles_naming_different_tickets_are_flagged(self):
+        template = "Review PR {ref}: build(deps): bump the python-minor-patch group across 1 directory with {n} updates"
+        rows = ROWS + [{"id": "d1", "status": "pending", "title": template.format(ref="#41", n=70)}]
+        index = TitleIndex(rows)
+        [match] = index.similar(template.format(ref="#48", n=5), min_score=0.5)
+        # Alike in every word but the ticket: a different item.
+        assert match.id == "d1" and match.score >= 0.5
+        assert match.conflicting_refs is True
+        same = index.similar(template.format(ref="#41", n=5))[0]
+        assert same.conflicting_refs is False and same.score == 1.0
         # The rule needs an identifier: a shared plain word that happens to be
         # rare does not qualify, and a number that many titles carry is not rare.
         assert all(m.id != "i2" for m in index.similar("Timing of the cold start on arm", min_score=0.5))
@@ -247,8 +265,44 @@ class TestTaskCreateGuard:
         outcome = result.structured
         assert outcome["created"] is True
         [related] = outcome["related"]
-        assert related["shared_identifiers"] == ["12345"]
-        assert "shares the identifier 12345" in result.text_content
+        assert related["shared_identifiers"] == ["#12345"]
+        assert "shares the identifier #12345" in result.text_content
+
+    async def test_a_different_ticket_is_never_a_duplicate(self, db, tmp_path):
+        ctx = await self._ctx(db, tmp_path)
+        template = "Review PR {ref}: build(deps): bump the python-minor-patch group across 1 directory with {n} updates"
+        await task_create_handler(ctx, {
+            "title": template.format(ref="#41", n=70), "content": "x", "confirm_duplicate": True,
+        })
+
+        result = await task_create_handler(ctx, {"title": template.format(ref="#48", n=5), "content": "x"})
+
+        outcome = result.structured
+        assert outcome["created"] is True
+        [related] = outcome["related"]
+        assert related["distinct_by"] == "names a different ticket"
+        assert "names a different ticket" in result.text_content
+
+    async def test_a_different_source_url_is_never_a_duplicate(self, db, tmp_path):
+        ctx = await self._ctx(db, tmp_path)
+        title = "Investigate the flaky 01234_some_test_name on the arm runner"
+        await task_create_handler(ctx, {
+            "title": title, "content": "x", "source_url": "https://example.invalid/runs/1",
+            "confirm_duplicate": True,
+        })
+
+        result = await task_create_handler(ctx, {
+            "title": title, "content": "x", "source_url": "https://example.invalid/runs/2",
+        })
+
+        outcome = result.structured
+        assert outcome["created"] is True
+        [related] = outcome["related"]
+        assert related["similarity"] == 1.0
+        assert related["distinct_by"] == "different source_url"
+        # Without a source on the new task there is no evidence of a different item: refused.
+        again = await task_create_handler(ctx, {"title": title, "content": "x"})
+        assert again.structured["created"] is False
 
     async def test_nothing_alike_creates_quietly(self, db, tmp_path):
         ctx = await self._ctx(db, tmp_path)
