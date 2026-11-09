@@ -272,6 +272,16 @@ class TestDefaultTimezone:
         assert "'Local'" in messages[0] and "'Mars/Olympus'" in messages[1]
 
 
+# list[str] fields whose entries are checked as the config loads: one they do
+# not take refuses to load (sync.github_repos.types names a closed set). The
+# sweeps below check that such a field refuses the arbitrary probe, then probe
+# it with an entry it takes. (sync.github_repos.repos is checked only while the
+# watch is on, so with the probe's defaults it keeps any entry.)
+_CHECKED_LIST_ENTRIES = {
+    ("GitHubReposSyncConfig", "types"): "release",
+}
+
+
 class TestScalarCoercion:
     """`${VAR}` interpolation is a string substitution — it erases YAML types.
 
@@ -541,7 +551,13 @@ class TestScalarCoercion:
                     continue
                 kind, base = classified
                 checked += 1
-                for raw, want in probes[base]:
+                field_probes = probes[base]
+                entry = _CHECKED_LIST_ENTRIES.get((klass.__name__, f.name))
+                if entry is not None:
+                    with pytest.raises(ValueError):
+                        from_dict({f.name: ["alpha,beta"]})
+                    field_probes = [(entry, entry)]
+                for raw, want in field_probes:
                     value = [raw] if kind == "list" else raw
                     expected = [want] if kind == "list" else want
                     args = ("probe", {f.name: value}) if klass.__name__ in two_arg \
@@ -648,6 +664,9 @@ class TestScalarCoercion:
                     skipped.append((f"{klass.__name__}.{f.name}", element))
                     continue
                 raw, expected = bare[element]
+                entry = _CHECKED_LIST_ENTRIES.get((klass.__name__, f.name))
+                if entry is not None:
+                    raw, expected = entry, [entry]
                 checked += 1
                 call = ("probe", {f.name: raw}) if klass.__name__ in two_arg \
                     else ({f.name: raw},)

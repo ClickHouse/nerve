@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
 from nerve.cron.jobs import RESERVED_JOB_ID_PREFIX
-from nerve.sources.models import IngestResult, SourceRecord
+from nerve.sources.models import IngestResult, SourceRecord, cursor_text
 from nerve.utils.llm import response_text
 
 if TYPE_CHECKING:
@@ -345,7 +345,7 @@ class SourceRunner:
                 logger.warning(
                     "Source %s: reports more to read but did not advance its "
                     "cursor (%s). Stopping this run.",
-                    self.source.source_name, cursor,
+                    self.source.source_name, cursor_text(cursor),
                 )
                 break
             cursor = result.next_cursor
@@ -365,7 +365,7 @@ class SourceRunner:
         """One fetch → preprocess → guardrail → persist → condense → drop hook → advance cycle."""
         logger.info(
             "Source %s: fetching (cursor=%s, batch_size=%d)",
-            self.source.source_name, cursor, self.batch_size,
+            self.source.source_name, cursor_text(cursor), self.batch_size,
         )
 
         try:
@@ -381,7 +381,7 @@ class SourceRunner:
                 await self.db.set_sync_cursor(self.source.source_name, result.next_cursor)
                 logger.info(
                     "Source %s: no records, cursor advanced to %s",
-                    self.source.source_name, result.next_cursor,
+                    self.source.source_name, cursor_text(result.next_cursor),
                 )
             else:
                 logger.info("Source %s: no new records", self.source.source_name)
@@ -477,7 +477,7 @@ class SourceRunner:
             await self.db.set_sync_cursor(self.source.source_name, result.next_cursor)
             logger.info(
                 "Source %s: %d records ingested, cursor -> %s",
-                self.source.source_name, len(records), result.next_cursor,
+                self.source.source_name, len(records), cursor_text(result.next_cursor),
             )
 
         return _BatchResult(

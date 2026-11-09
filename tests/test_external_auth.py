@@ -791,6 +791,8 @@ class TestRoutes:
 class _RecordingEngine:
     """Enough engine for ``/ws``; records what each message runs as."""
 
+    accepting_turns = True
+
     def __init__(self):
         self.session_actors: list[Actor] = []
         self.runs: list[dict] = []

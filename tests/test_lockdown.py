@@ -1442,7 +1442,9 @@ class TestLockdownTrackedConfigWrites:
         assert (ws / "memory" / "notes.md").read_text() == "hello\n"
 
     @pytest.mark.asyncio
-    async def test_unlocked_route_writes_config_freely(self, tmp_path, monkeypatch):
+    async def test_unlocked_route_writes_the_instruction_files(self, tmp_path, monkeypatch):
+        """Lockdown decides about the reviewed root files. The route itself only
+        decides that a path is a memory file (see test_memory_file_routes.py)."""
         from nerve.gateway.routes.memory import FileWriteRequest, write_memory_file
 
         ws = tmp_path / "ws"
@@ -1450,10 +1452,8 @@ class TestLockdownTrackedConfigWrites:
         monkeypatch.setattr(
             cfg, "_config", NerveConfig(lockdown=False, workspace=ws),
         )
-        await write_memory_file(
-            "config/settings.yaml", FileWriteRequest(content="timezone: UTC\n"),
-        )
-        assert (ws / "config" / "settings.yaml").exists()
+        await write_memory_file("SOUL.md", FileWriteRequest(content="be brief\n"))
+        assert (ws / "SOUL.md").read_text() == "be brief\n"
 
     def test_memory_manager_write_file_is_guarded_too(self, tmp_path, monkeypatch):
         """The route's twin. Guarding one and not the other is not a guard."""

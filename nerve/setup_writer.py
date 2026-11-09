@@ -48,6 +48,7 @@ import re
 import secrets
 import shutil
 import stat
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -161,7 +162,8 @@ PRODUCTIVITY_CRONS = [
             "1. Use task_list(status=\"pending\") to browse the tasks that are ready for work\n"
             "2. Use plan_list to see which tasks already have plans — skip those\n"
             "3. Pick ONE task and explore the relevant codebase\n"
-            "4. Call plan_propose(task_id, content) with your plan\n\n"
+            "4. Call plan_propose(task_id, content, summary) with your plan and a summary "
+            "of up to 3 short lines for the reviewer\n\n"
             "If all tasks have plans or none are actionable, say so and stop.\n\n"
             "plan_propose notifies the user with a link to the plan. "
             "Do not send another notification about it.\n"
@@ -210,6 +212,78 @@ PRODUCTIVITY_CRONS = [
             "Do not send another notification about it.\n"
         ),
     },
+    {
+        "id": "machine-maintenance",
+        "name": "Machine Maintenance",
+        "display_name": "Machine maintenance",
+        "schedule": "0 4 * * 0",
+        "description": "Weekly cleanup of the machine Nerve runs on: old build caches, Docker leftovers, worktrees of merged pull requests, temporary services left running on open ports. It asks you before it removes or stops anything that can hold data.",
+        "requires": None,
+        "session_mode": "isolated",
+        "reminder_mode": False,
+        "prompt": (
+            "You are running the weekly machine maintenance job. Free disk space and remove clutter "
+            "on the machine you run on. Remove only items that are old and that nothing uses. "
+            "Never destroy data without asking first.\n\n"
+            "## 1. Learn this machine\n\n"
+            "Each machine is different, so do not use a fixed list of commands. Find out what this "
+            "machine has:\n"
+            "- Disk use: `df -h`, then `du` on the large directories (home, the workspace, "
+            "repository clones, caches, temporary directories).\n"
+            "- Where clutter collects: Git repositories and their worktrees, build and compile "
+            "caches, package manager caches, Docker (images, containers, volumes, build cache), "
+            "temporary files, old logs, the trash.\n"
+            "- What runs: processes and containers that listen on a port (for example `ss -ltnp` "
+            "and `docker ps`), with their start time, command and working directory.\n"
+            "- What you already know: TOOLS.md, your memory (what earlier runs found, what must be "
+            "kept), and the answers to the questions earlier runs asked.\n\n"
+            "If the disk has a lot of free space, nothing is clearly old and no leftover service "
+            "runs, stop.\n\n"
+            "## 2. Sort the candidates\n\n"
+            "A candidate is old (not used or changed for some weeks) and nothing uses it now. "
+            "A leftover service is a candidate too: a dev server, preview, test database, tunnel "
+            "or test container that still listens on a port, that a past task or test run started "
+            "(often from a worktree or a temporary directory), and that nothing uses now. It "
+            "uses memory and can expose the machine on an open port. "
+            "Put each candidate in one of two groups.\n\n"
+            "**Remove without asking**: items that hold no data, because a tool makes them again "
+            "when it needs them or because the work is stored somewhere else:\n"
+            "- build, compile and package download caches;\n"
+            "- dangling Docker images and unused Docker build cache;\n"
+            "- a Git worktree whose branch is merged (its pull request is merged), with no "
+            "uncommitted changes, no untracked files and no unpushed commits;\n"
+            "- temporary files that no process uses.\n\n"
+            "**Ask first**: anything that can hold data that is not stored somewhere else:\n"
+            "- leftover services: a running service can hold state, and the person can still "
+            "use it;\n"
+            "- Docker volumes, stopped containers, tagged images;\n"
+            "- a worktree or branch with uncommitted, untracked or unpushed work, or whose pull "
+            "request is open or closed without a merge;\n"
+            "- user files, databases, logs, and anything else you are not sure about.\n\n"
+            "When you are not sure which group an item is in, it is in \"Ask first\".\n\n"
+            "Never stop or remove, and never offer to: Nerve itself, its state directory and "
+            "workspace; system services and services that a service manager or a deployment "
+            "keeps running; anything that a session or job of this agent uses now, and the "
+            "worktrees and files that a running process uses.\n\n"
+            "## 3. Act\n\n"
+            "- Remove the items of the first group with each tool's own command (for example "
+            "`git worktree remove`, `docker image prune`, the clean command of the package manager "
+            "or build cache), not with a raw recursive delete. Where a trash command is installed, "
+            "use it in place of `rm`.\n"
+            "- For the second group, send one `ask_user` that lists each item with its size, its "
+            "age and why you think nothing uses it; for a service, also its port, its command and "
+            "where it started. Remove or stop only the items that the answer approves. When there "
+            "is no answer, change nothing in that group.\n\n"
+            "## 4. Report\n\n"
+            "Say what you removed or stopped and how much space it freed (`df -h` before and "
+            "after). When "
+            "you also ask a question, put this in the `ask_user`; otherwise send one `notify` "
+            "(priority low) when you changed something. When you changed nothing and have no "
+            "question, send nothing.\n\n"
+            "Save to memory only lasting facts about this machine that make the next run faster "
+            "or safer, for example a directory that must be kept. Do not save a log of this run.\n"
+        ),
+    },
 ]
 
 # The optional crons each mode switches on when nobody chose otherwise: what
@@ -219,13 +293,13 @@ PRODUCTIVITY_CRONS = [
 # onboarding conversation, which enables the job (overridden by id in
 # ``jobs.yaml``, scoped to the worker's tag) when the answer is yes.
 DEFAULT_CRONS: dict[str, list[str]] = {
-    "personal": ["inbox-processor", "task-planner"],
-    "worker": ["skill-reviser", "skill-extractor"],
+    "personal": ["inbox-processor", "task-planner", "machine-maintenance"],
+    "worker": ["skill-reviser", "skill-extractor", "machine-maintenance"],
 }
 
 # The optional crons a worker install carries at all — task-planner included,
 # written disabled, so it stays one toggle away.
-_WORKER_CRONS = ("skill-reviser", "skill-extractor", "task-planner")
+_WORKER_CRONS = ("skill-reviser", "skill-extractor", "task-planner", "machine-maintenance")
 
 # Quiet hours: ``quiet_start`` and ``quiet_end`` both empty means there are
 # none; otherwise both are ``HH:MM``. The window an enabled-but-unspecified
@@ -1462,9 +1536,8 @@ def system_cron_file(workspace: Path) -> Path:
     return Path(workspace) / "config" / "cron" / "system.yaml"
 
 
-def _read_system_crons(workspace: Path) -> tuple[dict[str, Any] | None, str, str]:
-    """``(document, raw_text, problem)`` for the generated cron file."""
-    path = system_cron_file(workspace)
+def _read_cron_file(path: Path) -> tuple[dict[str, Any] | None, str, str]:
+    """``(document, raw_text, problem)`` for a cron file."""
     if not path.exists():
         return None, "", "missing"
     raw = path.read_text(encoding="utf-8")
@@ -1503,7 +1576,7 @@ def list_optional_crons(workspace: Path) -> list[CronToggle]:
     step has nothing to offer rather than inventing jobs that were never
     written.
     """
-    document, _raw, problem = _read_system_crons(workspace)
+    document, _raw, problem = _read_cron_file(system_cron_file(workspace))
     if problem or document is None:
         return []
     present = {
@@ -1541,7 +1614,7 @@ def plan_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronTogglePla
     error message is wrong.
     """
     path = system_cron_file(workspace)
-    document, raw, problem = _read_system_crons(workspace)
+    document, raw, problem = _read_cron_file(system_cron_file(workspace))
     if problem or document is None:
         return CronTogglePlan(path=path, text=None, problem=problem or "unreadable")
 
@@ -1585,6 +1658,119 @@ def set_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronToggleOutc
     one call, for a caller with nothing else to coordinate.
     """
     return plan_optional_crons(workspace, enabled_ids).publish()
+
+
+# --- Turning one job on and off (the Cron page) --------------------------------
+#
+# For one job of any cron file, ``system.yaml`` or ``jobs.yaml``. A person
+# writes ``jobs.yaml``, so the file is not dumped again (that loses comments
+# and formatting): only the job's ``enabled:`` line changes, or one is added
+# under its ``id:`` line. The result is parsed again, and it is written only
+# if the job's ``enabled`` is the one difference from the file as it was.
+
+#: ``CronTogglePlan.problem`` values of :func:`plan_cron_job_enabled`, beside
+#: ``missing`` and ``unreadable: ...``.
+CRON_FILE_HAND_EDITED = "hand-edited"
+CRON_FILE_READ_ONLY = "read-only"
+CRON_JOB_MISSING = "no such job"
+
+# A job's ``id:`` line and ``enabled:`` line (``- id: x`` or ``id: x``), with
+# what comes before the key; the ``- `` that starts a list item.
+_ID_LINE = re.compile(r"""^(?P<lead>[ \t]*(?:-[ \t]+)?)id:[ \t]*(?P<q>["']?)(?P<id>[^#\r\n]*?)(?P=q)[ \t]*(?:#.*)?$""")
+_ENABLED_LINE = re.compile(r"^(?P<lead>[ \t]*(?:-[ \t]+)?)enabled:(?P<value>[^#\r\n]*)(?P<comment>#.*)?$")
+_ITEM_START = re.compile(r"^[ \t]*-[ \t]+")
+
+
+def _indent(line: str) -> int | None:
+    """The indentation of a line with content; None for a blank or comment line."""
+    stripped = line.lstrip(" ")
+    return None if not stripped.strip() or stripped.startswith("#") else len(line) - len(stripped)
+
+
+def _item_bounds(lines: list[str], i: int, column: int) -> tuple[int, int] | None:
+    """``(first, end)`` lines of the list item whose keys are at ``column`` and
+    which has line ``i``, or None when line ``i`` is in no such item."""
+    start = i
+    while not ((dash := _ITEM_START.match(lines[start])) and len(dash.group(0)) == column):
+        start -= 1
+        if start < 0:
+            return None
+        indent = _indent(lines[start])
+        if indent is not None and indent < column - 2:
+            return None
+    end = start + 1
+    while end < len(lines) and (_indent(lines[end]) is None or _indent(lines[end]) >= column):
+        end += 1
+    return start, end
+
+
+def _enabled_edits(raw: str, job_id: str, enabled: bool) -> Iterator[str]:
+    """Each text that ``raw`` becomes when the ``enabled:`` line of a list item
+    with ``id: <job_id>`` is set, or added under the ``id:`` line.
+
+    One text for each ``id:`` line that names the job; the caller keeps the
+    first one that parses as intended. A layout this cannot read (a flow
+    mapping, say) gives no text.
+    """
+    lines = raw.splitlines(keepends=True)
+    value = "true" if enabled else "false"
+    for i, line in enumerate(lines):
+        match = _ID_LINE.match(line.rstrip("\r\n"))
+        if not match or match["id"] != job_id:
+            continue
+        column = len(match["lead"])
+        bounds = _item_bounds(lines, i, column)
+        if bounds is None:
+            continue
+        edited = list(lines)
+        for k in range(*bounds):
+            found = _ENABLED_LINE.match(lines[k].rstrip("\r\n"))
+            if found and len(found["lead"]) == column:
+                old = found["value"]
+                rest = old[len(old.rstrip()):] + (found["comment"] or "")
+                eol = lines[k][len(lines[k].rstrip("\r\n")):]
+                edited[k] = f"{found['lead']}enabled: {value}{rest}{eol}"
+                break
+        else:
+            eol = line[len(line.rstrip("\r\n")):] or "\n"
+            edited[i] = line.rstrip("\r\n") + eol
+            edited.insert(i + 1, f"{' ' * column}enabled: {value}{eol}")
+        yield "".join(edited)
+
+
+def plan_cron_job_enabled(path: Path, job_id: str, enabled: bool) -> CronTogglePlan:
+    """Set ``enabled`` of the job ``job_id`` in the cron file ``path``.
+
+    Nothing is written: :meth:`CronTogglePlan.publish` does that. ``problem``
+    is set for a file without the job, a file that cannot be written, and a
+    file in which no edit of one line gives the intended change
+    (``CRON_FILE_HAND_EDITED``).
+    """
+    document, raw, problem = _read_cron_file(path)
+    if problem or document is None:
+        return CronTogglePlan(path=path, text=None, problem=problem or "unreadable")
+    jobs = [
+        job for job in document["jobs"]
+        if isinstance(job, dict) and str(job.get("id") or "") == job_id
+    ]
+    if not jobs:
+        return CronTogglePlan(path=path, text=None, problem=CRON_JOB_MISSING)
+    names = {"enabled": (job_id,)} if enabled else {"disabled": (job_id,)}
+    # A job without the key is enabled (CronJob.enabled defaults to True).
+    if all(bool(job.get("enabled", True)) == enabled for job in jobs):
+        return CronTogglePlan(path=path, text=None, **names)
+    # publish_text writes a temporary file beside the file, then renames it.
+    if not (os.access(path, os.W_OK) and os.access(path.parent, os.W_OK)):
+        return CronTogglePlan(path=path, text=None, problem=CRON_FILE_READ_ONLY)
+    for job in jobs:
+        job["enabled"] = enabled
+    for text in _enabled_edits(raw, job_id, enabled):
+        try:
+            if yaml.safe_load(text) == document:
+                return CronTogglePlan(path=path, text=text, **names)
+        except yaml.YAMLError:
+            continue
+    return CronTogglePlan(path=path, text=None, problem=CRON_FILE_HAND_EDITED)
 
 
 _WEEKDAYS = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")

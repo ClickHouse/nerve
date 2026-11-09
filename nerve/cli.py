@@ -1064,11 +1064,19 @@ def stop(ctx: click.Context) -> None:
         click.echo("Nerve is not running")
         return
 
-    click.echo(f"Stopping Nerve (PID {pid})...")
+    drain = config.gateway.drain_timeout_seconds
+    if drain > 0:
+        click.echo(
+            f"Stopping Nerve (PID {pid}). Running turns get up to {drain}s to end..."
+        )
+    else:
+        click.echo(f"Stopping Nerve (PID {pid})...")
     os.kill(pid, signal.SIGTERM)
 
-    # Wait for graceful shutdown (up to 15 seconds)
-    for i in range(30):
+    from nerve import daemon
+
+    # Wait for graceful shutdown: the drain, then up to 15 seconds
+    for i in range(daemon.shutdown_wait_ticks(drain)):
         time.sleep(0.5)
         if not pidfile.pid_exists(pid):
             _remove_pid()
@@ -1159,6 +1167,7 @@ def restart(ctx: click.Context, resume_ids: tuple[str, ...]) -> None:
     outcome = daemon.restart_daemon(
         config_dir, verbose=ctx.obj["verbose"],
         old_pid=old_pid if running else None, systemd=False,
+        drain_timeout_seconds=config.gateway.drain_timeout_seconds,
     )
     click.echo(outcome.message)
 
@@ -1554,10 +1563,13 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
     """Doctor lines for the local Slack settings that still apply in hosted mode.
 
     The gateway decides admission and where the agent may post, so only the
-    send tool switch, its local conversation limit, and the notification
-    conversation are reported. Slash commands do not reach Nerve.
+    send tool switch, its local conversation limit, the channel source's
+    local grant, and where notification cards go are reported. The gateway
+    posts the cards in the notification channel set in the control plane;
+    ``notifications.slack_channel_id`` is not read. Slash commands do not
+    reach Nerve.
     """
-    from nerve.channels.slack import is_slack_id, notification_target
+    from nerve.channels.slack import is_slack_id
     from nerve.config import SLACK_HOST_COMMANDS
 
     slack = config.slack
@@ -1581,13 +1593,29 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
             )
     else:
         lines.append("[OK] Slack send tool on; the gateway decides where it may post")
-    target = notification_target(config)
-    if target:
-        lines.append(f"[OK] Slack notifications go to {target}")
+    source = slack.source
+    rules = len(source.allow_conversations)
+    if not source.enabled:
+        lines.append("[--] Slack channel source off (slack.source.enabled is false)")
+    elif source.gateway_grant:
+        limit = f", limited to {rules} allow rule(s)" if rules else ""
+        lines.append(
+            f"[OK] Slack channel source on{limit}; the gateway decides which channels are observed"
+        )
+    elif rules:
+        lines.append(
+            f"[OK] Slack channel source on, {rules} allow rule(s); the gateway also decides"
+        )
     else:
         warnings.append(
-            "[WARN] Slack notifications have no conversation: set "
-            "notifications.slack_channel_id"
+            "[WARN] Slack channel source collects nothing: set slack.source.gateway_grant, "
+            "or list channel ids in slack.source.allow_channels"
+        )
+    lines.append("[--] Slack notifications go to the notification channel set in the control plane")
+    if config.notifications.slack_channel_id.strip():
+        warnings.append(
+            "[WARN] notifications.slack_channel_id is not read in hosted mode; "
+            "set the notification channel in the control plane"
         )
     lines.append("[--] Slack /nerve commands are not available in hosted mode")
     host = [name for name in slack.commands or () if name in SLACK_HOST_COMMANDS]
@@ -1614,10 +1642,14 @@ def _hosted_github_lines(config, errors: list[str], warnings: list[str]) -> list
     from nerve.channels.hosted.auth import KeyFileError, read_key_file
 
     lines: list[str] = []
+    watching = config.sync.github_repos.enabled and bool(config.sync.github_repos.repos)
     if not github.enabled:
         lines.append(
             "[--] GitHub is hosted but switched off (sync.github.enabled is false); "
-            "the gateway is told that this agent subscribes to nothing"
+            + (
+                "the gateway is told that this agent takes no notifications"
+                if watching else "the gateway is told that this agent subscribes to nothing"
+            )
         )
     hosted = config.channels.hosted
     problems = hosted.problems()
@@ -1631,15 +1663,81 @@ def _hosted_github_lines(config, errors: list[str], warnings: list[str]) -> list
     elif github.enabled:
         lines.append(
             "[OK] GitHub notifications come from the channel gateway: filters "
-            f"published from sync.github, PR watch {'on' if github.pr_watch else 'off'}"
+            f"published from sync.github, PR watch {'on' if github.pr_watch else 'off'}, "
+            f"inbox {github.inbox}"
         )
-    if github.enabled and config.slack.mode == "hosted" and not config.slack.enabled:
+    if (
+        (github.enabled or config.sync.github_repos.enabled)
+        and config.slack.mode == "hosted" and not config.slack.enabled
+    ):
         warnings.append(
             "[WARN] Slack is hosted but switched off (slack.enabled is false): Nerve "
             "reads nothing from the channel gateway until it is switched on, so the "
             "hosted GitHub records wait there too"
         )
     return lines
+
+
+def _actor_context_lines(config, errors: list[str], warnings: list[str]) -> list[str]:
+    """Doctor lines for the actor context check of external mode (``auth.external``)."""
+    from nerve.config import EXTERNAL_VERIFICATION_LOG
+    from nerve.gateway.actor_context import KeyFileError, read_key_file
+
+    settings = config.auth.external
+    if settings.gateway_jwks_file is None:
+        warnings.append(
+            "[WARN] Actor context: the X-Nerve-Actor-Context header is not verified "
+            "(auth.external.gateway_jwks_file is not set), so only the gateway must "
+            "be able to reach Nerve"
+        )
+        return []
+    problems = settings.problems()
+    if not problems:
+        try:
+            keys = read_key_file(settings.gateway_jwks_file)
+        except KeyFileError as error:
+            problems = [f"auth.external.gateway_jwks_file: {error}"]
+    if problems:
+        errors.extend(f"[ERR] Actor context: {problem}" for problem in problems)
+        return []
+    source = f"agent {settings.agent_id}, {len(keys)} gateway key(s) from {settings.gateway_jwks_file}"
+    if settings.verification == EXTERNAL_VERIFICATION_LOG:
+        warnings.append(
+            "[WARN] Actor context: auth.external.verification is log, so a header "
+            f"that fails the check is used anyway ({source})"
+        )
+        return []
+    return [f"[OK] Actor context verified (verification: {settings.verification}): {source}"]
+
+
+def _github_repos_lines(config, warnings: list[str]) -> list[str]:
+    """The doctor line of the repository watch (``sync.github_repos``).
+
+    Its mode follows ``sync.github.mode``: the channel gateway polls the
+    repositories when GitHub is hosted, gh on this machine otherwise. The
+    line says so, with the number of repositories, the types, and whether
+    updates are reported.
+    """
+    watch = config.sync.github_repos
+    if not watch.enabled:
+        return ["[--] GitHub repository watch off (sync.github_repos.enabled is false)"]
+    if not watch.repos:
+        warnings.append(
+            "[WARN] GitHub repository watch is on but sync.github_repos.repos is empty, "
+            "so it watches nothing"
+        )
+        return []
+    how = (
+        "mode hosted, the channel gateway polls" if config.sync.github.mode == "hosted"
+        else "mode poll, gh on this machine"
+    )
+    count = len(watch.repos)
+    line = (
+        f"[OK] GitHub repository watch ({how}): {count} "
+        f"{'repository' if count == 1 else 'repositories'}; types {', '.join(watch.types)}; "
+        f"updates {'on' if watch.updates else 'off'}"
+    )
+    return [line]
 
 
 def _source_suffix(config, path: str) -> str:
@@ -1762,6 +1860,26 @@ def _platform_activity_line(config) -> str:
     if activity_socket_present(path):
         return f"[OK] Platform activity socket: present ({path})"
     return f"[--] Platform activity socket: not present ({path})"
+
+
+def _load_cron_gate_plugins(config) -> None:
+    """Register the workspace's drop-in gate plugins before cron jobs are read.
+
+    The daemon does this at startup and on reload. The ``doctor`` and ``cron``
+    commands run outside it: without this, a job gated on a plugin type builds
+    as "unknown gate type" and is dropped, so doctor undercounts the jobs and
+    ``nerve cron`` does not find it. For those CLI processes only — inside the
+    daemon the registry is the reload's business. A broken plugin is logged and
+    skipped by the loader; a directory it cannot read is logged here.
+    """
+    from nerve.cron.gate_plugins import load_gate_plugins
+
+    try:
+        load_gate_plugins(config.cron.gate_plugins_dir)
+    except OSError as e:
+        logging.getLogger(__name__).warning(
+            "Could not read the cron gate plugins in %s: %s", config.cron.gate_plugins_dir, e,
+        )
 
 
 def doctor_report(config, config_source: str = "", check_api: bool = False) -> str:
@@ -2112,6 +2230,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     else:
         lines.append("[--] Slack disabled")
     lines.extend(_hosted_github_lines(config, errors, warnings))
+    lines.extend(_github_repos_lines(config, warnings))
 
     # Check SSL
     if config.gateway.ssl.enabled:
@@ -2164,6 +2283,8 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
     else:
         lines.append(f"[OK] Auth mode: {mode} ({mode_source})")
     external = mode == AUTH_MODE_EXTERNAL
+    if external:
+        lines.extend(_actor_context_lines(config, errors, warnings))
 
     configured = bool(config.auth.password_hash)
     identity_state = inspect_bootstrap_state(paths.db_path())
@@ -2419,6 +2540,12 @@ def doctor(ctx: click.Context) -> None:
             f"[ERR] config failed to load: {ctx.obj.get('config_error')}", fg="red"
         )
         ctx.exit(1)
+    # The report reads the cron files (the setup checklist first, then the job
+    # count), so the plugins must be registered before it, as the daemon does
+    # before it parses the jobs. Here rather than in doctor_report: the
+    # daemon's own /doctor runs that too, and there the registry is the
+    # reload's business.
+    _load_cron_gate_plugins(config)
     report = doctor_report(
         config,
         config_source=ctx.obj.get("config_source", ""),
@@ -3123,6 +3250,7 @@ def cron(ctx: click.Context, job_id: str) -> None:
         engine = None
         try:
             engine = await _start_one_shot_engine(config, db)
+            _load_cron_gate_plugins(config)
 
             if job_id:
                 from nerve.cron.service import CronService

@@ -67,11 +67,11 @@ export function StopSplitButton({ onStopTurn, hasContent, onStopAndSend }: {
         onClick={onStopTurn}
         aria-label="Stop the turn"
         title="Stop the turn (Esc)"
-        className="h-10 w-10 bg-error-solid hover:bg-error-solid/90 text-white rounded-l-xl inline-flex items-center justify-center cursor-pointer transition-colors"
+        className="h-8 w-8 bg-error-solid hover:bg-error-solid/90 text-white rounded-l-lg inline-flex items-center justify-center cursor-pointer transition-colors"
       >
         {stopping
-          ? <Loader2 size={16} className="motion-safe:animate-spin" aria-hidden="true" />
-          : <Square size={16} aria-hidden="true" />}
+          ? <Loader2 size={14} className="motion-safe:animate-spin" aria-hidden="true" />
+          : <Square size={14} aria-hidden="true" />}
       </button>
       <button
         ref={caretRef}
@@ -80,7 +80,7 @@ export function StopSplitButton({ onStopTurn, hasContent, onStopAndSend }: {
         aria-label="Stop options"
         title="Stop options"
         onClick={() => setOpen(v => !v)}
-        className="h-10 w-6 bg-error-solid hover:bg-error-solid/90 text-white rounded-r-xl border-l border-white/20 inline-flex items-center justify-center cursor-pointer transition-colors"
+        className="h-8 w-5 bg-error-solid hover:bg-error-solid/90 text-white rounded-r-lg border-l border-white/20 inline-flex items-center justify-center cursor-pointer transition-colors"
       >
         <ChevronUp size={14} aria-hidden="true" className={`transition-transform ${open ? 'rotate-180' : ''}`} />
       </button>

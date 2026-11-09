@@ -13,9 +13,20 @@ direct message, a mention of the agent, a reply in a thread that the agent
 takes part in, a reaction, an interaction, or a command. A mention of the
 agent carries the ``self`` flag, so intake needs no capabilities.
 
+An invoke event names the person that the gateway resolved from its author.
+In external mode, a message or reaction turn runs as that person, and an
+interaction answers its notification as that person. In local mode, the
+person is not a local actor, so the turn and the answer have no actor. When
+the author's linked person is the resolved person, its display name fills a
+missing name of that actor.
+
 Observe events go to the source inbox through ``router.observe`` under the
-provider's local source grant (for Slack, ``slack.source``). The display
-names in events are untrusted, so they can match only a deny rule.
+provider's local source grant (for Slack, ``slack.source``). With
+``gateway_grant`` on, the gateway's grant takes the place of an empty local
+allow list. The display names in events are untrusted, so they can match
+only a deny rule. The stored observation names the person that the gateway
+linked to the author, for attribution only: the sender rules do not see it,
+and it adds no actor.
 
 Outbound messages are contract operations on the connection that the
 conversation's latest accepted event came on, or on the only connection that
@@ -29,10 +40,12 @@ a send is a refusal, not a transport failure.
 Files go out through ``file_send``. The attachments of a message that starts
 a turn are read through ``file_read`` before the turn and use the
 self-hosted extraction rules. A notification is a message with one button
-for each answer. A button press arrives as an invoke ``interaction`` event:
-it answers the notification when the card was delivered in that
-conversation, and the ``interaction`` operation then replaces the card
-without its buttons.
+for each answer. It goes through ``notify``, and the gateway posts it in the
+notification channel that the control plane set for the agent. The config
+does not choose this conversation. A button press
+arrives as an invoke ``interaction`` event: it answers the notification when
+the card was delivered in that conversation, and the ``interaction``
+operation then replaces the card without its buttons.
 """
 
 from __future__ import annotations
@@ -47,6 +60,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping
 
+from nerve.agent.engine import NotAcceptingTurnsError
 from nerve.channels.access import Decision, Identity, PatternGate, needs_name_resolution
 from nerve.channels.base import (
     BaseChannel,
@@ -73,7 +87,9 @@ from nerve.channels.hosted.contract.model import (
     FileUpload,
     InteractionOperation,
     InteractionTarget,
+    LinkedPrincipal,
     MessageTarget,
+    NotifyOperation,
     Reaction,
     ReactionOperation,
     SendOperation,
@@ -173,6 +189,21 @@ def _why(error: Exception) -> str:
     return getattr(error, "detailed", None) or str(error)
 
 
+def _expected_card_failure(error: OperationFailed) -> bool:
+    """Whether a card that was not posted is logged at INFO, not as a warning.
+
+    The gateway refuses ``notify`` with ``invalid_target`` while the agent
+    has no notification channel, which is the default. For an ambiguous
+    outcome that Nerve decided, the operation runner already logged a
+    warning.
+    """
+    no_channel = (
+        error.kind == "notify" and error.outcome == "forbidden"
+        and error.reason_code == "invalid_target" and not error.local
+    )
+    return no_channel or (error.outcome == "ambiguous" and error.local)
+
+
 def _origin(event: Event) -> MessageTarget:
     """The full target of an event's message."""
     return MessageTarget(
@@ -181,6 +212,36 @@ def _origin(event: Event) -> MessageTarget:
         topic=event.topic,
         message=event.message,
     )
+
+
+def _linked_person(event: Event) -> LinkedPrincipal | None:
+    """The person that the gateway linked to the event's author, or ``None``.
+
+    The person is attribution only. A linked person that is not valid is
+    logged and gives ``None``.
+    """
+    author = event.author
+    if author is None or author.linked_principal is None:
+        return None
+    person = author.linked_person
+    if person is None:
+        logger.warning(
+            "Hosted event %s links its author to a person that is not valid, so it has no linked person",
+            event.event_id,
+        )
+    return person
+
+
+def _invoke_person_name(event: Event) -> str | None:
+    """The display name that an invoke event gives its resolved person, or ``None``.
+
+    Only a linked person with the resolved principal's ID gives a name. The
+    name is presentation text, never an identity key.
+    """
+    person = _linked_person(event)
+    if person is None or person.id != event.admission.invoke.resolved_principal_id:
+        return None
+    return person.display_name or None
 
 
 def _snoozed_until(notification: dict[str, Any]) -> str | None:
@@ -213,7 +274,6 @@ class HostedChannel(BaseChannel):
         operations: OperationRunner | None = None,
         reaction_names: Mapping[str, str] | None = None,
         notifications: Any | None = None,
-        notification_target: Callable[[NerveConfig], str | None] | None = None,
         button_style: Callable[[str], str] | None = None,
     ) -> None:
         self._provider = provider
@@ -223,10 +283,8 @@ class HostedChannel(BaseChannel):
         self._is_id = is_id
         self._operations = operations
         self._reaction_names = dict(reaction_names or {})
-        # The notification service, the choice of the notification
-        # conversation, and the style of an answer button.
+        # The notification service and the style of an answer button.
         self._notifications = notifications
-        self._notification_target = notification_target
         self._button_style = button_style or (lambda value: "")
         self._running = False
         # conversation -> the connection it last arrived on.
@@ -631,34 +689,59 @@ class HostedChannel(BaseChannel):
     ) -> tuple[str, str] | None:
         """Post a notification card: its text and one button for each option.
 
-        The card goes to the same conversation as with the self-hosted
-        channel. Returns ``(target, message_id)``, or ``None`` when there is
-        no such conversation or the send fails.
+        The card goes with ``notify``, and the gateway posts it in the
+        agent's notification channel, which an admin sets in the control
+        plane. The config does not choose the conversation. Nerve sends the
+        card only when exactly one connection advertises ``notify``. Returns
+        ``(target, message_id)``, where the target is the card's
+        conversation, or ``None`` when there is no conversation or the post
+        fails.
         """
-        config = self._config()
-        target = self._notification_target(config) if self._notification_target else None
-        if not target or not self.is_available:
+        if not self.is_available:
             return None
         actions = notification_actions(notification_id, options, self._button_style)
         try:
-            connection = await self._connection(target, "send")
+            connection = self._notify_connection()
+            if connection is None:
+                logger.debug(
+                    "Hosted %s notification %s has no conversation: no connection advertises notify",
+                    self._provider, notification_id,
+                )
+                return None
             result, body = await self._fitting(
-                "send", truncate_text(text, self._limits(connection).text_characters),
-                lambda body: self._perform(connection, "send", SendOperation(
-                    destination=container_for(target, None), content=_markdown(body) + actions,
-                )),
+                "notify", truncate_text(text, self._limits(connection).text_characters),
+                lambda body: self._perform(
+                    connection, "notify", NotifyOperation(content=_markdown(body) + actions),
+                ),
             )
         except OperationFailed as error:
-            logger.warning(
-                "Hosted %s notification %s was not posted: %s", self._provider, notification_id, _why(error),
-            )
+            log = logger.info if _expected_card_failure(error) else logger.warning
+            log("Hosted %s notification %s was not posted: %s", self._provider, notification_id, _why(error))
             return None
         located = result.target
+        conversation = located.conversation.id
         message_id = located.message.id
-        _remember(self._targets, (target, message_id), (connection, located), _TARGET_CACHE_MAX)
-        _remember(self._notification_texts, (target, message_id), body, _TARGET_CACHE_MAX)
-        self.remember_message(target, message_id, target, body)
-        return target, message_id
+        _remember(self._targets, (conversation, message_id), (connection, located), _TARGET_CACHE_MAX)
+        _remember(self._notification_texts, (conversation, message_id), body, _TARGET_CACHE_MAX)
+        self.remember_message(conversation, message_id, conversation, body)
+        return conversation, message_id
+
+    def _notify_connection(self) -> uuid.UUID | None:
+        """The only connection that advertises ``notify`` now, else ``None``.
+
+        It does not wait for a stream. The caller first makes sure that a
+        stream can send, and a gateway without ``notify`` never advertises
+        it. Raises :class:`OperationFailed` when several connections
+        advertise it, because Nerve cannot tell which connection the card
+        is for.
+        """
+        candidates = self._operations.streams.connections("notify") if self._operations else set()
+        if len(candidates) > 1:
+            raise OperationFailed(
+                "notify", "unavailable", "invalid_target", local=True,
+                detail=f"several {self._provider} connections advertise notify",
+            )
+        return next(iter(candidates), None)
 
     async def expire_notification(self, target: str, message_id: str, text: str) -> None:
         """Replace a notification card with *text* and no buttons."""
@@ -747,9 +830,16 @@ class HostedChannel(BaseChannel):
         """Whether the channel runs, is still switched on, and has room for a turn.
 
         The provider section is read per call, so turning the provider off
-        by a reload stops intake until it is turned on again.
+        by a reload stops intake until it is turned on again. Intake also
+        stops while the engine drains: the gateway keeps the events, and the
+        next start reads them.
         """
-        return self._running and self._switched_on() and len(self._inflight) < self._max_inflight
+        return (
+            self._running
+            and self._switched_on()
+            and len(self._inflight) < self._max_inflight
+            and self.router.accepting_turns
+        )
 
     async def deliver(self, event: Event) -> Disposition:
         """Dispatch one admitted event and say what happened to it."""
@@ -805,7 +895,6 @@ class HostedChannel(BaseChannel):
             "message_id": event.message.id,
             "author_id": event.author.id,
             "connection_id": str(event.connection_id),
-            "principal_id": str(event.admission.invoke.resolved_principal_id),
         }
         logger.info(
             "Hosted %s message in %s: %s", self._provider, target,
@@ -819,7 +908,12 @@ class HostedChannel(BaseChannel):
             sender_id=target,
             text=body if event.attachments else text,
             metadata=metadata,
-        ), event if event.attachments else None)
+            # Untrusted presentation text, for the origin of a new session.
+            conversation_title=(
+                event.conversation.display_name
+                if event.conversation.kind != "direct" else ""
+            ),
+        ), event, attachments=bool(event.attachments))
 
     async def _add_attachments(self, message: InboundMessage, event: Event) -> None:
         """Read the event's attachments into the message text and images."""
@@ -869,10 +963,15 @@ class HostedChannel(BaseChannel):
         key = (event.conversation.id, event.message.id)
         result: dict[str, Any] | None = None
         if self._notifications is not None:
+            answerer = await self.router.actor_for_principal(
+                event.admission.invoke.resolved_principal_id,
+                display_name=_invoke_person_name(event),
+            )
             try:
                 result = await self._notifications.answer_delivered_notification(
                     notification_id, answer,
                     channel=self._provider, target=event.conversation.id, actor=actor,
+                    answerer=answerer,
                 )
             except Exception as error:  # noqa: BLE001 - the row is read again later
                 logger.warning(
@@ -955,27 +1054,35 @@ class HostedChannel(BaseChannel):
             sender_id=target,
             text=f'[Reaction: {label} on message: "{snippet}"]',
             metadata={},
-        ))
+        ), event)
 
-    def _dispatch(self, message: InboundMessage, attachments: Event | None = None) -> Disposition:
+    def _dispatch(self, message: InboundMessage, event: Event, *, attachments: bool = False) -> Disposition:
         """Start the turn as a task. Acceptance does not wait for the turn.
 
-        With *attachments*, the task reads that event's attachments first.
+        The task first resolves the event's person into the message's actor.
+        With *attachments*, it also reads the event's attachments.
         """
         if not self.can_accept():
             return Disposition.deferred(f"{self._provider} has {len(self._inflight)} turns starting")
-        task = asyncio.create_task(self._run_turn(message, attachments))
+        task = asyncio.create_task(self._run_turn(message, event, attachments))
         self._inflight.add(task)
         task.add_done_callback(self._inflight.discard)
         return Disposition.accepted()
 
-    async def _run_turn(self, message: InboundMessage, attachments: Event | None = None) -> None:
+    async def _run_turn(self, message: InboundMessage, event: Event, attachments: bool) -> None:
         try:
-            if attachments is not None:
-                await self._add_attachments(message, attachments)
+            message.actor = await self.router.actor_for_principal(
+                event.admission.invoke.resolved_principal_id,
+                display_name=_invoke_person_name(event),
+            )
+            if attachments:
+                await self._add_attachments(message, event)
             await self.router.handle_message(message)
         except asyncio.CancelledError:
             raise
+        except NotAcceptingTurnsError:
+            # The stream adapter already sent the engine's error event.
+            logger.info("Draining: refused a hosted %s turn for %s", self._provider, message.sender_id)
         except Exception as error:  # noqa: BLE001 - one turn must not stop intake
             logger.error(
                 "Agent error for hosted %s target %s: %s",
@@ -1040,6 +1147,7 @@ class HostedChannel(BaseChannel):
                 allow=list(source.allow_senders),
                 deny=list(source.deny_senders),
             ),
+            gateway_grant=source.gateway_grant,
         )
         author = event.author
         verdict = policy.check(
@@ -1061,6 +1169,7 @@ class HostedChannel(BaseChannel):
             return Disposition.rejected("admission_rejected", "the message carries no text")
 
         thread_id = event.thread.id if event.thread is not None else ""
+        person = _linked_person(event)
         observed = ObservedMessage(
             channel_name=self._provider,
             channel_key=f"{self._provider}:{self._target(event)}",
@@ -1071,6 +1180,8 @@ class HostedChannel(BaseChannel):
             timestamp=event.occurred_at.astimezone(timezone.utc).isoformat(),
             conversation_title=event.conversation.display_name,
             sender_name=author.display_name if author else "",
+            principal_id=str(person.id) if person else "",
+            principal_name=person.display_name if person else "",
             metadata={
                 "thread_ts": thread_id,
                 "connection_id": str(event.connection_id),

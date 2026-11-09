@@ -14,6 +14,7 @@ outstanding page, and the separation from the web UI's own authentication.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from dataclasses import dataclass
@@ -461,6 +462,9 @@ class TestInvoke:
         assert (run["session_id"], run["user_message"], run["channel"]) == (
             mapping["session_id"], "what is on today?", "slack",
         )
+        # A direct conversation has no channel name.
+        session = await hosted.db.get_session(mapping["session_id"])
+        assert (session["trigger"], session["origin_detail"]) == ("slack", '{"channel": "D0DIRECT"}')
 
     async def test_a_mention_in_a_channel_roots_a_thread_session(self, hosted):
         stream = await hosted.stream()
@@ -472,8 +476,16 @@ class TestInvoke:
 
         await hosted.acknowledged(inbox_id)
         await hosted.turns.wait_for(1)
-        assert await hosted.db.get_channel_session("slack:C_FIXTURE_CHANNEL:1700000300.000100")
+        mapping = await hosted.db.get_channel_session("slack:C_FIXTURE_CHANNEL:1700000300.000100")
+        assert mapping
         assert hosted.turns.runs[0]["user_message"] == "summarize the deploys"
+        # The session's origin names the channel with its display name.
+        session = await hosted.db.get_session(mapping["session_id"])
+        assert session["trigger"] == "slack"
+        assert json.loads(session["origin_detail"]) == {
+            "channel": "C_FIXTURE_CHANNEL", "thread": "1700000300.000100",
+            "channel_name": "deployments",
+        }
 
     async def test_acceptance_does_not_wait_for_the_turn(self, hosted):
         hosted.turns.release.clear()
@@ -572,6 +584,26 @@ class TestInvoke:
 
         hosted.config.slack.enabled = True
         assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
+
+    async def test_a_draining_engine_stops_intake_and_the_event_stays_in_the_inbox(self, hosted):
+        stream = await hosted.stream()
+        await hosted.gateway.wait_for(lambda: len(hosted.gateway.reads) >= 1)
+        hosted.router.engine.accepting_turns = False
+        reads_before = len(hosted.gateway.reads)
+        inbox_id = hosted.gateway.store(message_event(
+            conversation="D0DIRECT", conversation_kind="direct", message_id="8.5",
+        ))
+
+        await stream.nudge("invoke")
+        await asyncio.sleep(0.3)
+        assert len(hosted.gateway.reads) == reads_before
+        assert inbox_id not in hosted.gateway.acknowledged
+        assert hosted.turns.runs == []
+
+        # The next start reads the event that the drain left in the inbox.
+        hosted.router.engine.accepting_turns = True
+        assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
+        await hosted.turns.wait_for(1)
 
     async def test_a_provider_off_before_the_first_stream_takes_events_once_turned_on(self, hosted):
         hosted.config.slack.enabled = False
@@ -695,6 +727,55 @@ class TestObserve:
 
         assert await hosted.acknowledged(invoke, observe) == {invoke: "accepted", observe: "rejected"}
         assert await hosted.db.read_channel_observations("slack") == []
+
+    async def test_the_gateway_grant_collects_every_channel_the_gateway_observes(
+        self, tmp_path, db, monkeypatch,
+    ):
+        hosted = await start_hosted(tmp_path, db, monkeypatch, allow_conversations=[], gateway_grant=True)
+        try:
+            stream = await hosted.stream()
+            inbox_id = hosted.gateway.store(message_event(
+                purpose="observe", text="deploy at noon", conversation="C_FIXTURE_UNLISTED",
+                message_id="1700001300.000100",
+            ))
+
+            await stream.nudge("observe")
+
+            assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
+            (runner,) = [
+                r for r in build_source_runners(hosted.config, hosted.db)
+                if r.source.source_name == "slack:observed"
+            ]
+            assert (await runner.run()).records_ingested == 1
+            record = await hosted.db.get_source_message(
+                "slack:observed", "C_FIXTURE_UNLISTED:1700001300.000100",
+            )
+            assert record["content"] == "deploy at noon"
+        finally:
+            await stop_hosted(hosted)
+
+    @pytest.mark.parametrize(("conversation", "kind", "deny"), [
+        ("C_FIXTURE_DENIED", "channel", ["C_FIXTURE_DENIED"]),
+        ("D0DIRECT", "direct", []),
+    ])
+    async def test_with_the_gateway_grant_denied_and_private_conversations_are_rejected(
+        self, tmp_path, db, monkeypatch, conversation, kind, deny,
+    ):
+        hosted = await start_hosted(
+            tmp_path, db, monkeypatch, allow_conversations=[], gateway_grant=True, deny_conversations=deny,
+        )
+        try:
+            stream = await hosted.stream()
+            inbox_id = hosted.gateway.store(message_event(
+                purpose="observe", conversation=conversation, conversation_kind=kind, message_id="1.6",
+            ))
+
+            await stream.nudge("observe")
+
+            assert (await hosted.acknowledged(inbox_id))[inbox_id] == "rejected"
+            assert await hosted.db.read_channel_observations("slack") == []
+        finally:
+            await stop_hosted(hosted)
 
 
 # ---------------------------------------------------------------------- #

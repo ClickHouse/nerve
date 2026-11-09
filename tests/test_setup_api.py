@@ -28,7 +28,7 @@ import yaml
 from fastapi import FastAPI
 
 from nerve import boot, config_reload, daemon, onboarding, setup_checks, setup_state, setup_telegram_login, setup_token
-from nerve.config import DEFAULT_CRON_MODEL, DEFAULT_EFFORT, DEFAULT_MODEL, NerveConfig, load_config, set_config
+from nerve.config import DEFAULT_CRON_MODEL, DEFAULT_EFFORT, DEFAULT_MODEL, NerveConfig, get_config, load_config, set_config
 from nerve.db import Database
 from nerve.gateway import server
 from nerve.gateway.auth import (
@@ -457,7 +457,10 @@ class TestModeLock:
         assert profile["quiet_is_default"] is True
         optional = {o["id"]: o for o in step(state, "automation")["detail"]["optional"]}
         assert (optional["task-planner"]["enabled"], optional["task-planner"]["default_enabled"]) == (False, False)
-        assert all(optional[i]["enabled"] and optional[i]["default_enabled"] for i in ("skill-extractor", "skill-reviser"))
+        assert all(
+            optional[i]["enabled"] and optional[i]["default_enabled"]
+            for i in ("skill-extractor", "skill-reviser", "machine-maintenance")
+        )
         assert statuses(state)["automation"] == "pending"
 
     async def test_bad_mode_is_a_field_error(self, claimed):
@@ -1358,8 +1361,9 @@ class TestAutomation:
         assert auto["status"] == "done"
         assert {o["id"]: o["enabled"] for o in auto["detail"]["optional"]} == {
             "inbox-processor": False, "task-planner": True, "skill-extractor": False, "skill-reviser": False,
+            "machine-maintenance": False,
         }
-        assert auto["summary"] == "1 of 4 optional jobs on"
+        assert auto["summary"] == "1 of 5 optional jobs on"
         assert "automation" in setup_state.load_state().answered
         text = (claimed.workspace / "config" / "cron" / "system.yaml").read_text()
         assert text.startswith("# Nerve — System Cron Jobs")
@@ -1367,7 +1371,9 @@ class TestAutomation:
     async def test_default_set_still_records_answered(self, claimed):
         choose(claimed, "personal")
         async with claimed.client() as http:
-            state = (await http.put("/api/setup/automation", json={"crons": ["inbox-processor", "task-planner"]})).json()
+            state = (await http.put("/api/setup/automation", json={
+                "crons": ["inbox-processor", "task-planner", "machine-maintenance"],
+            })).json()
         assert step(state, "automation")["status"] == "done"
 
     async def test_a_worker_can_switch_task_planner_on(self, claimed):
@@ -1376,11 +1382,11 @@ class TestAutomation:
         async with claimed.client() as http:
             before = step((await http.get("/api/setup")).json(), "automation")
             assert {o["id"]: o["default_enabled"] for o in before["detail"]["optional"]} == {
-                "task-planner": False, "skill-extractor": True, "skill-reviser": True,
+                "task-planner": False, "skill-extractor": True, "skill-reviser": True, "machine-maintenance": True,
             }
-            assert before["summary"] == "2 of 3 optional jobs on"
+            assert before["summary"] == "3 of 4 optional jobs on"
             state = (await http.put("/api/setup/automation", json={
-                "crons": ["task-planner", "skill-extractor", "skill-reviser"],
+                "crons": ["task-planner", "skill-extractor", "skill-reviser", "machine-maintenance"],
             })).json()
         auto = step(state, "automation")
         assert auto["status"] == "done"
@@ -2038,7 +2044,18 @@ class TestTheRestartStep:
         assert calls[0][0] == claimed.config_dir
         assert calls[0][1]["old_pid"] == os.getpid()
         assert calls[0][1]["delay_seconds"] == 0.75
+        assert calls[0][1]["drain_timeout_seconds"] == 0
         assert second.status_code == 409
+
+    async def test_helper_restart_waits_for_the_drain(self, claimed, monkeypatch):
+        await self._make_pending(claimed)
+        monkeypatch.setattr(get_config().gateway, "drain_timeout_seconds", 60)
+        calls = []
+        monkeypatch.setattr(daemon, "restart_daemon", lambda config_dir, **kw: calls.append(kw) or daemon.RestartOutcome("helper", "ok", kw.get("old_pid")))
+        async with claimed.client() as http:
+            body = (await http.post("/api/system/restart")).json()
+        assert body["mode"] == "restart" and body["timeout_hint_seconds"] == 180
+        assert calls[0]["drain_timeout_seconds"] == 60
 
     async def test_docker_exits_for_the_supervisor(self, claimed, monkeypatch):
         await self._make_pending(claimed)
@@ -2437,8 +2454,10 @@ def _onboarding_engine(db) -> MagicMock:
     engine.channel = lambda name: None
     engine.run = AsyncMock(return_value="")
 
-    async def _get_or_create(session_id, title=None, source="web", *, actor, cause=None):
-        await db.create_session(session_id, title=title, source=source, actor=actor, cause=cause)
+    async def _get_or_create(session_id, title=None, source="web", *, actor, cause=None, origin=None):
+        await db.create_session(
+            session_id, title=title, source=source, actor=actor, cause=cause, origin=origin,
+        )
         return await db.get_session(session_id)
 
     engine.sessions.get_or_create = _get_or_create

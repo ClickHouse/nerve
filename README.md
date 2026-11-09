@@ -84,7 +84,7 @@ The mode is chosen on the setup page: run `nerve init`, open the page it
 prints, and pick **Worker** on the Mode step. When you finish setup, the agent
 opens its onboarding conversation: it starts from the note you left on the Mode
 step (or asks what to work on), studies the repositories and sources in the
-background while it asks you the few things only you know, proposes the setup
+background, then asks you the few things only you know, proposes the setup
 as a plan you approve, edit or send back, and applies it. The same choice in a terminal is
 `nerve init --terminal`; unattended installs set `NERVE_MODE=worker` and
 `NERVE_TASK`. Without the browser, a worker with a task description sets
@@ -159,7 +159,7 @@ Scheduled AI sessions via APScheduler. Three session modes:
 | **Persistent** | Accumulates context across runs. Optional rotation to manage token usage. Reminder mode for lightweight follow-ups. |
 | **Main** | Runs inside the user's primary conversation — full context access. |
 
-Built-in crons (personal mode): `skill-extractor` (12h), `skill-reviser` (weekly), `inbox-processor` (30min), `task-planner` (4h). Worker mode ships with `skill-reviser` and `skill-extractor` on and `task-planner` off; onboarding enables `task-planner` when the worker should plan through the approval loop, and configures the worker's own crons.
+Built-in crons (personal mode): `skill-extractor` (12h), `skill-reviser` (weekly), `inbox-processor` (30min), `task-planner` (4h), `machine-maintenance` (weekly). Worker mode ships with `skill-reviser`, `skill-extractor` and `machine-maintenance` on and `task-planner` off; onboarding enables `task-planner` when the worker should plan through the approval loop, and configures the worker's own crons.
 
 ### 📡 Source Sync
 

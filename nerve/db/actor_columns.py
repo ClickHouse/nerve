@@ -48,4 +48,7 @@ ACTOR_COLUMNS: tuple[tuple[str, str], ...] = (
     ("session_agents", "stopped_by_actor_id"),
     ("session_agents", "stopped_caused_by_actor_id"),
     ("onboarding", "actor_id"),
+    ("task_comments", "actor_id"),
+    ("task_comments", "caused_by_actor_id"),
+    ("push_subscriptions", "actor_id"),
 )

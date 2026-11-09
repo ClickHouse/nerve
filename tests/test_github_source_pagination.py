@@ -56,26 +56,32 @@ def _install_fake_gh(monkeypatch, state: dict[str, dict], between_pages=None) ->
     ``between_pages(state)`` runs once, after the first page of the first call.
     ``--paginate`` follows every page, otherwise only the first is returned.
     ``--jq '.[]'`` prints one object per line, ``--jq .`` one array per page.
+    ``participating=true`` leaves out a thread marked ``_participating: False``,
+    as GitHub leaves out a thread the account takes no part in.
     """
     hook = [between_pages]
 
-    def listed(since: str) -> list[dict]:
-        threads = [t for t in state.values() if t["_k"] >= since]
+    def listed(since: str, participating: bool) -> list[dict]:
+        threads = [
+            t for t in state.values()
+            if t["_k"] >= since and (t.get("_participating", True) or not participating)
+        ]
         return sorted(threads, key=lambda t: (t["_k"], t["id"]), reverse=True)
 
     async def fake_exec(*argv, **kwargs):
         query = parse_qs(urlsplit(argv[2]).query)
         since = query["since"][0]
+        participating = query.get("participating") == ["true"]
         per_page = min(int(query.get("per_page", [_PAGE_SIZE])[0]), _PAGE_SIZE)
 
         pages = []
         offset = 0
         while True:
-            current = listed(since)
+            current = listed(since, participating)
             page = current[offset:offset + per_page]
             if not page:
                 break
-            pages.append([{k: v for k, v in t.items() if k != "_k"} for t in page])
+            pages.append([{k: v for k, v in t.items() if not k.startswith("_")} for t in page])
             has_next = len(current) > offset + per_page
             if hook[0] is not None:
                 hook[0](state)
@@ -96,8 +102,8 @@ def _install_fake_gh(monkeypatch, state: dict[str, dict], between_pages=None) ->
     )
 
 
-def _source(monkeypatch) -> GitHubSource:
-    src = GitHubSource()
+def _source(monkeypatch, config: dict | None = None) -> GitHubSource:
+    src = GitHubSource(config)
 
     async def no_enrich(notif, sem):
         return {}
@@ -127,6 +133,53 @@ async def test_the_listing_asks_for_read_threads_too(monkeypatch):
     assert query["all"] == ["true"]
     assert query["participating"] == ["true"]
     assert "since" in query
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("config", "endpoint"), [
+    (None, f"notifications?since={_ts(0)}&participating=true&all=true"),
+    ({"inbox": "participating"}, f"notifications?since={_ts(0)}&participating=true&all=true"),
+    ({"inbox": "all"}, f"notifications?since={_ts(0)}&all=true"),
+])
+async def test_the_inbox_setting_decides_whether_only_participating_threads_are_listed(
+    monkeypatch, config, endpoint,
+):
+    """``sync.github.inbox: all`` leaves out ``participating=true`` and keeps
+    ``since`` and ``all=true`` as they are; the default listing is unchanged."""
+    argv_seen: list[tuple] = []
+
+    async def fake_exec(*argv, **kwargs):
+        argv_seen.append(argv)
+        return _FakeProc(b"")
+
+    monkeypatch.setattr("nerve.sources.github.asyncio.create_subprocess_exec", fake_exec)
+
+    await _source(monkeypatch, config).fetch(_ts(0), limit=30)
+
+    assert [argv[2] for argv in argv_seen] == [endpoint]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("inbox", "reasons"), [
+    ("participating", {"mine": "mention"}),
+    ("all", {"mine": "mention", "watched": "subscribed"}),
+])
+async def test_a_new_pull_request_in_a_watched_repository_arrives_with_inbox_all(
+    monkeypatch, inbox, reasons,
+):
+    """GitHub files a pull request that someone else opens in a repository the
+    account watches under ``subscribed``, which a participating listing leaves
+    out. With ``inbox: all`` it arrives, its reason there for the guardrail."""
+    mine = _thread("mine", 0)
+    watched = _thread("watched", 60)
+    watched.update(reason="subscribed", _participating=False)
+    watched["subject"]["type"] = "PullRequest"
+    _install_fake_gh(monkeypatch, {t["id"]: t for t in (mine, watched)})
+    src = _source(monkeypatch, {"inbox": inbox})
+
+    result = await src.fetch(_ts(-10), limit=30)
+
+    assert {r.id: r.metadata["reason"] for r in result.records} == reasons
 
 
 @pytest.mark.asyncio

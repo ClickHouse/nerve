@@ -21,7 +21,9 @@ from typing import TYPE_CHECKING, Any
 
 from nerve.identity import actor_id_of, attribution_for
 from nerve.notifications import handlers as _handlers
+from nerve.notifications import webpush
 from nerve.notifications.date_render import render_iso_dates
+from nerve.notifications.quiet_hours import deliver_silently
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -270,6 +272,8 @@ class NotificationService:
         Args:
             channels: Override default notification channels (e.g. ["telegram"]).
             silent: If True, deliver without sound (Telegram disable_notification).
+                During quiet hours the fan-out does this for each item that
+                is not ``urgent``.
             force: If True, bypass silence matching and deliver normally.
                 A forced send that *still* matched a rule is delivered but
                 stamped + counted as an override for audit.
@@ -477,11 +481,13 @@ class NotificationService:
         channel: str,
         target: str,
         actor: str | None = None,
+        answerer: Actor | None = None,
     ) -> dict[str, Any] | None:
         """Answer an explicit notification within its delivery scope.
 
-        The post-answer row lets an adapter render the result without reaching
-        through the service to its database.
+        ``actor`` and ``answerer`` have the meaning that they have in
+        :meth:`handle_answer`. The post-answer row lets an adapter render the
+        result without reaching through the service to its database.
         """
         delivery = await self.db.get_notification_delivery(
             notification_id, channel, target,
@@ -493,6 +499,7 @@ class NotificationService:
             answer,
             answered_by=channel,
             actor=actor,
+            answerer=answerer,
         )
         if not accepted:
             return None
@@ -534,12 +541,13 @@ class NotificationService:
         ``answered_by`` identifies the transport; ``actor`` identifies the
         person within that transport and is retained for audit.
         ``answerer`` is the person who answered: the signed-in actor of the
-        web answer route. A channel answer names a provider user and no
-        person, so it passes ``None``. The row records the answerer in
-        ``answered_by_actor_id``; the answer relayed into the asking session
-        is a message written by the answerer, and the agent's work in that
-        turn has the session's cause; an approval dispatcher receives the
-        answerer as its ``actor``.
+        web answer route, or the person that a channel gateway resolved for
+        a hosted channel answer. A self-hosted channel answer names a
+        provider user and no person, so it passes ``None``. The row records
+        the answerer in ``answered_by_actor_id``; the answer relayed into the
+        asking session is a message written by the answerer, and the agent's
+        work in that turn has the session's cause; an approval dispatcher
+        receives the answerer as its ``actor``.
 
         - For ``type=approval`` rows: claim the row, look up the
           dispatcher in the handler registry, run it, audit-log the
@@ -551,6 +559,10 @@ class NotificationService:
           inject it back into the originating session, broadcast.
         - Fire-and-forget ``type=notify`` rows do not flow through this
           method; the dismiss endpoint handles those.
+
+        Raises:
+            NotAcceptingTurnsError: a question answer while the engine
+                drains. The question stays pending.
         """
         notif = await self.db.get_notification(notification_id)
         if not notif or notif["status"] != "pending":
@@ -561,18 +573,7 @@ class NotificationService:
                 notif, answer, answered_by, actor, answerer=answerer,
             )
 
-        success = await self.db.answer_notification(
-            notification_id, answer, answered_by, actor=actor,
-            attribution=attribution_for(answerer),
-        )
-        if not success:
-            return False
-
         session_id = notif["session_id"]
-        answerer_id = actor_id_of(answerer)
-        attribution = {"answered_by_actor": actor} if actor else {}
-
-        from nerve.agent.streaming import broadcaster
 
         # External (satellite) sessions are MCP-driven by an outside agent
         # (Codex, Claude Code, ...). Nerve doesn't own their conversation
@@ -584,6 +585,26 @@ class NotificationService:
             session_record and session_record.get("source") == "external"
         )
 
+        # During a drain the turn that delivers the answer is refused. Keep
+        # the question pending, so the person can answer after the restart.
+        if not is_external and not self.engine.accepting_turns:
+            from nerve.agent.engine import NotAcceptingTurnsError
+
+            raise NotAcceptingTurnsError()
+
+        success = await self.db.answer_notification(
+            notification_id, answer, answered_by, actor=actor,
+            attribution=attribution_for(answerer),
+        )
+        if not success:
+            return False
+
+        answerer_id = actor_id_of(answerer)
+        attribution = {"answered_by_actor": actor} if actor else {}
+        answered_at = await self._answered_at(notification_id)
+
+        from nerve.agent.streaming import broadcaster
+
         if is_external:
             await broadcaster.broadcast("__global__", {
                 "type": "notification_answered",
@@ -591,6 +612,7 @@ class NotificationService:
                 "session_id": session_id,
                 "answer": answer,
                 "answered_by": answered_by,
+                "answered_at": answered_at,
                 "actor_id": answerer_id,
                 **attribution,
             })
@@ -639,11 +661,17 @@ class NotificationService:
             "session_id": session_id,
             "answer": answer,
             "answered_by": answered_by,
+            "answered_at": answered_at,
             "actor_id": answerer_id,
             **attribution,
         })
 
         return True
+
+    async def _answered_at(self, notification_id: str) -> str | None:
+        """The stored answer time of a row, for the answer broadcast."""
+        row = await self.db.get_notification(notification_id)
+        return row.get("answered_at") if row else None
 
     async def _handle_approval_answer(
         self,
@@ -806,6 +834,8 @@ class NotificationService:
         }
         if snoozed:
             payload["snooze_until"] = snooze_until
+        else:
+            payload["answered_at"] = await self._answered_at(notification_id)
         await broadcaster.broadcast("__global__", payload)
 
         return True
@@ -956,8 +986,23 @@ class NotificationService:
 
         ``plan_id`` names the plan of a ``notify`` row. Telegram adds an
         "Open plan" button for it.
+
+        Without ``channels`` the configured list goes out, with the panel
+        in it (:meth:`NotificationsConfig.delivery_channels`), and Web Push
+        to the browsers that turned it on (:func:`webpush.deliver`). A channel whose
+        ``notifications.levels`` entry is ``important`` skips an item below
+        that level (:meth:`NotificationsConfig.wants`).
+
+        During quiet hours an item that is not ``urgent`` goes out without
+        sound (:func:`deliver_silently`): Telegram gets
+        ``disable_notification`` and the web event gets ``silent: true``.
         """
-        target_channels = channels or self.config.notifications.channels
+        silent = silent or deliver_silently(self.config, priority)
+        settings = self.config.notifications
+        target_channels = [
+            name for name in (channels or [*settings.delivery_channels(), webpush.PUSH_CHANNEL])
+            if settings.wants(name, notif_type, priority)
+        ]
 
         async def _deliver(channel_name: str) -> str | None:
             """Deliver to a single channel, return name on success."""
@@ -967,7 +1012,7 @@ class NotificationService:
                         notification_id, session_id, notif_type,
                         title, body, priority, options,
                         option_labels=option_labels,
-                        extra=extra_web,
+                        extra={**(extra_web or {}), "silent": True} if silent else extra_web,
                     )
                     await self.db.record_notification_delivery(
                         notification_id, "web",
@@ -995,6 +1040,13 @@ class NotificationService:
                     if not msg_id:
                         return None
                     return "slack"
+                elif channel_name == webpush.PUSH_CHANNEL:
+                    pushed = await webpush.deliver(
+                        self.db, self.config, notification_id=notification_id,
+                        notif_type=notif_type, title=title, body=body,
+                        priority=priority, silent=silent,
+                    )
+                    return webpush.PUSH_CHANNEL if pushed else None
                 else:
                     logger.warning(
                         "notifications.channels names %r, which nothing "
@@ -1526,7 +1578,12 @@ class NotificationService:
         gets an ``approval-expired`` event (approvals), the web UI gets
         a ``notification_expired`` broadcast, and the Telegram card is
         edited to show it expired. ``notify``-kind expiry stays silent.
+
+        Does nothing while the engine drains: the turn with the note would
+        be refused. The sweep after the restart expires the rows.
         """
+        if not self.engine.accepting_turns:
+            return 0
         rows = await self.db.expire_due_notifications()
         if rows:
             await self._report_expired(rows)

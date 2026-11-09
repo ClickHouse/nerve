@@ -36,8 +36,8 @@ _REAL_GITHUB_CLI = env._github_cli
 
 LABELS = [
     "Mode", "Workspace", "Configuration", "Model", "Memory", "GitHub token",
-    "GitHub CLI (`gh`)", "GitHub sync source", "Slack", "Telegram channel",
-    "Telegram message sync", "Gmail", "Time zone", "Quiet hours",
+    "GitHub CLI (`gh`)", "GitHub sync source", "GitHub repository watch", "Slack",
+    "Telegram channel", "Telegram message sync", "Gmail", "Time zone", "Quiet hours",
 ]
 NONE_KNOWN = "GitHub access: none known — clone public URLs only; report what needs a credential."
 ACCESS_UNKNOWN = (
@@ -132,6 +132,7 @@ class TestNothingConfigured:
         assert lines["GitHub token"] == "none in Nerve's configuration or environment"
         assert lines["GitHub CLI (`gh`)"] == "not installed"
         assert lines["GitHub sync source"] == "off"
+        assert lines["GitHub repository watch"] == "off"
         assert lines["Slack"] == "not configured"
         assert lines["Telegram channel"] == "not configured"
         assert lines["Telegram message sync"] == "off"
@@ -287,13 +288,59 @@ class TestConnections:
         assert lines["Telegram message sync"] == f"on (API credentials {here} and from the environment)"
         assert lines["Gmail"] == "2 accounts, sync on"
         assert lines["GitHub sync source"] == (
-            "on: notifications from `org/repo-a`, `org/repo-b`; new issues and pull requests in "
+            "on: notifications of the threads the account takes part in (inbox `participating`), "
+            "only from `org/repo-a`, `org/repo-b`"
+        )
+        assert lines["GitHub repository watch"] == (
+            "on (polled here with `gh`): new pull requests and issues in "
             "`org/repo-c`, `org/repo-d`, `org/repo-e`, `org/repo-f`, `org/repo-g` and 1 more"
         )
         for secret in SECRETS:
             assert secret not in facts.section, secret
             assert secret[-4:] not in facts.section, secret
         assert "@example.com" not in facts.section, "Gmail is a count, not the addresses"
+
+    @pytest.mark.parametrize(("inbox", "line"), [
+        ("participating", "notifications of the threads the account takes part in (inbox `participating`)"),
+        ("all", "the account's whole notification inbox (inbox `all`)"),
+    ])
+    def test_the_github_line_names_the_inbox_and_says_when_no_repository_filter_is_set(
+        self, tmp_path, inbox, line,
+    ):
+        """An empty ``allow_repos`` is no repository filter on the account's
+        notifications, not a watch of every repository."""
+        config_dir, ws = _install(tmp_path)
+        merge_settings_paths(ws, {"sync.github.enabled": True, "sync.github.inbox": inbox})
+
+        lines = _lines(env.gather(load_config(config_dir), ws).section)
+
+        assert lines["GitHub sync source"] == f"on: {line}, with no repository filter"
+        assert "all repositories" not in lines["GitHub sync source"]
+
+    def test_the_repository_watch_line_says_who_polls_what_and_where(self, tmp_path):
+        config_dir, ws = _install(tmp_path)
+        merge_settings_paths(ws, {
+            "sync.github.mode": "hosted",
+            "sync.github_repos.enabled": True,
+            "sync.github_repos.repos": ["acme/widgets"],
+            "sync.github_repos.types": ["release", "pull_request", "issue"],
+            "sync.github_repos.updates": True,
+        })
+
+        lines = _lines(env.gather(load_config(config_dir), ws).section)
+
+        assert lines["GitHub repository watch"] == (
+            "on (the channel gateway polls): new pull requests, issues and releases in `acme/widgets`; "
+            "also new commits, ready for review, merges and closes of the pull requests it reported"
+        )
+
+    def test_a_repository_watch_without_repositories_says_so(self, tmp_path):
+        config_dir, ws = _install(tmp_path)
+        merge_settings_paths(ws, {"sync.github_repos.enabled": True, "sync.github_repos.types": ["release"]})
+
+        lines = _lines(env.gather(load_config(config_dir), ws).section)
+
+        assert lines["GitHub repository watch"] == "on, but no repositories are listed"
 
     def test_half_a_slack_setup_is_not_configured(self, tmp_path):
         config_dir, ws = _install(tmp_path)

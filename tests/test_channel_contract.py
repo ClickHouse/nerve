@@ -8,6 +8,7 @@ reads, the values that it branches on, and its size bounds.
 from __future__ import annotations
 
 import copy
+import dataclasses
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -16,18 +17,21 @@ from typing import Any
 import pytest
 
 from nerve.channels.hosted.contract import (
+    AuthorReference,
     Drain,
     Envelope,
     Heartbeat,
     InboxAck,
     InboxAckItem,
     InboxRead,
+    LinkedPrincipal,
     MetadataEntry,
     Negotiation,
     Operation,
     OperationResult,
     Payload,
     Rejected,
+    RepoWatch,
     SourceFilters,
     SourceSubscription,
     Subscriptions,
@@ -54,6 +58,7 @@ from nerve.channels.hosted.contract.model import (
     MessageContainer,
     MessageReference,
     MessageTarget,
+    NotifyOperation,
     Reaction,
     ReactionOperation,
     SendOperation,
@@ -63,6 +68,7 @@ from nerve.channels.hosted.contract.model import (
     TypingOperation,
 )
 from nerve.channels.hosted.contract.model import MAX_TEXT_BYTES
+from nerve.channels.hosted.contract.wire import dumps
 from nerve.channels.hosted.runtime import RECEIVE_LIMITS
 from tests.fake_channel_gateway import (
     CONNECTION_ID,
@@ -214,6 +220,84 @@ class TestInboxPages:
         validate_inbox_read_result(InboxRead(maximum_events=1, maximum_bytes=16384), result, 20000)
 
 
+PERSON_ID = "40306775-652f-4543-b432-4cb8ec5250c3"
+
+
+def linked(event: dict[str, Any], person: Any) -> dict[str, Any]:
+    event["author"]["linked_principal"] = person
+    return event
+
+
+def author_of(value: dict[str, Any]) -> AuthorReference:
+    return decode(value).body.events[0].author
+
+
+class TestLinkedPrincipal:
+    """The person that the gateway linked to the author: attribution only."""
+
+    @pytest.mark.parametrize("purpose", ["invoke", "observe"])
+    def test_a_linked_person_decodes(self, purpose):
+        event = direct_message() if purpose == "invoke" else message_event(purpose="observe")
+        event = linked(event, {"id": PERSON_ID, "display_name": "Ada Lovelace"})
+
+        author = author_of(page(event))
+
+        assert author.linked_person == LinkedPrincipal(id=uuid.UUID(PERSON_ID), display_name="Ada Lovelace")
+        assert (author.id, author.display_name) == ("U_FIXTURE_MEMBER", "Example Member")
+
+    def test_an_event_from_an_older_gateway_has_no_linked_person(self):
+        author = author_of(page(message_event(purpose="observe")))
+
+        assert (author.linked_principal, author.linked_person) == (None, None)
+
+    @pytest.mark.parametrize("person", [
+        {"id": PERSON_ID},
+        {"id": PERSON_ID, "display_name": ""},
+        {"id": PERSON_ID, "display_name": "é" * 128},
+        {"id": PERSON_ID, "display_name": "Ada", "email": "ada@example.com"},
+    ], ids=["no_name", "empty_name", "name_at_the_limit", "unknown_member"])
+    def test_a_linked_person_that_the_gateway_takes_is_kept(self, person):
+        author = author_of(page(linked(direct_message(), person)))
+
+        assert author.linked_person is not None
+        assert author.linked_person.id == uuid.UUID(PERSON_ID)
+
+    @pytest.mark.parametrize("person", [
+        {"id": "00000000-0000-0000-0000-000000000000", "display_name": "Ada"},
+        {"display_name": "Ada"},
+        {},
+        {"id": PERSON_ID, "display_name": "é" * 128 + "a"},
+        {"id": PERSON_ID, "display_name": "   "},
+        {"id": PERSON_ID, "display_name": "Ada\nLovelace"},
+    ], ids=["nil_id", "no_id", "empty", "name_above_the_limit", "blank_name", "control_character"])
+    def test_a_linked_person_that_is_not_valid_is_no_linked_person(self, person):
+        event = decode(page(linked(message_event(purpose="observe"), person))).body.events[0]
+
+        assert event.author.linked_principal is not None
+        assert event.author.linked_person is None
+        assert event.author.id == "U_FIXTURE_MEMBER"
+
+    @pytest.mark.parametrize("person", [
+        PERSON_ID,
+        {"id": "not-a-uuid"},
+        {"id": 7},
+        {"id": PERSON_ID, "display_name": 7},
+    ], ids=["not_an_object", "id_not_a_uuid", "id_not_a_string", "name_not_a_string"])
+    def test_a_member_of_another_type_is_malformed(self, person):
+        assert reason(page(linked(direct_message(), person))) == "malformed_frame"
+
+    def test_the_member_changes_nothing_else_that_nerve_reads(self):
+        plain = message_event(purpose="observe")
+        with_person = linked(copy.deepcopy(plain), {"id": PERSON_ID, "display_name": "Ada Lovelace"})
+
+        without, linked_event = (decode(page(event)).body.events[0] for event in (plain, with_person))
+
+        assert linked_event.author.linked_principal is not None
+        assert dataclasses.replace(linked_event, author=dataclasses.replace(
+            linked_event.author, linked_principal=None,
+        )) == without
+
+
 class TestOperationResults:
     SEND = Operation(kind="send", deadline_millis=30000, send=SendOperation())
     READ = Operation(kind="file_read", deadline_millis=30000, file_read=FileReadOperation(length_bytes=10))
@@ -241,6 +325,50 @@ class TestOperationResults:
         assert self.refused(self.SEND, kind="send", outcome="succeeded") == "malformed_frame"
         assert self.refused(self.READ, kind="file_read", outcome="succeeded") == "malformed_frame"
         validate_operation_result(self.SEND, self.result(kind="send", outcome="forbidden"))
+
+    NOTIFY = Operation(kind="notify", deadline_millis=30000, notify=NotifyOperation())
+    NOTIFY_TARGET: dict[str, Any] = {"conversation": {"id": "C0NOTICES"}, "message": {"id": "1.2"}}
+
+    def test_a_successful_notify_names_the_conversation_that_the_gateway_chose(self):
+        result = self.result(kind="notify", outcome="succeeded", target=self.NOTIFY_TARGET)
+
+        validate_operation_result(self.NOTIFY, result)
+        assert (result.target.conversation.id, result.target.message.id) == ("C0NOTICES", "1.2")
+        assert self.refused(self.NOTIFY, kind="send", outcome="succeeded", target=self.NOTIFY_TARGET) == (
+            "scope_mismatch"
+        )
+        validate_operation_result(
+            self.NOTIFY, self.result(kind="notify", outcome="forbidden", reason_code="invalid_target"),
+        )
+
+    def test_a_notify_message_may_root_its_own_thread(self):
+        target = {**self.NOTIFY_TARGET, "thread": {"id": "1.2"}}
+
+        validate_operation_result(self.NOTIFY, self.result(kind="notify", outcome="succeeded", target=target))
+
+    def test_a_successful_notify_needs_a_target(self):
+        assert self.refused(self.NOTIFY, kind="notify", outcome="succeeded") == "malformed_frame"
+
+    @pytest.mark.parametrize(("change", "expected"), [
+        ({"message": {}}, "malformed_frame"),
+        ({"message": {"id": ""}}, "malformed_frame"),
+        ({"message": {"id": "1" * 257}}, "malformed_frame"),
+        ({"message": {"id": "1.\x072"}}, "malformed_frame"),
+        ({"message": {"id": "   "}}, "malformed_frame"),
+        ({"conversation": {}}, "malformed_frame"),
+        ({"conversation": {"id": "C0NOTICES", "kind": "channel"}}, "malformed_frame"),
+        ({"conversation": {"id": "C0NOTICES", "display_name": "notices"}}, "malformed_frame"),
+        ({"thread": {"id": ""}}, "malformed_frame"),
+        ({"thread": {"id": "1.1"}}, "scope_mismatch"),
+        ({"topic": {"id": "T1"}}, "scope_mismatch"),
+    ], ids=[
+        "no_message", "empty_message", "long_message", "control_character", "blank_message", "no_conversation",
+        "conversation_kind", "conversation_name", "empty_thread", "another_thread", "topic",
+    ])
+    def test_a_notify_target_that_the_gateway_would_refuse_is_refused(self, change, expected):
+        target = {**self.NOTIFY_TARGET, **change}
+
+        assert self.refused(self.NOTIFY, kind="notify", outcome="succeeded", target=target) == expected
 
     def test_results_and_transfers_name_their_connection(self):
         assert reason(frame("operation_result", {"kind": "send", "outcome": "forbidden"})) == "scope_mismatch"
@@ -310,6 +438,17 @@ SENT: list[tuple[str, Any, dict[str, Any]]] = [
             }]}},
         ],
     }}),
+    ("operation", Operation(kind="notify", deadline_millis=10000, notify=NotifyOperation(content=(
+        ContentPart(kind="text", text=TextContent(format="markdown", body="Deploy now?")),
+        ContentPart(kind="actions", actions=ActionsContent(elements=(
+            ActionElement(kind="button", action_id="notif:n1:yes", label="Yes", value="yes"),
+        ))),
+    ))), {"kind": "notify", "deadline_millis": 10000, "notify": {"content": [
+        {"kind": "text", "text": {"format": "markdown", "body": "Deploy now?"}},
+        {"kind": "actions", "actions": {"elements": [
+            {"kind": "button", "action_id": "notif:n1:yes", "label": "Yes", "value": "yes"},
+        ]}},
+    ]}}),
     ("operation", Operation(kind="edit", deadline_millis=30000, edit=EditOperation(
         target=MESSAGE, content=(ContentPart(kind="text", text=TextContent(format="markdown", body="Done")),),
     )), {"kind": "edit", "deadline_millis": 30000, "edit": {
@@ -537,6 +676,28 @@ class TestSubscriptions:
         assert wide.sources == (SourceSubscription(provider="github", filters=SourceFilters(), pr_watch=True),)
         wide.validate()
 
+    def test_an_inbox_is_sent_as_its_sources_inbox_member_and_left_out_when_empty(self):
+        def sent(source: SourceSubscription) -> dict[str, Any]:
+            body = Subscriptions(version="1", sources=(source,))
+            envelope = Envelope(version="1", kind="subscriptions", request_id="o-2", payload=Payload(subscriptions=body))
+            return json.loads(encode_envelope(envelope))["payload"]["subscriptions"]["sources"][0]
+
+        assert sent(SourceSubscription(provider="github", inbox="all")) == {
+            "provider": "github", "filters": {}, "inbox": "all",
+        }
+        assert sent(SourceSubscription(provider="github")) == {"provider": "github", "filters": {}}
+
+    @pytest.mark.parametrize("inbox", ["", "participating", "all"])
+    def test_an_inbox_the_gateway_takes_is_valid(self, inbox):
+        Subscriptions(version="1", sources=(SourceSubscription(provider="github", inbox=inbox),)).validate()
+
+    def test_without_filters_keeps_the_inbox(self):
+        narrow = Subscriptions(version="1", sources=(
+            SourceSubscription(provider="github", filters=SourceFilters(allow_repos=("owner/*",)), inbox="all"),
+        ))
+
+        assert narrow.without_filters().sources == (SourceSubscription(provider="github", inbox="all"),)
+
     @pytest.mark.parametrize(("subscriptions", "expected"), [
         (Subscriptions(version="2"), "version_unsupported"),
         (Subscriptions(version="1", sources=(SourceSubscription(provider="github"),) * 17), "limit_exceeded"),
@@ -550,6 +711,8 @@ class TestSubscriptions:
         (Subscriptions(version="1", sources=(SourceSubscription(provider="git hub"),)), "malformed_frame"),
         (Subscriptions(version="1", sources=(SourceSubscription(provider="gitlab/self"),)), "malformed_frame"),
         (Subscriptions(version="1", sources=(SourceSubscription(provider="g" * 65),)), "limit_exceeded"),
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="github", inbox="mentions"),)), "malformed_frame"),
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="github", inbox="All"),)), "malformed_frame"),
     ])
     def test_the_gateways_bounds_are_checked_before_sending(self, subscriptions, expected):
         with pytest.raises(Rejected) as error:
@@ -568,3 +731,87 @@ class TestSubscriptions:
 
     def test_the_gateway_never_sends_subscriptions(self):
         assert reason(frame("subscriptions", {"version": "1"})) == "kind_unsupported"
+
+
+def repo_watch(*repos: RepoWatch, **source: Any) -> Subscriptions:
+    """A github_repos subscription of *repos* (one default repository without)."""
+    return Subscriptions(version="1", sources=(
+        SourceSubscription(provider="github_repos", repos=repos or (watched(),), **source),
+    ))
+
+
+def watched(name: str = "acme/widgets", **settings: Any) -> RepoWatch:
+    return RepoWatch(**{"name": name, "types": ("pull_request", "issue"), "include_drafts": True, **settings})
+
+
+class TestRepositoryWatch:
+    def test_every_member_of_a_watched_repository_is_sent(self):
+        body = repo_watch(watched(deny_authors=("noisy-*",)), watched("other-org/other-repo", updates=True))
+        envelope = Envelope(version="1", kind="subscriptions", request_id="o-2", payload=Payload(subscriptions=body))
+
+        value = json.loads(encode_envelope(envelope))
+
+        assert value["payload"]["subscriptions"]["sources"] == [{
+            "provider": "github_repos",
+            "filters": {},
+            "repos": [
+                {"name": "acme/widgets", "types": ["pull_request", "issue"], "include_bots": False,
+                 "include_drafts": True, "updates": False, "deny_authors": ["noisy-*"]},
+                {"name": "other-org/other-repo", "types": ["pull_request", "issue"], "include_bots": False,
+                 "include_drafts": True, "updates": True, "deny_authors": []},
+            ],
+        }]
+
+    def test_a_github_subscription_sends_no_repos_member(self):
+        assert dumps(github_subscription()) == (
+            '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true}]}'
+        )
+
+    def test_a_watch_the_gateway_takes_is_valid(self):
+        Subscriptions(version="1", sources=(
+            SourceSubscription(provider="github", pr_watch=True, inbox="all"),
+            SourceSubscription(provider="github_repos", repos=tuple(
+                watched(f"acme-{n}/r_{n}.x", types=("release",), deny_authors=("x" * 256,) * 256)
+                for n in range(50)
+            )),
+        )).validate()
+        repo_watch(watched("a/b", types=("pull_request", "issue", "release"))).validate()
+
+    @pytest.mark.parametrize(("subscriptions", "expected"), [
+        (Subscriptions(version="1", sources=(SourceSubscription(provider="github_repos"),)), "malformed_frame"),
+        (repo_watch(*(watched(f"acme/r{n}") for n in range(51))), "limit_exceeded"),
+        (repo_watch(watched("acme")), "malformed_frame"),
+        (repo_watch(watched("-acme/widgets")), "malformed_frame"),
+        (repo_watch(watched("acme/wid gets")), "malformed_frame"),
+        (repo_watch(watched("acme/..")), "malformed_frame"),
+        (repo_watch(watched("acme/.")), "malformed_frame"),
+        (repo_watch(watched("a" * 40 + "/widgets")), "malformed_frame"),
+        (repo_watch(watched("acme/widgets"), watched("ACME/Widgets")), "malformed_frame"),
+        (repo_watch(watched(types=("pull_request", "commits"))), "kind_unsupported"),
+        (repo_watch(watched(types=())), "malformed_frame"),
+        (repo_watch(watched(types=("issue", "issue"))), "malformed_frame"),
+        (repo_watch(watched(deny_authors=tuple(f"bot-{n}" for n in range(257)))), "limit_exceeded"),
+        (repo_watch(watched(deny_authors=("x" * 257,))), "malformed_frame"),
+        (repo_watch(watched(deny_authors=("",))), "malformed_frame"),
+        (repo_watch(watched(deny_authors=("tab\there",))), "malformed_frame"),
+        (repo_watch(filters=SourceFilters(deny_actors=("alice",))), "malformed_frame"),
+        (repo_watch(pr_watch=True), "malformed_frame"),
+        (repo_watch(inbox="all"), "malformed_frame"),
+        (Subscriptions(version="1", sources=(
+            SourceSubscription(provider="github", repos=(watched(),)),
+        )), "malformed_frame"),
+    ])
+    def test_the_gateways_bounds_are_checked_before_sending(self, subscriptions, expected):
+        with pytest.raises(Rejected) as error:
+            subscriptions.validate()
+        assert error.value.reason == expected
+
+    def test_without_filters_drops_the_deny_authors_and_keeps_the_rest(self):
+        narrow = repo_watch(watched(deny_authors=("noisy-*",), updates=True))
+
+        wide = narrow.without_filters()
+
+        assert wide.sources == (SourceSubscription(
+            provider="github_repos", repos=(watched(updates=True),),
+        ),)
+        wide.validate()

@@ -63,6 +63,8 @@ export interface AgentStoreState {
   upsertAgents(views: AgentView[]): void;
   addPendingSend(p: PendingSend): void;
   dropPendingSend(clientMsgId: string): void;
+  /** Drop a pending send that the server refused and put its text back in the composer. False if this tab has no such send. */
+  refusePendingSend(clientMsgId: string): boolean;
   openTranscript(agentId: string): Promise<void>;
   closeTranscript(agentId: string): void;
   loadEarlier(agentId: string): Promise<void>;
@@ -74,6 +76,8 @@ export interface AgentStoreState {
   stopAll(opts?: { includeShells?: boolean }): Promise<StopAllResult | null>;
   forceStop(): Promise<ForceStopResult | null>;
   cancelQueued(queueId: string): Promise<void>;
+  /** Set the run order of the queue: `queueIds` from the one that runs next to the last. */
+  reorderQueue(queueIds: string[]): Promise<void>;
   markSeen(agentIds: string[]): void;
   setStopDialog(d: 'all' | 'force' | null): void;
   dismissEscalation(): void;
@@ -500,6 +504,9 @@ export const useAgentStore = create<AgentStoreState>((set, get) => {
         } else if (removal.reason === 'cancelled') {
           result.cancelled.push(pending);
           if (!ownCancel && pending.content) restore.push(pending.content);
+        } else if (removal.reason === 'refused' && pending.content) {
+          // Nerve is shutting down: the text goes back to be sent again later.
+          restore.push(pending.content);
         }
       }
       set({ queue: msg.queue ?? [], ...(pendingSends !== s.pendingSends ? { pendingSends } : {}) });
@@ -511,6 +518,14 @@ export const useAgentStore = create<AgentStoreState>((set, get) => {
 
     addPendingSend: (p) => {
       set((s) => ({ pendingSends: { ...s.pendingSends, [p.clientMsgId]: p } }));
+    },
+
+    refusePendingSend: (clientMsgId) => {
+      const pending = get().pendingSends[clientMsgId];
+      if (!pending) return false;
+      get().dropPendingSend(clientMsgId);
+      if (pending.content) get().prefillComposer(pending.content, 'append');
+      return true;
     },
 
     dropPendingSend: (clientMsgId) => {
@@ -757,6 +772,30 @@ export const useAgentStore = create<AgentStoreState>((set, get) => {
           if (gen === generation) dropEntry();
         } else if (code !== 'already_started' && code !== 'not_owner') {
           console.error('Failed to cancel the queued message:', e);
+        }
+      }
+    },
+
+    reorderQueue: async (queueIds) => {
+      const s = get();
+      const sessionId = s.sessionId;
+      if (!sessionId) return;
+      const gen = generation;
+      // The new order shows at once, sorted as the server sorts it (entries
+      // not named keep their order, last). The queue_update that every tab
+      // gets then carries the server's order.
+      const rank = (q: QueueEntryView) => {
+        const at = queueIds.indexOf(q.queue_id);
+        return at < 0 ? queueIds.length : at;
+      };
+      set({ queue: [...s.queue].sort((a, b) => rank(a) - rank(b)) });
+      try {
+        await api.reorderQueue(sessionId, queueIds);
+      } catch (e) {
+        console.error('Failed to reorder the queue:', e);
+        const res = await api.getQueue(sessionId).catch(() => null);
+        if (res && gen === generation) {
+          set({ queue: res.items.filter(q => !removedQueueIds.has(q.queue_id)) });
         }
       }
     },

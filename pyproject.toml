@@ -61,6 +61,9 @@ dependencies = [
     "memu-py==1.4.0",  # pinned — nerve monkey-patches memU internals (see memu_bridge._patch_sqlite_bugs)
     "watchfiles>=1.0.0",
     "html2text>=2024.2.26",
+    # Web Push: VAPID signing and payload encryption for the panel's push
+    # notifications (nerve/notifications/webpush.py).
+    "pywebpush>=2.5.0",
     # Optional xmemory.ai structured-memory layer — only active when an
     # xmemory api_key + instance_id are configured (see XmemoryConfig).
     "xmemory-ai>=0.10.0",

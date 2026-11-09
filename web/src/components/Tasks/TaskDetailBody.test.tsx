@@ -6,10 +6,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MockInstance } from 'vitest';
 
 import { api, type Task } from '../../api/client';
+import { useTaskStatusStore } from '../../stores/taskStatusStore';
 import { TaskDetailBody } from './TaskDetailBody';
 
 vi.mock('../../api/client', () => ({
-  api: { updateTask: vi.fn(), getTaskPlans: vi.fn(async () => ({ plans: [] })) },
+  api: {
+    updateTask: vi.fn(),
+    getTaskPlans: vi.fn(async () => ({ plans: [] })),
+    listTaskComments: vi.fn(async () => ({ comments: [] })),
+  },
   // The timeline's actor labels read the viewer through the auth store,
   // which wires these on import.
   setToken: vi.fn(), clearToken: vi.fn(), getToken: vi.fn(),
@@ -179,7 +184,32 @@ describe('TaskDetailBody plan', () => {
     });
     rerender(<TaskDetailBody task={task('# original', '2026-08-05T01:00:00Z')} />);
 
-    expect(await screen.findByText('A plan waits for your review')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Open plan' })).toBeInTheDocument();
+    expect(await screen.findByText('Plan v1 waits for your review')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Review' })).toBeInTheDocument();
+  });
+});
+
+describe('TaskDetailBody status', () => {
+  beforeEach(() => {
+    useTaskStatusStore.setState({
+      statuses: [
+        { name: 'pending', label: 'Pending', color: '#6b7280', description: '', is_system: 1, sort_order: 0 },
+        { name: 'done', label: 'Done', color: '#22c55e', description: '', is_system: 1, sort_order: 1 },
+      ],
+      loaded: true,
+    });
+  });
+  afterEach(() => {
+    useTaskStatusStore.setState({ statuses: [], loaded: false });
+  });
+
+  it('shows the status once, as the Status select', () => {
+    render(<TaskDetailBody task={task('# original')} />);
+
+    expect(screen.getByRole('combobox', { name: 'Status' })).toHaveValue('pending');
+    // The label shows only as an option of the select, not as a second badge.
+    for (const el of screen.getAllByText('Pending')) {
+      expect(el.tagName).toBe('OPTION');
+    }
   });
 });

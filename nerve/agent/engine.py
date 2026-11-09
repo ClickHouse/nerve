@@ -97,7 +97,7 @@ from nerve.identity import (
     attribution_for,
     resolve_cause,
 )
-from nerve.inference_principal import inference_principal
+from nerve.inference_principal import inference_principal, inference_trigger
 from nerve.mcp_gateway import McpGatewayCatalog
 from nerve.memory.backend import (
     MemoryBackendUnavailable,
@@ -106,6 +106,7 @@ from nerve.memory.backend import (
 )
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.platform.activity import LEASE_MEMORIZE, keep_awake
+from nerve.session_origin import cron_origin, session_origin
 from nerve.skills.manager import SkillManager
 from nerve.utils.llm import response_text
 
@@ -122,6 +123,35 @@ _RESUME_AFTER_RESTART_PROMPT = (
     "the restart. If you triggered the restart yourself, confirm it succeeded "
     "and carry on."
 )
+
+# Sent to the session's clients when run() refuses a turn during a drain.
+_NOT_ACCEPTING_TURNS_MESSAGE = (
+    "Nerve is shutting down and did not run this message. "
+    "Send it again when Nerve is back."
+)
+
+
+class NotAcceptingTurnsError(RuntimeError):
+    """``AgentEngine.run`` refused a new turn because the engine is draining."""
+
+    def __init__(self) -> None:
+        super().__init__(_NOT_ACCEPTING_TURNS_MESSAGE)
+
+
+# The runtime's system frame that marks a compacted conversation.
+_COMPACT_BOUNDARY = "compact_boundary"
+# A compact turn that ended with no such frame: the runtime had no messages.
+_NOTHING_TO_COMPACT = "Nothing to compact yet."
+
+
+class CompactError(RuntimeError):
+    """``AgentEngine.compact_session`` did not compact. ``code``:
+    ``unavailable`` (no live client that can compact), ``busy`` (a turn runs
+    or waits), ``nothing_to_compact``, ``stopped`` or ``failed``."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _sanitize_surrogates(s: str) -> str:
@@ -262,7 +292,8 @@ def _iso_now() -> str:
 class QueuedTurn:
     """A run waiting for the session's run lock (a message sent while a turn
     streams). Listed in ``queue_update`` and the snapshot until it starts or
-    is cancelled."""
+    is cancelled. The lock goes to the first entry of the session's queue
+    (``AgentEngine._pass_run_lock``), so the queue order is the run order."""
 
     queue_id: str                 # "q_" + 8 hex
     session_id: str
@@ -273,6 +304,8 @@ class QueuedTurn:
     actor_id: str | None
     created_at: str
     task: asyncio.Task
+    # Gets a result when the run lock is handed to this run.
+    granted: asyncio.Future
     cancelled_by_request: bool = False
 
 
@@ -316,6 +349,9 @@ class _TurnState:
     got_content: bool = False
     status: TurnStatus = "completed"
     error: str | None = None
+    # The run's ``drop_leading_thinking``: thinking before the turn's first
+    # text or tool call is neither broadcast nor stored.
+    drop_leading_thinking: bool = False
 
 
 @dataclass(frozen=True)
@@ -383,6 +419,9 @@ class AgentEngine:
         self.sessions = SessionManager(db, default_cwd=str(config.workspace))
         self.config = config
         self._semaphore = asyncio.Semaphore(config.agent.max_concurrent)
+        # Cleared by stop_accepting_turns(). Never set again: a drain ends
+        # with the process exit.
+        self._accepting_turns = True
         self._memory_bridge = None
         self._xmemory_bridge = None
         self._skill_manager: SkillManager | None = None
@@ -1748,6 +1787,10 @@ class AgentEngine:
                 inference_principal=inference_principal(
                     (session or {}).get("caused_by_actor_id"),
                 ),
+                # The session's trigger, also fixed for the session.
+                inference_trigger=inference_trigger(
+                    session_origin(session or {}).trigger,
+                ),
                 extra=(
                     # Per-session codex sandbox override (review-loop verifier
                     # legs run workspace-write instead of the global default).
@@ -1952,6 +1995,75 @@ class AgentEngine:
             )
 
     # ------------------------------------------------------------------ #
+    #  Drain                                                               #
+    # ------------------------------------------------------------------ #
+
+    # How often drain() checks for running turns (seconds).
+    _DRAIN_POLL_SECONDS = 0.5
+
+    @property
+    def accepting_turns(self) -> bool:
+        """False after stop_accepting_turns(). Schedulers read this to skip work."""
+        return self._accepting_turns
+
+    def stop_accepting_turns(self) -> None:
+        """Make run() refuse every new turn. Running turns continue."""
+        if self._accepting_turns:
+            self._accepting_turns = False
+            logger.info("Engine no longer accepts new turns")
+
+    async def drain(self, timeout: float) -> bool:
+        """Stop accepting new turns, then wait for the running turns to end.
+
+        Returns True when no turn is running, or False if ``timeout``
+        seconds pass first. This does not stop the turns that are still
+        running.
+        """
+        self.stop_accepting_turns()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        running = self.sessions.get_running_ids()
+        if not running:
+            return True
+        logger.info(
+            "Drain: waiting up to %ss for %d running turn(s): %s",
+            timeout, len(running), ", ".join(sorted(running)),
+        )
+        while running:
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                logger.warning(
+                    "Drain: %d turn(s) still running after %ss: %s",
+                    len(running), timeout, ", ".join(sorted(running)),
+                )
+                return False
+            await asyncio.sleep(min(self._DRAIN_POLL_SECONDS, remaining))
+            running = self.sessions.get_running_ids()
+        logger.info("Drain: all running turns ended")
+        return True
+
+    async def _refuse_turn(
+        self,
+        session_id: str,
+        *,
+        entry: QueuedTurn | None = None,
+        client_msg_id: str | None = None,
+    ) -> None:
+        """Tell the session's clients that run() refused the turn, then raise.
+
+        A run that has a queue entry or a ``client_msg_id`` is reported in
+        ``queue_update`` with the reason ``refused``. The caller removes the
+        entry from the queue first.
+        """
+        if entry is not None or client_msg_id:
+            await self._emit_queue_update(session_id, removed=[{
+                "queue_id": entry.queue_id if entry is not None else None,
+                "client_msg_id": client_msg_id, "reason": "refused",
+            }])
+        await broadcaster.broadcast_error(session_id, _NOT_ACCEPTING_TURNS_MESSAGE)
+        raise NotAcceptingTurnsError()
+
+    # ------------------------------------------------------------------ #
     #  Public API: run, stop, fork, resume                                 #
     # ------------------------------------------------------------------ #
 
@@ -2074,17 +2186,12 @@ class AgentEngine:
                 session_id, kills_background=bool(killable) and not spares,
             )
         lock = self._session_locks.get(session_id)
-        # A queued run counts as behind the lock even in the instant the lock
-        # passes between runs (released, the next waiter not resumed yet).
-        registered = getattr(self.sessions, "registered_task", lambda _sid: None)(session_id)
-        queued = registered is not None and any(
-            entry.task is registered
-            for entry in self._queue_state()[0].get(session_id, ())
-        )
+        # The lock stays held while runs are queued (_pass_run_lock hands it
+        # over), so a queued run always counts as behind the lock.
         outcome = await self.sessions.interrupt_turn(
             session_id,
             allow_hard_cancel=force or not live,
-            lock_held=bool(lock is not None and lock.locked()) or queued,
+            lock_held=bool(lock is not None and lock.locked()),
             wait_s=self._STOP_WAIT_SECONDS,
         )
         if had_work:
@@ -2360,8 +2467,8 @@ class AgentEngine:
 
     def queue_view(self, session_id: str) -> list[dict]:
         """The session's server-visible turn queue (``QueueEntryView`` list,
-        oldest first). Internal entries never show their prompt: they carry a
-        fixed label by source."""
+        in run order: the first entry runs next). Internal entries never show
+        their prompt: they carry a fixed label by source."""
         queues, _started, _msgs = self._queue_state()
         out = []
         for entry in queues.get(session_id, ()):
@@ -2399,9 +2506,50 @@ class AgentEngine:
             actor_id=actor.actor_id if actor is not None else None,
             created_at=_iso_now(),
             task=task,
+            granted=asyncio.get_running_loop().create_future(),
         )
         queues.setdefault(session_id, []).append(entry)
         return entry
+
+    def _pass_run_lock(self, session_id: str, lock: asyncio.Lock) -> None:
+        """Give the held run lock to the first run in the session's queue, or
+        release it when no run waits. The lock stays held across the
+        handover, so no new run and no idle drain can take it in between.
+        Every holder of the run lock releases it here."""
+        queues, _started, _msgs = self._queue_state()
+        for entry in list(queues.get(session_id, ())):
+            if entry.granted.done():
+                continue  # cancelled while it waited; its run dequeues it
+            self._dequeue_turn(session_id, entry, started=True)
+            entry.granted.set_result(None)
+            return
+        lock.release()
+
+    @contextlib.asynccontextmanager
+    async def _holding_run_lock(self, session_id: str, lock: asyncio.Lock):
+        """Hold the session's run lock for work that is not a run (an idle
+        drain, a client reap), then pass it to the queue."""
+        await lock.acquire()
+        try:
+            yield
+        finally:
+            self._pass_run_lock(session_id, lock)
+
+    async def reorder_queue(self, session_id: str, queue_ids: list[str]) -> list[dict]:
+        """Put the session's queued runs in the order of ``queue_ids``; the
+        first one runs next. Ids that are not queued any more (the run started
+        or was cancelled meanwhile) are skipped. Queued runs that the list does
+        not name keep their order, after the named ones. Returns the queue view
+        that went to every client in ``queue_update``."""
+        queues, _started, _msgs = self._queue_state()
+        queue = queues.get(session_id)
+        if queue:
+            rank: dict[str, int] = {}
+            for position, queue_id in enumerate(queue_ids):
+                rank.setdefault(queue_id, position)
+            # A stable sort: entries with the same rank keep their order.
+            queue.sort(key=lambda entry: rank.get(entry.queue_id, len(queue_ids)))
+        return await self._emit_queue_update(session_id)
 
     def _dequeue_turn(
         self, session_id: str, entry: QueuedTurn, *, started: bool = False,
@@ -2442,21 +2590,30 @@ class AgentEngine:
 
     async def _emit_queue_update(
         self, session_id: str, *, removed: list[dict] | None = None,
-    ) -> None:
+    ) -> list[dict]:
         """Broadcast ``queue_update``: the full queue, plus what just left it
         (``started`` / ``cancelled`` / ``duplicate``). Never buffered for turn
-        replay: a reconnecting client gets the queue from its snapshot."""
-        message: dict[str, Any] = {
-            "type": "queue_update",
-            "session_id": session_id,
-            "queue": self.queue_view(session_id),
-        }
-        if removed:
-            message["removed"] = removed
-        try:
-            await broadcaster.broadcast(session_id, message, buffer=False)
-        except Exception:  # noqa: BLE001 — the queue never breaks a run
-            logger.debug("queue_update broadcast failed for %s", session_id, exc_info=True)
+        replay: a reconnecting client gets the queue from its snapshot.
+
+        The updates of one session go out one at a time, and each one reads
+        the queue only when it goes out. So a slow listener cannot make a
+        client get an older queue after a newer one. Returns the queue that
+        was sent."""
+        locks = self.__dict__.setdefault("_queue_emit_locks", {})
+        async with locks.setdefault(session_id, asyncio.Lock()):
+            queue = self.queue_view(session_id)
+            message: dict[str, Any] = {
+                "type": "queue_update",
+                "session_id": session_id,
+                "queue": queue,
+            }
+            if removed:
+                message["removed"] = removed
+            try:
+                await broadcaster.broadcast(session_id, message, buffer=False)
+            except Exception:  # noqa: BLE001 (the queue never breaks a run)
+                logger.debug("queue_update broadcast failed for %s", session_id, exc_info=True)
+        return queue
 
     def cancel_queued_turn(
         self, session_id: str, queue_id: str, *, actor: Actor | None,
@@ -2633,6 +2790,67 @@ class AgentEngine:
         )
         session = await self.db.get_session(session_id)
         return session
+
+    def can_compact(self, session_id: str) -> bool:
+        """The session has a live client whose backend can compact (and tell
+        its context use by category)."""
+        return (
+            self.sessions.get_client(session_id) is not None
+            and self._backend_for_live_session(session_id).capabilities.supports_compact
+        )
+
+    async def context_usage(self, session_id: str) -> dict | None:
+        """The live client's context use by category (the
+        ``AgentClient.context_usage`` shape), or None: no live client, a
+        backend that cannot tell it, or a runtime that did not answer."""
+        if not self.can_compact(session_id):
+            return None
+        client = self.sessions.get_client(session_id)
+        try:
+            return await client.context_usage()
+        except Exception as e:  # noqa: BLE001 (the breakdown is optional)
+            logger.info("No context usage for session %s: %s", session_id, e)
+            return None
+
+    async def compact_session(self, session_id: str, *, actor: Actor | None) -> None:
+        """Compact the conversation of the session's live client.
+
+        The compact runs as a turn: it takes the run lock, the session shows
+        as running, and Stop reaches it. Its frames are not shown and it adds
+        no message to the transcript; its cost and usage are recorded as for
+        any turn. Its usage and ``done`` event carry the context use measured
+        after the compact (``usage.context_tokens``). A compact that compacts
+        records ``compacted`` with ``actor`` as actor and cause; a compact
+        that stops, fails or has nothing to compact records no event.
+
+        Raises:
+            CompactError: the session did not compact (see its ``code``).
+        """
+        if not self.can_compact(session_id):
+            raise CompactError(
+                "unavailable", "Compact needs a running Claude session.",
+            )
+        lock = self._session_locks.get(session_id)
+        if (
+            self.sessions.is_running(session_id)
+            or (lock is not None and lock.locked())
+            or self._queue_state()[0].get(session_id)
+        ):
+            raise CompactError("busy", "The agent is busy. Try again when the turn ends.")
+        result = await self._run_turn(
+            session_id, "", internal=True, actor=actor, compact=True,
+        )
+        outcome = result.outcome
+        if outcome.ok:
+            await self.db.log_session_event(
+                session_id, "compacted", attribution=attribution_for(actor),
+            )
+            return
+        if outcome.status == "interrupted":
+            raise CompactError("stopped", "Compact stopped.")
+        if outcome.error == _NOTHING_TO_COMPACT:
+            raise CompactError("nothing_to_compact", _NOTHING_TO_COMPACT)
+        raise CompactError("failed", f"Compact failed: {outcome.error or 'no detail'}")
 
     async def resume_enrolled_sessions(self) -> int:
         """Re-drive sessions enrolled via ``nerve restart --resume`` on startup.
@@ -2920,6 +3138,13 @@ class AgentEngine:
                 parent_tool_use_id=event.parent_tool_use_id,
             )
 
+        elif isinstance(event, ThinkingDelta) and st.drop_leading_thinking and not (
+            st.full_response_text or st.tool_calls_log
+        ):
+            # Thinking before the first text or tool call of a run with
+            # ``drop_leading_thinking``: not shown, not kept.
+            st.got_content = True
+
         elif isinstance(event, ThinkingDelta):
             st.got_content = True
             st.thinking_text += event.text
@@ -3007,25 +3232,7 @@ class AgentEngine:
             await self._handle_system_event(session_id, event)
 
         elif isinstance(event, TurnCompleted):
-            if event.usage is not None:
-                st.last_usage = event.usage.to_anthropic_shape()
-            if event.native_session_id:
-                st.sdk_session_id = event.native_session_id
-            if event.native_turn_id:
-                st.native_turn_id = event.native_turn_id
-            if event.model and not st.last_model:
-                st.last_model = event.model
-            st.result_meta = {
-                "total_cost_usd": event.total_cost_usd,
-                "cost_basis": event.cost_basis,
-                "estimated_cost_usd": event.estimated_cost_usd,
-                "duration_ms": event.duration_ms,
-                "duration_api_ms": event.duration_api_ms,
-                "num_turns": event.num_turns,
-                "context_window": event.context_window,
-                "status": event.status,
-            }
-            st.status, st.error = event.status, event.error
+            self._record_turn_result(event, st)
             if event.status != "completed":
                 # Abnormal ends still complete: surface them inline so the
                 # conversation shows what happened (the runtime itself stays healthy).
@@ -3040,6 +3247,30 @@ class AgentEngine:
             return True
 
         return False
+
+    @staticmethod
+    def _record_turn_result(event: TurnCompleted, st: _TurnState) -> None:
+        """Keep what ``_persist_turn`` records from the turn's terminal event:
+        usage, native ids, cost and outcome."""
+        if event.usage is not None:
+            st.last_usage = event.usage.to_anthropic_shape()
+        if event.native_session_id:
+            st.sdk_session_id = event.native_session_id
+        if event.native_turn_id:
+            st.native_turn_id = event.native_turn_id
+        if event.model and not st.last_model:
+            st.last_model = event.model
+        st.result_meta = {
+            "total_cost_usd": event.total_cost_usd,
+            "cost_basis": event.cost_basis,
+            "estimated_cost_usd": event.estimated_cost_usd,
+            "duration_ms": event.duration_ms,
+            "duration_api_ms": event.duration_api_ms,
+            "num_turns": event.num_turns,
+            "context_window": event.context_window,
+            "status": event.status,
+        }
+        st.status, st.error = event.status, event.error
 
     async def _handle_system_event(
         self, session_id: str, event: SystemEvent,
@@ -3555,13 +3786,15 @@ class AgentEngine:
         cause: CauseArg = CAUSE_FROM_ACTOR,
         client_msg_id: str | None = None,
         origin: str | None = None,
+        drop_leading_thinking: bool = False,
     ) -> str:
         """Run the agent for a user message and return the final text response.
 
         Runs of one session are serialized by its run lock. A run that finds
         the lock held is listed in the session's turn queue (``queue_update``
-        to every client) until it gets the lock; its sender may cancel it
-        there (:meth:`cancel_queued_turn`), and then it returns ``""`` having
+        to every client) until it gets the lock; the queue runs in its order
+        (:meth:`reorder_queue` changes it). Its sender may cancel it there
+        (:meth:`cancel_queued_turn`), and then it returns ``""`` having
         persisted nothing. Stop never touches queued runs.
 
         Args:
@@ -3601,6 +3834,17 @@ class AgentEngine:
             origin: Label of where the message came from, shown on its queue
                       entry (``"web"``, ``"api"``, a channel name). Defaults
                       to ``source``.
+            drop_leading_thinking: If True, the thinking that comes before
+                      the turn's first text or tool call is neither broadcast
+                      nor stored with the reply. Thinking after that is kept.
+                      The onboarding conversation's first turn uses it, so
+                      that the chat opens with the greeting.
+
+        Raises:
+            NotAcceptingTurnsError: the engine is draining. The user message
+                      is not stored, the session's clients get an error
+                      event, and a queued run leaves the queue with the
+                      reason ``refused``.
         """
         return (await self._run_turn(
             session_id=session_id,
@@ -3617,6 +3861,7 @@ class AgentEngine:
             cause=cause,
             client_msg_id=client_msg_id,
             origin=origin,
+            drop_leading_thinking=drop_leading_thinking,
         )).text
 
     async def _run_turn(
@@ -3636,8 +3881,11 @@ class AgentEngine:
         cause: CauseArg = CAUSE_FROM_ACTOR,
         client_msg_id: str | None = None,
         origin: str | None = None,
+        drop_leading_thinking: bool = False,
+        compact: bool = False,
     ) -> TurnResult:
-        """``run()`` plus how the invocation's turn ended."""
+        """``run()`` plus how the invocation's turn ended. ``compact``: the
+        turn is the compact of :meth:`compact_session`, not a message."""
         # Resolved before the lock: an invalid cause fails here, before the
         # session is marked as running.
         cause_id = resolve_cause(actor, cause)
@@ -3650,26 +3898,33 @@ class AgentEngine:
                 "queue_id": None, "client_msg_id": client_msg_id, "reason": "duplicate",
             }])
             return TurnResult("", TurnOutcome("interrupted", "dropped as a repeated message"))
+        if not self._accepting_turns:
+            await self._refuse_turn(session_id, client_msg_id=client_msg_id)
         # Serialize runs per session — messages for the same session wait
-        # in order instead of failing with "already running", and are listed
-        # while they wait.
+        # in the session's queue instead of failing with "already running",
+        # and are listed while they wait. The run lock goes to the first
+        # entry of the queue (_pass_run_lock), so the queue order is the run
+        # order. The lock stays held while runs are queued.
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         entry: QueuedTurn | None = None
-        queues, _started, _msgs = self._queue_state()
-        # Behind a held lock, or behind runs still waiting for it (a lock just
-        # released passes to the oldest waiter before it reads as held).
-        if lock.locked() or queues.get(session_id):
+        if lock.locked():
             entry = self._enqueue_turn(
                 session_id, content=user_message, client_msg_id=client_msg_id,
                 source=origin or source, internal=internal, actor=actor,
             )
         try:
-            if entry is not None:
+            if entry is None:
+                await lock.acquire()  # free: returns at once
+            else:
                 # Inside the try: a cancel here still dequeues.
                 await self._emit_queue_update(session_id)
-            await lock.acquire()
+                await entry.granted
         except asyncio.CancelledError:
             if entry is not None:
+                if entry.granted.done() and not entry.granted.cancelled():
+                    # The lock came to this run in the same instant as the
+                    # cancel: give it to the next run.
+                    self._pass_run_lock(session_id, lock)
                 self._dequeue_turn(session_id, entry)
                 await self._emit_queue_update(session_id, removed=[{
                     "queue_id": entry.queue_id, "client_msg_id": entry.client_msg_id,
@@ -3686,11 +3941,15 @@ class AgentEngine:
             raise
         turn_task = asyncio.current_task()
         try:
+            # Check again: a drain can start while this run waits in the
+            # queue. Its entry then leaves the queue as refused, not started.
+            if not self._accepting_turns:
+                await self._refuse_turn(
+                    session_id, entry=entry, client_msg_id=client_msg_id,
+                )
             # The Stop target from the moment this run holds the run lock:
             # Stop reaches the turn, never a message queued behind it.
             self.sessions.set_turn_task(session_id, turn_task)
-            if entry is not None:
-                self._dequeue_turn(session_id, entry, started=True)
             if entry is not None or client_msg_id:
                 await self._emit_queue_update(session_id, removed=[{
                     "queue_id": entry.queue_id if entry is not None else None,
@@ -3702,10 +3961,12 @@ class AgentEngine:
                 images=images, image_refs=image_refs,
                 bump_updated_at=bump_updated_at, actor=actor,
                 cause_id=cause_id,
+                drop_leading_thinking=drop_leading_thinking,
+                compact=compact,
             )
         finally:
             self.sessions.clear_turn_task(session_id, turn_task)
-            lock.release()
+            self._pass_run_lock(session_id, lock)
 
     async def _run_locked(
         self,
@@ -3722,12 +3983,21 @@ class AgentEngine:
         bump_updated_at: bool,
         actor: Actor | None,
         cause_id: str | None,
+        drop_leading_thinking: bool = False,
+        compact: bool = False,
     ) -> TurnResult:
         """The turn of :meth:`run`, with the run lock held: framing
         (buffering, running state, ``session_running``) around
-        :meth:`_run_inner`."""
+        :meth:`_run_inner`, or around :meth:`_compact_inner` for a compact."""
         broadcaster.start_buffering(session_id)
         async with self._semaphore:
+            # Check again: a drain can start after the check in _run_turn,
+            # for example while this turn waits for a concurrency slot. No
+            # await between this check and mark_running, so drain() cannot
+            # miss this turn.
+            if not self._accepting_turns:
+                broadcaster.stop_buffering(session_id)
+                await self._refuse_turn(session_id)
             # Clear any stale deferred-stop flag left over from a *previous*
             # turn.  If /stop arrived while the old turn was still cleaning up
             # (mark_not_running hadn't run yet), the flag lingers and would
@@ -3746,6 +4016,8 @@ class AgentEngine:
             # Notify all connected clients that this session started running
             await self._broadcast_session_running(session_id, True)
             try:
+                if compact:
+                    return await self._compact_inner(session_id, channel)
                 return await self._run_inner(
                     session_id, user_message, source, channel, model,
                     effort_override=effort_override,
@@ -3754,6 +4026,7 @@ class AgentEngine:
                     bump_updated_at=bump_updated_at,
                     actor=actor,
                     cause_id=cause_id,
+                    drop_leading_thinking=drop_leading_thinking,
                 )
             finally:
                 self.sessions.mark_not_running(session_id)
@@ -3786,6 +4059,58 @@ class AgentEngine:
                 # a background task stays "running" in the sidebar.
                 await self._broadcast_session_running(session_id, False)
 
+    async def _compact_inner(self, session_id: str, channel: str | None) -> TurnResult:
+        """The compact turn of :meth:`compact_session`, framed by
+        :meth:`_run_locked`. It ends like a turn of a message (cost, usage,
+        ``done``, idle timer) but stores no message."""
+        client = self.sessions.get_client(session_id)
+        if client is None:
+            return TurnResult("", TurnOutcome("failed", "the session has no live client"))
+        st = _TurnState()
+        compacted = False
+        try:
+            # Autonomous turns that buffered since the last turn go first, as
+            # before a message (see _run_inner).
+            await self._drain_pending_messages(
+                session_id, client, "web", channel, first_content_timeout=3.0,
+            )
+            broadcaster.mark_turn_open(session_id)
+            await client.start_compact()
+            async for event in client.receive_turn():
+                if isinstance(event, SystemEvent) and event.subtype == _COMPACT_BOUNDARY:
+                    compacted = True
+                elif isinstance(event, TurnCompleted):
+                    self._record_turn_result(event, st)
+                    break
+                elif isinstance(event, SystemEvent) or _is_sidechain(event):
+                    # Background agents go on while the conversation compacts.
+                    await self._process_agent_event(session_id, event, st)
+                # Text of the main chain is the runtime's answer to the
+                # command ("No messages to compact"), not a reply: not shown.
+        except asyncio.CancelledError:
+            # A hard Stop: the runtime can be in the middle of the compact.
+            st.status, st.error = "interrupted", "stopped by user"
+            await self._discard_client(
+                session_id, background_memorize=True, reason="force_stop",
+            )
+        except Exception as e:  # noqa: BLE001 (the turn's outcome reports it)
+            logger.warning("Compact failed for session %s: %s", session_id, e)
+            st.status, st.error = "failed", str(e)
+            await self._discard_client(
+                session_id, background_memorize=True, reason="process_exit",
+            )
+        if st.result_meta is not None:
+            # The result of a compact reports no usage: measure the context,
+            # which the context bar then shows (``context_tokens``).
+            context = await self.context_usage(session_id)
+            if context is not None:
+                st.last_usage = {**(st.last_usage or {}), "context_tokens": context["total_tokens"]}
+                st.result_meta["context_window"] = context["max_tokens"]
+        if st.status == "completed" and not compacted:
+            st.status, st.error = "failed", _NOTHING_TO_COMPACT
+        outcome = await self._finalize_turn(session_id, st, channel, persist_message=False)
+        return TurnResult("", outcome)
+
     async def _run_inner(
         self,
         session_id: str,
@@ -3801,6 +4126,7 @@ class AgentEngine:
         *,
         actor: Actor | None,
         cause_id: str | None,
+        drop_leading_thinking: bool = False,
     ) -> TurnResult:
         # Ensure session exists in DB. ``cause_id`` applies only if the row
         # is created here.
@@ -3851,7 +4177,7 @@ class AgentEngine:
             )
 
         # Turn accumulator — shared shape with the autonomous-turn drain.
-        st = _TurnState()
+        st = _TurnState(drop_leading_thinking=drop_leading_thinking)
 
         # Wakeup turns (fired by the cron-service sweep) carry a leading
         # marker block so the UI shows a "scheduled wakeup" chip. Persisted
@@ -4657,7 +4983,7 @@ class AgentEngine:
                 if lock.locked():
                     continue  # a run is starting; its pre-query drain covers this
 
-                async with lock:
+                async with self._holding_run_lock(session_id, lock):
                     if self.sessions.get_client(session_id) is not client:
                         return
 
@@ -4726,7 +5052,7 @@ class AgentEngine:
         lock = self._session_locks.setdefault(session_id, asyncio.Lock())
         if lock.locked() or self.sessions.get_client(session_id) is not client:
             return
-        async with lock:
+        async with self._holding_run_lock(session_id, lock):
             if self.sessions.get_client(session_id) is not client:
                 return
             logger.info(
@@ -4887,7 +5213,7 @@ class AgentEngine:
         actor = self.db.system_actor
         await self.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron", actor=actor,
-            cause=cause,
+            cause=cause, origin=cron_origin(job_id),
         )
         await self._stamp_cron_session_meta(session_id, "persistent", cache_ttl)
         try:

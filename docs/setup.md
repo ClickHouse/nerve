@@ -184,7 +184,7 @@ keep", never read back.
 | Step | Asks | Writes | Takes effect |
 |---|---|---|---|
 | **Claim** (local mode only) | username, password or "Keep this installation passwordless", display name, the setup token | the account and the setup-complete record in `nerve.db`; deletes the token | immediately; you are signed in |
-| **Mode** | Personal assistant (works for you: your own inboxes, notes about you) or Worker (works for a team, with its own memory, task list and schedule). For a worker, what it should do: checkboxes from the work catalog, by group (code: review pull requests, triage issues, fix issues and open pull requests, keep CI healthy, dependency and security updates; operations: first response to alerts, which needs an alert source; communication: channel digests and answers; knowledge: research and reports, docs and release notes), **Custom…** for work in your own words (at most 4000 characters), and an optional "Anything it must know or never do?" (at most 2000). Nothing ticked is fine: the conversation then offers the same list | the mode's templates (`SOUL.md`, personal: `IDENTITY.md`, `USER.md`, …); a worker's `TASK.md` from its template with what you chose under "Task description (as given)" (the [onboarding conversation](#the-onboarding-conversation) fills the other sections); mode defaults in `settings.yaml` only where absent; `config/cron/system.yaml` with the mode's default jobs if missing. With `memory.backend: loom` the templates, bundled skills and jobs name Loom's memory tools | `memory.categories` is read at startup → restart; the rest is live |
+| **Mode** | Personal assistant (works for you: your own inboxes, notes about you) or Worker (works for a team, with its own memory, task list and schedule). For a worker, what it should do: checkboxes from the work catalog, by group (code: review pull requests, triage issues, fix issues and open pull requests, keep CI healthy, dependency and security updates; operations: first response to alerts, which needs an alert source; communication: channel digests and answers; knowledge: research and reports, docs and release notes), **Custom…** for work in your own words (at most 4000 characters), and an optional "Anything it must know or never do?" (at most 2000). Nothing ticked is fine: the conversation then asks with one form | the mode's templates (`SOUL.md`, personal: `IDENTITY.md`, `USER.md`, …); a worker's `TASK.md` from its template with what you chose under "Task description (as given)" (the [onboarding conversation](#the-onboarding-conversation) fills the other sections); mode defaults in `settings.yaml` only where absent; `config/cron/system.yaml` with the mode's default jobs if missing. With `memory.backend: loom` the templates, bundled skills and jobs name Loom's memory tools | `memory.categories` is read at startup → restart; the rest is live |
 | **Model** | Anthropic API key · Claude subscription token (`claude setup-token`) · the Claude Code login found on this server · AWS Bedrock (region, optional profile); "Test connection"; then a model and effort picker | `anthropic_api_key` / `claude_oauth_token` → `config.local.yaml`; `provider.type`, `provider.aws_region`, `agent.model`, `agent.cron_model` (the picked model, so scheduled jobs run on it too), `agent.effort` → `settings.yaml`; `provider.aws_profile` → `config.yaml` | new sessions; Bedrock's memory model ids need a restart |
 | **About you** (worker: **Operator**) | your name, time zone (prefilled from the browser), quiet hours as an on/off switch with two times (personal: on, prefilled 22:00–07:00; worker: off), response language, the agent's name and emoji, a sentence about you or your work | `timezone`, `quiet_start`, `quiet_end` → `settings.yaml` (both empty when quiet hours are off); the matching lines of `USER.md` and `IDENTITY.md` (personal; quiet hours off reads `none`) — only lines still at their template value are touched, your edits are never overwritten; in local mode the display name on your account | `timezone` → restart (the scheduler carries the old zone); the rest is live |
 | **Memory** | an OpenAI key for vector search, or "No embeddings" (Claude ranks memories at recall time). With `memory.backend: loom` nothing: the step is done and says memory is kept in Loom | `openai_api_key` → `config.local.yaml` | the key is live; embeddings are built at the next restart |
@@ -230,8 +230,9 @@ A few things worth knowing per step:
   the step would refuse — over 40 characters, or not a single line — is not
   offered, and nothing is offered under lockdown.
   Continuing accepts what the form shows; the step counts as decided. Nerve
-  records quiet hours for the agent and does not hold messages back itself
-  (see [Configuration → Quiet Hours](config.md#quiet-hours)).
+  records quiet hours for the agent and does not hold messages back itself;
+  during them, notifications below `urgent` arrive without sound (see
+  [Configuration → Quiet Hours](config.md#quiet-hours)).
 - **Channels.** A Telegram token is checked with Telegram before anything is
   written: a well-formed but revoked token would otherwise take the bot — and
   the next start — down. The bot itself starts with the new token after the
@@ -298,30 +299,46 @@ reasons are listed before you click. Then:
 After setup, the agent is set up by talking to it. Finish opens one web chat
 session titled **Onboarding** for the person who finished setup, and the agent
 speaks first: its first message is the answer to a hidden instruction, which
-the chat does not show. What it says first depends on what a worker's Mode
-step recorded:
+the chat does not show. Its first message always opens with the same
+sentence: "Hi Alice, nice to meet you! I'm Scout, and you can configure me by
+talking to me." The person's name is the display name of the person who
+finished setup. The agent's name is the name in `IDENTITY.md` (the About you
+step), else `NERVE_DISPLAY_NAME` (the name a hosting platform gives the
+agent). Without a name, the greeting is "Hi, nice to meet you!" and the agent
+is "your Nerve agent". What comes next depends on what a worker's Mode step
+recorded:
 
 - **With work chosen** (checkboxes, custom work, or both) it offers no menu
   and starts on that work in the same message. It explains before it asks:
-  it greets you, restates the work in one sentence, says what it studies and
-  sketches the setup it has in mind, and only then shows its first questions.
+  after the opening, it restates the work in one sentence, says what it
+  studies and sketches the setup it has in mind, and only then asks — first
+  only for what the explorer still lacks, the rest once its findings are in.
   It works from the follow-up questions of each item you ticked (which
-  repositories, what a review may do, the label vocabulary, how often, and so
-  on), asks the questions the items share once (the account it acts as, what
+  repositories, what a review may do, the label vocabulary, and so on), asks
+  the questions the items share once (the account it acts as, what
   waits for your approval, where results go), and skips what setup or its
   explorer can tell. What does not fit into two rounds of questions becomes a
   default in its proposal, for you to change. An item whose connection the
   instance lacks (first response to alerts without an alert source) appears
   under what it needs from you.
 - **With nothing chosen** (a personal install, or a worker with nothing
-  ticked) it says that it is set up by talking to it, offers the work catalog
-  by group, each item with its one-line description (a personal install lists
-  personal-assistant work first), and asks which apply. A worker with only
-  "Anything it must know or never do?" filled in gets the list too.
+  ticked) the opening is followed by "Let's start with a few questions so I
+  understand how I can help you." and one form with one question, "What
+  should I help you with?",
+  with a checkbox for each of: review pull requests, fix issues and open pull
+  requests, keep CI healthy, research and reports, and, on a personal install,
+  personal assistant. **Other…** takes work in your own words; the agent knows
+  the full work catalog and uses it to understand that answer, but does not
+  list it. A worker with only "Anything it must know or never do?" filled in
+  gets the same form.
 - **With a note from an older setup page, or from `nerve init --terminal`**
   (free text), a note that describes the work is handled like chosen work; a
   note with only rules ("never merge anything") or only repositories gets the
-  list.
+  form.
+
+In the agent's first turn, the chat does not show the thinking that comes
+before its first words or its first tool call. Thinking after that shows as
+in any other chat.
 
 Whatever you wrote under "Anything it must know or never do?" (or as rules in
 a note) becomes hard rules and approval boundaries in its proposal, and an
@@ -360,19 +377,29 @@ Then:
    task. If it fails or finds only part, the proposal says so. With nothing to
    clone or fetch (a personal assistant for the inbox and reminders) there is
    no explorer.
-2. **It asks in the foreground** while the explorer works, and only what
-   neither the explorer nor setup can tell. It explains first, then shows one
-   form of up to six questions per round, in at most two rounds, each saying
-   why it is asked and each in the shape its answer needs (the Nerve tool
-   `ask_form`): repositories as `owner/name` entries, decisions as a few
-   options that say what they lead to with its recommendation first and
-   **Other…** for your own words, channels and topics as a list, anything
-   else as free text. Typical questions: the account it acts as on the code
-   host (the login it knows is its recommendation), what waits for your
-   approval (its recommendation: drafts you approve for anything public, on
-   its own for reading, cloning and local checks), how often to look for new
-   work, and where results go. It never asks what setup recorded: the mode,
-   your name, time zone and quiet hours, the connected channels and sources.
+2. **It asks after the explorer reports**, and only what neither the
+   explorer nor setup can tell. A first form, when needed, asks only for the
+   targets the explorer cannot start without (which repositories, which
+   channels); the rest waits for the findings, so the options come from what
+   was found and nothing the findings settle is asked. It explains first, in
+   the form's intro (the text above the questions, because the chat does not
+   show its thinking as a message), then shows one form of up to six
+   questions per round, in at most two rounds, each saying why it is asked
+   and each in the shape its answer needs (the Nerve tool `ask_form`):
+   repositories as `owner/name` entries, decisions as a few options that say
+   what they lead to with its recommendation first and **Other…** for your
+   own words, channels and topics as a list, anything else as free text.
+   Typical questions: the account it acts as on the code host (the login it
+   knows is its recommendation), what waits for your approval (its
+   recommendation: drafts you approve for anything public, on its own for
+   reading, cloning and local checks), and where results go. It never asks
+   what setup recorded: the mode, your name, time zone and quiet hours, the
+   connected channels and sources. Work that arrives through a connected
+   source (GitHub notifications, mail, Slack; pull request activity too where
+   the GitHub source is hosted) is consumed by a job gated on new messages
+   from that source rather than by a timer that polls the service; on a
+   hosted instance the `nerve-cloud` skill says how each source reaches the
+   agent, and the agent reads it first.
 3. **It proposes the setup as a plan** once the findings and your answers
    are in, in Claude Code's plan mode. The plan has fixed headings: what it
    understood, what it found, the `TASK.md` sections (a worker), the cron
@@ -405,9 +432,10 @@ onboarded by an earlier version (the `TASK.md` marker is gone) counts as done.
 An install from before the onboarding state that still has its marker, and a
 personal install from before, count as pending: the banner offers them the
 conversation once setup is complete. Nothing opens without a model credential.
-When the agent's first turn fails (a model error), onboarding goes back to
-pending, and the next Finish or daemon start opens a new conversation. Until
-onboarding is done or skipped:
+When the agent's first turn fails (a model error) before you saw its form,
+onboarding goes back to pending, and the next Finish or daemon start opens a
+new conversation. When it fails after the form, the conversation stays open
+and you continue in the same chat. Until onboarding is done or skipped:
 
 - the Ready screen leads into the conversation;
 - a banner on every page except the conversation says that the agent waits
@@ -455,8 +483,11 @@ Nerve to apply your setup" when only the restart is left). The count
 includes the steps that are waiting for the Mode step, so it only ever goes
 down; steps a lockdown makes read-only are never counted. The
 chat page's empty state points at the Model step until a provider is
-configured. On the Overview every done step has a **Change** link; a skipped
-step offers **Undo skip**. The CLI reports the same checklist: `nerve status`
+configured. On the Overview every done step of your own has a **Change**
+link; a skipped step offers **Undo skip**. A done step that you cannot change
+here, because the operator configured it, is listed under **Your operator has
+configured**, with its summary and no Change link. A step that a lockdown or
+the instance's policy closed is not shown. The CLI reports the same checklist: `nerve status`
 prints `Setup checklist: N steps left — http://…/setup`, and `nerve doctor`
 prints `[OK] Setup checklist complete` or
 `[WARN] Setup checklist incomplete (steps: provider, profile) — finish at /setup`.
@@ -771,8 +802,9 @@ the setup page works the same way with these differences:
   environment.
 - **The wizard starts at Mode**, with an overview that says who you are
   ("Signed in as Alice Example through your organisation's sign-in"), what the
-  wizard does, and what is already configured. It configures the instance for
-  everyone who uses it; nothing in it is personal to your account.
+  wizard does, and what your operator has configured. It configures the
+  instance for everyone who uses it; nothing in it is personal to your
+  account.
 - **Any signed-in person may run setup.** There is no owner. Several people
   may have it open; the state is server-side, every save returns the whole
   checklist, and the last writer wins per step.
@@ -804,12 +836,16 @@ the setup page works the same way with these differences:
 
 Under [lockdown](config.md#lockdown-remote-only-read-only) configuration
 arrives by pull request, so the wizard is read-only for anything it would
-write to configuration or to a reviewed workspace file. Such steps read
-**blocked**, each with the reason ("Configuration is managed from the config
-repository on this instance; changes arrive by PR and sync. Configure this
-step from the config repository."), and are not counted as "left to do" —
-a locked instance that has everything provisioned reads as finished and the
-banner stays quiet. What still works: the claim (it writes to `nerve.db`), a
+write to configuration or to a reviewed workspace file. `GET /api/setup`
+marks such a step **blocked**, with the reason ("Configuration is managed
+from the config repository on this instance; changes arrive by PR and sync.
+Configure this step from the config repository."), and does not count it as
+"left to do". The setup page does not show it. A locked instance that has
+everything provisioned reads as finished and the banner stays quiet. A step
+that is done is read-only, and the Overview lists it under **Your operator
+has configured**; the Mode step and your account stay in your own list. When
+no step is left for you, the Overview says that the operator configured every
+step. What still works: the claim (it writes to `nerve.db`), a
 worker's `TASK.md` once the templates have arrived from the repository, your
 display name (local mode), skipping, finishing and restarting.
 
@@ -835,11 +871,11 @@ something else) stops the configuration from loading, as it does for
 on every request, so a reload applies it. The wizard then says so instead of
 offering the fields:
 
-- **Memory**, **Sources** and **Agents** read "Not available on this
-  instance", with the reason: *This instance does not store credentials
-  entered here. Connections are provided by the operator of this
-  deployment.* They are not counted as left to do, so the checklist can
-  finish without them.
+- **Memory**, **Sources** and **Agents** are closed, with the reason: *This
+  instance does not store credentials entered here. Connections are
+  provided by the operator of this deployment.* The setup page does not show
+  them. They are not counted as left to do, so the checklist can finish
+  without them.
   Recall is LLM-ranked, as it is on any instance without an OpenAI key.
 - **Sources** stays open for one toggle when the operator provides the
   GitHub token from the environment (`GH_TOKEN` or `GITHUB_TOKEN` in the
@@ -864,7 +900,7 @@ offering the fields:
   server.
 - A step the operator provided — an OpenAI key or a bot token as a `${VAR}`
   reference, a source switched on in the tracked settings — stays done and
-  reads read-only.
+  read-only, and the Overview lists it under **Your operator has configured**.
 - The writes behind those steps answer `409` with the same two sentences:
   the Memory, Channels, Sources and Agents saves (the Slack switch in hosted
   mode and the GitHub switch with a token from the environment excepted), the
@@ -987,7 +1023,7 @@ Nerve has built-in daemon management. No systemd required for basic usage.
 
 ```bash
 nerve start           # Start as background daemon (nerve init already did this once)
-nerve stop            # Stop the daemon (graceful, 15s timeout)
+nerve stop            # Stop the daemon (graceful: gateway.drain_timeout_seconds + 15s)
 nerve restart         # Stop + start
 nerve status          # Show PID, memory, uptime, setup state
 nerve status -f       # Show status then tail logs

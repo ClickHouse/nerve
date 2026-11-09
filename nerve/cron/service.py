@@ -17,6 +17,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
 
@@ -26,9 +27,9 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from nerve import paths
-from nerve.agent.engine import AgentEngine
+from nerve.agent.engine import AgentEngine, NotAcceptingTurnsError
 from nerve.agent.sessions import new_cron_run_id
-from nerve.config import ConfigError, NerveConfig
+from nerve.config import ConfigError, NerveConfig, _is_within, workspace_reviewed_paths
 from nerve.cron.jobs import (
     CronJob,
     describe_reserved_job_ids,
@@ -38,6 +39,14 @@ from nerve.cron.jobs import (
 )
 from nerve.db import Database
 from nerve.identity import CAUSE_FROM_ACTOR, Attribution, CauseArg, attribution_for
+from nerve.session_origin import cron_origin
+from nerve.setup_writer import (
+    CRON_FILE_HAND_EDITED,
+    CRON_FILE_READ_ONLY,
+    CRON_JOB_MISSING,
+    plan_cron_job_enabled,
+    publish_text,
+)
 from nerve.utils.aio import GRACEFUL_STOP_SECONDS
 
 if TYPE_CHECKING:
@@ -88,6 +97,40 @@ _PAUSED_MISS = "run skipped: came due while the machine was paused (catchup: fal
 # by hand (the Cron page's "Run now", the trigger API), or for source records
 # that a hosted source delivered (see CronService.on_source_delivered).
 RunOrigin = Literal["schedule", "catchup", "manual", "delivery"]
+
+# The window of the run counts that GET /api/cron/jobs gives for each job.
+_STATS_DAYS = 7
+
+# How much of a failed run's error goes into the notice that a job fails.
+_FAILURE_NOTICE_LINES = 5
+_FAILURE_NOTICE_CHARS = 600
+
+# Why the Cron page cannot switch a job on or off. ``{file}`` is the name of
+# the job's YAML file. The keys are CronTogglePlan problems (setup_writer).
+_TOGGLE_LOCKDOWN = "This instance is in lockdown. Change the job in the config repository."
+_TOGGLE_SYNCED = "This workspace syncs from a config repository. Change the job there."
+_TOGGLE_PROBLEMS = {
+    CRON_FILE_HAND_EDITED: "Nerve could not change only the enabled line of this "
+                           "job in {file}. Change it in the file.",
+    CRON_FILE_READ_ONLY: "Nerve cannot write {file}.",
+    CRON_JOB_MISSING: "{file} does not have this job.",
+}
+_TOGGLE_UNREADABLE = "Nerve cannot read {file}."
+
+
+class CronToggleRefused(Exception):
+    """A job cannot be switched on or off through the API. The message says why."""
+
+
+def _toggle_refusal(problem: str, file: Path) -> str:
+    return _TOGGLE_PROBLEMS.get(problem, _TOGGLE_UNREADABLE).format(file=file.name)
+
+
+def _failure_notice_body(error: str | None) -> str:
+    """The first lines of a run's error, as a code block."""
+    lines = (error or "").strip().splitlines()[:_FAILURE_NOTICE_LINES]
+    head = "\n".join(lines)[:_FAILURE_NOTICE_CHARS].replace("```", "'''")
+    return f"```\n{head}\n```" if head else "The run ended with an error."
 
 
 class _RunsInFlight:
@@ -196,9 +239,14 @@ class _Forecast:
     runs_at: datetime | None = None
 
 
-# The forecast reason of a source runner whose source runs when records are
-# delivered (``Source.push_fed``): its scheduled run is a fallback.
-_PUSH_FED_REASON = "the source runs when records are delivered; the scheduled run is a fallback"
+# The forecast reason of a source runner whose source reads a buffer only the
+# running instance writes (``Source.push_fed``) while nothing delivered waits
+# in it: the scheduled run is not counted as the next task.
+_PUSH_FED_REASON = (
+    "the source drains only what is delivered while the instance runs, and no "
+    "delivered records were found waiting; the scheduled run is not counted as the "
+    "next task"
+)
 
 
 # ScheduleWakeup autonomous-loop sentinels (Claude Code /loop). Nerve has no
@@ -1478,7 +1526,7 @@ class CronService:
         session_id = f"cron:{job_id}:{new_cron_run_id()}"
         await self.engine.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron",
-            actor=self.db.system_actor, cause=cause,
+            actor=self.db.system_actor, cause=cause, origin=cron_origin(job_id),
         )
         await self.db.set_channel_session(self._channel_key(job_id), session_id)
         logger.info(
@@ -1640,7 +1688,7 @@ class CronService:
         """Load and merge jobs from system.yaml and jobs.yaml.
 
         System jobs come from system.yaml (managed by `nerve init`).
-        User jobs come from jobs.yaml (user-defined, never touched by Nerve).
+        User jobs come from jobs.yaml (user-defined; Nerve only switches a job there).
         If a user job has the same ID as a system job, the user version wins.
 
         Jobs holding an id the daemon reserves for itself are dropped here, so
@@ -1756,6 +1804,12 @@ class CronService:
         self, job: CronJob, attribution: Attribution | None = None,
     ) -> None:
         """Inner implementation of job execution."""
+        # The engine is draining before a shutdown. Write no log row, so the
+        # catch-up after the restart sees the job as overdue.
+        if not self.engine.accepting_turns:
+            logger.info("Skipping cron job %s: Nerve is draining", job.id)
+            return
+
         # Pre-check: skip if any configured run gate is unsatisfied.
         if job.gates:
             from nerve.cron.gates import GateContext, evaluate_gates
@@ -1865,18 +1919,61 @@ class CronService:
                     log_id, "success", output=output, session_id=session_id,
                 )
                 logger.info("Cron job %s completed (%d chars)", job.id, len(response))
+                await self._send_health_notice(job.id, log_id, "success", session_id=session_id)
             else:
                 error = result.outcome.describe()
                 await self.db.log_cron_finish(
                     log_id, "error", output=output, error=error, session_id=session_id,
                 )
                 logger.warning("Cron job %s ended with %s", job.id, error)
+                await self._send_health_notice(
+                    job.id, log_id, "error", error=error, session_id=session_id,
+                )
 
         except Exception as e:
             logger.error("Cron job %s failed: %s", job.id, e, exc_info=True)
             await self.db.log_cron_finish(
                 log_id, "error", error=str(e), session_id=session_id,
             )
+            await self._send_health_notice(
+                job.id, log_id, "error", error=str(e), session_id=session_id,
+            )
+
+    async def _send_health_notice(
+        self, job_id: str, log_id: int, status: str, *,
+        error: str | None = None, session_id: str | None = None,
+    ) -> None:
+        """Tell the user when an agent job starts to fail, and when it works again.
+
+        The job's previous run decides: the latest run with a result that
+        started before this one (``get_previous_cron_status``). An error after
+        a success, or as the job's first recorded run, sends "Cron job <id>
+        failed" (high); more errors send nothing. The first success after an error sends
+        "Cron job <id> works again" (low). The notice goes through the
+        notification service, so silences and channels apply, and it names the
+        run's session. A notice that fails is logged and does not change the run.
+
+        Agent jobs only: a workflow run and a source runner send their own.
+        """
+        service = self.notification_service
+        if service is None:
+            return
+        try:
+            previous = await self.db.get_previous_cron_status(log_id)
+            if status == "error" and previous != "error":
+                title = f"Cron job {job_id} failed"
+                body, priority = _failure_notice_body(error), "high"
+            elif status == "success" and previous == "error":
+                title, body, priority = f"Cron job {job_id} works again", "", "low"
+            else:
+                return
+            await service.send_notification(
+                session_id=session_id or "system", title=title, body=body,
+                priority=priority,
+                metadata={"cron_job_id": job_id, "cron_log_id": log_id},
+            )
+        except Exception:
+            logger.warning("Health notice for cron job %s failed", job_id, exc_info=True)
 
     async def _start_workflow_run(
         self, job: CronJob, log_id: int, attribution: Attribution | None = None,
@@ -2002,7 +2099,10 @@ class CronService:
                 summary += f", error: {result.error}"
 
             status = "success" if result.error is None else "error"
-            await self.db.log_cron_finish(log_id, status, output=summary[:2000])
+            await self.db.log_cron_finish(
+                log_id, status, output=summary[:2000],
+                records=result.records_ingested + result.records_dropped,
+            )
             await self.db.log_source_run(
                 source=runner.source.source_name,
                 records_fetched=result.records_ingested,
@@ -2044,6 +2144,10 @@ class CronService:
         dispatched (not awaited) so one long turn can't stall the sweep; the
         per-session lock inside ``run`` serialises it behind any live turn.
         """
+        # During a drain, leave due wakeups pending: a claimed wakeup whose
+        # run is refused is lost. The sweep after the restart fires them.
+        if not self.engine.accepting_turns:
+            return
         try:
             now_iso = datetime.now(timezone.utc).isoformat()
             due = await self.db.get_due_wakeups(now_iso)
@@ -2132,6 +2236,9 @@ class CronService:
 
         if not job:
             raise ValueError(f"Job not found: {job_id}")
+        # The wrapper skips a job during a drain. A manual trigger must say so.
+        if not self.engine.accepting_turns:
+            raise NotAcceptingTurnsError()
 
         await self._run_job_wrapper(job, attribution, origin="manual")
 
@@ -2313,7 +2420,20 @@ class CronService:
         }
 
     async def list_jobs(self) -> list[dict]:
-        """List all registered jobs (cron + sources) with their next run times."""
+        """List all registered jobs (cron + sources) with their next run times.
+
+        Each job also has its kind (``agent``, ``workflow`` or ``source``), its
+        latest run and its run counts of the last 7 days.
+        """
+        last_runs = await self.db.get_last_cron_runs()
+        stats = await self.db.get_cron_job_stats(_STATS_DAYS)
+
+        def health(job_id: str) -> dict:
+            return {
+                "last_run": last_runs.get(job_id),
+                "stats_7d": stats.get(job_id, {"runs": 0, "success": 0, "error": 0, "missed": 0}),
+            }
+
         result = []
         for job in self._jobs:
             sched_job = self.scheduler.get_job(job.id)
@@ -2325,6 +2445,7 @@ class CronService:
             result.append({
                 "id": job.id,
                 "type": "cron",
+                "kind": "workflow" if job.workflow is not None else "agent",
                 "source": job.metadata.get("_source", "unknown"),
                 "schedule": job.schedule,
                 "description": job.description,
@@ -2335,6 +2456,7 @@ class CronService:
                 "gates": [gate.describe() for gate in job.gates],
                 "next_run": next_run.isoformat() if next_run else None,
                 "last_session_id": last_session_id,
+                **health(job.id),
             })
 
         # Include source runners
@@ -2351,14 +2473,70 @@ class CronService:
             result.append({
                 "id": runner.job_id,
                 "type": "source",
+                "kind": "source",
                 "schedule": schedule,
                 "description": f"Source: {source_name} (ingestor)",
                 "enabled": True,
                 "next_run": next_run.isoformat() if next_run else None,
                 "last_session_id": None,
+                **health(runner.job_id),
             })
 
         return result
+
+    def _job_file(self, job: CronJob) -> Path:
+        """The YAML file that the job comes from: a job in ``jobs.yaml``
+        replaces the ``system.yaml`` job with its id."""
+        if job.metadata.get("_source") == "user":
+            return Path(self.config.cron.jobs_file)
+        return Path(self.config.cron.system_file)
+
+    def _synced_from_config_repo(self, path: Path) -> bool:
+        """Whether workspace sync owns ``path``: it is in the reviewed surface
+        of a workspace that syncs. Sync refuses to merge while a file there has
+        a local change, so a change must go through the config repository."""
+        if not self.config.workspace_sync.enabled:
+            return False
+        return any(
+            _is_within(path, reviewed)
+            for reviewed in workspace_reviewed_paths(self.config.workspace)
+        )
+
+    async def set_job_enabled(self, job_id: str, enabled: bool) -> dict:
+        """Write ``enabled`` into the job's YAML file, then reload.
+
+        Only the job's ``enabled:`` line changes
+        (:func:`nerve.setup_writer.plan_cron_job_enabled`). Raises ValueError
+        for an unknown job, CronToggleRefused under lockdown, for a file that
+        workspace sync owns or for a file in which that one line cannot be
+        changed, and the reload's ConfigError. A reload
+        that fails leaves the schedule as it was, so the file gets its old
+        text back before the error goes on. Returns the reload summary, as
+        :meth:`reload` does.
+        """
+        async with self._reload_lock:
+            job = next((j for j in self._jobs if j.id == job_id), None)
+            if job is None:
+                raise ValueError(f"Unknown cron job: {job_id}")
+            if self.config.lockdown:
+                raise CronToggleRefused(_TOGGLE_LOCKDOWN)
+            path = self._job_file(job)
+            if self._synced_from_config_repo(path):
+                raise CronToggleRefused(_TOGGLE_SYNCED)
+            plan = plan_cron_job_enabled(path, job_id, enabled)
+            if not plan.ok:
+                raise CronToggleRefused(_toggle_refusal(plan.problem, path))
+            original = path.read_text(encoding="utf-8")
+            plan.publish()
+            try:
+                summary = await self._reload_locked()
+            except BaseException:
+                if plan.changes_anything:
+                    publish_text(path, original)
+                raise
+        self._schedule_changed()
+        logger.info("Cron job %s %s", job_id, "enabled" if enabled else "disabled")
+        return summary
 
     # -- What runs next --------------------------------------------------------
 
@@ -2375,11 +2553,13 @@ class CronService:
 
         Not every change is announced. A session that records a wakeup
         (``ScheduleWakeup``) does so inside its turn, which has no reference to
-        this service; and tasks created, moved or edited from a chat turn, the
+        this service; tasks created, moved or edited from a chat turn, the
         web UI or the API change what a ``tasks`` gate forecasts without any
-        call here. Those count from the next :meth:`next_scheduled` on, so a
-        caller that keeps the answer should also refresh it periodically, and
-        when a turn ends.
+        call here; and a message a channel buffers for its
+        ``<channel>:observed`` drain makes that drain count (see
+        :meth:`_undrained`) without one. Those count from the next
+        :meth:`next_scheduled` on, so a caller that keeps the answer should
+        also refresh it periodically, and when a turn ends.
         """
         self._schedule_listeners.append(callback)
 
@@ -2428,8 +2608,9 @@ class CronService:
         :func:`nerve.cron.gates.forecast_gates`) — its next run, or, when that
         is forecast to skip, one of its next few runs (see
         :meth:`_forecast_job`); the next run of each source runner, except
-        one whose source runs when records are delivered (``Source.push_fed``),
-        whose scheduled run is a fallback; the earliest pending session
+        one whose source reads a buffer only the running instance writes
+        (``Source.push_fed``: the hosted sources, the channel drains) while
+        nothing delivered waits in it; the earliest pending session
         wakeup. Cleanup and the wakeup sweep are housekeeping and never
         count. ``None`` when nothing falls within *horizon* of *now*
         (default: the current time), which must be
@@ -2491,10 +2672,11 @@ class CronService:
             next_run = getattr(sched_job, "next_run_time", None)
             if sched_job.func == self._run_source_wrapper:
                 runner = sched_job.args[0]
-                if getattr(runner.source, "push_fed", False) is True:
-                    # The source runs when records are delivered, and its
-                    # scheduled run is a fallback that normally finds nothing,
-                    # so it is not work the instance will start on its own.
+                push_fed = getattr(runner.source, "push_fed", False) is True
+                if push_fed and not await self._undrained(runner):
+                    # Only the running instance writes the source's buffer,
+                    # and nothing delivered waits in it, so the scheduled run
+                    # is not work the instance will start on its own.
                     forecasts[sched_job.id] = _Forecast(
                         "source", next_run, runs=False, reason=_PUSH_FED_REASON,
                     )
@@ -2505,6 +2687,23 @@ class CronService:
             elif sched_job.func == self._run_job_wrapper:
                 forecasts[sched_job.id] = await self._forecast_job(sched_job, limit)
         return forecasts
+
+    async def _undrained(self, runner) -> bool:
+        """Whether a push-fed runner's source has delivered records waiting
+        past the runner's cursor (:meth:`Source.has_undrained`), so its
+        scheduled run is work and counts. A source without the check, or a
+        check that fails, answers no: a forecast never fails for it."""
+        check = getattr(runner.source, "has_undrained", None)
+        if check is None:
+            return False
+        try:
+            cursor = await self.db.get_sync_cursor(runner.source.source_name)
+            return bool(await check(cursor))
+        except Exception:  # the forecast must not fail for a buffer check
+            logger.debug(
+                "Forecast: the buffer check of %s failed", runner.job_id, exc_info=True,
+            )
+            return False
 
     async def _forecast_job(self, sched_job, limit: datetime) -> _Forecast:
         """What the gates of a scheduled cron job forecast for its next run.

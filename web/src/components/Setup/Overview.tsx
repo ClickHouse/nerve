@@ -1,38 +1,30 @@
 import { Link, useNavigate } from 'react-router-dom';
-import type { SetupState, SetupStep } from '../../api/client';
+import type { SetupState } from '../../api/client';
 import { Button } from '../ui';
 import { ArrowRight, RefreshCw } from '../ui/icons';
 import { actorName } from '../../stores/actorStore';
 import { useAuthStore } from '../../stores/authStore';
-import { ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, NOT_AVAILABLE_HERE, OVERVIEW_SUBLINE, OVERVIEW_SUBLINE_FINISHED } from './copy';
-import { stepManaged } from './credentialSource';
-import { appliesHere, closedByPolicy, firstPendingStop, stepTitle, stopPath, waitsForMode } from './navigation';
+import {
+  ACCOUNT_ROW_LINK, ACCOUNT_ROW_TEXT, NO_OWN_STEPS, OPERATOR_SECTION_HEADING, OVERVIEW_SUBLINE,
+  OVERVIEW_SUBLINE_FINISHED,
+} from './copy';
+import { firstPendingStop, operatorSteps, ownSteps, stepTitle, stopPath } from './navigation';
 import { Notice } from './Notice';
 import { StatusBadge } from './StatusBadge';
 import { useWizardNav } from './wizardContext';
-
-/**
- * A done step whose configuration provably did not come from this wizard:
- * a credential the operator provided (the environment, a configuration
- * repository, the channel gateway), or any config-writing step on a
- * lockdown instance (its files arrive from the repository). Anything else
- * may well be the person's own work from a minute ago, or another
- * person's, and is not called "already configured".
- */
-function preconfigured(step: SetupStep, state: SetupState): boolean {
-  if (step.status !== 'done') return false;
-  if (stepManaged(step) !== null) return true;
-  return state.lockdown && step.id !== 'claim' && step.id !== 'mode';
-}
 
 /**
  * `/setup`: orientation before the first step, and the place to come back to.
  *
  * Who you are (from the actor the auth store confirmed — in external mode
  * that is the name your organisation's sign-in supplied), what the wizard
- * does, what was provably configured outside it, and a Continue that lands
- * on the first pending step. "Change" opens a done step to edit it: Save
- * and Back come straight back here.
+ * does, the person's own steps, and a Continue that lands on the first
+ * pending step. "Change" opens a done step to edit it: Save and Back come
+ * straight back here. Under the list, "Your operator has configured" names
+ * the done steps that the person cannot change here, with their summaries.
+ * A step that a lockdown or the instance's policy closed is not shown. When
+ * no step is left for the person (external mode under lockdown, before a
+ * mode is chosen), the page says so in place of the count and the list.
  */
 export function Overview({ state }: { state: SetupState }) {
   const nav = useWizardNav();
@@ -41,16 +33,14 @@ export function Overview({ state }: { state: SetupState }) {
   const account = useAuthStore((s) => s.account);
   const external = state.auth_mode === 'external';
   const name = viewer ? actorName(viewer) : (account?.username ?? 'you');
-  const done = state.steps.filter((s) => s.status === 'done');
-  const skipped = state.steps.filter((s) => s.status === 'skipped');
-  // A step closed on this instance stays in the list as "not available",
-  // but a finished setup must read "N of N", so the count leaves it out.
-  const total = state.steps.filter(appliesHere).length;
+  const own = ownSteps(state);
+  const operator = operatorSteps(state);
+  const done = own.filter((s) => s.status === 'done');
+  const skipped = own.filter((s) => s.status === 'skipped');
   const next = firstPendingStop(state);
-  const preset = state.steps.filter((s) => preconfigured(s, state)).map((s) => stepTitle(s));
   const count = state.finished && skipped.length > 0
     ? `${done.length} done · ${skipped.length} skipped`
-    : `${done.length} of ${total} steps done${skipped.length > 0 ? ` · ${skipped.length} skipped` : ''}`;
+    : `${done.length} of ${own.length} steps done${skipped.length > 0 ? ` · ${skipped.length} skipped` : ''}`;
 
   return (
     <div className="flex flex-col gap-4">
@@ -71,16 +61,15 @@ export function Overview({ state }: { state: SetupState }) {
       </div>
 
       <div className="rounded-lg border border-border bg-surface-raised p-4 flex flex-col gap-2 text-sm text-text-muted">
-        <p>
-          Each step saves when you continue.
-          {external && ' These settings apply to everyone who uses this instance, not only to you.'}
-        </p>
-        <p>
-          <strong className="text-text">{count}</strong>.
-          {preset.length > 0 && !state.finished && (
-            <> Already configured: {preset.join(', ')}.</>
-          )}
-        </p>
+        {own.length === 0 ? <p>{NO_OWN_STEPS}</p> : (
+          <>
+            <p>
+              Each step saves when you continue.
+              {external && ' These settings apply to everyone who uses this instance, not only to you.'}
+            </p>
+            <p><strong className="text-text">{count}</strong>.</p>
+          </>
+        )}
       </div>
 
       {state.lockdown && (
@@ -98,45 +87,53 @@ export function Overview({ state }: { state: SetupState }) {
 
       {state.warning && <Notice tone="warning">{state.warning}</Notice>}
 
-      <ol className="flex flex-col gap-1" aria-label="Steps">
-        {state.steps.map((step) => (
-          <li key={step.id} className="flex items-center justify-between gap-3 rounded-lg border border-border-subtle px-3 py-2">
-            <div className="min-w-0">
-              <Link to={stopPath(step.id)} className="text-sm text-text hover:underline underline-offset-2">
-                {stepTitle(step)}
-              </Link>
-              {step.summary && <p className="text-xs text-text-dim truncate">{step.summary}</p>}
-              {/* The account's page is read-only; what can be changed lives in Accounts. */}
-              {step.id === 'claim' && (
-                <p className="text-xs text-text-dim">
-                  {ACCOUNT_ROW_TEXT}{' '}
-                  <Link to="/accounts" className="underline underline-offset-2 hover:text-text">{ACCOUNT_ROW_LINK}</Link>
-                </p>
-              )}
-              {step.status === 'blocked' && step.blocked_reason && !waitsForMode(step) && (
-                <p className="text-xs text-text-dim">{step.blocked_reason}</p>
-              )}
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              {/* A step the instance has closed (it keeps no credentials on
-                  disk) is not a "blocked" chore: the row says so in words,
-                  and the reason above it says why. */}
-              {closedByPolicy(step)
-                ? <span className="text-xs text-text-muted">{NOT_AVAILABLE_HERE}</span>
-                : <StatusBadge step={step} />}
-              {step.status === 'done' && !step.read_only && step.id !== 'claim' && (
-                <Link
-                  to={stopPath(step.id)}
-                  state={{ returnTo: '/setup' }}
-                  className="text-xs text-text-muted hover:text-text underline-offset-2 hover:underline"
-                >
-                  Change
+      {own.length > 0 && (
+        <ol className="flex flex-col gap-1" aria-label="Steps">
+          {own.map((step) => (
+            <li key={step.id} className="flex items-center justify-between gap-3 rounded-lg border border-border-subtle px-3 py-2">
+              <div className="min-w-0">
+                <Link to={stopPath(step.id)} className="text-sm text-text hover:underline underline-offset-2">
+                  {stepTitle(step)}
                 </Link>
-              )}
-            </div>
-          </li>
-        ))}
-      </ol>
+                {step.summary && <p className="text-xs text-text-dim truncate">{step.summary}</p>}
+                {/* The account's page is read-only; what can be changed lives in Accounts. */}
+                {step.id === 'claim' && (
+                  <p className="text-xs text-text-dim">
+                    {ACCOUNT_ROW_TEXT}{' '}
+                    <Link to="/accounts" className="underline underline-offset-2 hover:text-text">{ACCOUNT_ROW_LINK}</Link>
+                  </p>
+                )}
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <StatusBadge step={step} />
+                {step.status === 'done' && !step.read_only && step.id !== 'claim' && (
+                  <Link
+                    to={stopPath(step.id)}
+                    state={{ returnTo: '/setup' }}
+                    className="text-xs text-text-muted hover:text-text underline-offset-2 hover:underline"
+                  >
+                    Change
+                  </Link>
+                )}
+              </div>
+            </li>
+          ))}
+        </ol>
+      )}
+
+      {operator.length > 0 && (
+        <section aria-labelledby="setup-operator-heading" className="flex flex-col gap-1">
+          <h2 id="setup-operator-heading" className="text-sm font-medium text-text">{OPERATOR_SECTION_HEADING}</h2>
+          <ul className="flex flex-col gap-1">
+            {operator.map((step) => (
+              <li key={step.id} className="rounded-lg border border-border-subtle px-3 py-2">
+                <p className="text-sm text-text">{stepTitle(step)}</p>
+                {step.summary && <p className="text-xs text-text-dim truncate">{step.summary}</p>}
+              </li>
+            ))}
+          </ul>
+        </section>
+      )}
 
       {/* Finished: a person who is done wants the chat, so that is the
           primary action; the review stays one click away. */}

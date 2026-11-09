@@ -12,7 +12,7 @@ git-syncable workspace subtree):
 | File | Purpose | Managed by |
 |------|---------|------------|
 | `system.yaml` | Built-in crons (core + productivity) | The Mode step of setup writes it (or `nerve init --terminal`); the Automation step flips its `enabled` flags — safe to regenerate with `nerve init --terminal` |
-| `jobs.yaml` | Your custom crons | You — Nerve never touches this file |
+| `jobs.yaml` | Your custom crons | You. Nerve changes only the `enabled` flag of a job, when you switch it on the Cron page (see [Switching a job on and off](#switching-a-job-on-and-off)) |
 
 > **Location & migration.** New installs write cron config to
 > `<workspace>/config/cron/`. Installs that still have the legacy
@@ -312,8 +312,8 @@ on every scheduled tick; `nerve doctor` names the jobs that still use this gate.
 
 A gate can also say ahead of time what it will decide. `forecast(ctx, at)`
 answers "would this gate let the job run at `at`?" from what is known now. Nerve
-asks it to show what each job's next run will do — `GET /api/cron/schedule`,
-`nerve cron next`, and the **Forecast** column on the Cron page — and to work out
+asks it to show what each job's next run will do (`GET /api/cron/schedule`,
+`nerve cron next`, and the next run on the Cron page), and to work out
 when the instance next has work of its own (see [What runs next](#what-runs-next)).
 The gate is still checked for real when the run comes; a forecast only predicts
 that check.
@@ -522,10 +522,13 @@ These ship in `<workspace>/config/cron/system.yaml`, written when the mode is ch
 | `task-planner` | Every 4 hours | persistent (168h rotation) | Reviews open tasks, explores codebases, proposes implementation plans via plan-approve workflow. Gated on `tasks` (status `pending`) — stays idle when there's nothing to plan. | ✅ default | off; onboarding enables it |
 | `skill-extractor` | Every 12 hours | persistent | Identifies repeated workflows from recent conversations, memory, and completed tasks. Proposes new skills via task+plan system. | ✅ optional | ✅ default |
 | `skill-reviser` | Weekly (Sun 3 AM) | persistent | Reviews existing skills for accuracy (outdated paths, credentials), completeness (missing steps), and quality (trigger phrases, examples). Proposes revisions via task+plan. | ✅ optional | ✅ default |
+| `machine-maintenance` | Weekly (Sun 4 AM) | isolated | Cleans up the machine Nerve runs on. The agent first finds out what this machine has (disk use, repositories and worktrees, build and package caches, Docker, services that listen on a port), then looks only at items that are old and that nothing uses. It removes items that hold no data without asking: caches, dangling Docker images and build cache, a worktree whose pull request is merged and that has no local changes. It sends one `ask_user` for anything that can hold data (Docker volumes, stopped containers, worktrees with local work, leftover dev servers or test containers on open ports) and acts only on what the answer approves. It never touches Nerve itself, system services or anything in use. Sends a low-priority `notify` with the space freed when it changed something. | ✅ default | ✅ default |
 
 **Mode defaults:**
-- **Personal**: `memory-maintenance` (always on) + `inbox-processor` + `task-planner` enabled by default. `skill-extractor` and `skill-reviser` are offered as toggles on the Automation step of the setup page (and in `nerve init --terminal`).
-- **Worker**: `memory-maintenance` (always on) + `skill-extractor` + `skill-reviser` enabled by default when the mode is chosen on the setup page or by `NERVE_MODE=worker nerve init --non-interactive`. `task-planner` is written with `enabled: false` on every path: whether the worker plans through the approval loop is decided during onboarding (the onboarding conversation, or the session in which a worker set up without the browser sets itself up), which enables it by overriding the job by id in `jobs.yaml` with a prompt and a `tasks` gate scoped to the worker's tag (the Automation step of the setup page can also switch it on). `nerve init --terminal` has no cron step for workers and writes the two skill jobs with `enabled: false` as well; set `enabled: true` in `system.yaml` (or override the job by id in `jobs.yaml`), then `nerve reload`. `inbox-processor` is not included (workers don't have sync sources).
+- **Personal**: `memory-maintenance` (always on) + `inbox-processor` + `task-planner` + `machine-maintenance` enabled by default. `skill-extractor` and `skill-reviser` are offered as toggles on the Automation step of the setup page (and in `nerve init --terminal`).
+- **Worker**: `memory-maintenance` (always on) + `skill-extractor` + `skill-reviser` + `machine-maintenance` enabled by default when the mode is chosen on the setup page or by `NERVE_MODE=worker nerve init --non-interactive`. `task-planner` is written with `enabled: false` on every path: whether the worker plans through the approval loop is decided during onboarding (the onboarding conversation, or the session in which a worker set up without the browser sets itself up), which enables it by overriding the job by id in `jobs.yaml` with a prompt and a `tasks` gate scoped to the worker's tag (the Automation step of the setup page can also switch it on). `nerve init --terminal` has no cron step for workers and writes the two skill jobs and `machine-maintenance` with `enabled: false` as well; set `enabled: true` in `system.yaml` (or override the job by id in `jobs.yaml`), then `nerve reload`. `inbox-processor` is not included (workers don't have sync sources).
+
+`machine-maintenance` is on by default and optional in both modes: switch it off on the Automation step of the setup page, or with a job of the same id in `jobs.yaml`. Its prompt is general on purpose: the agent learns what each machine has on each run. To keep an item out of its reach, write it in `TOOLS.md` or ask the agent to remember it; the job reads both before it acts.
 
 Both skill jobs use `source="skill-extractor"` or `source="skill-reviser"` on created tasks. When their plans are approved, an `impl-<id>` session is spawned like for any plan; its prompt tells it to apply the plan (a full SKILL.md file) with `skill_create` or `skill_update` and then close the task with `task_done`.
 
@@ -621,9 +624,10 @@ machine, more than 30 seconds before it ended, is not a late run: see
 
 `GET /api/cron/schedule` reports the next moment the instance will start work on
 its own, and what each job's next run is forecast to do. `nerve cron next` prints
-the same from the running daemon, and the Cron page shows each job's forecast in
-its card. The page lists the jobs without waiting for the forecasts, fills them
-in when they arrive, and goes on without them after 10 seconds.
+the same from the running daemon, and the Cron page shows the forecast under the
+next run of a job with gates, and a forecast skip of any job. The page lists the
+jobs without waiting for the forecasts, fills them in when they arrive, and goes
+on without them after 10 seconds.
 
 ```json
 {
@@ -646,9 +650,12 @@ in when they arrive, and goes on without them after 10 seconds.
   will be reached, say), and counts the first one forecast to happen. A gate on
   the default forecast is asked once: it answers the same for any time, so if it
   says no, so does every later run;
-- the next run of each source runner, except a source that runs when records
-  are delivered (the hosted GitHub source, `Source.push_fed`): its scheduled
-  run is a fallback and does not count;
+- the next run of each source runner, except a source whose buffer only the
+  running instance writes, as records are delivered to it (the hosted GitHub
+  source and the channel drains `<channel>:observed`, `Source.push_fed`), while
+  nothing delivered waits in that buffer: nothing is added to it while the
+  machine is parked, so the scheduled run is not counted; a run with delivered
+  records waiting counts;
 - the earliest pending session wakeup (`ScheduleWakeup`, or a message deferred
   with "Run later").
 
@@ -667,9 +674,10 @@ timezone-aware, or it raises `ValueError`.
 
 `jobs` lists the jobs `GET /api/cron/jobs` lists. `forecast` is `run` or `skip`
 for a job's next run and `null` for a job without one (a disabled job, say);
-`reason` says why a run is forecast to be skipped. For a source that runs when
-records are delivered, `skip` means the scheduled run is not counted in
-`next`; the run itself still fires.
+`reason` says why a run is forecast to be skipped. For a `Source.push_fed`
+source (the hosted GitHub source, the channel drains), `skip` means the
+scheduled run is not counted in `next` because nothing delivered waits in its
+buffer; the run itself still fires.
 
 Forecasts are judged from what is known when you ask. Code that keeps the answer
 around can register a schedule listener (`CronService.add_schedule_listener`) to
@@ -679,10 +687,11 @@ session wakeup is claimed; when triggers move past a pause; and when a source is
 synced by hand (`POST /api/sources/{name}/sync`, `POST /api/sources/sync-all`).
 
 Not every change is announced. A wakeup that a session records during its turn,
-and tasks created, moved or edited from a chat turn, the web UI or the API (which
-can change what a `tasks` gate forecasts), count only from the next time the
-schedule is read. Code that keeps the answer should therefore also refresh it
-periodically, and when a turn ends.
+tasks created, moved or edited from a chat turn, the web UI or the API (which
+can change what a `tasks` gate forecasts), and a message a channel buffers for
+its `<channel>:observed` drain (which makes that drain count) count only from
+the next time the schedule is read. Code that keeps the answer should therefore
+also refresh it periodically, and when a turn ends.
 
 ## Source Runners
 
@@ -724,9 +733,16 @@ not run the job again, since the job has run since. The drain counts as a run
 of the source's runner in the same way. Jobs without such a gate keep to their
 schedule, and the schedules stay the fallback for everything. The setting is
 read for each delivery, so a reload applies it. A scheduled run of a source
-that runs on delivery is not counted as the next scheduled task (see
-[What runs next](#what-runs-next)): it normally finds nothing, so a platform
-that parks the machine is not told to wake it for that run.
+that runs on delivery is not counted as the next scheduled task while nothing
+waits in its buffer (see [What runs next](#what-runs-next)): it normally finds
+nothing, so a platform that parks the machine is not told to wake it for that
+run. The channel drains (`<channel>:observed`) are not counted in `next` either
+while nothing waits in their buffer: only the running instance writes it, so
+nothing is added while the machine is parked, and what arrives meanwhile is
+delivered after the next wake. They are not run on delivery: messages buffered
+since the last drain are taken by the next scheduled drain, and from the next
+forecast on (at most one activity report interval later) that drain counts, so
+a platform keeps the machine up, or wakes it, for them.
 
 ## Logging
 
@@ -743,7 +759,70 @@ Every cron and source run is logged in the `cron_logs` SQLite table:
   creates has that person as its cause, so the agent's work in it is the
   system actor's for that person. See
   [Attribution](accounts.md#attribution).
+- `records`: for a source run, the number of records that it fetched: stored
+  in the inbox plus dropped by the inbox guardrail. NULL for agent, workflow
+  and missed runs. A source run with `records = 0` and status `success` found
+  nothing new.
 
 Source runs also log to `source_run_log` with per-source diagnostics (records fetched/processed, errors).
 
-View logs via API: `GET /api/cron/logs?job_id=morning-briefing&limit=10`
+View logs via API: `GET /api/cron/logs?job_id=morning-briefing&limit=10`.
+Add `hide_empty=1` to leave out the source runs that found nothing new.
+
+## The Cron page
+
+The Cron page opens on the sheet of the first job: its name and kind (agent,
+workflow or source), an **Active** switch, **Run now**, the schedule in words
+with the next run, the latest run, and how many of the runs of the last 7 days
+succeeded. For a workflow job, the sheet shows when the workflow run started
+and how many runs started, not whether they succeeded: the workflow run sends
+its own notifications when it finishes, fails or runs out of budget. Below the
+sheet, **History** lists the runs, newest first, with ✓,
+✗ or − (missed), the duration and a link to the run's session. The history
+hides the source runs that found nothing new; **Show runs with no new items**
+shows them. **All jobs** in the job list shows the runs of every job.
+
+### Switching a job on and off
+
+The **Active** switch writes `enabled` into the job's YAML file and reloads the
+cron jobs (`PUT /api/cron/jobs/{job_id}/enabled`). The file is the one that
+defines the job: `jobs.yaml` for your own jobs and for a built-in job that
+`jobs.yaml` replaces, `system.yaml` for the other built-in jobs.
+
+Nerve changes one line of the file: the job's `enabled:` line, or, when the
+job has none, a new `enabled:` line under its `id:` line, with the indentation
+of the job's keys. Comments, quotes, block scalars and the rest of the file
+stay as they are. Nerve then reads the result again and writes it only if the
+job's `enabled` is the one difference. A layout where one line cannot do that
+(a job written as a flow mapping, `{id: ..., ...}`, for example) is refused,
+and the error tells you to change `enabled` in the file. When the reload after
+the change fails, the file gets its old text back and the error is shown.
+
+Nerve also refuses the change under [lockdown](config.md#lockdown-remote-only-read-only)
+and, while [workspace sync](config.md#git-backed-workspace-sync) is on, for a
+file in the workspace's `config/`, because sync refuses to merge while a file
+there has a local change. In both cases, change the job in the config
+repository. A file outside the workspace, such as the legacy `~/.nerve/cron/jobs.yaml`,
+keeps its switch. A file that Nerve cannot write is refused too. A source has
+no switch: switch it in its `sync` settings.
+
+### Failure notices
+
+An agent job that starts to fail sends a notification: **Cron job `<id>`
+failed**, priority `high`, with the first lines of the error. It names the
+run's session, so the web UI links to it. More failed runs send nothing. The
+first run that succeeds after that sends **Cron job `<id>` works again**,
+priority `low`. The job's previous run decides: the latest run of the job
+that started before this one and has a result. A run that fails after a
+success, or as the job's first recorded run, sends the first notice; a
+success after a failed run sends the second. Missed runs, and earlier runs
+that are still going, do not count. Two runs that overlap and both fail can
+each send the first notice. The daily cleanup deletes runs older than 14
+days, but it keeps the latest finished run of each job, so a job that runs
+less often than that and keeps failing does not send the notice again.
+
+The notices go through the notification service, so notification silences
+and the notification channels apply to them. Their
+metadata has `cron_job_id` and `cron_log_id`. A failing job is not switched
+off. Workflow-run jobs and source runners are left out: a workflow run sends
+its own notices, and a source sends its health notices.

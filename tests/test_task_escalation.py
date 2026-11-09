@@ -2,6 +2,7 @@
 
 Quiet hours are optional: ``quiet_start`` and ``quiet_end`` both empty (a
 worker's default) means there are none, so the escalation check never pauses.
+``tests/test_quiet_hours.py`` tests the window itself.
 """
 
 from __future__ import annotations
@@ -11,11 +12,12 @@ from datetime import UTC, datetime
 import pytest
 
 from nerve.config import NerveConfig
+from nerve.notifications import quiet_hours
 from nerve.tasks import escalation
 
 
 def _at(monkeypatch, hour: int, minute: int = 0) -> None:
-    """Pin ``datetime.now`` inside the escalation module to a UTC wall time."""
+    """Pin ``datetime.now`` of escalation and quiet hours to a UTC wall time."""
     fixed = datetime(2026, 10, 11, hour, minute, tzinfo=UTC)
 
     class _Fixed(datetime):
@@ -24,6 +26,7 @@ def _at(monkeypatch, hour: int, minute: int = 0) -> None:
             return fixed.astimezone(tz) if tz is not None else fixed
 
     monkeypatch.setattr(escalation, "datetime", _Fixed)
+    monkeypatch.setattr(quiet_hours, "datetime", _Fixed)
 
 
 def _config(start: str | None, end: str | None) -> NerveConfig:
@@ -33,27 +36,6 @@ def _config(start: str | None, end: str | None) -> NerveConfig:
     if end is not None:
         data["quiet_end"] = end
     return NerveConfig.from_dict(data)
-
-
-class TestIsQuietHour:
-    @pytest.mark.parametrize(("start", "end"), [("", ""), ("02:00", ""), ("", "08:00"), ("  ", "08:00")])
-    def test_empty_values_mean_no_quiet_hours(self, monkeypatch, start, end):
-        _at(monkeypatch, 3)
-        assert escalation._is_quiet_hour(_config(start, end)) is False
-
-    def test_a_window_applies_and_may_cross_midnight(self, monkeypatch):
-        _at(monkeypatch, 3)
-        assert escalation._is_quiet_hour(_config("02:00", "08:00")) is True
-        assert escalation._is_quiet_hour(_config(None, None)) is True, "a key no layer states: 02:00–08:00"
-        _at(monkeypatch, 23, 30)
-        assert escalation._is_quiet_hour(_config("22:00", "07:00")) is True
-        _at(monkeypatch, 12)
-        assert escalation._is_quiet_hour(_config("22:00", "07:00")) is False
-        assert escalation._is_quiet_hour(_config("02:00", "08:00")) is False
-
-    def test_an_unreadable_value_is_not_quiet(self, monkeypatch):
-        _at(monkeypatch, 3)
-        assert escalation._is_quiet_hour(_config("2am", "8am")) is False
 
 
 class _Tasks:

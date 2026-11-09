@@ -25,6 +25,7 @@ from nerve.config import (
 )
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
+from nerve.memory.manager import memory_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -78,18 +79,28 @@ async def list_memory_files():
     return {"files": files}
 
 
+_NOT_A_MEMORY_FILE = (
+    "Access denied: only markdown files at the workspace root or under memory/ "
+    "can be read or written here"
+)
+
+
+def _memory_file(workspace: Path, file_path: str) -> Path:
+    """The memory file that the request names, or a 403 (see memory_file_path)."""
+    path = memory_file_path(workspace, file_path)
+    if path is None:
+        raise HTTPException(status_code=403, detail=_NOT_A_MEMORY_FILE)
+    return path
+
+
 @router.get("/api/memory/file/{file_path:path}")
 async def read_memory_file(file_path: str):
     config = get_config()
     full_path = config.workspace / file_path
-    # Prevent path traversal
-    try:
-        full_path.resolve().relative_to(config.workspace.resolve())
-    except ValueError:
-        raise HTTPException(status_code=403, detail="Access denied")
-    if not full_path.exists() or not full_path.is_file():
+    path = _memory_file(config.workspace, file_path)
+    if not path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
-    content = await asyncio.to_thread(full_path.read_text, encoding="utf-8")
+    content = await asyncio.to_thread(path.read_text, encoding="utf-8")
     # An editor that opened this file needs the same answer the listing gave, or
     # it re-offers the edit the PUT below refuses.
     return {
@@ -107,18 +118,16 @@ class FileWriteRequest(BaseModel):
 async def write_memory_file(file_path: str, req: FileWriteRequest):
     config = get_config()
     full_path = config.workspace / file_path
-    try:
-        full_path.resolve().relative_to(config.workspace.resolve())
-    except ValueError:
-        raise HTTPException(status_code=403, detail="Access denied")
-    # This endpoint writes anywhere under the workspace, which includes the
-    # tracked config subtree — settings.yaml and the gate plugins the daemon
-    # executes. A locked instance must not be editable through it.
+    # The root markdown files include SOUL.md and AGENTS.md, which are part of
+    # the reviewed surface. A locked instance must not be editable through this
+    # route. This check comes first because its refusal tells the caller what
+    # to do instead.
     ensure_path_not_tracked_config(full_path, "write")
+    path = _memory_file(config.workspace, file_path)
 
     def _write() -> None:
-        full_path.parent.mkdir(parents=True, exist_ok=True)
-        full_path.write_text(req.content, encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(req.content, encoding="utf-8")
 
     await asyncio.to_thread(_write)
     return {"path": file_path, "saved": True}

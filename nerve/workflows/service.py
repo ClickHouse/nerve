@@ -59,6 +59,7 @@ from nerve.agent.streaming import broadcaster
 from nerve.db.usage import estimate_turn_cost
 from nerve.db.workflow_runs import ACTIVE_STATUSES
 from nerve.identity import UNATTRIBUTED, Attribution, attribution_for
+from nerve.session_origin import DETAIL_WORKFLOW_RUN, TRIGGER_WORKFLOW, Origin
 from nerve.utils.time import utc_now_iso
 
 if TYPE_CHECKING:
@@ -381,7 +382,8 @@ class WorkflowRunService:
 
     async def _maybe_dispatch(self) -> None:
         """Promote queued pending runs into free concurrency slots (FIFO)."""
-        if self._stopping:
+        # During a drain, keep runs pending: engine.run would refuse them.
+        if self._stopping or not self.engine.accepting_turns:
             return
         async with self._dispatch_lock:
             limit = max(1, int(self.config.workflows.max_concurrent_runs))
@@ -538,6 +540,7 @@ class WorkflowRunService:
                 cwd=spec.get("cwd") or None,
                 actor=leg_actor,
                 cause=run.get("caused_by_actor_id"),
+                origin=Origin(TRIGGER_WORKFLOW, {DETAIL_WORKFLOW_RUN: run_id}),
             )
             if origin:
                 await self.db.update_session_fields(

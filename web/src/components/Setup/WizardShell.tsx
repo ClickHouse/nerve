@@ -6,7 +6,7 @@ import { useSetupStore } from '../../stores/setupStore';
 import { Button, Drawer, PageHeader, PaneToggle } from '../ui';
 import { ShieldCheck } from '../ui/icons';
 import {
-  REVIEW, closedByPolicy, nextStop, previousStop, stepOf, stepTitle, stopPath, stopPosition, type WizardStop,
+  REVIEW, nextStop, previousStop, stepOf, stepPlace, stepTitle, stopPath, stopPosition, type WizardStop,
 } from './navigation';
 import { OnboardingPanel } from './OnboardingPanel';
 import { Overview } from './Overview';
@@ -22,7 +22,6 @@ import { ProviderStep } from './steps/ProviderStep';
 import { ReviewStep } from './steps/ReviewStep';
 import { SourcesStep } from './steps/SourcesStep';
 import { ClaimDoneStep } from './steps/ClaimDoneStep';
-import { UnavailableStep } from './steps/UnavailableStep';
 import { WizardContext, type WizardNav } from './wizardContext';
 
 /**
@@ -137,12 +136,10 @@ export function WizardShell() {
     body = <ReviewStep state={state} />;
   } else {
     const step = stepOf(state, current);
-    if (!step) {
+    if (!step || stepPlace(step) !== 'own') {
+      // A step that the page does not show, or one that the operator
+      // configured: the Overview says what there is to see.
       body = <Navigate to="/setup" replace />;
-    } else if (closedByPolicy(step)) {
-      // The instance keeps no credentials on disk and this step would store
-      // one: the reason, and Next — never the form.
-      body = <UnavailableStep key={`${viewerId}:${step.etag}`} step={step} />;
     } else {
       const key = `${viewerId}:${step.etag}`;
       switch (step.id) {

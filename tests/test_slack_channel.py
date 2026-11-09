@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from nerve.agent.engine import NotAcceptingTurnsError
 from nerve.channels import slack as slack_module
 from nerve.channels.base import ChannelCapability, OutboundMessage
 from nerve.channels.slack import (
@@ -292,6 +294,17 @@ class TestNotificationDelivery:
         assert delivery == ("D0123ABC", "1.1")
 
     @pytest.mark.asyncio
+    async def test_without_a_target_the_card_is_skipped_with_a_warning(self, caplog):
+        channel = _channel(allow_channels=["engineering-*"])
+
+        with caplog.at_level(logging.WARNING, logger="nerve.channels.slack"):
+            delivery = await channel.post_notification("n1", "Hello")
+
+        assert delivery is None
+        channel._web.chat_postMessage.assert_not_awaited()
+        assert "No notifications.slack_channel_id is set" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_a_quiescing_channel_refuses_external_delivery(self):
         channel = _channel(allow_channels=["C0456DEF"])
         channel._state = "quiescing"
@@ -490,6 +503,44 @@ class TestMessageEvents:
         assert msg.text == "hello"
         assert msg.sender_id == "D1"
         assert msg.metadata["message_id"] == "1.1"
+
+    @pytest.mark.asyncio
+    async def test_a_channel_message_names_its_channel_from_a_cached_lookup(self):
+        channel = _channel(allow_users=["U1"])
+        channel._web.conversations_info = AsyncMock(
+            return_value={"channel": {"name": "design-review"}},
+        )
+        for ts in ("1.1", "2.1"):
+            await channel._handle_message_event({
+                "type": "message", "channel": "C1", "channel_type": "channel",
+                "user": "U1", "ts": ts, "text": "<@U0BOT> hi",
+            })
+            msg = channel.router.handle_message.await_args[0][0]
+            assert msg.conversation_title == "design-review"
+        channel._web.conversations_info.assert_awaited_once_with(channel="C1")
+
+    @pytest.mark.asyncio
+    async def test_a_direct_message_has_no_channel_name(self):
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
+        channel._web.conversations_info = AsyncMock()
+        await channel._handle_message_event({
+            "type": "message", "channel": "D1", "channel_type": "im",
+            "user": "U1", "ts": "1.1", "text": "hello",
+        })
+        assert channel.router.handle_message.await_args[0][0].conversation_title == ""
+        channel._web.conversations_info.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_message_refused_by_a_drain_posts_no_second_error(self):
+        """The stream adapter sends the engine's error. The handler posts nothing."""
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
+        channel.router.handle_message = AsyncMock(side_effect=NotAcceptingTurnsError())
+        await channel._handle_message_event({
+            "type": "message", "channel": "D1", "channel_type": "im",
+            "user": "U1", "ts": "1.1", "text": "hello",
+        })
+        channel.router.handle_message.assert_awaited_once()
+        channel._web.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_an_unauthorized_sender_never_reaches_the_router(self):
@@ -1823,6 +1874,16 @@ class TestCommandExposure:
         channel.router.list_sessions.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_reply_during_a_drain_says_nerve_is_shutting_down(self):
+        channel = self._ch()
+        channel._notification_service = MagicMock()
+        channel._notification_service.answer_latest_question = AsyncMock(
+            side_effect=NotAcceptingTurnsError(),
+        )
+        said = await self._run(channel, "reply yes")
+        assert said == str(NotAcceptingTurnsError())
+
+    @pytest.mark.asyncio
     async def test_reply_is_scoped_to_the_slack_conversation_and_actor(self):
         channel = self._ch()
         channel._notification_service = MagicMock()
@@ -2325,6 +2386,35 @@ class TestNotificationCardRoundTrip:
             "message": {"blocks": blocks},
         })
         return channel, blocks, posts.bodies[-1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_a_press_during_a_drain_keeps_the_card(self, monkeypatch):
+        import httpx
+
+        posts = _CapturedPosts()
+        monkeypatch.setattr(httpx, "AsyncClient", posts)
+        channel = _channel(allow_users=["U1"])
+        channel._respond_ephemeral = AsyncMock()
+        service = MagicMock()
+        service.answer_delivered_notification = AsyncMock(
+            side_effect=NotAcceptingTurnsError(),
+        )
+        channel._notification_service = service
+
+        await channel._handle_interactive({
+            "type": "block_actions",
+            "user": {"id": "U1"},
+            "channel": {"id": "C1"},
+            "response_url": "https://hooks.slack.test/x",
+            "actions": [{"action_id": "notif:n1:approve", "value": "approve"}],
+            "message": {"blocks": build_notification_blocks(self.RAW, "n1", [("Approve", "approve")])},
+        })
+
+        # The card keeps its buttons. Only the person who pressed is told.
+        assert posts.bodies == []
+        channel._respond_ephemeral.assert_awaited_once_with(
+            "C1", "U1", str(NotAcceptingTurnsError()),
+        )
 
     @pytest.mark.asyncio
     async def test_the_card_text_is_carried_across_unchanged(self, monkeypatch):

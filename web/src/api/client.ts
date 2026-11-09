@@ -6,6 +6,9 @@ import type {
   AgentDetail, AgentOutput, AgentSnapshot, AgentTranscriptPage, ForceStopResult, QueueEntryView,
   StopAgentResponse, StopAllResult, StopTurnResult,
 } from '../types/agents';
+import type { PullRequestResult } from '../types/github';
+import type { NotificationSettingValues, NotificationSettings, NotificationTestResult } from './settings';
+import type { PushDevice, PushDevices, PushSubscriptionBody } from './push';
 
 const API_BASE = '/api';
 
@@ -655,6 +658,18 @@ export interface TaskEvent {
   created_at: string;
 }
 
+export interface TaskComment {
+  id: number;
+  task_id: string;
+  /** Markdown. */
+  body: string;
+  /** Who wrote the comment: a person, or the system actor for the agent. */
+  actor_id: string | null;
+  /** On whose behalf it was written. `null` when unknown. */
+  caused_by_actor_id: string | null;
+  created_at: string;
+}
+
 export interface Task {
   id: string;
   title: string;
@@ -667,7 +682,30 @@ export interface Task {
   position: number;
   created_at: string;
   updated_at: string;
+  /** Number of comments. Server-maintained. */
+  comment_count?: number;
+  /** The session that created the task; null when it was not a session. */
+  created_session_id?: string | null;
+  /** That session's title (its id when untitled); null once it is deleted. */
+  created_session_title?: string | null;
   content?: string;
+  /** The sessions of the task. Only `GET /api/tasks/{id}` returns it. */
+  sessions?: TaskSession[];
+}
+
+/** How a session relates to a task, in order of precedence. */
+export type TaskSessionRelation = 'created' | 'implemented' | 'updated';
+
+/** A session that created, implemented or updated a task. */
+export interface TaskSession {
+  id: string;
+  title: string;
+  relation: TaskSessionRelation;
+}
+
+/** A task of a session, from `GET /api/sessions/{id}/tasks`. */
+export interface SessionTask extends Task {
+  relation: TaskSessionRelation;
 }
 
 export interface UltracodeUsage {
@@ -1076,6 +1114,21 @@ export interface ArchiveSessionResult {
 }
 
 /**
+ * `GET /api/sessions/{id}/context`: what fills the context window. `live`:
+ * measured by the session's runtime, with `categories` (each part of
+ * `total_tokens`); otherwise the last turn's totals and no categories.
+ */
+export interface SessionContext {
+  session_id: string;
+  live: boolean;
+  can_compact: boolean;
+  total_tokens: number;
+  max_tokens: number;
+  auto_compact_threshold: number | null;
+  categories: { name: string; tokens: number }[];
+}
+
+/**
  * `GET /health` — not under `/api`, unauthenticated, and deliberately a raw
  * `fetch`: during a restart it answers with connection errors and 5xx, and
  * none of those may reach the 401 handler or the hosted re-entry path.
@@ -1279,6 +1332,22 @@ export const api = {
 
   setupEnvironment: () => request<SetupEnvironment>('/setup/environment'),
 
+  // Settings: the same guards as setup; a PUT answers the whole section.
+  settingsNotifications: () => request<NotificationSettings>('/settings/notifications'),
+  saveSettingsNotifications: (values: NotificationSettingValues) =>
+    request<NotificationSettings>('/settings/notifications', {
+      method: 'PUT', body: JSON.stringify(values),
+    }),
+  testSettingsNotifications: () =>
+    request<NotificationTestResult>('/settings/notifications/test', { method: 'POST', body: '{}' }),
+
+  // Web Push: the browsers of the signed-in person.
+  pushDevices: () => request<PushDevices>('/push/subscriptions'),
+  savePushDevice: (body: PushSubscriptionBody) =>
+    request<PushDevice>('/push/subscriptions', { method: 'POST', body: JSON.stringify(body) }),
+  deletePushDevice: (id: number) =>
+    request<{ deleted: boolean }>(`/push/subscriptions/${id}`, { method: 'DELETE' }),
+
   restartSystem: () =>
     request<RestartResponse>('/system/restart', { method: 'POST', body: '{}' }),
 
@@ -1313,6 +1382,12 @@ export const api = {
   // One row per person plus the system principal, so a single fetch labels a
   // whole list; re-fetch after a rename rather than caching a name anywhere.
   listActors: () => request<{ actors: ActorRef[] }>('/actors'),
+
+  // GitHub pull requests for the PR cards, read with the server's gh login.
+  getPullRequests: (urls: string[]) =>
+    request<{ pulls: PullRequestResult[] }>(
+      `/github/pulls?${new URLSearchParams(urls.map(url => ['url', url]))}`,
+    ),
 
   // Models — chat models offered to the composer's picker, per backend
   // (the configured Claude list, Codex app-server models, and any
@@ -1401,7 +1476,7 @@ export const api = {
   updateSession: (id: string, data: { title?: string; starred?: boolean; model?: string; parent_session_id?: string | null }) =>
     request<any>(`/sessions/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   getMessages: (sessionId: string, limit = 100) =>
-    request<{ messages: any[]; last_usage?: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number; cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }; max_context_tokens: number; num_turns?: number } }>(`/sessions/${sessionId}/messages?limit=${limit}`),
+    request<{ messages: any[]; last_usage?: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number; cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }; max_context_tokens: number; num_turns?: number; context_tokens?: number } }>(`/sessions/${sessionId}/messages?limit=${limit}`),
   forkSession: (sourceSessionId: string, atMessageId?: string, title?: string) =>
     request<any>('/sessions/fork', {
       method: 'POST',
@@ -1420,6 +1495,11 @@ export const api = {
     request<any>(`/sessions/${id}/status`),
   getSessionEvents: (id: string, limit = 50) =>
     request<{ events: any[] }>(`/sessions/${id}/events?limit=${limit}`),
+  getSessionContext: (id: string) =>
+    request<SessionContext>(`/sessions/${encodeURIComponent(id)}/context`),
+  /** Runs as a turn; answers with the context measured after it. */
+  compactSession: (id: string) =>
+    request<SessionContext>(`/sessions/${encodeURIComponent(id)}/compact`, { method: 'POST' }),
 
   // Agents — the subagent / background-task records of one session, their
   // transcripts and output, scoped stops, and the server-visible turn queue.
@@ -1466,6 +1546,12 @@ export const api = {
     request<{ cancelled: true; content: string | null }>(
       `/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(queueId)}`,
       { method: 'DELETE' },
+    ),
+  /** Set the run order of the queued messages, the one that runs next first. */
+  reorderQueue: (sessionId: string, queueIds: string[]) =>
+    request<{ items: QueueEntryView[] }>(
+      `/sessions/${encodeURIComponent(sessionId)}/queue/order`,
+      { method: 'PUT', body: JSON.stringify({ queue_ids: queueIds }) },
     ),
 
   // Chat (non-streaming)
@@ -1526,7 +1612,20 @@ export const api = {
     }),
   listTaskEvents: (id: string) =>
     request<{ events: TaskEvent[] }>(`/tasks/${id}/events`),
+  listTaskComments: (id: string) =>
+    request<{ comments: TaskComment[] }>(`/tasks/${id}/comments`),
+  addTaskComment: (id: string, body: string) =>
+    request<{ comment: TaskComment }>(`/tasks/${id}/comments`, {
+      method: 'POST', body: JSON.stringify({ body }),
+    }),
+  deleteTaskComment: (id: string, commentId: number) =>
+    request<{ id: number; deleted: boolean }>(`/tasks/${id}/comments/${commentId}`, {
+      method: 'DELETE',
+    }),
   getTask: (id: string) => request<any>(`/tasks/${id}`),
+  /** The tasks that a session created, implemented or updated. */
+  getSessionTasks: (sessionId: string) =>
+    request<{ tasks: SessionTask[] }>(`/sessions/${encodeURIComponent(sessionId)}/tasks`),
   createTask: (data: {
     title: string; content?: string; deadline?: string;
     tags?: string; status?: string; confirm_duplicate?: boolean;
@@ -1665,9 +1764,10 @@ export const api = {
 
   // Diagnostics
   getDiagnostics: () => request<any>('/diagnostics'),
-  getCronLogs: (jobId?: string, limit = 50, offset = 0) =>
-    request<{ logs: any[]; total: number; limit: number; offset: number }>(
-      `/cron/logs?job_id=${jobId || ''}&limit=${limit}&offset=${offset}`),
+  getCronLogs: (jobId?: string, limit = 50, offset = 0, hideEmpty = false) =>
+    request<{ logs: any[]; total: number; empty: number; limit: number; offset: number }>(
+      `/cron/logs?job_id=${encodeURIComponent(jobId || '')}&limit=${limit}&offset=${offset}`
+      + (hideEmpty ? '&hide_empty=1' : '')),
 
   // Observability — lightweight status for UI deep-links
   getObservabilityStatus: () =>
@@ -1699,6 +1799,11 @@ export const api = {
     request<any>(`/cron/jobs/${encodeURIComponent(jobId)}/trigger`, { method: 'POST' }),
   rotateCronJob: (jobId: string) =>
     request<any>(`/cron/jobs/${encodeURIComponent(jobId)}/rotate`, { method: 'POST' }),
+  setCronJobEnabled: (jobId: string, enabled: boolean) =>
+    request<{ job_id: string; enabled: boolean }>(`/cron/jobs/${encodeURIComponent(jobId)}/enabled`, {
+      method: 'PUT',
+      body: JSON.stringify({ enabled }),
+    }),
 
   // Skills
   listSkills: () => request<{ skills: any[] }>('/skills'),
@@ -1752,7 +1857,7 @@ export const api = {
     if (type) qs.set('type', type);
     if (sessionId) qs.set('session_id', sessionId);
     const q = qs.toString();
-    return request<{ notifications: any[]; pending_count: number }>(
+    return request<{ notifications: any[]; pending_count: number; pending_answer_count: number }>(
       `/notifications${q ? '?' + q : ''}`
     );
   },

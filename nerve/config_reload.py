@@ -355,11 +355,31 @@ def _reload_hosted_keys(engine) -> str | None:
         return f"{_ERROR_PREFIX}{detail}"
 
 
+def _reload_actor_context_keys() -> str | None:
+    """Read the gateway key file of the actor context check again.
+
+    ``None`` unless external mode checks the actor context
+    (``auth.external.gateway_jwks_file``). A changed key file, tenant or
+    agent takes effect here as well.
+    """
+    try:
+        from nerve.gateway.auth import reload_actor_context_keys
+
+        return reload_actor_context_keys()
+    except Exception as e:  # noqa: BLE001 - report the subsystem and continue
+        detail = str(e) or type(e).__name__
+        logger.warning("Actor context key reload failed: %s", detail)
+        return f"{_ERROR_PREFIX}{detail}"
+
+
 async def _republish_hosted_subscriptions(engine) -> str | None:
     """Send the hosted source subscriptions to the gateway again.
 
-    The filters and ``pr_watch`` follow a reload this way; the gateway keeps
-    the newest subscription it received. ``None`` without hosted sources.
+    The filters, ``pr_watch`` and ``inbox`` follow a reload this way, and so
+    does the repository watch (``sync.github_repos``: switched on or off, its
+    repositories and settings); the gateway keeps the newest subscription it
+    received. (In poll mode they follow with the rebuilt source runners.)
+    ``None`` without hosted sources.
     """
     if engine is None:
         return None
@@ -423,6 +443,9 @@ async def reload_all(engine, cron_service, config_dir: Path) -> dict:
         hosted = _reload_hosted_keys(engine)
         if hosted is not None:
             summary["hosted"] = hosted
+        actor_keys = _reload_actor_context_keys()
+        if actor_keys is not None:
+            summary["actor_context"] = actor_keys
 
     # 2. Cron jobs + sources.
     if cron_service is not None:

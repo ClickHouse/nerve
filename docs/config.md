@@ -242,13 +242,14 @@ A reload is always explicit. Two things cause one:
 | Cron jobs (`config/cron/*.yaml`) | ✅ |
 | Custom cron gate plugins (new, edited *and* deleted `.py` files) | ✅ the registry is rebuilt from the directory |
 | Cron file locations (`cron.jobs_file`, `system_file`, `gate_plugins_dir`) | ✅ re-read from the new config |
-| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. In hosted mode the GitHub filters and `pr_watch` are published to the gateway again. **`sync.codex` and `sync.github.mode` are not among these**; see the restart table |
+| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. In hosted mode the GitHub filters, `pr_watch`, `inbox` and the repository watch (`sync.github_repos`) are published to the gateway again. **`sync.codex` and `sync.github.mode` are not among these**; see the restart table |
 | `cron.delivery_debounce_seconds` | ✅ read for each delivery |
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
 | Skills (`skills/`, and the platform skills in `skills/` in the config directory) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
 | `setup.local_secrets` | ✅ read on every request of the setup page |
-| Web gateway auth (`auth.*`) | partly. `auth.jwt_expiry_hours` follows a reload for newly issued or refreshed tokens. The deprecated `auth.password_hash` follows a reload only for accounts without a local password. `auth.jwt_secret` requires a restart (see the restart table) |
+| Web gateway auth (`auth.*`) | partly. `auth.jwt_expiry_hours` follows a reload for newly issued or refreshed tokens. The deprecated `auth.password_hash` follows a reload only for accounts without a local password. `auth.external.*` follows a reload, which also reads the file that `gateway_jwks_file` names again. `auth.jwt_secret` requires a restart (see the restart table) |
+| `gateway.drain_timeout_seconds` | ✅ read when the shutdown signal arrives (see [Shutdown Sequence](architecture.md#shutdown-sequence)) |
 | `notifications.*` | ✅ read per notification |
 | `workspace_sync.*` | ✅ from the next sync cycle |
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
@@ -295,7 +296,7 @@ reload cannot inspect, and are documented here only.
 | `mcp_endpoint.*` | fixed when the app was created |
 | `mcp_gateway_url` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
 | `slack.mode`, `channels.hosted.*` | the hosted channel, its stream endpoint, and its token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
-| `sync.github.mode` | the GitHub source, and in hosted mode the stream endpoint and the consumer of the gateway's records, are chosen at startup. Until a restart the source keeps the mode it started with, and so does the `github_pr_activity` gate. The filters and `pr_watch` do follow a reload: in hosted mode the reload publishes them to the gateway again. To go back to `poll`, set `enabled: false` and reload first (see [sources.md](sources.md#hosted-github-source)) |
+| `sync.github.mode` | the GitHub sources (`github` and the repository watch, `github_repos`), and in hosted mode the stream endpoint and the consumers of the gateway's records, are chosen at startup. Until a restart the sources keep the mode they started with, and so does the `github_pr_activity` gate. The filters, `pr_watch`, `inbox` and `sync.github_repos` do follow a reload: in hosted mode the reload publishes them to the gateway again. To go back to `poll`, set `enabled: false` (and `sync.github_repos.enabled: false`) and reload first (see [sources.md](sources.md#hosted-github-source)) |
 | `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
 | `workflows.poll_interval_seconds`, `workflows.review_loop.reconcile_interval_seconds` | both loops were handed their interval when they started. Everything else under `workflows.*` is read per use (see the table above) |
@@ -1153,7 +1154,8 @@ config like anything else under `config/`, so a config repo carries it to every
 instance that syncs, and a fleet can be told apart by its browser tabs. Nothing
 is copied into the web bundle — the file is read per request, so one that arrives
 by sync appears without a restart, and removing it goes back to the browser
-default.
+default. The panel draws a coloured dot on the icon while something waits for
+the person (see [Browser alerts](web-ui.md#browser-alerts)).
 
 Use one. If several are present the first of `.svg`, `.png`, `.ico` wins.
 
@@ -1355,9 +1357,31 @@ mention check and, as a thread reply, no local session. `slack.source`
 still decides what reaches the inbox, but only a channel ID can grant: a
 channel or sender name comes from the event, so it can only deny.
 
+The gateway sends an observation only for a channel where the agent's channel
+policy allows observations, so the policy that the control plane keeps is
+already a grant. `slack.source.gateway_grant: true` makes it the local grant
+too: with `slack.source.enabled: true` and no `allow_channels`, Nerve collects
+every observation that the gateway sends. A non-empty `allow_channels` still
+narrows that, and `deny_channels` and `deny_senders` still apply. Outside
+hosted mode the switch is ignored, with a warning.
+
 Nerve accepts events from every Slack connection that the gateway serves
 for this agent. For each conversation, Nerve records the connection of the
 latest accepted event.
+
+Each event that starts a turn or answers a notification names the person that
+the gateway resolved from the Slack user. In external mode, the turn runs as
+that person, and a session that the turn starts has that person as its cause.
+When the event also gives the display name of that person, and Nerve has no
+name for the person, Nerve stores it. See
+[External mode](accounts.md#external-mode). In local mode, these turns and
+answers have no actor.
+
+An observation can name the person that the gateway linked to the Slack user.
+The inbox record shows that person (see
+[Chat channels](sources.md#chat-channels-slack-telegram)). The person grants
+nothing: the `slack.source` sender rules match only the member ID and the
+display name in the event.
 
 `slack.enabled: false` pauses the hosted channel, at startup or after a
 reload. The stream endpoint still accepts streams, and events stay in the
@@ -1392,13 +1416,24 @@ files are unpacked one level. One file is read up to 16 MiB less one byte.
 The files of one message are read up to 32 MiB together, and the content
 unpacked from ZIP files counts against the same limit.
 
-Notifications go to the same conversation as in Socket Mode
-(`notifications.slack_channel_id`, else the first literal conversation ID in
-`slack.allow_channels`), with one button for each answer. A button press
-answers the notification only in the conversation where it was delivered,
-and the card then shows the answer without buttons. A press that answers
-nothing, for example a second press, gets a short notice and the card stays.
-An expired card is edited without buttons. `/nerve` commands, including the host commands
+A notification card has one button for each answer. Nerve sends it through
+the gateway's `notify` operation, and the gateway posts it in the agent's
+notification channel, which an administrator sets in the control plane.
+Nerve does not read `notifications.slack_channel_id` or the conversation IDs
+in `slack.allow_channels` to choose this conversation. The notification
+channel must allow posts in the agent's Slack access rules, and the agent's
+Slack app must be a member of it. Nerve uses `notify` only when exactly one
+connection advertises it. A gateway that does not advertise it gets no card.
+When the control plane sets no notification channel, the gateway refuses the
+card, and Nerve logs one INFO line for each card. Any other failure logs one
+warning.
+
+A button press answers the notification only in the conversation where it
+was delivered, and the card then shows the answer without buttons. A press
+that answers nothing, for example a second press, gets a short notice and
+the card stays. An expired card is edited without buttons.
+
+`/nerve` commands, including the host commands
 `doctor` and `restart`, are not available in hosted mode; `nerve doctor`
 reports this and the local settings that still apply.
 
@@ -1407,10 +1442,12 @@ hosted channels reads the key file again. Changing `mode` from `socket` to
 `hosted` stops the Socket Mode connection at once.
 
 The same streams carry hosted sources. With `sync.github.mode: hosted` the
-gateway polls GitHub for the agent and streams the records; the
+gateway polls GitHub for the agent and streams the records: the
+notifications, and with `sync.github_repos` the repositories it watches; the
 `channels.hosted` settings above apply unchanged, and they are enough on their
 own: Slack need not be hosted too. See
-[Hosted GitHub source](sources.md#hosted-github-source).
+[Hosted GitHub source](sources.md#hosted-github-source) and
+[Hosted repository watch](sources.md#hosted-repository-watch).
 
 When Slack is hosted as well, its switch also holds GitHub back. Nerve reads
 the events of every hosted provider from one ordered inbox, and it reads
@@ -1547,6 +1584,7 @@ slack:
 | `slack.source.allow_senders` | list[str] | `[]` | Restrict to these senders |
 | `slack.source.deny_senders` | list[str] | `[]` | Skip these senders |
 | `slack.source.include_handled_messages` | bool | `false` | Also collect messages accepted for live routing |
+| `slack.source.gateway_grant` | bool | `false` | Hosted mode only: collect every channel that the gateway observes for the agent, with no local allow list (see [Hosted mode](#hosted-mode)) |
 | `slack.source.schedule` | cron/interval | `*/5 * * * *` | Drain cadence |
 | `slack.source.batch_size` | int | `50` | Records per drain |
 | `slack.source.condense` | bool | `false` | LLM-condense long messages |
@@ -1650,14 +1688,18 @@ Question and approval cards go to Slack by default.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `notifications.channels` | list | `[web, telegram, slack]` | Where `notify`, `ask_user`, and `propose_action` deliver |
-| `notifications.slack_channel_id` | string | `""` | Target channel ID; defaults to the first literal ID in `slack.allow_channels` |
+| `notifications.slack_channel_id` | string | `""` | Target channel ID; defaults to the first literal ID in `slack.allow_channels`. Not read in hosted mode |
 
 `notifications.channels` replaces the default rather than adding to it, so
-list every transport you want. A name nothing delivers to is skipped with a
+list every transport you want. The panel (`web`) is always in the list: Nerve
+adds it to a list without it. A name nothing delivers to is skipped with a
 warning. Slack in the list costs nothing while Slack is off.
 
 Names and globs are not resolved for the `slack_channel_id` fallback. Without
-a literal channel ID, delivery is skipped with a warning.
+a literal channel ID, delivery is skipped with a warning. In
+[hosted mode](#hosted-mode), Nerve does not read these keys to choose the
+conversation: the channel gateway posts each card in the notification channel
+that an administrator sets in the control plane.
 
 ### Outbound Slack message tool
 
@@ -1688,6 +1730,42 @@ Three differences from the inbound policy:
   `G` target costs one cached lookup; a lookup that cannot answer is refused
   rather than guessed.
 
+## Notification delivery
+
+`notify`, `ask_user` and `propose_action` go to each channel in
+`notifications.channels` (see [Slack](#notifications) and
+[Telegram](#notification-sink) for the destinations). The Notifications
+section of the panel's Settings page changes these keys (see
+[web-ui.md](web-ui.md#settings)).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `notifications.levels` | map | `{}` | For each channel, `all` or `important` |
+| `notifications.default_expiry_hours` | int | `48` | Hours until an unanswered question or approval expires, when the agent gives no time |
+| `notifications.max_redeliveries` | int | `3` | How often one snoozed item comes back, at most. At this count it expires |
+
+A channel at `important` gets questions, approvals, and items with priority
+`high` or `urgent`. It does not get other items. The panel (`web`) gets every
+item. A channel without an entry gets every item, and so does a channel with
+an unknown level (Nerve logs a warning).
+
+```yaml
+notifications:
+  channels: [web, slack, telegram]
+  levels:
+    slack: all
+    telegram: important
+```
+
+### Web Push
+
+The fan-out also sends each item as a push notification (channel `webpush`)
+to the browsers where a person turned push on. `notifications.channels` does
+not list it, and `notifications.levels.webpush: important` limits all
+browsers. The instance must reach the push services of the browsers; on Nerve
+Cloud that works only for agents in open internet mode. How push works, the
+VAPID key and the hosts: [web-ui.md](web-ui.md#push-notifications).
+
 ## Quiet Hours
 
 | Key | Type | Default | Description |
@@ -1697,20 +1775,33 @@ Three differences from the inbound policy:
 
 Quiet hours are optional. Both values empty (`''`) means there are none;
 otherwise both are `HH:MM`, and the window may cross midnight (`22:00` to
-`07:00`). The setup writers (the setup page's Mode step, `nerve init
+`07:00`). A value that is not a 24-hour time from `00:00` to `23:59` also
+means no quiet hours. An unquoted time such as `quiet_start: 22:00` is read
+as `22:00` too: YAML reads it as the number 1320 (the minutes after
+midnight), and Nerve changes that number back to the time. The setup writers (the setup page's Mode step, `nerve init
 --terminal` and `--non-interactive`) state the mode's default in
 `settings.yaml`: `02:00`/`08:00` for a personal install, and empty values for
 a worker, so a worker has no quiet hours until someone turns them on (the
 setup page's Operator step, or these two keys). A key that no layer sets falls
 back to `02:00`/`08:00`.
 
-Nerve stores quiet hours for the agent; it does not enforce them. On a
-personal install the setup page also fills the `Quiet hours:` line of
-`USER.md`, and `AGENTS.md` tells the agent to hold anything below `urgent`
-during them. A worker's brain files do not mention them, so state the rule in
-`TASK.md` if the worker should keep them. No built-in delivery gating is
-attached today: `notify`, `ask_user` and cron runs go out whenever they
-happen.
+During quiet hours, each notification (`notify`, `ask_user`,
+`propose_action`, and a re-delivered snoozed item) with a priority other than
+`urgent` goes out without sound: Telegram sends it with
+`disable_notification`, and the panel's `notification` event has
+`silent: true`, so a browser alert of the panel makes no sound either. Nerve
+still delivers it at once. An `urgent` item makes a
+sound. Slack has no such option for one message, so Slack follows its own
+notification settings. The Notifications section of the panel's Settings page
+changes the two keys (see [web-ui.md](web-ui.md#settings)).
+
+Nerve holds nothing back during quiet hours: `notify`, `ask_user` and cron
+runs go out whenever they happen. On a personal install the setup page also
+fills the `Quiet hours:` line of `USER.md`, and `AGENTS.md` tells the agent to
+hold anything below `urgent` during them. A worker's brain files do not
+mention them, so state the rule in `TASK.md` if the worker should keep them.
+The deadline escalation check pauses during quiet hours (see
+[tasks.md](tasks.md)).
 
 ## Sources (sync)
 
@@ -1778,6 +1869,24 @@ the channel transport, matching messages are written to a local buffer.
 | `sync.github.schedule` | cron | `*/15 * * * *` | Fetch frequency; in hosted mode the fallback cadence of the drain |
 | `sync.github.mode` | string | `poll` | `poll`: fetch notifications here with the gh CLI. `hosted`: the channel gateway polls GitHub, applies the guardrails, and streams the records (needs the `channels.hosted` settings, see [Hosted mode](#hosted-mode)). An unknown value falls back to `poll` with a warning. Restart-only. See [sources.md](sources.md#hosted-github-source) |
 | `sync.github.pr_watch` | bool | `true` | Hosted mode: also deliver a `github_pr_activity` record whenever one of the agent's own open pull requests changes. Its `reason` is always `author`, and only `allow_repos` and `deny_repos` apply to it (see [sources.md](sources.md#github-pull-request-activity-records)) |
+| `sync.github.inbox` | string | `participating` | Which notification threads are listed, in both modes. `participating`: only the threads the account takes part in (GitHub's `participating=true`). `all`: the account's whole GitHub inbox as its watch settings produce it, adding `subscribed` threads of watched repositories (new issues and pull requests), `ci_activity` and `security_alert`; pick within it with the reason guardrails. Case does not matter; any other value refuses to load. Follows a reload. In hosted mode the gateway must support it. See [sources.md](sources.md#watched-repositories-inbox-all) |
+
+**GitHub Repos-specific** (repositories the agent follows without taking part
+in them; see [sources.md](sources.md#github-repos)). With `sync.github.mode:
+hosted` the channel gateway polls them, and it must know the repository watch
+(see [sources.md](sources.md#hosted-repository-watch)). Everything follows a
+reload:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `sync.github_repos.enabled` | bool | `false` | Enable the repository watch. In hosted mode Nerve publishes it to the gateway only while it is on and `repos` lists a repository |
+| `sync.github_repos.schedule` | cron | `*/15 * * * *` | Poll frequency; in hosted mode the fallback cadence of the drain, which also runs on every delivery |
+| `sync.github_repos.repos` | list | `[]` | `owner/repo` names as GitHub writes them, each once (case does not matter), at most 50. While the watch is on, a name GitHub would not take, a repository named twice, or more than 50 refuses to load; while it is off, a warning names them. Empty = nothing is watched. Nothing older than a day is backfilled: a check more than a day after the last one (a daily schedule, an outage, the watch switched off for longer) reports the last day's items, with an hour of grace; in hosted mode, switching the watch off and on starts fresh |
+| `sync.github_repos.types` | list | `[pull_request, issue]` | What is reported: `pull_request`, `issue`, `release`. Case does not matter; an unknown type or an empty list refuses to load |
+| `sync.github_repos.include_bots` | bool | `false` | Also report the pull requests and issues that a GitHub App or an account whose login ends in `[bot]` opened. A release is reported whoever published it (release automation such as `github-actions[bot]` is the normal case) |
+| `sync.github_repos.include_drafts` | bool | `true` | `false`: a draft pull request is reported when it is marked ready for review (event `ready`), not when it is opened |
+| `sync.github_repos.updates` | bool | `false` | Also report a new head commit, ready for review, and the merge or close of each pull request the watch reported |
+| `sync.github_repos.deny_authors` | list | `[]` | Case-insensitive globs on the author's login, with the guardrail rules; what they match is never reported, releases included |
 
 `cron.delivery_debounce_seconds` (int, default `60`) spaces the job runs that a
 hosted delivery starts; a negative value reads as `0`, and a value above `600`
@@ -2123,6 +2232,10 @@ a server or a tool that the organization removed.
 |-----|------|---------|-------------|
 | `auth.password_hash` | string | - | Deprecated compatibility setting. Manage passwords from the Accounts page. If neither this setting nor the sole account has a password, anyone who can reach the gateway can act as the owner. See [Accounts and identity](accounts.md) |
 | `auth.jwt_secret` | string | - | JWT signing secret. When unset, Nerve generates one and stores it in `nerve.db`. Changing it requires a restart and signs users out. See [Accounts and identity](accounts.md) |
+| `auth.external.gateway_jwks_file` | path | - | External mode only. An absolute path to the gateway's public actor signing keys, a JWK Set file. When set, Nerve verifies the `X-Nerve-Actor-Context` header. See [Actor context verification](#actor-context-verification) |
+| `auth.external.tenant_id` | string | - | The tenant of this instance, a lower-case UUID. Required with `gateway_jwks_file` |
+| `auth.external.agent_id` | string | - | The agent of this instance, a lower-case UUID. Required with `gateway_jwks_file` |
+| `auth.external.verification` | string | `require` | `require` refuses a header that fails the check. `log` logs the failure and uses the header anyway, for a first rollout |
 
 ### Authentication mode
 
@@ -2142,10 +2255,74 @@ error. `nerve restart` checks the value before it stops the running daemon.
 runs `nerve doctor`. It does not ask the running server, so the mode of a
 daemon that started with a different environment can be different.
 
-> **Warning:** In external mode, Nerve trusts the `X-Nerve-Actor-Context`
-> header and does not check its signature. A caller that can send a request to
-> Nerve can act as any person. Use external mode only when the gateway is the
-> only caller that can reach Nerve.
+#### Actor context verification
+
+The gateway signs the `X-Nerve-Actor-Context` header with an Ed25519 key. To
+check it, give Nerve the gateway's public keys and the identity of this
+instance in `auth.external`. The mode itself still comes only from
+`NERVE_AUTH_MODE`.
+
+```yaml
+auth:
+  external:
+    gateway_jwks_file: /etc/nerve/actor-keys.json   # an absolute path
+    tenant_id: 00000000-0000-0000-0000-000000000000
+    agent_id: 00000000-0000-0000-0000-000000000000
+    verification: require                            # or log
+```
+
+The file is a JWK Set of Ed25519 public keys (`kty` `OKP`, `crv` `Ed25519`,
+`alg` `EdDSA`, `use` `sig`, a unique `kid`, and `x`). Nerve reads only `keys`
+and ignores the other members of the document. A file with a private key
+member is refused. Nerve reads the file at startup and on each reload, and
+again, at most once a minute, when a header names an unknown `kid`. When a
+later read fails, the keys of the last good read stay in use. Nerve never
+fetches keys over the network.
+
+With the file set, Nerve accepts the header of an HTTP request or a WebSocket
+upgrade only when all of these are true:
+
+- The header is a compact JWS. Its protected header has `typ`
+  `nerve-actor-context+jws`, `alg` `EdDSA` and a `kid` from the file, and no
+  `jwk`, `jku`, `x5c`, `x5u` or `crit`. The signature verifies with that key.
+- The payload has `version` `"1"`, the configured `tenant_id` and `agent_id`,
+  `signer_id` `urn:nerve:gateway:actor:<tenant_id>:<agent_id>`, `audience`
+  `urn:nerve:runtime:<tenant_id>:<agent_id>`, `actor_kind` `human`, and a UUID
+  in `principal_id`.
+- `request_binding` names this request. `kind` is `http`, or `websocket` for an
+  upgrade, which also needs a `gateway_connection_id`. `method` is the request
+  method. `target` is the request-target that Nerve received: the raw path, and
+  `?` and the query when there is a query. Without a query, `/path?` also
+  matches.
+- `issued_at` is at most 30 seconds in the future, `expires_at` is at most 30
+  seconds in the past, and `expires_at` is 1 to 30 seconds after `issued_at`.
+- Nerve has not accepted the same `assertion_id` before. Nerve keeps accepted
+  IDs in memory until they expire, at most 10,000; when it is full, it forgets
+  the oldest.
+
+Nerve checks the header of an HTTP request when the request arrives, before it
+reads the body, and the header of a WebSocket upgrade when it accepts the
+socket.
+
+| Result | Response |
+|---|---|
+| All checks pass | The request acts as `principal_id`, with `profile.display_name`, as without the check |
+| A check fails | `401`. The reason, the `kid` and the request ID go to the log, never the header |
+| No usable key set: the file cannot be read or used, or an `auth.external` setting is invalid | `503` |
+| A check fails, or no usable key set, with `verification: log` | Nerve logs the failure and reads the header without the check |
+
+The server accepts a WebSocket before it authenticates it, so a failed check
+and a missing key set both close the socket with `4001`.
+
+A reload applies changed `auth.external` settings and reads the file again.
+In external mode, `nerve doctor` reads the file, reports invalid settings, and
+warns when `verification` is `log`. Startup logs the key file and the
+`verification` value, as a warning when it is `log`.
+
+> **Warning:** Without `auth.external.gateway_jwks_file`, Nerve trusts the
+> `X-Nerve-Actor-Context` header and does not check its signature. A caller
+> that can send a request to Nerve can act as any person. Then use external
+> mode only when the gateway is the only caller that can reach Nerve.
 
 #### Inference principal header
 
@@ -2178,6 +2355,25 @@ again for the session (after a model change or a crash) gets the same header.
 These requests have no header: memory embedding requests to the OpenAI API,
 and Codex sessions.
 
+#### Inference trigger header
+
+In external mode, Nerve also adds one `X-Nerve-Inference-Trigger` header to
+each model request of a session, also a session with no cause, and to each of
+its own model calls. The value is the kind of event that started the work:
+
+| Requests | Trigger |
+|---|---|
+| The model requests of an agent session | The session's `trigger`: `chat`, `api`, `slack`, `telegram`, `email`, `cron`, `plan`, `workflow`, `external`, `system` (the autonomous onboarding) or `unknown`. See `trigger` in [api.md](api.md#sessions) |
+| Nerve's own model calls (the second row of the table above) | `system` |
+
+Nerve sets a session's trigger when it creates the session, from the code
+path that creates it, and never changes it. A session from before the
+trigger field sends the value that Nerve derives from its source and its
+id. The header has the same rules as the principal header: local mode sends
+none, Nerve removes an inherited line for it from `ANTHROPIC_CUSTOM_HEADERS`,
+and a CLI process keeps it for its whole life. Nerve does not prove the
+value. The same requests as above have no header.
+
 ### System principal ID
 
 The environment variable `NERVE_SYSTEM_PRINCIPAL_ID` gives the ID of the
@@ -2204,7 +2400,7 @@ reason.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `setup.local_secrets` | bool | `true` | Whether the browser setup page may store a credential it is given (an API key, a bot token, a Telegram sign-in) in the files on this machine. `false` on an instance whose connections the operator provides: the Memory, Channels, Sources and Agents steps read "Not available on this instance" and their writes are refused (`409`); the Model step accepts Bedrock or a credential from the environment, never a pasted key; Slack through a channel gateway keeps its switch, and so does the GitHub source when its token comes from the environment (`GH_TOKEN` / `GITHUB_TOKEN`, or a `${VAR}` reference) — the Sources step then offers that one toggle while Gmail and Telegram stay closed. Usually set in the tracked `settings.yaml`. `NERVE_SETUP_LOCAL_SECRETS=0` in the service environment forces it off — one-way, like `NERVE_LOCKDOWN`: the variable can turn the storage off, never on. Read per request, so a reload applies it. See [Instances that keep no credentials](setup.md#instances-that-keep-no-credentials). |
+| `setup.local_secrets` | bool | `true` | Whether the browser setup page may store a credential it is given (an API key, a bot token, a Telegram sign-in) in the files on this machine. `false` on an instance whose connections the operator provides: the Memory, Channels, Sources and Agents steps are closed, the setup page does not show them, and their writes are refused (`409`); the Model step accepts Bedrock or a credential from the environment, never a pasted key; Slack through a channel gateway keeps its switch, and so does the GitHub source when its token comes from the environment (`GH_TOKEN` / `GITHUB_TOKEN`, or a `${VAR}` reference); the Sources step then offers that one toggle while Gmail and Telegram stay closed. Usually set in the tracked `settings.yaml`. `NERVE_SETUP_LOCAL_SECRETS=0` in the service environment forces it off, one way only, like `NERVE_LOCKDOWN`: the variable can turn the storage off, never on. Read per request, so a reload applies it. See [Instances that keep no credentials](setup.md#instances-that-keep-no-credentials). |
 
 ## API Keys (config.local.yaml)
 
@@ -2284,6 +2480,7 @@ The proxy binary is automatically downloaded from [CLIProxyAPI](https://github.c
 | `sessions.max_sessions` | int | `500` | Max active (non-archived) sessions before cleanup |
 | `sessions.cron_session_mode` | string | `per_run` | `per_run` (unique session per cron run) or `reuse` (shared session per job) |
 | `sessions.sidebar_page_size` | int | `50` | Rows per sidebar request: caps the conversation feed and sizes one lazy Archived/System page. `0` = unlimited (a group loads in a single request). Starred sessions are exempt and always returned in full. |
+| `sessions.plan_attention_days` | int | `7` | Days a pending plan puts its proposing session in the sidebar's "Needs you" group, counted from the proposal (a new version with `plan_update` starts the count again). `0` = no limit. The Plans page still lists older pending plans. Questions and approvals are not affected: they expire on their own (`notifications.default_expiry_hours`). |
 
 **Starred sessions are exempt from all auto-archival.** A session starred via
 the star toggle (web sidebar, or the Telegram `/sessions` list / `/star`) is

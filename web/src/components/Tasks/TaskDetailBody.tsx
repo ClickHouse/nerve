@@ -3,14 +3,16 @@ import type { Task } from '../../api/client';
 import { useTaskStore } from '../../stores/taskStore';
 import { Button, IconButton } from '../ui';
 import { Calendar, Edit3, ExternalLink, Eye, History, Save } from '../ui/icons';
-import { StatusBadge, StatusSelect } from './StatusControls';
+import { StatusSelect } from './StatusControls';
 import { MarkdownContent } from '../Chat/MarkdownContent';
+import { TaskComments } from './TaskComments';
 import { TaskPlan } from './TaskPlan';
+import { CreatedInLink, TaskSessions } from './TaskSessions';
 import { TaskTimeline } from './TaskTimeline';
 
 /**
  * The task editor itself: metadata row, the task's plan, edit/preview
- * toggle, markdown body, save.
+ * toggle, markdown body, save, and in preview the comments.
  *
  * Shared by the full page and the board's modal so the two can't drift.
  * Only the surrounding chrome differs: the page supplies a back button and
@@ -58,29 +60,47 @@ export function TaskDetailBody({ task }: { task: Task }) {
     }
   }, [handleSave]);
 
+  const fromSession = task.created_session_title != null;
+  const hasFacts = Boolean(
+    task.deadline
+    || (fromSession ? task.created_session_id : task.source)
+    || task.source_url,
+  );
+
   return (
     <div className="flex flex-col h-full min-h-0">
-      <div className="flex items-center gap-3 px-5 py-2.5 text-xs border-b border-border-subtle shrink-0 flex-wrap">
-        <StatusBadge status={task.status} />
+      {/* On a phone, the status and the buttons share the first row and the
+          facts (deadline, origin, source) go in a second row. From `md` up,
+          the facts sit between them in one row. */}
+      <div className="flex items-center gap-x-3 gap-y-1.5 px-5 py-2 text-xs border-b border-border-subtle shrink-0 flex-wrap">
+        {/* The select is the only display of the status, so it carries the
+            status colours. */}
         <StatusSelect
           value={task.status}
           onChange={(status) => updateStatus(task.id, status)}
+          tinted
         />
-        {task.deadline && (
-          <span className="flex items-center gap-1 text-text-dim">
-            <Calendar size={11} /> {task.deadline}
-          </span>
-        )}
-        {task.source && <span className="text-text-faint">from {task.source}</span>}
-        {task.source_url && (
-          <a
-            href={task.source_url}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="flex items-center gap-1 text-accent hover:underline"
-          >
-            <ExternalLink size={11} /> source
-          </a>
+        {hasFacts && (
+          <div className="order-last basis-full md:order-none md:basis-auto md:flex-1 flex items-center gap-3 min-w-0">
+            {task.deadline && (
+              <span className="flex items-center gap-1 text-text-dim shrink-0">
+                <Calendar size={11} /> {task.deadline}
+              </span>
+            )}
+            {fromSession
+              ? <CreatedInLink task={task} />
+              : task.source && <span className="min-w-0 truncate text-text-faint">from {task.source}</span>}
+            {task.source_url && (
+              <a
+                href={task.source_url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-1 text-accent hover:underline shrink-0"
+              >
+                <ExternalLink size={11} /> source
+              </a>
+            )}
+          </div>
         )}
 
         <div className="ml-auto flex items-center gap-2">
@@ -153,10 +173,14 @@ export function TaskDetailBody({ task }: { task: Task }) {
           placeholder="Task content..."
         />
       ) : (
+        // The comments scroll with the content, so they read as the task's
+        // discussion, after the task itself.
         <div className="flex-1 min-h-0 overflow-y-auto px-6 py-5">
           {localContent
             ? <MarkdownContent content={localContent} />
             : <span className="text-text-faint italic">No content</span>}
+          <TaskSessions sessions={task.sessions} />
+          <TaskComments taskId={task.id} refreshKey={task.updated_at} />
         </div>
       )}
     </div>

@@ -134,6 +134,9 @@ gateway:
   ssl:
     cert: ~/.nerve/certs/cert.pem
     key: ~/.nerve/certs/key.pem
+  # On shutdown, wait up to this many seconds for running turns to end.
+  # 0 (the default) means no wait. See "Shutdown Sequence" in docs/architecture.md.
+  # drain_timeout_seconds: 0
 
 # Channels
 telegram:
@@ -239,8 +242,14 @@ slack:
   #
   # Everything collected is untrusted input: the grant decides whose messages
   # are kept, not whether their contents can be believed. See docs/sources.md.
+  #
+  # In hosted mode (mode: hosted) the gateway sends an observation only for a
+  # channel that the agent's channel policy observes. gateway_grant: true makes
+  # that policy the grant here too, so no allow_channels is needed; the deny
+  # lists still apply. It is ignored in Socket Mode.
   # source:
   #   enabled: true
+  #   gateway_grant: false               # hosted mode only
   #   allow_channels: ["C0456DEF", "eng-*"]
   #   deny_channels: ["*-social"]
   #   deny_senders: ["*-bot"]
@@ -261,12 +270,13 @@ slack:
 #     max_streams: 8
 
 # Where notify, ask_user, and propose_action deliver. The list replaces the
-# default rather than adding to it, so name every transport you want. A
-# transport that is off costs nothing here.
+# default rather than adding to it, so name every transport you want. The
+# panel (web) is always in it. A transport that is off costs nothing here.
 notifications:
   channels: [web, telegram, slack]
   # Target conversation for Slack cards. Without this, the first literal ID
-  # in slack.allow_channels is used; names and globs are not resolved.
+  # in slack.allow_channels is used; names and globs are not resolved. In
+  # hosted mode the control plane's notification channel is used instead.
   # slack_channel_id: "C0456DEF"
 
 # Quiet hours (local timezone). Optional: set both to "" for none, which is
@@ -304,6 +314,11 @@ sync:
                                    # open PRs changes (state, commit, review, CI,
                                    # comment). Its reason is always "author", and
                                    # only allow_repos/deny_repos apply to it.
+    # inbox: participating         # participating = threads you are directly
+                                   # involved in; all = the whole inbox as your
+                                   # GitHub watch settings produce it, incl. new
+                                   # issues/PRs of watched repos and CI. Pick
+                                   # within it with the reason guardrails below.
     # Guardrails (case-insensitive globs; deny wins; non-empty allow is
     # fail-closed). allow_* = allowlist (empty = all pass).
     #   repo_name — the notification's repo full_name ("ClickHouse/nerve").
@@ -326,10 +341,25 @@ sync:
     deny_ci_branches: []           # Example: ["main", "master"] — keep CI
                                    # failures on your own PR branches, drop
                                    # default-branch syncs and scheduled runs.
-  github_repos:                    # Monitor a set of repos for NEW issues & PRs
+  # Repositories you follow without taking part in them: new PRs, issues and
+  # releases there. Nothing is set on the GitHub account. With
+  # sync.github.mode: hosted the channel gateway polls them too (it must know
+  # the repository watch). Nothing older than a day is backfilled: a check
+  # more than a day after the last (a daily schedule, an outage) reports the
+  # last day's items, with an hour of grace; in hosted mode, switching the
+  # watch off and on starts fresh. See docs/sources.md "GitHub Repos".
+  github_repos:
     enabled: false
-    schedule: "*/15 * * * *"
-    repos: []                      # Required: ["ClickHouse/clickhouse-go", "owner/repo"]
+    schedule: "*/15 * * * *"       # poll mode; hosted: the fallback drain
+    repos: []                      # Required: ["acme/widgets"], each once, at most 50
+    # types: [pull_request, issue] # pull_request | issue | release
+    # include_bots: false          # also PRs and issues a GitHub App or a [bot]
+                                   # opened; releases arrive whoever published them
+    # include_drafts: true         # false: a draft PR is reported when it is
+                                   # ready for review (event "ready")
+    # updates: false               # true: also new commits, ready, merge and
+                                   # close of the PRs it reported
+    # deny_authors: []             # case-insensitive globs on the author login
     batch_size: 50
 
 # Memory (memU)

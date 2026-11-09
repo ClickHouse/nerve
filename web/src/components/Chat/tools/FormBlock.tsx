@@ -5,11 +5,12 @@ import { ListChecks, Send, X } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { useChatStore } from '../../../stores/chatStore';
 import { Badge, Button, TextArea, TextField } from '../../ui';
-import { InlineMarkdown } from '../MarkdownContent';
+import { InlineMarkdown, MarkdownContent } from '../MarkdownContent';
 import { formatCombo } from '../../../utils/keyboard';
 import { AnsweredCard, NoAnswer, OptionButton, QuestionHeader, type AnswerRow } from './QuestionCard';
 import {
-  addItems, answersOf, couldBecomeUrl, draftFor, firstLine, formQuestions, formTitle, isValidRepo, isValidUrl,
+  addItems, answersOf, couldBecomeUrl, draftFor, firstLine, formIntro, formQuestions, formTitle, isValidRepo,
+  isValidUrl,
   MAX_ANSWER_LENGTH, parseFormResult, problemOf, resultText, sameIds, splitItems,
   type Draft, type FormAnswers, type FormQuestion,
 } from './formQuestions';
@@ -37,6 +38,8 @@ const REPOS_PROBLEM = 'Write each repository as owner/name, like org/repo-a.';
  *   running — it waits for this form.
  * - Answered, the card folds to one line per question; "Show questions"
  *   opens it, read-only.
+ * - The call's intro shows above the card as chat text, answered or not:
+ *   it is the agent's explanation of why it asks.
  */
 export function FormBlock({ block, fallback = null }: {
   block: ToolCallBlockData;
@@ -68,6 +71,12 @@ export function FormBlock({ block, fallback = null }: {
   const questions = submitted?.questions ?? (mine ? live : seen ?? own);
   if (questions.length === 0) return <>{fallback}</>;
   const title = formTitle(block.input) || (mine ? formTitle(pendingInput) : '');
+  const introText = formIntro(block.input) || (mine ? formIntro(pendingInput) : '');
+  const intro = introText ? (
+    <div data-testid="form-intro" className="text-text">
+      <MarkdownContent content={introText} />
+    </div>
+  ) : null;
 
   // Finished (history), a result in, answered here, or the wait seen and over.
   const resolved = submitted !== null || block.status === 'complete' || block.result !== undefined
@@ -79,13 +88,16 @@ export function FormBlock({ block, fallback = null }: {
     const answers: FormAnswers = closed ? {} : parseFormResult(block.result, questions)?.answers ?? submitted?.answers ?? {};
     const rows: AnswerRow[] = questions.map(q => ({ key: q.id, label: q.label, answer: answers[q.id] ?? null }));
     return (
-      <AnsweredCard
-        rows={rows}
-        closed={closed}
-        closedReason={block.isError ? firstLine(resultText(block.result ?? '')) : undefined}
-      >
-        <FormFields title={title} questions={questions} draftOf={q => draftFor(q, answers[q.id], true)} />
-      </AnsweredCard>
+      <>
+        {intro}
+        <AnsweredCard
+          rows={rows}
+          closed={closed}
+          closedReason={block.isError ? firstLine(resultText(block.result ?? '')) : undefined}
+        >
+          <FormFields title={title} questions={questions} draftOf={q => draftFor(q, answers[q.id], true)} />
+        </AnsweredCard>
+      </>
     );
   }
 
@@ -122,6 +134,7 @@ export function FormBlock({ block, fallback = null }: {
 
   return (
     <div className="question-block my-2">
+      {intro}
       <div
         role="form"
         aria-label={title || UNTITLED}

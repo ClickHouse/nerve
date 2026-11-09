@@ -9,17 +9,20 @@ can't drift apart (the same rationale as ``test_plan_revise.py``).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from types import SimpleNamespace
 
 import pytest
 
 from nerve.agent import tools as tools_mod
+from nerve.agent.engine import TurnOutcome, TurnWatch
 from nerve.agent.plan_service import (
     PlanNotFound,
     PlanNotPending,
     TaskNotFound,
     approve_plan,
     decline_plan,
+    record_plan_approval,
 )
 from nerve.db import Database
 from nerve.identity import ACTOR_KIND_HUMAN, Actor
@@ -43,7 +46,7 @@ class FakeSessionManager:
 
     async def get_or_create(
         self, session_id, title=None, source="web", metadata=None,
-        *, actor: Actor | None, cause=None,
+        *, actor: Actor | None, cause=None, origin=None,
     ) -> dict:
         self.calls.append({
             "session_id": session_id, "title": title, "source": source,
@@ -53,7 +56,12 @@ class FakeSessionManager:
 
 
 class FakeEngine:
-    """Mimics AgentEngine.run + .sessions + .register_task for approve tests."""
+    """Mimics AgentEngine.run + .sessions + .register_task + .watch_turns for approve tests.
+
+    ``turn_outcome`` is how each run ends its turn, as ``watch_turns`` reports it.
+    """
+
+    accepting_turns = True
 
     def __init__(self, db: Database) -> None:
         self.db = db
@@ -61,6 +69,16 @@ class FakeEngine:
         self.runs: list[dict] = []
         self.registered: list[str] = []
         self.run_event = asyncio.Event()
+        self.turn_outcome = TurnOutcome()
+        self._watches: dict[str, TurnWatch] = {}
+
+    @contextlib.contextmanager
+    def watch_turns(self, session_id):
+        watch = self._watches[session_id] = TurnWatch()
+        try:
+            yield watch
+        finally:
+            self._watches.pop(session_id, None)
 
     async def run(
         self, session_id, user_message, source="web", *, actor: Actor | None,
@@ -69,6 +87,8 @@ class FakeEngine:
             "session_id": session_id, "user_message": user_message,
             "source": source, "actor": actor,
         })
+        if session_id in self._watches:
+            self._watches[session_id].outcome = self.turn_outcome
         self.run_event.set()
 
     def register_task(self, session_id, task) -> None:
@@ -153,6 +173,177 @@ class TestApprovePlan:
         with pytest.raises(TaskNotFound):
             await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER, cause=APPROVER)
         assert engine.runs == []
+
+
+def _ctx(db, engine, session_id):
+    """The ToolContext of an agent session, as the MCP tools get it."""
+    from dataclasses import replace
+
+    return replace(
+        tools_mod._legacy_ctx(session_id), db=db, engine=engine,
+        actor=db.system_actor, cause=APPROVER,
+    )
+
+
+@pytest.mark.asyncio
+class TestRecordPlanApproval:
+    """``plan_approve`` with ``implement_here``: the user approved in the chat
+    of the session that does the work, so nothing starts."""
+
+    async def test_links_the_calling_session_and_starts_nothing(self, db, tmp_path):
+        from nerve.agent.tools.handlers.plans import plan_approve_handler
+
+        engine, task_id = await _setup(db, tmp_path)
+        result = await plan_approve_handler(
+            _ctx(db, engine, "sess-chat"), {"plan_id": "plan-act", "implement_here": True},
+        )
+
+        assert "No new session started" in result.content[0]["text"]
+        assert "The task status did not change" in result.content[0]["text"]
+        plan = await db.get_plan("plan-act")
+        assert plan["status"] == "implementing"
+        assert plan["impl_session_id"] == "sess-chat"
+        assert plan["reviewed_at"]
+        assert plan["reviewed_by_actor_id"] == db.system_actor.actor_id
+        assert plan["reviewed_caused_by_actor_id"] == APPROVER.actor_id
+        assert engine.sessions.calls == []
+        assert engine.runs == []
+        assert engine.registered == []
+        # The task keeps its status and gets a note that links the session.
+        task = await db.get_task(task_id)
+        assert task["status"] == "pending"
+        assert [e for e in await db.list_task_events(task_id) if e["to_status"] != "pending"] == []
+        text = (tmp_path / "task.md").read_text(encoding="utf-8")
+        assert "approved in the chat of session [sess-chat](/chat/sess-chat)" in text
+
+    async def test_a_task_in_plan_review_starts(self, db, tmp_path):
+        """No plan waits for a decision after the approval, so the task leaves
+        plan_review, as it does for an approval that starts a session."""
+        from nerve.agent.tools.handlers.plans import plan_approve_handler
+
+        engine, task_id = await _setup(db, tmp_path)
+        await db.db.execute("UPDATE tasks SET status = 'plan_review' WHERE id = ?", (task_id,))
+        await db.db.commit()
+
+        result = await plan_approve_handler(
+            _ctx(db, engine, "sess-chat"), {"plan_id": "plan-act", "implement_here": True},
+        )
+
+        assert "moved from plan_review to in_progress" in result.content[0]["text"]
+        assert (await db.get_task(task_id))["status"] == "in_progress"
+        assert _in_progress_by(await db.list_task_events(task_id)) == ["sess-chat"]
+        assert engine.sessions.calls == []
+
+    async def test_needs_no_engine(self, db, tmp_path):
+        from nerve.agent.tools.handlers.plans import plan_approve_handler
+
+        engine, _ = await _setup(db, tmp_path)
+        await plan_approve_handler(
+            _ctx(db, None, "sess-chat"), {"plan_id": "plan-act", "implement_here": True},
+        )
+        assert (await db.get_plan("plan-act"))["status"] == "implementing"
+
+    async def test_plan_of_a_done_task_is_done(self, db, tmp_path):
+        engine, task_id = await _setup(db, tmp_path)
+        await db.db.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (task_id,))
+        await db.db.commit()
+
+        result = await record_plan_approval(
+            db=db, engine=engine, plan_id="plan-act", session_id="sess-chat",
+            actor=db.system_actor, cause=APPROVER,
+        )
+
+        assert result["status"] == "done"
+        plan = await db.get_plan("plan-act")
+        assert (plan["status"], plan["impl_session_id"]) == ("done", "sess-chat")
+        assert (await db.get_task(task_id))["status"] == "done"
+
+    async def test_dismisses_the_plan_notification(self, db, tmp_path):
+        engine, task_id = await _setup(db, tmp_path)
+        await db.create_notification(
+            "n-plan", "sess-proposer", "notify", "Plan ready",
+            metadata={"plan_id": "plan-act", "task_id": task_id},
+        )
+
+        await record_plan_approval(
+            db=db, engine=engine, plan_id="plan-act", session_id="sess-chat",
+            actor=db.system_actor, cause=APPROVER,
+        )
+
+        assert (await db.get_notification("n-plan"))["status"] == "dismissed"
+
+    async def test_refuses_non_pending(self, db, tmp_path):
+        engine, _ = await _setup(db, tmp_path, status="declined")
+        with pytest.raises(PlanNotPending):
+            await record_plan_approval(
+                db=db, engine=engine, plan_id="plan-act", session_id="sess-chat",
+                actor=db.system_actor, cause=APPROVER,
+            )
+        plan = await db.get_plan("plan-act")
+        assert (plan["status"], plan["impl_session_id"]) == ("declined", None)
+
+    async def test_raises_plan_and_task_not_found(self, db, tmp_path):
+        engine, task_id = await _setup(db, tmp_path)
+        with pytest.raises(PlanNotFound):
+            await record_plan_approval(
+                db=db, engine=engine, plan_id="plan-missing", session_id="sess-chat",
+                actor=db.system_actor, cause=APPROVER,
+            )
+        await db.db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        await db.db.commit()
+        with pytest.raises(TaskNotFound):
+            await record_plan_approval(
+                db=db, engine=engine, plan_id="plan-act", session_id="sess-chat",
+                actor=db.system_actor, cause=APPROVER,
+            )
+        assert (await db.get_plan("plan-act"))["status"] == "pending"
+
+    async def test_failed_task_note_puts_plan_back_to_pending(
+        self, db, tmp_path, monkeypatch,
+    ):
+        from nerve.agent.tools.handlers import tasks as task_handlers
+
+        engine, _ = await _setup(db, tmp_path)
+
+        async def broken_task_update(ctx, args):
+            raise RuntimeError("task store unavailable")
+
+        monkeypatch.setattr(task_handlers, "task_update_handler", broken_task_update)
+        with pytest.raises(RuntimeError):
+            await record_plan_approval(
+                db=db, engine=engine, plan_id="plan-act", session_id="sess-chat",
+                actor=db.system_actor, cause=APPROVER,
+            )
+
+        plan = await db.get_plan("plan-act")
+        assert plan["status"] == "pending"
+        assert plan["impl_session_id"] is None
+        assert plan["reviewed_by_actor_id"] is None
+
+    async def test_tool_needs_a_calling_session(self, db, tmp_path):
+        from dataclasses import replace
+
+        from nerve.agent.tools.handlers.plans import plan_approve_handler
+
+        engine, _ = await _setup(db, tmp_path)
+        ctx = replace(_ctx(db, engine, "sess-chat"), session_id="")
+        result = await plan_approve_handler(ctx, {"plan_id": "plan-act", "implement_here": True})
+
+        assert "needs a calling session" in result.content[0]["text"]
+        assert (await db.get_plan("plan-act"))["status"] == "pending"
+
+    async def test_task_done_closes_the_recorded_plan(self, db, tmp_path):
+        from nerve.agent.tools.handlers.tasks import task_done_handler
+
+        engine, task_id = await _setup(db, tmp_path)
+        await record_plan_approval(
+            db=db, engine=engine, plan_id="plan-act", session_id="sess-chat",
+            actor=db.system_actor, cause=APPROVER,
+        )
+
+        await task_done_handler(_ctx(db, engine, "sess-chat"), {"task_id": task_id})
+
+        assert (await db.get_plan("plan-act"))["status"] == "done"
 
 
 @pytest.mark.asyncio

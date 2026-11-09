@@ -18,6 +18,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from nerve.session_origin import external_origin
+
 if TYPE_CHECKING:
     from nerve.db import Database
 
@@ -154,6 +156,7 @@ class SatelliteSessionResolver:
                     actor=self.db.system_actor,
                     # The agent behind it runs outside this instance.
                     cause=None,
+                    origin=external_origin(safe_client),
                 )
                 logger.info(
                     "Created Codex satellite session %s via MCP (mcp=%s)",
@@ -187,6 +190,7 @@ class SatelliteSessionResolver:
                 actor=self.db.system_actor,
                 # The agent behind it runs outside this instance.
                 cause=None,
+                origin=external_origin(safe_client),
             )
             logger.info(
                 "Created satellite session %s (client=%s, mcp=%s)",

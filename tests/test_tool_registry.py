@@ -149,7 +149,7 @@ class TestDefaultRegistry:
         expected = {
             # tasks
             "task_search", "task_create", "task_list", "task_update",
-            "task_read", "task_write", "task_done",
+            "task_read", "task_write", "task_done", "task_comment",
             # memory
             "memory_recall", "conversation_history", "memorize",
             # plans

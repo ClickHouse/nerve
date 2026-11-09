@@ -9,9 +9,10 @@ export type WSMessage =
   | { type: 'tool_use'; session_id: string; tool: string; input: Record<string, unknown>; tool_use_id?: string; parent_tool_use_id?: string }
   | { type: 'tool_result'; session_id: string; tool_use_id?: string; result: string; is_error?: boolean; parent_tool_use_id?: string }
   | { type: 'tool_output'; session_id: string; tool_use_id?: string; content: string; parent_tool_use_id?: string }
-  | { type: 'done'; session_id: string; usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number }; max_context_tokens?: number; num_turns?: number }
+  | { type: 'done'; session_id: string; usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number; context_tokens?: number }; max_context_tokens?: number; num_turns?: number }
   | { type: 'stopped'; session_id: string }
-  | { type: 'error'; session_id: string; error: string }
+  // client_msg_id: the refused message, when the error refuses a message (Nerve is shutting down).
+  | { type: 'error'; session_id: string; error: string; client_msg_id?: string | null }
   | { type: 'session_switched'; session_id: string }
   | { type: 'session_updated'; session_id: string; title: string }
   // `agents` is the roster snapshot, sent on every bind and switch (also when
@@ -32,9 +33,11 @@ export type WSMessage =
   | { type: 'subagent_start'; session_id: string; tool_use_id: string; subagent_type: string; description: string; model?: string }
   | { type: 'subagent_complete'; session_id: string; tool_use_id: string; duration_ms: number; is_error?: boolean }
   | { type: 'file_changed'; session_id: string; path: string; operation: string; tool_use_id: string }
-  | { type: 'notification'; notification_id: string; notification_type: 'notify' | 'question' | 'approval'; session_id: string; title: string; body: string; priority: string; options: string[] | null; option_labels?: Record<string, string>; target_kind?: string; target_id?: string; silenced?: boolean; silence_reason?: string; silence_pattern?: string; silenced_by?: string; redelivered?: boolean; redelivery_count?: number }
+  // `silent`: inside quiet hours and not urgent, so show it without sound.
+  // `silenced`: a silence rule held it back.
+  | { type: 'notification'; notification_id: string; notification_type: 'notify' | 'question' | 'approval'; session_id: string; title: string; body: string; priority: string; options: string[] | null; option_labels?: Record<string, string>; target_kind?: string; target_id?: string; silenced?: boolean; silence_reason?: string; silence_pattern?: string; silenced_by?: string; redelivered?: boolean; redelivery_count?: number; silent?: boolean }
   // `actor_id` is the person who answered; null for a chat-channel answer.
-  | { type: 'notification_answered'; notification_id: string; session_id: string; answer: string; answered_by: string; actor_id?: string | null; approval_status?: 'answered' | 'snoozed'; dispatch_ok?: boolean; snooze_until?: string }
+  | { type: 'notification_answered'; notification_id: string; session_id: string; answer: string; answered_by: string; answered_at?: string | null; actor_id?: string | null; approval_status?: 'answered' | 'snoozed'; dispatch_ok?: boolean; snooze_until?: string }
   | { type: 'notification_expired'; notification_id: string; session_id: string; notification_type: string; title: string }
   // The answer becomes a user message written by the person who answered;
   // `actor_id` is null for a chat-channel answer.
@@ -60,7 +63,11 @@ export type WSMessage =
   // Global (session_id is always null): a task row changed anywhere — the
   // API, another tab, or the agent in an unrelated session. Deliberately
   // NOT view-scoped; the board reflects all of them.
-  | { type: 'task_updated'; session_id: null; event: 'created' | 'updated' | 'moved' | 'done'; task: Task }
+  | {
+      type: 'task_updated'; session_id: null;
+      event: 'created' | 'updated' | 'moved' | 'done' | 'commented' | 'comment_deleted';
+      task: Task;
+    }
   | { type: 'wakeup'; session_id: string }
   // `triggers` names the agents whose settling started the turn (`more` counts the rest).
   | { type: 'auto_turn'; session_id: string; triggers?: AutoTurnTrigger[]; more?: number }
@@ -88,6 +95,17 @@ export type SendStatus = 'sent' | 'queued' | 'dropped';
 // payload wins. The caller still gets 'queued' for the surviving payload.
 const MAX_PENDING = 5;
 
+/** The interval of the ping on an open socket. */
+const PING_INTERVAL_MS = 30_000;
+/** A socket that sends no frame this long after a ping counts as dead. */
+const PING_DEADLINE_MS = 10_000;
+/**
+ * The deadline after the page comes back (a phone wakes, a tab shows again,
+ * the network returns). A sleeping phone often stops the connection without
+ * a close event, so the socket can show OPEN and be dead.
+ */
+const WAKE_DEADLINE_MS = 4_000;
+
 /** A chat message that waits in the queue for an open socket. */
 export interface QueuedMessage {
   session_id: string;
@@ -100,6 +118,16 @@ export class NerveWebSocket {
   private openHandlers: Set<OpenHandler> = new Set();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingInterval: ReturnType<typeof setInterval> | null = null;
+  /** Closes the socket when no frame arrives in time after a ping. */
+  private deadline: ReturnType<typeof setTimeout> | null = null;
+  private deadlineAt = 0;
+  /**
+   * The page came back and the socket must answer a ping first. Frames wait
+   * in the queue until it does: a frame sent into a dead socket is lost.
+   */
+  private checking = false;
+  /** Removes the page listeners. */
+  private unlisten: (() => void) | null = null;
   private _connected = false;
   private _pending: Record<string, unknown>[] = [];
   private shouldReconnect = true;
@@ -112,6 +140,7 @@ export class NerveWebSocket {
 
   connect() {
     this.shouldReconnect = true;
+    this.listen();
     if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) return;
     if (isHosted()) {
       this.checkSession(true);
@@ -135,7 +164,7 @@ export class NerveWebSocket {
         return;
       }
       this._connected = true;
-      this.startPing();
+      this.startPing(socket);
       // Before the queued frames: a handler re-binds the session (and its
       // agent subscriptions) so the queued messages land on the right view.
       this.openHandlers.forEach((h) => {
@@ -150,6 +179,12 @@ export class NerveWebSocket {
 
     socket.onmessage = (event) => {
       if (this.ws !== socket) return;
+      // Any frame shows that the socket is alive.
+      this.clearDeadline();
+      if (this.checking) {
+        this.checking = false;
+        this.flushPending();
+      }
       try {
         const msg: WSMessage = JSON.parse(event.data);
         this.handlers.forEach((h) => h(msg));
@@ -185,6 +220,8 @@ export class NerveWebSocket {
 
   disconnect() {
     this.shouldReconnect = false;
+    this.unlisten?.();
+    this.unlisten = null;
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
@@ -200,15 +237,16 @@ export class NerveWebSocket {
 
   send(data: Record<string, unknown>): SendStatus {
     if (isHosted() && !hostedSessionActive()) return 'dropped';
-    if (this.ws?.readyState === WebSocket.OPEN) {
+    if (this.ws?.readyState === WebSocket.OPEN && !this.checking) {
       this.ws.send(JSON.stringify(data));
       return 'sent';
     }
-    // Queue while the socket is mid-handshake, a reconnect is scheduled, or
-    // the gateway session check runs. The drain happens in `onopen` once the
-    // new socket is OPEN.
+    // Queue while the socket is mid-handshake, a reconnect is scheduled, the
+    // gateway session check runs, or the socket must first answer a ping.
+    // The drain happens in `onopen` once the new socket is OPEN, or when the
+    // socket answers.
     const connecting = this.ws?.readyState === WebSocket.CONNECTING;
-    if (connecting || this.reconnectTimer !== null || this.probe !== null) {
+    if (connecting || this.reconnectTimer !== null || this.probe !== null || this.checking) {
       if (this._pending.length >= MAX_PENDING) {
         this._pending.shift();
       }
@@ -312,12 +350,12 @@ export class NerveWebSocket {
     return 'sent';
   }
 
-  private startPing() {
+  private startPing(socket: WebSocket) {
     this.pingInterval = setInterval(() => {
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        this.send({ type: 'ping' });
+      if (this.ws === socket && socket.readyState === WebSocket.OPEN) {
+        this.ping(socket, PING_DEADLINE_MS);
       }
-    }, 30000);
+    }, PING_INTERVAL_MS);
   }
 
   private stopPing() {
@@ -325,6 +363,89 @@ export class NerveWebSocket {
       clearInterval(this.pingInterval);
       this.pingInterval = null;
     }
+    this.clearDeadline();
+    this.checking = false;
+  }
+
+  /** Send a ping and give up on the socket when no frame arrives within `ms`. */
+  private ping(socket: WebSocket, ms: number) {
+    if (isHosted() && !hostedSessionActive()) return;
+    socket.send(JSON.stringify({ type: 'ping' }));
+    const at = Date.now() + ms;
+    // An earlier deadline stays.
+    if (this.deadline !== null && this.deadlineAt <= at) return;
+    this.clearDeadline();
+    this.deadlineAt = at;
+    this.deadline = setTimeout(() => {
+      this.deadline = null;
+      if (this.ws !== socket) return;
+      // Its close event can come minutes later, or never: it no longer counts.
+      socket.close();
+      this.reconnectNow();
+    }, ms);
+  }
+
+  private clearDeadline() {
+    if (this.deadline !== null) {
+      clearTimeout(this.deadline);
+      this.deadline = null;
+    }
+  }
+
+  /**
+   * Leave the current socket and connect at once, without the retry delay.
+   * The old socket's close event is ignored after this.
+   */
+  private reconnectNow() {
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.stopPing();
+    this.ws = null;
+    this._connected = false;
+    if (!this.shouldReconnect) return;
+    if (isHosted()) this.checkSession(true);
+    else this.openSocket();
+  }
+
+  /**
+   * The page is visible again or the network is back. A socket that waits
+   * for a retry connects now; an open socket must answer a ping first.
+   */
+  private wake = () => {
+    if (!this.shouldReconnect) return;
+    const socket = this.ws;
+    if (socket?.readyState === WebSocket.CONNECTING) return;
+    if (socket?.readyState === WebSocket.OPEN) {
+      if (this.checking || (isHosted() && !hostedSessionActive())) return;
+      this.checking = true;
+      this.ping(socket, WAKE_DEADLINE_MS);
+      return;
+    }
+    // The gateway session check opens the socket or plans a retry.
+    if (this.probe !== null) return;
+    // A retry waits, or the socket closed and its close event is late.
+    this.reconnectNow();
+  };
+
+  private listen() {
+    if (this.unlisten !== null || typeof window === 'undefined') return;
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') this.wake();
+    };
+    // A page restored from the back/forward cache.
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) this.wake();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    window.addEventListener('pageshow', onPageShow);
+    window.addEventListener('online', this.wake);
+    this.unlisten = () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      window.removeEventListener('pageshow', onPageShow);
+      window.removeEventListener('online', this.wake);
+    };
   }
 
   private flushPending() {

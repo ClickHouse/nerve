@@ -1,21 +1,28 @@
 import { useEffect, useRef, useCallback, memo } from 'react';
 import { Link } from 'react-router-dom';
-import type { ChatMessage } from '../../types/chat';
+import type { ChatMessage, Session } from '../../types/chat';
 import { useVisibleActorIds } from '../../stores/actorStore';
+import { useAgentStore } from '../../stores/agentStore';
 import { useAuthStore } from '../../stores/authStore';
 import { useChatStore } from '../../stores/chatStore';
-import { providerConfigured, useSetupStore } from '../../stores/setupStore';
-import { CHAT_EMPTY_NO_PROVIDER } from '../Setup/copy';
+import { providerConfigured, stepById, useSetupStore } from '../../stores/setupStore';
+import { CHAT_EMPTY_NO_PROVIDER, CHAT_EMPTY_PROVIDER_CLOSED } from '../Setup/copy';
+import { stepPlace } from '../Setup/navigation';
 import { UserMessage } from './UserMessage';
 import { AssistantMessage } from './AssistantMessage';
 import { StreamingMessage } from './StreamingMessage';
 import { SelectionToolbar } from './SelectionToolbar';
 import { MessageActions } from './MessageActions';
+import { SessionOriginLine } from './SessionOrigin';
 import { GitBranch } from '../ui/icons';
+import { followScrollEnd } from '../../utils/followScrollEnd';
 
-function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }: {
+function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks, unlistedSession }: {
   messages: ChatMessage[];
   isStreaming: boolean;
+  /** The open session's row when no loaded session list has it, for the
+      origin line. */
+  unlistedSession?: Session | null;
   /** Fork the chat from a specific message (undefined = feature unavailable
       for this session, e.g. a virtual chat). */
   onForkMessage?: (messageId: number) => void;
@@ -35,6 +42,11 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
   // predating turn recording can only be forked whole (header action).
   const hasForkAnchors = messages.some(m => m.native_turn_id != null);
 
+  // A message waiting in the turn queue (an echo from another tab) shows as
+  // a queue row above the composer, not as a bubble, until it starts.
+  const queue = useAgentStore(s => s.queue);
+  const queuedMsgIds = new Set(queue.map(q => q.client_msg_id));
+
   const viewerActorId = useAuthStore((s) => s.viewer?.id ?? null);
   const namedSenders = useVisibleActorIds(
     messages.map(m => m.actor_id), viewerActorId,
@@ -42,6 +54,10 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
   // `false` only when the server says no provider is configured; unknown
   // (`null`) keeps the ordinary empty state, so a failed read never nags.
   const needsProvider = useSetupStore(providerConfigured) === false;
+  // A Model step that a lockdown closed is not on the setup page, so the
+  // empty state gives the server's reason and no link to the step.
+  const providerStep = useSetupStore((s) => stepById(s, 'provider'));
+  const providerClosed = !!providerStep && stepPlace(providerStep) !== 'own';
 
   const handleScroll = useCallback(() => {
     const el = containerRef.current;
@@ -49,8 +65,13 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
     isNearBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100;
   }, []);
 
+  // Stops the follow of the end that starts after the first load, while it runs.
+  const stopFollow = useRef<(() => void) | null>(null);
+  useEffect(() => () => stopFollow.current?.(), []);
+
   useEffect(() => {
-    if (!isNearBottom.current) {
+    // While the end is followed after the first load, the follow scrolls.
+    if (stopFollow.current || !isNearBottom.current) {
       prevMessageCount.current = messages.length;
       return;
     }
@@ -58,6 +79,12 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
     const wasEmpty = prevMessageCount.current === 0 && messages.length > 0;
     prevMessageCount.current = messages.length;
     endRef.current?.scrollIntoView({ behavior: wasEmpty ? 'instant' : 'smooth' });
+    // The rows near the end take their real height only after this jump.
+    if (wasEmpty && containerRef.current) {
+      stopFollow.current = followScrollEnd(containerRef.current, () => {
+        stopFollow.current = null;
+      });
+    }
   }, [messages.length, streamingBlockCount, isStreaming]);
 
   return (
@@ -67,10 +94,21 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
       {messages.length === 0 && !isStreaming && (
         needsProvider ? (
           <div role="status" className="flex flex-col items-center justify-center h-full gap-2 text-center px-6">
-            <p className="text-text-faint text-lg">{CHAT_EMPTY_NO_PROVIDER}</p>
-            <Link to="/setup/provider" className="text-sm text-accent hover:underline underline-offset-2">
-              Finish setup
-            </Link>
+            {providerClosed ? (
+              <>
+                <p className="text-text-faint text-lg">{CHAT_EMPTY_PROVIDER_CLOSED}</p>
+                {providerStep?.blocked_reason && (
+                  <p className="text-sm text-text-muted max-w-md">{providerStep?.blocked_reason}</p>
+                )}
+              </>
+            ) : (
+              <>
+                <p className="text-text-faint text-lg">{CHAT_EMPTY_NO_PROVIDER}</p>
+                <Link to="/setup/provider" className="text-sm text-accent hover:underline underline-offset-2">
+                  Finish setup
+                </Link>
+              </>
+            )}
           </div>
         ) : (
           <div className="flex items-center justify-center h-full text-text-faint text-lg">
@@ -79,7 +117,10 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
         )
       )}
 
+      {messages.length > 0 && <SessionOriginLine unlisted={unlistedSession} />}
+
       {messages.map((msg, i) => {
+        if (msg.role === 'user' && msg.client_msg_id && queuedMsgIds.has(msg.client_msg_id)) return null;
         // "Fork from here" needs a persisted row id (live-streamed messages
         // gain one on the next reload) and at least one native turn mapping
         // in the transcript to anchor the branch to.
@@ -93,7 +134,7 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks }:
         );
         const forks = msg.id != null ? messageForks?.get(String(msg.id)) : undefined;
         return (
-          <div key={msg.id ?? i}>
+          <div key={msg.id ?? i} className="chat-row">
             {msg.role === 'user'
               ? <UserMessage
                   message={msg}

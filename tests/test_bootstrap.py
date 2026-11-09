@@ -227,8 +227,8 @@ class TestNonInteractiveSetup:
         assert "task-planner" in choices.enabled_crons
 
     def test_worker_mode_defaults(self, tmp_path: Path) -> None:
-        """Worker non-interactive: the two skill jobs on, task-planner
-        written but off (the onboarding conversation decides), quiet hours none."""
+        """Worker non-interactive: the two skill jobs and machine maintenance
+        on, task-planner written but off (the onboarding conversation decides), quiet hours none."""
         env = {
             "ANTHROPIC_API_KEY": "sk-ant-REPLACE",
             "NERVE_MODE": "worker",
@@ -238,12 +238,12 @@ class TestNonInteractiveSetup:
         with patch.dict(os.environ, env, clear=False):
             choices = run_non_interactive(tmp_path)
 
-        assert choices.enabled_crons == ["skill-reviser", "skill-extractor"]
+        assert choices.enabled_crons == ["skill-reviser", "skill-extractor", "machine-maintenance"]
         ws = tmp_path / "ws"
         system = yaml.safe_load((ws / "config" / "cron" / "system.yaml").read_text())
         assert {job["id"]: job["enabled"] for job in system["jobs"]} == {
             "memory-maintenance": True, "task-planner": False,
-            "skill-extractor": True, "skill-reviser": True,
+            "skill-extractor": True, "skill-reviser": True, "machine-maintenance": True,
         }
         settings = yaml.safe_load((ws / "config" / "settings.yaml").read_text())
         assert (settings["quiet_start"], settings["quiet_end"]) == ("", "")

@@ -38,6 +38,19 @@ class MockWebSocket {
 
 const { NerveWebSocket } = await import('./websocket');
 
+// A client listens to the page after connect. Disconnect each one after its
+// test, so that a page event in a later test reaches only that test's client.
+const clients = new Set<InstanceType<typeof NerveWebSocket>>();
+const realConnect = NerveWebSocket.prototype.connect;
+NerveWebSocket.prototype.connect = function connect(this: InstanceType<typeof NerveWebSocket>) {
+  clients.add(this);
+  realConnect.call(this);
+};
+afterEach(() => {
+  clients.forEach((client) => client.disconnect());
+  clients.clear();
+});
+
 describe('NerveWebSocket', () => {
   beforeEach(() => {
     MockWebSocket.instances = [];
@@ -401,5 +414,180 @@ describe('NerveWebSocket credentials and session checks', () => {
     expect(MockWebSocket.instances[0].send).toHaveBeenCalledOnce();
     expect(JSON.parse(MockWebSocket.instances[0].send.mock.calls[0][0]))
       .toEqual({ type: 'switch_session', session_id: 's2' });
+  });
+});
+
+describe('NerveWebSocket after the page comes back', () => {
+  let visibility: DocumentVisibilityState;
+
+  function show() {
+    visibility = 'visible';
+    document.dispatchEvent(new Event('visibilitychange'));
+  }
+
+  function hide() {
+    visibility = 'hidden';
+    document.dispatchEvent(new Event('visibilitychange'));
+  }
+
+  const frames = (socket: MockWebSocket) => socket.send.mock.calls.map(([frame]) => JSON.parse(frame));
+
+  /** A client with an open socket. */
+  function connected() {
+    const client = new NerveWebSocket();
+    client.connect();
+    MockWebSocket.instances[0].open();
+    return { client, socket: MockWebSocket.instances[0] };
+  }
+
+  beforeEach(() => {
+    MockWebSocket.instances = [];
+    vi.stubGlobal('WebSocket', MockWebSocket);
+    vi.useFakeTimers();
+    setAuthMode('local');
+    visibility = 'visible';
+    Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => visibility });
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    Reflect.deleteProperty(document, 'visibilityState');
+  });
+
+  it('connects at once instead of waiting for the retry', () => {
+    const { socket } = connected();
+    hide();
+    socket.closeUnexpectedly();
+
+    show();
+
+    expect(MockWebSocket.instances).toHaveLength(2);
+    // The retry that waited does not open a third socket.
+    vi.advanceTimersByTime(3000);
+    expect(MockWebSocket.instances).toHaveLength(2);
+  });
+
+  it('does nothing while the page is hidden', () => {
+    const { socket } = connected();
+    socket.closeUnexpectedly();
+
+    hide();
+
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it('replaces an open socket that does not answer, and sends the held frames on the new one', () => {
+    const { client, socket } = connected();
+    const opened = vi.fn(() => client.switchSession('s-1234'));
+    client.onOpen(opened);
+
+    show();
+    expect(frames(socket)).toEqual([{ type: 'ping' }]);
+    expect(client.sendMessage('hello', 's-1234')).toBe('queued');
+
+    vi.advanceTimersByTime(4000);
+    expect(socket.close).toHaveBeenCalledOnce();
+    expect(MockWebSocket.instances).toHaveLength(2);
+    // The late close event of the dead socket changes nothing.
+    socket.closeUnexpectedly();
+    vi.advanceTimersByTime(3000);
+    expect(MockWebSocket.instances).toHaveLength(2);
+
+    MockWebSocket.instances[1].open();
+    expect(opened).toHaveBeenCalledOnce();
+    expect(frames(MockWebSocket.instances[1]).map((f) => f.type)).toEqual(['switch_session', 'message']);
+    expect(frames(socket)).toEqual([{ type: 'ping' }]);
+  });
+
+  it('keeps an open socket that answers, then sends the held frames', () => {
+    const { client, socket } = connected();
+
+    show();
+    expect(client.sendMessage('hello', 's-1234')).toBe('queued');
+    socket.onmessage?.({ data: JSON.stringify({ type: 'pong' }) });
+
+    expect(frames(socket)).toEqual([
+      { type: 'ping' },
+      { type: 'message', content: 'hello', session_id: 's-1234' },
+    ]);
+    expect(client.sendMessage('more', 's-1234')).toBe('sent');
+    vi.advanceTimersByTime(10_000);
+    expect(socket.close).not.toHaveBeenCalled();
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it('checks an open socket when the network comes back or the page is restored', () => {
+    const { socket } = connected();
+
+    window.dispatchEvent(new Event('online'));
+    expect(frames(socket)).toEqual([{ type: 'ping' }]);
+    socket.onmessage?.({ data: JSON.stringify({ type: 'pong' }) });
+
+    window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: false }));
+    expect(frames(socket)).toHaveLength(1);
+    window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }));
+    expect(frames(socket)).toHaveLength(2);
+  });
+
+  it('closes a socket that does not answer the regular ping', () => {
+    const { socket } = connected();
+
+    vi.advanceTimersByTime(30_000);
+    expect(frames(socket)).toEqual([{ type: 'ping' }]);
+    vi.advanceTimersByTime(9_999);
+    expect(MockWebSocket.instances).toHaveLength(1);
+    vi.advanceTimersByTime(1);
+
+    expect(socket.close).toHaveBeenCalledOnce();
+    expect(MockWebSocket.instances).toHaveLength(2);
+  });
+
+  it('counts any frame as an answer', () => {
+    const { socket } = connected();
+
+    vi.advanceTimersByTime(30_000);
+    socket.onmessage?.({ data: JSON.stringify({ type: 'token', session_id: 's-1234', content: 'x' }) });
+    vi.advanceTimersByTime(10_000);
+
+    expect(socket.close).not.toHaveBeenCalled();
+  });
+
+  it('stops listening to the page after a disconnect', () => {
+    const { client, socket } = connected();
+    client.disconnect();
+
+    show();
+    window.dispatchEvent(new Event('online'));
+
+    expect(socket.send).not.toHaveBeenCalled();
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it('checks the gateway session before it connects at once', async () => {
+    setAuthMode('external');
+    useHostedStore.setState({ mode: 'external', principalId: 'alice', problem: null, reentering: false });
+    const valid = () => new Response(JSON.stringify({ authenticated: true, principalId: 'alice' }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    });
+    const fetchMock = vi.fn(async () => valid());
+    vi.stubGlobal('fetch', fetchMock);
+    const client = new NerveWebSocket();
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    MockWebSocket.instances[0].open();
+    let answer: (res: Response) => void = () => {};
+    fetchMock.mockReturnValueOnce(new Promise<Response>((done) => { answer = done; }));
+
+    show();
+    await vi.advanceTimersByTimeAsync(4000);
+    // The socket did not answer: the session check runs, no socket yet.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(MockWebSocket.instances).toHaveLength(1);
+    answer(valid());
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(MockWebSocket.instances).toHaveLength(2);
+    useHostedStore.setState({ mode: 'local', principalId: null, problem: null, reentering: false });
   });
 });

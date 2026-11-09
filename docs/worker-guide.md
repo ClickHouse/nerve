@@ -32,7 +32,8 @@ worker is configured on that page:
    This writes the worker templates (`SOUL.md`, `AGENTS.md`, `TOOLS.md`,
    `MEMORY.md`), `TASK.md` from its template with your choice in place (the
    onboarding conversation fills the rest), and `config/cron/system.yaml` with
-   `skill-extractor` and `skill-reviser` on and `task-planner` off
+   `skill-extractor`, `skill-reviser` and `machine-maintenance` on and
+   `task-planner` off
    (`memory-maintenance` is always on; the onboarding conversation turns
    `task-planner` on when the worker should plan through the approval loop)
 3. **Model** — an Anthropic API key, a Claude subscription token, the Claude
@@ -49,7 +50,7 @@ worker is configured on that page:
 The same choice from a terminal is `nerve init --terminal`, which asks for the
 mode and an optional task description itself and does not start the daemon
 (`nerve start` afterwards). Its worker path has no cron step, so it writes
-`skill-extractor` and `skill-reviser` with `enabled: false` too (`task-planner` is
+`skill-extractor`, `skill-reviser` and `machine-maintenance` with `enabled: false` too (`task-planner` is
 off on every path until onboarding enables it): set `enabled: true` in
 `config/cron/system.yaml` (or override the job by id in `jobs.yaml`) and `nerve reload`. Unattended installs set `NERVE_MODE=worker` and
 `NERVE_TASK="…"` for `nerve init --non-interactive` (see
@@ -60,9 +61,9 @@ waits for its onboarding conversation in the web UI.
 
 ## How Onboarding Works
 
-After setup in the browser, you set the worker up by talking to it, in the onboarding conversation (see [Setup → The onboarding conversation](setup.md#the-onboarding-conversation)). The setup page's Finish opens it, or the next start of the daemon when a restart comes first. When setup is complete and nobody pressed Finish, the banner in the web UI offers to start it. Until onboarding is done, `TASK.md` keeps the onboarding marker (the `<!-- nerve:onboarding pending … -->` comment on its second line). The agent's hidden instruction holds what you chose on the Mode step (each ticked item with what it does, the connection it needs and the follow-up questions it raises), the full [Worker Best Practices](worker-best-practices.md) guide and the rules below. The agent speaks first: with work chosen it offers no menu, restates the work in one sentence, says what it studies and sketches the setup it has in mind before it asks anything; with nothing ticked, or only rules, it offers the same list of work and asks which kinds apply. A free-text note (from an older setup page or `nerve init --terminal`) that describes the work counts as chosen work; one with only rules or only repositories gets the list. Then:
+After setup in the browser, you set the worker up by talking to it, in the onboarding conversation (see [Setup → The onboarding conversation](setup.md#the-onboarding-conversation)). The setup page's Finish opens it, or the next start of the daemon when a restart comes first. When setup is complete and nobody pressed Finish, the banner in the web UI offers to start it. Until onboarding is done, `TASK.md` keeps the onboarding marker (the `<!-- nerve:onboarding pending … -->` comment on its second line). The agent's hidden instruction holds what you chose on the Mode step (each ticked item with what it does, the connection it needs and the follow-up questions it raises), the full [Worker Best Practices](worker-best-practices.md) guide and the rules below. The agent speaks first: with work chosen it offers no menu, restates the work in one sentence, says what it studies and sketches the setup it has in mind before it asks anything; with nothing ticked, or only rules, it shows one form that asks which work applies, with four common kinds of work as checkboxes and **Other…** for work in your own words. A free-text note (from an older setup page or `nerve init --terminal`) that describes the work counts as chosen work; one with only rules or only repositories gets the form. Then:
 
-1. **Explore and ask**: one background explorer clones the repositories into `<workspace>/repos/` and reads them, without installing, building or running tests (build and test, CI, contribution and review rules, the volume of the work, risks and missing access), while the agent asks you, in question cards with its recommendation first, only what neither the explorer nor setup can tell. It works from the follow-up questions of each item you ticked (which repositories, what a review may do, the label vocabulary, how often to look for new work, and so on) and asks once what the items share: the account it acts as on the code host, what waits for your approval, where results go. What does not fit into two rounds becomes a default in the proposal; your rules ("Anything it must know or never do?") become hard rules and approval boundaries
+1. **Explore and ask**: one background explorer clones the repositories into `<workspace>/repos/` and reads them, without installing, building or running tests (build and test, CI, contribution and review rules, the volume of the work, risks and missing access); once its findings are in, the agent asks you, in question cards with its recommendation first, only what neither the explorer nor setup can tell (a first card asks only for missing repositories or channels, so the explorer can start). It works from the follow-up questions of each item you ticked (which repositories, what a review may do, the label vocabulary, and so on) and asks once what the items share: the account it acts as on the code host, what waits for your approval, where results go. What does not fit into two rounds becomes a default in the proposal; your rules ("Anything it must know or never do?") become hard rules and approval boundaries
 2. **Propose the setup as a plan**: cron jobs with schedule and `run_if` gate, whether `task-planner` plans through the approval loop (it ships disabled for workers; the agent turns it on by overriding the job by id in `jobs.yaml`, with a `tasks` gate scoped to the worker's tag), task statuses (the built-in `backlog` and `plan_review`, plus a status for each other kind of wait), tags, skills, the `TASK.md` sections, what it needs from you (including a connection a chosen item needs that the instance lacks) and the approval boundaries. **Apply setup** approves it, **Edit** lets you change the text and approve your version, and **Change something…** sends your words back and the agent revises the plan. It is instructed to change nothing before you approve
 3. **Apply what you approved**: fills `TASK.md` in place (every `_(onboarding fills this in: …)_` placeholder and example line, keeping the headings and what you chose, the `### ⛔ HARD RULE: … [operator directive YYYY-MM-DD]` shape for the non-negotiables, the Actions transition table, and the closing "Read the full guide" link), adds the jobs to `<workspace>/config/cron/jobs.yaml`, creates statuses, skills and the tasks only you can do, and saves what it learned to memory
 4. **Summarize**: lists every change and the next steps for you
@@ -311,7 +312,7 @@ Workers communicate through the notification system:
 - **`notify`** — status updates, completion alerts, issues found
 - **`ask_user`** — questions that need decisions (rendered as buttons in web UI and Telegram)
 
-Priority levels: `urgent`, `high`, `normal`, `low`. Quiet hours are optional and off for a worker by default (`quiet_start` and `quiet_end` empty in `<workspace>/config/settings.yaml`; see [Configuration → Quiet Hours](config.md#quiet-hours)). When set, they record the human's quiet window but gate nothing the agent sends; `notify` is not held back by them, so have the worker apply quiet hours itself for anything below `urgent` (see [Personal Best Practices → Notifications](personal-best-practices.md#notifications)).
+Priority levels: `urgent`, `high`, `normal`, `low`. Quiet hours are optional and off for a worker by default (`quiet_start` and `quiet_end` empty in `<workspace>/config/settings.yaml`; see [Configuration → Quiet Hours](config.md#quiet-hours)). When set, Nerve sends each notification below `urgent` without sound during them, but holds nothing back; `notify` still goes out, so have the worker apply quiet hours itself for anything below `urgent` (see [Personal Best Practices → Notifications](personal-best-practices.md#notifications)).
 
 ### Logs
 
@@ -329,7 +330,7 @@ Cron run history is stored in the `cron_logs` SQLite table and visible in the we
 | **Purpose** | Full-featured assistant for one human | Task-focused autonomous agent |
 | **Workspace files** | SOUL.md, IDENTITY.md, USER.md, MEMORY.md, AGENTS.md, TOOLS.md | SOUL.md, TASK.md, MEMORY.md, AGENTS.md, TOOLS.md |
 | **Memory categories** | Life-oriented (relationships, finances, health, travel) | Operational (patterns, procedures, decisions, approvals) |
-| **Default crons** | inbox-processor, task-planner, memory-maintenance | skill-extractor, skill-reviser, memory-maintenance (task-planner off until onboarding enables it) |
+| **Default crons** | inbox-processor, task-planner, machine-maintenance, memory-maintenance | skill-extractor, skill-reviser, machine-maintenance, memory-maintenance (task-planner off until onboarding enables it) |
 | **Quiet hours** | 02:00–08:00 | none |
 | **Sync sources** | Telegram, Gmail, GitHub | None by default (can add custom sources) |
 | **Channels** | Web UI + Telegram bot | Web UI (+ Telegram if configured) |

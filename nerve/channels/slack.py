@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from nerve.agent.engine import NotAcceptingTurnsError
 from nerve.channels.access import (
     Decision,
     Identity,
@@ -162,11 +163,12 @@ def is_slack_id(pattern: str) -> bool:
 
 
 def notification_target(config: NerveConfig) -> str | None:
-    """The conversation for notification cards, or ``None``.
+    """The conversation for notification cards in Socket Mode, or ``None``.
 
     That is ``notifications.slack_channel_id``, else the first literal
-    conversation ID in ``slack.allow_channels``. The hosted channel uses the
-    same choice.
+    conversation ID in ``slack.allow_channels``. In hosted mode the config
+    does not choose the conversation: the gateway posts each card in the
+    agent's notification channel, which an admin sets in the control plane.
     """
     configured = config.notifications.slack_channel_id.strip()
     if configured:
@@ -875,6 +877,12 @@ class SlackChannel(BaseChannel):
         )
         return identity
 
+    async def conversation_name(self, channel_id: str) -> str | None:
+        """The name of a channel (``conversations.info``, cached), or
+        ``None`` for a direct message or when Slack does not answer."""
+        identity = await self._identify_conversation(channel_id, "channel", True)
+        return identity.names[0] if identity.names else None
+
     async def _identify_conversation(
         self, channel_id: str, channel_type: str, resolve: bool,
     ) -> Identity:
@@ -1231,6 +1239,11 @@ class SlackChannel(BaseChannel):
         if images:
             metadata["images"] = images
         self._remember(self._last_inbound_ts, target, ts, _INBOUND_TS_MAX)
+        # The channel name for the origin of a new session. The lookup is
+        # cached, and a direct message has no name.
+        conversation = await self._identify_conversation(
+            channel_id, channel_type, True,
+        )
 
         msg = InboundMessage(
             channel_name="slack",
@@ -1238,10 +1251,14 @@ class SlackChannel(BaseChannel):
             sender_id=target,
             text=text,
             metadata=metadata,
+            conversation_title=next(iter(conversation.names), ""),
         )
 
         try:
             await self.router.handle_message(msg)
+        except NotAcceptingTurnsError:
+            # The stream adapter already sent the engine's error event.
+            logger.info("Draining: refused a message from %s", target)
         except Exception as e:
             logger.error("Agent error for %s: %s", target, e, exc_info=True)
             await self._post(target, f"Error: {e}")
@@ -1294,6 +1311,9 @@ class SlackChannel(BaseChannel):
         )
         try:
             await self.router.handle_message(msg)
+        except NotAcceptingTurnsError:
+            # The stream adapter already sent the engine's error event.
+            logger.info("Draining: refused a reaction from %s", target)
         except Exception as e:
             logger.error("Agent error for reaction in %s: %s", target, e, exc_info=True)
 
@@ -2162,12 +2182,16 @@ class SlackChannel(BaseChannel):
                 "Notification service not available.",
             )
             return
-        result = await self._notification_service.answer_latest_question(
-            answer,
-            channel="slack",
-            target=channel_id,
-            actor=user_id,
-        )
+        try:
+            result = await self._notification_service.answer_latest_question(
+                answer,
+                channel="slack",
+                target=channel_id,
+                actor=user_id,
+            )
+        except NotAcceptingTurnsError as exc:
+            await self._respond_ephemeral(channel_id, user_id, str(exc))
+            return
         await self._respond_ephemeral(
             channel_id,
             user_id,
@@ -2405,13 +2429,20 @@ class SlackChannel(BaseChannel):
         # would stop matching that record the moment somebody replied under
         # the card, and every later press would read as already answered.
         target = format_target((payload.get("channel") or {}).get("id") or "")
-        result = await self._notification_service.answer_delivered_notification(
-            notification_id,
-            answer,
-            channel="slack",
-            target=target,
-            actor=actor,
-        )
+        try:
+            result = await self._notification_service.answer_delivered_notification(
+                notification_id,
+                answer,
+                channel="slack",
+                target=target,
+                actor=actor,
+            )
+        except NotAcceptingTurnsError as exc:
+            # The question stays pending, so the card keeps its buttons.
+            await self._respond_ephemeral(
+                (payload.get("channel") or {}).get("id") or "", actor, str(exc),
+            )
+            return
         if not result:
             await self._replace_via_url(
                 response_url,

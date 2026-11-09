@@ -352,7 +352,7 @@ export function handleToolOutput(
 /** Settle a plan tab still streaming when the turn ends. Workflows settle on
  *  their own terminal workflow_progress, and the Agents / agent tabs follow
  *  the agent records, so neither ends with the turn. */
-function finalizeRunningPanels(get: Get): void {
+export function finalizeRunningPanels(get: Get): void {
   for (const panel of get().panels) {
     if (panel.type !== 'plan' || panel.status !== 'running') continue;
     get().updatePanelTab(panel.id, {
@@ -383,6 +383,7 @@ export function handleDone(
       cache_creation_1h_input_tokens: cc?.ephemeral_1h_input_tokens ?? 0,
       max_context_tokens: msg.max_context_tokens || 200_000,
       num_turns: msg.num_turns || 1,
+      context_tokens: msg.usage.context_tokens,
     };
   }
   // A turn that produced nothing but its "background" marker (e.g. the

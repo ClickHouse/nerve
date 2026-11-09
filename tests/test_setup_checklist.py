@@ -304,9 +304,9 @@ class TestDoneRules:
         s = step(facts(personal), "automation")
         assert s["status"] == "pending"
         assert s["detail"]["file_present"] is True
-        assert s["summary"] == "2 of 4 optional jobs on"
+        assert s["summary"] == "3 of 5 optional jobs on"
         ids = [o["id"] for o in s["detail"]["optional"]]
-        assert ids == ["inbox-processor", "task-planner", "skill-extractor", "skill-reviser"]
+        assert ids == ["inbox-processor", "task-planner", "skill-extractor", "skill-reviser", "machine-maintenance"]
         inbox = s["detail"]["optional"][0]
         assert inbox["requirement_met"] is False and inbox["schedule_text"] == "every 30 minutes"
         assert inbox["default"] is True and inbox["enabled"] is True
@@ -319,23 +319,25 @@ class TestDoneRules:
         detail says so per job, which is what the page's hint keys on."""
         s = step(facts(worker), "automation")
         optional = {o["id"]: o for o in s["detail"]["optional"]}
-        assert list(optional) == ["task-planner", "skill-extractor", "skill-reviser"]
+        assert list(optional) == ["task-planner", "skill-extractor", "skill-reviser", "machine-maintenance"]
         assert {i: (o["enabled"], o["default_enabled"]) for i, o in optional.items()} == {
             "task-planner": (False, False),
             "skill-extractor": (True, True),
             "skill-reviser": (True, True),
+            "machine-maintenance": (True, True),
         }
         assert all(o["default"] == o["default_enabled"] for o in optional.values()), "the older name stays"
         assert s["status"] == "pending", "the file matches the worker defaults"
-        assert s["summary"] == "2 of 3 optional jobs on"
+        assert s["summary"] == "3 of 4 optional jobs on"
         # Turning the planner on is a decision, as any other change is.
-        set_optional_crons(worker, {"task-planner", "skill-extractor", "skill-reviser"})
+        set_optional_crons(worker, {"task-planner", "skill-extractor", "skill-reviser", "machine-maintenance"})
         assert statuses(facts(worker))["automation"] == "done"
 
     def test_automation_personal_defaults_are_unchanged(self, personal):
         optional = {o["id"]: o["default_enabled"] for o in step(facts(personal), "automation")["detail"]["optional"]}
         assert optional == {
             "inbox-processor": True, "task-planner": True, "skill-extractor": False, "skill-reviser": False,
+            "machine-maintenance": True,
         }
 
     def test_quiet_hours_detail_follows_the_mode_default(self, tmp_path):

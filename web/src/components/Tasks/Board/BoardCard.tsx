@@ -4,7 +4,8 @@ import { CSS } from '@dnd-kit/utilities';
 import type { Task } from '../../../api/client';
 import { formatTimeAgo } from '../../../utils/dateGroups';
 import { Badge } from '../../ui';
-import { Calendar, Clock, ExternalLink, Hourglass } from '../../ui/icons';
+import { Calendar, Clock, ExternalLink, Hourglass, MessageSquare } from '../../ui/icons';
+import { CreatedInLink } from '../TaskSessions';
 
 /**
  * Deadline urgency, as a token class rather than a raw colour so it tracks
@@ -121,7 +122,17 @@ function BoardCardInner({ task, statusSince, onOpen }: BoardCardProps) {
             <Hourglass size={10} /> {age.days}d
           </span>
         )}
-        {task.source && task.source !== 'manual' && (
+        {!!task.comment_count && (
+          <span
+            className="flex items-center gap-1 text-text-faint"
+            title={task.comment_count === 1 ? '1 comment' : `${task.comment_count} comments`}
+          >
+            <MessageSquare size={10} aria-hidden="true" /> {task.comment_count}
+          </span>
+        )}
+        {task.created_session_title != null ? (
+          <CreatedInLink task={task} className="max-w-full" />
+        ) : task.source && task.source !== 'manual' && (
           <span className="text-text-faint">{task.source}</span>
         )}
         {task.source_url && (

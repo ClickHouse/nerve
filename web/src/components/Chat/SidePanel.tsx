@@ -14,6 +14,7 @@ import {
 import { SelectionToolbar } from './SelectionToolbar';
 import { BlockRenderer } from './BlockRenderer';
 import { FileChangesPanel } from './FileChangesPanel';
+import { SessionTasksPanel } from './SessionTasksPanel';
 import { WorkflowPanel } from './WorkflowPanel';
 import { AgentsPanel } from './agents/AgentsPanel';
 import { AgentTranscript } from './agents/AgentTranscript';
@@ -307,6 +308,8 @@ function PanelBody({ tab, containerRef }: { tab: PanelTab; containerRef: React.R
   switch (tab.type) {
     case 'files':
       return <FileChangesPanel />;
+    case 'tasks':
+      return <SessionTasksPanel />;
     case 'workflow':
       return <WorkflowPanel tab={tab} />;
     case 'agents':

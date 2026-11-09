@@ -350,6 +350,8 @@ class RecordingRouter:
     would end up doing.
     """
 
+    accepting_turns = True
+
     def __init__(self, reply_text: str | None = None):
         self.messages: list[Any] = []
         self.observed: list[Any] = []
@@ -385,6 +387,10 @@ class RecordingRouter:
 
     async def get_last_session(self, channel_key: str) -> str | None:
         return self._sessions.get(channel_key)
+
+    async def actor_for_principal(self, _principal_id: Any, display_name: str | None = None) -> None:
+        """No person, as in local mode."""
+        return None
 
     # The registry half of ChannelRouter, which SlackRuntime uses: it
     # refuses to start while a channel is already registered, and hands

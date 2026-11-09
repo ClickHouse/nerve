@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { Bell, X, CheckCheck, EyeOff, Check, XCircle, Moon, BellOff, Trash2, Plus, RotateCw, Clock } from '../components/ui/icons';
-import { Badge, Button, IconButton, TextField, type BadgeTone, type ButtonVariant } from '../components/ui';
+import { useNavigate, useSearchParams } from 'react-router-dom';
+import { Bell, CheckCheck, EyeOff, BellOff, Trash2, Plus, RotateCw, Clock } from '../components/ui/icons';
+import { Badge, Button, IconButton, TextField, type BadgeTone } from '../components/ui';
 import { useNotificationStore, type Notification, type Silence } from '../stores/notificationStore';
 import { PageHeader } from '../components/ui/PageHeader';
 import { ActorAttribution } from '../components/Chat/ActorLabel';
 import { NotificationBody, NotificationLinks } from '../components/Notifications/NotificationParts';
+import { NotificationOptions } from '../components/Notifications/NotificationOptions';
+import { BrowserAlertsLink } from '../components/Notifications/BrowserAlertOffer';
 
 /** Lifecycle state — a status, so it takes a `Badge` tone. */
 const STATUS_TONES: Record<string, BadgeTone> = {
@@ -49,54 +51,6 @@ const TYPE_FILTERS = [
   { label: 'Approvals', value: 'approval' },
 ];
 
-// Approval-kind button styling. Keyed by the option ``value`` the
-// dispatcher receives, not the human label, so the styling stays
-// stable even when labels are renamed.
-const APPROVAL_BUTTON_VARIANTS: Record<string, ButtonVariant> = {
-  approve: 'success',
-  decline: 'danger',
-  snooze_24h: 'secondary',
-};
-
-const APPROVAL_BUTTON_ICONS: Record<string, typeof Check> = {
-  approve: Check,
-  decline: XCircle,
-  snooze_24h: Moon,
-};
-
-const APPROVAL_DEFAULT_LABELS: Record<string, string> = {
-  approve: 'Approve',
-  decline: 'Decline',
-  snooze_24h: 'Snooze 24h',
-};
-
-function approvalLabel(value: string, labels: Record<string, string> | null | undefined): string {
-  if (labels && labels[value]) return labels[value];
-  if (APPROVAL_DEFAULT_LABELS[value]) return APPROVAL_DEFAULT_LABELS[value];
-  // Fall back to value with underscores replaced and title cased.
-  return value
-    .split('_')
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(' ');
-}
-
-function parseOptionLabels(notif: Notification): Record<string, string> | null {
-  if (notif.option_labels) return notif.option_labels;
-  if (!notif.metadata) return null;
-  try {
-    const meta = typeof notif.metadata === 'string' ? JSON.parse(notif.metadata) : notif.metadata;
-    if (meta && typeof meta === 'object' && 'option_labels' in meta) {
-      const labels = (meta as Record<string, unknown>).option_labels;
-      if (labels && typeof labels === 'object') {
-        return labels as Record<string, string>;
-      }
-    }
-  } catch {
-    // Malformed JSON: just fall back to defaults.
-  }
-  return null;
-}
-
 interface SilenceInfo {
   silenced_by?: string;
   silence_reason?: string;
@@ -130,73 +84,14 @@ function formatLocalTime(iso: string): string {
   });
 }
 
-function FreeTextInput({ onSubmit }: { onSubmit: (text: string) => void }) {
-  const [text, setText] = useState('');
-  const [open, setOpen] = useState(false);
-
-  if (!open) {
-    return (
-      <Button
-        variant="ghost"
-        size="md"
-        onClick={() => setOpen(true)}
-        className="border border-dashed border-border rounded-lg hover:border-border-subtle"
-      >
-        Custom answer...
-      </Button>
-    );
-  }
-
-  return (
-    <div className="flex items-center gap-2 w-full mt-1">
-      <TextField
-        autoFocus
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === 'Enter' && text.trim()) {
-            onSubmit(text.trim());
-            setText('');
-            setOpen(false);
-          }
-          if (e.key === 'Escape') setOpen(false);
-        }}
-        fullWidth={false}
-        className="flex-1"
-        placeholder="Type your answer..."
-      />
-      <Button
-        variant="accentSoft"
-        size="md"
-        onClick={() => {
-          if (text.trim()) {
-            onSubmit(text.trim());
-            setText('');
-            setOpen(false);
-          }
-        }}
-      >
-        Send
-      </Button>
-      <IconButton size="xs" label="Cancel" onClick={() => { setText(''); setOpen(false); }}>
-        <X size={14} />
-      </IconButton>
-    </div>
-  );
-}
-
 function NotificationCard({ notif }: { notif: Notification }) {
   const navigate = useNavigate();
-  const { answerNotification, dismissNotification } = useNotificationStore();
+  const dismissNotification = useNotificationStore(s => s.dismissNotification);
   const priorityDot = PRIORITY_DOTS[notif.priority];
-  const options = notif.options ? (typeof notif.options === 'string' ? JSON.parse(notif.options) : notif.options) : null;
   const isApproval = notif.type === 'approval';
-  const optionLabels = isApproval ? parseOptionLabels(notif) : null;
 
   return (
-    <div className={`p-4 bg-surface border rounded-lg transition-colors ${
-      notif.status === 'pending' ? 'border-border-subtle' : 'border-border-subtle'
-    }`}>
+    <div className="p-4 bg-surface border border-border-subtle rounded-lg transition-colors">
       {/* The badge column is shrink-0, so beside the text it costs a fixed
           ~127px — over a third of the card on a phone, which left the body
           wrapping at ~190px. Below `sm` the badges take a row of their own
@@ -261,48 +156,8 @@ function NotificationCard({ notif }: { notif: Notification }) {
         )}
       </div>
 
-      {/* Answer UI for pending questions */}
-      {notif.type === 'question' && notif.status === 'pending' && (
-        <div className="mt-3 flex flex-wrap gap-2">
-          {options?.map((opt: string) => (
-            <Button
-              key={opt}
-              variant="accentSoft"
-              size="md"
-              onClick={() => answerNotification(notif.id, opt)}
-            >
-              {opt}
-            </Button>
-          ))}
-          <FreeTextInput onSubmit={(text) => answerNotification(notif.id, text)} />
-        </div>
-      )}
-
-      {/* Action UI for pending approvals */}
-      {isApproval && notif.status === 'pending' && (
-        <div className="mt-3 flex flex-wrap gap-2">
-          {options?.map((value: string) => {
-            const Icon = APPROVAL_BUTTON_ICONS[value];
-            // `accentSoft` for anything outside approve/decline/snooze_24h, so
-            // an unrecognised option still reads as the same kind of control as
-            // the `success`/`danger` siblings beside it.
-            const variant = APPROVAL_BUTTON_VARIANTS[value] || 'accentSoft';
-            const label = approvalLabel(value, optionLabels);
-            return (
-              <Button
-                key={value}
-                variant={variant}
-                size="md"
-                className="gap-1.5"
-                onClick={() => answerNotification(notif.id, value)}
-              >
-                {Icon ? <Icon size={14} /> : null}
-                <span>{label}</span>
-              </Button>
-            );
-          })}
-        </div>
-      )}
+      {/* The options while it waits, then the answer */}
+      <NotificationOptions notif={notif} />
 
       {/* Snoozed: still pending server-side, will be re-delivered */}
       {notif.status === 'pending' && notif.redeliver_at && (
@@ -321,26 +176,6 @@ function NotificationCard({ notif }: { notif: Notification }) {
             causeId={null}
             verb="Snoozed by"
           />
-        </div>
-      )}
-
-      {/* Show answer if answered. The person is known for a web answer; a
-          chat-channel answer names only its transport. */}
-      {notif.status === 'answered' && (
-        <div className="mt-2 text-sm text-success">
-          Answer: {isApproval ? approvalLabel(notif.answer || '', optionLabels) : notif.answer}{' '}
-          <span className="text-text-faint">
-            ({notif.answered_by_actor_id && (
-              <>
-                by{' '}
-                <ActorAttribution
-                  actorId={notif.answered_by_actor_id}
-                  causeId={null}
-                  verb="Answered by"
-                />{' '}
-              </>
-            )}via {notif.answered_by})
-          </span>
         </div>
       )}
 
@@ -500,7 +335,9 @@ export function NotificationsPage() {
     notifications, pendingCount, filter, typeFilter, loading,
     loadNotifications, setFilter, setTypeFilter, dismissAll,
   } = useNotificationStore();
-  const [showSilences, setShowSilences] = useState(false);
+  // Settings links here with `?silences=1` to open the silences manager.
+  const [searchParams] = useSearchParams();
+  const [showSilences, setShowSilences] = useState(() => searchParams.has('silences'));
 
   useEffect(() => { loadNotifications(); }, []);
 
@@ -552,6 +389,7 @@ export function NotificationsPage() {
       />
 
       <div className="flex-1 overflow-y-auto p-4 md:p-6">
+        <BrowserAlertsLink />
         {showSilences && <SilencesPanel />}
         {loading ? (
           <div className="text-text-faint text-center py-10">Loading...</div>

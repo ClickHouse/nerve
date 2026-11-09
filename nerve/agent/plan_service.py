@@ -8,6 +8,8 @@ here once and each surface is a thin adapter:
 
 - ``approve_plan`` — mark implementing, spawn an implementation session,
   flip the task to in_progress, and dispatch the build prompt.
+- ``record_plan_approval`` - mark implementing for a plan that the user
+  approved in the chat of the session that does the work; no new session.
 - ``decline_plan`` — mark declined and close the task as done.
 - ``request_plan_revision`` — persist feedback and dispatch a
   ``plan_update`` prompt to the original proposer session (not
@@ -26,6 +28,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, NoReturn
 
 from nerve.identity import attribution_for
+from nerve.session_origin import plan_origin
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -54,8 +57,9 @@ _REVISION_PROMPT_TEMPLATE = (
     'Revise plan {plan_id} for task "{task_title}" based on this feedback:\n\n'
     "{feedback}\n\n"
     "Explore the codebase again if needed, then call "
-    'plan_update(plan_id="{plan_id}", content="...", feedback="<short summary>") '
-    "with the revised plan."
+    'plan_update(plan_id="{plan_id}", content="...", summary="...", '
+    'feedback="<what changed>") with the revised plan and a summary of it '
+    "in up to 3 short lines for the reviewer."
 )
 
 
@@ -154,6 +158,8 @@ async def request_plan_revision(
         PlanNotFound: No plan with that ID.
         TaskNotFound: The plan's task no longer exists.
         PlanNotPending: The plan is declined/superseded/implementing/etc.
+        NotAcceptingTurnsError: The engine is draining, so the planner turn
+            would be refused. Nothing is stored.
 
     Behavior contract:
         - Stores ``feedback`` on the plan, and ``actor`` + ``cause`` as its
@@ -164,7 +170,7 @@ async def request_plan_revision(
           (``plan.session_id``), falling back to ``cron:task-planner``
           if the proposer is unknown/deleted.
         - The planner is instructed to call
-          ``plan_update(plan_id=..., content=..., feedback=<summary>)``
+          ``plan_update(plan_id=..., content=..., summary=..., feedback=...)``
           so version history stays linked.
     """
     # Import here to avoid a circular import: tool handlers import
@@ -191,6 +197,8 @@ async def request_plan_revision(
     task = await db.get_task(plan["task_id"])
     if not task:
         raise TaskNotFound(f"Task not found for plan {plan_id}: {plan['task_id']}")
+
+    _require_accepting_turns(engine)
 
     # 1. Store feedback on the plan (status stays pending until planner
     #    supersedes it via plan_update). The request is a review decision,
@@ -241,6 +249,7 @@ async def request_plan_revision(
     await engine.sessions.get_or_create(
         session_id, title=session_title, source="cron",
         actor=engine.db.system_actor, cause=cause,
+        origin=plan_origin(plan_id, plan["task_id"]),
     )
     asyncio.create_task(
         engine.run(
@@ -262,6 +271,18 @@ async def request_plan_revision(
         "session_id": session_id,
         "status": "revision_requested",
     }
+
+
+def _require_accepting_turns(engine: "AgentEngine") -> None:
+    """Raise ``NotAcceptingTurnsError`` while the engine drains.
+
+    Call it before a decision is stored: the turn that acts on the decision
+    would be refused, and the decision would be lost.
+    """
+    if not engine.accepting_turns:
+        from nerve.agent.engine import NotAcceptingTurnsError
+
+        raise NotAcceptingTurnsError()
 
 
 async def _raise_not_pending(db: "Database", plan_id: str, verb: str) -> NoReturn:
@@ -293,6 +314,22 @@ async def _revert_plan(
         )
     except Exception:
         logger.exception("Failed to restore plan %s after an error", plan_id)
+
+
+async def _mark_failed(db: "Database", plan: dict) -> None:
+    """Mark an implementing plan ``failed`` and push its task row.
+
+    Only from ``implementing``: a plan that ``task_done`` marked done in the
+    same turn stays done. The task event is the broadcast that an open plan
+    page follows, as for the other plan status writes.
+    """
+    from nerve.agent.streaming import emit_task_event
+
+    try:
+        if await db.compare_and_update_plan(plan["id"], expect_status="implementing", status="failed"):
+            await emit_task_event(await db.get_task(plan["task_id"]), "updated")
+    except Exception:
+        logger.exception("Failed to mark plan %s as failed", plan["id"])
 
 
 async def approve_plan(
@@ -331,6 +368,8 @@ async def approve_plan(
         PlanNotPending: The plan is not ``pending``, including when a
             concurrent approve or decline got to it first.
         TaskNotFound: The plan's task no longer exists.
+        NotAcceptingTurnsError: The engine is draining, so the
+            implementation turn would be refused. The plan stays pending.
 
     Behavior contract:
         - Claims the plan with one atomic ``pending`` → ``implementing``
@@ -362,6 +401,8 @@ async def approve_plan(
     if not task:
         raise TaskNotFound(f"Task not found for plan {plan_id}: {plan['task_id']}")
 
+    _require_accepting_turns(engine)
+
     now = datetime.now(timezone.utc).isoformat()
     plan_type = plan.get("plan_type", "generic")
     impl_session_id = f"impl-{str(uuid.uuid4())[:8]}"
@@ -385,6 +426,7 @@ async def approve_plan(
         await engine.sessions.get_or_create(
             impl_session_id, title=f"Implement: {task['title']}", source="web",
             actor=actor, cause=cause,
+            origin=plan_origin(plan_id, plan["task_id"]),
         )
         await task_update_handler(task_ctx, {
             "task_id": plan["task_id"],
@@ -420,21 +462,37 @@ async def approve_plan(
     )
 
     async def _run_impl():
+        from nerve.agent.engine import NotAcceptingTurnsError
+
         try:
-            await engine.run(
-                session_id=impl_session_id, user_message=prompt, source="web",
-                # Nerve assembles the prompt from the task file and the
-                # approved plan, so the turn is the instance's own work even
-                # though an approval started it. The session carries who
-                # approved.
-                actor=db.system_actor,
+            # ``run`` returns normally for a failed turn too; the watch has
+            # the turn's outcome.
+            with engine.watch_turns(impl_session_id) as turn:
+                await engine.run(
+                    session_id=impl_session_id, user_message=prompt, source="web",
+                    # Nerve assembles the prompt from the task file and the
+                    # approved plan, so the turn is the instance's own work
+                    # even though an approval started it. The session
+                    # carries who approved.
+                    actor=db.system_actor,
+                )
+        except NotAcceptingTurnsError:
+            # A drain started after the check above. The implementation did
+            # not start, so the plan can be approved again after the restart.
+            logger.info("Plan %s: implementation refused, Nerve is draining", plan_id)
+            await _revert_plan(
+                db, plan, "implementing",
+                impl_session_id=plan.get("impl_session_id"),
             )
         except Exception:
             logger.exception("Implementation session %s failed", impl_session_id)
-            try:
-                await db.update_plan(plan_id, status="failed")
-            except Exception:
-                logger.exception("Failed to mark plan %s as failed", plan_id)
+            await _mark_failed(db, plan)
+        else:
+            if turn.outcome is not None and turn.outcome.status == "failed":
+                logger.warning(
+                    "Plan %s: implementation turn failed: %s", plan_id, turn.outcome.error,
+                )
+                await _mark_failed(db, plan)
 
     impl_task = asyncio.create_task(_run_impl())
     # Register with the engine so a manual /stop can cancel a stuck impl
@@ -452,6 +510,118 @@ async def approve_plan(
         "plan_id": plan_id,
         "task_id": plan["task_id"],
         "impl_session_id": impl_session_id,
+    }
+
+
+async def record_plan_approval(
+    db: "Database",
+    engine: "AgentEngine | None",
+    plan_id: str,
+    *,
+    session_id: str,
+    actor: "ActorOrId | None",
+    cause: "ActorOrId | None",
+) -> dict:
+    """Record the approval of a pending plan that a session implements itself.
+
+    For a plan that the user approved in the chat of the session that does
+    the work. ``approve_plan`` would start a second session for the same
+    work. Without a record, the plan stays ``pending``: it waits on the
+    Plans page and keeps its session in the sidebar's "Needs you" group.
+
+    Args:
+        db: Database instance.
+        engine: AgentEngine, only for the task-handler context.
+        plan_id: The pending plan.
+        session_id: The calling session. It becomes the plan's
+            ``impl_session_id``, so the task lists it as the session that
+            implemented the plan.
+        actor: Who records the approval (see ``approve_plan``).
+        cause: On whose behalf (see ``approve_plan``).
+
+    Returns:
+        ``{"plan_id", "task_id", "impl_session_id", "status",
+        "task_started"}``. ``status`` is the new plan status;
+        ``task_started`` is true when the task went from ``plan_review``
+        to ``in_progress``.
+
+    Raises:
+        PlanNotFound: No plan with that ID.
+        PlanNotPending: The plan is not ``pending``, including when a
+            concurrent decision got to it first.
+        TaskNotFound: The plan's task no longer exists.
+
+    Behavior contract:
+        - The plan goes ``pending`` → ``implementing`` in one atomic
+          transition, or → ``done`` when the task is already done
+          (``task_done`` marks only an ``implementing`` plan done).
+        - No session starts and no turn runs.
+        - A task in ``plan_review`` goes to ``in_progress``, as for
+          ``approve_plan``: no plan waits for a decision now. Any other task
+          status does not change, because the session sets it as the work
+          goes on. The task gets a note with links to the plan and the
+          session, and its pending plan notifications are dismissed.
+    """
+    from dataclasses import replace
+    from nerve.agent.tools import _legacy_ctx
+    from nerve.agent.tools.handlers.tasks import task_update_handler
+    from nerve.db.task_statuses import PLAN_REVIEW_STATUS, TERMINAL_STATUS
+
+    plan = await db.get_plan(plan_id)
+    if not plan:
+        raise PlanNotFound(f"Plan not found: {plan_id}")
+
+    if plan["status"] != "pending":
+        await _raise_not_pending(db, plan_id, "approved")
+
+    task = await db.get_task(plan["task_id"])
+    if not task:
+        raise TaskNotFound(f"Task not found for plan {plan_id}: {plan['task_id']}")
+
+    status = "done" if task.get("status") == TERMINAL_STATUS else "implementing"
+    if not await db.compare_and_update_plan(
+        plan_id, expect_status="pending",
+        status=status, reviewed_at=datetime.now(timezone.utc).isoformat(),
+        impl_session_id=session_id,
+        attribution=attribution_for(actor, cause),
+    ):
+        await _raise_not_pending(db, plan_id, "approved")
+
+    task_ctx = replace(
+        _legacy_ctx(session_id), db=db, engine=engine,
+        actor=actor, cause=cause,
+    )
+    update = {
+        "task_id": plan["task_id"],
+        "note": (
+            f"Plan {plan_link(plan_id)} approved in the chat of session "
+            f"{session_link(session_id)}, which does the work."
+        ),
+    }
+    if task.get("status") == PLAN_REVIEW_STATUS:
+        update["status"] = "in_progress"
+    try:
+        await task_update_handler(task_ctx, update)
+    except Exception:
+        await _revert_plan(
+            db, plan, status, impl_session_id=plan.get("impl_session_id"),
+        )
+        raise
+    await db.dismiss_plan_notifications(
+        plan["task_id"], attribution=attribution_for(actor, cause),
+    )
+
+    logger.info(
+        "Plan approval recorded: plan=%s task=%s session=%s status=%s",
+        plan_id, plan["task_id"], session_id, status,
+    )
+
+    return {
+        "plan_id": plan_id,
+        "task_id": plan["task_id"],
+        "impl_session_id": session_id,
+        "status": status,
+        "task_started": "status" in update,
     }
 
 

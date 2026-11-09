@@ -44,6 +44,9 @@ from nerve.sources.runner import _MAX_PASSES, SourceRunner
 
 pytestmark = pytest.mark.asyncio
 
+# A tenant person that a channel gateway linked to a sender.
+PERSON_ID = "40306775-652f-4543-b432-4cb8ec5250c3"
+
 
 # ---------------------------------------------------------------------- #
 #  Helpers                                                                #
@@ -63,6 +66,7 @@ def _policy(**kwargs) -> ObservationPolicy:
             allow=kwargs.pop("allow_senders", []),
             deny=kwargs.pop("deny_senders", []),
         ),
+        gateway_grant=kwargs.pop("gateway_grant", False),
     )
 
 
@@ -168,6 +172,36 @@ class TestObservationPolicy:
         assert _policy().active
         assert not _policy(enabled=False).active
         assert not _policy(allow_conversations=[]).active
+
+    def test_the_gateway_grant_replaces_an_empty_allow_list(self):
+        # A hosted gateway sends only the conversations that the agent's
+        # channel policy observes: that policy is the written grant.
+        policy = _policy(allow_conversations=[], gateway_grant=True)
+
+        assert policy.active
+        assert policy.check(Identity(id="C0999ZZZZ"), Identity(id="U1")).allowed
+
+    def test_the_gateway_grant_does_not_open_a_disabled_source(self):
+        policy = _policy(enabled=False, allow_conversations=[], gateway_grant=True)
+
+        assert not policy.active
+        assert "not enabled" in policy.check(Identity(id="C0123ABCD"), Identity(id="U1")).reason
+
+    def test_with_the_gateway_grant_the_deny_lists_still_refuse(self):
+        policy = _policy(
+            allow_conversations=[], gateway_grant=True,
+            deny_conversations=["C0999ZZZZ"], deny_senders=["U0BOT"],
+        )
+
+        assert not policy.check(Identity(id="C0999ZZZZ"), Identity(id="U1")).allowed
+        assert not policy.check(Identity(id="C0123ABCD"), Identity(id="U0BOT")).allowed
+        assert policy.check(Identity(id="C0123ABCD"), Identity(id="U1")).allowed
+
+    def test_with_the_gateway_grant_an_allow_list_still_narrows(self):
+        policy = _policy(allow_conversations=["C0123ABCD"], gateway_grant=True)
+
+        assert policy.check(Identity(id="C0123ABCD"), Identity(id="U1")).allowed
+        assert not policy.check(Identity(id="C0999ZZZZ"), Identity(id="U1")).allowed
 
     def test_observation_is_not_the_access_policy(self):
         # Observing a room the agent takes no orders from is the point.
@@ -1011,6 +1045,60 @@ class TestChannelSource:
         assert record.content == "ship it"
         assert record.metadata["thread_ts"] == "1699999999.000000"
         assert record.metadata["conversation_id"] == "C0123ABCD"
+        assert "principal_id" not in record.metadata
+        assert "principal_name" not in record.metadata
+
+    @pytest.mark.parametrize(("sender_name", "principal_name", "summary", "metadata"), [
+        ("alice", "Alice Liddell", "[general] alice (Alice Liddell): ship it",
+         {"principal_id": PERSON_ID, "principal_name": "Alice Liddell"}),
+        ("", "Alice Liddell", "[general] U0456DEFG (Alice Liddell): ship it",
+         {"principal_id": PERSON_ID, "principal_name": "Alice Liddell"}),
+        ("alice", "", "[general] alice: ship it", {"principal_id": PERSON_ID}),
+        ("Alice Liddell", "Alice Liddell", "[general] Alice Liddell: ship it",
+         {"principal_id": PERSON_ID, "principal_name": "Alice Liddell"}),
+    ], ids=["both_names", "no_sender_name", "no_person_name", "same_name"])
+    async def test_a_linked_person_is_shown_after_the_sender(
+        self, db, sender_name, principal_name, summary, metadata,
+    ):
+        await db.insert_channel_observation("slack", "slack:C0123ABCD", {
+            "conversation_id": "C0123ABCD",
+            "conversation_title": "general",
+            "sender_id": "U0456DEFG",
+            "sender_name": sender_name,
+            "principal_id": PERSON_ID,
+            "principal_name": principal_name,
+            "text": "ship it",
+            "message_id": "1700000000.000100",
+        })
+
+        (record,) = (await ChannelSource("slack", db).fetch(None)).records
+
+        assert record.summary == summary
+        assert {key: record.metadata[key] for key in metadata} == metadata
+        assert set(metadata) == {"principal_id", "principal_name"} & set(record.metadata)
+        assert (record.metadata["sender_id"], record.metadata["sender_name"]) == ("U0456DEFG", sender_name)
+
+    async def test_the_drain_sender_rule_does_not_match_the_person(self, db):
+        cfg = NerveConfig()
+        cfg.slack.source = ChannelSourceConfig(
+            enabled=True, allow_conversations=["C1"],
+            deny_senders=[PERSON_ID, "Alice*", "U_DENIED"],
+        )
+        (runner,) = [
+            r for r in build_source_runners(cfg, db) if r.source.source_name == "slack:observed"
+        ]
+        for sender_id, message_id in (("U0456DEFG", "1"), ("U_DENIED", "2")):
+            await db.insert_channel_observation("slack", "k", {
+                "conversation_id": "C1", "sender_id": sender_id, "sender_name": "alice",
+                "principal_id": PERSON_ID, "principal_name": "Alice Liddell",
+                "text": "hi", "message_id": message_id,
+            })
+
+        result = await runner.run()
+
+        assert result.records_ingested == 1
+        assert await db.get_source_message("slack:observed", "C1:1") is not None
+        assert await db.get_source_message("slack:observed", "C1:2") is None
 
     async def test_the_cursor_is_the_buffer_id(self, db):
         last = 0

@@ -241,9 +241,9 @@ Implementation: `nerve/memory/xmemory_bridge.py` (`XmemoryBridge`), wired into `
 
 ## API
 
-- `GET /api/memory/files` — List workspace markdown files
-- `GET /api/memory/file/{path}` — Read a file
-- `PUT /api/memory/file/{path}` — Write a file
+- `GET /api/memory/files`: List the memory files: markdown at the workspace root and under `memory/`
+- `GET /api/memory/file/{path}`: Read a memory file (403 for any other path)
+- `PUT /api/memory/file/{path}`: Write a memory file (403 for any other path)
 - `GET /api/memory/memu` — Get memU categories, items, and resources for the UI (with the Loom backend: `available: false`, `backend: "loom"` and `dashboard_url`)
 - `POST /api/memory/memu/categories` — Create a new category
 - `PATCH /api/memory/memu/categories/{id}` — Update a category (summary, description; re-embeds)

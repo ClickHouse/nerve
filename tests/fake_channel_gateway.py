@@ -6,8 +6,10 @@ to a Nerve endpoint, negotiates, advertises capabilities, and serves inbox
 pages from an in-memory inbox while it records every read and
 acknowledgement. Switches on the gateway simulate lost frames and outages.
 It records every operation and answers it with the next scripted reply for
-its kind, or with success. It serves ``file_read`` from ``files``, and it
-answers a ``file_send`` after the final chunk and keeps it in ``uploads``.
+its kind, or with success. A ``notify`` posts in
+``notification_conversation``, and without one it is ``forbidden``. It
+serves ``file_read`` from ``files``, and it answers a ``file_send`` after the
+final chunk and keeps it in ``uploads``.
 It keeps every ``subscriptions`` payload that Nerve sends, in arrival order,
 in ``subscriptions``, and ``source_record_event`` builds the records of a
 hosted GitHub source.
@@ -43,6 +45,8 @@ CONNECTION_ID = "3d9a4f2e-1c7b-4a85-9e60-2f8b7c1d5a43"
 # The connection of the agent's hosted GitHub source records.
 GITHUB_CONNECTION_ID = "7b9e8d6c-5a0f-4e24-93a4-6c2f1a5b9e87"
 AGENT_AUTHOR = "U_FIXTURE_AGENT"
+# The conversation where a notify posts, as the control plane sets it.
+NOTIFICATION_CONVERSATION = "C0NOTICES"
 ISSUER = "nerve-gateway"
 AUDIENCE = "nerve-channel"
 # An upper bound for waits. A loaded machine can be slow; a passing run is not.
@@ -318,6 +322,9 @@ class FakeChannelGateway:
         # Every subscriptions payload Nerve sent, on any stream, in arrival order.
         self.subscriptions: list[dict[str, Any]] = []
         self.subscriptions_changed = asyncio.Event()
+        # The agent's notification conversation, which the control plane
+        # sets. Without one, a notify is refused as the gateway refuses it.
+        self.notification_conversation = NOTIFICATION_CONVERSATION
 
     # ------------------------------------------------------------------ #
     #  Tokens and keys                                                     #
@@ -421,6 +428,12 @@ class FakeChannelGateway:
         """Queue replies for the next operations of *kind*."""
         self.operation_replies.setdefault(kind, []).extend(replies)
 
+    def _default_reply(self, kind: str) -> dict[str, Any]:
+        """Success, except for a notify while the agent has no notification conversation."""
+        if kind == "notify" and not self.notification_conversation:
+            return {"outcome": "forbidden", "reason_code": "invalid_target"}
+        return {"outcome": "succeeded"}
+
     def sent_operations(self, kind: str) -> list[dict[str, Any]]:
         """The payloads of the operations of *kind*, in arrival order."""
         return [record["operation"][kind] for record in self.operations if record["kind"] == kind]
@@ -446,7 +459,7 @@ class FakeChannelGateway:
         })
         self.operation_changed.set()
         replies = self.operation_replies.get(kind)
-        reply = replies.pop(0) if replies else {"outcome": "succeeded"}
+        reply = replies.pop(0) if replies else self._default_reply(kind)
         if reply == "hold":
             stream.held.append(frame)
             return
@@ -462,6 +475,8 @@ class FakeChannelGateway:
         body = {"kind": kind, **reply}
         if body["outcome"] == "succeeded" and kind == "send" and "target" not in body:
             body["target"] = self.new_target(operation["send"]["destination"])
+        if body["outcome"] == "succeeded" and kind == "notify" and "target" not in body:
+            body["target"] = self.new_target({"conversation": {"id": self.notification_conversation}})
         if body["outcome"] == "succeeded" and kind == "file_read":
             read = operation["file_read"]
             if data is None:

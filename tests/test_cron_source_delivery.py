@@ -22,6 +22,7 @@ from nerve.cron.service import CronService
 from nerve.identity import attribution_for
 from nerve.sources.github import GitHubSource
 from nerve.sources.github_hosted import HostedGitHubSource
+from nerve.sources.github_repos import GitHubReposSource
 from nerve.sources.models import IngestResult
 from tests.actor_rows import FAKE_SYSTEM_ACTOR, mock_system_principal
 
@@ -446,8 +447,11 @@ class TestJobs:
 
 
 async def test_source_reloads_keep_the_github_mode_the_service_started_with():
+    """The repository watch keeps it too: GitHub is hosted as a whole."""
     config = NerveConfig()
     config.sync.github.mode = "hosted"
+    config.sync.github_repos.enabled = True
+    config.sync.github_repos.repos = ["acme/widgets"]
     service = CronService(config, AsyncMock(), MagicMock())
     service.scheduler.start(paused=True)
     try:
@@ -458,12 +462,17 @@ async def test_source_reloads_keep_the_github_mode_the_service_started_with():
 
         (runner,) = [r for r in service._source_runners if r.job_id == "source:github"]
         assert isinstance(runner.source, HostedGitHubSource)
+        (watch,) = [r for r in service._source_runners if r.job_id == "source:github_repos"]
+        assert isinstance(watch.source, HostedGitHubSource)
+        assert watch.source.source_name == "github_repos"
     finally:
         await service.stop()
 
 
 async def test_a_service_started_in_poll_mode_keeps_polling():
     config = NerveConfig()
+    config.sync.github_repos.enabled = True
+    config.sync.github_repos.repos = ["acme/widgets"]
     service = CronService(config, AsyncMock(), MagicMock())
     service.scheduler.start(paused=True)
     try:
@@ -473,5 +482,7 @@ async def test_a_service_started_in_poll_mode_keeps_polling():
 
         (runner,) = [r for r in service._source_runners if r.job_id == "source:github"]
         assert isinstance(runner.source, GitHubSource)
+        (watch,) = [r for r in service._source_runners if r.job_id == "source:github_repos"]
+        assert isinstance(watch.source, GitHubReposSource)
     finally:
         await service.stop()

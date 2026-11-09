@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { useShallow } from 'zustand/react/shallow';
-import { useChatStore } from '../stores/chatStore';
+import { TASKS_PANEL_ID, useChatStore } from '../stores/chatStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
 import { MessageList } from '../components/Chat/MessageList';
 import { ChatInput } from '../components/Chat/ChatInput';
@@ -17,15 +17,17 @@ import { StopAllDialog } from '../components/Chat/agents/StopAllDialog';
 import { StopEscalationBanner } from '../components/Chat/agents/StopEscalationBanner';
 import { ReviewLoopCard } from '../components/Chat/ReviewLoopCard';
 import { SessionCreator } from '../components/Chat/ActorLabel';
-import { Loader2, Files, ExternalLink, GitBranch } from '../components/ui/icons';
+import { Loader2, Files, ExternalLink, GitBranch, ListChecks } from '../components/ui/icons';
 import { Button, PaneToggle } from '../components/ui';
 import { api } from '../api/client';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useIsMobile } from '../hooks/useMediaQuery';
-import type { ShortcutDef } from '../utils/keyboard';
+import { useFetchedSession } from '../hooks/useFetchedSession';
+import { FOCUS_COMPOSER_COMBO, type ShortcutDef } from '../utils/keyboard';
 import { copyToClipboard } from '../utils/clipboard';
 import { forkChat } from '../utils/forkChat';
 import { findSessionById } from '../utils/findSession';
+import { modelLabel } from '../utils/modelNames';
 import { langfuseSessionUrl, type LangfuseLinkStatus } from '../utils/langfuseLinks';
 import type { ChatMessage, TextBlockData } from '../types/chat';
 
@@ -33,17 +35,6 @@ const STATUS_LABELS: Record<string, string> = {
   thinking: 'Thinking...',
   writing: 'Writing...',
 };
-
-/** Format a model identifier into a short display label. */
-function formatModelLabel(model: string): string {
-  const m = model.replace(/^claude-/, '');
-  const match = m.match(/^(\w+)-(\d+)-(\d+)/);
-  if (match) {
-    const name = match[1].charAt(0).toUpperCase() + match[1].slice(1);
-    return `${name} ${match[2]}.${match[3]}`;
-  }
-  return m.charAt(0).toUpperCase() + m.slice(1);
-}
 
 export function ChatPage() {
   const { sessionId } = useParams();
@@ -62,10 +53,10 @@ export function ChatPage() {
     isStreaming, loading,
     agentStatus, contextUsage, backendStatus, currentTodos, currentCCTasks,
     sidebarCollapsed, mobileSidebarOpen, panelVisible,
-    modifiedFiles, modifiedFilesCount,
+    modifiedFiles, modifiedFilesCount, sessionTasks,
     backendDefault, newChatBackend,
     loadSessions, switchSession, createSession, deleteSession,
-    sendMessage, stopSession, toggleSessionList, setMobileSidebarOpen, openFilesPanel,
+    sendMessage, stopSession, toggleSessionList, setMobileSidebarOpen, openFilesPanel, openTasksPanel,
   } = useChatStore(useShallow(s => ({
     sessions: s.sessions,
     archivedSessions: s.archivedSessions,
@@ -85,6 +76,7 @@ export function ChatPage() {
     panelVisible: s.panelVisible,
     modifiedFiles: s.modifiedFiles,
     modifiedFilesCount: s.modifiedFilesCount,
+    sessionTasks: s.sessionTasks,
     backendDefault: s.backendDefault,
     newChatBackend: s.newChatBackend,
     loadSessions: s.loadSessions,
@@ -96,12 +88,19 @@ export function ChatPage() {
     toggleSessionList: s.toggleSessionList,
     setMobileSidebarOpen: s.setMobileSidebarOpen,
     openFilesPanel: s.openFilesPanel,
+    openTasksPanel: s.openTasksPanel,
   })));
   const hasPanels = useChatStore(s => s.panels.length > 0);
   const filesPanelActive = useChatStore(s => s.panels.some(p => p.id === 'files-panel'));
+  const tasksPanelActive = useChatStore(s => s.panels.some(p => p.id === TASKS_PANEL_ID));
 
-  // The active session row may live in the feed or a lazy archived/system group.
-  const activeSessionRow = findSessionById(activeSession, sessions, archivedSessions, systemSessions);
+  // The active session row may live in the feed or a lazy archived/system
+  // group. A session that none of them has loaded is read by its id.
+  const listedSessionRow = findSessionById(activeSession, sessions, archivedSessions, systemSessions);
+  const fetchedSessionRow = useFetchedSession(
+    listedSessionRow || !activeSession || virtualSession?.id === activeSession ? null : activeSession,
+  );
+  const activeSessionRow = listedSessionRow ?? fetchedSessionRow ?? undefined;
 
   // Forks of THIS chat keyed by their anchor message — MessageList marks the
   // divergence points with a pill. Memoized so the memo'd list doesn't
@@ -192,7 +191,7 @@ export function ChatPage() {
     },
     {
       id: 'chat-focus-input',
-      combo: { mod: true, shift: true, key: ';' },
+      combo: FOCUS_COMPOSER_COMBO,
       description: 'Focus message input',
       section: 'chat',
       allowInInput: true,
@@ -317,6 +316,7 @@ export function ChatPage() {
     : STATUS_LABELS[agentStatus.state] || null;
 
   const fileCount = modifiedFiles.length || modifiedFilesCount;
+  const taskCount = sessionTasks?.length ?? 0;
   // SidePanel renders nothing without a tab, so it only covers the column when
   // there is one.
   const panelCoversColumn = isMobile && panelVisible && hasPanels;
@@ -332,7 +332,7 @@ export function ChatPage() {
         onCreate={handleCreateSession}
         onDelete={handleDeleteSession}
         collapsed={!sessionListOpen}
-        mobile={isMobile}
+        layout={isMobile ? 'drawer' : 'column'}
         onRequestClose={() => setMobileSidebarOpen(false)}
       />
 
@@ -387,7 +387,7 @@ export function ChatPage() {
                 const model = activeSessionRow?.model;
                 return model ? (
                   <span className="hidden md:inline shrink-0 text-xs text-text-faint bg-surface-raised px-1.5 py-0.5 rounded">
-                    {formatModelLabel(model)}
+                    {modelLabel(model)}
                   </span>
                 ) : null;
               })()}
@@ -465,10 +465,31 @@ export function ChatPage() {
                   <span className="tabular-nums">{fileCount}</span>
                 </Button>
               )}
-              {contextUsage && (
-                <div className="hidden md:flex">
-                  <ContextBar usage={contextUsage} sessionCostUsd={activeSessionRow?.total_cost_usd} />
-                </div>
+              {taskCount > 0 && (
+                <Button
+                  variant="subtle"
+                  size="xs"
+                  onClick={openTasksPanel}
+                  title="Tasks from this session"
+                  aria-label={`Tasks from this session (${taskCount})`}
+                  // On a phone, the last button of the header: the pseudo-element
+                  // makes the tap target 44 px high (10 px up and down) and wider
+                  // (4 px into the gap, 12 px into the header's padding).
+                  className="relative max-md:before:absolute max-md:before:-inset-y-2.5 max-md:before:-left-1 max-md:before:-right-3 max-md:before:content-['']"
+                >
+                  <ListChecks size={14} className={tasksPanelActive ? 'text-hue-blue' : undefined} />
+                  <span className="tabular-nums">{taskCount}</span>
+                </Button>
+              )}
+              {contextUsage && activeSession && (
+                <ContextBar
+                  key={`context-${activeSession}`}
+                  usage={contextUsage}
+                  sessionId={activeSession}
+                  backend={activeSessionRow?.backend ?? 'claude'}
+                  busy={isStreaming}
+                  sessionCostUsd={activeSessionRow?.total_cost_usd}
+                />
               )}
               {langfuseUrl && (
                 <a
@@ -533,6 +554,7 @@ export function ChatPage() {
               <MessageList
                 messages={messages}
                 isStreaming={isStreaming}
+                unlistedSession={fetchedSessionRow}
                 onForkMessage={canForkSession ? handleForkMessage : undefined}
                 messageForks={messageForks}
               />

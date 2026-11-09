@@ -11,7 +11,7 @@ import logging
 import os
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -933,6 +933,11 @@ class GatewayConfig:
     # rates. ``uvloop``/``auto`` remain available for a deployment that wants
     # them. Takes effect at startup only.
     loop: str = "asyncio"
+    # On SIGTERM or SIGINT, how long to wait for running turns to end before
+    # the shutdown. New turns are refused during the wait. 0 means no wait.
+    # Under Kubernetes, set it below terminationGracePeriodSeconds so the
+    # shutdown that follows can finish. Read when the signal arrives.
+    drain_timeout_seconds: int = 0
 
     @classmethod
     @_coerced
@@ -947,6 +952,7 @@ class GatewayConfig:
             port=d.get("port", 8900),
             ssl=SSLConfig.from_dict(d.get("ssl", {})),
             loop=loop,
+            drain_timeout_seconds=d.get("drain_timeout_seconds", 0),
         )
 
 
@@ -1420,6 +1426,13 @@ class ChannelSourceConfig:
     the short version is that a platform id always works, and a name works
     only where the platform, not the subject, controls it.
 
+    ``gateway_grant`` is for a hosted channel only (``slack.mode: hosted``).
+    There the gateway sends an observation only for a conversation that the
+    agent's channel policy observes, so that policy is already a written
+    grant. With the switch on, an empty allow list collects every
+    observation the gateway sends; a non-empty allow list still narrows it,
+    and the deny lists still apply. Anywhere else the switch is ignored.
+
     ``schedule`` is the drain cadence, not a poll: the messages are already
     in the buffer by the time it fires.
     """
@@ -1442,6 +1455,30 @@ class ChannelSourceConfig:
     # Off by default. Turn it on only when source consumers should receive the
     # same message later, such as when the source is an archive or digest.
     include_handled_messages: bool = False
+    # Hosted channels only: the gateway's observation grant counts as the
+    # local one. See the class docstring.
+    gateway_grant: bool = False
+
+    @property
+    def collects(self) -> bool:
+        """Whether this grant can ever approve a message."""
+        return self.enabled and (bool(self.allow_conversations) or self.gateway_grant)
+
+    def outside_hosted_mode(self, subject: str) -> ChannelSourceConfig:
+        """This grant for a channel that takes no events from a gateway.
+
+        ``gateway_grant`` stands for a gateway's grant, so it is dropped here,
+        with a warning. ``subject`` names the YAML keys, as in ``from_dict``.
+        """
+        if not self.gateway_grant:
+            return self
+        logger.warning(
+            "source.gateway_grant applies only to a channel in hosted mode "
+            "(slack.mode: hosted); ignored, so source.allow_%s alone decides "
+            "what is collected%s.",
+            subject, "" if self.allow_conversations else ", and it names nothing",
+        )
+        return replace(self, gateway_grant=False)
 
     @classmethod
     @_coerced
@@ -1453,14 +1490,18 @@ class ChannelSourceConfig:
         ``subject`` is the noun this transport calls the thing being watched
         — ``"channels"`` for Slack, ``"chats"`` for Telegram — and names both
         the YAML keys and every warning, so an operator is told about the key
-        they actually wrote.
+        they actually wrote. ``gateway_grant`` is read as written; a channel
+        that is not hosted drops it through ``outside_hosted_mode``.
         """
         enabled = _as_bool(
             d.get("enabled", False), False, label="source.enabled",
         )
         allow_key, deny_key = f"allow_{subject}", f"deny_{subject}"
         allow = _pattern_list(d.get(allow_key), allow_key)
-        if enabled and not allow:
+        gateway_grant = _as_bool(
+            d.get("gateway_grant", False), False, label="source.gateway_grant",
+        )
+        if enabled and not allow and not gateway_grant:
             logger.warning(
                 "source.enabled is set but source.%s names nothing usable — "
                 "nothing will be collected. List the %s to watch; an empty "
@@ -1485,6 +1526,7 @@ class ChannelSourceConfig:
                 d.get("include_handled_messages", False), False,
                 label="source.include_handled_messages",
             ),
+            gateway_grant=gateway_grant,
         )
 
 
@@ -1548,7 +1590,7 @@ class TelegramConfig:
             dm_policy=dm_policy,
             source=ChannelSourceConfig.from_dict(
                 d.get("source", {}), subject="chats",
-            ),
+            ).outside_hosted_mode("chats"),
         )
 
 
@@ -1687,6 +1729,9 @@ class SlackConfig:
             if "enabled" in d
             else mode == "hosted" or (bool(bot_token and app_token) and not locked)
         )
+        source = ChannelSourceConfig.from_dict(d.get("source", {}), subject="channels")
+        if mode != "hosted":
+            source = source.outside_hosted_mode("channels")
         return cls(
             mode=mode,
             enabled=enabled,
@@ -1703,9 +1748,7 @@ class SlackConfig:
             ),
             stream_mode=stream_mode,
             commands=_slack_commands(d.get("commands")),
-            source=ChannelSourceConfig.from_dict(
-                d.get("source", {}), subject="channels",
-            ),
+            source=source,
         )
 
 
@@ -1916,6 +1959,10 @@ class ImapSyncConfig:
 # gh CLI, or a shared channel gateway polls it and streams the records here.
 GITHUB_SYNC_MODES: tuple[str, ...] = ("poll", "hosted")
 
+# Which notification threads the GitHub source lists: those the account takes
+# part in, or its whole GitHub inbox (see GitHubSyncConfig.inbox).
+GITHUB_INBOX_MODES: tuple[str, ...] = ("participating", "all")
+
 
 @dataclass
 class GitHubSyncConfig:
@@ -1975,6 +2022,15 @@ class GitHubSyncConfig:
     # pull requests and deliver a record when one changes (state, head
     # commit, review, CI, or a comment).
     pr_watch: bool = True
+    # Which notification threads are listed, in both modes.
+    # "participating": only the threads the account takes part in (GitHub's
+    # participating=true), such as mentions, assignments and review requests.
+    # "all": the account's whole GitHub inbox as its watch settings produce
+    # it, adding "subscribed" threads of watched repositories (new issues and
+    # PRs) and "ci_activity" for its own workflow runs; pick within it with
+    # the reason guardrails above. An unknown value
+    # refuses to load. Follows a reload.
+    inbox: str = "participating"
 
     @classmethod
     @_coerced
@@ -1986,9 +2042,15 @@ class GitHubSyncConfig:
                 mode, GITHUB_SYNC_MODES,
             )
             mode = "poll"
+        inbox = _setting_str(d.get("inbox"), "participating").lower()
+        if inbox not in GITHUB_INBOX_MODES:
+            raise ValueError(
+                f"sync.github.inbox must be one of {GITHUB_INBOX_MODES}, got {inbox!r}"
+            )
         return cls(
             mode=mode,
             pr_watch=d.get("pr_watch", True),
+            inbox=inbox,
             enabled=d.get("enabled", True),
             schedule=d.get("schedule", "*/15 * * * *"),
             processor=d.get("processor", "agent"),
@@ -2036,18 +2098,144 @@ class GitHubEventsSyncConfig:
         )
 
 
+# What the GitHub Repos source can report from a repository (see
+# GitHubReposSyncConfig.types), and what it reports when nothing is said.
+GITHUB_REPOS_TYPES: tuple[str, ...] = ("pull_request", "issue", "release")
+GITHUB_REPOS_DEFAULT_TYPES: tuple[str, ...] = ("pull_request", "issue")
+# The most repositories the source follows; the channel gateway's bound too.
+GITHUB_REPOS_MAX_REPOS = 50
+# A repository as GitHub names it: an owner of 1 to 39 letters, digits and
+# hyphens that starts with a letter or a digit, then a name of 1 to 100
+# letters, digits, ".", "_" and "-". The channel gateway checks the same.
+_GITHUB_REPO_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}")
+
+
+def _switched_on(value: object) -> bool:
+    """An ``enabled`` value as the scalar coercion reads it, without its warning."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return isinstance(value, str) and value.strip().lower() in TRUTHY
+
+
+def _github_repos_names(value: object, *, enabled: bool) -> list[str]:
+    """``sync.github_repos.repos``: ``owner/repo`` names, each once.
+
+    Entries are stripped and blank ones dropped. A single value is one entry,
+    as for any list setting. While the watch is on (*enabled*), a name that
+    GitHub would not take ("." and ".." included), the same repository twice
+    (GitHub's names ignore case), or more than :data:`GITHUB_REPOS_MAX_REPOS`
+    repositories refuses to load. While it is off, those are logged in one
+    warning and the entries are kept as written: the earlier source took any
+    value, and a watch that is off must not stop a config that held one from
+    loading. Switching it on then refuses the config until they are fixed.
+    """
+    if value is None:
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    unnamed: list[str] = []
+    twice: list[str] = []
+    for entry in value if isinstance(value, (list, tuple)) else [value]:
+        name = "" if entry is None else str(entry).strip()
+        if not name:
+            continue
+        if (
+            not _GITHUB_REPO_NAME_RE.fullmatch(name)
+            or name.split("/", 1)[1] in (".", "..")
+        ):
+            if enabled:
+                raise ValueError(
+                    "sync.github_repos.repos entries must be owner/repo names as GitHub "
+                    f"writes them, got {name!r}"
+                )
+            unnamed.append(name)
+        elif name.lower() in seen:
+            if enabled:
+                raise ValueError(f"sync.github_repos.repos names {name!r} twice")
+            twice.append(name)
+        seen.add(name.lower())
+        names.append(name)
+    too_many = len(names) > GITHUB_REPOS_MAX_REPOS
+    if too_many and enabled:
+        raise ValueError(
+            f"sync.github_repos.repos must name at most {GITHUB_REPOS_MAX_REPOS} "
+            f"repositories, got {len(names)}"
+        )
+    problems = [
+        *([f"not owner/repo names: {', '.join(map(repr, unnamed))}"] if unnamed else []),
+        *([f"named twice: {', '.join(map(repr, twice))}"] if twice else []),
+        *([f"more than {GITHUB_REPOS_MAX_REPOS} repositories ({len(names)})"] if too_many else []),
+    ]
+    if problems:
+        logger.warning(
+            "sync.github_repos is switched off, and its repos would refuse to load once it "
+            "is switched on: %s", "; ".join(problems),
+        )
+    return names
+
+
+def _github_repos_types(value: object) -> list[str]:
+    """``sync.github_repos.types``, checked against :data:`GITHUB_REPOS_TYPES`.
+
+    Unset (missing, null or blank) is the default. Case does not matter, a
+    type named twice counts once, and they are kept in the order of
+    :data:`GITHUB_REPOS_TYPES`. An unknown type, or an empty list, refuses to
+    load.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return list(GITHUB_REPOS_DEFAULT_TYPES)
+    chosen: list[str] = []
+    for entry in value if isinstance(value, (list, tuple)) else [value]:
+        name = str(entry or "").strip().lower()
+        if name not in GITHUB_REPOS_TYPES:
+            raise ValueError(
+                f"sync.github_repos.types must be one or more of {GITHUB_REPOS_TYPES}, "
+                f"got {name!r}"
+            )
+        chosen.append(name)
+    if not chosen:
+        raise ValueError(
+            f"sync.github_repos.types must be one or more of {GITHUB_REPOS_TYPES}, got none"
+        )
+    return [kind for kind in GITHUB_REPOS_TYPES if kind in chosen]
+
+
 @dataclass
 class GitHubReposSyncConfig:
-    """Config for the GitHub Repos source (monitor watched repos for new issues/PRs).
+    """Config for the GitHub Repos source: repositories the agent follows.
 
-    Unlike ``github`` (notifications) and ``github_events`` (your own activity),
-    this source watches an explicit set of repositories for newly-created issues
-    and pull requests. ``repos`` is required — an empty list makes the source a
-    no-op.
+    Unlike ``github`` (notifications) and ``github_events`` (your own
+    activity), this source watches an explicit set of repositories that the
+    account need not take part in, and reports new pull requests, issues and
+    releases there (``types``). ``repos`` is required: an empty list makes the
+    source a no-op. With ``sync.github.mode: hosted`` the channel gateway
+    polls the repositories for the agent, as it polls the notifications;
+    otherwise this process polls them with the gh CLI. All of it follows a
+    reload. See docs/sources.md "GitHub Repos".
     """
     enabled: bool = False
     schedule: str = "*/15 * * * *"
-    repos: list[str] = field(default_factory=list)  # required; empty = no-op
+    # owner/repo names, each once, at most GITHUB_REPOS_MAX_REPOS; while the
+    # watch is on, anything else refuses to load (while it is off, a
+    # warning). Required; empty = no-op.
+    repos: list[str] = field(default_factory=list)
+    # What is reported: pull_request, issue, release (GITHUB_REPOS_TYPES).
+    # An unknown type or an empty list refuses to load.
+    types: list[str] = field(default_factory=lambda: list(GITHUB_REPOS_DEFAULT_TYPES))
+    # Also report the pull requests and issues that a GitHub App or a "[bot]"
+    # account opened. A release is reported whoever published it.
+    include_bots: bool = False
+    # Report a draft pull request when it is opened. false: report it when it
+    # is marked ready for review (event "ready") instead.
+    include_drafts: bool = True
+    # Also report a new head commit, ready for review, merge and close of the
+    # pull requests already reported.
+    updates: bool = False
+    # Case-insensitive globs on the author's login; the guardrail rules
+    # (deny wins). Dropped before anything is stored.
+    deny_authors: list[str] = field(default_factory=list)
     batch_size: int = 50
     condense: bool = False
     processor: str = "agent"
@@ -2060,7 +2248,14 @@ class GitHubReposSyncConfig:
         return cls(
             enabled=d.get("enabled", False),
             schedule=d.get("schedule", "*/15 * * * *"),
-            repos=d.get("repos", []),
+            repos=_github_repos_names(
+                d.get("repos"), enabled=_switched_on(d.get("enabled", False)),
+            ),
+            types=_github_repos_types(d.get("types")),
+            include_bots=d.get("include_bots", False),
+            include_drafts=d.get("include_drafts", True),
+            updates=d.get("updates", False),
+            deny_authors=_str_list(d.get("deny_authors") or [], clean=True),
             batch_size=d.get("batch_size", 50),
             condense=d.get("condense", False),
             processor=d.get("processor", "agent"),
@@ -2715,6 +2910,8 @@ class SessionsConfig:
     star_project_hook: bool = False  # opt-in; fire an internal agent turn on star/unstar transition
     # Rows per sidebar request; caps the conversation feed and sizes one lazy Archived/System page (0 = unlimited, starred exempt).
     sidebar_page_size: int = 50
+    # Days a pending plan puts its session in the sidebar's "Needs you" group, counted from the proposal (0 = no limit). The Plans page still lists older plans.
+    plan_attention_days: int = 7
 
     @classmethod
     @_coerced
@@ -2729,6 +2926,7 @@ class SessionsConfig:
             client_idle_timeout_minutes=d.get("client_idle_timeout_minutes", 60),
             star_project_hook=d.get("star_project_hook", False),
             sidebar_page_size=max(0, _lenient_int(d.get("sidebar_page_size"), 50)),
+            plan_attention_days=max(0, _lenient_int(d.get("plan_attention_days"), 7)),
         )
 
 
@@ -2765,6 +2963,66 @@ class RetentionConfig:
         )
 
 
+EXTERNAL_VERIFICATION_REQUIRE = "require"
+EXTERNAL_VERIFICATION_LOG = "log"
+EXTERNAL_VERIFICATION_MODES = (EXTERNAL_VERIFICATION_REQUIRE, EXTERNAL_VERIFICATION_LOG)
+
+
+@dataclass
+class ExternalAuthConfig:
+    """The check of the gateway's actor context in external mode.
+
+    With ``gateway_jwks_file`` set, Nerve accepts an ``X-Nerve-Actor-Context``
+    header only with a signature from a key in that local JWK Set file, and
+    with claims for exactly ``tenant_id``, ``agent_id`` and the request (see
+    :mod:`nerve.gateway.actor_context`). ``verification: log`` logs a failed
+    check and uses the header anyway, for a first rollout. Without
+    ``gateway_jwks_file``, Nerve reads the header without a check. The mode
+    itself comes only from ``NERVE_AUTH_MODE``.
+    """
+
+    gateway_jwks_file: Path | None = None
+    tenant_id: str = ""
+    agent_id: str = ""
+    verification: str = EXTERNAL_VERIFICATION_REQUIRE
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> ExternalAuthConfig:
+        return cls(
+            gateway_jwks_file=_expand_path(d.get("gateway_jwks_file")),
+            tenant_id=str(d.get("tenant_id") or "").strip(),
+            agent_id=str(d.get("agent_id") or "").strip(),
+            verification=str(
+                d.get("verification") or EXTERNAL_VERIFICATION_REQUIRE,
+            ).strip().lower(),
+        )
+
+    def problems(self) -> list[str]:
+        """Why these settings cannot check the actor context. Empty when they
+        can, and when ``gateway_jwks_file`` is unset (no check).
+
+        The key file itself is read by the verifier and by ``nerve doctor``.
+        """
+        if self.gateway_jwks_file is None:
+            return []
+        found: list[str] = []
+        if not self.gateway_jwks_file.is_absolute():
+            # The daemon and `nerve doctor` can start in different directories.
+            found.append("auth.external.gateway_jwks_file must be an absolute path")
+        for key in ("tenant_id", "agent_id"):
+            value = getattr(self, key)
+            try:
+                canonical = str(uuid.UUID(value)) == value
+            except ValueError:
+                canonical = False
+            if not canonical:
+                found.append(f"auth.external.{key} must be a lowercase UUID")
+        if self.verification not in EXTERNAL_VERIFICATION_MODES:
+            found.append("auth.external.verification must be require or log")
+        return found
+
+
 @dataclass
 class AuthConfig:
     password_hash: str = ""
@@ -2778,6 +3036,7 @@ class AuthConfig:
     # logged out mid-work. Only a tab left untouched for the whole window
     # comes back to a password prompt.
     jwt_expiry_hours: int = 720  # 30 days
+    external: ExternalAuthConfig = field(default_factory=ExternalAuthConfig)
 
     @classmethod
     @_coerced
@@ -2786,6 +3045,7 @@ class AuthConfig:
             password_hash=d.get("password_hash", ""),
             jwt_secret=d.get("jwt_secret", ""),
             jwt_expiry_hours=max(1, _lenient_int(d.get("jwt_expiry_hours"), 720)),
+            external=ExternalAuthConfig.from_dict(d.get("external") or {}),
         )
 
 
@@ -2817,12 +3077,53 @@ class SetupConfig:
         return cls(local_secrets=_as_local_secrets(d["local_secrets"]))
 
 
+#: ``notifications.levels`` values: a channel gets every item, or only the
+#: important ones (questions, approvals, and ``high`` or ``urgent`` items).
+NOTIFY_LEVEL_ALL = "all"
+NOTIFY_LEVEL_IMPORTANT = "important"
+NOTIFY_LEVELS = (NOTIFY_LEVEL_ALL, NOTIFY_LEVEL_IMPORTANT)
+_IMPORTANT_PRIORITIES = frozenset({"high", "urgent"})
+#: The channel that gets every item whatever its level: the panel is the record.
+NOTIFY_RECORD_CHANNEL = "web"
+#: The names ``notifications.channels`` can list (the channels the fan-out delivers to).
+NOTIFY_CHANNELS = (NOTIFY_RECORD_CHANNEL, "telegram", "slack")
+
+
+def level_wants(level: str, notif_type: str, priority: str) -> bool:
+    """Whether a channel at ``level`` gets an item of this type and priority:
+    ``important`` gets questions, approvals, and ``high`` or ``urgent`` items."""
+    if level != NOTIFY_LEVEL_IMPORTANT:
+        return True
+    return notif_type in ("question", "approval") or priority in _IMPORTANT_PRIORITIES
+
+
+def _notification_levels(raw: Any) -> dict[str, str]:
+    """``notifications.levels`` as ``{channel: level}``. An unknown level is
+    logged and read as ``all``, so a typo holds nothing back."""
+    if not isinstance(raw, dict):
+        if raw:
+            logger.warning("notifications.levels is not a mapping; every channel gets every item")
+        return {}
+    levels: dict[str, str] = {}
+    for channel, level in raw.items():
+        value = str(level or "").strip().lower()
+        if value not in NOTIFY_LEVELS:
+            logger.warning(
+                "notifications.levels.%s: unknown level %r, using %r", channel, level, NOTIFY_LEVEL_ALL,
+            )
+            value = NOTIFY_LEVEL_ALL
+        levels[str(channel)] = value
+    return levels
+
+
 @dataclass
 class NotificationsConfig:
     """Async notification delivery settings."""
     channels: list[str] = field(
         default_factory=lambda: ["web", "telegram", "slack"],
     )
+    # Per channel, ``all`` (the default) or ``important``: see :meth:`wants`.
+    levels: dict[str, str] = field(default_factory=dict)
     telegram_chat_id: int | None = None       # Target chat; falls back to first allowed_user
     # Opt-in, default off = backward compatible. When true AND telegram_chat_id
     # is a non-private group/supergroup, that chat is DELIVERY-ONLY: notifications
@@ -2843,11 +3144,29 @@ class NotificationsConfig:
     # from may be in any language. Unknown values fall back to English.
     date_locale: str = "en"
 
+    def delivery_channels(self) -> list[str]:
+        """``channels`` with the panel first when the list leaves it out. The
+        panel is the record and the place to answer, so a list written
+        without ``web`` (for example ``[telegram]``) still delivers there."""
+        channels = list(self.channels)
+        return channels if NOTIFY_RECORD_CHANNEL in channels else [NOTIFY_RECORD_CHANNEL, *channels]
+
+    def wants(self, channel: str, notif_type: str, priority: str) -> bool:
+        """Whether ``channel`` gets an item of this type and priority.
+
+        A channel at ``important`` gets questions, approvals, and ``high`` or
+        ``urgent`` items. The panel gets every item.
+        """
+        if channel == NOTIFY_RECORD_CHANNEL:
+            return True
+        return level_wants(self.levels.get(channel, NOTIFY_LEVEL_ALL), notif_type, priority)
+
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> NotificationsConfig:
         return cls(
             channels=d.get("channels", ["web", "telegram", "slack"]),
+            levels=_notification_levels(d.get("levels")),
             telegram_chat_id=d.get("telegram_chat_id"),
             delivery_only_sink=d.get("delivery_only_sink", False),
             slack_channel_id=str(d.get("slack_channel_id") or ""),
@@ -3692,6 +4011,23 @@ def default_timezone() -> str:
     return FALLBACK_TIMEZONE
 
 
+_MINUTES_PER_HOUR = 60
+
+
+def _as_clock_time(value: Any) -> Any:
+    """``quiet_start`` or ``quiet_end`` as ``HH:MM`` text.
+
+    YAML 1.1 reads an unquoted time that does not start with ``0`` as a
+    base-60 integer: ``22:00`` is 1320 (22 * 60 + 0), ``9:30`` is 570;
+    ``08:00`` stays text. This gives such an integer as ``HH:MM`` text (1320
+    is ``22:00``, 570 is ``09:30``). Any other value stays as it is.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        hours, minutes = divmod(value, _MINUTES_PER_HOUR)
+        return f"{hours:02d}:{minutes:02d}"
+    return value
+
+
 @dataclass
 class NerveConfig:
     workspace: Path = field(default_factory=paths.default_workspace)
@@ -4115,8 +4451,8 @@ class NerveConfig:
             timezone=d["timezone"] if "timezone" in d else default_timezone(),
             lockdown=locked,
             deployment=d.get("deployment", "server"),
-            quiet_start=d.get("quiet_start", "02:00"),
-            quiet_end=d.get("quiet_end", "08:00"),
+            quiet_start=_as_clock_time(d.get("quiet_start", "02:00")),
+            quiet_end=_as_clock_time(d.get("quiet_end", "08:00")),
             provider=ProviderConfig.from_dict(d.get("provider", {})),
             gateway=GatewayConfig.from_dict(d.get("gateway", {})),
             agent=AgentConfig.from_dict(d.get("agent", {})),

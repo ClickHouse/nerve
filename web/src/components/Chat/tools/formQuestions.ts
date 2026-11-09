@@ -66,6 +66,11 @@ export function formTitle(input: Record<string, unknown> | null | undefined): st
   return str(input?.title).trim();
 }
 
+/** The call's intro, the Markdown the card shows above the questions; '' for none. */
+export function formIntro(input: Record<string, unknown> | null | undefined): string {
+  return str(input?.intro).trim();
+}
+
 /**
  * The call's questions, with the contract's defaults where a key is left out
  * (required: true; allow_other: true for choice and multi). Reads the

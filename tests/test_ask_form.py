@@ -45,7 +45,7 @@ from nerve.agent.tools.handlers.forms import (
     validate_form,
 )
 from nerve.agent.tools.registry import ToolContext
-from nerve.agent.tools.schemas import ASK_FORM_SCHEMA, FORM_KINDS
+from nerve.agent.tools.schemas import ASK_FORM_SCHEMA, FORM_INTRO_MAX, FORM_KINDS
 
 SID = "sess-form"
 
@@ -107,6 +107,7 @@ class TestTheCall:
         ))
         assert form == {
             "title": "Setup questions",
+            "intro": "",
             "questions": [
                 {"id": "repos", "kind": "repos", "label": "Repositories",
                  "question": "Which repositories should I review?", "help": "so the explorer can clone them",
@@ -239,15 +240,28 @@ class TestTheCall:
             f"questions[0].default: at most {ANSWER_MAX} characters (got {ANSWER_MAX + 1})",
         ]
 
+    def test_the_intro_is_kept_for_the_card(self):
+        """The explanation the card shows above the questions: stripped,
+        Markdown kept as written."""
+        intro = "  I understood **PR review**.\n\nThe questions set the scan job.  "
+        assert _form(_call(REPOS, intro=intro))["intro"] == intro.strip()
+        assert _form(_call(REPOS))["intro"] == ""
+        assert _problems(_call(REPOS, intro="x" * FORM_INTRO_MAX)) == []
+        assert _problems(_call(REPOS, intro="x" * (FORM_INTRO_MAX + 1))) == [
+            f"intro: at most {FORM_INTRO_MAX} characters (got {FORM_INTRO_MAX + 1})",
+        ]
+
     def test_every_problem_is_named_at_once(self):
         problems = _problems(_call(
             {**REPOS, "label": "x" * 41},
             {**CADENCE, "options": [{"label": "only one"}]},
             {**NOTES, "id": "repos"},
             title=5,
+            intro=["not", "text"],
         ))
         assert problems == [
             "title: must be a string",
+            "intro: must be a string",
             "questions[0].label: at most 40 characters (got 41)",
             "questions[1].options: a choice question has 2 to 8 options (got 1)",
             "questions[2].id: 'repos' is the id of an earlier question; ids are unique",
@@ -265,6 +279,7 @@ class TestTheCall:
             _call(_choice(options=[{"label": str(n)} for n in range(9)])),
             _call({**REPOS, "id": "re pos"}),
             _call({key: value for key, value in REPOS.items() if key != "question"}),
+            _call(REPOS, intro="x" * (FORM_INTRO_MAX + 1)),
         ):
             with pytest.raises(jsonschema.ValidationError):
                 jsonschema.validate(bad, ASK_FORM_SCHEMA)

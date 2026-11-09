@@ -1,7 +1,4 @@
-import type {
-  CredentialSource, SecretOut, SetupChannelsDetail, SetupMemoryDetail, SetupProviderDetail,
-  SetupSourcesDetail, SetupStep,
-} from '../../api/client';
+import type { CredentialSource, SecretOut, SetupProviderDetail } from '../../api/client';
 
 /**
  * Where a configured value lives, when that is somewhere other than the
@@ -36,28 +33,4 @@ export function providerManaged(detail: SetupProviderDetail): ManagedSource | nu
   if (detail.credential === 'api_key') return secretManaged(detail.anthropic_api_key);
   if (detail.credential === 'oauth_token') return secretManaged(detail.claude_oauth_token);
   return null;
-}
-
-/** The first managed credential a step carries, for "Already configured" and the summaries. */
-export function stepManaged(step: SetupStep): ManagedSource | null {
-  switch (step.id) {
-    case 'provider':
-      return providerManaged(step.detail as SetupProviderDetail);
-    case 'memory':
-      return secretManaged((step.detail as SetupMemoryDetail).openai_api_key);
-    case 'channels': {
-      const { telegram, slack } = step.detail as SetupChannelsDetail;
-      return secretManaged(telegram.bot_token) ?? secretManaged(slack.bot_token)
-        ?? secretManaged(slack.app_token) ?? (slack.mode === 'hosted' ? 'gateway' : null);
-    }
-    case 'sources': {
-      const { github, gmail, telegram } = step.detail as SetupSourcesDetail;
-      // A GitHub the operator switched on in the machine's configuration
-      // arrives through the channel gateway.
-      return managedSource(github.source) ?? (github.managed && github.enabled ? 'gateway' : null)
-        ?? managedSource(gmail.source) ?? secretManaged(telegram.api_id) ?? secretManaged(telegram.api_hash);
-    }
-    default:
-      return null;
-  }
 }

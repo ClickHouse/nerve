@@ -23,7 +23,9 @@ from nerve.gateway.routes import (
     agents,
     auth,
     setup,
+    settings,
     sessions,
+    session_context,
     tasks,
     plans,
     skills,
@@ -33,7 +35,9 @@ from nerve.gateway.routes import (
     cron,
     sources,
     notifications,
+    push,
     files,
+    github,
     external_agents,
     prompt_rewrite,
     models,
@@ -68,7 +72,9 @@ def register_all_routes() -> APIRouter:
     if local_accounts:
         router.include_router(setup.claim_router)
     router.include_router(setup.router)
+    router.include_router(settings.router)
     router.include_router(sessions.router)
+    router.include_router(session_context.router)
     router.include_router(agents.router)
     router.include_router(tasks.router)
     router.include_router(plans.router)
@@ -79,7 +85,9 @@ def register_all_routes() -> APIRouter:
     router.include_router(cron.router)
     router.include_router(sources.router)
     router.include_router(notifications.router)
+    router.include_router(push.router)
     router.include_router(files.router)
+    router.include_router(github.router)
     router.include_router(external_agents.router)
     router.include_router(prompt_rewrite.router)
     router.include_router(models.router)

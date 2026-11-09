@@ -25,6 +25,7 @@ installStorage();
 vi.mock('../api/client', () => ({
   api: {
     listSessions: vi.fn(),
+    listNotifications: vi.fn(async () => ({ notifications: [], pending_count: 0 })),
     listArchivedSessions: vi.fn(),
     listSystemSessions: vi.fn(),
     getViewer: vi.fn(async () => { throw new Error("401"); }),
@@ -34,6 +35,8 @@ vi.mock('../api/client', () => ({
     getAgentTranscript: vi.fn(),
     archiveSession: vi.fn(),
     stopSession: vi.fn(),
+    createSession: vi.fn(),
+    getSessionTasks: vi.fn(async () => ({ tasks: [] })),
   },
   apiErrorCode: () => null,
   // chatStore reads these authStore dependencies when it stamps optimistic rows.
@@ -52,10 +55,11 @@ vi.mock('../api/websocket', () => ({
 
 const { api } = await import('../api/client');
 const { ws } = await import('../api/websocket');
-const { useChatStore, registerComposerFlush, AGENTS_PANEL_ID, MAX_AGENT_TABS } = await import('./chatStore');
+const { useChatStore, registerComposerFlush, AGENTS_PANEL_ID, MAX_AGENT_TABS, EMPTY_REVIEW_LOOP } = await import('./chatStore');
 const { reenter, setAuthMode, useHostedStore } = await import('../api/hosted');
 const { useAgentStore } = await import('./agentStore');
 const fx = await import('../test/agentFixtures');
+const { needsYou } = await import('../utils/sessionAttention');
 // chatStore registers its socket-open handler once, at module init.
 const onSocketOpen = vi.mocked(ws.onOpen).mock.calls[0]?.[0] as (() => void) | undefined;
 
@@ -115,6 +119,89 @@ describe('loadSessions depth preservation', () => {
     const s = useChatStore.getState();
     expect(s.sessions.length).toBe(100);
     expect(s.sessionsHasMore).toBe(false);
+  });
+});
+
+describe('the sessions that need you', () => {
+  afterEach(() => vi.useRealTimers());
+
+  it('a later page never repeats a session that page 1 already holds', async () => {
+    // Page 1 carries s60 from page 2, because it waits for the user.
+    vi.mocked(api.listSessions).mockImplementation(async (offset = 0) => offset === 0
+      ? { sessions: [...rows(0, PAGE), rows(60, 1)[0]], archived_count: 0, system_count: 0, has_more: true, next_offset: PAGE }
+      : { sessions: rows(PAGE, PAGE), archived_count: 0, system_count: 0, has_more: false, next_offset: 2 * PAGE });
+    useChatStore.setState({
+      sessions: [], sessionsNextOffset: 0, sessionsHasMore: false,
+      archivedSessions: null, systemSessions: null, activeSession: '', virtualSession: null,
+    });
+
+    await useChatStore.getState().loadSessions();
+    await useChatStore.getState().loadMoreSessions();
+
+    const ids = useChatStore.getState().sessions.map(s => s.id);
+    expect(ids.length).toBe(2 * PAGE);
+    expect(new Set(ids).size).toBe(2 * PAGE);
+    expect(useChatStore.getState().sessionsNextOffset).toBe(2 * PAGE);
+  });
+
+  // The server list after the reload, and the store before the event.
+  const listed = (sessions: unknown[]) => vi.mocked(api.listSessions).mockResolvedValue(
+    { sessions, archived_count: 0, system_count: 0, has_more: false, next_offset: 1 } as never);
+  const feed = (sessions: unknown[]) => useChatStore.setState({
+    sessions: sessions as never, sessionsNextOffset: 0, sessionsHasMore: false,
+    archivedSessions: null, systemSessions: null, activeSession: '', virtualSession: null,
+  });
+  const chat = { id: 'chat-1', title: 'chat', source: 'web', updated_at: '2026-11-07T04:00:00Z' };
+  const cron = { ...chat, id: 'cron-1', source: 'cron' };
+
+  it('a session from outside the feed that starts to wait enters Needs you', async () => {
+    vi.useFakeTimers();
+    feed([chat]);
+    listed([chat, { ...cron, awaiting_input: true }]);
+
+    dispatch({ type: 'session_awaiting_input', session_id: 'cron-1', awaiting: true });
+    await vi.advanceTimersByTimeAsync(500);
+
+    const added = useChatStore.getState().sessions.find(s => s.id === 'cron-1');
+    expect(added && needsYou(added)).toBe(true);
+  });
+
+  it('a session from outside the feed leaves when its review loop stops waiting', async () => {
+    vi.useFakeTimers();
+    const loop = { id: 'rvl-1', status: 'awaiting_user', iteration: 1, max_iterations: 3 };
+    feed([chat, { ...cron, review_loop: loop }]);
+    listed([chat]);
+
+    dispatch({ type: 'review_loop_update', session_id: 'cron-1', loop: { ...loop, status: 'implementing' } } as never);
+    // The row is patched at once and dropped by the reload.
+    expect(needsYou(useChatStore.getState().sessions.find(s => s.id === 'cron-1')!)).toBe(false);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(useChatStore.getState().sessions.map(s => s.id)).toEqual(['chat-1']);
+  });
+
+  it('a burst of notification events reloads the list once', async () => {
+    vi.useFakeTimers();
+    useChatStore.setState({ sessionsNextOffset: 0, sessionsHasMore: false, archivedSessions: null, systemSessions: null });
+    const base = { notification_id: 'n1', session_id: 's1', title: 't' };
+    dispatch({ ...base, type: 'notification', notification_type: 'question', body: '', priority: 'normal', options: null });
+    dispatch({ ...base, type: 'notification_answered', answer: 'yes', answered_by: 'web' });
+    dispatch({ ...base, type: 'notification_expired', notification_type: 'question' });
+    expect(api.listSessions).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(api.listSessions).toHaveBeenCalledTimes(1);
+  });
+
+  it('a task event reloads the list: a plan decided in another place clears "Plan to review"', async () => {
+    vi.useFakeTimers();
+    useChatStore.setState({ sessionsNextOffset: 0, sessionsHasMore: false, archivedSessions: null, systemSessions: null });
+    const task = { id: 't1', title: 'Upgrade CI runners', status: 'done' };
+    dispatch({ type: 'task_updated', session_id: null, event: 'done', task } as never);
+    expect(api.listSessions).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(api.listSessions).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -240,6 +327,45 @@ describe('agent events in the dispatcher', () => {
     expect(useAgentStore.getState().queue).toEqual([entry]);
   });
 
+  it('drops the echoed bubble of a queued message that never ran', () => {
+    const echo = (content: string, client_msg_id: string) => ({
+      role: 'user' as const, blocks: [{ type: 'text' as const, content }], client_msg_id,
+    });
+    onSession({ messages: [echo('cancelled', 'c-1'), echo('refused', 'c-2'), echo('started', 'c-3')] });
+
+    dispatch({ type: 'queue_update', session_id: SID, queue: [], removed: [
+      { queue_id: 'q_1', client_msg_id: 'c-1', reason: 'cancelled' },
+      { queue_id: 'q_2', client_msg_id: 'c-2', reason: 'refused' },
+      { queue_id: 'q_3', client_msg_id: 'c-3', reason: 'started' },
+    ] });
+
+    expect(useChatStore.getState().messages.map(m => m.client_msg_id)).toEqual(['c-3']);
+  });
+
+  it('moves the echo of a message that starts after the replies before it', () => {
+    const user = (content: string, client_msg_id?: string) => ({
+      role: 'user' as const, blocks: [{ type: 'text' as const, content }], created_at: '2026-02-27T02:00:00Z', client_msg_id,
+    });
+    const reply = (content: string) => ({ role: 'assistant' as const, blocks: [{ type: 'text' as const, content }] });
+    const texts = () => useChatStore.getState().messages.map(m => (m.blocks[0] as { content: string }).content);
+    // Two sends from another tab wait behind a turn; the second one was moved up.
+    onSession({ messages: [user('run the tests'), user('first', 'c-1'), user('second', 'c-2'), reply('tests pass')] });
+
+    dispatch({ type: 'queue_update', session_id: SID, queue: [fx.makeQueueEntry()], removed: [
+      { queue_id: 'q_2', client_msg_id: 'c-2', reason: 'started' },
+    ] });
+    expect(texts()).toEqual(['run the tests', 'first', 'tests pass', 'second']);
+    const moved = useChatStore.getState().messages[3];
+    expect(moved.client_msg_id).toBe('c-2');
+    expect(moved.created_at).not.toBe('2026-02-27T02:00:00Z');
+
+    useChatStore.setState(s => ({ messages: [...s.messages, reply('second done')] }));
+    dispatch({ type: 'queue_update', session_id: SID, queue: [], removed: [
+      { queue_id: 'q_1', client_msg_id: 'c-1', reason: 'started' },
+    ] });
+    expect(texts()).toEqual(['run the tests', 'tests pass', 'second', 'second done', 'first']);
+  });
+
   it('drops the agent events of a session that is not on screen', () => {
     dispatch({ type: 'agent_update', session_id: 's-other', agents: [{ ...fx.FX_RUNNING, session_id: 's-other' }], summary: fx.makeSummary([]) });
     dispatch({ type: 'queue_update', session_id: 's-other', queue: [fx.makeQueueEntry()] });
@@ -311,6 +437,26 @@ describe('sending while a turn runs', () => {
     expect(useAgentStore.getState().pendingSends).toEqual({});
   });
 
+  it('keeps streaming when the server refuses the queued send', async () => {
+    await useChatStore.getState().sendMessage('also run the e2e suite');
+    const [pending] = Object.values(useAgentStore.getState().pendingSends);
+
+    dispatch({ type: 'error', session_id: SID, error: 'Nerve is shutting down', client_msg_id: pending.clientMsgId });
+
+    expect(useChatStore.getState().isStreaming).toBe(true);
+    expect(useChatStore.getState().messages).toEqual([
+      { role: 'assistant', blocks: [{ type: 'text', content: 'Error: Nerve is shutting down' }] },
+    ]);
+    expect(useAgentStore.getState().pendingSends).toEqual({});
+    expect(useAgentStore.getState().composerInsert).toMatchObject({ text: 'also run the e2e suite' });
+  });
+
+  it('ends the stream for a refused send this tab did not queue', () => {
+    dispatch({ type: 'error', session_id: SID, error: 'Nerve is shutting down', client_msg_id: 'other-tab' });
+
+    expect(useChatStore.getState().isStreaming).toBe(false);
+  });
+
   it('reports a send that could not leave the tab', async () => {
     vi.mocked(ws.sendMessage).mockReturnValueOnce('dropped');
 
@@ -335,7 +481,7 @@ describe('sending while a turn runs', () => {
 });
 
 describe('socket open', () => {
-  it('re-binds the session on screen and resubscribes its transcripts', () => {
+  it('re-binds the session on screen and resubscribes its transcripts', async () => {
     onSession();
     const resubscribeAll = vi.fn();
     const original = useAgentStore.getState().resubscribeAll;
@@ -345,10 +491,14 @@ describe('socket open', () => {
       expect(ws.switchSession).toHaveBeenCalledWith(SID);
       expect(resubscribeAll).toHaveBeenCalledOnce();
       // The first open loads nothing more; a reconnect fetches the sidebar
-      // again (its counts may have changed while the socket was down).
+      // and the notifications again (they may have changed while the socket
+      // was down).
+      await new Promise((resolve) => setTimeout(resolve, 0));
       expect(api.listSessions).not.toHaveBeenCalled();
+      expect(api.listNotifications).not.toHaveBeenCalled();
       onSocketOpen?.();
       expect(api.listSessions).toHaveBeenCalled();
+      await vi.waitFor(() => expect(api.listNotifications).toHaveBeenCalledOnce());
 
       vi.mocked(ws.switchSession).mockClear();
       useChatStore.setState({ activeSession: 'v-1', virtualSession: { id: 'v-1', title: '', source: 'web', updated_at: '' } });
@@ -360,6 +510,170 @@ describe('socket open', () => {
       useAgentStore.setState({ resubscribeAll: original });
     }
     expect(onSocketOpen).toBeTypeOf('function');
+  });
+});
+
+describe('catching up after a reconnect', () => {
+  const userRow = (id: number, text: string) => ({ id, role: 'user', content: text });
+  const replyRow = (id: number, text: string) => ({ id, role: 'assistant', content: text, blocks: [{ type: 'text', content: text }] });
+  const texts = () => useChatStore.getState().messages.map(m => m.blocks.map(b => ('content' in b ? b.content : '')).join(''));
+  const shown = (id: number, role: 'user' | 'assistant', text: string) =>
+    ({ id, role, blocks: [{ type: 'text' as const, content: text }] });
+
+  it('loads the messages of the open chat on a reconnect', async () => {
+    onSession({ messages: [shown(1, 'user', 'hi')] });
+    vi.mocked(api.getMessages).mockImplementation(async () => ({ messages: [userRow(1, 'hi'), replyRow(2, 'stored while away')] }));
+    try {
+      // The first open of the module loads nothing; every later open is a reconnect.
+      onSocketOpen?.();
+      onSocketOpen?.();
+      await vi.waitFor(() => expect(texts()).toEqual(['hi', 'stored while away']));
+      expect(api.getMessages).toHaveBeenCalledWith(SID);
+    } finally {
+      vi.mocked(api.getMessages).mockImplementation(async () => ({ messages: [] }));
+    }
+  });
+
+  it('reads the tasks of the open chat again on a reconnect', async () => {
+    const task = { id: 't-1', title: 'Write the report', status: 'pending', relation: 'created' } as never;
+    onSession({ sessionTasks: [] });
+    vi.mocked(api.getSessionTasks).mockImplementation(async () => ({ tasks: [task] }));
+    try {
+      onSocketOpen?.();
+      onSocketOpen?.();
+      await vi.waitFor(() => expect(useChatStore.getState().sessionTasks).toEqual([task]));
+      expect(api.getSessionTasks).toHaveBeenCalledWith(SID);
+    } finally {
+      vi.mocked(api.getSessionTasks).mockImplementation(async () => ({ tasks: [] }));
+    }
+  });
+
+  it('keeps the view when nothing changed', async () => {
+    const before = [shown(1, 'user', 'hi'), shown(2, 'assistant', 'hello')];
+    onSession({ messages: before });
+    vi.mocked(api.getMessages).mockResolvedValueOnce({ messages: [userRow(1, 'hi'), replyRow(2, 'hello')] });
+
+    await useChatStore.getState().catchUp();
+
+    expect(useChatStore.getState().messages).toBe(before);
+    expect(api.getModifiedFiles).not.toHaveBeenCalled();
+  });
+
+  it('keeps a message sent during the reconnect until the server stores it', async () => {
+    onSession({ messages: [shown(1, 'user', 'hi')] });
+    await useChatStore.getState().sendMessage('run the tests');
+    vi.mocked(api.getMessages).mockResolvedValueOnce({ messages: [userRow(1, 'hi'), replyRow(2, 'hello')] });
+
+    await useChatStore.getState().catchUp();
+
+    expect(texts()).toEqual(['hi', 'hello', 'run the tests']);
+    expect(useChatStore.getState().messages[2].client_msg_id).toBeTruthy();
+  });
+
+  it('reads again when a live event changes the rows during the read', async () => {
+    onSession({ messages: [shown(1, 'user', 'hi')] });
+    let answer: (value: { messages: unknown[] }) => void = () => {};
+    vi.mocked(api.getMessages)
+      .mockReturnValueOnce(new Promise((done) => { answer = done; }))
+      .mockResolvedValueOnce({ messages: [userRow(1, 'hi'), replyRow(2, 'done reply'), userRow(3, 'next')] });
+
+    const run = useChatStore.getState().catchUp();
+    dispatch({ type: 'user_message', session_id: SID, content: 'next', actor_id: null });
+    answer({ messages: [userRow(1, 'hi')] });
+    await run;
+
+    expect(api.getMessages).toHaveBeenCalledTimes(2);
+    expect(texts()).toEqual(['hi', 'done reply', 'next']);
+  });
+
+  it('drops the read when another chat opens meanwhile', async () => {
+    onSession({ messages: [shown(1, 'user', 'hi')] });
+    let answer: (value: { messages: unknown[] }) => void = () => {};
+    vi.mocked(api.getMessages).mockReturnValueOnce(new Promise((done) => { answer = done; }));
+
+    const run = useChatStore.getState().catchUp();
+    useChatStore.setState({ activeSession: 's-other', messages: [] });
+    answer({ messages: [userRow(1, 'hi'), replyRow(2, 'hello')] });
+    await run;
+
+    expect(useChatStore.getState().messages).toEqual([]);
+  });
+
+  it('shows the stored reply when the turn ended while the socket was down', async () => {
+    onSession({
+      messages: [shown(1, 'user', 'hi')],
+      isStreaming: true,
+      streamingBlocks: [{ type: 'text', content: 'half a rep' }],
+      agentStatus: { state: 'thinking' },
+    });
+    vi.mocked(api.getMessages).mockResolvedValueOnce({ messages: [userRow(1, 'hi'), replyRow(2, 'the whole reply')] });
+
+    dispatch({ type: 'session_status', session_id: SID, is_running: false });
+
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    expect(useChatStore.getState().streamingBlocks).toEqual([]);
+    await vi.waitFor(() => expect(texts()).toEqual(['hi', 'the whole reply']));
+  });
+});
+
+describe('starting a chat from the Inbox', () => {
+  // An unsent new chat with a draft and a review loop set up in the chat page.
+  const loop = { ...EMPTY_REVIEW_LOOP, goal: 'Ship the parser', verifier: 'Tests pass', budget: '20' };
+  beforeEach(() => {
+    useChatStore.setState({
+      sessions: [], messages: [], isStreaming: false, streamingBlocks: [],
+      activeSession: 'v-1', virtualSession: { id: 'v-1', title: '', source: 'web', updated_at: '' },
+      drafts: { 'v-1': 'half a thought' }, newChatReviewLoop: loop,
+      newChatBackend: 'codex', newChatModels: { codex: 'gpt-x' },
+    });
+  });
+
+  it('opens a new default chat and leaves the unsent chat, its draft and its settings alone', async () => {
+    vi.mocked(api.createSession).mockResolvedValueOnce({ id: 'n-1', source: 'web' });
+
+    const started = await useChatStore.getState().startChat('Plan my week');
+
+    expect(started).toEqual({ sessionId: 'n-1', sent: true });
+    // No backend, model, work directory or review loop: the defaults.
+    expect(api.createSession).toHaveBeenCalledWith();
+    expect(ws.sendMessage).toHaveBeenCalledWith('Plan my week', 'n-1', undefined, expect.any(String));
+    const s = useChatStore.getState();
+    expect(s.activeSession).toBe('n-1');
+    expect(s.sessions.map(r => r.id)).toEqual(['n-1']);
+    expect(s.virtualSession?.id).toBe('v-1');
+    expect(s.drafts['v-1']).toBe('half a thought');
+    expect(s.newChatReviewLoop).toEqual(loop);
+    expect(s.newChatBackend).toBe('codex');
+    expect(s.newChatModels).toEqual({ codex: 'gpt-x' });
+  });
+
+  it('opens nothing when the chat cannot be created', async () => {
+    vi.mocked(api.createSession).mockRejectedValueOnce(new Error('500'));
+    vi.spyOn(console, 'error').mockImplementationOnce(() => {});
+
+    expect(await useChatStore.getState().startChat('Plan my week')).toBeNull();
+
+    expect(useChatStore.getState().activeSession).toBe('v-1');
+    expect(ws.sendMessage).not.toHaveBeenCalled();
+  });
+
+  it('reports a message that could not be sent, and sends a retry to the same chat', async () => {
+    vi.mocked(api.createSession).mockResolvedValueOnce({ id: 'n-1', source: 'web' });
+    vi.mocked(ws.sendMessage).mockReturnValueOnce('dropped');
+
+    expect(await useChatStore.getState().startChat('Plan my week')).toEqual({ sessionId: 'n-1', sent: false });
+    expect(await useChatStore.getState().startChat('Plan my week', 'n-1')).toEqual({ sessionId: 'n-1', sent: true });
+
+    expect(api.createSession).toHaveBeenCalledTimes(1);
+    expect(ws.sendMessage).toHaveBeenLastCalledWith('Plan my week', 'n-1', undefined, expect.any(String));
+    expect(useChatStore.getState().sessions.map(r => r.id)).toEqual(['n-1']);
+  });
+
+  it('starts a new chat when the chat of the failed send is gone', async () => {
+    vi.mocked(api.createSession).mockResolvedValueOnce({ id: 'n-2', source: 'web' });
+
+    expect(await useChatStore.getState().startChat('Plan my week', 'n-1')).toEqual({ sessionId: 'n-2', sent: true });
+    expect(api.createSession).toHaveBeenCalledTimes(1);
   });
 });
 

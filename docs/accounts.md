@@ -119,7 +119,10 @@ installation's system actor.
 | Backend and external MCP token | The system actor |
 
 Disabling an account blocks its next HTTP or MCP request and any new WebSocket
-connection, and closes its open WebSocket connections. Autonomous work, including cron jobs and background agents, uses the
+connection, and closes its open WebSocket connections. It also stops the
+[push notifications](web-ui.md#push-notifications) to the browsers of the
+account. Nerve keeps their subscriptions, so push starts again when the
+account is enabled again. Autonomous work, including cron jobs and background agents, uses the
 system actor rather than a human account.
 
 ### External mode
@@ -136,8 +139,15 @@ and names the person behind each request. See
 | Backend and external MCP token | The system actor |
 
 The header is a compact JWS. Nerve reads `principal_id` and
-`profile.display_name` from its payload. It does not check the signature or
-any other claim. `principal_id` must be a UUID, and Nerve uses its lowercase
+`profile.display_name` from its payload. With `auth.external.gateway_jwks_file`
+set, Nerve first checks the gateway's signature with a key from that file, and
+the claims: this tenant and agent, the method and target of this request, the
+issue and expiry times, and that the assertion was not used before. It checks
+a request when the request arrives, before it reads the body. A failed check
+gives `401`, and a missing key set gives `503`. See
+[Actor context verification](config.md#actor-context-verification). Without
+that setting, Nerve does not check the signature or any other claim.
+`principal_id` must be a UUID, and Nerve uses its lowercase
 form as the actor ID. `profile.display_name` must be a string, `null`, or
 absent. A header that Nerve cannot read, a header that names the system actor,
 and a request with more than one header give `401`. When the header is
@@ -149,6 +159,20 @@ Nerve adds an `actor_refs` row of kind `human` when it sees a principal for the
 first time, and writes the display name again when it changes. The row has no
 `accounts` row. Nerve does not check the access of the person; the gateway
 does.
+
+A hosted channel event that invokes the agent (a message, a reaction, or a
+button press) names the person that the channel gateway resolved from the
+provider user. Nerve adds the `actor_refs` row of that person when it is
+absent. When the event also gives the display name of that person, Nerve
+writes it only to a row that has no name, so it keeps the display name that a
+web request stored. A message or a reaction runs its turn as that person, and
+a button press answers its notification as that person. An event that names no
+person or the system actor has no actor. In local mode, hosted channel events
+have no actor.
+
+A hosted channel observation can name the person that the channel gateway
+linked to the provider user. Nerve shows that person in the inbox record only.
+It adds no `actor_refs` row and authorizes nothing with it.
 
 In external mode:
 
@@ -163,15 +187,22 @@ In external mode:
 - Startup can give the system actor the ID of the agent's system principal.
   See [The system actor in external mode](#the-system-actor-in-external-mode).
 - Accounts and history from an earlier local mode stay in `nerve.db`.
+- Nerve does not know when the gateway removes the access of a person. The
+  browsers where that person turned on
+  [push notifications](web-ui.md#push-notifications) continue to show them.
+  This stops when the person blocks the notifications of the panel in each
+  browser, or when somebody with access to `nerve.db` deletes the rows of
+  that person from `push_subscriptions` (`actor_id` is the principal ID). No
+  route removes the browsers of a different person.
 - Each model request names the principal that caused the work, in the
   `X-Nerve-Inference-Principal` header: the session's cause, or the system
   actor for Nerve's own model calls. See
   [Inference principal header](config.md#inference-principal-header).
 
-> **Warning:** Nerve trusts the header. Use external mode only when the
-> gateway is the only caller that can reach Nerve. A caller that can send the
-> header can act as any person, also as the actor of an account from an earlier
-> local mode.
+> **Warning:** Without `auth.external.gateway_jwks_file`, Nerve trusts the
+> header. Then use external mode only when the gateway is the only caller that
+> can reach Nerve. A caller that can send the header can act as any person,
+> also as the actor of an account from an earlier local mode.
 
 ### The system actor in external mode
 
@@ -241,6 +272,7 @@ These columns store actor IDs:
 | `review_loop_decisions.actor_id`, `review_loop_decisions.caused_by_actor_id` | Actor and cause of one decision on a parked review loop |
 | `session_wakeups.created_by_actor_id`, `session_wakeups.caused_by_actor_id` | Who scheduled a wakeup or a deferred message, and on whose behalf. The turn that it fires runs in its session, for the session's cause |
 | `cron_logs.actor_id`, `cron_logs.caused_by_actor_id` | Who started a cron or source run, and on whose behalf |
+| `task_comments.actor_id`, `task_comments.caused_by_actor_id` | Who wrote a task comment, and on whose behalf |
 
 `nerve/db/actor_columns.py` lists every attribution column. Clients resolve
 names through `GET /api/actors`, which returns every actor that these columns
@@ -261,7 +293,8 @@ never changes it:
 | A plan implementation session after the agent approved the plan | The cause of the session in which the agent approved it |
 | A planner session that a revision request creates | The person who asked for the revision |
 | A workflow run's session, and each leg session of a review loop | The cause of the run or the loop: its creator, or the cause of the session whose tool call started it. A loop leg keeps the loop's cause, also after a decision by another person |
-| A Telegram, Slack or other channel session, or an imported Codex session | None until a local identity mapping exists |
+| A session that a hosted channel message or reaction starts, in external mode | The person that the channel gateway resolved |
+| Another Telegram, Slack or other channel session, or an imported Codex session | None until a local identity mapping exists |
 | An external MCP client's session | None |
 
 Everything the agent does in a session (a tool call, a task it changes, a plan
@@ -296,13 +329,15 @@ in the same way, so the same approximation applies to model usage. See
 | A person answers, dismisses, or silences notifications, or reviews a plan, through the web UI or the REST API | The person | The person |
 | A person starts or kills a workflow run or a review loop through the web UI or the REST API, or decides on a parked loop through the REST API or its decision card in the web UI | The person | The person |
 | The agent starts or kills a workflow run or a review loop | The system actor | The session's cause |
-| The message that relays a web answer into the session that asked | The person who answered | Not recorded (the agent's work in that turn has the session's cause) |
+| The message that relays a web answer into the session that asked, also a hosted channel answer in external mode | The person who answered | Not recorded (the agent's work in that turn has the session's cause) |
 | A scheduled cron or source run (also a catch-up or missed run, and `nerve cron <id>`) | The system actor on the run log | The system actor |
 | A person starts a cron or source run from the web UI or with `POST /api/cron/jobs/{job_id}/trigger` | The person on the run log; the system actor for the workflow run that a workflow-run job starts | The person |
 | A person defers a message with "Run later" | The person on the wakeup row | The person |
 | The agent schedules a wakeup (`ScheduleWakeup`, `schedule_wakeup`) | The system actor | The session's cause |
-| Telegram, Slack, or imported Codex input, and channel commands (`/new`, `/stop`, `/star`) | None until a local identity mapping exists | None |
-| An answer through Telegram, Slack, or a hosted channel (also a decision on a review-loop card), and the message that relays it | None | None |
+| A message or a reaction through a hosted channel, in external mode | The person that the channel gateway resolved | The person |
+| An answer through a hosted channel (also a decision on a review-loop card), in external mode | The person that the channel gateway resolved | The person |
+| Other Telegram, Slack, or imported Codex input, and channel commands (`/new`, `/stop`, `/star`) | None until a local identity mapping exists | None |
+| Another answer through Telegram, Slack, or a hosted channel (also a decision on a review-loop card), and the message that relays it | None | None |
 | Assistant and tool output | None | None |
 
 Existing records remain unattributed: Nerve does not backfill these columns.
@@ -329,6 +364,7 @@ work uses the system actor.
 | `starred`, `unstarred` | The session is starred or unstarred | |
 | `model_changed` | The model changes | `model`, `previous` |
 | `parent_changed` | The session moves under another session, or back to the top level | `parent_session_id`, `previous` |
+| `compacted` | A Compact compacts the conversation. A Compact that stops, fails or has nothing to compact records no event | |
 | `archived`, `unarchived` | The session is archived or restored | `cascade_root` for a session that an archive of an ancestor archives; `reason` for an automatic archive (`idle_interactive`, `stale`, `overflow`, `codex_thread_archived`) |
 | `stop_requested` | A stop request reaches a running turn; each request is one event | `scope` (`turn`), `outcome` (`stopped`, `killed`, `not_stopped`, …), `live_agents` |
 | `agent_stop_requested` | One agent is stopped (with the agents it started) | `agent_ids`, `task_ids`, `cascade` |

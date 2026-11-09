@@ -8,9 +8,10 @@ the mode, the workspace, how configuration changes, the model, memory, and the
 connections: what is configured and where it comes from
 (:func:`nerve.setup_provenance.credential_sources`), the GitHub CLI's login
 (the probe of the setup page's sources preflight,
-:func:`nerve.setup_checks._gh_status`), the GitHub sync source and its
-repositories, Slack (with the platform's gateway in hosted mode), Telegram,
-Gmail, and the time zone and quiet hours.
+:func:`nerve.setup_checks._gh_status`), the GitHub sync source (its inbox and
+repository filter), the repository watch and its repositories, Slack (with the
+platform's gateway in hosted mode), Telegram, Gmail, and the time zone and
+quiet hours.
 
 One line per item, always in the same order, each a fact or ``unknown``.
 Sources and identities only: never a secret, a part of one, or a hash.
@@ -253,22 +254,46 @@ def _github_access(cli: _GitHubCLI) -> str:
     )
 
 
+#: What each ``sync.github.inbox`` lists.
+_INBOXES = {
+    "participating": "notifications of the threads the account takes part in (inbox `participating`)",
+    "all": "the account's whole notification inbox (inbox `all`)",
+}
+#: How the repository watch names each of its types.
+_WATCHED_TYPES = {"pull_request": "pull requests", "issue": "issues", "release": "releases"}
+
+
 def _github_sync_text(config: Any) -> str:
     sync = config.sync
     parts: list[str] = []
     if sync.github.enabled:
+        inbox = str(sync.github.inbox)
         repos = list(sync.github.allow_repos or [])
-        parts.append("notifications from " + (_names(repos) if repos else "all repositories"))
-    if sync.github_repos.enabled:
-        repos = list(sync.github_repos.repos or [])
-        if repos:
-            parts.append("new issues and pull requests in " + _names(repos))
-        else:
-            parts.append("new issues and pull requests, but no repositories are listed")
+        parts.append(
+            _INBOXES.get(inbox, f"notifications (inbox `{inbox}`)")
+            + (f", only from {_names(repos)}" if repos else ", with no repository filter")
+        )
     if sync.github_events.enabled:
         repos = list(sync.github_events.repos or [])
         parts.append("the account's own activity" + (f" in {_names(repos)}" if repos else ""))
     return "on: " + "; ".join(parts) if parts else "off"
+
+
+def _github_repos_text(config: Any) -> str:
+    """The repository watch: who polls, what it reports, and where."""
+    watch = config.sync.github_repos
+    if not watch.enabled:
+        return "off"
+    repos = list(watch.repos or [])
+    if not repos:
+        return "on, but no repositories are listed"
+    kinds = [_WATCHED_TYPES[kind] for kind in watch.types or () if kind in _WATCHED_TYPES]
+    what = " and ".join([", ".join(kinds[:-1]), kinds[-1]] if len(kinds) > 1 else kinds)
+    how = "the channel gateway polls" if config.sync.github.mode == "hosted" else "polled here with `gh`"
+    text = f"on ({how}): new {what} in {_names(repos)}"
+    if watch.updates:
+        text += "; also new commits, ready for review, merges and closes of the pull requests it reported"
+    return text
 
 
 def _slack_text(config: Any, sources: dict[str, str | None] | None) -> str:
@@ -365,6 +390,7 @@ def gather(
         ("GitHub token", lambda: _github_token_text(sources)),
         ("GitHub CLI (`gh`)", lambda: _github_cli_text(cli)),
         ("GitHub sync source", lambda: _github_sync_text(config)),
+        ("GitHub repository watch", lambda: _github_repos_text(config)),
         ("Slack", lambda: _slack_text(config, sources)),
         ("Telegram channel", lambda: _telegram_channel_text(config, sources)),
         ("Telegram message sync", lambda: _telegram_sync_text(config, sources)),
