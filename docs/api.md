@@ -1911,7 +1911,7 @@ Response: {
       "pull": {
         "repo": "example/repo", "number": 12, "title": "Fix the flaky login test",
         "state": "open", "review": "approved",
-        "checks": { "passed": 12, "failed": 0, "running": 3 },
+        "checks": { "passed": 12, "failed": 0, "running": 3, "cancelled": 0 },
         "head_ref": "alice/fix-login", "base_ref": "main"
       }
     },
@@ -1921,8 +1921,11 @@ Response: {
 ```
 
 A check run that ends as success, neutral or skipped counts as passed. A check
-run that has not completed counts as running. A commit status counts as running
-while it is pending or expected.
+run that ends as cancelled or stale counts as cancelled: it gave no result (a
+newer run replaced it, a fail-fast matrix stopped it, someone cancelled it), and
+it is not a failure. Every other conclusion counts as failed. A check run that
+has not completed counts as running. A commit status counts as running while it
+is pending or expected.
 
 ### Diagnostics
 

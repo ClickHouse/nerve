@@ -47,6 +47,10 @@ GH_UNAVAILABLE = "gh_unavailable"
 
 # A check run that ends with one of these conclusions counts as passed.
 _PASSED_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+# A check run that ends with one of these conclusions never gave a result:
+# it was stopped (a newer run of the same workflow, a fail-fast matrix, a
+# hand on the button) or GitHub set it aside. It is not a failure.
+_CANCELLED_CONCLUSIONS = {"CANCELLED", "STALE"}
 # A commit status in one of these states has no result yet.
 _PENDING_STATUS_STATES = {"PENDING", "EXPECTED"}
 
@@ -64,12 +68,12 @@ def reset_cache() -> None:
 
 
 def _check_counts(rollup: list[dict[str, Any]] | None) -> dict[str, int]:
-    """Passed, failed and running checks of ``statusCheckRollup``.
+    """Passed, failed, running and cancelled checks of ``statusCheckRollup``.
 
     The rollup has two kinds of item: a check run (``status`` and
     ``conclusion``) and a commit status (``state``).
     """
-    counts = {"passed": 0, "failed": 0, "running": 0}
+    counts = {"passed": 0, "failed": 0, "running": 0, "cancelled": 0}
     for check in rollup or []:
         if check.get("__typename") == "StatusContext":
             state = check.get("state") or ""
@@ -83,6 +87,8 @@ def _check_counts(rollup: list[dict[str, Any]] | None) -> dict[str, int]:
             counts["running"] += 1
         elif check.get("conclusion") in _PASSED_CONCLUSIONS:
             counts["passed"] += 1
+        elif check.get("conclusion") in _CANCELLED_CONCLUSIONS:
+            counts["cancelled"] += 1
         else:
             counts["failed"] += 1
     return counts

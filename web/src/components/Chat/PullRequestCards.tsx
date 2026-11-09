@@ -7,7 +7,7 @@ import type {
 import { findPullRequests, type PullRequestRef } from '../../utils/pullRequestLinks';
 import { Badge, type BadgeTone } from '../ui/Badge';
 import {
-  Check, CircleDashed, ExternalLink, GitMerge, GitPullRequest, GitPullRequestClosed,
+  Ban, Check, CircleDashed, ExternalLink, GitMerge, GitPullRequest, GitPullRequestClosed,
   GitPullRequestDraft, X, type Icon,
 } from '../ui/icons';
 
@@ -111,14 +111,19 @@ function usePullRequests(urls: string[], visible: boolean): { results: Map<strin
 }
 
 function Checks({ pull }: { pull: PullRequestSummary }) {
-  const { passed, failed, running } = pull.checks;
+  const { passed, failed, running, cancelled } = pull.checks;
   const review = pull.review ? REVIEWS[pull.review] : null;
-  if (!passed && !failed && !running && !review) return null;
+  if (!passed && !failed && !running && !cancelled && !review) return null;
   return (
     <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
       {failed > 0 && (
         <span className="inline-flex items-center gap-1 text-error">
           <X size={12} aria-hidden /> {failed} failed
+        </span>
+      )}
+      {cancelled > 0 && (
+        <span className="inline-flex items-center gap-1 text-text-muted">
+          <Ban size={12} aria-hidden /> {cancelled} cancelled
         </span>
       )}
       {running > 0 && (
