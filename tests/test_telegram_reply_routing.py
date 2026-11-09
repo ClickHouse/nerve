@@ -313,8 +313,18 @@ async def test_reply_to_own_recorded_message_routes_to_where_it_landed(db):
 
 
 # --------------------------------------------------------------------------- #
-#  Feature flag: telegram.reply_routes_to_origin_session (default off)         #
+#  Feature flag: telegram.reply_routes_to_origin_session (default on)          #
 # --------------------------------------------------------------------------- #
+
+def test_routing_is_on_by_default():
+    from nerve.config import NerveConfig, TelegramConfig
+
+    assert NerveConfig().telegram.reply_routes_to_origin_session is True
+    assert TelegramConfig.from_dict({}).reply_routes_to_origin_session is True
+    assert TelegramConfig.from_dict(
+        {"reply_routes_to_origin_session": False},
+    ).reply_routes_to_origin_session is False
+
 
 def test_routing_enabled_reflects_config():
     db = MagicMock()

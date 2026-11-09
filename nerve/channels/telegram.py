@@ -57,9 +57,9 @@ MAX_MSG_LEN = 4096
 # rather than silently mis-routing the reply into the chat's active session.
 REPLY_UNRESOLVED_MSG = (
     "⚠️ I couldn't find the session that produced the message you replied to "
-    "(it may be too old, or its session was archived). Nothing was sent, to "
-    "avoid routing it to the wrong session. Use /sessions to pick the session "
-    "you want, then send your message again."
+    "(it may be too old, or its session was archived), so nothing was sent. "
+    "Reply with /new <your message> to start a new session with it quoted, "
+    "or send the message without replying to reach the active session."
 )
 # Minimum interval between message edits (seconds) to avoid rate limits
 EDIT_INTERVAL = 1.5
@@ -1304,11 +1304,12 @@ class TelegramChannel(BaseChannel):
     def _reply_routing_enabled(self) -> bool:
         """Whether reply→origin-session routing is on (a telegram config flag).
 
-        Off by default: a reply is then context-only and lands in the active
-        session, and none of the resolve / reject machinery runs. Routes are
-        still recorded (see ``_record_reply_route``), so turning the flag on
-        covers earlier messages too. Read live per message so a config reload
-        can flip it without a restart.
+        On by default. ``false`` restores the old behaviour: a reply is then
+        context-only and lands in the active session, and none of the resolve /
+        reject machinery runs. Routes are still recorded (see
+        ``_record_reply_route``), so turning the flag back on covers earlier
+        messages too. Read live per message so a config reload can flip it
+        without a restart.
         """
         return bool(self.config.telegram.reply_routes_to_origin_session)
 
@@ -1500,7 +1501,10 @@ class TelegramChannel(BaseChannel):
                 )
             return
         await update.message.reply_text(
-            "Connected to Nerve. Send me a message to start chatting."
+            "Connected to Nerve. Send me a message to start chatting.\n\n"
+            "Replying to a message continues the session it belongs to. "
+            "/new [message] starts a fresh session, with the message as its "
+            "first turn if given. /sessions lists and switches sessions."
         )
 
     async def _handle_pair(self, update: Update, context: Any) -> None:
@@ -1978,7 +1982,13 @@ class TelegramChannel(BaseChannel):
             )
 
     async def _handle_new_session(self, update: Update, context: Any) -> None:
-        """Handle /new [title] — stop current session, create and switch to a new one."""
+        """Handle /new [message] — stop the current session, switch to a new one.
+
+        Text after the command is the new session's first message, delivered
+        through the same pipeline as a plain message but with the new session
+        forced as the target. A reply's routing is bypassed, so this is how to
+        answer a message without continuing the session it came from.
+        """
         self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
@@ -1995,14 +2005,17 @@ class TelegramChannel(BaseChannel):
                     parse_mode=ParseMode.MARKDOWN,
                 )
 
-        title = " ".join(context.args) if context.args else None
-        session_id = await self.router.create_session(
-            channel_key, title=title, source="telegram",
-        )
+        # Taken from the raw text rather than ``context.args``, which is
+        # whitespace-split and would flatten a multi-line message. No title:
+        # the engine names the session from its first exchange.
+        parts = (update.message.text or "").split(maxsplit=1)
+        first_message = parts[1] if len(parts) > 1 else ""
+        session_id = await self.router.create_session(channel_key, source="telegram")
         await update.message.reply_text(
-            f"New session: `{session_id}`" + (f" — {title}" if title else ""),
-            parse_mode=ParseMode.MARKDOWN,
+            f"New session: `{session_id}`", parse_mode=ParseMode.MARKDOWN,
         )
+        if first_message:
+            await self._deliver_message(update, first_message, session_id=session_id)
 
     async def _handle_stop(self, update: Update, context: Any) -> None:
         """Handle /stop — stop the currently running session."""
@@ -2456,8 +2469,24 @@ class TelegramChannel(BaseChannel):
             await self._collect_media_group(update)
             return
 
+        await self._deliver_message(
+            update, update.message.text or update.message.caption or "",
+        )
+
+    async def _deliver_message(
+        self, update: Update, text: str, *, session_id: str | None = None,
+    ) -> None:
+        """Turn one inbound message into an agent turn.
+
+        Builds the agent-facing text (forward origin, reply context and quote,
+        attachments on this message and on the replied-to one), picks the
+        session and delivers. ``session_id`` forces the target: ``/new <text>``
+        passes the session it just created, so the message gets there even as
+        a reply — no routing lookup, no rejection. Otherwise a reply routes to
+        the session that produced the replied-to message when routing is on,
+        and anything else lands in the chat's active session.
+        """
         chat_id = update.effective_chat.id
-        text = update.message.text or update.message.caption or ""
 
         # Cache for reaction lookups (raw text, before reply-context prefix)
         self._cache_message(update.message.message_id, chat_id, text)
@@ -2518,12 +2547,15 @@ class TelegramChannel(BaseChannel):
         if images:
             metadata["images"] = images
 
-        # Reply routing (telegram.reply_routes_to_origin_session, default off).
+        # Reply routing (telegram.reply_routes_to_origin_session, on by default).
         # When off, a reply is context-only and lands in the active session
-        # (session_id stays None), exactly like a plain message.
+        # (the target stays None), exactly like a plain message. A forced
+        # target skips the lookup altogether: a reply the user sent as
+        # /new <text> must never be refused on its way to the session they
+        # just asked for.
         channel_key = f"telegram:{chat_id}"
-        target_session: str | None = None
-        if self._reply_routing_enabled():
+        target_session: str | None = session_id
+        if target_session is None and self._reply_routing_enabled():
             # Route a reply to the session that produced the replied-to message
             # (and make it active). An unresolvable reply is rejected with a
             # no-LLM nudge rather than mis-routed into the active session.
@@ -2734,7 +2766,7 @@ class TelegramChannel(BaseChannel):
         if images:
             metadata["images"] = images
 
-        # Reply routing (telegram.reply_routes_to_origin_session, default off).
+        # Reply routing (telegram.reply_routes_to_origin_session, on by default).
         # When off, a reply is context-only and lands in the active session
         # (session_id stays None), exactly like a plain message.
         channel_key = f"telegram:{chat_id}"

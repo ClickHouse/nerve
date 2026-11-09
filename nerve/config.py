@@ -1545,12 +1545,14 @@ class TelegramConfig:
     #                         agent access for any Telegram user. A warning
     #                         is logged at startup.
     dm_policy: str = "pairing"
-    # When True, a Telegram *reply* is routed to the session that produced the
-    # replied-to message (and that session becomes active); a reply that can't
-    # be tied to a live session is refused rather than delivered to the active
-    # session. When False (default) a reply is context-only — it quotes the
+    # On (the default), a Telegram *reply* is routed to the session that
+    # produced the replied-to message (and that session becomes active); a
+    # reply that can't be tied to a live session is refused with a hint rather
+    # than delivered to the active session. `/new <message>` is the escape
+    # hatch: it starts a fresh session with that message, reply or not. False
+    # restores the old behaviour: a reply is context-only — it quotes the
     # replied-to message and lands in the active session, like a plain message.
-    reply_routes_to_origin_session: bool = False
+    reply_routes_to_origin_session: bool = True
     # Chats whose traffic feeds the inbox — see ChannelSourceConfig.
     source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
 
@@ -1597,7 +1599,7 @@ class TelegramConfig:
             stream_mode=d.get("stream_mode", "partial"),
             dm_policy=dm_policy,
             reply_routes_to_origin_session=d.get(
-                "reply_routes_to_origin_session", False,
+                "reply_routes_to_origin_session", True,
             ),
             source=ChannelSourceConfig.from_dict(
                 d.get("source", {}), subject="chats",
