@@ -137,11 +137,20 @@ class PlanStore:
         ) as cursor:
             return [row[0] async for row in cursor]
 
-    async def count_pending_plans_by_session(self) -> dict[str, int]:
-        """Pending plans per proposing session: ``{session_id: count}``."""
-        async with self.db.execute(
-            """SELECT session_id, COUNT(*) FROM plans
-               WHERE status = 'pending' AND session_id IS NOT NULL
-               GROUP BY session_id"""
-        ) as cursor:
+    async def count_pending_plans_by_session(
+        self, created_since: str | None = None,
+    ) -> dict[str, int]:
+        """Pending plans per proposing session: ``{session_id: count}``.
+
+        With ``created_since`` (an ISO timestamp in UTC, the format that
+        ``created_at`` has), only plans proposed at or after it count.
+        """
+        sql = """SELECT session_id, COUNT(*) FROM plans
+                 WHERE status = 'pending' AND session_id IS NOT NULL"""
+        params: tuple = ()
+        if created_since is not None:
+            sql += " AND created_at >= ?"
+            params = (created_since,)
+        sql += " GROUP BY session_id"
+        async with self.db.execute(sql, params) as cursor:
             return {session_id: count async for session_id, count in cursor}

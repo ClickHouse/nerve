@@ -73,6 +73,14 @@ from nerve.utils.aio import stop_background_task
 
 logger = logging.getLogger(__name__)
 
+# FastAPI's native OpenTelemetry support is off for each app that Nerve
+# builds. Langfuse installs the global tracer provider, and FastAPI uses it.
+# The span of a /ws connection then stays current for as long as the socket
+# is open, so each agent turn that the socket starts gets that span as its
+# parent, and all those turns go into one Langfuse trace. Nerve traces the
+# agent loop itself (nerve.observability.langfuse).
+_FASTAPI_TELEMETRY = {"tracing": False, "metrics": False, "logs": False}
+
 # Global references
 _engine: AgentEngine | None = None
 _cron_service = None  # CronService
@@ -562,7 +570,10 @@ async def lifespan(app: FastAPI):
                 try:
                     from nerve.gateway.routes.codex import router as codex_router
 
-                    loopback_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+                    loopback_app = FastAPI(
+                        docs_url=None, redoc_url=None, openapi_url=None,
+                        telemetry=_FASTAPI_TELEMETRY,
+                    )
                     _mount_mcp_deferred(
                         loopback_app, config, lambda: _mcp_manager,
                     )
@@ -1155,6 +1166,7 @@ def create_app() -> FastAPI:
         description="Personal AI Assistant",
         version="0.1.0",
         lifespan=lifespan,
+        telemetry=_FASTAPI_TELEMETRY,
     )
 
     # Render a lockdown violation as a clean 403 instead of an opaque 500.

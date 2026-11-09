@@ -175,6 +175,35 @@ class TestSidebarListRoutes:
         assert body["system_count"] == 3
         assert body["next_offset"] == 2
 
+    async def _age_plan(self, db: Database, plan_id: str, days: float) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        when = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        await db.db.execute("UPDATE plans SET created_at = ? WHERE id = ?", (when, plan_id))
+        await db.db.commit()
+
+    async def test_an_old_pending_plan_does_not_need_you(self, setup):
+        """Past ``plan_attention_days`` (7 by default), a pending plan no longer
+        puts its session in "Needs you", and page 1 does not add it."""
+        await self._seed(setup.sm, setup.db, chats=1, crons=2)
+        await self._plan(setup.db, "plan-new", "cron-000")
+        await self._plan(setup.db, "plan-old", "cron-001")
+        await self._age_plan(setup.db, "plan-new", 6.9)
+        await self._age_plan(setup.db, "plan-old", 7.1)
+
+        rows = {s["id"]: s for s in setup.client.get("/api/sessions").json()["sessions"]}
+        assert sorted(rows) == ["chat-000", "cron-000"]
+        assert rows["cron-000"]["attention"]["plans"] == 1
+
+    async def test_plan_attention_days_zero_counts_every_pending_plan(self, setup):
+        setup.cfg.sessions.plan_attention_days = 0
+        await self._seed(setup.sm, setup.db, crons=1)
+        await self._plan(setup.db, "plan-old", "cron-000")
+        await self._age_plan(setup.db, "plan-old", 400)
+
+        rows = {s["id"]: s for s in setup.client.get("/api/sessions").json()["sessions"]}
+        assert rows["cron-000"]["attention"]["plans"] == 1
+
     async def test_page_one_adds_a_waiting_session_from_a_later_page(self, setup):
         setup.cfg.sessions.sidebar_page_size = 5
         await self._seed(setup.sm, setup.db, chats=8)
@@ -286,10 +315,59 @@ class TestAttentionCounts:
 
         assert await db.count_pending_plans_by_session() == {"s1": 2}
 
-    async def test_plan_count_reads_only_the_index(self, db: Database):
-        async with db.db.execute(
+    async def test_pending_plans_since_a_time_are_counted(self, db: Database):
+        await db.create_plan("p1", "t1", "c", session_id="s1")
+        await db.create_plan("p2", "t2", "c", session_id="s1")
+        await db.create_plan("p3", "t3", "c", session_id="s2")
+        for plan_id, created in [
+            ("p1", "2026-01-01T00:00:00+00:00"),
+            ("p2", "2026-01-10T00:00:00+00:00"),
+            ("p3", "2026-01-05T00:00:00+00:00"),
+        ]:
+            await db.db.execute("UPDATE plans SET created_at = ? WHERE id = ?", (created, plan_id))
+        await db.db.commit()
+
+        assert await db.count_pending_plans_by_session("2026-01-05T00:00:00+00:00") == {
+            "s1": 1, "s2": 1,
+        }
+        assert await db.count_pending_plans_by_session("2026-01-06T00:00:00+00:00") == {"s1": 1}
+
+    @pytest.mark.parametrize("since", [False, True])
+    async def test_plan_count_reads_only_the_index(self, db: Database, since: bool):
+        sql = (
             "EXPLAIN QUERY PLAN SELECT session_id, COUNT(*) FROM plans"
-            " WHERE status = 'pending' AND session_id IS NOT NULL GROUP BY session_id"
-        ) as cursor:
+            " WHERE status = 'pending' AND session_id IS NOT NULL"
+            + (" AND created_at >= '2026-01-01'" if since else "")
+            + " GROUP BY session_id"
+        )
+        async with db.db.execute(sql) as cursor:
             plan = " ".join(str(row[-1]) for row in await cursor.fetchall())
-        assert "COVERING INDEX idx_plans_status_session" in plan
+        assert "COVERING INDEX idx_plans_status_session_created" in plan
+
+
+@pytest.mark.asyncio
+async def test_v069_replaces_the_plan_index_and_reruns_without_change():
+    import aiosqlite
+
+    from nerve.db.migrations import v063_plans_session_index, v069_plans_status_session_created_index
+
+    db = await aiosqlite.connect(":memory:")
+    try:
+        await db.execute(
+            "CREATE TABLE plans (id TEXT PRIMARY KEY, status TEXT, session_id TEXT, created_at TEXT)"
+        )
+        await v063_plans_session_index.up(db)
+
+        async def indexes() -> list[str]:
+            async with db.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'plans'"
+                " AND sql IS NOT NULL ORDER BY name"
+            ) as cursor:
+                return [row[0] async for row in cursor]
+
+        await v069_plans_status_session_created_index.up(db)
+        assert await indexes() == ["idx_plans_status_session_created"]
+        await v069_plans_status_session_created_index.up(db)
+        assert await indexes() == ["idx_plans_status_session_created"]
+    finally:
+        await db.close()
