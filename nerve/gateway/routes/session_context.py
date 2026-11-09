@@ -38,8 +38,9 @@ async def _require_session(deps: Any, session_id: str) -> dict:
 
 def _last_turn_totals(session: dict) -> dict:
     """Totals from the session's last usage, as the context bar estimates
-    them: the measured ``context_tokens`` after a compact, else the turn's
-    input tokens divided by its model calls."""
+    them: ``context_tokens`` (measured after a compact, or the last model
+    call's input on Codex), else the turn's input tokens divided by its model
+    calls."""
     meta = json.loads(session.get("metadata") or "{}")
     usage = meta.get("last_usage") or {}
     total = usage.get("context_tokens")

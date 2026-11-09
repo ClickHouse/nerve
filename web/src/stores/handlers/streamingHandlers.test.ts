@@ -218,6 +218,11 @@ describe('context usage', () => {
     expect(useChatStore.getState().contextUsage?.context_tokens).toBeUndefined();
   });
 
+  it('keeps the input of the last call that Codex reports on done', () => {
+    send({ type: 'done', session_id: 's1', usage, max_context_tokens: 272000, num_turns: 3, context_tokens: 180000 });
+    expect(useChatStore.getState().contextUsage).toMatchObject({ context_tokens: 180000, num_turns: 3 });
+  });
+
   it('keeps it from the last usage when a session opens', async () => {
     const { api } = await import('../../api/client');
     vi.mocked(api.getMessages).mockResolvedValueOnce({
