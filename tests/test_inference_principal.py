@@ -34,14 +34,17 @@ from nerve.gateway.auth import AUTH_MODE_ENV, AUTH_MODE_EXTERNAL, pin_auth_mode
 from nerve.identity import Actor
 from nerve.inference_principal import (
     CUSTOM_HEADERS_ENV,
+    INFERENCE_ORIGIN_HEADER,
     INFERENCE_PRINCIPAL_HEADER,
     INFERENCE_TRIGGER_HEADER,
     custom_headers_env,
+    direct_client_headers,
+    inference_origin,
     inference_principal,
     inference_trigger,
     principal_headers,
 )
-from nerve.session_origin import Origin
+from nerve.session_origin import Origin, cron_origin
 from tests.actor_rows import ensure_actor_row
 
 ALICE = Actor(
@@ -81,6 +84,13 @@ def _triggers(env: dict[str, str]) -> list[str]:
     return [
         value for name, value in _cli_headers(env.get(CUSTOM_HEADERS_ENV, ""))
         if name.lower() == INFERENCE_TRIGGER_HEADER.lower()
+    ]
+
+
+def _origins(env: dict[str, str]) -> list[str]:
+    return [
+        value for name, value in _cli_headers(env.get(CUSTOM_HEADERS_ENV, ""))
+        if name.lower() == INFERENCE_ORIGIN_HEADER.lower()
     ]
 
 
@@ -140,6 +150,25 @@ class TestTrigger:
     @pytest.mark.parametrize("bad", [None, "", "web", "cron\nX-Injected: 1"])
     def test_a_value_outside_the_vocabulary_names_no_trigger(self, external, bad):
         assert inference_trigger(bad) is None
+
+
+class TestOrigin:
+    def test_local_mode_names_no_origin(self):
+        assert inference_origin(cron_origin("nightly")) is None
+
+    def test_external_mode_names_the_origin_tag(self, external):
+        assert inference_origin(cron_origin("nightly")) == "cron=nightly"
+        assert inference_origin(Origin("slack", {
+            "channel": "C0123ABCD", "thread": "1700000000.000100", "channel_name": "general",
+        })) == "channel=C0123ABCD"
+        assert inference_origin(Origin("api", {"hook": "deploy/main"})) == "hook=deploy_main"
+
+    @pytest.mark.parametrize("origin", [
+        Origin("chat"), Origin("system"), Origin("unknown", {"channel": "1"}),
+        Origin("cron", {"run_later": "1h"}), Origin("api"),
+    ])
+    def test_an_origin_without_a_tag_names_no_origin(self, external, origin):
+        assert inference_origin(origin) is None
 
 
 class TestCliEnvironment:
@@ -223,6 +252,41 @@ class TestCliEnvironment:
 
     def test_a_trigger_outside_the_vocabulary_is_never_written(self, external):
         assert custom_headers_env(None, {}, trigger="cron\nX-Injected: 1") == {}
+
+    def test_one_header_line_for_the_origin(self, external):
+        env = custom_headers_env(
+            ALICE.actor_id, {}, trigger="cron", origin="cron=nightly",
+        )
+        assert _cli_headers(env[CUSTOM_HEADERS_ENV]) == [
+            (INFERENCE_PRINCIPAL_HEADER, ALICE.actor_id),
+            (INFERENCE_TRIGGER_HEADER, "cron"),
+            (INFERENCE_ORIGIN_HEADER, "cron=nightly"),
+        ]
+        assert _origins(custom_headers_env(None, {}, origin="channel=C0123ABCD")) == [
+            "channel=C0123ABCD",
+        ]
+
+    def test_an_inherited_origin_is_replaced_or_removed(self, external):
+        environ = {CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue\nx-nerve-inference-origin: hook=other"}
+        env = custom_headers_env(None, environ, origin="cron=nightly")
+        assert _cli_headers(env[CUSTOM_HEADERS_ENV]) == [
+            ("X-Proxy-Tag", "blue"), (INFERENCE_ORIGIN_HEADER, "cron=nightly"),
+        ]
+        assert custom_headers_env(None, environ) == {CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue"}
+
+    def test_local_mode_removes_an_inherited_origin(self):
+        environ = {CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue\nX-Nerve-Inference-Origin: hook=other"}
+        assert custom_headers_env(None, environ, origin="cron=nightly") == {
+            CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue",
+        }
+        assert custom_headers_env(None, {}, origin="cron=nightly") == {}
+
+    @pytest.mark.parametrize("bad", [
+        "cron=nightly\nX-Injected: 1", "nightly", "chat=x", "cron=a b", "cron=",
+        "cron=" + "j" * 57, "workflow=" + "w" * 56,
+    ])
+    def test_an_origin_outside_the_grammar_is_never_written(self, external, bad):
+        assert custom_headers_env(None, {}, origin=bad) == {}
 
     def test_the_process_environment_is_the_default(self, external, monkeypatch):
         monkeypatch.setenv(CUSTOM_HEADERS_ENV, "X-Proxy-Tag: blue")
@@ -461,7 +525,7 @@ async def _process_env(options, monkeypatch) -> dict[str, str]:
 
 _INHERITED = (
     f"X-Proxy-Tag: blue\nx-nerve-inference-principal: {BOB.actor_id}\n"
-    "x-nerve-inference-trigger: api"
+    "x-nerve-inference-trigger: api\nx-nerve-inference-origin: hook=other"
 )
 
 
@@ -506,6 +570,26 @@ async def test_each_session_names_its_trigger(external, engine, cli, db):
 
 
 @pytest.mark.asyncio
+async def test_each_session_names_its_origin(external, engine, cli, db):
+    await engine.run_cron(job_id="nightly", prompt="tidy up")
+    await db.create_session(
+        "slack-1", source="slack", actor=ALICE,
+        origin=Origin("slack", {
+            "channel": "C0123ABCD", "thread": "1700000000.000100", "channel_name": "general",
+        }),
+    )
+    await _turn(engine, "slack-1", ALICE)
+    # A web chat has no origin tag.
+    await _turn(engine, "s1", ALICE)
+
+    assert [_origins(process.env) for process in cli] == [
+        ["cron=nightly"], ["channel=C0123ABCD"], [],
+    ]
+    assert cli[1].spec.inference_origin == "channel=C0123ABCD"
+    assert cli[2].spec.inference_origin is None
+
+
+@pytest.mark.asyncio
 async def test_local_mode_sends_no_header(engine, cli):
     await _turn(engine, "s1", ALICE)
     await _turn(engine, "s1", BOB)
@@ -514,6 +598,15 @@ async def test_local_mode_sends_no_header(engine, cli):
     assert CUSTOM_HEADERS_ENV not in process.env
     assert process.spec.inference_principal is None
     assert process.turns == 2
+
+
+@pytest.mark.asyncio
+async def test_local_mode_names_no_origin(engine, cli):
+    await engine.run_cron(job_id="nightly", prompt="tidy up")
+
+    (process,) = cli
+    assert CUSTOM_HEADERS_ENV not in process.env
+    assert process.spec.inference_origin is None
 
 
 # --------------------------------------------------------------------------- #
@@ -729,6 +822,26 @@ def _trigger_values(headers: list[tuple[str, str]]) -> list[str]:
     ]
 
 
+def _origin_values(headers: list[tuple[str, str]]) -> list[str]:
+    return [
+        value for name, value in headers
+        if name.lower() == INFERENCE_ORIGIN_HEADER.lower()
+    ]
+
+
+def test_direct_client_headers_omit_an_inherited_origin_and_add_none(
+    external, global_db,
+):
+    from anthropic import omit
+
+    environ = {CUSTOM_HEADERS_ENV: "X-Proxy-Tag: blue\nx-nerve-inference-origin: hook=other"}
+    assert direct_client_headers(environ) == {
+        "x-nerve-inference-origin": omit,
+        INFERENCE_PRINCIPAL_HEADER: global_db.system_actor_id,
+        INFERENCE_TRIGGER_HEADER: "system",
+    }
+
+
 def test_direct_requests_in_local_mode_drop_an_inherited_principal(
     global_db, monkeypatch,
 ):
@@ -737,6 +850,7 @@ def test_direct_requests_in_local_mode_drop_an_inherited_principal(
         headers = _sent_headers(client)
         assert _principal_values(headers) == []
         assert _trigger_values(headers) == []
+        assert _origin_values(headers) == []
         assert ("x-proxy-tag", "blue") in headers
 
 
@@ -748,6 +862,7 @@ def test_direct_requests_in_external_mode_name_the_system_actor_once(
         headers = _sent_headers(client)
         assert _principal_values(headers) == [global_db.system_actor_id]
         assert _trigger_values(headers) == ["system"]
+        assert _origin_values(headers) == []
         assert ("x-proxy-tag", "blue") in headers
 
 
@@ -829,6 +944,7 @@ async def test_the_doctor_probe_names_the_stored_system_actor(
     (headers,) = _MessagesApi.received
     assert _principal_values(headers) == [system_actor_id]
     assert _trigger_values(headers) == ["system"]
+    assert _origin_values(headers) == []
 
 
 @pytest.mark.asyncio
@@ -846,6 +962,7 @@ async def test_the_doctor_probe_names_no_principal_in_local_mode(
     (headers,) = _MessagesApi.received
     assert _principal_values(headers) == []
     assert _trigger_values(headers) == []
+    assert _origin_values(headers) == []
 
 
 def test_the_doctor_probe_without_a_database_names_no_principal(

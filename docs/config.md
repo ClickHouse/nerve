@@ -2391,6 +2391,42 @@ and a CLI process keeps it for its whole life. Nerve does not prove the
 value. The same requests as above have no header, and Codex requests to
 `codex.base_url` have no trigger header.
 
+#### Inference origin header
+
+In external mode, Nerve also adds one `X-Nerve-Inference-Origin` header to
+each model request of a session that has a specific origin. The header names
+where the session comes from: the cron job, the channel conversation, the
+hook, the plan, the workflow run or the external client that started it. The
+value is `<kind>=<value>`, from the session's `trigger` and `origin_detail`
+(see [api.md](api.md#sessions)):
+
+| Session `trigger` | Value |
+|---|---|
+| `cron`, for a cron job | `cron=` and the job ID |
+| `slack`, `telegram` or `email` | `channel=` and the conversation ID, for example a Slack channel ID. Never the thread or the channel name |
+| `api`, for a webhook | `hook=` and the hook name |
+| `plan` | `plan=` and the plan ID |
+| `workflow` | `workflow=` and the workflow run ID |
+| `external` | `client=` and the name of the external client |
+
+The value after `=` has 1 to 56 bytes of `A`-`Z`, `a`-`z`, `0`-`9`, `.`, `_`
+and `-`, and the whole header value has at most 64 bytes. Nerve replaces each
+other byte of the detail with `_` (a character outside ASCII gives one `_` for
+each byte of its UTF-8 form) and cuts the result to 56 bytes, or to 55 for
+`workflow`. For example, a session of the cron job `nightly` sends
+`cron=nightly`.
+
+A session of another trigger (`chat`, `system`, `unknown`) or without the
+detail sends no origin header: for example a "Run later" session has no cron
+job, and a session of `/api/chat` has no hook. Nerve's own model calls send
+no origin header. Nerve sets a session's origin when it creates the session
+and never changes it; a session from before the trigger field sends the
+value from the origin that Nerve derives, when that has the detail. The
+header has the same rules as the principal header: local mode sends none,
+Nerve removes an inherited line for it from `ANTHROPIC_CUSTOM_HEADERS`, and a
+CLI process keeps it for its whole life. Nerve does not prove the value.
+Codex sends no origin header.
+
 ### System principal ID
 
 The environment variable `NERVE_SYSTEM_PRINCIPAL_ID` gives the ID of the

@@ -738,6 +738,7 @@ class ClaudeBackend:
                 cache_ttl=spec.cache_ttl,
                 inference_principal=spec.inference_principal,
                 inference_trigger=spec.inference_trigger,
+                inference_origin=spec.inference_origin,
             ),
             cwd=spec.cwd,
             # Load no filesystem settings/memory: Nerve owns the entire
@@ -842,13 +843,14 @@ class ClaudeBackend:
 
     def _build_env(
         self, cache_ttl: str = "5m", inference_principal: str | None = None,
-        inference_trigger: str | None = None,
+        inference_trigger: str | None = None, inference_origin: str | None = None,
     ) -> dict[str, str]:
         """Build environment variables for the SDK subprocess.
 
-        ``inference_principal`` and ``inference_trigger``: the principal and
-        the trigger that every model request of the process names (external
-        mode; see nerve.inference_principal).
+        ``inference_principal``, ``inference_trigger`` and
+        ``inference_origin``: the principal, the trigger and the origin that
+        every model request of the process names (external mode; see
+        nerve.inference_principal).
         """
         config = self.config
         env: dict[str, str] = {}
@@ -921,7 +923,9 @@ class ClaudeBackend:
                 env[env_name] = str(target)
         # The SDK merges this dict over Nerve's own environment, so an
         # inherited ANTHROPIC_CUSTOM_HEADERS is kept and extended here.
-        env.update(custom_headers_env(inference_principal, trigger=inference_trigger))
+        env.update(custom_headers_env(
+            inference_principal, trigger=inference_trigger, origin=inference_origin,
+        ))
         return env
 
     def _build_mcp_servers(self, session_id: str) -> dict[str, Any]:

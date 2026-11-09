@@ -98,7 +98,11 @@ from nerve.identity import (
     attribution_for,
     resolve_cause,
 )
-from nerve.inference_principal import inference_principal, inference_trigger
+from nerve.inference_principal import (
+    inference_origin,
+    inference_principal,
+    inference_trigger,
+)
 from nerve.mcp_gateway import McpGatewayCatalog
 from nerve.memory.backend import (
     MemoryBackendUnavailable,
@@ -1804,6 +1808,9 @@ class AgentEngine:
                 inference_trigger=inference_trigger(
                     session_origin(session or {}).trigger,
                 ),
+                # Where the session comes from (its cron job, channel, ...),
+                # also fixed for the session.
+                inference_origin=inference_origin(session_origin(session or {})),
                 extra=(
                     # Per-session codex sandbox override (review-loop verifier
                     # legs run workspace-write instead of the global default).
