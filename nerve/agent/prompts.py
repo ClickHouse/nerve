@@ -560,6 +560,14 @@ and local checks;
 - for a personal assistant: which of the connected inboxes and calendars to \
 read, and how reminders reach the person.
 
+Your last form asks one more question, a `choice` with `required: \
+false`: how chats get their names. Either renamed once after the agent's \
+first answer, with a title that says what the chat did (recommended; \
+Nerve's default, `agent.outcome_titles`), or kept from the first message. \
+It counts toward the form's six questions (four with `AskUserQuestion`). \
+Skip it when the Model line of "This instance" names a Claude subscription \
+token: Nerve cannot make these titles with one (the local proxy can).
+
 Use `AskUserQuestion` only when `ask_form` is not available: one to four \
 questions per call, each with two to four options, the recommended one first, \
 and Other… for the person's own words (which repositories, which channels). \
@@ -675,6 +683,9 @@ its config directory; then run `nerve -c <that directory> reload`.
 - Create statuses with `task_status_create`, skills with `skill_create`, and \
 tasks with `task_create` for what only the person can do (access to grant, \
 accounts to create).
+- When the person chose to keep the names from the first message, set \
+`outcome_titles: false` under `agent:` in `<workspace>/config/settings.yaml`, \
+then run `nerve reload`.
 - `memorize` what you learned about the work and what was decided.
 - When configuration changes arrive by pull request on this instance, use \
 `propose_config_change` instead of editing the files, and skip the reload.

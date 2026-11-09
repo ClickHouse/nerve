@@ -73,6 +73,7 @@ from nerve.agent.prompts import (
     prepend_session_preamble,
     set_skill_manager,
 )
+from nerve.agent.session_titles import REPLACEABLE_SOURCES, STYLE_EXAMPLES, outcome_title
 from nerve.agent.sessions import SessionManager, SessionStatus, new_cron_run_id
 from nerve.agent.streaming import broadcaster
 from nerve.agent.tools import (
@@ -433,6 +434,9 @@ class AgentEngine:
         # Plan summaries being written (see _schedule_plan_summary) — strong
         # refs too; cancelled in shutdown().
         self._plan_summary_tasks: set[asyncio.Task] = set()
+        self._title_tasks: set[asyncio.Task] = set()
+        # Sessions whose answer to the first message gets an outcome title when it ends.
+        self._titles_due: set[str] = set()
         self._session_locks: dict[str, asyncio.Lock] = {}
         # Idle stream watchers — one per live SDK client. Between run()
         # calls nothing reads the SDK message stream, but the CLI keeps
@@ -1069,6 +1073,12 @@ class AgentEngine:
                 *self._plan_summary_tasks, return_exceptions=True,
             )
         self._plan_summary_tasks.clear()
+
+        for task in list(self._title_tasks):
+            task.cancel()
+        if self._title_tasks:
+            await asyncio.gather(*self._title_tasks, return_exceptions=True)
+        self._title_tasks.clear()
 
         # Close the optional xmemory HTTP client (no-op when disabled).
         if self._xmemory_bridge is not None:
@@ -3573,7 +3583,10 @@ class AgentEngine:
         except Exception as e:
             self._end_turn(session_id, TurnOutcome("failed", f"turn not persisted: {e}"))
             raise
-        return self._end_turn(session_id, TurnOutcome(st.status, st.error))
+        outcome = self._end_turn(session_id, TurnOutcome(st.status, st.error))
+        if outcome.ok and session_id in self._titles_due:
+            self._schedule_outcome_title(session_id)
+        return outcome
 
     async def _persist_turn(
         self, session_id: str, st: _TurnState, channel: str | None,
@@ -4156,7 +4169,7 @@ class AgentEngine:
                 await self.db.update_session_title(
                     session_id, placeholder,
                     attribution=self._agent_attribution(session_id),
-                    reason="placeholder",
+                    reason="placeholder", source="placeholder",
                 )
                 await broadcaster.broadcast(session_id, {
                     "type": "session_updated",
@@ -4166,6 +4179,14 @@ class AgentEngine:
                 asyncio.create_task(
                     self._generate_session_title(session_id, user_message),
                 )
+            if self.config.agent.outcome_titles and (
+                current_title in (None, "", session_id)
+                or (session.get("title_source") == "fork"
+                    and session.get("status") == SessionStatus.CREATED.value)
+            ):
+                self._titles_due.add(session_id)
+            else:
+                self._titles_due.discard(session_id)
 
             # Store user message in DB (note attached images for display)
             db_text = user_message
@@ -5371,12 +5392,12 @@ class AgentEngine:
                     }],
                 )
             title = response_text(response).strip().strip('"\'').lstrip('#').strip()
-            if title and len(title) < 60:
-                await self.db.update_session_title(
-                    session_id, title,
-                    attribution=self._agent_attribution(session_id),
-                    reason="generated",
-                )
+            if title and len(title) < 60 and await self.db.update_session_title(
+                session_id, title,
+                attribution=self._agent_attribution(session_id),
+                reason="generated", source="generated",
+                only_from=(None, "placeholder"),
+            ):
                 await broadcaster.broadcast(session_id, {
                     "type": "session_updated",
                     "session_id": session_id,
@@ -5388,6 +5409,69 @@ class AgentEngine:
                 )
         except Exception as e:
             logger.warning("Failed to generate session title: %s", e)
+
+    def _schedule_outcome_title(self, session_id: str) -> None:
+        """Retitle the session from its turn, in the background (``agent.outcome_titles``)."""
+        task = asyncio.create_task(self._apply_outcome_title(session_id))
+        self._title_tasks.add(task)
+        task.add_done_callback(self._title_tasks.discard)
+
+    async def _apply_outcome_title(self, session_id: str) -> None:
+        # Parked on background work: the turn that settles it retitles. Runs
+        # after the turn's settle_turn_scoped, so only work that outlives it counts.
+        if session_id not in self._titles_due or self._has_live_background_tasks(session_id):
+            return
+        self._titles_due.discard(session_id)
+        try:
+            session = await self.db.get_session(session_id)
+            if not session or session.get("title_source") not in REPLACEABLE_SOURCES:
+                return
+            request, reply = await self.db.get_title_context(session_id)
+            title = await self._outcome_title(session, request, reply)
+            if title and await self.db.update_session_title(
+                session_id, title,
+                attribution=self._agent_attribution(session_id),
+                reason="outcome", source="outcome", only_from=REPLACEABLE_SOURCES,
+            ):
+                await self._broadcast_title(session_id, title)
+        except Exception as e:  # noqa: BLE001 — the session keeps its title
+            logger.warning("Outcome title for session %s failed: %s", session_id, e)
+
+    async def regenerate_session_title(
+        self, session_id: str, *, attribution: Attribution,
+    ) -> str | None:
+        """Retitle the session from what it did, replacing any title, and
+        return the new title, or ``None`` when no title could be made."""
+        session = await self.db.get_session(session_id)
+        if not session:
+            return None
+        request, reply = await self.db.get_title_context(session_id)
+        title = await self._outcome_title(session, request, reply)
+        if not title or not await self.db.update_session_title(
+            session_id, title, attribution=attribution,
+            reason="regenerated", source="outcome",
+        ):
+            return None
+        await self._broadcast_title(session_id, title)
+        return title
+
+    async def _outcome_title(self, session: dict, request: str, reply: str) -> str | None:
+        session_id = session["id"]
+        parent_title = ""
+        if session.get("parent_session_id"):
+            parent = await self.db.get_session(session["parent_session_id"])
+            parent_title = (parent or {}).get("title") or ""
+        return await outcome_title(
+            self.config, request=request, reply=reply, parent_title=parent_title,
+            examples=await self.db.recent_manual_titles(STYLE_EXAMPLES),
+            label=session_id,
+        )
+
+    async def _broadcast_title(self, session_id: str, title: str) -> None:
+        # Global, so the sidebar of every client shows it, not only this chat's.
+        await broadcaster.broadcast("__global__", {
+            "type": "session_updated", "session_id": session_id, "title": title,
+        })
 
 
 def _is_plan_file(file_path: str) -> bool:

@@ -187,6 +187,23 @@ class MessageStore:
                 )
         return copied
 
+    async def get_title_context(self, session_id: str) -> tuple[str, str]:
+        """The session's own first user message and last assistant message;
+        a fork's copies of its parent's messages are skipped."""
+        own = (
+            "session_id = ? AND role = ?"
+            " AND (external_id IS NULL OR external_id NOT LIKE 'forkcopy:%')"
+        )
+        texts: list[str] = []
+        for role, order in (("user", "ASC"), ("assistant", "DESC")):
+            async with self.db.execute(
+                f"SELECT content FROM messages WHERE {own} ORDER BY id {order} LIMIT 1",
+                (session_id, role),
+            ) as cursor:
+                row = await cursor.fetchone()
+            texts.append((row[0] or "") if row else "")
+        return texts[0], texts[1]
+
     async def add_message_idempotent(
         self,
         session_id: str,

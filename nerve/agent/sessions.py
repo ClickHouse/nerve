@@ -797,6 +797,10 @@ class SessionManager:
             # A person forks a chat in the web UI, whatever started the parent.
             origin=Origin(TRIGGER_CHAT, {DETAIL_FORK_OF: source_session_id}),
         )
+        session["title_source"] = "manual" if title else "fork"
+        await self.db.update_session_fields(
+            fork_id, {"title_source": session["title_source"]},
+        )
         copied = await self.db.copy_messages_to_session(
             source_session_id, fork_id, up_to_native_turn_id=fork_turn_id,
         )

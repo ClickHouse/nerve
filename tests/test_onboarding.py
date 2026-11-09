@@ -726,6 +726,26 @@ class TestPrompt:
             assert part in apply, part
 
     @pytest.mark.parametrize("mode, description", VARIANTS)
+    def test_the_last_form_asks_how_chats_are_named(self, mode, description):
+        """Outcome titles are on by default; the person can turn them off here."""
+        prompt = onboarding_prompt(mode, description, GUIDE)
+        ask = _flat(_between(prompt, "### 2. Ask after the explorer reports", "### 3."))
+        for part in (
+            "Your last form asks one more question, a `choice` with `required: false`: "
+            "how chats get their names. Either renamed once after the agent's first answer, "
+            "with a title that says what the chat did (recommended; Nerve's default, "
+            "`agent.outcome_titles`), or kept from the first message",
+            "It counts toward the form's six questions (four with `AskUserQuestion`)",
+            'Skip it when the Model line of "This instance" names a Claude subscription token',
+        ):
+            assert part in ask, part
+        apply = _flat(_between(prompt, "### 4. Apply", "### 5."))
+        assert (
+            "set `outcome_titles: false` under `agent:` in `<workspace>/config/settings.yaml`, "
+            "then run `nerve reload`"
+        ) in apply
+
+    @pytest.mark.parametrize("mode, description", VARIANTS)
     def test_the_instance_facts_come_before_the_first_message_as_facts(self, mode, description):
         """A real run asked about `gh` without checking anything: the first
         turn calls no tool before its message, so Nerve's facts about the
