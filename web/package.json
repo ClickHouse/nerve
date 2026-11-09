@@ -30,7 +30,7 @@
     "cronstrue": "^3.38.0",
     "dayjs": "^1.11.21",
     "highlight.js": "^11.11.1",
-    "lucide-react": "^0.575.0",
+    "lucide-react": "^1.66.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",
     "react-router-dom": "^7.18.4",
