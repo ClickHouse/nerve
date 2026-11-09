@@ -2662,7 +2662,7 @@ def test_model_labels_are_formatted_consistently():
     from nerve.config import DEFAULT_CLAUDE_MODELS
 
     assert [setup_routes._label(m) for m in DEFAULT_CLAUDE_MODELS] == [
-        "Claude Opus 5.5", "Claude Fable 5.1", "Claude Sonnet 5.5", "Claude Haiku 5.5",
+        "Claude Opus 5.5", "Claude Fable 5.2", "Claude Sonnet 5.5", "Claude Haiku 5.5",
     ]
 
 

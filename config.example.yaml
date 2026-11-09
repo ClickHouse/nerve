@@ -57,20 +57,21 @@ timezone: America/New_York
 # Agent
 agent:
   model: claude-opus-5-5         # Primary model for conversations (Nerve's default)
-  # Use claude-fable-5-1 for Anthropic's newest generation (Mythos-class).
-  # Note: ~2x the cost of Opus ($10/$50 per MTok in/out).
+  # Use claude-fable-5-2 for Anthropic's newest generation (Mythos-class).
+  # Note: 2x the cost of Opus 5.5 ($8/$40 per MTok in/out).
   cron_model: claude-sonnet-5-5  # Cheaper model for cron jobs
   title_model: claude-haiku-5-5  # Session title generation
   # outcome_titles: false        # Keep the first-message title instead of renaming once the first answer ends
   # Model-alias remapping for the CLI: short aliases ("opus") used in
   # Agent/Workflow tool model options and skill frontmatter resolve to the
-  # mapped ID. Supported: opus, sonnet, haiku, fable. opus → claude-opus-5-5
-  # and haiku → claude-haiku-5-5 are the built-in defaults (not applied on
-  # Bedrock); "" unsets an alias. The CLI also uses the haiku model for its
-  # background calls.
+  # mapped ID. Supported: opus, sonnet, haiku, fable. opus → claude-opus-5-5,
+  # haiku → claude-haiku-5-5 and fable → claude-fable-5-2 are the built-in
+  # defaults (not applied on Bedrock); "" unsets an alias. The CLI also uses
+  # the haiku model for its background calls.
   # model_aliases:
   #   opus: claude-opus-5-5
   #   haiku: claude-haiku-5-5
+  #   fable: claude-fable-5-2
   # Claude models selectable in the web composer's model picker. The
   # configured `model` above is always offered first; entries here extend
   # the list. Unset → the models the Anthropic Models API reports for your

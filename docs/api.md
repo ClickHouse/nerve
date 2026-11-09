@@ -539,10 +539,10 @@ the `reason` names the variable.
 ```json
 Response: {
   "models": [{ "id": "claude-opus-5-5", "label": "Claude Opus 5.5", "family": "opus", "recommended": true },
+             { "id": "claude-fable-5-2", "label": "Claude Fable 5.2", "family": "fable", "recommended": false },
              { "id": "claude-haiku-5-5", "label": "Claude Haiku 5.5", "family": "haiku", "recommended": false },
              { "id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "family": "sonnet", "recommended": false },
-             { "id": "claude-fable-5-1", "label": "Claude Fable 5.1", "family": "fable", "recommended": false },
-             { "id": "claude-opus-5", "label": "Claude Opus 5", "family": "opus", "recommended": false }],
+             { "id": "claude-fable-5-1", "label": "Claude Fable 5.1", "family": "fable", "recommended": false }],
   "current": { "model": "claude-opus-5-5", "effort": "xhigh" },
   "efforts": ["max", "xhigh", "high", "medium", "low"],
   "discovered": true,
