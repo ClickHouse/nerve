@@ -16,13 +16,27 @@ updates:
     # The default ("direct") would leave those pins to go stale.
     allow:
       - dependency-type: "all"
-    # Keep the floors in pyproject.toml as written, and change a bound only
-    # when the new version is outside it. The default for an app raises every
-    # floor to the latest version in every PR.
-    versioning-strategy: "increase-if-necessary"
+    # Change uv.lock only, and never pyproject.toml. A floor in pyproject.toml
+    # is the oldest version that nerve accepts. uv.lock sets the version that
+    # is installed and tested. Do not use "increase-if-necessary": the uv
+    # updater raises a floor also when the range already allows the new
+    # version (dependabot-core#14908).
+    # Dependabot proposes no update that needs a new bound in pyproject.toml.
+    # This applies to each exact pin and upper bound, for example
+    # memu-py==1.4.0, mcp<3 and the hatchling build requirement. A person
+    # examines each such update and changes the bound by hand. Security
+    # updates have the same limit: when the fix is outside a bound,
+    # Dependabot opens no PR and the alert stays open.
+    versioning-strategy: "lockfile-only"
     # One PR for all minor and patch updates. Each major update gets its own
-    # PR. memu-py also gets its own PR: nerve monkey-patches its internals
-    # (memu_bridge._patch_sqlite_bugs), so a bump needs a manual review.
+    # PR. These packages also get their own PR, because each update needs a
+    # manual check:
+    # - memu-py: nerve monkey-patches its internals
+    #   (memu_bridge._patch_sqlite_bugs). The exact pin stops all Dependabot
+    #   updates for it. This exclusion keeps it out of the group if the pin
+    #   becomes a range.
+    # - claude-agent-sdk: the wheel bundles the Claude CLI that runs every
+    #   agent turn, and CI does not run the real CLI.
     groups:
       python-minor-patch:
         update-types:
@@ -30,6 +44,32 @@ updates:
           - "patch"
         exclude-patterns:
           - "memu-py"
+          - "claude-agent-sdk"
+
+  - package-ecosystem: "npm"
+    directory: "/web"
+    # Runs on the first day of each month. Security updates do not use this
+    # schedule.
+    schedule:
+      interval: "monthly"
+    # Do not propose a release until it is 7 days old. See the uv entry.
+    cooldown:
+      default-days: 7
+    # Change package.json only when the new version is outside its range. An
+    # update inside a "^" or "~" range changes package-lock.json only, so the
+    # package.json diff shows the updates that leave a declared range: majors,
+    # 0.x minors and exact pins such as @clickhouse/click-ui. The default for
+    # an app raises the floor of each updated range. "lockfile-only" would
+    # stop all major updates, because a major is outside each "^" or "~"
+    # range.
+    versioning-strategy: "increase-if-necessary"
+    # One PR for all minor and patch updates. Each major update gets its own
+    # PR.
+    groups:
+      npm-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
 
   - package-ecosystem: "github-actions"
     directory: "/"
