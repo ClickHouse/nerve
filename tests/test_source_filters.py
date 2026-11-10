@@ -397,6 +397,10 @@ def test_the_values_at_a_path():
     assert DataRule("/issue/size", deny=("x",)).values(record) == ["2"]
     assert DataRule("/issue/team", deny=("x",)).values(record) == []
     assert DataRule("/issue/missing", deny=("x",)).values(record) == []
+    # An index names an element only in decimal without a leading zero.
+    assert DataRule("/issue/labels/1", deny=("x",)).values(record) == ["Frontend"]
+    assert DataRule("/issue/labels/01", deny=("x",)).values(record) == []
+    assert DataRule("/issue/labels/-", deny=("x",)).values(record) == []
     assert DataRule("not a pointer", deny=("x",)).values(record) == []
 
 
