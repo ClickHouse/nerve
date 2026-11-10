@@ -2120,39 +2120,17 @@ class AgentEngine:
         logger.info("Drain: all running turns ended")
         return True
 
-    async def _refuse_closed_session(
-        self,
-        session_id: str,
-        reason: str,
-        *,
-        entry: QueuedTurn | None = None,
-        client_msg_id: str | None = None,
-    ) -> None:
-        """Tell the session's clients that run() refused the turn because the
-        session is closed, then raise :class:`SessionClosedError`.
-
-        As :meth:`_refuse_turn`: a run that has a queue entry or a
-        ``client_msg_id`` leaves the queue with the reason ``refused``. The
-        error event says why.
-        """
-        if entry is not None or client_msg_id:
-            await self._emit_queue_update(session_id, removed=[{
-                "queue_id": entry.queue_id if entry is not None else None,
-                "client_msg_id": client_msg_id, "reason": "refused",
-            }])
-        error = SessionClosedError(reason)
-        logger.info("Session %s: refused a turn (%s)", session_id, reason)
-        await broadcaster.broadcast_error(session_id, str(error))
-        raise error
-
     async def _refuse_turn(
         self,
         session_id: str,
         *,
         entry: QueuedTurn | None = None,
         client_msg_id: str | None = None,
+        error: RuntimeError | None = None,
     ) -> None:
-        """Tell the session's clients that run() refused the turn, then raise.
+        """Tell the session's clients that run() refused the turn, then raise
+        ``error`` (default :class:`NotAcceptingTurnsError`). The error event
+        says why.
 
         A run that has a queue entry or a ``client_msg_id`` is reported in
         ``queue_update`` with the reason ``refused``. The caller removes the
@@ -2163,8 +2141,9 @@ class AgentEngine:
                 "queue_id": entry.queue_id if entry is not None else None,
                 "client_msg_id": client_msg_id, "reason": "refused",
             }])
-        await broadcaster.broadcast_error(session_id, _NOT_ACCEPTING_TURNS_MESSAGE)
-        raise NotAcceptingTurnsError()
+        error = error or NotAcceptingTurnsError()
+        await broadcaster.broadcast_error(session_id, str(error))
+        raise error
 
     # ------------------------------------------------------------------ #
     #  Public API: run, stop, fork, resume                                 #
@@ -4069,8 +4048,9 @@ class AgentEngine:
                 or await self.db.closed_session_reason(session_id)
             )
             if closed:
-                await self._refuse_closed_session(
-                    session_id, closed, entry=entry, client_msg_id=client_msg_id,
+                await self._refuse_turn(
+                    session_id, entry=entry, client_msg_id=client_msg_id,
+                    error=SessionClosedError(closed),
                 )
             if entry is not None or client_msg_id:
                 await self._emit_queue_update(session_id, removed=[{
