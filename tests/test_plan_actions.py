@@ -94,6 +94,9 @@ class FakeEngine:
     def register_task(self, session_id, task) -> None:
         self.registered.append(session_id)
 
+    async def reopen_archived(self, session_id, *, attribution) -> bool:
+        return False
+
 
 async def _setup(
     db: Database, tmp_path, *, plan_type: str = "generic", status: str = "pending",

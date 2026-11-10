@@ -168,7 +168,8 @@ async def request_plan_revision(
         - Writes a ``Revision requested for {plan_id}`` note to the task.
         - Dispatches ``engine.run()`` on the original proposer session
           (``plan.session_id``), falling back to ``cron:task-planner``
-          if the proposer is unknown/deleted.
+          if the proposer is unknown/deleted. An archived proposer session
+          is unarchived first, in the name of ``actor``.
         - The planner is instructed to call
           ``plan_update(plan_id=..., content=..., summary=..., feedback=...)``
           so version history stays linked.
@@ -250,6 +251,12 @@ async def request_plan_revision(
         session_id, title=session_title, source="cron",
         actor=engine.db.system_actor, cause=cause,
         origin=plan_origin(plan_id, plan["task_id"]),
+    )
+    # The person's revision request opens an archived planner session again
+    # (an ``unarchived`` event in their name); a run in an archived session
+    # is refused.
+    await engine.reopen_archived(
+        session_id, attribution=attribution_for(actor, cause),
     )
     asyncio.create_task(
         engine.run(

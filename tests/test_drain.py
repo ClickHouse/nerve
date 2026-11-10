@@ -45,7 +45,10 @@ def _make_engine() -> AgentEngine:
     config = MagicMock()
     config.agent.max_concurrent = 3
     config.mcp_servers = []
-    engine = AgentEngine(config, AsyncMock())
+    db = AsyncMock()
+    # A run reads the session row: an open session.
+    db.get_session.return_value = {"status": "idle"}
+    engine = AgentEngine(config, db)
     engine._broadcast_session_running = AsyncMock()
     engine._DRAIN_POLL_SECONDS = 0.01
     return engine

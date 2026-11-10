@@ -530,6 +530,23 @@ class SessionStore:
             return
         await self._write(*built)
 
+    async def update_unarchived_session_fields(
+        self, session_id: str, fields: dict,
+    ) -> bool:
+        """Like :meth:`update_session_fields`, but only for a session that is
+        not archived.
+
+        The runtime's status writes use it, so that only unarchive takes a
+        session out of ``archived``. Returns ``True`` when a row was written,
+        ``False`` for an archived or missing session.
+        """
+        built = self._build_session_fields_update(session_id, fields)
+        if built is None:
+            return False
+        sql, params = built
+        result = await self._write(f"{sql} AND status != 'archived'", params)
+        return (result.rowcount or 0) > 0
+
     async def change_session_fields(
         self,
         session_id: str,

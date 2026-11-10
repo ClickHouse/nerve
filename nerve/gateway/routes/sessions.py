@@ -701,53 +701,79 @@ async def delete_session(session_id: str, actor: Actor = Depends(require_auth)):
     db = deps.db
 
     if engine:
-        # Disconnect client
-        client = engine.sessions.remove_client(session_id, reason="deleted")
-        if client:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-        # Drop the session's agent records, queued writes and pending emits
-        # before the rows go (a write already in flight fails the foreign key
-        # and is dropped).
-        agents = getattr(engine, "agents", None)
-        if agents is not None:
-            await agents.forget_session(session_id)
-        # Snapshot messages for background memorization before deleting
-        session = await db.get_session(session_id)
-        connected_at = session.get("connected_at") if session else None
-        messages = await db.get_messages(session_id, limit=10000) if connected_at else []
-        # Delete from DB immediately (fast). The delete is recorded with
-        # the person, because the session's own events go with it.
-        await db.delete_session(session_id, attribution=attribution_for(actor))
-        # Cleanup uploaded files for this session
-        await _cleanup_uploaded_files(db, session_id)
-        # Memorize in background from snapshot
-        if messages and connected_at and engine._memory_bridge and engine._memory_bridge.available:
-            async def _bg_memorize():
-                try:
-                    context_msgs = []
-                    for msg in messages:
-                        created = msg.get("created_at", "")
-                        if created:
-                            norm = created if "T" in created else created.replace(" ", "T") + "Z"
-                            if norm >= connected_at:
-                                context_msgs.append(msg)
-                    if context_msgs:
-                        with keep_awake(LEASE_MEMORIZE):
-                            await engine._memory_bridge.memorize_conversation(
-                                session_id, context_msgs,
-                            )
-                        # Same window to xmemory (opt-in, fire-and-forget).
-                        engine.schedule_xmemory_transcript(session_id, context_msgs)
-                except Exception as e:
-                    logger.warning("Background memorize for deleted session %s failed: %s", session_id, e)
-            asyncio.create_task(_bg_memorize())
+        # A turn that runs or waits would write into the deleted rows, or
+        # create the session again. The person stops it first.
+        if not engine.begin_delete(session_id):
+            raise HTTPException(status_code=409, detail=_DELETE_BUSY_DETAIL)
+        try:
+            await _delete_with_engine(engine, db, session_id, actor)
+        finally:
+            engine.end_delete(session_id)
     else:
         await db.delete_session(session_id, attribution=attribution_for(actor))
         await _cleanup_uploaded_files(db, session_id)
     return {"deleted": True}
+
+
+_DELETE_BUSY_DETAIL = (
+    "The session is running or has queued messages. Stop it, then delete it."
+)
+
+
+async def _delete_with_engine(engine, db, session_id: str, actor: Actor) -> None:
+    """Delete a session that has no turn work: its client, agent records,
+    rows and uploads; memorize it from a snapshot; expire its questions."""
+    # Disconnect client
+    client = engine.sessions.remove_client(session_id, reason="deleted")
+    if client:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    # Drop the session's agent records, queued writes and pending emits
+    # before the rows go (a write already in flight fails the foreign key
+    # and is dropped).
+    agents = getattr(engine, "agents", None)
+    if agents is not None:
+        await agents.forget_session(session_id)
+    # Snapshot messages for background memorization before deleting
+    session = await db.get_session(session_id)
+    connected_at = session.get("connected_at") if session else None
+    messages = await db.get_messages(session_id, limit=10000) if connected_at else []
+    # Delete from DB immediately (fast). The delete is recorded with
+    # the person, because the session's own events go with it.
+    await db.delete_session(session_id, attribution=attribution_for(actor))
+    # Cleanup uploaded files for this session
+    await _cleanup_uploaded_files(db, session_id)
+    # Memorize in background from snapshot
+    if messages and connected_at and engine._memory_bridge and engine._memory_bridge.available:
+        async def _bg_memorize():
+            try:
+                context_msgs = []
+                for msg in messages:
+                    created = msg.get("created_at", "")
+                    if created:
+                        norm = created if "T" in created else created.replace(" ", "T") + "Z"
+                        if norm >= connected_at:
+                            context_msgs.append(msg)
+                if context_msgs:
+                    with keep_awake(LEASE_MEMORIZE):
+                        await engine._memory_bridge.memorize_conversation(
+                            session_id, context_msgs,
+                        )
+                    # Same window to xmemory (opt-in, fire-and-forget).
+                    engine.schedule_xmemory_transcript(session_id, context_msgs)
+            except Exception as e:
+                logger.warning("Background memorize for deleted session %s failed: %s", session_id, e)
+        asyncio.create_task(_bg_memorize())
+    # No question stays answerable for a deleted session. The rows stay
+    # as history.
+    try:
+        await engine.expire_session_questions(session_id)
+    except Exception as e:
+        logger.warning(
+            "Expire questions of deleted session %s failed: %s", session_id, e,
+        )
 
 
 @router.get("/api/sessions/{session_id}/status")
@@ -1118,6 +1144,10 @@ async def chat(req: MessageRequest, actor: Actor = Depends(require_auth)):
         # engine creates nothing: run() refuses the turn with a 503.
         await deps.engine.sessions.get_or_create(
             session_id, source="web", actor=actor, origin=Origin(TRIGGER_API),
+        )
+        # The caller's own message into an archived session opens it again.
+        await deps.engine.reopen_archived(
+            session_id, attribution=attribution_for(actor),
         )
     response = await deps.engine.run(
         session_id=session_id,

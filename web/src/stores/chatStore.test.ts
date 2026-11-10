@@ -34,6 +34,7 @@ vi.mock('../api/client', () => ({
     getSessionAgents: vi.fn(async (sessionId: string) => ({ session_id: sessionId, agents: [], queue: [] })),
     getAgentTranscript: vi.fn(),
     archiveSession: vi.fn(),
+    deleteSession: vi.fn(),
     stopSession: vi.fn(),
     createSession: vi.fn(),
     getSessionTasks: vi.fn(async () => ({ tasks: [] })),
@@ -742,6 +743,37 @@ describe('archiving a session with running agents', () => {
     expect(api.archiveSession).toHaveBeenCalledTimes(1);
     expect(useChatStore.getState().drafts[SID]).toBe('unsent');
     confirm.mockRestore();
+  });
+});
+
+describe('deleting a running session', () => {
+  beforeEach(() => {
+    onSession();
+    localStorage.setItem(`nerve_draft_${SID}`, 'unsent');
+    useChatStore.setState({ drafts: { [SID]: 'unsent' } });
+  });
+
+  it('says why the server refused, and keeps the draft', async () => {
+    const alert = vi.spyOn(window, 'alert').mockImplementation(() => {});
+    vi.mocked(api.deleteSession).mockRejectedValueOnce(
+      new Error('409: {"detail":"The session is running or has queued messages. Stop it, then delete it."}'),
+    );
+
+    await useChatStore.getState().deleteSession(SID);
+
+    expect(alert).toHaveBeenCalledWith('Could not delete this chat: it is running or has queued messages. Stop it, then delete it.');
+    expect(useChatStore.getState().drafts[SID]).toBe('unsent');
+    alert.mockRestore();
+  });
+
+  it('shows nothing for another error', async () => {
+    const alert = vi.spyOn(window, 'alert').mockImplementation(() => {});
+    vi.mocked(api.deleteSession).mockRejectedValueOnce(new Error('500: boom'));
+
+    await useChatStore.getState().deleteSession(SID);
+
+    expect(alert).not.toHaveBeenCalled();
+    alert.mockRestore();
   });
 });
 
