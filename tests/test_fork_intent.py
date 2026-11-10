@@ -43,6 +43,7 @@ class _Client:
         self.model = "claude-test"
         self.n = n
         self.entered = asyncio.Event()
+        self.resume_dropped = False
         if spec.fork:
             # Codex: thread/fork returns the new thread. Claude: no id
             # until the CLI's first message.
@@ -114,6 +115,9 @@ class _Backend:
         self.missing: set[str] = set()
         # Fork sources the runtime itself cannot find (Codex thread/read).
         self.refuse_fork_of: set[str] = set()
+        # Resume targets that the runtime finds missing only when it
+        # connects (Codex): it starts a fresh thread and says so.
+        self.drop_resume_of: set[str] = set()
 
     def default_model(self, source):
         return "claude-test"
@@ -131,7 +135,12 @@ class _Backend:
                 f"Cannot fork missing Codex thread {spec.resume_native_id!r}",
             )
         mode = self.modes.pop(0) if self.modes else "ok"
-        client = _Client(spec, mode, codex=self.codex, n=len(self.clients))
+        if not spec.fork and spec.resume_native_id in self.drop_resume_of:
+            spec = SessionSpec(**{**vars(spec), "resume_native_id": None})
+            client = _Client(spec, mode, codex=self.codex, n=len(self.clients))
+            client.resume_dropped = True
+        else:
+            client = _Client(spec, mode, codex=self.codex, n=len(self.clients))
         self.clients.append(client)
         return client
 
@@ -205,45 +214,117 @@ async def test_fork_session_stores_the_source_and_the_fork_turn(tmp_path, db):
     contents = [m["content"] for m in await db.get_messages(fork_id)]
     assert contents == ["first question", "first answer"]
 
+    # A whole fork branches at the parent's last completed turn: a turn that
+    # the parent completes later is neither copied nor in the native fork.
     whole = await engine.fork_session("parent", None, None, actor=None)
     row = await db.get_session(whole["id"])
     assert row["fork_source_native_id"] == PARENT_NATIVE
-    assert row["fork_source_turn_id"] is None
+    assert row["fork_source_turn_id"] == "p-turn-2"
+    await db.add_message("parent", "user", "later question", actor=None)
+    await db.add_message(
+        "parent", "assistant", "later answer", native_turn_id="p-turn-3", actor=None,
+    )
+    await _run(engine, whole["id"])
+    spec = engine._backends["claude"].specs[-1]
+    assert (spec.fork, spec.resume_native_id, spec.fork_last_turn_id) == (
+        True, PARENT_NATIVE, "p-turn-2",
+    )
+    contents = [m["content"] for m in await db.get_messages(whole["id"])]
+    assert "later question" not in contents and "later answer" not in contents
 
 
 @pytest.mark.asyncio
-async def test_v072_fills_the_source_of_forks_that_have_not_run(db):
+async def test_a_whole_fork_of_history_without_turn_mapping_takes_everything(tmp_path, db):
+    engine, _backend, _fork_id = await _setup(tmp_path, db, [])
+    await engine.sessions.get_or_create(
+        "old", title="o", source="web", backend="claude", actor=None,
+    )
+    await db.update_session_fields("old", {"sdk_session_id": "sdk-old"})
+    await db.add_message("old", "user", "q", actor=None)
+    await db.add_message("old", "assistant", "a", actor=None)
+    fork = await engine.fork_session("old", None, None, actor=None)
+    row = await db.get_session(fork["id"])
+    assert (row["fork_source_native_id"], row["fork_source_turn_id"]) == ("sdk-old", None)
+    assert fork["message_count"] == 2
+
+
+async def _started(db, session_id: str, native_id: str | None) -> None:
+    await db.log_session_event(session_id, "started", {"sdk_session_id": native_id})
+
+
+@pytest.mark.asyncio
+async def test_v072_gives_a_source_to_forks_that_never_had_their_own_conversation(db):
     from nerve.db.migrations.v072_session_fork_source import up
 
     await db.create_session("parent", actor=None)
     await db.update_session_fields("parent", {"sdk_session_id": PARENT_NATIVE})
+    await _started(db, "parent", PARENT_NATIVE)
     anchor = await db.add_message("parent", "user", "q", actor=None)
     await db.add_message("parent", "assistant", "a", native_turn_id="p-turn-1", actor=None)
-    await db.create_session("whole", parent_session_id="parent", actor=None)
-    await db.create_session(
-        "at-turn", parent_session_id="parent", forked_from_message=str(anchor), actor=None,
+
+    async def fork(fork_id: str, parent: str = "parent", **kw) -> None:
+        await db.create_session(fork_id, parent_session_id=parent, actor=None, **kw)
+        await db.log_session_event(fork_id, "created", {"parent": parent})
+
+    # Not run yet, whole and at a message.
+    await fork("fork-whole")
+    await fork("fork-at", forked_from_message=str(anchor))
+    # Archived and unarchived before its first turn: idle, no own id.
+    await fork("fork-unarchived")
+    await db.update_session_fields("fork-unarchived", {"status": "idle"})
+    # A first turn that did not complete bound it to the parent's id.
+    await fork("fork-bound")
+    await _started(db, "fork-bound", PARENT_NATIVE)
+    await db.update_session_fields(
+        "fork-bound", {"sdk_session_id": PARENT_NATIVE, "status": "idle"},
     )
-    await db.create_session("ran", parent_session_id="parent", actor=None)
-    await db.update_session_fields("ran", {"sdk_session_id": "sdk-ran", "status": "idle"})
+    # Its parent was archived (native id cleared) after the fork.
+    await db.create_session("archived-parent", actor=None)
+    await _started(db, "archived-parent", "sdk-old-parent")
+    await fork("fork-of-archived", parent="archived-parent")
+    await _started(db, "archived-parent", "sdk-after-the-fork")
+    # Completed a turn in its own conversation, with or without the id now.
+    await fork("fork-ran")
+    await _started(db, "fork-ran", PARENT_NATIVE)
+    await _started(db, "fork-ran", "sdk-ran")
+    await db.update_session_fields("fork-ran", {"sdk_session_id": "sdk-ran", "status": "idle"})
+    await fork("fork-ran-then-archived")
+    await _started(db, "fork-ran-then-archived", PARENT_NATIVE)
+    await _started(db, "fork-ran-then-archived", "sdk-ran-2")
+    # Its first build did not fork (status had changed): a fresh conversation.
+    await fork("fork-fresh")
+    await _started(db, "fork-fresh", None)
+    await _started(db, "fork-fresh", "sdk-fresh")
+    # Not forks: a nested session and a workflow leg.
+    await db.create_session("nested", parent_session_id="parent", actor=None)
     await db.create_session(
-        "leg", source="workflow", parent_session_id="parent", actor=None,
+        "workflow:wfr-x", source="workflow", parent_session_id="parent", actor=None,
     )
+    # An interrupted run: only the first column was added.
     await db.db.execute("ALTER TABLE sessions DROP COLUMN fork_source_native_id")
     await db.db.execute("ALTER TABLE sessions DROP COLUMN fork_source_turn_id")
+    await db.db.execute("ALTER TABLE sessions ADD COLUMN fork_source_native_id TEXT")
 
     await up(db.db)
     await up(db.db)
 
     expected = {
-        "whole": (PARENT_NATIVE, None),
-        "at-turn": (PARENT_NATIVE, "p-turn-1"),
-        "ran": (None, None),
-        "leg": (None, None),
-        "parent": (None, None),
+        "fork-whole": (PARENT_NATIVE, None, None),
+        "fork-at": (PARENT_NATIVE, "p-turn-1", None),
+        "fork-unarchived": (PARENT_NATIVE, None, None),
+        "fork-bound": (PARENT_NATIVE, None, None),
+        "fork-of-archived": ("sdk-old-parent", None, None),
+        "fork-ran": (None, None, "sdk-ran"),
+        "fork-ran-then-archived": (None, None, None),
+        "fork-fresh": (None, None, None),
+        "nested": (None, None, None),
+        "workflow:wfr-x": (None, None, None),
+        "parent": (None, None, PARENT_NATIVE),
     }
-    for session_id, (native, turn) in expected.items():
+    for session_id, want in expected.items():
         row = await db.get_session(session_id)
-        assert (row["fork_source_native_id"], row["fork_source_turn_id"]) == (native, turn), session_id
+        got = (row["fork_source_native_id"], row["fork_source_turn_id"], row["sdk_session_id"])
+        assert got == want, session_id
 
 
 # --------------------------------------------------------------------------- #
@@ -390,6 +471,24 @@ async def test_a_codex_fork_stopped_before_content_resumes_its_new_thread(tmp_pa
 
 
 @pytest.mark.asyncio
+async def test_a_codex_fork_whose_new_thread_is_gone_forks_again(tmp_path, db):
+    """Codex finds a missing thread only when it connects, and then starts a
+    fresh one: for a fork, the engine branches from the source instead."""
+    engine, backend, fork_id = await _setup(tmp_path, db, ["hang", "ok", "ok"], codex=True)
+    await _stop_when_entered(engine, backend, fork_id, 0)
+    assert (await db.get_session(fork_id))["sdk_session_id"] == "thread-fork-0"
+
+    backend.drop_resume_of.add("thread-fork-0")
+    await _run(engine, fork_id, "go on")
+    dropped, refork = backend.specs[1:]
+    assert (dropped.fork, dropped.resume_native_id) == (False, "thread-fork-0")
+    assert (refork.fork, refork.resume_native_id) == (True, PARENT_NATIVE)
+    row = await db.get_session(fork_id)
+    assert row["sdk_session_id"] == "thread-fork-2"
+    assert row["fork_source_native_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_a_row_that_holds_the_source_id_still_forks(tmp_path, db):
     """Defense against a runtime that reports the parent's id for a fork."""
     engine, backend, fork_id = await _setup(tmp_path, db, ["ok"])
@@ -425,12 +524,22 @@ async def test_resume_session_does_not_fork_a_fork_again(tmp_path, db):
     engine, backend, fork_id = await _setup(tmp_path, db, ["ok", "ok"])
     await _run(engine, fork_id)
     await _drop_client(engine, fork_id)
-    await engine.sessions.mark_idle(fork_id)
+    await engine.sessions.mark_stopped(fork_id)
 
     resumed = await engine.resume_session(fork_id)
     assert resumed["status"] == "created"
     await _run(engine, fork_id, "second message")
     assert (backend.specs[1].fork, backend.specs[1].resume_native_id) == (False, FORK_OWN)
+
+
+@pytest.mark.asyncio
+async def test_resume_session_leaves_a_running_session_active(tmp_path, db):
+    engine, _backend, fork_id = await _setup(tmp_path, db, ["ok"])
+    await _run(engine, fork_id)
+    assert (await db.get_session(fork_id))["status"] == "active"
+
+    resumed = await engine.resume_session(fork_id)
+    assert resumed["status"] == "active"
 
 
 @pytest.mark.asyncio
@@ -481,10 +590,14 @@ async def test_a_missing_source_fails_once_and_says_so(tmp_path, db, found_by):
 
 
 @pytest.mark.asyncio
-async def test_a_fork_across_backends_is_refused(tmp_path, db):
+async def test_a_fork_moved_under_another_session_still_forks(tmp_path, db):
+    """The parent link is for the sidebar: moving a fork that has not run
+    under a session of another backend does not change what it forks."""
     engine, backend, fork_id = await _setup(tmp_path, db, ["ok"])
-    await db.update_session_fields("parent", {"backend": "codex"})
+    await engine.sessions.get_or_create(
+        "other", title="o", source="web", backend="codex", actor=None,
+    )
+    await db.update_session_fields(fork_id, {"parent_session_id": "other"})
 
-    out = await _run(engine, fork_id)
-    assert "Cannot fork a native session across agent backends" in out
-    assert backend.specs == []
+    await _run(engine, fork_id)
+    assert (backend.specs[0].fork, backend.specs[0].resume_native_id) == (True, PARENT_NATIVE)

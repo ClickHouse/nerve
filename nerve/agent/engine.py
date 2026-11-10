@@ -22,7 +22,7 @@ import secrets
 import time
 from collections import OrderedDict
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -1679,7 +1679,6 @@ class AgentEngine:
             is_fork = bool(fork_from) and not sdk_resume_id
             fork_last_turn_id: str | None = None
             if is_fork:
-                await self._check_fork_backend(session or {}, backend.name)
                 if not backend.validate_resume_target(fork_from, session_cwd):
                     raise await self._fork_source_missing(session_id, fork_from)
                 sdk_resume_id = fork_from
@@ -1904,12 +1903,15 @@ class AgentEngine:
                 ),
             )
 
-            try:
-                client = await backend.create_client(spec)
-            except ForkSourceMissingError:
-                if not is_fork:
-                    raise
-                raise await self._fork_source_missing(session_id, fork_from) from None
+            async def _create(spec: SessionSpec) -> AgentClient:
+                try:
+                    return await backend.create_client(spec)
+                except ForkSourceMissingError:
+                    if not spec.fork:
+                        raise
+                    raise await self._fork_source_missing(session_id, fork_from) from None
+
+            client = await _create(spec)
             if getattr(client, "resume_dropped", False):
                 # The backend had to discard the stale native id (codex
                 # resume-miss recovery) — clear the persisted column AND
@@ -1921,6 +1923,17 @@ class AgentEngine:
                 sdk_resume_id = None
                 # The transcript is fresh after all — it needs the preamble.
                 deliver_preamble = static_prompt
+                if fork_from:
+                    # A fork whose own conversation is gone branches from
+                    # its source again, not from nothing.
+                    await self._safe_disconnect(client)
+                    is_fork = True
+                    fork_last_turn_id = (session or {}).get("fork_source_turn_id") or None
+                    spec = dc_replace(
+                        spec, resume_native_id=fork_from, fork=True,
+                        fork_last_turn_id=fork_last_turn_id,
+                    )
+                    client = await _create(spec)
             if deliver_preamble:
                 self._pending_preambles[session_id] = build_session_preamble(
                     session_id, source, recalled_memories or None,
@@ -1974,15 +1987,6 @@ class AgentEngine:
                 " (forked)" if is_fork else "",
             )
             return client
-
-    async def _check_fork_backend(self, session: dict, backend_name: str) -> None:
-        """Refuse a fork whose parent runs on another backend: a native
-        conversation cannot move between runtimes. A deleted parent is not
-        checked (``fork_session`` copied the parent's backend)."""
-        parent_id = session.get("parent_session_id")
-        parent = await self.db.get_session(parent_id) if parent_id else None
-        if parent and parent.get("backend") and parent["backend"] != backend_name:
-            raise ValueError("Cannot fork a native session across agent backends")
 
     async def _fork_source_missing(
         self, session_id: str, fork_from: str,
@@ -2921,20 +2925,25 @@ class AgentEngine:
     ) -> dict:
         """Resume a stopped/idle session.
 
-        Records a ``created`` status event with reason ``resume`` and
-        ``attribution``, only when the status changes: a session that is
-        resumed already stays as it is, so of two resumes at the same time
-        only one is recorded.
+        A ``stopped``, ``idle`` or ``error`` session goes to ``created``, with
+        a ``created`` status event with reason ``resume`` and
+        ``attribution``. Any other status stays as it is and records
+        nothing: a session that runs keeps ``active``, and of two resumes at
+        the same time only one is recorded. The next message resumes the
+        stored native conversation.
         """
         info = await self.sessions.get_resume_info(session_id)
         if not info or not info.get("sdk_session_id"):
             raise ValueError(
                 f"Session {session_id} cannot be resumed (no SDK session)",
             )
-        # Mark as created so the next message will reconnect the client
         await self.sessions.transition(
             session_id, SessionStatus.CREATED, {"reason": "resume"},
             attribution=attribution,
+            only_from=(
+                SessionStatus.STOPPED.value, SessionStatus.IDLE.value,
+                SessionStatus.ERROR.value,
+            ),
         )
         session = await self.db.get_session(session_id)
         return session

@@ -264,6 +264,7 @@ class SessionManager:
         self, session_id: str, new_status: SessionStatus,
         details: dict | None = None,
         *, attribution: Attribution = UNATTRIBUTED,
+        only_from: tuple[str, ...] | None = None,
     ) -> bool:
         """Atomically transition a session's status and log the event.
 
@@ -271,14 +272,15 @@ class SessionManager:
         resume). A transition that records the state of the runtime keeps it
         unattributed. A session that has ``new_status`` already stays as it
         is and records nothing, so of two callers that make the same
-        transition at the same time only one is recorded. Returns ``True``
-        when the status changed.
+        transition at the same time only one is recorded. With
+        ``only_from``, a session in another status also stays as it is.
+        Returns ``True`` when the status changed.
         """
         async with self._transition_lock:
             return await self.db.change_session_status(
                 session_id, new_status.value,
                 event_type=new_status.value, details=details,
-                attribution=attribution,
+                attribution=attribution, only_from=only_from,
             )
 
     # The ``mark_*`` methods record the state of the runtime. They write
@@ -817,7 +819,10 @@ class SessionManager:
 
         # Resolve the fork point up front so a bad anchor fails the API
         # call, not the fork's first message. The same turn bounds the
-        # copied messages and the native fork.
+        # copied messages and the native fork. A fork of the whole chat
+        # branches at the source's last completed turn, so turns that the
+        # source completes later are in neither. With no turn mapping (history
+        # from before per-turn recording) it takes the whole conversation.
         fork_turn_id: str | None = None
         if at_message_id is not None:
             fork_turn_id = await self.db.get_native_turn_at_message(
@@ -829,6 +834,8 @@ class SessionManager:
                     "mapping (recorded per turn since this feature shipped). "
                     "Fork the whole chat instead."
                 )
+        else:
+            fork_turn_id = await self.db.get_last_native_turn(source_session_id)
 
         fork_id = f"fork-{str(uuid.uuid4())[:8]}"
         fork_title = title or f"Fork of {parent.get('title', source_session_id)}"
