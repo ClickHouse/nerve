@@ -59,12 +59,13 @@ from nerve.config import (
     SlackConfig,
     validate_config_keys,
 )
-from nerve.cron.gates import GateContext, GitHubPrActivityGate
+from nerve.cron.gates import GateContext, GitHubPrActivityGate, MessagesGate
 from nerve.cron.service import CronService
 from nerve.gateway import server as gateway_server
 from nerve.sources.github import GitHubSource, notification_record
 from nerve.sources.github_hosted import HostedGitHubSource, record_from_buffer
 from nerve.sources.registry import build_source_runners
+from nerve.sources.runner import SourceRunner
 from tests.fake_channel_gateway import (
     EVENT_TIMEOUT,
     FakeChannelGateway,
@@ -651,6 +652,20 @@ class TestBufferedRecords:
         assert (result.next_cursor, result.has_more) == ("2", False)
         again = await HostedGitHubSource(db).fetch(result.next_cursor, limit=10)
         assert (again.records, again.next_cursor) == ([], "2")
+
+    @pytest.mark.asyncio
+    async def test_the_first_drain_of_a_provider_wakes_the_consumers_of_other_sources(self, db):
+        """The first records of a provider that starts later, here the
+        repository watch, are unread for a consumer that reads another source."""
+        await db.set_consumer_cursor("inbox", "github", 0)
+        await db.insert_channel_observation("github_repos", "github_repos:owner/repo", self.payload())
+        gate, ctx = MessagesGate(), GateContext(job_id="inbox-processor", db=db)
+        assert not await gate.is_satisfied(ctx)
+
+        await SourceRunner(HostedGitHubSource(db, provider="github_repos"), db).run()
+
+        assert await gate.is_satisfied(ctx)
+        assert await db.peek_consumer_cursor("inbox", "github_repos") == 0
 
 
 @pytest.mark.asyncio
