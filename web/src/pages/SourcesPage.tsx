@@ -3,13 +3,14 @@ import { useNavigate } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import {
-  RefreshCw, Play, Loader2, Mail, Github, MessageCircle, Slack, Inbox,
+  RefreshCw, Play, Loader2, Mail, Github, MessageCircle, Slack, Inbox, ListTodo,
   ExternalLink, Trash2, ChevronDown, ChevronRight,
   CheckCircle2, XCircle, HardDrive, Database, Filter, AlertTriangle,
 } from '../components/ui/icons';
 import { Badge, Button, Checkbox, IconButton, type BadgeTone } from '../components/ui';
 import { useSourcesStore, type SourceOverviewEntry } from '../stores/sourcesStore';
 import { MessageContent } from '../components/Sources/MessageContent';
+import { getRendererType, showsRecordData } from '../components/Sources/renderers';
 import { sourceLabel } from '../utils/sourceLabel';
 
 // --- Helpers ---
@@ -37,6 +38,7 @@ function sourceIcon(source: string) {
     case 'gmail': return <Mail size={14} className="text-hue-red" />;
     case 'github': return <Github size={14} className="text-hue-purple" />;
     case 'github_repos': return <Github size={14} className="text-hue-purple" />;
+    case 'linear': return <ListTodo size={14} className="text-hue-violet" />;
     case 'telegram': return <MessageCircle size={14} className="text-hue-blue" />;
     case 'slack': return <Slack size={14} className="text-hue-emerald" />;
     default: return <Inbox size={14} className="text-text-dim" />;
@@ -53,6 +55,7 @@ function sourceBadgeTone(source: string): BadgeTone {
     case 'gmail': return 'danger';
     case 'github': return 'purple';
     case 'github_repos': return 'purple';
+    case 'linear': return 'info';
     case 'telegram': return 'info';
     // `accent` rather than `success`: the tone has to say "Slack", and a
     // status token would say the row went well.
@@ -551,6 +554,9 @@ function MessageDetail() {
 
   const msg = selectedMessage;
   const hasProcessedContent = msg.processed_content && msg.processed_content !== msg.content;
+  // The record data of a generic hosted source is nested JSON, which the
+  // content renderer shows in full; chips would show it as raw text.
+  const metadataChips = !showsRecordData(getRendererType(msg.source, msg.metadata));
 
   return (
     <div className="flex-1 overflow-y-auto">
@@ -565,7 +571,7 @@ function MessageDetail() {
         <div className="text-sm text-text-secondary font-medium">{msg.summary}</div>
 
         {/* Metadata */}
-        {msg.metadata && Object.keys(msg.metadata).length > 0 && (
+        {metadataChips && msg.metadata && Object.keys(msg.metadata).length > 0 && (
           <div className="flex flex-wrap gap-2 mt-2">
             {Object.entries(msg.metadata).map(([k, v]) => (
               <span key={k} className="text-xs px-1.5 py-0.5 bg-surface border border-border-subtle rounded">
