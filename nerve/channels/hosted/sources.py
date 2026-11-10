@@ -237,11 +237,7 @@ def linear_subscription(settings: LinearSyncConfig) -> SourceSubscription:
         settings=provider_settings or None,
         schemas=LINEAR_SCHEMAS,
         rules=tuple(
-            SourceRule(
-                path=rule["path"],
-                allow=tuple(rule.get("allow") or ()),
-                deny=tuple(rule.get("deny") or ()),
-            )
+            SourceRule(path=rule.path, allow=tuple(rule.allow), deny=tuple(rule.deny))
             for rule in settings.rules
         ),
     )

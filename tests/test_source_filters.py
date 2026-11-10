@@ -15,7 +15,7 @@ import pytest
 
 from nerve.config import GitHubSyncConfig
 from nerve.sources.base import Source
-from nerve.sources.filters import DataRule, FieldRule, InboxFilter, data_rules
+from nerve.sources.filters import DataRule, FieldRule, InboxFilter
 from nerve.sources.github import github_inbox_filter
 from nerve.sources.models import FetchResult, SourceRecord
 from nerve.sources.runner import SourceRunner
@@ -376,6 +376,11 @@ RULE_VECTORS = json.loads(
 )
 
 
+def _data_rules(rules: list[dict]) -> list[DataRule]:
+    """The guardrail rules of subscription rules in the contract's shape."""
+    return [DataRule(rule["path"], tuple(rule.get("allow", ())), tuple(rule.get("deny", ()))) for rule in rules]
+
+
 def _data_record(data: dict) -> SourceRecord:
     return SourceRecord(
         id="note:1", source="example", record_type="example_note", summary="[NOTE-7] Plan",
@@ -387,7 +392,7 @@ def _data_record(data: dict) -> SourceRecord:
 def test_the_rule_vectors_shared_with_the_gateway(case):
     record = _data_record(RULE_VECTORS["data"])
 
-    assert InboxFilter(rules=data_rules(case["rules"])).passes(record) is case["keep"]
+    assert InboxFilter(rules=_data_rules(case["rules"])).passes(record) is case["keep"]
 
 
 def test_the_values_at_a_path():
@@ -415,7 +420,7 @@ def test_a_data_rule_without_patterns_is_inactive_and_an_invalid_path_names_noth
 
 def test_rejects_names_the_path_and_the_value_of_the_data_rule():
     record = _data_record(RULE_VECTORS["data"])
-    flt = InboxFilter(rules=data_rules([
+    flt = InboxFilter(rules=_data_rules([
         {"path": "/issue/team/key", "allow": ["ENG*"]},
         {"path": "/actor/kind", "deny": ["user"]},
     ]))
@@ -433,7 +438,7 @@ class _DataSource(_FakeSource):
 async def test_runner_drops_on_a_data_rule_and_logs_its_path_and_value(db, caplog):
     kept = _data_record({"actor": {"kind": "user"}})
     bot = SourceRecord(**{**kept.__dict__, "id": "note:2", "metadata": {"actor": {"kind": "bot"}}})
-    flt = InboxFilter(rules=data_rules([{"path": "/actor/kind", "deny": ["bot"]}]))
+    flt = InboxFilter(rules=_data_rules([{"path": "/actor/kind", "deny": ["bot"]}]))
     runner = SourceRunner(source=_DataSource([kept, bot]), db=db, inbox_filter=flt)
 
     with caplog.at_level("INFO", logger="nerve.sources.runner"):

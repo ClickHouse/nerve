@@ -54,6 +54,7 @@ from nerve.config import (
     LinearSyncConfig,
     NerveConfig,
     SlackConfig,
+    SourceRuleConfig,
     validate_config_keys,
 )
 from nerve.gateway import server as gateway_server
@@ -154,7 +155,7 @@ class TestSettings:
         assert (linear.enabled, linear.mode, linear.events) == (True, "hosted", ["assigned", "commented"])
         assert (linear.inbox, linear.include_bots, linear.drop_own_actions) == (False, True, False)
         assert (linear.schedule, linear.batch_size, linear.condense) == ("*/5 * * * *", 20, True)
-        assert linear.rules == [{"path": "/issue/team/key", "allow": ["ENG*", "OPS"]}]
+        assert linear.rules == [SourceRuleConfig(path="/issue/team/key", allow=["ENG*", "OPS"])]
 
     @pytest.mark.parametrize("blank", [None, "", "  "])
     def test_blank_events_and_mode_mean_the_defaults(self, blank):
@@ -558,5 +559,5 @@ def test_a_config_file_with_the_example_section_loads(tmp_path):
 
     linear = LinearSyncConfig.from_dict(section["linear"])
 
-    assert linear.rules == [{"path": "/issue/team/key", "allow": ["ENG*"]}]
+    assert linear.rules == [SourceRuleConfig(path="/issue/team/key", allow=["ENG*"])]
     assert linear.events == ["assigned", "commented", "mentioned"]

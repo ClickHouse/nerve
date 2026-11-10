@@ -284,7 +284,7 @@ def build_source_runners(
     linear = config.sync.linear
     if linear.enabled:
         from nerve.channels.hosted.sources import LINEAR
-        from nerve.sources.filters import InboxFilter, data_rules
+        from nerve.sources.filters import DataRule, InboxFilter
         from nerve.sources.hosted import HostedSource
 
         runners.append(SourceRunner(
@@ -295,7 +295,10 @@ def build_source_runners(
             condense_model=condense_model,
             condense_client_factory=condense_factory,
             ttl_days=ttl_days,
-            inbox_filter=InboxFilter(rules=data_rules(linear.rules)),
+            inbox_filter=InboxFilter(rules=[
+                DataRule(rule.path, allow=tuple(rule.allow), deny=tuple(rule.deny))
+                for rule in linear.rules
+            ]),
         ))
         logger.info(
             "Registered source: linear (hosted) (batch=%d, events=%s, inbox=%s, "

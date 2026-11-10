@@ -2322,6 +2322,21 @@ SOURCE_RULE_PATTERN_MAX_BYTES = 256
 _SOURCE_RULE_KEYS = frozenset({"path", "allow", "deny"})
 
 
+@dataclass
+class SourceRuleConfig:
+    """One rule of a generic hosted source (``sync.linear.rules``).
+
+    ``path`` is a JSON Pointer into the record's data, such as
+    ``/actor/kind``, and exactly one of ``allow`` and ``deny`` holds glob
+    patterns; the other is empty. :func:`_source_rules` builds them from the
+    config and refuses a rule that the channel gateway would refuse, so this
+    has no ``from_dict`` of its own.
+    """
+    path: str = ""
+    allow: list[str] = field(default_factory=list)
+    deny: list[str] = field(default_factory=list)
+
+
 def _linear_mode(value: object) -> str:
     """``sync.linear.mode``: ``hosted``, also when unset; anything else refuses to load."""
     mode = _setting_str(value, "hosted").lower()
@@ -2356,7 +2371,7 @@ def _linear_events(value: object) -> list[str]:
     return [event for event in LINEAR_EVENTS if event in chosen]
 
 
-def _source_rules(value: object, setting: str) -> list[dict[str, Any]]:
+def _source_rules(value: object, setting: str) -> list[SourceRuleConfig]:
     """The rules of a generic hosted source, such as ``sync.linear.rules``.
 
     Each rule is a mapping with a ``path``, a JSON Pointer into the record's
@@ -2364,7 +2379,7 @@ def _source_rules(value: object, setting: str) -> list[dict[str, Any]]:
     ``deny`` list of glob patterns. Patterns are stripped and blank ones
     dropped; a single value is a list of one. A rule that the channel gateway
     would refuse refuses to load, so the gateway never closes the stream over
-    one. The loaded rule has its path and its one list.
+    one.
     """
     if value is None:
         return []
@@ -2372,7 +2387,7 @@ def _source_rules(value: object, setting: str) -> list[dict[str, Any]]:
         raise ValueError(f"{setting} must be a list of rules, each with a path and an allow or deny list")
     if len(value) > SOURCE_RULES_MAX:
         raise ValueError(f"{setting} must have at most {SOURCE_RULES_MAX} rules, got {len(value)}")
-    rules: list[dict[str, Any]] = []
+    rules: list[SourceRuleConfig] = []
     for index, entry in enumerate(value):
         where = f"{setting}[{index}]"
         if not isinstance(entry, dict):
@@ -2394,7 +2409,7 @@ def _source_rules(value: object, setting: str) -> list[dict[str, Any]]:
                 lists[key] = patterns
         if len(lists) != 1:
             raise ValueError(f"{where} needs exactly one non-empty list: allow or deny")
-        rules.append({"path": path, **lists})
+        rules.append(SourceRuleConfig(path=path, **lists))
     return rules
 
 
@@ -2452,7 +2467,7 @@ class LinearSyncConfig:
     # Allow/deny glob lists on JSON Pointer paths into the record data, such
     # as {"path": "/issue/team/key", "allow": ["ENG*"]}. At most
     # SOURCE_RULES_MAX rules; a rule the gateway would refuse refuses to load.
-    rules: list[dict[str, Any]] = field(default_factory=list)
+    rules: list[SourceRuleConfig] = field(default_factory=list)
     schedule: str = "*/15 * * * *"
     condense: bool = False
     batch_size: int = 50

@@ -42,7 +42,7 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 import logging
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -203,22 +203,6 @@ class DataRule:
     def passes(self, record: SourceRecord) -> bool:
         """Return True if *record* satisfies this rule (should be kept)."""
         return _passes(self.values(record), self.allow, self.deny)
-
-
-def data_rules(rules: Iterable[Mapping[str, Any]]) -> list[DataRule]:
-    """The :class:`DataRule` of each rule of a generic source's settings.
-
-    Each rule is a mapping with a ``path`` and an ``allow`` or ``deny`` list,
-    as the config loads it (``sync.linear.rules``, for example).
-    """
-    return [
-        DataRule(
-            path=str(rule.get("path", "")),
-            allow=tuple(rule.get("allow") or ()),
-            deny=tuple(rule.get("deny") or ()),
-        )
-        for rule in rules
-    ]
 
 
 @dataclass
