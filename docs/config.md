@@ -2144,7 +2144,14 @@ also when the backend did not start at all, and nothing is frozen into it;
 the sweep keeps its watermark, so the window is offered again. Reads are
 tried twice, and wait out a `Retry-After` of up to 2 seconds once (the
 gateway's per-agent limit sends 1); a longer one holds that operation (at
-most 60 seconds). When the gateway is not reached, or a call gets no answer
+most 60 seconds). A call the gateway answers with
+`MCP server session ended; the state of earlier calls is lost`
+did not reach Loom: the session the gateway kept with Loom had ended. Nerve
+sends such a call again at once, an extraction batch too, at most three
+times in a row, without using up a read's second try. A fourth such answer
+in a row is a failure like any other `-32002`: a read goes on to its second
+try, and a batch waits for the sweep. When the gateway is not reached, or a
+call gets no answer
 in time (a read gives up long before the gateway's call limit, extraction a
 little after it), calls fail at once for 15 seconds, doubling with each such
 failure in a row up to 5 minutes: the gateway's own circuit does not count
