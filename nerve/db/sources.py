@@ -399,6 +399,29 @@ class SourceStore:
             (consumer, source, cursor_seq, session_id, now.isoformat(), expires),
         )
 
+    async def seed_consumer_cursors(self, source: str, ttl_days: int = 2) -> int:
+        """Start a cursor on *source* for every consumer that has one elsewhere.
+
+        Each starts at the source's newest message, as :meth:`get_consumer_cursor`
+        would, so what the source stores from now on is unread. Without it a
+        new source stays invisible to :meth:`consumer_has_unread`, and the
+        consumer's first poll starts past the source's first records. A
+        consumer's existing cursor on *source* is left as it is. Returns the
+        number of cursors started.
+        """
+        now = datetime.now(UTC)
+        expires = (now + timedelta(days=ttl_days)).isoformat()
+        result = await self._write(
+            """INSERT OR IGNORE INTO consumer_cursors
+                   (consumer, source, cursor_seq, updated_at, expires_at)
+               SELECT DISTINCT consumer, ?,
+                      (SELECT COALESCE(MAX(rowid), 0) FROM source_messages WHERE source = ?),
+                      ?, ?
+               FROM consumer_cursors WHERE source != ?""",
+            (source, source, now.isoformat(), expires, source),
+        )
+        return result.rowcount or 0
+
     async def keep_consumer_cursors_alive(
         self, consumer: str, sources: list[str] | None = None, ttl_days: int = 2,
     ) -> int:

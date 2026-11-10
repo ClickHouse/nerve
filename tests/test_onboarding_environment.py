@@ -36,7 +36,7 @@ _REAL_GITHUB_CLI = env._github_cli
 
 LABELS = [
     "Mode", "Workspace", "Configuration", "Model", "Memory", "GitHub token",
-    "GitHub CLI (`gh`)", "GitHub sync source", "GitHub repository watch", "Slack",
+    "GitHub CLI (`gh`)", "GitHub sync source", "GitHub repository watch", "Linear", "Slack",
     "Telegram channel", "Telegram message sync", "Gmail", "Time zone", "Quiet hours",
 ]
 NONE_KNOWN = "GitHub access: none known — clone public URLs only; report what needs a credential."
@@ -133,6 +133,7 @@ class TestNothingConfigured:
         assert lines["GitHub CLI (`gh`)"] == "not installed"
         assert lines["GitHub sync source"] == "off"
         assert lines["GitHub repository watch"] == "off"
+        assert lines["Linear"] == "off"
         assert lines["Slack"] == "not configured"
         assert lines["Telegram channel"] == "not configured"
         assert lines["Telegram message sync"] == "off"
@@ -333,6 +334,27 @@ class TestConnections:
             "on (the channel gateway polls): new pull requests, issues and releases in `acme/widgets`; "
             "also new commits, ready for review, merges and closes of the pull requests it reported"
         )
+
+    def test_the_linear_line_says_what_it_reports_and_how_the_agent_writes_back(self, tmp_path):
+        import yaml
+
+        config_dir, ws = _install(tmp_path)
+        merge_settings_paths(ws, {"sync.linear.enabled": True, "sync.linear.types": ["assigned"]})
+
+        lines = _lines(env.gather(load_config(config_dir), ws).section)
+        assert lines["Linear"] == "on, but its API key is not set"
+
+        local_file = config_dir / "config.local.yaml"
+        local = yaml.safe_load(local_file.read_text()) if local_file.exists() else {}
+        local.setdefault("sync", {})["linear"] = {"api_key": "lin_api_REPLACE-LINEAR-K2"}
+        local_file.write_text(yaml.safe_dump(local))
+
+        section = env.gather(load_config(config_dir), ws).section
+        assert _lines(section)["Linear"] == (
+            "on (API key from a configuration file on this machine): assigned; writes through "
+            "the `linear` MCP server (`mcp__linear__*`) as the key's user"
+        )
+        assert "REPLACE-LINEAR" not in section
 
     def test_a_repository_watch_without_repositories_says_so(self, tmp_path):
         config_dir, ws = _install(tmp_path)

@@ -277,6 +277,45 @@ def build_source_runners(
             gh_repos.deny_authors or [],
         )
 
+    # Linear (notifications of the user the API key belongs to). The key comes
+    # from sync.linear.api_key (config.local.yaml); without one the source is
+    # skipped rather than failing every run.
+    linear = config.sync.linear
+    if linear.enabled:
+        if not linear.api_key:
+            logger.warning(
+                "Skipping source linear: sync.linear is enabled but sync.linear.api_key "
+                "is empty (set it in config.local.yaml)",
+            )
+        else:
+            from nerve.sources.linear import LinearSource, linear_inbox_filter
+
+            source = LinearSource(config={
+                "api_key": linear.api_key,
+                "types": linear.types,
+                "include_bots": linear.include_bots,
+                "deny_actors": linear.deny_actors,
+                "allow_teams": linear.allow_teams,
+                "deny_teams": linear.deny_teams,
+            })
+            runners.append(SourceRunner(
+                source=source,
+                db=db,
+                batch_size=linear.batch_size,
+                condense=linear.condense,
+                condense_model=condense_model,
+                condense_client_factory=condense_factory,
+                ttl_days=ttl_days,
+                inbox_filter=linear_inbox_filter(linear),
+            ))
+            logger.info(
+                "Registered source: linear (batch=%d, types=%s, include_bots=%s, "
+                "teams allow=%s deny=%s, deny_actors=%s, mcp=%s)",
+                linear.batch_size, linear.types, linear.include_bots,
+                linear.allow_teams or "*", linear.deny_teams or [],
+                linear.deny_actors or [], linear.mcp,
+            )
+
     # Channel source drains. Not a poll: the channel transport already
     # delivered and buffered these events. This only moves them into the
     # inbox. What to watch is a property of the channel, so the config lives at
