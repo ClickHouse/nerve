@@ -116,12 +116,26 @@ def gateway_negotiation(**limits: int) -> dict[str, Any]:
     }
 
 
-def capabilities(*, operations: list[str] | None = None, **limits: int) -> dict[str, Any]:
-    """The sample capabilities, with other operations or limits if given."""
+def capabilities(
+    *,
+    operations: list[str] | None = None,
+    provider: str | None = None,
+    behaviour: dict[str, str] | None = None,
+    **limits: int,
+) -> dict[str, Any]:
+    """The sample capabilities, with other operations, limits, provider, or behaviour if given.
+
+    Without a provider and a behaviour, the capabilities are those of a
+    gateway that announces neither.
+    """
     body = copy.deepcopy(CAPABILITIES)
     if operations is not None:
         body["operations"] = operations
     body["limits"].update(limits)
+    if provider is not None:
+        body["provider"] = provider
+    if behaviour is not None:
+        body["behaviour"] = behaviour
     return body
 
 
@@ -138,6 +152,7 @@ def message_event(
     event_id: str | None = None,
     connection_id: str = CONNECTION_ID,
     kind: str = "message",
+    provider: str = "slack",
 ) -> dict[str, Any]:
     """A message event in the shape of the contract samples, without a delivery.
 
@@ -145,6 +160,7 @@ def message_event(
     as the gateway sets it.
     """
     event = copy.deepcopy(MESSAGE_EVENT)
+    event["provider"] = provider
     event["kind"] = kind
     event["event_id"] = event_id or f"ev-{purpose}-{conversation}-{message_id}-{kind}"
     event["message_revision_id"] = f"revision:{message_id}:0"
@@ -700,10 +716,13 @@ class FakeStream:
         *,
         connection_id: str = CONNECTION_ID,
         operations: list[str] | None = None,
+        provider: str | None = None,
+        behaviour: dict[str, str] | None = None,
         **limits: int,
     ) -> None:
         await self.send(
-            "capabilities", capabilities(operations=operations, **limits),
+            "capabilities",
+            capabilities(operations=operations, provider=provider, behaviour=behaviour, **limits),
             connection_id=connection_id,
         )
 

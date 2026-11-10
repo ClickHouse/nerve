@@ -271,6 +271,14 @@ slack:
 #     agent_id: 00000000-0000-0000-0000-000000000000
 #     max_streams: 8
 
+# The email channel, hosted mode only (needs the channels.hosted settings
+# above): the gateway delivers the mail that members of the agent send to its
+# address, and each mail starts or continues a session. Nerve posts no answer;
+# the agent answers with the reply tool that the gateway names. A reload
+# switches it on or off. See docs/config.md#email.
+# email:
+#   enabled: false
+
 # Where notify, ask_user, and propose_action deliver. The list replaces the
 # default rather than adding to it, so name every transport you want. The
 # panel (web) is always in it. A transport that is off costs nothing here.

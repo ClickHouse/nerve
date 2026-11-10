@@ -69,6 +69,9 @@ MAX_SUBSCRIPTION_PATTERN_BYTES = 256
 SUBSCRIPTION_INBOXES = ("", "participating", "all")
 # The provider whose subscription names repositories to watch, and only it.
 REPO_WATCH_PROVIDER = "github_repos"
+# The provider of the mail that members send to the agent. Its subscription
+# names only the provider, with empty filters.
+EMAIL_PROVIDER = "email"
 # Such a subscription names 1 to this many repositories, each once.
 MAX_REPO_WATCHES = 50
 # What a watched repository may report.
@@ -78,6 +81,17 @@ _REPO_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_.-]{1,100
 # A provider name is a lowercase token of at most this many bytes.
 MAX_PROVIDER_BYTES = 64
 _PROVIDER_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-.")
+# How Nerve answers the turns of a connection's events (ConnectionBehaviour).
+ANSWER_POST = "post"
+ANSWER_TOOL = "tool"
+ANSWER_MODES = (ANSWER_POST, ANSWER_TOOL)
+# Which session the turns of a conversation go to (ConnectionBehaviour).
+SESSION_ROTATE = "rotate"
+SESSION_KEEP = "keep"
+SESSION_MODES = (SESSION_ROTATE, SESSION_KEEP)
+# The name of a reply tool: 1 to this many characters of a-z, 0-9 and _.
+MAX_REPLY_TOOL_BYTES = 128
+_REPLY_TOOL = re.compile(rf"[a-z0-9_]{{1,{MAX_REPLY_TOOL_BYTES}}}")
 
 
 def byte_length(value: str) -> int:
@@ -513,17 +527,79 @@ class ConnectionLimits:
 
 
 @_record
+class ConnectionBehaviour:
+    """How Nerve answers the turns of a connection's events, and keeps their sessions.
+
+    ``answer`` is ``post``: Nerve posts the turn's answer in the
+    conversation. Or it is ``tool``: Nerve posts nothing for the turn, the
+    answer stays in the session, and the agent answers only with a tool.
+    ``reply_tool`` is the name of that tool, which Nerve shows to the agent.
+    Only ``tool`` can have it, and it is optional. ``session`` is
+    ``rotate``: a conversation gets a new session after the sticky period.
+    Or it is ``keep``: a conversation keeps its last session, however long
+    it was idle. An empty member, as from an older gateway, has its default:
+    ``post``, no tool, and ``rotate``.
+    """
+
+    answer: str = omit_empty()
+    reply_tool: str = omit_empty()
+    session: str = omit_empty()
+
+    @property
+    def posts_answer(self) -> bool:
+        """Whether Nerve posts the turn's answer in the conversation."""
+        return self.answer != ANSWER_TOOL
+
+    @property
+    def keeps_session(self) -> bool:
+        """Whether a conversation keeps its last session past the sticky period."""
+        return self.session == SESSION_KEEP
+
+    def validate(self) -> None:
+        """Check the modes and the reply tool, as the gateway does."""
+        if self.answer:
+            _one_of("answer mode", self.answer, ANSWER_MODES)
+        if self.session:
+            _one_of("session mode", self.session, SESSION_MODES)
+        if self.reply_tool:
+            if self.answer != ANSWER_TOOL:
+                malformed("a reply tool is permitted only with the tool answer mode")
+            if _REPLY_TOOL.fullmatch(self.reply_tool) is None:
+                malformed(f"reply tool is not 1 to {MAX_REPLY_TOOL_BYTES} characters of a-z, 0-9 and _")
+
+
+@_record
 class Capabilities:
-    """A connection's operations and limits."""
+    """A connection's operations, limits, provider, and behaviour.
+
+    ``provider`` is the provider of the connection, such as ``slack``. An
+    older gateway leaves it out, and the connection then serves every hosted
+    chat channel. ``behaviour`` has its defaults when it is absent. A
+    connection without operations, such as one that only delivers events,
+    still sends usable limits.
+    """
 
     operations: tuple[str, ...] = omit_empty(())
     limits: ConnectionLimits = struct(ConnectionLimits)
+    provider: str = omit_empty()
+    behaviour: ConnectionBehaviour = struct(ConnectionBehaviour)
 
     def validate(self) -> None:
         # Nerve paces, splits, and times out operations by these limits.
         limits = self.limits
         if min(limits.in_flight_operations, limits.operation_deadline_millis, limits.text_characters) < 1:
             reject(RejectionReason.LIMIT_EXCEEDED, "capabilities have no usable operation or text limit")
+        # Nerve chooses the connections of a channel by this name.
+        if self.provider and not valid_provider(self.provider):
+            malformed("capabilities provider is not a lowercase token")
+        self.behaviour.validate()
+
+    def serves(self, provider: str) -> bool:
+        """Whether the connection serves the hosted chat channel of *provider*.
+
+        A connection that names no provider serves every hosted chat channel.
+        """
+        return self.provider in ("", provider)
 
 
 @_record
@@ -796,6 +872,8 @@ class SourceSubscription:
     watches. Only that provider carries them, and it carries no filters,
     ``pr_watch`` or ``inbox``. Nerve sends it only while the repository watch
     is switched on, so every other frame is unchanged.
+
+    The ``email`` subscription carries only its provider and empty filters.
     """
 
     provider: str = ""
@@ -821,8 +899,9 @@ class Subscriptions:
 
         The version, the number of sources, each provider name and that no
         provider appears twice, each inbox, the bounds of every filter list,
-        and the watched repositories, which only ``github_repos`` names (see
-        :func:`_validate_repo_watches`).
+        the watched repositories, which only ``github_repos`` names (see
+        :func:`_validate_repo_watches`), and that an ``email`` subscription
+        carries nothing but its provider.
         """
         if self.version != SUBSCRIPTIONS_VERSION:
             reject(RejectionReason.VERSION_UNSUPPORTED, f"unknown subscriptions version {self.version!r}")
@@ -847,6 +926,10 @@ class Subscriptions:
                 _validate_repo_watches(source)
             elif source.repos:
                 malformed(f"only a {REPO_WATCH_PROVIDER} subscription names repositories")
+            if source.provider == EMAIL_PROVIDER and (
+                any(source.filters.pattern_lists().values()) or source.pr_watch or source.inbox
+            ):
+                malformed(f"an {EMAIL_PROVIDER} subscription carries filters, pr_watch or an inbox")
 
     def without_filters(self) -> Subscriptions:
         """The same sources with no filter patterns.

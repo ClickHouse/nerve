@@ -17,7 +17,9 @@ buffer row is written.
 
 :func:`subscriptions_for` builds the ``subscriptions`` frame from the same
 settings that build the inbox filter, so the gateway and Nerve drop the same
-records.
+records. The runtime adds :func:`chat_subscription` entries for the hosted
+chat providers whose events the gateway takes only for a subscribed agent,
+such as ``email``, while they are switched on.
 """
 
 from __future__ import annotations
@@ -98,6 +100,18 @@ def subscriptions_for(config: NerveConfig, providers: Iterable[str]) -> Subscrip
         if watch is not None:
             sources.append(watch)
     return Subscriptions(version=SUBSCRIPTIONS_VERSION, sources=tuple(sources))
+
+
+def chat_subscription(provider: str) -> SourceSubscription:
+    """The subscription of a hosted chat provider: its name with empty filters.
+
+    The gateway takes the events of such a provider, such as ``email``, only
+    for an agent whose frame names it. The platform decides which of them
+    reach the agent, so there is nothing to filter. A member that the
+    gateway does not take would make it close the stream, so the entry
+    carries none.
+    """
+    return SourceSubscription(provider=provider)
 
 
 def github_subscription(settings: GitHubSyncConfig) -> SourceSubscription:
@@ -337,6 +351,7 @@ __all__ = [
     "GITHUB_REPOS",
     "HostedSourceConsumer",
     "buffered_record",
+    "chat_subscription",
     "github_repos_subscription",
     "github_subscription",
     "hosted_sources",

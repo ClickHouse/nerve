@@ -23,9 +23,10 @@ stops when the result arrives first. Nerve starts an upload only while its
 size, together with the uploads already in flight, fits the gateway's
 ``memory_bytes``.
 
-When the agent has hosted sources, the stream sends its ``subscriptions``
-frame as soon as negotiation completes, and again whenever the runtime
-publishes changed settings. The first frame waits for the stream for as long
+When the runtime publishes subscriptions (for hosted sources, or for a chat
+provider such as email), the stream sends its ``subscriptions`` frame as soon
+as negotiation completes, and again whenever the runtime publishes changed
+settings. The first frame waits for the stream for as long
 as it is open; a republish gives up after a short bound, so a stalled stream
 does not hold up a reload. A subscription that the gateway's bounds or frame
 limit would refuse goes without its filter patterns, so it never closes the
@@ -183,8 +184,8 @@ class ChannelStream:
     ``receive_limits`` is what Nerve accepts on this stream. Nerve advertises
     the same limits on every stream, so a row that one stream cannot carry
     cannot be carried by another either. ``subscriptions`` returns the
-    agent's current source subscriptions, or ``None`` when it has no hosted
-    sources and sends no ``subscriptions`` frame.
+    agent's current subscriptions, or ``None`` when the runtime sends no
+    ``subscriptions`` frame.
     """
 
     def __init__(

@@ -644,9 +644,15 @@ async def lifespan(app: FastAPI):
         # Hosted channels and sources: a shared gateway holds the provider
         # connections, polls the hosted sources, and streams admitted events to
         # /_internal/channel/v1/stream. Optional like Slack: a failure leaves
-        # the endpoint refusing upgrades.
+        # the endpoint refusing upgrades. Usable channels.hosted settings give
+        # the email channel, so a reload can switch email on; without them,
+        # email.enabled gets a warning and no channel.
+        from nerve.channels.hosted.providers import email_warning
         from nerve.channels.hosted.runtime import HostedChannelRuntime, hosted_providers
 
+        email_problem = email_warning(config)
+        if email_problem is not None:
+            logger.warning("%s", email_problem)
         if hosted_providers(config):
             try:
                 runtime = HostedChannelRuntime(
