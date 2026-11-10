@@ -561,7 +561,8 @@ class NotificationService:
           maintenance tick (:meth:`redeliver_due`) fans it out again
           with a fresh card.
         - For ``type=question`` rows (legacy): persist the answer,
-          inject it back into the originating session, broadcast.
+          inject it back into the originating session, broadcast. For an
+          archived or deleted session, persist and broadcast only: no turn.
         - Fire-and-forget ``type=notify`` rows do not flow through this
           method; the dismiss endpoint handles those.
 
@@ -589,10 +590,16 @@ class NotificationService:
         is_external = bool(
             session_record and session_record.get("source") == "external"
         )
+        # An archived or deleted session runs no more turns: the answer is
+        # stored and shown, but nothing is delivered to the session.
+        is_closed = (
+            session_record is None
+            or session_record.get("status") == "archived"
+        )
 
         # During a drain the turn that delivers the answer is refused. Keep
         # the question pending, so the person can answer after the restart.
-        if not is_external and not self.engine.accepting_turns:
+        if not is_external and not is_closed and not self.engine.accepting_turns:
             from nerve.agent.engine import NotAcceptingTurnsError
 
             raise NotAcceptingTurnsError()
@@ -610,7 +617,13 @@ class NotificationService:
 
         from nerve.agent.streaming import broadcaster
 
-        if is_external:
+        if is_closed:
+            logger.info(
+                "Answer to %s stored; session %s is %s, no turn",
+                notification_id, session_id,
+                "missing" if session_record is None else "archived",
+            )
+        if is_external or is_closed:
             await broadcaster.broadcast("__global__", {
                 "type": "notification_answered",
                 "notification_id": notification_id,
@@ -938,7 +951,11 @@ class NotificationService:
         if task.cancelled():
             return
         exc = task.exception()
-        if exc:
+        from nerve.agent.engine import SessionClosedError
+
+        if isinstance(exc, SessionClosedError):
+            logger.info("Answer injection dropped: %s", exc)
+        elif exc:
             logger.error("Answer injection task failed: %s", exc)
 
     async def handle_dismiss(
@@ -1658,6 +1675,23 @@ class NotificationService:
             return 0
         rows = await self.db.expire_due_notifications()
         if rows:
+            await self._report_expired(rows)
+        return len(rows)
+
+    async def expire_session_questions(self, session_id: str) -> int:
+        """Expire the pending questions of a session that was archived or
+        deleted, and report each one as :meth:`expire_stale` does (web
+        broadcast, Telegram and Slack card edits). The session gets no note:
+        :meth:`_takes_note` refuses an archived or missing session.
+        Approvals stay pending, because their answer acts on their target,
+        not on the session. Returns the number of expired questions.
+        """
+        rows = await self.db.expire_pending_questions_for_session(session_id)
+        if rows:
+            logger.info(
+                "Expired %d pending question(s) of closed session %s",
+                len(rows), session_id,
+            )
             await self._report_expired(rows)
         return len(rows)
 

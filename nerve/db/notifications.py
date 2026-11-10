@@ -395,28 +395,33 @@ class NotificationStore:
             )
         return True
 
-    async def expire_pending_questions_for_session(self, session_id: str) -> int:
+    async def expire_pending_questions_for_session(
+        self, session_id: str,
+    ) -> list[dict]:
         """Expire a session's pending ``question`` notifications.
 
-        Called when an idle session is auto-archived so the user isn't left
-        with a phantom pending question on a closed session (and the periodic
-        expiry pass has nothing to inject into the now-archived session).
-        Returns the number of questions expired.
+        Called when a session is archived or deleted, so that no question
+        stays answerable for a session that runs no more turns. Approvals
+        stay pending: their answer acts on their target, not on the session.
+        Returns the expired rows, with ``status`` set to ``'expired'``, for
+        the service layer to report (as :meth:`expire_due_notifications`).
         """
         async with self._atomic():
             async with self.db.execute(
-                """SELECT id FROM notifications
+                """SELECT * FROM notifications
                    WHERE session_id = ? AND status = 'pending' AND type = 'question'""",
                 (session_id,),
             ) as cursor:
-                ids = [row[0] async for row in cursor]
-            if ids:
-                ph = ",".join("?" for _ in ids)
+                rows = [dict(row) async for row in cursor]
+            if rows:
+                ph = ",".join("?" for _ in rows)
                 await self.db.execute(
                     f"UPDATE notifications SET status = 'expired' WHERE id IN ({ph})",
-                    tuple(ids),
+                    tuple(r["id"] for r in rows),
                 )
-        return len(ids)
+        for r in rows:
+            r["status"] = "expired"
+        return rows
 
     async def snooze_notification(
         self, notification_id: str, redeliver_at: str, new_expires_at: str,

@@ -27,7 +27,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from nerve import paths
-from nerve.agent.engine import AgentEngine, NotAcceptingTurnsError
+from nerve.agent.engine import AgentEngine, NotAcceptingTurnsError, SessionClosedError
 from nerve.agent.sessions import new_cron_run_id
 from nerve.config import ConfigError, NerveConfig, _is_within, workspace_reviewed_paths
 from nerve.cron.jobs import (
@@ -2215,7 +2215,12 @@ class CronService:
 
         def _done(t: asyncio.Task) -> None:
             exc = t.exception() if not t.cancelled() else None
-            if exc is not None:
+            if isinstance(exc, SessionClosedError):
+                logger.info(
+                    "Wakeup %s dropped: session %s is %s",
+                    wakeup["id"], session_id, exc.reason,
+                )
+            elif exc is not None:
                 logger.error(
                     "Wakeup %s run failed for session %s: %s",
                     wakeup["id"], session_id, exc,

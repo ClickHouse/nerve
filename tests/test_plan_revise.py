@@ -82,6 +82,7 @@ class FakeEngine:
         # Event flipped after every run() call so tests can await
         # dispatch deterministically instead of sleeping.
         self.run_event = asyncio.Event()
+        self.reopened: list[str] = []
 
     async def run(
         self,
@@ -100,6 +101,10 @@ class FakeEngine:
             "cause": cause,
         })
         self.run_event.set()
+
+    async def reopen_archived(self, session_id: str, *, attribution) -> bool:
+        self.reopened.append(session_id)
+        return False
 
 
 async def _setup(db: Database, tmp_path) -> tuple[FakeEngine, str]:
@@ -195,6 +200,25 @@ class TestRequestPlanRevision:
         # must route the feedback there, not to the cron fallback.
         assert engine.runs[0]["session_id"] == "sess-proposer"
         assert engine.sessions.calls[0]["session_id"] == "sess-proposer"
+        # An archived proposer session is unarchived before the run.
+        assert engine.reopened == ["sess-proposer"]
+
+    async def test_falls_back_to_cron_planner_when_proposer_was_deleted(
+        self, db: Database, tmp_path,
+    ):
+        engine, _ = await _setup(db, tmp_path)
+        await db.create_session("sess-proposer", actor=None)
+        await db.delete_session("sess-proposer")
+
+        await request_plan_revision(
+            db=db, engine=engine,
+            plan_id="plan-orig", feedback="rev",
+            actor=None, cause=None,
+        )
+        await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
+
+        assert engine.runs[0]["session_id"] == "cron:task-planner"
+        assert await db.get_session("sess-proposer") is None
 
     async def test_falls_back_to_cron_planner_when_session_unknown(
         self, db: Database, tmp_path,

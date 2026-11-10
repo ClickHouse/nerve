@@ -1119,6 +1119,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
     } catch (e) {
       console.error('Failed to delete session:', e);
+      // 409: a turn of the session runs or waits in its queue.
+      if (e instanceof Error && e.message.startsWith('409:')) {
+        window.alert('Could not delete this chat: it is running or has queued messages. Stop it, then delete it.');
+      }
     }
   },
 

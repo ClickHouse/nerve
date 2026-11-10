@@ -18,6 +18,7 @@ import uuid
 from dataclasses import asdict
 from typing import Any, TYPE_CHECKING
 
+from nerve.agent.engine import SessionClosedError
 from nerve.agent.interactive import get_handler
 from nerve.agent.streaming import broadcaster
 from nerve.channels.access import Decision
@@ -211,7 +212,24 @@ class ChannelRouter:
         conversation thus share the session that the first one creates.
 
         Called by channel implementations when they receive a user message.
+
+        A message that the channel's session takes, but that run() refuses
+        because the session was archived meanwhile, is sent again once: the
+        channel then gets a new session, as after the sticky period.
         """
+        try:
+            return await self._handle_message(msg)
+        except SessionClosedError as exc:
+            if msg.session_id or exc.reason != "archived":
+                raise
+            logger.info(
+                "Channel %s: session archived before the message ran; "
+                "sending it to a new session", msg.channel_key,
+            )
+            return await self._handle_message(msg)
+
+    async def _handle_message(self, msg: InboundMessage) -> str:
+        """:meth:`handle_message` for one session resolution."""
         channel = self._channels.get(msg.channel_name)
         if not channel:
             raise ValueError(f"Unknown channel: {msg.channel_name}")

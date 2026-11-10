@@ -30,7 +30,7 @@ User reviews (via /plans UI or chat tools)
 | `plan_read` | Read full plan content. Used to review details before approving/declining. |
 | `plan_approve` | Approve a pending plan and spawn an implementation session. With `implement_here=true`, record the approval for the calling session and start nothing. |
 | `plan_decline` | Decline a pending plan with optional feedback. Moves the related task to `done` (declining is treated as abandoning the effort, not pausing it). |
-| `plan_revise` | Request revision of a pending plan — sends feedback to the session that proposed it (the planner session for cron-made plans; `cron:task-planner` when the plan records no session), which calls `plan_update` to produce v+1. |
+| `plan_revise` | Request revision of a pending plan — sends feedback to the session that proposed it (the planner session for cron-made plans; `cron:task-planner` when the plan records no session or its session was deleted; an archived session is unarchived first), which calls `plan_update` to produce v+1. |
 
 ### `plan_propose(task_id, content, plan_type?, summary?)`
 

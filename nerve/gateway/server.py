@@ -31,7 +31,7 @@ from fastapi.staticfiles import StaticFiles
 
 from nerve import paths
 from nerve.agent.agents.emitter import agent_channel
-from nerve.agent.engine import AgentEngine, NotAcceptingTurnsError
+from nerve.agent.engine import AgentEngine, NotAcceptingTurnsError, SessionClosedError
 from nerve.agent.streaming import broadcaster
 from nerve.config import EXTERNAL_VERIFICATION_LOG, NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
@@ -185,7 +185,8 @@ _ws_runs: set[asyncio.Task] = set()
 
 
 def _ws_run_done(task: asyncio.Task) -> None:
-    """Forget a finished WebSocket run. A run refused by a drain is no error."""
+    """Forget a finished WebSocket run. A run refused by a drain or by a
+    closed session is no error."""
     _ws_runs.discard(task)
     if task.cancelled():
         return
@@ -193,6 +194,9 @@ def _ws_run_done(task: asyncio.Task) -> None:
     if isinstance(exc, NotAcceptingTurnsError):
         # The engine already told the session's clients.
         logger.info("Draining: refused a queued web turn")
+    elif isinstance(exc, SessionClosedError):
+        # The engine already told the session's clients.
+        logger.info("Refused a web turn: session %s", exc.reason)
     elif exc is not None:
         logger.error("Web turn failed", exc_info=exc)
 
@@ -1213,6 +1217,15 @@ def create_app() -> FastAPI:
     ):
         return JSONResponse(status_code=503, content={"detail": str(exc)})
 
+    # A route that starts a turn in an archived or deleted session.
+    @app.exception_handler(SessionClosedError)
+    async def _session_closed_handler(  # noqa: ANN001
+        request, exc: SessionClosedError,
+    ):
+        return JSONResponse(
+            status_code=409, content={"detail": str(exc), "reason": exc.reason},
+        )
+
     # FastAPI validation errors echo the rejected input, which can include the
     # setup token. Return them without the input.
     @app.exception_handler(RequestValidationError)
@@ -1390,6 +1403,13 @@ def create_app() -> FastAPI:
                             "client_msg_id": client_msg_id,
                         })
                         continue
+
+                    # The person's own message into an archived chat opens
+                    # it again (an ``unarchived`` event in their name). Every
+                    # other run in an archived session is refused.
+                    await _engine.reopen_archived(
+                        session_id, attribution=attribution_for(connection.actor),
+                    )
 
                     # Load uploaded files if any
                     images = None

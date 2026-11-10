@@ -143,6 +143,25 @@ class NotAcceptingTurnsError(RuntimeError):
         super().__init__(_NOT_ACCEPTING_TURNS_MESSAGE)
 
 
+_SESSION_CLOSED_MESSAGES = {
+    "archived": "This session is archived. Unarchive it to continue.",
+    "deleted": "This session was deleted.",
+}
+
+
+class SessionClosedError(RuntimeError):
+    """``AgentEngine.run`` refused a turn because its session is closed.
+
+    ``reason`` is ``archived`` (only unarchive opens the session again) or
+    ``deleted`` (no session row, and ``session_deletions`` records the
+    delete). The user message is not stored.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(_SESSION_CLOSED_MESSAGES[reason])
+        self.reason = reason
+
+
 # The runtime's system frame that marks a compacted conversation.
 _COMPACT_BOUNDARY = "compact_boundary"
 # A compact turn that ended with no such frame: the runtime had no messages.
@@ -472,6 +491,10 @@ class AgentEngine:
         # guard asks whether agents still run.
         self.sessions.on_client_removed = self.agents.on_client_gone
         self.sessions.has_live_agents = self.agents.has_live
+        # An archive expires the session's pending questions, and is refused
+        # while anything holds the session's run lock.
+        self.sessions.on_archived = self.expire_session_questions
+        self.sessions.run_lock_held = self._run_lock_held
         # Generation of the live runtime client per build (any session): a
         # finished agent is resumable only on the client that ran it.
         self._client_gen = 0
@@ -1149,6 +1172,41 @@ class AgentEngine:
         with keep_awake(LEASE_MEMORIZE):
             async with self._memorize_lock:
                 yield
+
+    async def reopen_archived(
+        self, session_id: str, *, attribution: Attribution,
+    ) -> bool:
+        """Unarchive ``session_id`` before a person's own message runs in it.
+
+        A message that a person sends into an archived session (the web
+        chat, ``POST /api/chat``, a plan revision request) opens it again,
+        recorded as ``unarchived`` with ``attribution``. Every other run in
+        an archived session is refused (:class:`SessionClosedError`).
+        Returns ``True`` when this call unarchived the session.
+        """
+        session = await self.db.get_session(session_id)
+        if not session or session.get("status") != SessionStatus.ARCHIVED.value:
+            return False
+        return await self.sessions.unarchive_session(
+            session_id, attribution=attribution,
+        )
+
+    def _run_lock_held(self, session_id: str) -> bool:
+        """Something holds the session's run lock: a turn, a run that waits
+        in the queue (the lock stays held across the handover), an
+        autonomous turn, an idle drain or a client reap."""
+        lock = self._session_locks.get(session_id)
+        return lock is not None and lock.locked()
+
+    async def expire_session_questions(self, session_id: str) -> None:
+        """Expire the pending questions of a session that was archived or
+        deleted, with the same reports as an expiry (web, Telegram, Slack).
+        Without a notification service (CLI, tests), only the rows change."""
+        service = self.notification_service
+        if service is not None:
+            await service.expire_session_questions(session_id)
+        else:
+            await self.db.expire_pending_questions_for_session(session_id)
 
     async def _memorize_session(
         self, session_id: str, connected_at_override: str | None = None,
@@ -2068,8 +2126,11 @@ class AgentEngine:
         *,
         entry: QueuedTurn | None = None,
         client_msg_id: str | None = None,
+        error: RuntimeError | None = None,
     ) -> None:
-        """Tell the session's clients that run() refused the turn, then raise.
+        """Tell the session's clients that run() refused the turn, then raise
+        ``error`` (default :class:`NotAcceptingTurnsError`). The error event
+        says why.
 
         A run that has a queue entry or a ``client_msg_id`` is reported in
         ``queue_update`` with the reason ``refused``. The caller removes the
@@ -2080,8 +2141,9 @@ class AgentEngine:
                 "queue_id": entry.queue_id if entry is not None else None,
                 "client_msg_id": client_msg_id, "reason": "refused",
             }])
-        await broadcaster.broadcast_error(session_id, _NOT_ACCEPTING_TURNS_MESSAGE)
-        raise NotAcceptingTurnsError()
+        error = error or NotAcceptingTurnsError()
+        await broadcaster.broadcast_error(session_id, str(error))
+        raise error
 
     # ------------------------------------------------------------------ #
     #  Public API: run, stop, fork, resume                                 #
@@ -3978,6 +4040,18 @@ class AgentEngine:
             # The Stop target from the moment this run holds the run lock:
             # Stop reaches the turn, never a message queued behind it.
             self.sessions.set_turn_task(session_id, turn_task)
+            # The session can be archived or deleted before this run holds
+            # the lock, or while it waits in the queue. No await since the
+            # lock (see SessionManager.closing).
+            closed = (
+                self.sessions.closing_reason(session_id)
+                or await self.db.closed_session_reason(session_id)
+            )
+            if closed:
+                await self._refuse_turn(
+                    session_id, entry=entry, client_msg_id=client_msg_id,
+                    error=SessionClosedError(closed),
+                )
             if entry is not None or client_msg_id:
                 await self._emit_queue_update(session_id, removed=[{
                     "queue_id": entry.queue_id if entry is not None else None,
