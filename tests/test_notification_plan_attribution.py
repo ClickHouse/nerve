@@ -663,6 +663,40 @@ async def test_dismiss_and_dismiss_all_record_each_person(install):
     assert by == {first: alice, second: bob, third: bob}
 
 
+@pytest.mark.asyncio
+async def test_a_web_dismissal_of_a_question_tells_the_session_as_the_person(install):
+    alice, bob = install.actor_id("alice"), install.actor_id("bob")
+    # Bob started the session that asks; Alice dismisses the question.
+    await install.db.create_session("asker", source="web", actor=_actor(install, "bob"))
+    asked = await install.notifications.ask_question("asker", title="Pick one")
+    nid = asked["notification_id"]
+
+    async with _client(install.app()) as client:
+        response = await client.post(
+            f"/api/notifications/{nid}/dismiss", headers=install.headers("alice"),
+        )
+        again = await client.post(
+            f"/api/notifications/{nid}/dismiss", headers=install.headers("alice"),
+        )
+    assert response.status_code == 200
+    assert again.status_code == 409
+    await install.turn_done("asker")
+
+    row = await install.db.get_notification(nid)
+    assert (row["status"], row["dismissed_by_actor_id"]) == ("dismissed", alice)
+    # The note is an internal turn of Alice's: the agent reads it, the
+    # transcript does not store it, and the session keeps Bob as its cause.
+    run = install.runs[-1]
+    assert (run["session_id"], run["source"], run["internal"]) == (
+        "asker", "notification:dismiss", True,
+    )
+    assert run["user_message"] == "[Question dismissed without an answer: Pick one]"
+    assert run["actor"].actor_id == alice
+    assert await install.user_rows("asker") == []
+    assert await install.session_cause_of("asker") == bob
+    assert install.events_of("notification_dismissed")[-1]["actor_id"] == alice
+
+
 # --------------------------------------------------------------------------- #
 #  Silences                                                                    #
 # --------------------------------------------------------------------------- #

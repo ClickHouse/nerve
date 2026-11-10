@@ -24,7 +24,7 @@ import { registerSessionsLoader, reloadSessionsSoon } from './helpers/sessionsRe
 import { discardStreamDeltas, flushStreamDeltas, handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate, exitStreaming } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleWorkflowProgress } from './handlers/panelHandlers';
-import { handleInteraction, handleInteractionResolved, handlePlanSummary, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired } from './handlers/auxiliaryHandlers';
+import { handleInteraction, handleInteractionResolved, handlePlanSummary, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired, handleNotificationDismissed } from './handlers/auxiliaryHandlers';
 
 export interface TodoItem {
   content: string;
@@ -1737,6 +1737,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'notification':             return handleNotification(msg, get, set);
       case 'notification_answered':    return handleNotificationAnswered(msg, get, set);
       case 'notification_expired':     return handleNotificationExpired(msg, get, set);
+      case 'notification_dismissed':   return handleNotificationDismissed(msg, get, set);
     }
   },
 }));

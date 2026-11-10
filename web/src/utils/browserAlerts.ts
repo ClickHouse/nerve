@@ -32,7 +32,7 @@ export function tabInFront(): boolean {
 
 /**
  * `seen`: a tab in front shows the item. `shown`: a tab showed the alert.
- * `changed`: a tab dismissed items. The server sends no event for a dismissal.
+ * `changed`: a tab dismissed items. The server sends no event for Dismiss All.
  */
 type TabMessage = { kind: 'seen' | 'shown'; key: string } | { kind: 'changed' };
 
@@ -47,7 +47,7 @@ export function tellNotificationsChanged(): void {
 export interface Alerter {
   /** A new item. `wanted`: the choices of this browser want an alert for it. */
   receive: (event: NotificationEvent, wanted: boolean) => void;
-  /** The item was answered or expired: its alert goes away. */
+  /** The item was answered, expired or dismissed: its alert goes away. */
   close: (id: string) => void;
   dispose: () => void;
 }

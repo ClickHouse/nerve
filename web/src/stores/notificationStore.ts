@@ -105,11 +105,16 @@ interface NotificationState {
   fetchNotification: (id: string) => Promise<void>;
   /** Resolves true when the server took the answer. */
   answerNotification: (id: string, answer: string) => Promise<boolean>;
-  dismissNotification: (id: string) => Promise<void>;
+  /**
+   * Resolves true when the server dismissed the row. A question or an
+   * approval then ends without an answer.
+   */
+  dismissNotification: (id: string) => Promise<boolean>;
   dismissAll: () => Promise<void>;
   handleWSNotification: (data: any) => void;
   handleWSNotificationAnswered: (data: any) => void;
   handleWSNotificationExpired: (data: any) => void;
+  handleWSNotificationDismissed: (data: any) => void;
   dismissToast: (id: string) => void;
   loadSilences: () => Promise<void>;
   addSilence: (pattern: string, reason: string, ttlHours: number) => Promise<void>;
@@ -208,14 +213,21 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
   },
 
   dismissNotification: async (id: string) => {
+    let ok = true;
     try {
       await api.dismissNotification(id);
       set(s => patchCopies(s, id, { status: 'dismissed' }));
-      get().loadNotifications();
       tellNotificationsChanged();
     } catch (e) {
       console.error('Failed to dismiss notification:', e);
+      ok = false;
+      // The row can have an answer from a different place: read it again.
+      await api.getNotification(id)
+        .then(row => set(s => patchCopies(s, id, row)))
+        .catch(err => console.error('Failed to reload notification:', err));
     }
+    get().loadNotifications();
+    return ok;
   },
 
   dismissAll: async () => {
@@ -330,6 +342,24 @@ export const useNotificationStore = create<NotificationState>((set, get) => ({
         ...patchCopies(s, data.notification_id, { status: 'expired' }),
         pendingCount: Math.max(0, s.pendingCount - removed),
         pendingAnswerCount: Math.max(0, s.pendingAnswerCount - removed),
+      };
+    });
+  },
+
+  handleWSNotificationDismissed: (data: any) => {
+    set(s => {
+      // The server sends this event for a row that it took from pending. A
+      // filter or the limit can leave the row out of the list; a question in
+      // the chat can then be in `byId` only.
+      const id = data.notification_id;
+      const row = s.notifications.find(n => n.id === id) ?? s.byId[id];
+      const removed = !row || row.status === 'pending' ? 1 : 0;
+      return {
+        ...patchCopies(s, id, { status: 'dismissed', dismissed_by_actor_id: data.actor_id ?? null }),
+        pendingCount: Math.max(0, s.pendingCount - removed),
+        pendingAnswerCount: waitsForAnswer(data.notification_type)
+          ? Math.max(0, s.pendingAnswerCount - removed)
+          : s.pendingAnswerCount,
       };
     });
   },
