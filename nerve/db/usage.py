@@ -14,6 +14,12 @@ from __future__ import annotations
 # Key: canonical model short-name substring → (input, output, cache_read,
 # cache_write_5m, cache_write_1h, web_search_per_req)
 MODEL_PRICING: dict[str, tuple[float, float, float, float, float, float]] = {
+    # Fable: 5.2 is the current one ($8/$40, cache reads at 0.025x = $0.20);
+    # 5.1 kept the $10/$50 tier but already read the cache at 0.025x ($0.25);
+    # Fable 5 reads at the usual 0.1x ($1). Most-specific key first — the bare
+    # "fable-5" row must not catch 5.1 or 5.2. Verified 2026-11-09.
+    "fable-5-2":  (8,   40, 0.20, 10.00, 16.00, 0.01),  # Fable 5.2 (2x Opus 5.5)
+    "fable-5-1":  (10,  50, 0.25, 12.50, 20.00, 0.01),  # Fable 5.1
     "fable-5":    (10,  50, 1.00, 12.50, 20.00, 0.01),  # Fable 5 (Mythos-class, ~2x Opus)
     "opus-5-5":   (4,   20, 0.20,  5.00,  8.00, 0.01),  # Opus 5.5 standard (verified 2026-09-22)
     "opus-5":     (5,   25, 0.50,  6.25, 10.00, 0.01),  # Opus 5 standard (verified 2026-07-28)
