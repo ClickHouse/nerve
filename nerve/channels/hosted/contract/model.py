@@ -13,6 +13,7 @@ import dataclasses
 import re
 import unicodedata
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -1045,8 +1046,9 @@ class Subscriptions:
 
         The version, the number of sources, each provider name and that no
         provider appears twice, each inbox, the bounds of every filter list,
-        the watched repositories, which only ``github_repos`` names (see
-        :func:`_validate_repo_watches`), that an ``email`` subscription
+        the watched repositories (see :func:`_validate_repo_entries`), which
+        ``github``, ``email`` and a generic source do not name and
+        ``github_repos`` must name, that an ``email`` subscription
         carries nothing but its provider, and the members of a generic
         source (see :func:`_validate_generic_members`).
         """
@@ -1069,10 +1071,11 @@ class Subscriptions:
                 malformed("source subscription inbox is not 'participating' or 'all'")
             for patterns in source.filters.pattern_lists().values():
                 _validate_patterns(patterns, "source filter")
+            _validate_repo_entries(source.repos)
             if source.provider == REPO_WATCH_PROVIDER:
-                _validate_repo_watches(source)
-            elif source.repos:
-                malformed(f"only a {REPO_WATCH_PROVIDER} subscription names repositories")
+                _validate_repo_watch(source)
+            elif source.repos and not generic_provider(source.provider):
+                malformed(f"a {source.provider} subscription names repositories")
             if source.provider == EMAIL_PROVIDER and (
                 any(source.filters.pattern_lists().values()) or source.pr_watch or source.inbox
             ):
@@ -1084,18 +1087,36 @@ class Subscriptions:
 
         The gateway then keeps every record of those sources, and Nerve's own
         inbox filter is the only one that drops records. A watched
-        repository's ``deny_authors`` and the rules of a generic source are
-        filter patterns too.
+        repository's ``deny_authors`` are filter patterns too. The rules of a
+        generic source stay: it is never sent wider (see
+        :meth:`without_providers`).
         """
         return dataclasses.replace(self, sources=tuple(
             dataclasses.replace(
                 source,
                 filters=SourceFilters(),
                 repos=tuple(dataclasses.replace(repo, deny_authors=()) for repo in source.repos),
-                rules=(),
             )
             for source in self.sources
         ))
+
+    def ruled_providers(self) -> tuple[str, ...]:
+        """The providers whose subscriptions carry rules, in frame order.
+
+        Such a subscription is never sent without its rules: the gateway
+        would then store the records that the rules drop.
+        """
+        return tuple(source.provider for source in self.sources if source.rules)
+
+    def without_providers(self, providers: Iterable[str]) -> Subscriptions:
+        """The same subscriptions without the sources of *providers*.
+
+        The gateway stores nothing for a provider that the frame leaves out.
+        """
+        left_out = set(providers)
+        return dataclasses.replace(
+            self, sources=tuple(source for source in self.sources if source.provider not in left_out),
+        )
 
 
 def _validate_generic_members(source: SourceSubscription) -> None:
@@ -1148,31 +1169,24 @@ def _validate_patterns(patterns: tuple[str, ...], what: str) -> None:
         )
 
 
-def _validate_repo_watches(source: SourceSubscription) -> None:
-    """Check a ``github_repos`` subscription as the gateway does.
+def _validate_repo_entries(repos: tuple[RepoWatch, ...]) -> None:
+    """Check the watched repositories of any subscription, as the gateway does.
 
-    It names 1 to :data:`MAX_REPO_WATCHES` repositories, each an
-    ``owner/repo`` name (:func:`valid_repo_name`) and each once, ignoring
-    case; every one reports one or more of :data:`REPO_WATCH_TYPES`, each
-    once, and has at most :data:`MAX_SUBSCRIPTION_PATTERNS` ``deny_authors``
-    that a filter list would take. It carries no filters, ``pr_watch`` or
-    ``inbox``.
+    At most :data:`MAX_REPO_WATCHES`, each an ``owner/repo`` name
+    (:func:`valid_repo_name`) and each once, ignoring case; every one
+    reports one or more of :data:`REPO_WATCH_TYPES`, each once, and has at
+    most :data:`MAX_SUBSCRIPTION_PATTERNS` ``deny_authors`` that a filter
+    list would take. Which providers may name repositories at all is
+    checked by the caller.
     """
-    if any(source.filters.pattern_lists().values()) or source.pr_watch or source.inbox:
-        malformed(f"a {REPO_WATCH_PROVIDER} subscription carries filters, pr_watch or an inbox")
-    if not source.repos:
-        malformed(f"a {REPO_WATCH_PROVIDER} subscription names no repository")
-    if len(source.repos) > MAX_REPO_WATCHES:
-        reject(
-            RejectionReason.LIMIT_EXCEEDED,
-            f"a {REPO_WATCH_PROVIDER} subscription names too many repositories",
-        )
+    if len(repos) > MAX_REPO_WATCHES:
+        reject(RejectionReason.LIMIT_EXCEEDED, "a subscription names too many repositories")
     names: set[str] = set()
-    for repo in source.repos:
+    for repo in repos:
         if not valid_repo_name(repo.name):
             malformed("a watched repository is not an owner/repo name")
         if repo.name.lower() in names:
-            malformed(f"a {REPO_WATCH_PROVIDER} subscription repeats a repository")
+            malformed("a subscription repeats a repository")
         names.add(repo.name.lower())
         for kind in repo.types:
             if kind not in REPO_WATCH_TYPES:
@@ -1186,6 +1200,18 @@ def _validate_repo_watches(source: SourceSubscription) -> None:
                 "a watched repository's deny_authors pattern is empty, too long, or has a "
                 "control character"
             )
+
+
+def _validate_repo_watch(source: SourceSubscription) -> None:
+    """Check what only a ``github_repos`` subscription must hold.
+
+    It names at least one repository, and no filters, ``pr_watch`` or
+    ``inbox``.
+    """
+    if any(source.filters.pattern_lists().values()) or source.pr_watch or source.inbox:
+        malformed(f"a {REPO_WATCH_PROVIDER} subscription carries filters, pr_watch or an inbox")
+    if not source.repos:
+        malformed(f"a {REPO_WATCH_PROVIDER} subscription names no repository")
 
 
 # ---------------------------------------------------------------------- #

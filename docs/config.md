@@ -2028,7 +2028,7 @@ the source on needs a restart:
 | `sync.linear.inbox` | bool | `true` | Also report the Linear notifications of the agent's Linear user. Only a credential that belongs to the agent (an agent API key, the agent's sign-in) has them |
 | `sync.linear.include_bots` | bool | `false` | Also report the events of bots and integrations |
 | `sync.linear.drop_own_actions` | bool | `true` | Drop the events of the credential's Linear user. With a tenant API key they are kept and marked with `actor.credential_user: true` |
-| `sync.linear.rules` | list | `[]` | At most 16 rules, each a `path` (a JSON Pointer into the record data, such as `/issue/team/key`) and exactly one non-empty `allow` or `deny` list of globs. A rule the gateway would refuse refuses to load. See [sources.md](sources.md#rules-of-generic-hosted-sources) |
+| `sync.linear.rules` | list | `[]` | At most 16 rules, each a `path` (a JSON Pointer into the record data, such as `/issue/team/key`) and exactly one non-empty `allow` or `deny` list of globs. A rule the gateway would refuse refuses to load. The subscription is never sent without its rules: rules too large for the gateway's frame leave Linear out (`nerve doctor` reports it). See [sources.md](sources.md#rules-of-generic-hosted-sources) |
 | `sync.linear.schedule` | cron | `*/15 * * * *` | Fallback cadence of the drain, which also runs on every delivery |
 | `sync.linear.batch_size` | int | `50` | Max records per drain |
 | `sync.linear.condense` | bool | `false` | LLM-condense long records via `memory.fast_model` |

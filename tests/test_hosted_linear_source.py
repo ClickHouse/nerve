@@ -3,8 +3,16 @@ drain into the inbox with the rules as guardrail, and ``nerve doctor``.
 
 Linear is a generic hosted source: the channel gateway sends each record's
 ``data``, a JSON object that the provider defines (``linear.issue_event/1``),
-and Nerve keeps it as the record's metadata. The record data here follows the
-members that the gateway's Linear provider writes; the values are test data.
+and Nerve keeps it, with the schema, as the record's metadata.
+
+The fixtures follow the gateway's Linear provider: every record data is valid
+against a byte-exact copy of its schema file
+(``fixtures/sources/linear/linear_issue_event.v1.schema.json``), and the IDs
+follow its rules. ``data.server.id`` is the catalog server ID (a slug); the
+connection ID is a UUIDv5 of the tenant and that server; the record ID is
+``<server>:<event>:<entity>``, the same for every version of the event, so a
+changed event replaces the earlier copy; the event ID adds the version in
+Unix milliseconds. The values are test data.
 
 The end-to-end tests run the fake gateway against the real stream endpoint,
 as the hosted GitHub tests do, with a real database and source runner.
@@ -13,13 +21,17 @@ as the hosted GitHub tests do, with a real database and source runner.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
+import logging
+import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import jsonschema
 import pytest
 import pytest_asyncio
 import yaml
@@ -28,7 +40,7 @@ import nerve.config as config_module
 from nerve import config_reload
 from nerve.agent.sessions import SessionManager
 from nerve.agent.tools.handlers.sources import _format_source_batch
-from nerve.channels.hosted.contract import Rejected, SourceRule, Subscriptions
+from nerve.channels.hosted.contract import MAX_FRAME_BYTES, Rejected, SourceRule, Subscriptions
 from nerve.channels.hosted.contract.model import (
     MAX_SOURCE_RULE_PATTERNS,
     MAX_SOURCE_RULES,
@@ -44,6 +56,7 @@ from nerve.channels.hosted.sources import (
     hosted_sources,
     linear_subscription,
     subscriptions_for,
+    subscriptions_frame_bytes,
 )
 from nerve.channels.router import ChannelRouter
 from nerve.cli import doctor_report
@@ -63,24 +76,40 @@ from nerve.sources.filters import DataRule
 from nerve.sources.github_hosted import HostedGitHubSource
 from nerve.sources.hosted import HostedSource, record_from_buffer
 from nerve.sources.registry import build_source_runners
-from tests.fake_channel_gateway import FakeChannelGateway, FakeStream, NerveServer, source_record_event
+from nerve.sources.source_json import record_metadata
+from tests.fake_channel_gateway import TENANT_ID, FakeChannelGateway, FakeStream, NerveServer, source_record_event
 from tests.test_hosted_channel import FAST_READER, FAST_STREAM
 from tests.test_hosted_channel import hosted_config as slack_hosted_config
 from tests.test_hosted_channel_config import HOSTED
 from tests.test_hosted_sources import decoded, hosted_github
 
-SERVER_ID = "3c9a7e15-2b4d-4f60-8e1a-5d7c9b2f4a68"
+ROOT = Path(__file__).parent.parent
+# A copy of the schema file of linear.issue_event/1 of the hosted gateway's
+# contract (see fixtures/sources/README.md), byte for byte.
+SCHEMA_FILE = Path(__file__).parent / "fixtures" / "sources" / "linear" / "linear_issue_event.v1.schema.json"
+SCHEMA_SHA256 = "ef43b2e7e5b63d94ee4cf00893f4baa7cbf19258fa3890d75a268fa7e1ad9c85"
+SCHEMA = LINEAR_SCHEMAS[0]
+# The record data that the Sources page tests render.
+WEB_FIXTURES = ROOT / "web" / "src" / "test" / "linearIssueEvents.json"
+
+# The catalog server ID of the Linear connector, and the connection ID that the
+# gateway derives from the tenant and that server.
+SERVER = "linear"
+CONNECTION_NAMESPACE = uuid.UUID("6c1f3a8e-2b47-5d90-8e1c-4a7b9d2e5f30")
+CONNECTION_ID = str(uuid.uuid5(CONNECTION_NAMESPACE, uuid.UUID(TENANT_ID).bytes + SERVER.encode()))
 ISSUE_ID = "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30"
+HISTORY_ID = "2d4f6a8c-1e3b-4d5f-8a7c-9e1b3d5f7a90"
 ALICE_ID = "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49"
 AGENT_USER_ID = "8d1e3f5a-7b9c-4d2e-a6f8-1c3e5a7b9d20"
+VERSION_MS = 1793433600000  # 2026-10-31T08:00:00Z
 
 
 def linear_data(**changes: Any) -> dict[str, Any]:
-    """The data of an assignment to the agent's Linear user."""
+    """The data of an assignment of the issue to the agent's Linear user."""
     data: dict[str, Any] = {
         "event": "assigned",
         "via": "watch",
-        "server": {"id": SERVER_ID, "name": "Linear"},
+        "server": {"id": SERVER, "name": "Linear"},
         "issue": {
             "id": ISSUE_ID,
             "identifier": "ENG-12",
@@ -91,39 +120,76 @@ def linear_data(**changes: Any) -> dict[str, Any]:
             "state": {"name": "Todo", "type": "unstarted"},
             "priority": 2,
             "assignee": {"id": AGENT_USER_ID, "name": "Example Agent"},
-            "delegate": None,
         },
-        "actor": {"id": ALICE_ID, "name": "Alice Example", "kind": "user", "credential_user": False},
-        "changes": [{"field": "assignee", "from": None, "to": AGENT_USER_ID}],
+        "actor": {"id": ALICE_ID, "name": "Alice Example", "kind": "user"},
+        "changes": [{"field": "assignee", "to": "Example Agent"}],
     }
     data.update(changes)
     return data
 
 
-def linear_event(*, kind: str = "assigned", version: int = 1, data: dict[str, Any] | None = None) -> dict[str, Any]:
+def comment_data() -> dict[str, Any]:
+    """A comment on the issue, cut to its bound, from the agent's inbox."""
+    return linear_data(
+        event="commented", via="inbox", changes=[], comment={
+            "id": "9e2f6a4b-1c3d-4e5f-a7b8-c9d0e1f2a3b4",
+            "url": "https://linear.example.test/acme/issue/ENG-12#comment-9e2f6a4b",
+            "body": "x" * 4000, "truncated": True,
+        },
+    )
+
+
+def bot_data() -> dict[str, Any]:
+    return linear_data(event="state_changed", actor={"id": "b0b0b0b0", "name": "Triage", "kind": "bot"},
+                       changes=[{"field": "state", "from": "Backlog", "to": "Todo"}])
+
+
+def system_data() -> dict[str, Any]:
+    """A change without an actor, such as an automatic close."""
+    return linear_data(event="state_changed", actor={"kind": "system"},
+                       changes=[{"field": "state", "from": "Todo", "to": "Canceled"}])
+
+
+def own_data() -> dict[str, Any]:
+    """An action of the Linear user of a tenant API key: kept and marked."""
+    return linear_data(actor={"id": ALICE_ID, "name": "Alice Example", "kind": "user", "credential_user": True})
+
+
+def record_id(event: str = "assigned", entity: str = HISTORY_ID) -> str:
+    return f"{SERVER}:{event}:{entity}"
+
+
+def linear_event(
+    *, event: str = "assigned", entity: str = HISTORY_ID, version_ms: int = VERSION_MS,
+    data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """A Linear record as the gateway delivers it, without a delivery."""
-    key = f"{kind}:{ISSUE_ID}:{version}"
+    data = data if data is not None else linear_data(event=event)
+    actor = data["actor"]
     return {
-        "event_id": f"linear:{SERVER_ID}:{key}",
-        "message_revision_id": key,
-        "connection_id": SERVER_ID,
+        "event_id": f"linear:{record_id(event, entity)}:{version_ms}",
+        "message_revision_id": f"{record_id(event, entity)}:{version_ms}",
+        "connection_id": CONNECTION_ID,
         "provider": "linear",
         "kind": "source_record",
         "conversation": {"id": ISSUE_ID, "kind": "item", "display_name": "ENG-12"},
-        "author": {"id": ALICE_ID, "kind": "human", "display_name": "Alice Example"},
+        **({"author": {"id": actor["id"], "kind": "human", "display_name": actor["name"]}} if "id" in actor else {}),
         "admission": {
             "purpose": "observe",
             "observe": {"provenance": {"provider": "linear", "issuer": "", "installation_id": ""}},
         },
-        "occurred_at": "2026-11-10T08:00:00Z",
+        "occurred_at": "2026-10-31T08:00:00Z",
         "record": {
-            "id": f"issue:{key}",
+            "id": record_id(event, entity),
             "record_type": "linear_issue_event",
-            "schema": "linear.issue_event/1",
+            "schema": SCHEMA,
             "summary": "[ENG-12] Alice Example assigned you: Fix the login page",
-            "content": "**Alice Example** assigned [ENG-12](https://linear.example.test/acme/issue/ENG-12) to you.",
-            "timestamp": "2026-11-10T08:00:00Z",
-            "data": data if data is not None else linear_data(),
+            "content": (
+                "**ENG-12: Fix the login page**\nhttps://linear.example.test/acme/issue/ENG-12\n"
+                "Alice Example assigned the issue to you.\nMCP server: linear"
+            ),
+            "timestamp": "2026-10-31T08:00:00Z",
+            "data": data,
         },
     }
 
@@ -306,7 +372,8 @@ class TestConsumerAndDrain:
         assert disposition.outcome == "accepted"
         [(_, payload)] = await db.read_channel_observations("linear")
         assert payload["conversation_id"] == ISSUE_ID
-        assert payload["connection_id"] == SERVER_ID
+        assert payload["connection_id"] == CONNECTION_ID
+        assert payload["event_id"] == f"linear:linear:assigned:{HISTORY_ID}:{VERSION_MS}"
         record = payload["record"]
         assert (record["record_type"], record["schema"], record["metadata"]) == (
             "linear_issue_event", "linear.issue_event/1", [],
@@ -318,8 +385,8 @@ class TestConsumerAndDrain:
 
         assert "schema" not in record and "data" not in record
 
-    async def test_the_drain_makes_the_data_the_metadata_with_every_member(self, db):
-        data = linear_data(estimate={"points": 3}, labels=["bug"])
+    async def test_the_drain_keeps_the_schema_and_every_member_of_the_data(self, db):
+        data = linear_data(estimate={"points": 3}, labels=["bug"], archived=False)
         await db.insert_channel_observation("linear", f"linear:{ISSUE_ID}", buffered_record(decoded(
             linear_event(data=data),
         )))
@@ -330,12 +397,10 @@ class TestConsumerAndDrain:
         result = await source.fetch(None, limit=10)
 
         (record,) = result.records
-        assert (record.id, record.source, record.record_type) == (
-            f"issue:assigned:{ISSUE_ID}:1", "linear", "linear_issue_event",
-        )
+        assert (record.id, record.source, record.record_type) == (record_id(), "linear", "linear_issue_event")
         assert record.summary == "[ENG-12] Alice Example assigned you: Fix the login page"
-        assert record.timestamp == "2026-11-10T08:00:00Z"
-        assert record.metadata == data
+        assert record.timestamp == "2026-10-31T08:00:00Z"
+        assert record.metadata == {"schema": SCHEMA, "data": data} == record_metadata(SCHEMA, data)
         assert (result.next_cursor, result.has_more) == ("2", False)
         assert await source.has_undrained(None) is True
         assert await source.has_undrained(result.next_cursor) is False
@@ -396,9 +461,11 @@ class Harness:
 
 
 async def start(tmp_path, db, monkeypatch, *, config_getter: Callable[[], NerveConfig] | None = None,
-                **settings: Any) -> Harness:
+                github: bool = False, **settings: Any) -> Harness:
     config = slack_hosted_config(tmp_path)
     config.slack = SlackConfig()
+    if github:
+        config.sync.github = hosted_github()
     config.sync.linear = LinearSyncConfig.from_dict({"enabled": True, **settings})
     monkeypatch.setattr(config_module, "_config", config)
     engine = MagicMock()
@@ -424,9 +491,7 @@ async def hosted(tmp_path, db, monkeypatch):
     try:
         yield harness
     finally:
-        await harness.runtime.stop()
-        await harness.gateway.close_all()
-        await harness.server.__aexit__(None, None, None)
+        await stop(harness)
 
 
 @pytest.mark.asyncio
@@ -453,15 +518,37 @@ class TestStreams:
         assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
         result = await hosted.runner().run()
         assert result.records_ingested == 1
-        stored = await hosted.db.get_source_message("linear", f"issue:assigned:{ISSUE_ID}:1")
+        stored = await hosted.db.get_source_message("linear", record_id())
         assert stored["record_type"] == "linear_issue_event"
         assert stored["summary"] == "[ENG-12] Alice Example assigned you: Fix the login page"
-        assert stored["metadata"] == linear_data()
-        assert stored["metadata"]["server"] == {"id": SERVER_ID, "name": "Linear"}
+        assert stored["metadata"] == {"schema": SCHEMA, "data": linear_data()}
+        assert stored["metadata"]["data"]["server"] == {"id": "linear", "name": "Linear"}
 
-    async def test_the_agent_reads_the_server_and_the_issue_as_json(self, hosted):
+    async def test_a_changed_event_replaces_the_earlier_copy(self, hosted):
+        """A new version of an event keeps its record ID, so the inbox holds one
+        record of it, the newest, and it is unread again."""
         stream = await hosted.stream()
-        inbox_id = hosted.gateway.store(linear_event())
+        runner = hosted.runner()
+        first = hosted.gateway.store(linear_event())
+        await stream.nudge("observe")
+        assert (await hosted.acknowledged(first))[first] == "accepted"
+        assert (await runner.run()).records_ingested == 1
+        before = await hosted.db.get_source_max_rowid("linear")
+
+        changed = linear_data(issue={**linear_data()["issue"], "state": {"name": "In Progress", "type": "started"}})
+        second = hosted.gateway.store(linear_event(version_ms=VERSION_MS + 60_000, data=changed))
+        await stream.nudge("observe")
+
+        assert (await hosted.acknowledged(second))[second] == "accepted"
+        assert (await runner.run()).records_ingested == 1
+        rows = await hosted.db.read_source_messages_by_rowid("linear", 0, limit=10)
+        assert [row["id"] for row in rows] == [record_id()]
+        assert rows[0]["metadata"]["data"]["issue"]["state"]["name"] == "In Progress"
+        assert await hosted.db.get_source_max_rowid("linear") > before
+
+    async def test_the_agent_reads_the_schema_and_every_member_of_the_data_as_json(self, hosted):
+        stream = await hosted.stream()
+        inbox_id = hosted.gateway.store(linear_event(data=own_data()))
         await stream.nudge("observe")
         assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
         await hosted.runner().run()
@@ -469,15 +556,15 @@ class TestStreams:
 
         text = _format_source_batch(rows, "linear")
 
-        assert '**Metadata:** event=assigned, via=watch, server={"id":"' + SERVER_ID + '","name":"Linear"}' in text
-        assert '"identifier":"ENG-12"' in text
-        assert 'changes=[{"field":"assignee","from":null,"to":"' + AGENT_USER_ID + '"}]' in text
+        assert f"**Schema:** {SCHEMA}\n" in text
+        data_line = next(line for line in text.splitlines() if line.startswith("**Data:** "))
+        assert json.loads(data_line.removeprefix("**Data:** ")) == own_data()
+        assert '"server":{"id":"linear","name":"Linear"}' in data_line
+        assert "**Metadata:**" not in text
 
     async def test_the_guardrail_applies_the_rules_again(self, hosted):
         stream = await hosted.stream()
-        bot = linear_event(kind="commented", data=linear_data(
-            event="commented", actor={"id": "b", "name": "CI", "kind": "bot", "credential_user": False},
-        ))
+        bot = linear_event(event="state_changed", data=bot_data())
         person = linear_event()
         dropped, kept = hosted.gateway.store(bot), hosted.gateway.store(person)
 
@@ -486,7 +573,7 @@ class TestStreams:
         assert await hosted.acknowledged(dropped, kept) == {dropped: "accepted", kept: "accepted"}
         result = await hosted.runner().run()
         assert (result.records_ingested, result.records_dropped) == (1, 1)
-        assert await hosted.db.get_source_message("linear", f"issue:commented:{ISSUE_ID}:1") is None
+        assert await hosted.db.get_source_message("linear", record_id("state_changed")) is None
 
     async def test_a_record_the_contract_refuses_closes_the_stream(self, hosted):
         stream = await hosted.stream()
@@ -514,6 +601,165 @@ class TestStreams:
 
         assert off == {"version": "1"}
         assert on["sources"][0]["settings"] == {"include_bots": True}
+
+
+# ---------------------------------------------------------------------- #
+#  The frame limit: a subscription with rules is never sent without them  #
+# ---------------------------------------------------------------------- #
+
+# The frame limit that these tests negotiate, the smallest that the contract
+# permits.
+FRAME_LIMIT = 16384
+
+
+def frame_bytes(config: NerveConfig) -> int:
+    """The bytes of the subscriptions frame that the Linear-only runtime sends for *config*."""
+    return subscriptions_frame_bytes(subscriptions_for(config, ["linear"]))
+
+
+def rules_of_frame(config: NerveConfig, target: int) -> list[SourceRuleConfig]:
+    """Linear rules with which the subscriptions frame has exactly *target* bytes."""
+    rules = [SourceRuleConfig(path="/issue/team/key", deny=["p"])]
+    while True:
+        config.sync.linear = dataclasses.replace(config.sync.linear, rules=rules)
+        gap = target - frame_bytes(config)
+        if gap == 0:
+            return rules
+        patterns = rules[-1].deny
+        room = SOURCE_RULE_PATTERN_MAX_BYTES - len(patterns[-1])
+        if gap < 0:
+            patterns[-1] = patterns[-1][:gap]
+        elif gap <= room:
+            patterns[-1] += "p" * gap
+        elif len(patterns) < SOURCE_RULE_PATTERNS_MAX:
+            patterns[-1] += "p" * room
+            patterns.append("p")
+        else:
+            rules.append(SourceRuleConfig(path="/issue/team/key", deny=["p"]))
+
+
+@pytest.mark.asyncio
+class TestFrameLimit:
+    async def nerve_side(self, harness: Harness):
+        stream = await harness.gateway.open_stream(harness.server.stream_url, negotiate=False)
+        await stream.negotiate(frame_bytes=FRAME_LIMIT)
+        await harness.subscriptions()
+        [nerve_side] = harness.runtime.streams.streams
+        return stream, nerve_side
+
+    async def test_a_frame_at_the_limit_carries_the_rules(self, hosted):
+        _, nerve_side = await self.nerve_side(hosted)
+        rules = rules_of_frame(hosted.config, FRAME_LIMIT)
+
+        text = nerve_side._subscriptions_frame("o-9")
+
+        assert len(text.encode("utf-8")) == FRAME_LIMIT
+        [source] = json.loads(text)["payload"]["subscriptions"]["sources"]
+        assert source["rules"] == [{"path": rule.path, "deny": rule.deny} for rule in rules]
+
+    async def test_one_byte_more_leaves_linear_out_and_says_what_to_shorten(self, hosted, caplog):
+        _, nerve_side = await self.nerve_side(hosted)
+        rules_of_frame(hosted.config, FRAME_LIMIT + 1)
+        caplog.set_level(logging.WARNING, logger="nerve.channels.hosted.stream")
+
+        text = nerve_side._subscriptions_frame("o-9")
+
+        assert json.loads(text)["payload"]["subscriptions"] == {"version": "1"}
+        [record] = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert "the subscriptions of linear are not sent" in record.getMessage()
+        assert "sync.linear.rules are shorter" in record.getMessage()
+
+    async def test_the_gateway_gets_no_linear_subscription_and_the_stream_stays_open(self, tmp_path, db, monkeypatch):
+        config = slack_hosted_config(tmp_path)
+        config.sync.linear = LinearSyncConfig(enabled=True)
+        rules = rules_of_frame(config, FRAME_LIMIT + 1)
+        harness = await start(tmp_path, db, monkeypatch, rules=[
+            {"path": rule.path, "deny": rule.deny} for rule in rules
+        ])
+        try:
+            stream, _ = await self.nerve_side(harness)
+
+            assert harness.gateway.subscriptions == [{"version": "1"}]
+            assert stream.close_code is None
+        finally:
+            await stop(harness)
+
+    async def test_github_patterns_go_first_and_linear_keeps_its_rules(self, tmp_path, db, monkeypatch):
+        harness = await start(tmp_path, db, monkeypatch, github=True, rules=[
+            {"path": "/actor/kind", "deny": ["bot"]},
+        ])
+        try:
+            harness.config.sync.github.allow_repos = [f"owner/{'r' * 200}-{n}" for n in range(100)]
+            await self.nerve_side(harness)
+
+            [subscriptions] = harness.gateway.subscriptions
+            github, linear = subscriptions["sources"]
+            assert github == {"provider": "github", "filters": {}, "pr_watch": True}
+            assert linear["rules"] == [{"path": "/actor/kind", "deny": ["bot"]}]
+        finally:
+            await stop(harness)
+
+    async def test_the_largest_rules_that_load_do_not_fit_and_doctor_says_so(self, tmp_path):
+        rules = [{"path": "/issue/team/key", "deny": ["é" * 128] * SOURCE_RULE_PATTERNS_MAX}] * SOURCE_RULES_MAX
+        config = doctor_config(tmp_path, rules=rules)
+
+        report = doctor_report(config)
+
+        assert frame_bytes(config) > MAX_FRAME_BYTES
+        assert "[ERR] Linear: with sync.linear.rules the subscriptions frame has about" in report
+        assert "the gateway stores no Linear records. Shorten sync.linear.rules" in report
+        assert "[OK] Linear records" not in report
+
+
+async def stop(harness: Harness) -> None:
+    await harness.runtime.stop()
+    await harness.gateway.close_all()
+    await harness.server.__aexit__(None, None, None)
+
+
+# ---------------------------------------------------------------------- #
+#  Record fixtures                                                        #
+# ---------------------------------------------------------------------- #
+
+
+def schema_validator() -> jsonschema.Draft202012Validator:
+    return jsonschema.Draft202012Validator(json.loads(SCHEMA_FILE.read_text(encoding="utf-8")))
+
+
+class TestRecordFixtures:
+    def test_the_copy_of_the_schema_has_its_exact_bytes(self):
+        assert hashlib.sha256(SCHEMA_FILE.read_bytes()).hexdigest() == SCHEMA_SHA256
+
+    @pytest.mark.parametrize("data", [
+        linear_data(), comment_data(), bot_data(), system_data(), own_data(),
+        linear_data(event="moved_in", changes=[{"field": "project", "to": "Web"}]),
+        linear_data(event="priority_changed", changes=[{"field": "priority", "from": 3, "to": 1}]),
+    ], ids=lambda data: f"{data['event']}-{data['actor']['kind']}")
+    def test_every_fixture_is_data_that_the_gateway_can_send(self, data):
+        schema_validator().validate(data)
+
+    @pytest.mark.parametrize("name", sorted(json.loads(WEB_FIXTURES.read_text(encoding="utf-8"))))
+    def test_every_fixture_of_the_sources_page_is_data_that_the_gateway_can_send(self, name):
+        schema_validator().validate(json.loads(WEB_FIXTURES.read_text(encoding="utf-8"))[name])
+
+    @pytest.mark.parametrize("change", [
+        {"server": {"id": "3c9a7e15-2b4d-4f60-8e1a-5d7c9b2f4a68-and-more", "name": "Linear"}},
+        {"changes": [{"field": "assignee", "from": None, "to": "Example Agent"}]},
+        {"actor": {"kind": "robot"}},
+    ])
+    def test_the_schema_refuses_what_the_gateway_never_sends(self, change):
+        with pytest.raises(jsonschema.ValidationError):
+            schema_validator().validate(linear_data(**change))
+
+    def test_the_ids_follow_the_gateways_rules(self):
+        event = linear_event()
+
+        assert event["record"]["id"] == f"linear:assigned:{HISTORY_ID}"
+        assert event["event_id"] == f"linear:linear:assigned:{HISTORY_ID}:{VERSION_MS}"
+        assert event["connection_id"] == CONNECTION_ID
+        assert uuid.UUID(CONNECTION_ID).version == 5
+        assert event["record"]["data"]["server"]["id"] == SERVER
+        assert "author" not in linear_event(event="state_changed", data=system_data())
 
 
 # ---------------------------------------------------------------------- #

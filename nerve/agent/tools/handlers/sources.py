@@ -20,6 +20,7 @@ from nerve.agent.tools.schemas import (
     SYNC_STATUS_SCHEMA,
 )
 from nerve.sources.models import cursor_text
+from nerve.sources.source_json import record_data
 
 logger = logging.getLogger(__name__)
 
@@ -56,18 +57,6 @@ def _format_relative_time(iso_ts: str) -> str:
         return iso_ts
 
 
-def _metadata_value(value: object) -> str:
-    """A metadata value as the agent reads it.
-
-    Nested JSON, the data of a generic hosted source such as Linear, is
-    compact JSON; every other value is written as it is.
-    """
-    nested = isinstance(value, dict) or (
-        isinstance(value, list) and any(isinstance(item, (dict, list)) for item in value)
-    )
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":")) if nested else str(value)
-
-
 def _format_source_batch(messages: list[dict], source: str | None = None) -> str:
     """Format a batch of source messages for agent consumption."""
     count = len(messages)
@@ -88,10 +77,16 @@ def _format_source_batch(messages: list[dict], source: str | None = None) -> str
         parts.append(f"**Type:** {record_type} | **Time:** {timestamp} ({relative}) | **seq:** {rowid}")
 
         metadata = m.get("metadata")
-        if metadata and isinstance(metadata, dict):
+        generic = record_data(metadata)
+        if generic is not None:
+            # The data of a generic hosted source, every member as it came.
+            schema, data = generic
+            parts.append(f"**Schema:** {schema}")
+            parts.append(f"**Data:** {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}")
+        elif metadata and isinstance(metadata, dict):
             interesting = {k: v for k, v in metadata.items() if v and k not in ("message_id",)}
             if interesting:
-                meta_str = ", ".join(f"{k}={_metadata_value(v)}" for k, v in interesting.items())
+                meta_str = ", ".join(f"{k}={v}" for k, v in interesting.items())
                 parts.append(f"**Metadata:** {meta_str}")
 
         parts.append("")

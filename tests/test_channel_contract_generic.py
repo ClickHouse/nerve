@@ -30,6 +30,7 @@ from nerve.channels.hosted.contract import (
     Envelope,
     Payload,
     Rejected,
+    RepoWatch,
     SourceFilters,
     SourceRule,
     SourceSubscription,
@@ -61,15 +62,6 @@ VECTOR_SHA256 = {
     "example_note.v1.schema.json": "3b3b93c1561607e2d7017036db3bc18e257e1e8338dddfba2923834a6e1f5b90",
     "subscriptions_generic.json": "7188e0efd42a679c0710c4ee28d55e8d4bac238146883b9b4096ecf524fe8804",
 }
-
-# Vectors that Nerve's own check refuses although the gateway takes them.
-# Nerve checks the subscriptions that it builds, and it never builds these.
-STRICTER_THAN_THE_GATEWAY = {
-    # A subscription names repositories only for github_repos: Nerve's check
-    # predates generic sources.
-    "GitHub members on a provider without schemas": "malformed_frame",
-}
-
 
 def vectors(name: str) -> Any:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
@@ -266,13 +258,7 @@ class TestGenericSubscriptions:
             source = decode_record(SourceSubscription, parse_json(json.dumps(case["source"])))
             Subscriptions(version="1", sources=(source,)).validate()
 
-        expected = STRICTER_THAN_THE_GATEWAY.get(case["name"], case["reason"])
-        assert reason(check) == expected
-
-    def test_the_stricter_cases_are_vectors(self):
-        names = {case["name"] for case in vectors("source_subscriptions.json")["sources"]}
-
-        assert set(STRICTER_THAN_THE_GATEWAY) <= names
+        assert reason(check) == case["reason"]
 
     def test_nerve_sends_the_contracts_generic_frame(self):
         sample = vectors("subscriptions_generic.json")
@@ -302,18 +288,44 @@ class TestGenericSubscriptions:
         assert sent(None) == {"provider": "linear", "filters": {}, "schemas": ["linear.issue_event/1"]}
         assert sent({})["settings"] == {}
 
-    def test_without_filters_drops_the_rules_and_keeps_the_settings_and_schemas(self):
-        narrow = Subscriptions(version="1", sources=(SourceSubscription(
+    def test_without_filters_never_widens_a_generic_source(self):
+        """A generic source keeps its rules; one that cannot be sent with them
+        leaves the frame instead (see test_hosted_linear_source)."""
+        generic = SourceSubscription(
             provider="example", settings={"inbox": False}, schemas=("example.note/1",),
             rules=(SourceRule(path="/actor/kind", deny=("bot",)),),
-        ),))
+        )
+        narrow = Subscriptions(version="1", sources=(
+            SourceSubscription(provider="github", filters=SourceFilters(deny_actors=("*-bot",))),
+            generic,
+            SourceSubscription(provider="other", schemas=("other.note/1",)),
+        ))
 
         wide = narrow.without_filters()
 
-        assert wide.sources == (SourceSubscription(
-            provider="example", settings={"inbox": False}, schemas=("example.note/1",),
-        ),)
+        assert wide.sources == (SourceSubscription(provider="github"), generic, narrow.sources[2])
+        assert wide.ruled_providers() == ("example",)
+        assert wide.without_providers(wide.ruled_providers()).sources == (
+            SourceSubscription(provider="github"), narrow.sources[2],
+        )
         wide.validate()
+
+    def test_repositories_follow_the_providers_rules(self):
+        """github_repos must name them; github, email and a generic source must
+        not; another provider without schemas may, within the bounds."""
+        def check(source: SourceSubscription) -> str:
+            return reason(Subscriptions(version="1", sources=(source,)).validate)
+
+        repo = RepoWatch(name="acme/widgets", types=("issue",))
+        assert check(SourceSubscription(provider="gitlab", repos=(repo,))) == ""
+        assert check(SourceSubscription(provider="gitlab", repos=(RepoWatch(name="a/b/c", types=("issue",)),))) == (
+            "malformed_frame"
+        )
+        for provider in ("github", "email"):
+            assert check(SourceSubscription(provider=provider, repos=(repo,))) == "malformed_frame"
+        assert check(SourceSubscription(provider="gitlab", schemas=("gitlab.note/1",), repos=(repo,))) == (
+            "malformed_frame"
+        )
 
     def test_the_email_subscription_is_not_generic(self):
         Subscriptions(version="1", sources=(SourceSubscription(provider="email"),)).validate()

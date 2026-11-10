@@ -28,6 +28,11 @@ import unicodedata
 from decimal import Decimal
 from typing import Any
 
+# The metadata of a stored generic record holds its record schema and its
+# data under these two members, so that the data keeps every member of its
+# own and the schema stays known after the drain (see record_data).
+RECORD_SCHEMA_KEY = "schema"
+RECORD_DATA_KEY = "data"
 # The levels of objects and arrays in a source JSON object, the object itself
 # as the first. A JSON Pointer into one has at most this many tokens.
 MAX_SOURCE_JSON_DEPTH = 8
@@ -112,6 +117,25 @@ def _binary64(number: int | float) -> float:
     if not math.isfinite(value):
         raise SourceJSONError("has a number outside the binary64 range")
     return value
+
+
+def record_metadata(schema: str, data: dict[str, Any]) -> dict[str, Any]:
+    """The metadata of a stored generic record: its record schema and its data."""
+    return {RECORD_SCHEMA_KEY: schema, RECORD_DATA_KEY: data}
+
+
+def record_data(metadata: Any) -> tuple[str, dict[str, Any]] | None:
+    """The record schema and the data of a generic record's metadata.
+
+    ``None`` for the metadata of any other record: it must hold exactly the
+    two members of :func:`record_metadata`, a string and a JSON object.
+    """
+    if not isinstance(metadata, dict) or set(metadata) != {RECORD_SCHEMA_KEY, RECORD_DATA_KEY}:
+        return None
+    schema, data = metadata[RECORD_SCHEMA_KEY], metadata[RECORD_DATA_KEY]
+    if not isinstance(schema, str) or not isinstance(data, dict):
+        return None
+    return schema, data
 
 
 # ---------------------------------------------------------------------- #
@@ -244,10 +268,14 @@ def resolve_pointer(value: Any, tokens: list[str]) -> tuple[bool, Any]:
 __all__ = [
     "MAX_POINTER_BYTES",
     "MAX_SOURCE_JSON_DEPTH",
+    "RECORD_DATA_KEY",
+    "RECORD_SCHEMA_KEY",
     "SourceJSONError",
     "canonical_json",
     "canonical_number",
     "check_source_json_object",
     "pointer_tokens",
+    "record_data",
+    "record_metadata",
     "resolve_pointer",
 ]

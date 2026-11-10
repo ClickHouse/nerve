@@ -13,9 +13,9 @@ with the guardrail, condensing, health checks, consumer cursors and
 the chat channel drains.
 
 :class:`HostedSource` drains a generic source, such as Linear: the record's
-``data``, the JSON object that the provider defines, becomes the record's
-metadata, with every member. GitHub has a closed vocabulary of its own
-(:class:`~nerve.sources.github_hosted.HostedGitHubSource`).
+metadata holds its record ``schema`` and its ``data``, the JSON object that
+the provider defines, with every member. GitHub has a closed vocabulary of its
+own (:class:`~nerve.sources.github_hosted.HostedGitHubSource`).
 
 Buffered payload of a generic record (one row per record)::
 
@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 
 from nerve.sources.base import Source
 from nerve.sources.models import FetchResult, SourceRecord
+from nerve.sources.source_json import record_metadata
 
 if TYPE_CHECKING:
     from nerve.db import Database
@@ -131,8 +132,9 @@ def record_from_buffer(payload: dict[str, Any], source: str) -> SourceRecord | N
     """The inbox record of one buffered generic payload, or ``None`` when it is unusable.
 
     *source* is the provider whose buffer held it, and the record's source.
-    The record's ``data`` becomes its metadata; a record without data has
-    none.
+    The record's metadata holds its ``schema`` and its ``data``, with every
+    member (:func:`~nerve.sources.source_json.record_metadata`); a record
+    without data has no metadata.
     """
     record = record_fields(payload)
     if record is None:
@@ -140,6 +142,7 @@ def record_from_buffer(payload: dict[str, Any], source: str) -> SourceRecord | N
     content = record.get("content")
     timestamp = record.get("timestamp")
     data = record.get("data")
+    schema = record.get("schema")
     return SourceRecord(
         id=record["id"],
         source=source,
@@ -147,7 +150,10 @@ def record_from_buffer(payload: dict[str, Any], source: str) -> SourceRecord | N
         summary=record["summary"],
         content=content if isinstance(content, str) else "",
         timestamp=timestamp if isinstance(timestamp, str) else "",
-        metadata=dict(data) if isinstance(data, dict) else {},
+        metadata=(
+            record_metadata(schema if isinstance(schema, str) else "", dict(data))
+            if isinstance(data, dict) else {}
+        ),
     )
 
 

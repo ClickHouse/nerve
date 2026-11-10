@@ -452,23 +452,34 @@ reads them, also while Nerve is not running.
   Markdown for the agent. With a credential that belongs to the agent (an
   agent API key, or the agent's sign-in), the Linear notifications of the
   agent's Linear user come too.
-- **The data of a record is its metadata.** The gateway sends the data of a
-  record as a JSON object (record schema `linear.issue_event/1`), and Nerve
-  stores it as the record's metadata with every member, also the members that
-  this release does not know. The members:
+- **The record keeps its schema and its data.** The gateway sends the data of
+  a record as a JSON object of the record schema `linear.issue_event/1`, and
+  Nerve stores both as the record's metadata, `{"schema": ..., "data": ...}`,
+  with every member of the data, also the members that this release does not
+  know. The poll tools show them to the agent as a `Schema:` line and a
+  `Data:` line of JSON. The members of the data (optional members are left
+  out, never `null`):
   - `event`, and `via`: `watch` for an issue of the scope, `inbox` for a
     notification;
-  - `server`: the `id` and `name` of the Linear server in the MCP catalog;
+  - `server`: the `id` of the Linear server in the MCP catalog (its catalog
+    server ID, such as `linear`) and its `name`;
   - `issue`: `id`, `identifier`, `title`, `url`, `team` (`key`), `project`
-    (`id`, `name`), `state` (`name`, `type`), `priority`, `assignee`,
-    `delegate`;
-  - `comment`: `id`, `url`, `body` (at most 4,000 characters), `parent_id`;
-  - `actor`: `id`, `name`, `kind` (`user`, `app`, `bot`, `integration` or
-    `external`), and `credential_user`;
-  - `changes`: a list of `{field, from, to}`.
+    (`id`, `name`), `state` (`name`, `type`), `priority` (0 to 4),
+    `assignee` and `delegate` (`id`, `name`);
+  - `comment`: `id`, `url`, `body` (at most 4,000 characters; `truncated` is
+    true when it was cut), `parent_id`;
+  - `actor`: `id`, `name`, `kind` (`user`, `app`, `bot`, `integration`,
+    `external`, or `system` for a change without an actor), and
+    `credential_user`;
+  - `changes`: a list of `{field, from, to}`, where `from` and `to` are a
+    name or a priority.
+- **One record for each event.** The record ID is
+  `<server>:<event>:<entity>`. A changed event, such as a comment that was
+  edited, keeps it, so the new version replaces the stored one and is unread
+  again.
 - **Act on a record with the Linear tools of the server that it names**
-  (`server`). That MCP catalog server reaches the same issues, with the same
-  scope.
+  (`server.id`). That MCP catalog server reaches the same issues, with the
+  same scope.
 - **The settings go to the gateway.** `events`, `inbox`, `include_bots` and
   `drop_own_actions` go in the subscription as the provider settings. Only the
   values that differ from the defaults are sent, so with the default `events`
@@ -481,7 +492,11 @@ reads them, also while Nerve is not running.
 - **The rules go to the gateway too.** The gateway applies `rules` before it
   stores a record, and the guardrail here applies them again; see
   [Rules of generic hosted sources](#rules-of-generic-hosted-sources). A rule
-  that the gateway would refuse refuses to load.
+  that the gateway would refuse refuses to load. The subscription is never
+  sent without its rules: if the subscriptions frame with the rules is larger
+  than the gateway takes, Nerve leaves the Linear subscription out, logs an
+  error, and the gateway stores no Linear records until the rules are shorter.
+  `nerve doctor` reports this as an error.
 - **The gateway must know generic sources.** A gateway that predates them
   closes a stream whose subscriptions carry `settings`, `schemas` or `rules`,
   hosted Slack traffic included. Update the gateway before you switch Linear on.
@@ -972,11 +987,13 @@ drop them; `deny_repos` and an `allow_repos` list that the repo does not match d
 ### Debugging drops
 
 Dropped records are never persisted, so the run summary count is backed by per-record log
-lines naming the rule that fired:
+lines naming the rule that fired. They name the record ID, the rule's field and the list
+that dropped it, and never a value or the summary of the dropped record, so what the
+guardrail keeps from the inbox does not reach the log either:
 
 ```
-Source github: guardrail dropped 3/5 records (e.g. '[owner/repo] CI workflow run failed …')
-Source github: dropped 19542… on ci_branch='main' — [owner/repo] CI workflow run failed …
+Source github: guardrail dropped 3/5 records
+Source github: dropped 19542… by the deny list of the rule on ci_branch
 ```
 
 ### Drop hook
@@ -1092,10 +1109,14 @@ sync:
   An `allow` rule drops a record when none of its values matches, also a record
   without a value at its path. A record stays only when every rule keeps it.
 - **At most 16 rules.** A rule outside these bounds, or with unknown keys,
-  refuses to load, so the gateway never closes the stream over one.
+  refuses to load, so the gateway never closes the stream over one. A
+  subscription is never sent without its rules (see [Linear](#linear-hosted)).
+- **The paths are into the data.** The record's schema, which Nerve keeps next
+  to the data, is not part of it.
 
-The runner's drop log names the path of the rule that dropped a record, and the
-drop hook gets it as `dropped_on`.
+The runner's drop log names the record ID, the path of the rule that dropped
+it, and whether its `allow` or its `deny` list did, and nothing of the record's
+data.
 
 ### Extending to other sources
 
@@ -1310,9 +1331,10 @@ web/src/components/Sources/
     ├── MarkdownRenderer.tsx        ← Default: ReactMarkdown with prose styles
     ├── EmailRenderer.tsx           ← Gmail: sandboxed iframe for HTML + text toggle
     ├── GitHubRenderer.tsx          ← GitHub: repo/PR header card + markdown body
-    ├── LinearRenderer.tsx          ← Linear: issue card + markdown body + the record data
-    ├── DataRenderer.tsx            ← Another generic hosted source: markdown body + the record data
-    └── RecordData.tsx              ← The record data (nested JSON metadata) as an expandable JSON view
+    ├── LinearRenderer.tsx          ← Records of schema linear.issue_event/1: issue card + markdown body + the record data
+    ├── DataRenderer.tsx            ← A record of another schema: markdown body + the record data
+    ├── RecordData.tsx              ← The record data as an expandable JSON view, with its schema
+    └── storedRecord.ts             ← The schema and the data of a stored generic record (metadata {schema, data})
 ```
 
 ### Steps

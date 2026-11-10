@@ -402,19 +402,19 @@ class SourceRunner:
             kept, dropped = self.inbox_filter.partition(records)
             if dropped:
                 logger.info(
-                    "Source %s: guardrail dropped %d/%d records (e.g. %r)",
+                    "Source %s: guardrail dropped %d/%d records",
                     self.source.source_name, len(dropped), len(records),
-                    dropped[0].summary,
                 )
-                # Name the rule that fired — the summary alone can't tell a
-                # repo drop from an actor or CI-branch drop, and the record
-                # itself is gone after this point. Capped to keep logs sane.
+                # Name the rule that fired, and only the rule: the record is
+                # gone after this point, and what the guardrail kept from the
+                # inbox must not reach the log either (no summary, no value).
+                # Capped to keep logs sane.
                 for record in dropped[:_MAX_DROP_LOG_LINES]:
                     rule = self.inbox_filter.rejects(record)
                     logger.info(
-                        "Source %s: dropped %s on %s=%r — %s",
-                        self.source.source_name, record.id, rule.field if rule else "?",
-                        rule.value(record) if rule else None, record.summary,
+                        "Source %s: dropped %s by the %s list of the rule on %s",
+                        self.source.source_name, record.id,
+                        rule.fired_list(record) if rule else "?", rule.field if rule else "?",
                     )
             records = kept
         dropped_count = len(dropped)

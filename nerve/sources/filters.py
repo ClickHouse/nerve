@@ -31,7 +31,7 @@ Matching is case-insensitive and supports shell-style globs
 coerced to ``str`` before matching.
 
 A generic hosted source (Linear, for example) uses :class:`DataRule`: the
-record's metadata is the JSON data that the provider sent, and each rule
+record's metadata holds the JSON data that the provider sent, and each rule
 names a value in it with a JSON Pointer. The channel gateway applies the same
 rules before it stores a record, so these semantics are the channel
 contract's, and the two sides drop the same records.
@@ -46,12 +46,22 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from nerve.sources.source_json import SourceJSONError, canonical_number, pointer_tokens, resolve_pointer
+from nerve.sources.source_json import (
+    SourceJSONError,
+    canonical_number,
+    pointer_tokens,
+    record_data,
+    resolve_pointer,
+)
 
 if TYPE_CHECKING:
     from nerve.sources.models import SourceRecord
 
 logger = logging.getLogger(__name__)
+
+# The names of a rule's two lists, as a log line names the one that fired.
+ALLOW = "allow"
+DENY = "deny"
 
 
 def _norm(value: object) -> str:
@@ -110,9 +120,9 @@ class FieldRule:
             return [str(v) for v in raw if v is not None]
         return [str(raw)]
 
-    def value(self, record: SourceRecord) -> object:
-        """The metadata value that the rule judges, for a log line."""
-        return (record.metadata or {}).get(self.field)
+    def fired_list(self, record: SourceRecord) -> str:
+        """``deny`` or ``allow``: the list that drops *record*, for a log line."""
+        return DENY if self.deny and any(matches_any(v, self.deny) for v in self._values(record)) else ALLOW
 
     def passes(self, record: SourceRecord) -> bool:
         """Return True if *record* satisfies this rule (should be kept)."""
@@ -140,9 +150,11 @@ def _passes(values: list[str], allow: Sequence[str], deny: Sequence[str]) -> boo
 class DataRule:
     """Allow/deny matching on a value in the data of a generic hosted record.
 
-    ``path`` is a JSON Pointer (RFC 6901) into the record's metadata, which
-    holds the provider's data, such as ``/actor/kind``. The values at the
-    path are:
+    ``path`` is a JSON Pointer (RFC 6901) into the record's data, the JSON
+    object that the provider sent, such as ``/actor/kind``. The record's
+    metadata holds it next to its schema (see
+    :func:`nerve.sources.source_json.record_data`); a record without data
+    has no value at any path. The values at the path are:
 
     * a string, as it is;
     * a number, as its canonical JSON text: ``2`` for ``2.0``, ``1.5``;
@@ -172,9 +184,10 @@ class DataRule:
 
     def _resolved(self, record: SourceRecord) -> tuple[bool, Any]:
         tokens = pointer_tokens(self.path)
-        if tokens is None:
+        stored = record_data(record.metadata)
+        if tokens is None or stored is None:
             return False, None
-        return resolve_pointer(record.metadata or {}, tokens)
+        return resolve_pointer(stored[1], tokens)
 
     def values(self, record: SourceRecord) -> list[str]:
         """The values that the rule judges in *record*."""
@@ -196,9 +209,9 @@ class DataRule:
                     continue
         return values
 
-    def value(self, record: SourceRecord) -> object:
-        """The value at the path, for a log line; ``None`` when there is none."""
-        return self._resolved(record)[1]
+    def fired_list(self, record: SourceRecord) -> str:
+        """``deny`` or ``allow``: the list of the rule, which is the one that drops *record*."""
+        return DENY if self.deny else ALLOW
 
     def passes(self, record: SourceRecord) -> bool:
         """Return True if *record* satisfies this rule (should be kept)."""

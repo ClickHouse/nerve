@@ -1795,6 +1795,20 @@ def _linear_lines(config, errors: list[str], warnings: list[str]) -> list[str]:
     if problems:
         errors.extend(f"[ERR] Linear is on but {problem}" for problem in problems)
         return []
+    # The stream leaves a subscription with rules out of the frame when the
+    # rules do not fit, rather than send it without them.
+    from nerve.channels.hosted.contract import MAX_FRAME_BYTES
+    from nerve.channels.hosted.sources import hosted_sources, subscriptions_for, subscriptions_frame_bytes
+
+    frame = subscriptions_frame_bytes(subscriptions_for(config, hosted_sources(config)).without_filters())
+    if frame > MAX_FRAME_BYTES:
+        errors.append(
+            f"[ERR] Linear: with sync.linear.rules the subscriptions frame has about {frame} "
+            f"bytes, above the {MAX_FRAME_BYTES} that the channel gateway takes, so Nerve does "
+            "not send the Linear subscription and the gateway stores no Linear records. "
+            "Shorten sync.linear.rules"
+        )
+        return []
     if config.slack.mode == "hosted" and not config.slack.enabled:
         warnings.append(
             "[WARN] Slack is hosted but switched off (slack.enabled is false): Nerve "

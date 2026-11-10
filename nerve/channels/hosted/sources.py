@@ -41,8 +41,11 @@ from typing import TYPE_CHECKING, Any
 
 from nerve.channels.hosted.contract import (
     EVENT_KIND_SOURCE_RECORD,
+    PROTOCOL_VERSION,
     SUBSCRIPTIONS_VERSION,
+    Envelope,
     Event,
+    Payload,
     RepoWatch,
     SourceFilters,
     SourceRule,
@@ -56,10 +59,11 @@ from nerve.channels.hosted.contract.model import (
     REPO_WATCH_PROVIDER,
     REPO_WATCH_TYPES,
     ZERO_TIME,
+    byte_length,
     valid_pattern,
     valid_repo_name,
 )
-from nerve.channels.hosted.contract.wire import format_time
+from nerve.channels.hosted.contract.wire import dumps, format_time
 from nerve.channels.hosted.intake import Disposition
 from nerve.config import LINEAR_EVENTS
 
@@ -122,6 +126,19 @@ def subscriptions_for(config: NerveConfig, providers: Iterable[str]) -> Subscrip
     if LINEAR in providers and config.sync.linear.enabled:
         sources.append(linear_subscription(config.sync.linear))
     return Subscriptions(version=SUBSCRIPTIONS_VERSION, sources=tuple(sources))
+
+
+def subscriptions_frame_bytes(body: Subscriptions) -> int:
+    """The UTF-8 bytes of the ``subscriptions`` frame that carries *body*.
+
+    The request ID of a stream's frame (``o-<n>``) can be a few bytes longer
+    than the one used here.
+    """
+    envelope = Envelope(
+        version=PROTOCOL_VERSION, kind="subscriptions", request_id="o-1",
+        payload=Payload(subscriptions=body),
+    )
+    return byte_length(dumps(envelope))
 
 
 def chat_subscription(provider: str) -> SourceSubscription:
@@ -416,4 +433,5 @@ __all__ = [
     "hosted_sources",
     "linear_subscription",
     "subscriptions_for",
+    "subscriptions_frame_bytes",
 ]
