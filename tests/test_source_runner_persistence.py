@@ -250,22 +250,38 @@ async def test_a_baseline_run_seeds_the_cursor_so_later_records_wake_the_consume
 
 
 @pytest.mark.asyncio
-async def test_seeding_leaves_an_existing_cursor_and_only_runs_without_a_source_cursor(db):
+async def test_seeding_leaves_a_live_cursor_and_only_runs_without_a_source_cursor(db):
     await db.insert_source_messages([_record("old")], source=SOURCE_NAME)
+    newest = await db.get_source_max_rowid(SOURCE_NAME)
     await db.set_consumer_cursor("inbox", SOURCE_NAME, 0)
     await db.set_consumer_cursor("other-consumer", "other", 0)
+    # A consumer whose only cursor, on the source, has expired.
+    await db.set_consumer_cursor("lapsed", SOURCE_NAME, 0, ttl_days=-1)
 
-    assert await db.seed_consumer_cursors(SOURCE_NAME) == 1
+    assert await db.seed_consumer_cursors(SOURCE_NAME) == 2
     assert await db.peek_consumer_cursor("inbox", SOURCE_NAME) == 0
-    # A consumer new to the source starts past what is already stored.
-    assert await db.peek_consumer_cursor("other-consumer", SOURCE_NAME) == (
-        await db.get_source_max_rowid(SOURCE_NAME)
-    )
+    # A consumer new to the source, or with an expired cursor on it, starts
+    # past what is already stored.
+    assert await db.peek_consumer_cursor("other-consumer", SOURCE_NAME) == newest
+    assert await db.peek_consumer_cursor("lapsed", SOURCE_NAME) == newest
 
     await db.set_sync_cursor(SOURCE_NAME, "stored")
     await db.set_consumer_cursor("late", "other", 0)
     await SourceRunner(_FixedSource([]), db).run()
     assert await db.peek_consumer_cursor("late", SOURCE_NAME) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sources", [[], [SOURCE_NAME]], ids=["any-source-gate", "new-source-gate"])
+async def test_an_expired_cursor_on_a_new_source_starts_again_before_its_first_records(db, sources):
+    await db.set_consumer_cursor("inbox", "other", 0)
+    await db.set_consumer_cursor("inbox", SOURCE_NAME, 0, ttl_days=-1)
+
+    result = await SourceRunner(_FixedSource([_record("a")]), db).run()
+
+    assert result.records_ingested == 1
+    assert await MessagesGate(sources=sources).is_satisfied(_inbox_gate_context(db))
+    assert "Record a" in await _poll_inbox(db)
 
 
 @pytest.mark.asyncio

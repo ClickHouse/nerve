@@ -400,25 +400,34 @@ class SourceStore:
         )
 
     async def seed_consumer_cursors(self, source: str, ttl_days: int = 2) -> int:
-        """Start a cursor on *source* for every consumer that has one elsewhere.
+        """Start a cursor on *source* for every consumer that has a cursor.
 
         Each starts at the source's newest message, as :meth:`get_consumer_cursor`
         would, so what the source stores after this call is unread. Without it
         a new source stays invisible to :meth:`consumer_has_unread`, and the
-        consumer's first poll starts past the source's first records. A
-        consumer's existing cursor on *source* is left as it is. Returns the
-        number of cursors started.
+        consumer's first poll starts past the source's first records. A live
+        cursor on *source* is left as it is. An expired one starts again at
+        the newest message with a fresh TTL, because :meth:`get_consumer_cursor`
+        would start it again later, past the records stored in between.
+        Returns the number of cursors started.
         """
         now = datetime.now(UTC)
         expires = (now + timedelta(days=ttl_days)).isoformat()
+        # SQLite needs a WHERE clause in the SELECT of an upsert.
         result = await self._write(
-            """INSERT OR IGNORE INTO consumer_cursors
+            """INSERT INTO consumer_cursors
                    (consumer, source, cursor_seq, updated_at, expires_at)
                SELECT DISTINCT consumer, ?,
                       (SELECT COALESCE(MAX(rowid), 0) FROM source_messages WHERE source = ?),
                       ?, ?
-               FROM consumer_cursors WHERE source != ?""",
-            (source, source, now.isoformat(), expires, source),
+               FROM consumer_cursors WHERE true
+               ON CONFLICT(consumer, source) DO UPDATE SET
+                   cursor_seq = excluded.cursor_seq,
+                   updated_at = excluded.updated_at,
+                   expires_at = excluded.expires_at
+               WHERE consumer_cursors.expires_at IS NOT NULL
+                 AND consumer_cursors.expires_at <= excluded.updated_at""",
+            (source, source, now.isoformat(), expires),
         )
         return result.rowcount or 0
 
