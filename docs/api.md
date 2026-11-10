@@ -2094,6 +2094,45 @@ Response: { "deleted": true }
 Response: { "deleted": false }
 ```
 
+### Workspace Files
+
+Read-only browsing for the Files page. Paths are relative to the workspace root.
+Paths matched by `files.exclude` (see [config.md](config.md#files-page)), paths
+outside the workspace, and symlinks that lead to either get 404. There is no
+write route: saves go through `PUT /api/memory/file/{path}`.
+
+#### `GET /api/workspace/list?path=<dir>`
+One directory's visible children, directories first. `path` is empty for the root.
+
+```json
+Response: {
+  "path": "drafts",
+  "entries": [
+    { "name": "plan.md", "path": "drafts/plan.md", "type": "file", "size": 812,
+      "modified": "2026-11-10T01:00:00+00:00",
+      "read_only": true, "read_only_reason": "not_memory" }
+  ],
+  "total": 1,
+  "truncated": false
+}
+```
+
+`read_only_reason` is `not_memory` (only memory markdown is writable) or
+`lockdown` (a reviewed file on a locked instance), and `null` for a file that
+`PUT /api/memory/file` would save. Directories carry no write state. Past
+`files.max_entries`, `truncated` is true and `total` counts every entry.
+
+#### `GET /api/workspace/file?path=<file>`
+A file's text, as UTF-8. A binary or non-UTF-8 file comes back with
+`binary: true`, and a file over `files.max_file_bytes` with `too_large: true`.
+Either way `content` is empty.
+
+```json
+Response: { "path": "TOOLS.md", "name": "TOOLS.md", "size": 17325, "content": "...",
+            "binary": false, "too_large": false,
+            "read_only": false, "read_only_reason": null }
+```
+
 ### Memory Files
 
 #### `GET /api/memory/files`
