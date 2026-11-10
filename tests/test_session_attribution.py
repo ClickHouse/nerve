@@ -349,10 +349,7 @@ async def test_concurrent_archives_and_restores_record_one_change(install, monke
     alice, bob = install.actor_id("alice"), install.actor_id("bob")
     async with _client(install.app()) as client:
         session_id = await _new_session(client, install.headers("alice"))
-        # Two archives of one session take turns on its client lock, so they
-        # wait for each other before the lock: both have read the session,
-        # and the second one finds it archived.
-        _hold_until_all_arrive(monkeypatch, install.db, "list_child_sessions")
+        _hold_until_all_arrive(monkeypatch, install.db, "change_session_status")
 
         async def both(action: str) -> None:
             responses = await asyncio.gather(*(
@@ -364,7 +361,6 @@ async def test_concurrent_archives_and_restores_record_one_change(install, monke
             assert [r.status_code for r in responses] == [200, 200]
 
         await both("archive")
-        _hold_until_all_arrive(monkeypatch, install.db, "change_session_status")
         await both("unarchive")
 
     events = await install.events(session_id, "archived", "unarchived")

@@ -298,14 +298,53 @@ async def test_archive_is_refused_while_a_turn_waits_for_a_concurrency_slot(tmp_
 
 
 @pytest.mark.asyncio
+async def test_archive_is_refused_while_a_registered_task_runs(tmp_path, db):
+    """A workflow leg between two of its turns: its task is registered for
+    the session, and nothing holds the run lock."""
+    engine, _backend = _engine(tmp_path, db)
+    sid = "s-leg"
+    await _new_session(engine, db, sid)
+    leg = asyncio.create_task(asyncio.Event().wait())
+    engine.register_task(sid, leg)
+    try:
+        assert not engine._session_locks[sid].locked()
+        with pytest.raises(SessionBusyError) as info:
+            await engine.sessions.archive_session(sid)
+        assert str(info.value) == BUSY_RUNNING_REASON
+    finally:
+        leg.cancel()
+    await asyncio.sleep(0)
+    assert await engine.sessions.archive_session(sid) is True
+
+
+@pytest.mark.asyncio
+async def test_archive_is_refused_while_anything_holds_the_run_lock(tmp_path, db):
+    """An autonomous turn, an idle drain or a queued message holds the run
+    lock with no turn task: the archive is refused all the same."""
+    engine, _backend = _engine(tmp_path, db)
+    sid = "s-run-lock"
+    await _new_session(engine, db, sid)
+
+    async with engine._holding_run_lock(sid, engine._session_locks[sid]):
+        assert engine.sessions.turn_task(sid) is None
+        with pytest.raises(SessionBusyError) as info:
+            await engine.sessions.archive_session(sid)
+        assert str(info.value) == BUSY_RUNNING_REASON
+        result = await engine.sessions.archive_session_cascade(sid)
+        assert result["skipped"] == [{"id": sid, "reason": BUSY_RUNNING_REASON}]
+
+    assert await engine.sessions.archive_session(sid) is True
+
+
+@pytest.mark.asyncio
 async def test_a_queued_turn_is_refused_when_the_session_was_archived_meanwhile(
     tmp_path, db, broadcasts,
 ):
+    """The check after the run lock: a session that another path archives
+    (as the Codex sync does for its mirror sessions) while a run waits."""
     engine, backend = _engine(tmp_path, db)
     sid = "s-queued"
     await _new_session(engine, db, sid)
-    # The run lock is held by work that is not a turn (an idle drain or a
-    # client reap), so the next message waits in the queue.
     lock = engine._session_locks[sid]
     await lock.acquire()
     turn = asyncio.create_task(
@@ -314,7 +353,7 @@ async def test_a_queued_turn_is_refused_when_the_session_was_archived_meanwhile(
     )
     await _until(lambda: len(engine.queue_view(sid)) == 1)
 
-    assert (await engine.sessions.archive_session_cascade(sid))["archived"] == [sid]
+    await db.change_session_status(sid, "archived", event_type="archived")
     engine._pass_run_lock(sid, lock)
 
     with pytest.raises(SessionClosedError):
@@ -361,9 +400,11 @@ async def test_a_session_archived_while_its_turn_waits_for_the_client_gets_no_cl
 
 
 @pytest.mark.asyncio
-async def test_a_turn_that_starts_during_an_archive_gets_no_client(tmp_path, db):
-    """The archive holds the client lock: a turn that passed its checks while
-    the archive disconnected the old client builds no new one."""
+async def test_a_turn_that_starts_during_an_archive_is_refused_before_it_stores_anything(
+    tmp_path, db,
+):
+    """The archive mark: a turn that takes the run lock while the archive
+    disconnects the old client is refused before its message is stored."""
     engine, backend = _engine(tmp_path, db)
     sid = "s-mid-archive"
     await _new_session(engine, db, sid)
@@ -371,16 +412,21 @@ async def test_a_turn_that_starts_during_an_archive_gets_no_client(tmp_path, db)
     backend.clients[0].disconnect_gate = gate
     archive = asyncio.create_task(engine.sessions.archive_session(sid))
     await _until(lambda: engine.sessions.get_client(sid) is None)
-    turn = asyncio.create_task(
-        engine.run(sid, "sent during the archive", source="web", channel="web", actor=None),
-    )
-    await _until(lambda: engine.sessions.is_running(sid))
+    assert engine.sessions.is_archiving(sid)
+
+    with pytest.raises(SessionClosedError):
+        await asyncio.wait_for(
+            engine.run(sid, "sent during the archive", source="web",
+                       channel="web", actor=None),
+            timeout=5,
+        )
     gate.set()
 
     assert await asyncio.wait_for(archive, timeout=5) is True
-    with pytest.raises(SessionClosedError):
-        await asyncio.wait_for(turn, timeout=5)
+    assert not engine.sessions.is_archiving(sid)
     assert len(backend.clients) == 1
+    users = [m["content"] for m in await db.get_messages(sid) if m["role"] == "user"]
+    assert "sent during the archive" not in users
     assert (await db.get_session(sid))["status"] == "archived"
 
 
@@ -482,6 +528,58 @@ async def test_the_chat_api_unarchives_an_archived_session_it_names(tmp_path, db
     assert "unarchived" in await _events(db, sid)
 
 
+@pytest.mark.asyncio
+async def test_run_later_into_an_archived_session_unarchives_it(tmp_path, db):
+    from nerve.gateway.routes import _deps as deps_mod
+    from nerve.gateway.routes import sessions as routes
+
+    engine, _backend = _engine(tmp_path, db)
+    sid = "s-later"
+    await _new_session(engine, db, sid)
+    await engine.sessions.archive_session(sid)
+
+    saved = deps_mod._deps
+    deps_mod.init_deps(engine, db)
+    try:
+        req = routes.RunLaterRequest(session_id=sid, message="do it later", delay="30m")
+        result = await routes.run_later(req, actor=db.system_actor)
+    finally:
+        deps_mod._deps = saved
+
+    assert result["scheduled"] is True
+    assert (await db.get_session(sid))["status"] == "idle"
+    assert len(await db.list_pending_wakeups(sid)) == 1
+    assert "unarchived" in await _events(db, sid)
+
+
+@pytest.mark.asyncio
+async def test_unstarring_an_archived_session_runs_no_hook(tmp_path, db, monkeypatch):
+    from nerve.gateway.routes import _deps as deps_mod
+    from nerve.gateway.routes import sessions as routes
+
+    engine, _backend = _engine(tmp_path, db)
+    engine.config.sessions.star_project_hook = True
+    monkeypatch.setattr(routes, "get_config", lambda: engine.config)
+    sid = "s-starred"
+    await engine.sessions.get_or_create(sid, source="web", actor=None)
+    await db.change_session_fields(sid, {"starred": 1})
+    await engine.sessions.archive_session(sid)
+    runs = AsyncMock()
+    engine.run = runs
+
+    saved = deps_mod._deps
+    deps_mod.init_deps(engine, db)
+    try:
+        await routes.update_session(sid, {"starred": False}, actor=db.system_actor)
+    finally:
+        deps_mod._deps = saved
+    await asyncio.sleep(0)
+
+    runs.assert_not_called()
+    row = await db.get_session(sid)
+    assert row["status"] == "archived" and not row["starred"]
+
+
 # --------------------------------------------------------------------------- #
 # Delete
 # --------------------------------------------------------------------------- #
@@ -524,6 +622,45 @@ async def test_delete_is_refused_while_a_turn_runs_and_one_waits(tmp_path, db):
     await asyncio.wait_for(turn2, timeout=5)
     users = [m["content"] for m in await db.get_messages(sid) if m["role"] == "user"]
     assert users == ["long task", "queued follow-up"]
+
+
+@pytest.mark.asyncio
+async def test_delete_is_refused_while_the_run_lock_is_held_without_a_turn(tmp_path, db):
+    """The queue handoff, an autonomous turn or an idle drain: the run lock
+    is held, and no turn task is set."""
+    engine, _backend = _engine(tmp_path, db)
+    sid = "s-handoff"
+    await _new_session(engine, db, sid)
+
+    async with engine._holding_run_lock(sid, engine._session_locks[sid]):
+        with pytest.raises(HTTPException) as info:
+            await _delete(engine, db, sid)
+    assert info.value.status_code == 409
+    assert await db.get_session(sid) is not None
+
+
+@pytest.mark.asyncio
+async def test_the_chat_api_does_not_create_a_deleted_session_again(tmp_path, db):
+    from nerve.gateway.routes import _deps as deps_mod
+    from nerve.gateway.routes import sessions as routes
+
+    engine, backend = _engine(tmp_path, db)
+    sid = "s-api-deleted"
+    await _new_session(engine, db, sid)
+    await _delete(engine, db, sid)
+
+    saved = deps_mod._deps
+    deps_mod.init_deps(engine, db)
+    try:
+        req = routes.MessageRequest(session_id=sid, message="still there?")
+        with pytest.raises(SessionClosedError) as info:
+            await routes.chat(req, actor=db.system_actor)
+    finally:
+        deps_mod._deps = saved
+
+    assert info.value.reason == "deleted"
+    assert await db.get_session(sid) is None
+    assert len(backend.clients) == 1
 
 
 @pytest.mark.asyncio

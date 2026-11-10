@@ -1116,8 +1116,9 @@ The delete removes the session's events and its agent records and
 transcripts. Nerve records the delete in
 `session_deletions` with the signed-in person as actor and cause (see
 [Session changes](accounts.md#session-changes)).
-While a turn of the session runs, or a message waits in its turn queue, the
-delete answers `409`: stop the session first. The delete expires the
+While a turn of the session runs, a message waits in its turn queue, or a
+background continuation of the runtime runs, the delete answers `409`: stop
+the session first. The delete expires the
 session's pending questions; the notification rows stay. A turn never creates
 a deleted session again: a run in it is refused.
 
@@ -1198,8 +1199,10 @@ archived session: a wakeup or a queued message is refused, an answer is
 stored but starts no turn, and a channel message goes to a new session. Only these
 open an archived session again, each with an `unarchived` event: the
 unarchive endpoint, a star, and a person's own message into it (the web chat,
-`POST /api/chat` with its `session_id`, a plan revision request for a plan
-that it proposed). A route that would run a turn in an archived session
+`POST /api/chat` with its `session_id`, "Run later", a plan revision request
+for a plan that it proposed). The archive itself is refused (`session is
+running`) while a turn runs or waits, or while a background continuation of
+the runtime runs. A route that would run a turn in an archived session
 answers `409` with `{"detail": "...", "reason": "archived"}`.
 
 ```json
@@ -1322,7 +1325,9 @@ Response: { "response": "Hi there!", "session_id": "main" }
 10 minutes runs nothing and answers with an empty `response`. While another
 turn of the session runs, the message waits in the session's
 [turn queue](#get-apisessionsidqueue) (source `api`). A `session_id` of an
-archived session unarchives it first, in the caller's name.
+archived session unarchives it first, in the caller's name. A `session_id` of
+a deleted session creates nothing and answers `409` with
+`{"detail": "This session was deleted.", "reason": "deleted"}`.
 
 For streaming, use the WebSocket endpoint.
 

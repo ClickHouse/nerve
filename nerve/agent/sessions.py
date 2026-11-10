@@ -116,6 +116,9 @@ class SessionManager:
     # status (the engine wires the expiry of the session's questions).
     # Never raises into the caller.
     on_archived: Callable[[str], Awaitable[None]] | None = None
+    # ``run_lock_held(session_id)``: something holds the session's run lock
+    # (the archive guard). Wired to the engine's run locks.
+    run_lock_held: Callable[[str], bool] | None = None
     # Called as ``listener(session_id, running)`` right after a session
     # starts or stops running a turn (see ``add_running_listener``).
     _running_listeners: tuple[Callable[[str, bool], None], ...] = ()
@@ -1021,12 +1024,14 @@ class SessionManager:
         agents is refused with :class:`SessionBusyError`; with ``force`` its
         agents end as interrupted (``archived``).
 
-        A session with a turn that holds its run lock (it runs, or waits for
-        a concurrency slot) is refused with :class:`SessionBusyError`, also
-        with ``force``. The check and the status write hold the session's
-        client lock, the lock under which a turn builds its client and checks
-        that the session is not archived. So the runtime never gets a turn of
-        a session that this call archives.
+        A session with turn work is refused with :class:`SessionBusyError`,
+        also with ``force``: a turn that runs or waits for a concurrency
+        slot, or any holder of the session's run lock (a queued message, an
+        autonomous turn, an idle drain). Right after these checks, with no
+        await in between, the session is marked as archiving until its status
+        is written (:meth:`is_archiving`). A run checks the mark right after
+        it holds the run lock, also with no await in between. So a run either
+        makes this call fail or is refused.
 
         After the archive, the session's pending wakeups are deleted and
         ``on_archived`` runs (it expires the session's pending questions).
@@ -1036,57 +1041,79 @@ class SessionManager:
             raise ValueError(f"Session {session_id} not found")
         if session.get("status") == SessionStatus.ARCHIVED.value:
             return False
-        lock = self.get_lock(session_id)
-        async with lock:
-            # Read again under the lock: another archive that held it can
-            # have archived the session meanwhile.
-            session = await self.db.get_session(session_id)
-            if not session or session.get("status") == SessionStatus.ARCHIVED.value:
-                return False
-            if self.has_running_work(session_id):
-                raise SessionBusyError(BUSY_RUNNING_REASON)
-            if not force and self._agents_live(session_id):
-                raise SessionBusyError(BUSY_AGENTS_REASON)
-            # Memorize in the background: memU indexing can take ~90s; awaiting it
-            # here would hang the archive (and, in a cascade, the whole request on the root).
-            if self._on_memorize:
-                async def _memorize_bg(sid: str = session_id) -> None:
-                    try:
-                        await self._on_memorize(sid)
-                    except Exception as e:
-                        logger.warning("Background memorize for %s failed: %s", sid, e)
-                asyncio.create_task(_memorize_bg())
-
-            client = self.remove_client(session_id, reason="archived")
-            # remove_client drops the session's client lock from the map. Keep
-            # the held lock there until the status is written, so that a turn
-            # that builds a client meanwhile waits for it.
-            self._client_locks[session_id] = lock
-            if client is None and self._agents_live(session_id):
-                # Records still live without a runtime: nothing runs them any
-                # more, so settle them with the archive.
-                self._notify_client_removed(session_id, "archived")
-            if client:
-                try:
-                    await client.disconnect()
-                except Exception:
-                    pass
-            now = datetime.now(timezone.utc).isoformat()
-            archived = await self.db.change_session_status(
-                session_id, SessionStatus.ARCHIVED.value,
-                fields={
-                    "archived_at": now,
-                    "connected_at": None,
-                    "sdk_session_id": None,
-                },
-                event_type="archived", details=details, attribution=attribution,
+        if self.has_running_work(session_id) or self._run_lock_held(session_id):
+            raise SessionBusyError(BUSY_RUNNING_REASON)
+        if not force and self._agents_live(session_id):
+            raise SessionBusyError(BUSY_AGENTS_REASON)
+        marks = self._archiving_marks()
+        marks[session_id] = marks.get(session_id, 0) + 1
+        try:
+            archived = await self._archive_marked(
+                session_id, attribution=attribution, details=details,
             )
-        if self._client_locks.get(session_id) is lock:
-            self._client_locks.pop(session_id)
+        finally:
+            left = marks.pop(session_id, 1) - 1
+            if left:
+                marks[session_id] = left
         if archived:
             logger.info("Archived session %s", session_id)
             await self._close_archived_work(session_id)
         return archived
+
+    async def _archive_marked(
+        self, session_id: str, *, attribution: Attribution, details: dict | None,
+    ) -> bool:
+        """The work of :meth:`archive_session` while the session is marked:
+        memorize, disconnect the client, write the status."""
+        # Memorize in the background: memU indexing can take ~90s; awaiting it
+        # here would hang the archive (and, in a cascade, the whole request on the root).
+        if self._on_memorize:
+            async def _memorize_bg(sid: str = session_id) -> None:
+                try:
+                    await self._on_memorize(sid)
+                except Exception as e:
+                    logger.warning("Background memorize for %s failed: %s", sid, e)
+            asyncio.create_task(_memorize_bg())
+
+        client = self.remove_client(session_id, reason="archived")
+        if client is None and self._agents_live(session_id):
+            # Records still live without a runtime: nothing runs them any
+            # more, so settle them with the archive.
+            self._notify_client_removed(session_id, "archived")
+        if client:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+        now = datetime.now(timezone.utc).isoformat()
+        return await self.db.change_session_status(
+            session_id, SessionStatus.ARCHIVED.value,
+            fields={
+                "archived_at": now,
+                "connected_at": None,
+                "sdk_session_id": None,
+            },
+            event_type="archived", details=details, attribution=attribution,
+        )
+
+    def _archiving_marks(self) -> dict[str, int]:
+        """Archives in progress per session (created on first use, so
+        managers built with ``__new__`` work too)."""
+        return self.__dict__.setdefault("_archiving", {})
+
+    def is_archiving(self, session_id: str) -> bool:
+        """An archive of the session is in progress (see :meth:`archive_session`)."""
+        return session_id in self._archiving_marks()
+
+    def _run_lock_held(self, session_id: str) -> bool:
+        """``run_lock_held(session_id)``; ``False`` when it is not wired."""
+        if self.run_lock_held is None:
+            return False
+        try:
+            return bool(self.run_lock_held(session_id))
+        except Exception:
+            logger.exception("run-lock check failed for %s", session_id)
+            return False
 
     async def _close_archived_work(self, session_id: str) -> None:
         """End the work that targets a session that was just archived: its

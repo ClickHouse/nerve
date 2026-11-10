@@ -240,6 +240,14 @@ async def request_plan_revision(
     #    Fall back to the cron planner if the plan was created without
     #    a session attribution (older rows, manual inserts, etc.).
     session_id = plan.get("session_id") or _FALLBACK_PLANNER_SESSION
+    # A deleted proposer session is not created again: the cron planner
+    # takes the revision.
+    if (
+        session_id != _FALLBACK_PLANNER_SESSION
+        and await db.get_session(session_id) is None
+        and await db.get_session_deletion(session_id) is not None
+    ):
+        session_id = _FALLBACK_PLANNER_SESSION
     session_title = (
         f"Cron: {session_id.split(':')[-1]}"
         if session_id.startswith("cron:")

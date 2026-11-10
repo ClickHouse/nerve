@@ -491,8 +491,10 @@ class AgentEngine:
         # guard asks whether agents still run.
         self.sessions.on_client_removed = self.agents.on_client_gone
         self.sessions.has_live_agents = self.agents.has_live
-        # An archive expires the session's pending questions.
+        # An archive expires the session's pending questions, and is refused
+        # while anything holds the session's run lock.
         self.sessions.on_archived = self.expire_session_questions
+        self.sessions.run_lock_held = self._run_lock_held
         # Generation of the live runtime client per build (any session): a
         # finished agent is resumable only on the client that ran it.
         self._client_gen = 0
@@ -1189,12 +1191,19 @@ class AgentEngine:
             session_id, attribution=attribution,
         )
 
+    def _run_lock_held(self, session_id: str) -> bool:
+        """Something holds the session's run lock: a turn, a run that waits
+        in the queue (the lock stays held across the handover), an
+        autonomous turn, an idle drain or a client reap."""
+        lock = self._session_locks.get(session_id)
+        return lock is not None and lock.locked()
+
     def has_turn_work(self, session_id: str) -> bool:
-        """A turn of the session runs, waits for a concurrency slot, or
-        waits in the session's turn queue."""
+        """A turn of the session runs or waits for a concurrency slot, or
+        anything holds its run lock (see :meth:`_run_lock_held`)."""
         return (
             self.sessions.has_running_work(session_id)
-            or bool(self.queue_view(session_id))
+            or self._run_lock_held(session_id)
         )
 
     def _deleting_sessions(self) -> set[str]:
@@ -1207,7 +1216,7 @@ class AgentEngine:
         (:meth:`has_turn_work`), else mark it and return ``True``. Call
         :meth:`end_delete` when the rows are gone.
 
-        No await here. A run sets its turn task and then checks the mark,
+        No await here. A run takes the run lock and then checks the mark,
         with no await in between either. So a run either sees the mark and
         is refused, or makes this call return ``False``.
         """
@@ -1577,9 +1586,8 @@ class AgentEngine:
 
             # Session row first — backend resolution is sticky on it.
             session = await self.db.get_session(session_id)
-            # Under the client lock, which archive_session also holds: a
-            # session archived (or deleted) after the checks in _run_turn
-            # gets no client, and its runtime gets no turn.
+            # Check again before the runtime gets anything: the session row
+            # read here is the one the client is built for.
             closed = await self._session_closed_reason(session_id, session)
             if closed:
                 raise SessionClosedError(closed)
@@ -2154,10 +2162,13 @@ class AgentEngine:
     ) -> str | None:
         """``archived`` or ``deleted`` when no turn may run in the session,
         else ``None``. ``session`` is the row when the caller has read it
-        already (``None`` for no row). A delete in progress counts as
-        ``deleted``; that check comes before the first await."""
+        already (``None`` for no row). A delete or an archive in progress
+        counts as ``deleted`` or ``archived``; those checks come before the
+        first await."""
         if session_id in self._deleting_sessions():
             return "deleted"
+        if self.sessions.is_archiving(session_id):
+            return "archived"
         if session is False:
             session = await self.db.get_session(session_id)
         if session is not None:
@@ -4107,11 +4118,11 @@ class AgentEngine:
                     session_id, entry=entry, client_msg_id=client_msg_id,
                 )
             # The Stop target from the moment this run holds the run lock:
-            # Stop reaches the turn, never a message queued behind it. From
-            # here on, an archive of the session is refused.
+            # Stop reaches the turn, never a message queued behind it.
             self.sessions.set_turn_task(session_id, turn_task)
             # The session can be archived or deleted before this run holds
-            # the lock, or while it waits in the queue.
+            # the lock, or while it waits in the queue. No await since the
+            # lock: an archive or a delete that starts later sees this run.
             closed = await self._session_closed_reason(session_id)
             if closed:
                 await self._refuse_closed_session(

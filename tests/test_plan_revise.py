@@ -203,6 +203,23 @@ class TestRequestPlanRevision:
         # An archived proposer session is unarchived before the run.
         assert engine.reopened == ["sess-proposer"]
 
+    async def test_falls_back_to_cron_planner_when_proposer_was_deleted(
+        self, db: Database, tmp_path,
+    ):
+        engine, _ = await _setup(db, tmp_path)
+        await db.create_session("sess-proposer", actor=None)
+        await db.delete_session("sess-proposer")
+
+        await request_plan_revision(
+            db=db, engine=engine,
+            plan_id="plan-orig", feedback="rev",
+            actor=None, cause=None,
+        )
+        await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
+
+        assert engine.runs[0]["session_id"] == "cron:task-planner"
+        assert await db.get_session("sess-proposer") is None
+
     async def test_falls_back_to_cron_planner_when_session_unknown(
         self, db: Database, tmp_path,
     ):

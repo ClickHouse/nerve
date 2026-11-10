@@ -650,9 +650,11 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
     await deps.db.change_session_fields(session_id, fields, attribution=attribution)
     updated = await deps.db.get_session(session_id)
     # Star = opt-in project registration (sessions.star_project_hook, default
-    # off). On a starred transition fire a one-shot internal turn.
+    # off). On a starred transition fire a one-shot internal turn. An
+    # archived session runs no turn (unstarring keeps it archived).
     if (get_config().sessions.star_project_hook and "starred" in fields
-            and deps.engine and fields["starred"] != old_starred):
+            and deps.engine and fields["starred"] != old_starred
+            and (updated or {}).get("status") != "archived"):
         promoted = fields["starred"] == 1
         trigger = (
             "[system:star-promote] This session was just STARRED, which registers it as a "
@@ -849,6 +851,12 @@ async def run_later(req: RunLaterRequest, actor: Actor = Depends(require_auth)):
     message = (req.message or "").strip()
     if not message and not req.file_ids:
         raise HTTPException(status_code=400, detail="Nothing to defer")
+    if deps.engine:
+        # The person's own message into an archived session opens it again,
+        # so that the deferred turn can run.
+        await deps.engine.reopen_archived(
+            req.session_id, attribution=attribution_for(actor),
+        )
 
     delay = (req.delay or "none").strip().lower()
     if delay != "none" and delay not in _RUN_LATER_TIMED:
@@ -1139,9 +1147,14 @@ async def chat(req: MessageRequest, actor: Actor = Depends(require_auth)):
         session_id = await deps.engine.sessions.get_active_session(
             "api:default", source="api", actor=actor,
         )
-    elif deps.engine.accepting_turns:
+    elif deps.engine.accepting_turns and not (
+        await deps.db.get_session(session_id) is None
+        and await deps.db.get_session_deletion(session_id) is not None
+    ):
         # A new session id from the caller: a session of the API. A draining
-        # engine creates nothing: run() refuses the turn with a 503.
+        # engine creates nothing: run() refuses the turn with a 503. The id of
+        # a deleted session creates nothing either: run() refuses it with a
+        # 409.
         await deps.engine.sessions.get_or_create(
             session_id, source="web", actor=actor, origin=Origin(TRIGGER_API),
         )
