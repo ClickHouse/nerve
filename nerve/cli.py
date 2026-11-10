@@ -1771,6 +1771,47 @@ def _github_repos_lines(config, warnings: list[str]) -> list[str]:
     return [line]
 
 
+def _linear_lines(config, errors: list[str], warnings: list[str]) -> list[str]:
+    """Doctor lines for the Linear source (``sync.linear``).
+
+    Linear records come only from the channel gateway, so the source needs
+    usable ``channels.hosted`` settings and a key file that can be read. A
+    switched-off hosted Slack holds the records back too, as for hosted
+    GitHub.
+    """
+    linear = config.sync.linear
+    if not linear.enabled:
+        return ["[--] Linear source off (sync.linear.enabled is false)"]
+    from nerve.channels.hosted.auth import KeyFileError, read_key_file
+    from nerve.config import LINEAR_EVENTS
+
+    hosted = config.channels.hosted
+    problems = hosted.problems()
+    if not problems:
+        try:
+            read_key_file(hosted.gateway_jwks_file)
+        except KeyFileError as error:
+            problems = [f"channels.hosted.gateway_jwks_file: {error}"]
+    if problems:
+        errors.extend(f"[ERR] Linear is on but {problem}" for problem in problems)
+        return []
+    if config.slack.mode == "hosted" and not config.slack.enabled:
+        warnings.append(
+            "[WARN] Slack is hosted but switched off (slack.enabled is false): Nerve "
+            "reads nothing from the channel gateway until it is switched on, so the "
+            "Linear records wait there too"
+        )
+    events = "all" if len(linear.events) == len(LINEAR_EVENTS) else ", ".join(linear.events)
+    count = len(linear.rules)
+    return [
+        "[OK] Linear records come from the channel gateway (the agent's Linear "
+        f"connector): events {events}; inbox {'on' if linear.inbox else 'off'}; bots "
+        f"{'included' if linear.include_bots else 'left out'}; own actions "
+        f"{'dropped' if linear.drop_own_actions else 'kept'}; "
+        f"{count} {'rule' if count == 1 else 'rules'}"
+    ]
+
+
 def _source_suffix(config, path: str) -> str:
     """`` (environment)`` / `` (config-repo)`` after a configured connection
     line when the value did not come from a file on this machine; ``""`` for
@@ -2262,6 +2303,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         lines.append("[--] Slack disabled")
     lines.extend(_hosted_github_lines(config, errors, warnings))
     lines.extend(_github_repos_lines(config, warnings))
+    lines.extend(_linear_lines(config, errors, warnings))
     lines.extend(_email_lines(config, errors, warnings))
 
     # Check SSL

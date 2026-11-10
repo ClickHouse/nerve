@@ -371,6 +371,22 @@ sync:
                                    # close of the PRs it reported
     # deny_authors: []             # case-insensitive globs on the author login
     batch_size: 50
+  # Linear issue events of the agent's Linear connector in the MCP catalog.
+  # The channel gateway polls Linear with the connector's credential and
+  # project scope and streams the records (needs channels.hosted and a
+  # gateway that knows generic sources). Each record names the catalog
+  # server whose Linear tools act on it. Switching it on needs a restart.
+  # See docs/sources.md "Linear (hosted)".
+  # linear:
+  #   enabled: false
+  #   mode: hosted                 # the only mode; poll refuses to load
+  #   events: [assigned, commented, mentioned]  # default: every event
+  #   inbox: true                  # also the agent's own Linear notifications
+  #   include_bots: false          # also events of bots and integrations
+  #   drop_own_actions: true       # drop the credential user's own events
+  #   rules:                       # JSON Pointers into the record data;
+  #     - path: /issue/team/key    # applied by the gateway and again here
+  #       allow: ["ENG*"]
 
 # Memory (memU)
 memory:

@@ -4,16 +4,25 @@ In hosted mode the channel gateway polls a source instead of this process.
 It applies the filters that Nerve publishes before it stores a record, keeps
 the records in the agent's inbox until Nerve reads them, also while Nerve is
 not running, and Nerve reads them over the same streams that carry hosted
-channel traffic. GitHub is the hosted source, as a whole: with
-``sync.github.mode: hosted`` both the notifications (provider ``github``) and
-the repository watch (provider ``github_repos``) come from the gateway.
+channel traffic. The hosted sources:
+
+- GitHub, as a whole: with ``sync.github.mode: hosted`` both the
+  notifications (provider ``github``) and the repository watch (provider
+  ``github_repos``) come from the gateway. Their records carry metadata from
+  the contract's closed vocabulary.
+- Linear (provider ``linear``), with ``sync.linear.enabled``: a generic
+  source. Its records carry ``data``, a JSON object that the provider
+  defines (record schema ``linear.issue_event/1``), and its subscription
+  carries provider ``settings``, the record ``schemas`` that Nerve reads,
+  and ``rules`` on the data.
 
 :class:`HostedSourceConsumer` takes a provider's records from the inbox reader
 and writes each one to the local ``channel_observations`` buffer under the
 provider's name. The provider's source runner drains that buffer into the
-inbox with the guardrail, drop hook, and condensing of the polling source
-(:mod:`nerve.sources.github_hosted`). A record is acknowledged only after its
-buffer row is written.
+inbox with the guardrail and condensing of every source, and for GitHub the
+drop hook of the polling source (:mod:`nerve.sources.github_hosted`,
+:mod:`nerve.sources.hosted`). A record is acknowledged only after its buffer
+row is written.
 
 :func:`subscriptions_for` builds the ``subscriptions`` frame from the same
 settings that build the inbox filter, so the gateway and Nerve drop the same
@@ -36,6 +45,7 @@ from nerve.channels.hosted.contract import (
     Event,
     RepoWatch,
     SourceFilters,
+    SourceRule,
     SourceSubscription,
     Subscriptions,
 )
@@ -51,9 +61,10 @@ from nerve.channels.hosted.contract.model import (
 )
 from nerve.channels.hosted.contract.wire import format_time
 from nerve.channels.hosted.intake import Disposition
+from nerve.config import LINEAR_EVENTS
 
 if TYPE_CHECKING:
-    from nerve.config import GitHubReposSyncConfig, GitHubSyncConfig, NerveConfig
+    from nerve.config import GitHubReposSyncConfig, GitHubSyncConfig, LinearSyncConfig, NerveConfig
     from nerve.db import Database
 
 logger = logging.getLogger(__name__)
@@ -61,6 +72,10 @@ logger = logging.getLogger(__name__)
 GITHUB = "github"
 # The repository watch: the repositories that sync.github_repos names.
 GITHUB_REPOS = REPO_WATCH_PROVIDER
+# Linear issue events of the agent's Linear connector.
+LINEAR = "linear"
+# The record schemas of Linear records that Nerve reads.
+LINEAR_SCHEMAS = ("linear.issue_event/1",)
 
 # Row target of a provider's buffer. The gateway keeps at most this many
 # source records for an agent, and the runner drains the buffer after every
@@ -72,9 +87,14 @@ def hosted_sources(config: NerveConfig) -> list[str]:
     """The source providers whose records come from the gateway.
 
     GitHub is hosted as a whole: ``sync.github.mode: hosted`` makes the
-    repository watch (``github_repos``) hosted too.
+    repository watch (``github_repos``) hosted too, switched on or not.
+    Linear is hosted only (``sync.linear.mode``), and is a hosted source
+    while ``sync.linear.enabled`` is on when the process starts.
     """
-    return [GITHUB, GITHUB_REPOS] if config.sync.github.mode == "hosted" else []
+    providers = [GITHUB, GITHUB_REPOS] if config.sync.github.mode == "hosted" else []
+    if config.sync.linear.enabled:
+        providers.append(LINEAR)
+    return providers
 
 
 # ---------------------------------------------------------------------- #
@@ -99,6 +119,8 @@ def subscriptions_for(config: NerveConfig, providers: Iterable[str]) -> Subscrip
         watch = github_repos_subscription(config.sync.github_repos)
         if watch is not None:
             sources.append(watch)
+    if LINEAR in providers and config.sync.linear.enabled:
+        sources.append(linear_subscription(config.sync.linear))
     return Subscriptions(version=SUBSCRIPTIONS_VERSION, sources=tuple(sources))
 
 
@@ -191,6 +213,40 @@ def github_repos_subscription(settings: GitHubReposSyncConfig) -> SourceSubscrip
     )
 
 
+def linear_subscription(settings: LinearSyncConfig) -> SourceSubscription:
+    """The Linear subscription: provider settings, record schemas, and rules.
+
+    The settings carry only the values that differ from the provider's
+    defaults (every event, the inbox on, bot events off, own actions
+    dropped), so that absent settings mean the defaults and an event kind
+    that a later gateway adds reaches an agent that keeps the default. The
+    config refuses to load rules that the gateway would refuse, so they go
+    as they are, and the inbox guardrail applies them again.
+    """
+    provider_settings: dict[str, Any] = {}
+    if set(settings.events) != set(LINEAR_EVENTS):
+        provider_settings["events"] = [event for event in LINEAR_EVENTS if event in settings.events]
+    if not settings.inbox:
+        provider_settings["inbox"] = False
+    if settings.include_bots:
+        provider_settings["include_bots"] = True
+    if not settings.drop_own_actions:
+        provider_settings["drop_own_actions"] = False
+    return SourceSubscription(
+        provider=LINEAR,
+        settings=provider_settings or None,
+        schemas=LINEAR_SCHEMAS,
+        rules=tuple(
+            SourceRule(
+                path=rule["path"],
+                allow=tuple(rule.get("allow") or ()),
+                deny=tuple(rule.get("deny") or ()),
+            )
+            for rule in settings.rules
+        ),
+    )
+
+
 def _patterns(values: object) -> list[str]:
     """The non-blank patterns of a setting, stripped as the inbox filter strips them."""
     if not isinstance(values, (list, tuple)):
@@ -234,25 +290,30 @@ def buffered_record(event: Event) -> dict[str, Any]:
 
     ``record.metadata`` keeps the wire entries (``key`` with ``value`` or
     ``values``); the source that drains the buffer knows which keys hold
-    lists and which hold flags.
+    lists and which hold flags. A record of a generic source adds its
+    ``schema`` and its ``data``, with every member.
     """
     record = event.record
     timestamp = record.timestamp if record.timestamp != ZERO_TIME else event.occurred_at
+    fields: dict[str, Any] = {
+        "id": record.id,
+        "record_type": record.record_type,
+        "summary": record.summary,
+        "content": record.content,
+        "timestamp": format_time(timestamp) if timestamp != ZERO_TIME else "",
+        "metadata": [
+            {"key": entry.key, "value": entry.value, "values": list(entry.values)}
+            for entry in record.metadata
+        ],
+    }
+    if record.data is not None:
+        fields["schema"] = record.schema
+        fields["data"] = record.data
     return {
         "event_id": event.event_id,
         "connection_id": str(event.connection_id),
         "conversation_id": event.conversation.id,
-        "record": {
-            "id": record.id,
-            "record_type": record.record_type,
-            "summary": record.summary,
-            "content": record.content,
-            "timestamp": format_time(timestamp) if timestamp != ZERO_TIME else "",
-            "metadata": [
-                {"key": entry.key, "value": entry.value, "values": list(entry.values)}
-                for entry in record.metadata
-            ],
-        },
+        "record": fields,
     }
 
 
@@ -349,11 +410,14 @@ __all__ = [
     "BUFFER_MAX_ROWS",
     "GITHUB",
     "GITHUB_REPOS",
+    "LINEAR",
+    "LINEAR_SCHEMAS",
     "HostedSourceConsumer",
     "buffered_record",
     "chat_subscription",
     "github_repos_subscription",
     "github_subscription",
     "hosted_sources",
+    "linear_subscription",
     "subscriptions_for",
 ]
