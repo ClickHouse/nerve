@@ -3,7 +3,8 @@ import type { SessionContext } from '../../api/client';
 import { Button } from '../ui';
 import { Loader2 } from '../ui/icons';
 import {
-  COMPACT_CONFIRM_TEXT, formatTokens, meterColor, turnCalls, turnInputTokens, type ContextUsage,
+  COMPACT_CONFIRM_TEXT, formatDollars, formatTokens, meterColor, turnCalls, turnInputTokens,
+  type ContextUsage, type SessionCost,
 } from './contextUsage';
 
 /**
@@ -35,10 +36,11 @@ export type CompactState =
 
 /**
  * The context popover: the context use by category (live Claude sessions) or
- * the totals, the last turn's tokens and the cost, and Compact.
+ * the totals, the last turn's tokens (or, while a turn runs, its calls so
+ * far) and the cost, and Compact.
  */
 export function ContextPopover({
-  id, used, exact, max, context, loadFailed, usage, backend, busy, sessionCostUsd,
+  id, used, exact, max, context, loadFailed, usage, live = false, backend, busy, cost,
   compact, onCompact, onConfirm, onCancel,
 }: {
   id: string;
@@ -49,9 +51,11 @@ export function ContextPopover({
   context: SessionContext | null;
   loadFailed: boolean;
   usage: ContextUsage;
+  /** `usage` is the running turn's calls so far. */
+  live?: boolean;
   backend: string;
   busy: boolean;
-  sessionCostUsd?: number;
+  cost: SessionCost;
   compact: CompactState;
   onCompact: () => void;
   onConfirm: () => void;
@@ -113,8 +117,8 @@ export function ContextPopover({
         <CompactSection state={compact} busy={busy} onCompact={onCompact} onConfirm={onConfirm} onCancel={onCancel} />
       )}
 
-      <LastTurn usage={usage} />
-      <Cost usage={usage} sessionCostUsd={sessionCostUsd} />
+      <LastTurn usage={usage} live={live} />
+      <Cost usage={usage} cost={cost} />
     </div>
   );
 }
@@ -206,12 +210,12 @@ function CompactSection({ state, busy, onCompact, onConfirm, onCancel }: {
   );
 }
 
-function LastTurn({ usage }: { usage: ContextUsage }) {
+function LastTurn({ usage, live }: { usage: ContextUsage; live: boolean }) {
   if (usage.input_tokens + usage.output_tokens + usage.cache_read_input_tokens === 0) return null;
   const calls = turnCalls(usage);
   return (
     <div className="mt-3 pt-3 border-t border-border space-y-1.5 leading-tight">
-      <SectionTitle>Last turn</SectionTitle>
+      <SectionTitle>{live ? 'This turn so far' : 'Last turn'}</SectionTitle>
       <Row label="Fresh input" value={usage.input_tokens} />
       <Row label="Output" value={usage.output_tokens} />
       {usage.cache_read_input_tokens > 0 && (
@@ -236,21 +240,38 @@ function LastTurn({ usage }: { usage: ContextUsage }) {
   );
 }
 
-function Cost({ usage, sessionCostUsd }: { usage: ContextUsage; sessionCostUsd?: number }) {
+function Cost({ usage, cost }: { usage: ContextUsage; cost: SessionCost }) {
   // Cache hit rate over all model calls of the turn: a billing metric, so the
   // sum over the calls is right here.
   const input = turnInputTokens(usage);
   const cacheRate = input > 0 ? (usage.cache_read_input_tokens / input) * 100 : 0;
-  if (!(sessionCostUsd ?? 0) && cacheRate <= 0) return null;
+  if (!(cost.total > 0) && cacheRate <= 0) return null;
   return (
     <div className="mt-3 pt-3 border-t border-border space-y-1.5 leading-tight">
       <SectionTitle>Cost</SectionTitle>
-      {(sessionCostUsd ?? 0) > 0 && <CostRow label="Session total" value={sessionCostUsd!} />}
+      {cost.total > 0 && (
+        <CostRow label={cost.turn ? 'Session (live)' : 'Session total'} value={cost.total} estimate={cost.estimate} bold />
+      )}
+      {cost.turn && (
+        <CostRow
+          label={`This turn, ${cost.turn.calls} call${cost.turn.calls === 1 ? '' : 's'}`}
+          value={cost.turn.costUsd}
+          estimate
+        />
+      )}
+      {cost.agentsUsd > 0 && (
+        <CostRow label={cost.turn ? 'Agents this turn' : 'Agents since the last turn'} value={cost.agentsUsd} estimate />
+      )}
       {cacheRate > 0 && (
         <div className="flex justify-between items-center">
           <span className="text-text-muted">Cache hit rate</span>
           <span className={cacheRate > 50 ? 'text-success' : 'text-text-muted'}>{cacheRate.toFixed(1)}%</span>
         </div>
+      )}
+      {cost.estimate && (
+        <p className="text-text-faint pt-1">
+          ~ is an estimate at list prices. The billed cost replaces it when the turn ends.
+        </p>
       )}
     </div>
   );
@@ -267,12 +288,15 @@ function Row({ label, value, color }: { label: string; value: number; color?: st
   );
 }
 
-function CostRow({ label, value }: { label: string; value: number }) {
-  const formatted = value < 0.01 ? `$${value.toFixed(4)}` : `$${value.toFixed(2)}`;
+function CostRow({ label, value, estimate, bold }: {
+  label: string; value: number; estimate?: boolean; bold?: boolean;
+}) {
   return (
-    <div className="flex justify-between items-center">
+    <div className="flex justify-between items-center gap-3">
       <span className="text-text-muted">{label}</span>
-      <span className="text-text font-medium">{formatted}</span>
+      <span className={`tabular-nums ${bold ? 'text-text font-medium' : 'text-text-muted'}`}>
+        {estimate ? '~' : ''}{formatDollars(value)}
+      </span>
     </div>
   );
 }

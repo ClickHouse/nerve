@@ -58,7 +58,7 @@ from nerve.agent.backends import (
     TurnRefusedError,
     build_backends,
 )
-from nerve.agent.backends.events import TurnStatus
+from nerve.agent.backends.events import CallUsage, TurnStatus
 from nerve.agent.cache_policy import resolve_cache_ttl
 from nerve.agent.interactive import (
     InteractiveToolHandler,
@@ -395,6 +395,12 @@ class _TurnState:
     # The run's ``drop_leading_thinking``: thinking before the turn's first
     # text or tool call is neither broadcast nor stored.
     drop_leading_thinking: bool = False
+    # Live cost: each main-chain model call's latest usage by message id,
+    # ``(model, usage, final)`` (see CallUsage), the id of the latest call,
+    # and the session's billed total when the turn's first call started.
+    calls: dict[str, tuple[str | None, dict, bool]] = field(default_factory=dict)
+    last_call: str | None = None
+    live_base_cost: float | None = None
 
 
 @dataclass(frozen=True)
@@ -530,6 +536,12 @@ class AgentEngine:
         # "this was a stop" before engine.run swallows the interrupt.
         self._stop_listeners: list[Any] = []
         self._turn_watches: dict[str, list[TurnWatch]] = {}
+        # Live cost: the latest ``usage_update`` of each session's running
+        # turn (for ``session_status``), and the agents' cost the session's
+        # billed total already covers (the registry's summary at the last
+        # turn end), so an estimate counts only the agents' spend since.
+        self._live_usage: dict[str, dict[str, Any]] = {}
+        self._agents_cost_base: dict[str, float] = {}
         # Per-session active channel — set on run() entry, cleared on exit.
         # Read by session-scoped tools (send_file) to avoid dispatching via
         # stale router context from a prior inbound channel.
@@ -2324,6 +2336,11 @@ class AgentEngine:
     def _end_turn(self, session_id: str, outcome: TurnOutcome) -> TurnOutcome:
         for watch in self._turn_watches.get(session_id, ()):
             watch.outcome = outcome
+        # A turn that ended before its usage was recorded (stopped, failed)
+        # leaves no estimate behind.
+        live = getattr(self, "_live_usage", None)
+        if live is not None:
+            live.pop(session_id, None)
         return outcome
 
     async def _run_stop_listeners(
@@ -3561,6 +3578,9 @@ class AgentEngine:
                 parent_tool_use_id=event.parent_tool_use_id,
             )
 
+        elif isinstance(event, CallUsage):
+            await self._on_call_usage(session_id, event, st)
+
         elif isinstance(event, ModelObserved):
             # Main-agent serving-model observation (backends already gate
             # out sub-agent models). More reliable than config.
@@ -3615,6 +3635,90 @@ class AgentEngine:
             "status": event.status,
         }
         st.status, st.error = event.status, event.error
+    # ------------------------------------------------------------------ #
+    #  Live cost during a turn                                             #
+    # ------------------------------------------------------------------ #
+
+    def live_usage(self, session_id: str) -> dict[str, Any] | None:
+        """The running turn's latest ``usage_update`` payload, or None."""
+        return self._live_usage.get(session_id)
+
+    def agents_cost_base(self, session_id: str) -> float | None:
+        """The agents' cost the session's billed total already covers."""
+        return self._agents_cost_base.get(session_id)
+
+    def _agents_cost_now(self, session_id: str) -> float:
+        try:
+            return float(self.agents.summary(session_id).get("cost_usd") or 0.0)
+        except Exception:  # noqa: BLE001 — an estimate never breaks a turn
+            return 0.0
+
+    async def _on_call_usage(
+        self, session_id: str, event: CallUsage, st: _TurnState,
+    ) -> None:
+        """Fold one main-chain call's usage into the turn's tally and send
+        the UI the running estimate (``usage_update``)."""
+        key = event.message_id or f"_call{len(st.calls) + 1}"
+        previous = st.calls.get(key)
+        if previous is not None and previous[2] and not event.final:
+            return  # the call's final usage stands
+        if previous is not None and previous[1] == event.usage and previous[2] == event.final:
+            return  # one more frame of the same call: nothing new
+        st.calls[key] = (event.model or st.last_model, dict(event.usage), bool(event.final))
+        st.last_call = key
+        if st.live_base_cost is None:
+            record = await self.db.get_session(session_id)
+            st.live_base_cost = float((record or {}).get("total_cost_usd") or 0.0)
+        live = self._live_payload(session_id, st)
+        self._live_usage[session_id] = live
+        await broadcaster.broadcast_usage_update(session_id, live)
+
+    def _live_payload(self, session_id: str, st: _TurnState) -> dict[str, Any]:
+        """The estimate: the turn's calls priced with MODEL_PRICING, plus the
+        agents' cost since the last turn end, on top of the billed total."""
+        from nerve.db.usage import estimate_turn_cost, extract_cache_ttl_split
+
+        keys = (
+            "input_tokens", "output_tokens",
+            "cache_read_input_tokens", "cache_creation_input_tokens",
+        )
+        totals: dict[str, Any] = dict.fromkeys(keys, 0)
+        split_5m = split_1h = 0
+        turn_cost = 0.0
+        for model, usage, _final in st.calls.values():
+            for k in keys:
+                totals[k] += int(usage.get(k) or 0)
+            c5, c1 = extract_cache_ttl_split(usage)
+            split_5m += c5
+            split_1h += c1
+            turn_cost += estimate_turn_cost(usage, model)
+        if split_5m or split_1h:
+            totals["cache_creation"] = {
+                "ephemeral_5m_input_tokens": split_5m,
+                "ephemeral_1h_input_tokens": split_1h,
+            }
+        model, latest, _final = st.calls[st.last_call]
+        context = sum(
+            int(latest.get(k) or 0)
+            for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+        )
+        agents_now = self._agents_cost_now(session_id)
+        base = self._agents_cost_base.setdefault(session_id, agents_now)
+        agents_cost = max(0.0, agents_now - base)
+        window = (
+            1_048_576
+            if self.config.agent.context_1m_enabled_for(model or st.last_model)
+            else 200_000
+        )
+        return {
+            "usage": totals,
+            "context_tokens": context,
+            "max_context_tokens": window,
+            "calls": len(st.calls),
+            "turn_cost_usd": round(turn_cost, 6),
+            "agents_cost_usd": round(agents_cost, 6),
+            "session_cost_usd": round((st.live_base_cost or 0.0) + turn_cost + agents_cost, 6),
+        }
 
     async def _handle_system_event(
         self, session_id: str, event: SystemEvent,
@@ -4000,7 +4104,17 @@ class AgentEngine:
                 else 200_000
             )
         num_turns = (st.result_meta or {}).get("num_turns") or 1
-        context_tokens = (st.result_meta or {}).get("context_tokens")
+        # The last model call's context: exact from the live cost tally when
+        # it saw the call, else what the backend reported (Codex), else the
+        # turn's usage averaged over its calls (in the UI).
+        context_tokens: int | None = (st.result_meta or {}).get("context_tokens")
+        if st.last_call is not None and st.last_call in st.calls:
+            latest = st.calls[st.last_call][1]
+            context_tokens = sum(
+                int(latest.get(k) or 0)
+                for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+            ) or context_tokens
+        session_cost_usd: float | None = None
         if st.last_usage:
             usage_data = {
                 **st.last_usage,
@@ -4113,13 +4227,31 @@ class AgentEngine:
             )
 
             # Update total_cost_usd on the session
+            session_cost_usd = current_session_cost + (turn_cost or 0.0)
             await self.db.update_session_fields(session_id, {
-                "total_cost_usd": current_session_cost + (turn_cost or 0.0),
+                "total_cost_usd": session_cost_usd,
             })
+            live = self._live_usage.get(session_id)
+            if live is not None:
+                # How far the live estimate ran from the billed cost.
+                logger.info(
+                    "Session %s: live estimate $%.4f (calls $%.4f + agents $%.4f, "
+                    "%d calls) vs billed $%.4f for the turn",
+                    session_id,
+                    live["turn_cost_usd"] + live["agents_cost_usd"],
+                    live["turn_cost_usd"], live["agents_cost_usd"], live["calls"],
+                    turn_cost or 0.0,
+                )
 
         # The turn's cost is now recorded — settled Workflow snapshots must
         # leave the live registry or budget metering double-counts them.
         self._prune_settled_workflows(session_id)
+
+        # The billed total now covers the agents' spend so far: estimates
+        # from here count the agents' cost since this point.
+        self._live_usage.pop(session_id, None)
+        agents_base = self._agents_cost_now(session_id)
+        self._agents_cost_base[session_id] = agents_base
 
         await broadcaster.broadcast_done(
             session_id,
@@ -4127,6 +4259,8 @@ class AgentEngine:
             max_context_tokens=max_context,
             num_turns=num_turns,
             context_tokens=context_tokens,
+            session_cost_usd=session_cost_usd,
+            agents_cost_base=agents_base,
         )
         self.sessions.touch(session_id)
 

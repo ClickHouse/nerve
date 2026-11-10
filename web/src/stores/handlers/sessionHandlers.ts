@@ -19,7 +19,8 @@ const KEPT_ON_REPLAY: ReadonlySet<PanelTab['type']> = new Set(['agents', 'agent'
 export function emptyChatView(): Partial<ChatState> {
   return {
     messages: [], streamingBlocks: [], isStreaming: false,
-    agentStatus: { state: 'idle' }, contextUsage: null, backendStatus: null,
+    agentStatus: { state: 'idle' }, contextUsage: null, liveUsage: null, agentsCostBase: null,
+    backendStatus: null,
     currentTodos: [], currentCCTasks: [], pendingInteraction: null,
     planSummaries: {}, planEditRequest: null,
     panels: [], activePanelId: null, panelVisible: false,
@@ -136,6 +137,10 @@ export function handleSessionStatus(
       set((s) => ({ sessions: s.sessions.map(patch), searchResults: s.searchResults?.map(patch) ?? null }));
     }
   }
+  // Live cost: the running turn's latest estimate, and the agents' cost the
+  // billed total covers (for the estimate between turns).
+  if (msg.agents_cost_base != null) set({ agentsCostBase: msg.agents_cost_base });
+  set({ liveUsage: msg.is_running ? (msg.live_usage ?? get().liveUsage) : null });
   if (!msg.is_running) {
     // The turn on screen ended while the socket was down (a phone that slept,
     // a dropped network), so its done never came. Leave streaming mode and

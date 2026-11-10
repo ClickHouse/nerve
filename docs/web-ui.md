@@ -93,6 +93,7 @@ On a phone (narrower than 768 px), a bar at the bottom replaces the nav rail: **
 ### Agent Status
 - **Live indicator** — Header shows current agent state: "Thinking...", "Writing...", "Using Read...", etc.
 - **Per-session** — Sidebar shows spinner on the active session when agent is working
+- **Context and cost** — The header's context bar shows the context size and the session's cost in dollars next to it (desktop). While a turn runs, both update at the start and the end of each model call (`usage_update`): the context is the latest call's, and the cost is the billed total plus an estimate at list prices for the turn's calls and the agents' spend, shown as `~$`. When the turn ends, the billed cost replaces the estimate. Between turns the cost adds what background agents spent since the last turn (also `~$`). Click the meter for the breakdown. `agent.live_usage: false` turns the per-call updates off (no partial messages; the estimate then has only the input side until the turn ends)
 
 ### Context window
 - **Context bar**: the chat header shows the context use of the last turn and how full the window is (on a phone, the percentage). A `~` marks an estimate from the last turn's usage.

@@ -321,6 +321,14 @@ async def _send_session_status(
     }
     if is_running:
         status_msg["buffered_events"] = broadcaster.get_buffer(session_id)
+        # The running turn's cost estimate (usage_update stays out of the
+        # replay buffer; its latest state comes here).
+        live = getattr(_engine, "live_usage", None)
+        if callable(live) and live(session_id) is not None:
+            status_msg["live_usage"] = live(session_id)
+    base = getattr(_engine, "agents_cost_base", None)
+    if callable(base) and base(session_id) is not None:
+        status_msg["agents_cost_base"] = base(session_id)
     status_msg["agents"] = agents if agents is not None else await _agent_snapshot(session_id)
     await websocket.send_json(status_msg)
 

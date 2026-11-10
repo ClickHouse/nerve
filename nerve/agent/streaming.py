@@ -240,6 +240,8 @@ class StreamBroadcaster:
         max_context_tokens: int | None = None,
         num_turns: int | None = None,
         context_tokens: int | None = None,
+        session_cost_usd: float | None = None,
+        agents_cost_base: float | None = None,
     ) -> None:
         msg: dict[str, Any] = {"type": "done", "session_id": session_id}
         if usage is not None:
@@ -248,9 +250,25 @@ class StreamBroadcaster:
             msg["max_context_tokens"] = max_context_tokens
         if num_turns is not None:
             msg["num_turns"] = num_turns
+        # The last model call's context, the session's new billed total and
+        # the agents' cost it already covers (see broadcast_usage_update).
         if context_tokens is not None:
             msg["context_tokens"] = context_tokens
+        if session_cost_usd is not None:
+            msg["session_cost_usd"] = session_cost_usd
+        if agents_cost_base is not None:
+            msg["agents_cost_base"] = agents_cost_base
         await self.broadcast(session_id, msg)
+
+    async def broadcast_usage_update(self, session_id: str, live: dict[str, Any]) -> None:
+        """The running turn's usage and cost estimate, once per model call
+        start and end (engine ``_on_call_usage``). A state snapshot: kept
+        out of the replay buffer, ``session_status.live_usage`` carries the
+        latest one to a client that connects."""
+        await self.broadcast(
+            session_id, {"type": "usage_update", "session_id": session_id, **live},
+            buffer=False,
+        )
 
     async def broadcast_plan_update(self, session_id: str, content: str) -> None:
         await self.broadcast(session_id, {"type": "plan_update", "session_id": session_id, "content": content})
