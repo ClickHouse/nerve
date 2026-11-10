@@ -2,16 +2,20 @@
 
 Covers the pure matching logic of :class:`FieldRule` / :class:`InboxFilter`
 plus an end-to-end runner test proving dropped records never reach the inbox
-while the source cursor still advances.
+while the source cursor still advances, and :class:`DataRule`, the rules of a
+generic hosted source, against the channel contract's rule vectors.
 """
 
 from __future__ import annotations
+
+import json
+from pathlib import Path
 
 import pytest
 
 from nerve.config import GitHubSyncConfig
 from nerve.sources.base import Source
-from nerve.sources.filters import FieldRule, InboxFilter
+from nerve.sources.filters import DataRule, FieldRule, InboxFilter, data_rules
 from nerve.sources.github import github_inbox_filter
 from nerve.sources.models import FetchResult, SourceRecord
 from nerve.sources.runner import SourceRunner
@@ -358,3 +362,79 @@ def test_the_repo_rule_still_applies_to_a_pull_request_record(settings):
     rejected_by = flt.rejects(_github("github_pr_activity"))
 
     assert rejected_by is not None and rejected_by.field == "repo_name"
+
+
+# ---------------------------------------------------------------------------
+# DataRule: the rules of a generic hosted source, on JSON Pointers into the
+# record's data (its metadata), with the semantics of the channel contract
+# ---------------------------------------------------------------------------
+
+# A byte-exact copy of the contract's rule vectors (testdata/source_rules.json);
+# test_channel_contract_generic pins its bytes.
+RULE_VECTORS = json.loads(
+    (Path(__file__).parent / "fixtures" / "channel_contract" / "source_rules.json").read_text(encoding="utf-8")
+)
+
+
+def _data_record(data: dict) -> SourceRecord:
+    return SourceRecord(
+        id="note:1", source="example", record_type="example_note", summary="[NOTE-7] Plan",
+        content="", timestamp="2026-11-10T08:00:00Z", metadata=data,
+    )
+
+
+@pytest.mark.parametrize("case", RULE_VECTORS["cases"], ids=lambda case: case["name"])
+def test_the_rule_vectors_shared_with_the_gateway(case):
+    record = _data_record(RULE_VECTORS["data"])
+
+    assert InboxFilter(rules=data_rules(case["rules"])).passes(record) is case["keep"]
+
+
+def test_the_values_at_a_path():
+    record = _data_record(RULE_VECTORS["data"])
+
+    assert DataRule("/issue/labels", deny=("x",)).values(record) == ["bug", "Frontend", "7", "true", "null"]
+    assert DataRule("/issue/size", deny=("x",)).values(record) == ["2"]
+    assert DataRule("/issue/team", deny=("x",)).values(record) == []
+    assert DataRule("/issue/missing", deny=("x",)).values(record) == []
+    assert DataRule("not a pointer", deny=("x",)).values(record) == []
+
+
+def test_a_data_rule_without_patterns_is_inactive_and_an_invalid_path_names_nothing():
+    record = _data_record(RULE_VECTORS["data"])
+
+    assert DataRule("/actor/kind").active is False
+    assert InboxFilter(rules=[DataRule("/actor/kind")]).active is False
+    assert DataRule("actor/kind", deny=("user",)).passes(record) is True
+    assert DataRule("actor/kind", allow=("user",)).passes(record) is False
+
+
+def test_rejects_names_the_path_and_the_value_of_the_data_rule():
+    record = _data_record(RULE_VECTORS["data"])
+    flt = InboxFilter(rules=data_rules([
+        {"path": "/issue/team/key", "allow": ["ENG*"]},
+        {"path": "/actor/kind", "deny": ["user"]},
+    ]))
+
+    rule = flt.rejects(record)
+
+    assert (rule.field, rule.value(record)) == ("/actor/kind", "user")
+
+
+class _DataSource(_FakeSource):
+    source_name = "example"
+
+
+@pytest.mark.asyncio
+async def test_runner_drops_on_a_data_rule_and_logs_its_path_and_value(db, caplog):
+    kept = _data_record({"actor": {"kind": "user"}})
+    bot = SourceRecord(**{**kept.__dict__, "id": "note:2", "metadata": {"actor": {"kind": "bot"}}})
+    flt = InboxFilter(rules=data_rules([{"path": "/actor/kind", "deny": ["bot"]}]))
+    runner = SourceRunner(source=_DataSource([kept, bot]), db=db, inbox_filter=flt)
+
+    with caplog.at_level("INFO", logger="nerve.sources.runner"):
+        result = await runner.run()
+
+    assert (result.records_ingested, result.records_dropped) == (1, 1)
+    assert await db.get_source_message("example", "note:2") is None
+    assert "dropped note:2 on /actor/kind='bot'" in caplog.text

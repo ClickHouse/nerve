@@ -411,11 +411,10 @@ class SourceRunner:
                 # itself is gone after this point. Capped to keep logs sane.
                 for record in dropped[:_MAX_DROP_LOG_LINES]:
                     rule = self.inbox_filter.rejects(record)
-                    field = rule.field if rule else "?"
                     logger.info(
                         "Source %s: dropped %s on %s=%r — %s",
-                        self.source.source_name, record.id, field,
-                        (record.metadata or {}).get(field), record.summary,
+                        self.source.source_name, record.id, rule.field if rule else "?",
+                        rule.value(record) if rule else None, record.summary,
                     )
             records = kept
         dropped_count = len(dropped)
