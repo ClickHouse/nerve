@@ -133,11 +133,11 @@ class FieldRule:
 
 def _passes(values: list[str], allow: Sequence[str], deny: Sequence[str]) -> bool:
     """The decision of one rule on its values, with the semantics at the top of this module."""
-    # deny wins — drop on any deny match.
+    # Deny wins: drop on any deny match.
     if deny and any(matches_any(v, deny) for v in values):
         return False
 
-    # allow gate — when set, require a match. An absent field fails closed.
+    # Allow gate: when set, require a match. An absent field fails closed.
     if allow:
         if not values:
             return False
@@ -223,7 +223,7 @@ class InboxFilter:
     """A set of rules applied to source records (logical AND).
 
     Each rule is a :class:`FieldRule` or a :class:`DataRule`. An inactive
-    filter (no rules, or all rules empty) is a pass-through —
+    filter (no rules, or all rules empty) is a pass-through:
     :meth:`partition` returns every record as kept with nothing dropped.
     """
 

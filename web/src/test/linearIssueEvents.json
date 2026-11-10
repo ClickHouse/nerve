@@ -18,7 +18,7 @@
   },
   "commented": {
     "event": "commented",
-    "via": "inbox",
+    "via": "watch",
     "server": {"id": "linear", "name": "Linear"},
     "issue": {
       "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",

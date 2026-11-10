@@ -381,7 +381,7 @@ sync:
   #   enabled: false
   #   mode: hosted                 # the only mode; poll refuses to load
   #   events: [assigned, commented, mentioned]  # default: every event
-  #   inbox: true                  # also the agent's own Linear notifications
+  #   inbox: true                  # also mentions of the credential's Linear user
   #   include_bots: false          # also events of bots and integrations
   #   drop_own_actions: true       # drop the credential user's own events
   #   rules:                       # JSON Pointers into the record data;

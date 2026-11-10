@@ -129,12 +129,26 @@ def linear_data(**changes: Any) -> dict[str, Any]:
 
 
 def comment_data() -> dict[str, Any]:
-    """A comment on the issue, cut to its bound, from the agent's inbox."""
+    """A comment on the issue, cut to its bound."""
     return linear_data(
-        event="commented", via="inbox", changes=[], comment={
+        event="commented", changes=[], comment={
             "id": "9e2f6a4b-1c3d-4e5f-a7b8-c9d0e1f2a3b4",
             "url": "https://linear.example.test/acme/issue/ENG-12#comment-9e2f6a4b",
             "body": "x" * 4000, "truncated": True,
+        },
+    )
+
+
+def mention_data() -> dict[str, Any]:
+    """A mention of the credential's Linear user in a comment, from its Linear inbox.
+
+    The inbox gives only mentions.
+    """
+    return linear_data(
+        event="mentioned", via="inbox", changes=[], comment={
+            "id": "9e2f6a4b-1c3d-4e5f-a7b8-c9d0e1f2a3b4",
+            "url": "https://linear.example.test/acme/issue/ENG-12#comment-9e2f6a4b",
+            "body": "@agent can you take this one?",
         },
     )
 
@@ -731,16 +745,21 @@ class TestRecordFixtures:
         assert hashlib.sha256(SCHEMA_FILE.read_bytes()).hexdigest() == SCHEMA_SHA256
 
     @pytest.mark.parametrize("data", [
-        linear_data(), comment_data(), bot_data(), system_data(), own_data(),
+        linear_data(), comment_data(), mention_data(), bot_data(), system_data(), own_data(),
         linear_data(event="moved_in", changes=[{"field": "project", "to": "Web"}]),
         linear_data(event="priority_changed", changes=[{"field": "priority", "from": 3, "to": 1}]),
     ], ids=lambda data: f"{data['event']}-{data['actor']['kind']}")
     def test_every_fixture_is_data_that_the_gateway_can_send(self, data):
         schema_validator().validate(data)
+        # The Linear inbox gives only mentions.
+        assert data["via"] == "watch" or data["event"] == "mentioned"
 
     @pytest.mark.parametrize("name", sorted(json.loads(WEB_FIXTURES.read_text(encoding="utf-8"))))
     def test_every_fixture_of_the_sources_page_is_data_that_the_gateway_can_send(self, name):
-        schema_validator().validate(json.loads(WEB_FIXTURES.read_text(encoding="utf-8"))[name])
+        data = json.loads(WEB_FIXTURES.read_text(encoding="utf-8"))[name]
+
+        schema_validator().validate(data)
+        assert data["via"] == "watch" or data["event"] == "mentioned"
 
     @pytest.mark.parametrize("change", [
         {"server": {"id": "3c9a7e15-2b4d-4f60-8e1a-5d7c9b2f4a68-and-more", "name": "Linear"}},

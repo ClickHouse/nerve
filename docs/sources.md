@@ -449,9 +449,12 @@ reads them, also while Nerve is not running.
   `priority_changed`, `moved_in` (moved into a project of the scope),
   `commented` and `mentioned`. The summary is one line, such as
   `[ENG-12] Alice assigned you: Fix the login page`, and the content is
-  Markdown for the agent. With a credential that belongs to the agent (an
-  agent API key, or the agent's sign-in), the Linear notifications of the
-  agent's Linear user come too.
+  Markdown for the agent. Assignments, comments and the other changes come
+  from the issues of the scope. `mentioned` comes from the Linear inbox of
+  the credential's Linear user: only a credential that belongs to the agent
+  (an agent API key, or the agent's sign-in) has one, and the gateway reads
+  only the mentions from it. An item that is too large for the gateway to
+  read is left out, with no record.
 - **The record keeps its schema and its data.** The gateway sends the data of
   a record as a JSON object of the record schema `linear.issue_event/1`, and
   Nerve stores both as the record's metadata, `{"schema": ..., "data": ...}`,
@@ -460,7 +463,7 @@ reads them, also while Nerve is not running.
   `Data:` line of JSON. The members of the data (optional members are left
   out, never `null`):
   - `event`, and `via`: `watch` for an issue of the scope, `inbox` for a
-    notification;
+    mention from the Linear inbox (only with `mentioned`);
   - `server`: the `id` of the Linear server in the MCP catalog (its catalog
     server ID, such as `linear`) and its `name`;
   - `issue`: `id`, `identifier`, `title`, `url`, `team` (`key`), `project`
@@ -483,7 +486,8 @@ reads them, also while Nerve is not running.
 - **The settings go to the gateway.** `events`, `inbox`, `include_bots` and
   `drop_own_actions` go in the subscription as the provider settings. Only the
   values that differ from the defaults are sent, so with the default `events`
-  an event that a later gateway adds arrives too. `inbox` has an effect only
+  an event that a later gateway adds arrives too. `inbox` switches the
+  mentions of the credential's Linear user on or off; it has an effect only
   with a credential that belongs to the agent. `drop_own_actions` drops the
   events of the credential's Linear user. A tenant API key belongs to a
   person, so the events of that person are kept and marked with
@@ -773,7 +777,7 @@ sync:
     enabled: false                # The channel gateway polls Linear with the agent's Linear connector
     mode: hosted                  # The only mode; poll refuses to load
     events: [issue_created, assigned, unassigned, delegated, state_changed, priority_changed, moved_in, commented, mentioned]
-    inbox: true                   # Also the notifications of the agent's Linear user (agent credentials only)
+    inbox: true                   # Also the mentions of the credential's Linear user (agent credentials only)
     include_bots: false           # Also the events of bots and integrations
     drop_own_actions: true        # Drop the events of the credential's Linear user (not with a tenant API key)
     rules: []                     # Allow/deny globs on JSON Pointers into the data. See "Rules of generic hosted sources"
@@ -1373,7 +1377,7 @@ export function MyRenderer({ content, metadata, summary }: Props) {
 | `nerve/sources/models.py` | `SourceRecord`, `FetchResult`, `IngestResult` dataclasses |
 | `nerve/sources/base.py` | `Source` abstract base class |
 | `nerve/sources/runner.py` | `SourceRunner` — pure ingestion pipeline (fetch → preprocess → guardrail → persist → condense → drop hook → advance) |
-| `nerve/sources/filters.py` | `InboxFilter` / `FieldRule` / `DataRule` — declarative allow/deny guardrails applied before persist |
+| `nerve/sources/filters.py` | `InboxFilter` / `FieldRule` / `DataRule`: declarative allow/deny guardrails applied before persist |
 | `nerve/sources/source_json.py` | The JSON data of generic hosted sources: checks, canonical form (RFC 8785), JSON Pointers |
 | `nerve/sources/hosted.py` | `HostedSource`: drain the records of a generic hosted source (Linear) that the channel gateway delivered |
 | `nerve/sources/processor.py` | Legacy agent prompt building (unused by runner, may be used by tools) |

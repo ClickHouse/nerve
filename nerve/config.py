@@ -2453,10 +2453,11 @@ class LinearSyncConfig:
     # The events to report (LINEAR_EVENTS); every one by default. An unknown
     # event or an empty list refuses to load.
     events: list[str] = field(default_factory=lambda: list(LINEAR_EVENTS))
-    # Also report the Linear notifications of the agent's own Linear user
-    # (mentions, assignments, comments on issues it subscribes to). Only a
+    # Also report the mentions of the credential's Linear user, which the
+    # gateway reads from its Linear inbox (event mentioned, via inbox). Only a
     # credential of the agent's own (an agent API key, the agent's sign-in)
-    # has them; a credential of the tenant ignores it.
+    # has an inbox; a credential of the tenant ignores it. Assignments,
+    # comments and the other changes come from the issues of the scope.
     inbox: bool = True
     # Also report the events of bots and integrations.
     include_bots: bool = False
