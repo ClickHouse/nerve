@@ -7,6 +7,7 @@ trigger any actual sync work (that's the cron-driven source runners).
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -55,6 +56,18 @@ def _format_relative_time(iso_ts: str) -> str:
         return iso_ts
 
 
+def _metadata_value(value: object) -> str:
+    """A metadata value as the agent reads it.
+
+    Nested JSON, the data of a generic hosted source such as Linear, is
+    compact JSON; every other value is written as it is.
+    """
+    nested = isinstance(value, dict) or (
+        isinstance(value, list) and any(isinstance(item, (dict, list)) for item in value)
+    )
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")) if nested else str(value)
+
+
 def _format_source_batch(messages: list[dict], source: str | None = None) -> str:
     """Format a batch of source messages for agent consumption."""
     count = len(messages)
@@ -78,7 +91,7 @@ def _format_source_batch(messages: list[dict], source: str | None = None) -> str
         if metadata and isinstance(metadata, dict):
             interesting = {k: v for k, v in metadata.items() if v and k not in ("message_id",)}
             if interesting:
-                meta_str = ", ".join(f"{k}={v}" for k, v in interesting.items())
+                meta_str = ", ".join(f"{k}={_metadata_value(v)}" for k, v in interesting.items())
                 parts.append(f"**Metadata:** {meta_str}")
 
         parts.append("")

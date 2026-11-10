@@ -27,6 +27,7 @@ import yaml
 import nerve.config as config_module
 from nerve import config_reload
 from nerve.agent.sessions import SessionManager
+from nerve.agent.tools.handlers.sources import _format_source_batch
 from nerve.channels.hosted.contract import Rejected, SourceRule, Subscriptions
 from nerve.channels.hosted.contract.model import (
     MAX_SOURCE_RULE_PATTERNS,
@@ -457,6 +458,20 @@ class TestStreams:
         assert stored["summary"] == "[ENG-12] Alice Example assigned you: Fix the login page"
         assert stored["metadata"] == linear_data()
         assert stored["metadata"]["server"] == {"id": SERVER_ID, "name": "Linear"}
+
+    async def test_the_agent_reads_the_server_and_the_issue_as_json(self, hosted):
+        stream = await hosted.stream()
+        inbox_id = hosted.gateway.store(linear_event())
+        await stream.nudge("observe")
+        assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
+        await hosted.runner().run()
+        rows = await hosted.db.read_source_messages_by_rowid("linear", 0, limit=10)
+
+        text = _format_source_batch(rows, "linear")
+
+        assert '**Metadata:** event=assigned, via=watch, server={"id":"' + SERVER_ID + '","name":"Linear"}' in text
+        assert '"identifier":"ENG-12"' in text
+        assert 'changes=[{"field":"assignee","from":null,"to":"' + AGENT_USER_ID + '"}]' in text
 
     async def test_the_guardrail_applies_the_rules_again(self, hosted):
         stream = await hosted.stream()
