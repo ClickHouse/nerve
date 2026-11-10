@@ -39,6 +39,7 @@ from nerve.agent.backends.base import (
     AgentClient,
     BackendCapabilities,
     BackendError,
+    ForkSourceMissingError,
     SessionSpec,
     TransportDiedError,
     TurnInput,
@@ -902,7 +903,7 @@ class CodexClient(AgentClient):
                 if not _is_missing_thread_error(e):
                     raise
                 if spec.fork:
-                    raise BackendError(
+                    raise ForkSourceMissingError(
                         f"Cannot fork missing Codex thread {spec.resume_native_id!r}"
                     ) from e
                 logger.warning(

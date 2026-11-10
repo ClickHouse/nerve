@@ -66,6 +66,8 @@ class SessionStore:
         cause: CauseArg = CAUSE_FROM_ACTOR,
         created_event: Attribution | None = None,
         origin: Origin | None = None,
+        fork_source_native_id: str | None = None,
+        fork_source_turn_id: str | None = None,
     ) -> dict:
         """Insert a session row, recording who caused it to exist.
 
@@ -100,6 +102,9 @@ class SessionStore:
         (:mod:`nerve.session_origin`), written once like the attribution.
         Without it, both columns stay NULL, as in a row from before the
         columns existed, and a reader derives the origin.
+
+        ``fork_source_native_id`` and ``fork_source_turn_id`` are the native
+        conversation and turn that a fork branches from (migration v072).
         """
         now = datetime.now(timezone.utc).isoformat()
         created_by = actor.actor_id if actor else None
@@ -112,12 +117,14 @@ class SessionStore:
                    (id, title, source, metadata, status, parent_session_id,
                     forked_from_message, backend, model, cwd, created_by_actor_id,
                     caused_by_actor_id, trigger, origin_detail,
+                    fork_source_native_id, fork_source_turn_id,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (session_id, title or session_id, source,
                  json.dumps(metadata or {}), status,
                  parent_session_id, forked_from_message, backend, model, cwd,
-                 created_by, caused_by, trigger, origin_detail, now, now),
+                 created_by, caused_by, trigger, origin_detail,
+                 fork_source_native_id, fork_source_turn_id, now, now),
             )
             inserted = cursor.rowcount == 1
             await cursor.close()
@@ -518,6 +525,7 @@ class SessionStore:
             "archived_at", "title", "message_count", "total_cost_usd",
             "parent_session_id", "forked_from_message", "last_memorized_at",
             "starred", "model", "backend", "cwd", "title_source",
+            "fork_source_native_id", "fork_source_turn_id",
         }
         set_clauses: list[str] = []
         params: list = []

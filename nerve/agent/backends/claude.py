@@ -1284,7 +1284,11 @@ class ClaudeClient(AgentClient):
         # at connect, and a pre-configured copy would set both can_use_tool and
         # permission_prompt_tool_name (a ValueError there).
         self._sdk = ClaudeSDKClient(options=options, transport=self._transport)
-        self._native_session_id: str | None = spec.resume_native_id
+        # A fork gets its own id from the CLI's first message. Until then it
+        # has none: the resume target is the parent's conversation.
+        self._native_session_id: str | None = (
+            None if spec.fork else spec.resume_native_id
+        )
         # The resolved model this client was built with (engine reads it
         # to detect mid-session model switches).
         self.model: str = options.model or ""

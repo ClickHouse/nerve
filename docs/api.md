@@ -1166,6 +1166,17 @@ a numeric message row id as a string). The fork branches the source's
 pre-populated with the source's messages up to the fork point, so the new
 chat displays exactly the history the agent remembers.
 
+The fork stores the source's native id and the fork turn when it is created
+(`fork_source_native_id`, `fork_source_turn_id`). A fork of the whole chat
+branches at the source's last completed turn, so a turn that the source
+completes later is neither copied nor known to the fork's agent (history
+from before per-turn recording is forked whole). Each start of the fork's
+runtime branches from the stored source until a turn completes in the fork's
+own conversation. A stop, a crash, a restart, an archive, or a later change to
+the source does not change what the fork branches from. If the source
+conversation no longer exists, the fork's next turn fails with a message
+that says so, and the message after it starts a new conversation.
+
 Errors: `404` unknown source; `409` not forkable — the source has no native
 conversation yet (no completed turn), or the anchor message has no native
 turn mapping (sessions predating per-turn recording can only be forked
@@ -1177,7 +1188,10 @@ Response: { "id": "fork-a1b2c3d4", "title": "My Fork", "source": "web", "status"
 ```
 
 #### `POST /api/sessions/{id}/resume`
-Resume a stopped or idle session (must have a stored `sdk_session_id`).
+Resume a stopped or idle session (must have a stored `sdk_session_id`). A
+`stopped`, `idle` or `error` session goes to `created`; any other status (for
+example `active`, while a turn runs) stays as it is. The next message resumes
+the stored native conversation.
 
 ```json
 Response: { "id": "a1b2c3d4", "status": "created", "sdk_session_id": "..." }

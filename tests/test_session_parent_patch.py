@@ -2,9 +2,8 @@
 
 Covers the write path added for the session-hierarchy feature in
 ``gateway/routes/sessions.py``: setting a parent, clearing it (null →
-top-level), and the guards — self-parent, unknown parent, cycle, and the
-fork-window (a session still in ``created`` status can't be nested, so a
-display drag never turns a not-yet-started session into a fork).
+top-level), and the guards — self-parent, unknown parent, cycle. A drag
+never changes what a fork branches from.
 
 Harness mirrors TestSidebarListRoutes in test_sidebar_pagination_api.py: a
 minimal FastAPI app with the real router, auth disabled via an empty jwt_secret.
@@ -101,13 +100,22 @@ class TestSessionParentPatch:
         r = setup.client.patch("/api/sessions/a", json={"parent_session_id": "b"})
         assert r.status_code == 400
 
-    async def test_created_session_cannot_be_nested(self, setup):
-        # A brand-new session still in 'created' is fork-eligible; refuse to
-        # re-parent it so a drag can never turn it into a fork.
+    async def test_nesting_never_changes_a_fork(self, setup):
+        # A session forks only from the source that fork_session stored, so a
+        # drag can nest or un-nest a session that has not run yet.
         await self._mk(setup, "parent")
         await self._mk(setup, "fresh", started=False)  # stays 'created'
         r = setup.client.patch("/api/sessions/fresh", json={"parent_session_id": "parent"})
-        assert r.status_code == 409
+        assert r.status_code == 200
+        assert (await setup.db.get_session("fresh"))["fork_source_native_id"] is None
+
+        await setup.db.update_session_fields("parent", {"sdk_session_id": "sdk-parent"})
+        fork = await setup.sm.fork_session("parent", actor=None)
+        r = setup.client.patch(f"/api/sessions/{fork['id']}", json={"parent_session_id": None})
+        assert r.status_code == 200
+        row = await setup.db.get_session(fork["id"])
+        assert row["parent_session_id"] is None
+        assert row["fork_source_native_id"] == "sdk-parent"
 
     async def test_deep_chain_allowed(self, setup):
         # Arbitrary depth is fine: a → b → c.

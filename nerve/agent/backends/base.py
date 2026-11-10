@@ -36,6 +36,10 @@ class TransportDiedError(BackendError):
     """The backend subprocess/stream died mid-operation."""
 
 
+class ForkSourceMissingError(BackendError):
+    """The native conversation that a fork branches from no longer exists."""
+
+
 @dataclass
 class TurnInput:
     """One user turn, engine-normalized.

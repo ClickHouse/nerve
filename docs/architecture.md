@@ -314,7 +314,7 @@ Every database open runs the runner: the gateway's start and every CLI command t
 ### Schema
 
 SQLite with WAL mode (schema version 16):
-- `sessions` — Session metadata with lifecycle columns (`status`, `sdk_session_id`, `connected_at`, `parent_session_id`, `forked_from_message`, `last_activity_at`, `archived_at`, `message_count`, `total_cost_usd`) and `created_by_actor_id` → `actor_refs`: who caused the session to exist
+- `sessions` — Session metadata with lifecycle columns (`status`, `sdk_session_id`, `connected_at`, `parent_session_id`, `forked_from_message`, `fork_source_native_id`, `fork_source_turn_id`, `last_activity_at`, `archived_at`, `message_count`, `total_cost_usd`) and `created_by_actor_id` → `actor_refs`: who caused the session to exist
 - `messages` — Conversation messages with tool call data and ordered `blocks` JSON column (preserves interleaving of text/thinking/tool_call blocks across page reloads), plus `actor_id` → `actor_refs`: whose input the row records. NULL means attribution was not recorded (legacy history, unidentified external people, and assistant/tool output). Nothing is backfilled — see [Accounts and identity](accounts.md)
 - `session_events`: append-only lifecycle audit log (created, started, idle, stopped, archived, error, and the changes listed in [Session changes](accounts.md#session-changes)), with `actor_id` and `caused_by_actor_id` → `actor_refs`
 - `session_deletions`: one row for each deleted session: last title, time, `actor_id` and `caused_by_actor_id`. Written in the transaction of the delete, which removes the session's events

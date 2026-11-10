@@ -21,7 +21,9 @@ from pathlib import Path
 
 import pytest
 
-from nerve.agent.backends import BackendDeps, SessionSpec, TransportDiedError
+from nerve.agent.backends import (
+    BackendDeps, ForkSourceMissingError, SessionSpec, TransportDiedError,
+)
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.codex import CodexBackend
 from nerve.agent.backends.base import TurnInput
@@ -706,6 +708,17 @@ async def test_fork_uses_selected_native_turn(tmp_path, monkeypatch):
         assert client.native_session_id == "fork:turn_selected"
     finally:
         await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_fork_of_a_missing_thread_reports_a_missing_fork_source(tmp_path, monkeypatch):
+    # A fork never falls back to a fresh thread: the engine removes the fork
+    # source and says so (ForkSourceMissingError).
+    _mode(monkeypatch, "resume_fail")
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    with pytest.raises(ForkSourceMissingError, match="th_gone"):
+        await backend.create_client(_spec(cfg, resume_native_id="th_gone", fork=True))
 
 
 @pytest.mark.asyncio
