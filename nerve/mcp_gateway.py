@@ -234,6 +234,10 @@ SERVER_FAULT = -32000
 # limit (MCP_GATEWAY_CALL_TIMEOUT, two minutes by default); the upstream may
 # still finish the call.
 UPSTREAM_TIMEOUT_MESSAGE = "MCP server timed out"
+# The gateway's fixed message for a call that it did not send: the session it
+# kept with the upstream server had ended. It answers so once and sends the
+# next call in a new session.
+SESSION_ENDED_MESSAGE = "MCP server session ended; the state of earlier calls is lost"
 
 
 class GatewayCallError(Exception):
