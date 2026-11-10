@@ -400,7 +400,14 @@ class SourceStore:
         )
 
     async def seed_consumer_cursors(self, source: str, ttl_days: int = 2) -> int:
-        """Start a cursor on *source* for every consumer that has a cursor.
+        """Start a cursor on *source* for each consumer that reads every source.
+
+        Such a consumer has a cursor on each other source that has messages,
+        as ``poll_all_sources`` leaves it. An expired cursor that is not yet
+        deleted also counts. A consumer that reads only some sources with
+        ``poll_source`` gets no cursor: its job would not move that cursor, so
+        a ``messages`` gate without ``sources`` would find unread messages on
+        every check.
 
         Each starts at the source's newest message, as :meth:`get_consumer_cursor`
         would, so what the source stores after this call is unread. Without it
@@ -413,21 +420,28 @@ class SourceStore:
         """
         now = datetime.now(UTC)
         expires = (now + timedelta(days=ttl_days)).isoformat()
-        # SQLite needs a WHERE clause in the SELECT of an upsert.
+        # The WHERE clause also keeps SQLite from reading ON CONFLICT as a
+        # join constraint of the SELECT.
         result = await self._write(
             """INSERT INTO consumer_cursors
                    (consumer, source, cursor_seq, updated_at, expires_at)
-               SELECT DISTINCT consumer, ?,
+               SELECT c.consumer, ?,
                       (SELECT COALESCE(MAX(rowid), 0) FROM source_messages WHERE source = ?),
                       ?, ?
-               FROM consumer_cursors WHERE true
+               FROM (SELECT DISTINCT consumer FROM consumer_cursors) AS c
+               WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM (SELECT DISTINCT source FROM source_messages WHERE source != ?) AS s
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM consumer_cursors AS cc
+                       WHERE cc.consumer = c.consumer AND cc.source = s.source))
                ON CONFLICT(consumer, source) DO UPDATE SET
                    cursor_seq = excluded.cursor_seq,
                    updated_at = excluded.updated_at,
                    expires_at = excluded.expires_at
                WHERE consumer_cursors.expires_at IS NOT NULL
                  AND consumer_cursors.expires_at <= excluded.updated_at""",
-            (source, source, now.isoformat(), expires),
+            (source, source, now.isoformat(), expires, source),
         )
         return result.rowcount or 0
 

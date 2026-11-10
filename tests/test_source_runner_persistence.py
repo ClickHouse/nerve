@@ -272,6 +272,30 @@ async def test_seeding_leaves_a_live_cursor_and_only_runs_without_a_source_curso
 
 
 @pytest.mark.asyncio
+async def test_seeding_skips_a_consumer_that_reads_only_some_sources(db):
+    for name in ("alpha", "beta"):
+        await db.insert_source_messages([dataclasses.replace(_record("x"), source=name)], source=name)
+    alpha, beta = await db.get_source_max_rowid("alpha"), await db.get_source_max_rowid("beta")
+    # "inbox" reads every source. "alpha-only" polls only alpha. "lapsed" reads
+    # every source, but its cursor on beta has expired.
+    await db.set_consumer_cursor("inbox", "alpha", alpha)
+    await db.set_consumer_cursor("inbox", "beta", beta)
+    await db.set_consumer_cursor("alpha-only", "alpha", alpha)
+    await db.set_consumer_cursor("lapsed", "alpha", alpha)
+    await db.set_consumer_cursor("lapsed", "beta", beta, ttl_days=-1)
+
+    await SourceRunner(_FixedSource([_record("a")]), db).run()
+
+    assert await db.peek_consumer_cursor("inbox", SOURCE_NAME) == 0
+    assert await db.peek_consumer_cursor("lapsed", SOURCE_NAME) == 0
+    assert await db.peek_consumer_cursor("alpha-only", SOURCE_NAME) is None
+    # The gate of a job that polls only alpha does not see the new source.
+    ctx = _inbox_gate_context(db)
+    assert not await MessagesGate(consumer="alpha-only").is_satisfied(ctx)
+    assert await MessagesGate().is_satisfied(ctx)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("sources", [[], [SOURCE_NAME]], ids=["any-source-gate", "new-source-gate"])
 async def test_an_expired_cursor_on_a_new_source_starts_again_before_its_first_records(db, sources):
     await db.set_consumer_cursor("inbox", "other", 0)

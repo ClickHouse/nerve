@@ -55,7 +55,7 @@ Consumers read from the inbox using the `poll_source` agent tool with a named co
 **Key properties:**
 - Consumer cursors are independent — multiple consumers can read the same source at different positions
 - New consumer cursors initialize to the latest message (no backlog flooding)
-- Before a source's first run, each consumer that has a cursor gets a live cursor on the new source at its newest message (a live cursor that is already there stays as it is), so the first records of the new source are unread for that consumer and its `messages` gates see them
+- Before a source's first run, each consumer that reads every source gets a live cursor on the new source at its newest message (a live cursor that is already there stays as it is), so the first records of the new source are unread for that consumer and its `messages` gates see them. Such a consumer has a cursor on each other source that has messages, as `poll_all_sources` leaves it. A consumer that reads only some sources with `poll_source` gets no cursor on the new source
 - Consumer cursors expire after N days of inactivity (configurable, default: 2 days); a `messages` gate that checks the consumer renews the cursors it reads (see [cron.md](cron.md#messages))
 - Cross-source deduplication happens naturally because one agent session sees messages from all sources
 

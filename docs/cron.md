@@ -253,6 +253,13 @@ run_if:
     consumer: inbox
 ```
 
+Without `sources`, the gate checks the sources on which the consumer has a
+cursor. A consumer that reads every source with `poll_all_sources` gets a cursor
+on a new source before the source's first run, so the gate sees the first records
+of the new source (see [sources.md](sources.md)). A consumer that reads only some
+sources with `poll_source` does not get one. For such a job, name its sources in
+`sources`.
+
 Checking the gate keeps the consumer's cursors from expiring: each check renews
 the TTL (`sync.consumer_cursor_ttl_days`) of the live cursors it reads. A cursor
 expires when nothing reads it for that long, and an expired cursor starts again at

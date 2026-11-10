@@ -366,7 +366,8 @@ class SourceRunner:
         )
 
     async def _seed_consumer_cursors(self) -> str | None:
-        """Before a source's first run, start the existing consumers' cursors on it.
+        """Before a source's first run, start a cursor on it for each consumer
+        that reads every source (see :meth:`SourceStore.seed_consumer_cursors`).
 
         This occurs before the source stores a record, so its first records
         are unread for those consumers, and their ``messages`` gates see them.
