@@ -705,12 +705,10 @@ async def delete_session(session_id: str, actor: Actor = Depends(require_auth)):
     if engine:
         # A turn that runs or waits would write into the deleted rows, or
         # create the session again. The person stops it first.
-        if not engine.begin_delete(session_id):
+        if engine.sessions.has_turn_work(session_id):
             raise HTTPException(status_code=409, detail=_DELETE_BUSY_DETAIL)
-        try:
+        with engine.sessions.closing(session_id, "deleted"):
             await _delete_with_engine(engine, db, session_id, actor)
-        finally:
-            engine.end_delete(session_id)
     else:
         await db.delete_session(session_id, attribution=attribution_for(actor))
         await _cleanup_uploaded_files(db, session_id)
@@ -1147,9 +1145,9 @@ async def chat(req: MessageRequest, actor: Actor = Depends(require_auth)):
         session_id = await deps.engine.sessions.get_active_session(
             "api:default", source="api", actor=actor,
         )
-    elif deps.engine.accepting_turns and not (
-        await deps.db.get_session(session_id) is None
-        and await deps.db.get_session_deletion(session_id) is not None
+    elif (
+        deps.engine.accepting_turns
+        and await deps.db.closed_session_reason(session_id) != "deleted"
     ):
         # A new session id from the caller: a session of the API. A draining
         # engine creates nothing: run() refuses the turn with a 503. The id of

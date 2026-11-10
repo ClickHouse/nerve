@@ -12,9 +12,11 @@ Session lifecycle:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
 import uuid
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Any, Awaitable, Callable, Literal
@@ -117,7 +119,7 @@ class SessionManager:
     # Never raises into the caller.
     on_archived: Callable[[str], Awaitable[None]] | None = None
     # ``run_lock_held(session_id)``: something holds the session's run lock
-    # (the archive guard). Wired to the engine's run locks.
+    # (see :meth:`has_turn_work`). Wired to the engine's run locks.
     run_lock_held: Callable[[str], bool] | None = None
     # Called as ``listener(session_id, running)`` right after a session
     # starts or stops running a turn (see ``add_running_listener``).
@@ -159,6 +161,9 @@ class SessionManager:
         # Callback for memorizing session before close/archive/delete.
         # Set by AgentEngine after init to wire up memU bridge.
         self._on_memorize: Any | None = None
+        # session_id -> one reason per archive or delete in progress
+        # (see :meth:`closing`).
+        self._closing: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------------ #
     #  Lifecycle: Create / Get                                             #
@@ -656,6 +661,14 @@ class SessionManager:
             or (task is not None and not task.done())
         )
 
+    def has_turn_work(self, session_id: str) -> bool:
+        """:meth:`has_running_work`, or something holds the session's run
+        lock (a queued message, an autonomous turn, an idle drain). Archive
+        and delete refuse a session with turn work."""
+        return self.has_running_work(session_id) or bool(
+            self.run_lock_held and self.run_lock_held(session_id)
+        )
+
     def get_running_ids(self) -> set[str]:
         """Return the set of currently running session IDs."""
         return set(self._running_sessions)
@@ -1027,11 +1040,8 @@ class SessionManager:
         A session with turn work is refused with :class:`SessionBusyError`,
         also with ``force``: a turn that runs or waits for a concurrency
         slot, or any holder of the session's run lock (a queued message, an
-        autonomous turn, an idle drain). Right after these checks, with no
-        await in between, the session is marked as archiving until its status
-        is written (:meth:`is_archiving`). A run checks the mark right after
-        it holds the run lock, also with no await in between. So a run either
-        makes this call fail or is refused.
+        autonomous turn, an idle drain). The session is then marked as
+        closing until its status is written (:meth:`closing`).
 
         After the archive, the session's pending wakeups are deleted and
         ``on_archived`` runs (it expires the session's pending questions).
@@ -1041,20 +1051,14 @@ class SessionManager:
             raise ValueError(f"Session {session_id} not found")
         if session.get("status") == SessionStatus.ARCHIVED.value:
             return False
-        if self.has_running_work(session_id) or self._run_lock_held(session_id):
+        if self.has_turn_work(session_id):
             raise SessionBusyError(BUSY_RUNNING_REASON)
         if not force and self._agents_live(session_id):
             raise SessionBusyError(BUSY_AGENTS_REASON)
-        marks = self._archiving_marks()
-        marks[session_id] = marks.get(session_id, 0) + 1
-        try:
+        with self.closing(session_id, "archived"):
             archived = await self._archive_marked(
                 session_id, attribution=attribution, details=details,
             )
-        finally:
-            left = marks.pop(session_id, 1) - 1
-            if left:
-                marks[session_id] = left
         if archived:
             logger.info("Archived session %s", session_id)
             await self._close_archived_work(session_id)
@@ -1096,24 +1100,32 @@ class SessionManager:
             event_type="archived", details=details, attribution=attribution,
         )
 
-    def _archiving_marks(self) -> dict[str, int]:
-        """Archives in progress per session (created on first use, so
-        managers built with ``__new__`` work too)."""
-        return self.__dict__.setdefault("_archiving", {})
+    @contextlib.contextmanager
+    def closing(self, session_id: str, reason: str) -> Iterator[None]:
+        """Mark the session as closing (``archived`` or ``deleted``) for the
+        duration of the block (see :meth:`closing_reason`).
 
-    def is_archiving(self, session_id: str) -> bool:
-        """An archive of the session is in progress (see :meth:`archive_session`)."""
-        return session_id in self._archiving_marks()
-
-    def _run_lock_held(self, session_id: str) -> bool:
-        """``run_lock_held(session_id)``; ``False`` when it is not wired."""
-        if self.run_lock_held is None:
-            return False
+        The caller checks :meth:`has_turn_work` and enters the block with no
+        await in between. A run checks the mark right after it holds the run
+        lock, also with no await in between. So a run either makes the
+        caller's check fail, or is refused.
+        """
+        self._closing.setdefault(session_id, []).append(reason)
         try:
-            return bool(self.run_lock_held(session_id))
-        except Exception:
-            logger.exception("run-lock check failed for %s", session_id)
-            return False
+            yield
+        finally:
+            marks = self._closing[session_id]
+            marks.remove(reason)
+            if not marks:
+                del self._closing[session_id]
+
+    def closing_reason(self, session_id: str) -> str | None:
+        """``deleted`` or ``archived`` while :meth:`closing` marks the
+        session (``deleted`` wins), else ``None``."""
+        marks = self._closing.get(session_id)
+        if not marks:
+            return None
+        return "deleted" if "deleted" in marks else "archived"
 
     async def _close_archived_work(self, session_id: str) -> None:
         """End the work that targets a session that was just archived: its

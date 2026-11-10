@@ -244,8 +244,7 @@ async def request_plan_revision(
     # takes the revision.
     if (
         session_id != _FALLBACK_PLANNER_SESSION
-        and await db.get_session(session_id) is None
-        and await db.get_session_deletion(session_id) is not None
+        and await db.closed_session_reason(session_id) == "deleted"
     ):
         session_id = _FALLBACK_PLANNER_SESSION
     session_title = (

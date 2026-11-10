@@ -21,7 +21,7 @@ from fastapi import HTTPException
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.base import BackendCapabilities
 from nerve.agent.engine import AgentEngine, SessionClosedError
-from nerve.agent.sessions import BUSY_RUNNING_REASON, SessionBusyError
+from nerve.agent.sessions import BUSY_RUNNING_REASON, SessionBusyError, SessionManager
 from nerve.config import NerveConfig, NotificationsConfig
 from nerve.cron.service import CronService
 from nerve.identity import attribution_for
@@ -336,6 +336,16 @@ async def test_archive_is_refused_while_anything_holds_the_run_lock(tmp_path, db
     assert await engine.sessions.archive_session(sid) is True
 
 
+def test_closing_marks_nest_and_clear():
+    manager = SessionManager(MagicMock())
+    with manager.closing("s", "deleted"):
+        with manager.closing("s", "archived"):
+            assert manager.closing_reason("s") == "deleted"
+        assert manager.closing_reason("s") == "deleted"
+    assert manager.closing_reason("s") is None
+    assert manager._closing == {}
+
+
 @pytest.mark.asyncio
 async def test_a_queued_turn_is_refused_when_the_session_was_archived_meanwhile(
     tmp_path, db, broadcasts,
@@ -412,7 +422,7 @@ async def test_a_turn_that_starts_during_an_archive_is_refused_before_it_stores_
     backend.clients[0].disconnect_gate = gate
     archive = asyncio.create_task(engine.sessions.archive_session(sid))
     await _until(lambda: engine.sessions.get_client(sid) is None)
-    assert engine.sessions.is_archiving(sid)
+    assert engine.sessions.closing_reason(sid) == "archived"
 
     with pytest.raises(SessionClosedError):
         await asyncio.wait_for(
@@ -423,7 +433,7 @@ async def test_a_turn_that_starts_during_an_archive_is_refused_before_it_stores_
     gate.set()
 
     assert await asyncio.wait_for(archive, timeout=5) is True
-    assert not engine.sessions.is_archiving(sid)
+    assert engine.sessions.closing_reason(sid) is None
     assert len(backend.clients) == 1
     users = [m["content"] for m in await db.get_messages(sid) if m["role"] == "user"]
     assert "sent during the archive" not in users
@@ -681,21 +691,28 @@ async def test_a_run_never_creates_a_deleted_session_again(tmp_path, db):
 
 @pytest.mark.asyncio
 async def test_a_run_during_a_delete_is_refused(tmp_path, db):
+    """The delete mark: a run that takes the run lock while the delete
+    disconnects the client is refused and creates nothing."""
     engine, backend = _engine(tmp_path, db)
     sid = "s-deleting"
-    await engine.sessions.get_or_create(sid, source="web", backend="claude", actor=None)
+    await _new_session(engine, db, sid)
+    gate = asyncio.Event()
+    backend.clients[0].disconnect_gate = gate
+    delete = asyncio.create_task(_delete(engine, db, sid))
+    await _until(lambda: engine.sessions.get_client(sid) is None)
+    assert engine.sessions.closing_reason(sid) == "deleted"
 
-    assert engine.begin_delete(sid) is True
-    try:
-        with pytest.raises(SessionClosedError) as info:
-            await engine.run(sid, "a message", source="web", channel="web", actor=None)
-    finally:
-        engine.end_delete(sid)
+    with pytest.raises(SessionClosedError) as info:
+        await asyncio.wait_for(
+            engine.run(sid, "a message", source="web", channel="web", actor=None),
+            timeout=5,
+        )
+    gate.set()
 
     assert info.value.reason == "deleted"
-    assert backend.clients == []
-    # After the delete ends, an existing session runs again.
-    await engine.run(sid, "a message", source="web", channel="web", actor=None)
+    assert await asyncio.wait_for(delete, timeout=5) == {"deleted": True}
+    assert engine.sessions.closing_reason(sid) is None
+    assert await db.get_session(sid) is None
     assert len(backend.clients) == 1
 
 

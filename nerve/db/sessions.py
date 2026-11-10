@@ -465,6 +465,16 @@ class SessionStore:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
+    async def closed_session_reason(self, session_id: str) -> str | None:
+        """``archived`` for an archived session, ``deleted`` for an id that
+        has no row and a ``session_deletions`` record, else ``None``."""
+        session = await self.get_session(session_id)
+        if session is not None:
+            return "archived" if session.get("status") == "archived" else None
+        if await self.get_session_deletion(session_id) is not None:
+            return "deleted"
+        return None
+
     async def update_session_metadata(self, session_id: str, metadata: dict) -> None:
         """Update the metadata JSON for a session.
 

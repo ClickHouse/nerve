@@ -24,7 +24,7 @@ from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Literal
+from typing import Any
 
 from nerve.agent.agents import AgentRegistry
 from nerve.agent.agents.errors import (
@@ -1198,38 +1198,6 @@ class AgentEngine:
         lock = self._session_locks.get(session_id)
         return lock is not None and lock.locked()
 
-    def has_turn_work(self, session_id: str) -> bool:
-        """A turn of the session runs or waits for a concurrency slot, or
-        anything holds its run lock (see :meth:`_run_lock_held`)."""
-        return (
-            self.sessions.has_running_work(session_id)
-            or self._run_lock_held(session_id)
-        )
-
-    def _deleting_sessions(self) -> set[str]:
-        """Sessions whose delete is in progress (created on first use, so
-        engines built with ``__new__`` work too)."""
-        return self.__dict__.setdefault("_deleting", set())
-
-    def begin_delete(self, session_id: str) -> bool:
-        """Start the delete of a session: ``False`` while it has turn work
-        (:meth:`has_turn_work`), else mark it and return ``True``. Call
-        :meth:`end_delete` when the rows are gone.
-
-        No await here. A run takes the run lock and then checks the mark,
-        with no await in between either. So a run either sees the mark and
-        is refused, or makes this call return ``False``.
-        """
-        if self.has_turn_work(session_id):
-            return False
-        self._deleting_sessions().add(session_id)
-        return True
-
-    def end_delete(self, session_id: str) -> None:
-        """End what :meth:`begin_delete` started. The ``session_deletions``
-        row refuses later runs."""
-        self._deleting_sessions().discard(session_id)
-
     async def expire_session_questions(self, session_id: str) -> None:
         """Expire the pending questions of a session that was archived or
         deleted, with the same reports as an expiry (web, Telegram, Slack).
@@ -1586,9 +1554,8 @@ class AgentEngine:
 
             # Session row first — backend resolution is sticky on it.
             session = await self.db.get_session(session_id)
-            # Check again before the runtime gets anything: the session row
-            # read here is the one the client is built for.
-            closed = await self._session_closed_reason(session_id, session)
+            # Check again before the runtime gets anything.
+            closed = await self._session_closed_reason(session_id)
             if closed:
                 raise SessionClosedError(closed)
             backend = self._backend_for(session, source)
@@ -2157,27 +2124,14 @@ class AgentEngine:
         logger.info("Drain: all running turns ended")
         return True
 
-    async def _session_closed_reason(
-        self, session_id: str, session: dict | None | Literal[False] = False,
-    ) -> str | None:
+    async def _session_closed_reason(self, session_id: str) -> str | None:
         """``archived`` or ``deleted`` when no turn may run in the session,
-        else ``None``. ``session`` is the row when the caller has read it
-        already (``None`` for no row). A delete or an archive in progress
-        counts as ``deleted`` or ``archived``; those checks come before the
-        first await."""
-        if session_id in self._deleting_sessions():
-            return "deleted"
-        if self.sessions.is_archiving(session_id):
-            return "archived"
-        if session is False:
-            session = await self.db.get_session(session_id)
-        if session is not None:
-            if session.get("status") == SessionStatus.ARCHIVED.value:
-                return "archived"
-            return None
-        if await self.db.get_session_deletion(session_id) is not None:
-            return "deleted"
-        return None
+        else ``None``. An archive or a delete in progress counts; that check
+        comes before the first await."""
+        return (
+            self.sessions.closing_reason(session_id)
+            or await self.db.closed_session_reason(session_id)
+        )
 
     async def _refuse_closed_session(
         self,
@@ -4122,7 +4076,7 @@ class AgentEngine:
             self.sessions.set_turn_task(session_id, turn_task)
             # The session can be archived or deleted before this run holds
             # the lock, or while it waits in the queue. No await since the
-            # lock: an archive or a delete that starts later sees this run.
+            # lock (see SessionManager.closing).
             closed = await self._session_closed_reason(session_id)
             if closed:
                 await self._refuse_closed_session(
