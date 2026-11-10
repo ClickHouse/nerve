@@ -1,0 +1,43 @@
+{
+  "event_id": "example:3c9a7e15-2b4d-4f60-8e1a-5d7c9b2f4a68:commented:9e2f6a4b-1c3d-4e5f-a7b8-c9d0e1f2a3b4:1",
+  "message_revision_id": "commented:9e2f6a4b-1c3d-4e5f-a7b8-c9d0e1f2a3b4:1",
+  "tenant_id": "6f1d3a2c-0b4e-4f7a-9c1d-2e5b8a3f7c04",
+  "agent_id": "b28c5e91-7d4a-4c3b-8f61-0a9e2d4b6c17",
+  "connection_id": "3c9a7e15-2b4d-4f60-8e1a-5d7c9b2f4a68",
+  "provider": "example",
+  "kind": "source_record",
+  "conversation": {
+    "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+    "kind": "item",
+    "display_name": "NOTE-7"
+  },
+  "author": {
+    "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+    "kind": "human",
+    "display_name": "Alice Example"
+  },
+  "admission": {
+    "purpose": "observe",
+    "observe": {
+      "provenance": {
+        "provider": "example",
+        "issuer": "",
+        "installation_id": ""
+      }
+    }
+  },
+  "delivery": {
+    "inbox_id": "1020",
+    "received_at": "2026-11-10T08:00:12.5Z"
+  },
+  "occurred_at": "2026-11-10T08:00:00Z",
+  "record": {
+    "id": "comment:9e2f6a4b-1c3d-4e5f-a7b8-c9d0e1f2a3b4",
+    "record_type": "example_note",
+    "schema": "example.note/1",
+    "summary": "[NOTE-7] Alice Example commented: Plan the release",
+    "content": "**Alice Example** commented on [NOTE-7](https://notes.example.test/NOTE-7) Plan the release:\n\n> Ship it after the freeze.\n> Thanks!",
+    "timestamp": "2026-11-10T08:00:00Z",
+    "data": {"note":{"title":"Plan the release \u00e9t\u00e9","key":"NOTE-7","id":"5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30","priority":2,"url":"https://notes.example.test/NOTE-7","labels":["planning","Q4"]},"event":"commented","actor":{"kind":"user","name":"Alice Example","id":"0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49"},"comment":{"id":"9e2f6a4b-1c3d-4e5f-a7b8-c9d0e1f2a3b4","body":"Ship it after the freeze.\nThanks!"},"score":2.50}
+  }
+}

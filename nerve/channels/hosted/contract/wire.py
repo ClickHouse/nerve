@@ -6,6 +6,14 @@ ignores members that the record does not declare, so the gateway can add
 members without a change in Nerve. A missing or null member takes the
 field's default. Encoding leaves out a field marked with :func:`omit_empty`
 when it holds its zero value.
+
+A field marked with :func:`source_json` holds a JSON object that a provider
+defines, such as the data of a generic source record. Decoding keeps it as
+the parsed object, with every member, and tells an absent member (``None``)
+from a present one: a present ``null`` or another JSON type is malformed.
+
+The parser refuses what the gateway's parser refuses: a JSON object that
+repeats a member name, and ``NaN`` or ``Infinity``.
 """
 
 from __future__ import annotations
@@ -63,6 +71,15 @@ def struct(factory: type) -> Any:
     return dataclasses.field(default_factory=factory)
 
 
+def source_json() -> Any:
+    """A JSON object that a provider defines: ``None`` when the member is absent.
+
+    It is left out of the JSON when it is ``None``. Any other value, an empty
+    object too, is sent.
+    """
+    return dataclasses.field(default=None, metadata={"source_json": True})
+
+
 def format_time(value: datetime) -> str:
     """An RFC 3339 UTC timestamp, as the contract sends it."""
     utc = value.astimezone(timezone.utc)
@@ -73,13 +90,28 @@ def format_time(value: datetime) -> str:
 
 
 def parse_json(text: str) -> Any:
-    """Parse one JSON value, or raise :class:`Rejected`."""
+    """Parse one JSON value, or raise :class:`Rejected`.
+
+    An object that repeats a member name, and the literals ``NaN``,
+    ``Infinity`` and ``-Infinity``, are malformed, as for the gateway.
+    """
     try:
-        return json.loads(text)
+        return json.loads(text, object_pairs_hook=_unique_members, parse_constant=_not_json)
     except RecursionError:
         reject(RejectionReason.LIMIT_EXCEEDED, "JSON nesting exceeds the parser's depth")
     except ValueError as error:
         malformed(f"decode frame: {error}")
+
+
+def _unique_members(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    members = dict(pairs)
+    if len(members) != len(pairs):
+        malformed("decode frame: a JSON object repeats a member name")
+    return members
+
+
+def _not_json(literal: str) -> typing.NoReturn:
+    malformed(f"decode frame: {literal} is not a JSON value")
 
 
 _HINTS: dict[type, dict[str, Any]] = {}
@@ -96,9 +128,15 @@ def decode_record(cls: type, raw: Any, path: str = "") -> Any:
         hints = _HINTS[cls] = typing.get_type_hints(cls)
     values: dict[str, Any] = {}
     for field in dataclasses.fields(cls):
+        member_path = f"{path}.{field.name}" if path else field.name
+        if field.metadata.get("source_json"):
+            if field.name in raw:
+                if not isinstance(raw[field.name], dict):
+                    malformed(f"decode frame: {member_path} is not a JSON object")
+                values[field.name] = raw[field.name]
+            continue
         value = raw.get(field.name)
         if value is not None:
-            member_path = f"{path}.{field.name}" if path else field.name
             values[field.name] = _decode_value(hints[field.name], value, member_path)
     return cls(**values)
 
@@ -149,6 +187,10 @@ def encode_record(record: Any) -> dict[str, Any]:
         value = getattr(record, field.name)
         if field.metadata.get("omitempty") and value in (None, False, 0, "", ()):
             continue
+        if field.metadata.get("source_json"):
+            if value is not None:
+                out[field.name] = value
+            continue
         out[field.name] = _encode_value(value)
     return out
 
@@ -183,5 +225,6 @@ __all__ = [
     "omit_empty",
     "parse_json",
     "reject",
+    "source_json",
     "struct",
 ]

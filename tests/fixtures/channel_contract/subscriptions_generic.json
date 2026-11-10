@@ -1,0 +1,42 @@
+{
+  "version": "1",
+  "kind": "subscriptions",
+  "request_id": "n-26",
+  "payload": {
+    "subscriptions": {
+      "version": "1",
+      "sources": [
+        {
+          "provider": "github",
+          "filters": {
+            "deny_actors": [
+              "*-bot"
+            ]
+          }
+        },
+        {
+          "provider": "example",
+          "filters": {},
+          "settings": {"events":["created","commented"],"inbox":true},
+          "schemas": [
+            "example.note/1"
+          ],
+          "rules": [
+            {
+              "path": "/actor/kind",
+              "deny": [
+                "bot"
+              ]
+            },
+            {
+              "path": "/note/key",
+              "allow": [
+                "NOTE-*"
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+}
