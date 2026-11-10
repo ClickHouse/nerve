@@ -1730,6 +1730,99 @@ class TelegramChannel(BaseChannel):
         text, markup = build_plan_detail_view(plan, tzname=self.config.timezone)
         await self._safe_edit(query, text, markup, parse_mode=ParseMode.HTML)
 
+    # -- GitHub write approvals (nerve/agent/github_gate.py) ------------- #
+
+    async def _approval_chat(self, session_id: str) -> int | None:
+        """Where a session's approval goes: the chat it is bound to, else the
+        notification chat, else the first allowed user's DM."""
+        keys = await self.router.engine.db.channel_keys_for_sessions([session_id])
+        key = keys.get(session_id) or ""
+        parts = key.split(":")
+        if len(parts) >= 2 and parts[0] == "telegram":
+            try:
+                return int(parts[1])
+            except ValueError:
+                pass
+        chat_id = self.config.notifications.telegram_chat_id
+        if chat_id:
+            return int(chat_id)
+        allowed = self.config.telegram.allowed_users
+        return int(allowed[0]) if allowed else None
+
+    async def post_github_approval(
+        self, session_id: str, interaction_id: str, payload: dict[str, Any],
+    ):
+        """Post a GitHub-write approval with Approve/Decline buttons.
+
+        Returns an async ``finish(outcome)`` that writes the outcome
+        ("approved", "declined", "expired", "cancelled") on the message and
+        removes its buttons, or None when nothing could be posted.
+        """
+        if self._app is None:
+            return None
+        chat_id = await self._approval_chat(session_id)
+        if chat_id is None:
+            return None
+        session = await self.router.get_session(session_id) or {}
+        title = session.get("title") or f"Session {session_id}"
+        command = str((payload.get("item") or {}).get("command") or "")
+        if len(command) > 2500:
+            command = command[:2500] + "…"
+        reason = str(payload.get("reason") or "")[:600]
+        text = (
+            "🔐 <b>GitHub write needs your OK</b>\n"
+            f"{_html.escape(title)}\n\n"
+            f"<pre>{_html.escape(command)}</pre>"
+            + (f"\n{_html.escape(reason)}" if reason else "")
+        )
+        markup = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Approve", callback_data=f"ghw:a:{interaction_id}"),
+            InlineKeyboardButton("❌ Decline", callback_data=f"ghw:d:{interaction_id}"),
+        ]])
+        try:
+            sent = await self._app.bot.send_message(
+                chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+                reply_markup=markup,
+            )
+        except Exception as exc:
+            logger.warning("GitHub approval for %s not posted: %s", session_id, exc)
+            return None
+        labels = {
+            "approved": "✅ Approved", "declined": "❌ Declined",
+            "expired": "⌛ No answer: declined", "cancelled": "⏹ Session stopped",
+        }
+
+        async def finish(outcome: str) -> None:
+            try:
+                await self._app.bot.edit_message_text(
+                    chat_id=chat_id, message_id=sent.message_id,
+                    text=f"{text}\n\n{labels.get(outcome, outcome)}",
+                    parse_mode=ParseMode.HTML, reply_markup=None,
+                )
+            except Exception as exc:  # noqa: BLE001 — the decision stands
+                logger.info("GitHub approval message not updated: %s", exc)
+
+        return finish
+
+    async def _handle_github_approval_button(self, query: Any) -> None:
+        """``ghw:a:<interaction>`` approves, ``ghw:d:<interaction>`` declines."""
+        from nerve.agent.interactive import answer_github_approval
+
+        parts = query.data.split(":", 2)
+        if len(parts) != 3 or parts[1] not in ("a", "d"):
+            await query.answer()
+            return
+        approve = parts[1] == "a"
+        if answer_github_approval(parts[2], approve) is None:
+            await query.answer("Already answered or expired", show_alert=True)
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        # The pause's finish() writes the outcome on the message.
+        await query.answer("Approved" if approve else "Declined")
+
     async def _handle_plan_button(self, query: Any) -> None:
         """Handle /plans inline-keyboard presses.
 
@@ -2962,6 +3055,11 @@ class TelegramChannel(BaseChannel):
         # /plans inline keyboard: list/view/approve/decline/revise.
         if query.data.startswith("plan:"):
             await self._handle_plan_button(query)
+            return
+
+        # GitHub write approvals (nerve/agent/github_gate.py).
+        if query.data.startswith("ghw:"):
+            await self._handle_github_approval_button(query)
             return
 
         # Parse callback_data: "notif:{notification_id}:{answer}"

@@ -63,9 +63,11 @@ from nerve.agent.backends.base import (
 )
 from nerve.agent.backends.images import validate_image_data, validate_image_file
 from nerve.agent.cache_policy import cache_ttl_env
+from nerve.agent import github_gate
 from nerve.agent.interactive import (
     FILE_MODIFY_TOOLS,
     INTERACTIVE_TOOLS,
+    UNREACHABLE_MESSAGE,
     InteractiveToolHandler,
     _read_file_safe,
     defer_idle_timeout,
@@ -398,6 +400,71 @@ def lockdown_denial(tool_name: str, tool_input: dict[str, Any]) -> str | None:
 
 
 # ------------------------------------------------------------------ #
+#  GitHub write gate                                                   #
+# ------------------------------------------------------------------ #
+
+def github_gate_check(
+    hub: Any, tool_name: str, tool_input: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None, list[github_gate.Write]]:
+    """What the GitHub write gate makes of one tool call.
+
+    ``("pass", None, [])``: not a GitHub write. ``("allow", input, writes)``:
+    runs without a card (CI reruns, or the person's "push"/"post" message
+    ordered exactly these writes); ``input`` is the rewritten tool input that
+    carries the approval for the git/gh wrappers, or None to run as is.
+    ``("ask", None, writes)``: the person has to approve it.
+    """
+    if tool_name != "Bash":
+        return "pass", None, []
+    command = tool_input.get("command")
+    if not isinstance(command, str) or not command:
+        return "pass", None, []
+    writes = github_gate.classify_command(command)
+    if not writes:
+        return "pass", None, []
+    message_of = getattr(hub, "turn_person_message", None)
+    message = message_of() if callable(message_of) else None
+    verbs = github_gate.message_verbs(message)
+    if github_gate.runs_without_card(writes, verbs):
+        if not github_gate.needs_person(writes):
+            return "allow", None, writes
+        logger.info(
+            "Session %s: GitHub write allowed by the person's message %r: %s",
+            getattr(hub, "session_id", "?"), message, github_gate.describe(writes),
+        )
+        return "allow", _approved_input(tool_input, writes), writes
+    return "ask", None, writes
+
+
+def _github_gate_on(config: Any) -> bool:
+    """``agent.github_write_gate`` (minimal test configs lack it: off).
+    On, it also points the gate at ``~/.nerve/github-gate`` (nerve.paths)."""
+    on = bool(getattr(getattr(config, "agent", None), "github_write_gate", False))
+    if on and not os.environ.get(github_gate.GATE_DIR_ENV):
+        from nerve.paths import nerve_path
+
+        github_gate.configure(nerve_path("github-gate"))
+    return on
+
+
+def _approved_input(tool_input: dict[str, Any], writes: list[github_gate.Write]) -> dict[str, Any]:
+    nonce = github_gate.issue_approval(github_gate.describe(writes))
+    return {**tool_input, "command": github_gate.approved_command(tool_input["command"], nonce)}
+
+
+def github_approval_payload(
+    tool_input: dict[str, Any], writes: list[github_gate.Write],
+) -> dict[str, Any]:
+    """The ``command_approval`` card's input (see web ApprovalCard)."""
+    return {
+        "title": "Agent wants to write to GitHub",
+        "item": {"command": tool_input.get("command", "")},
+        "reason": github_gate.describe(writes),
+        "github": True,
+    }
+
+
+# ------------------------------------------------------------------ #
 #  can_use_tool adapter                                                #
 # ------------------------------------------------------------------ #
 
@@ -411,11 +478,15 @@ class ClaudeToolPermissions:
       interactive one, ``AskUserQuestion`` and ``ExitPlanMode`` pause via the
       hub and translate its outcome into ``PermissionResultAllow/Deny``;
       ``EnterPlanMode`` is allowed without a pause.
+    * With ``github_gate``, a Bash command that writes to GitHub waits for
+      the person's approval (:func:`github_gate_check`). The PreToolUse grant
+      hook leaves exactly these commands undecided so they come here.
     * Everything else auto-approves with zero overhead.
     """
 
-    def __init__(self, hub: InteractiveToolHandler):
+    def __init__(self, hub: InteractiveToolHandler, *, github_gate: bool = False):
         self._hub = hub
+        self._github_gate = github_gate
 
     async def can_use_tool(
         self,
@@ -448,6 +519,24 @@ class ClaudeToolPermissions:
                     logger.warning(
                         "Failed to save file snapshot for %s: %s", file_path, e,
                     )
+
+        if self._github_gate and tool_name == "Bash":
+            gate, updated, writes = github_gate_check(hub, tool_name, tool_input)
+            if gate == "allow":
+                return PermissionResultAllow(updated_input=updated) if updated else PermissionResultAllow()
+            if gate == "ask":
+                logger.info(
+                    "Session %s: asking the person about a GitHub write: %s",
+                    hub.session_id, github_gate.describe(writes),
+                )
+                outcome = await hub.request_github_approval(
+                    github_approval_payload(tool_input, writes),
+                )
+                if outcome.approved:
+                    return PermissionResultAllow(updated_input=_approved_input(tool_input, writes))
+                return PermissionResultDeny(
+                    message=f"GitHub write not approved: {outcome.message or 'declined'}",
+                )
 
         if tool_name not in INTERACTIVE_TOOLS:
             return PermissionResultAllow()
@@ -704,7 +793,9 @@ class ClaudeBackend:
 
         can_use_tool = None
         if spec.interactive is not None:
-            can_use_tool = ClaudeToolPermissions(spec.interactive).can_use_tool
+            can_use_tool = ClaudeToolPermissions(
+                spec.interactive, github_gate=_github_gate_on(self.config),
+            ).can_use_tool
 
         return ClaudeAgentOptions(
             model=selected_model,
@@ -948,6 +1039,17 @@ class ClaudeBackend:
         env.update(custom_headers_env(
             inference_principal, trigger=inference_trigger, origin=inference_origin,
         ))
+        # GitHub write gate: git/gh wrappers first on PATH, so a script's own
+        # pushes and API writes need the approval its command got.
+        if _github_gate_on(config):
+            try:
+                bin_dir = github_gate.install_wrappers()
+            except OSError as e:
+                logger.warning("GitHub gate wrappers not installed: %s", e)
+                bin_dir = None
+            if bin_dir is not None:
+                env[github_gate.GATE_DIR_ENV] = str(github_gate.gate_dir())
+                env["PATH"] = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
         return env
 
     def _build_mcp_servers(
@@ -1101,6 +1203,36 @@ class ClaudeBackend:
                         "permissionDecisionReason": denial,
                     }
                 }
+            if _github_gate_on(self.config) and tool_name == "Bash":
+                # A GitHub write is no blanket allow: it runs without a card
+                # only for the reasons github_gate_check gives, and otherwise
+                # stays undecided here, so the CLI asks can_use_tool, which
+                # shows the person the card. A background agent has no
+                # can_use_tool: the CLI declines its undecided call.
+                gate, updated, _writes = github_gate_check(
+                    spec.interactive, tool_name, hook_input.get("tool_input", {}) or {},
+                )
+                if gate == "ask" and spec.interactive is None:
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "deny",
+                            "permissionDecisionReason": UNREACHABLE_MESSAGE,
+                        }
+                    }
+                if gate == "ask":
+                    return {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
+                if gate == "allow" and updated is not None:
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "allow",
+                            "permissionDecisionReason": (
+                                "nerve: GitHub write ordered by the person's message"
+                            ),
+                            "updatedInput": updated,
+                        }
+                    }
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",

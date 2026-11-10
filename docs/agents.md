@@ -175,6 +175,42 @@ the model never sees it during an earlier turn.
 | `x` `x` | Stop the focused agent (press twice) |
 | `Esc` (in the panel) | Back to the message box (never stops the turn) |
 
+## GitHub writes
+
+With `agent.github_write_gate: true` (off by default), a shell command that
+pushes, posts or changes something on GitHub waits for the person
+(`nerve/agent/github_gate.py`, Claude sessions). The web UI shows
+an "Agent wants to write to GitHub" card with the command; Telegram gets the
+same with ✅ Approve / ❌ Decline buttons, in the chat the session is bound
+to, else the notification chat. Telegram is skipped when
+a web client watches the session and the turn did not come from Telegram. No
+answer within an hour declines it.
+
+It runs without a card when:
+
+- the person's message that started the turn starts with "push" or "post"
+  (after an optional "yes", "ok", "go"), is at most 80 characters, asks no
+  question and has no "don't", "not", "never", "no" or "without". "push"
+  covers pushes, "post" covers comments, issues, PRs, reviews and other API
+  writes. A Telegram reply counts only the person's own text;
+- it is a CI rerun (`gh run rerun`, `POST …/actions/runs/{id}/rerun`,
+  `…/rerun-failed-jobs`, `…/actions/jobs/{id}/rerun`), as a cron job that
+  reruns failed CI does.
+
+Force pushes, branch and ref deletions, merges, closes, repository and
+settings changes always ask. Sessions without a person (cron, hooks,
+workflow runs) are refused; background sub-agents too, since the CLI never
+asks for them.
+
+Writes inside a script are caught by `git` and `gh` wrappers that come first
+on the runtime's PATH (`~/.nerve/github-gate/bin`). They let a write through
+only when the command that ran them was approved: the gate exports
+`NERVE_GITHUB_APPROVAL` into it. A script that writes starts with
+`NERVE_GITHUB_WRITE=1` so the gate asks before it runs. The gate is a guard
+against mistakes; the agent runs as the same user as the wrappers.
+
+The gate is off by default: `agent.github_write_gate: true` turns it on.
+
 ## Configuration
 
 `agent.subagents` in `config.yaml` (see [config.md](config.md#agent)):
