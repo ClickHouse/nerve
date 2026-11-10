@@ -40,6 +40,7 @@ from nerve.agent.backends import (
     AgentBackend,
     AgentClient,
     BackendDeps,
+    ForkSourceMissingError,
     ModelObserved,
     SessionSpec,
     SubagentStarted,
@@ -365,6 +366,9 @@ class _TurnState:
     ordered_blocks: list[dict] = field(default_factory=list)
     last_usage: dict | None = None
     sdk_session_id: str | None = None
+    # True when ``sdk_session_id`` comes from the turn's terminal event, not
+    # from the live client after a Stop or an error.
+    native_id_from_result: bool = False
     native_turn_id: str | None = None
     result_meta: dict | None = None
     last_model: str | None = None
@@ -548,6 +552,9 @@ class AgentEngine:
         self._mcp_catalog_task: asyncio.Task | None = None
         # The catalog revision that each session's client was built with.
         self._client_mcp_revisions: dict[str, str | None] = {}
+        # The fork source of each session whose last client build found one
+        # on the row (a fork before its first completed turn).
+        self._fork_sources: dict[str, str] = {}
         self._mcp_servers_cache = (  # hot-reloadable
             [] if self._managed_mcp else list(config.mcp_servers)
         )
@@ -1532,8 +1539,6 @@ class AgentEngine:
 
     async def _get_or_create_client(
         self, session_id: str, source: str, model: str | None,
-        fork_from: str | None = None,
-        fork_last_turn_id: str | None = None,
         effort_override: str | None = None,
     ) -> AgentClient:
         """Get an existing persistent client or create a new one.
@@ -1547,6 +1552,12 @@ class AgentEngine:
         A live client is built again when its process is dead, its model
         changed, or the MCP gateway catalog changed after its build
         (:meth:`_mcp_catalog_rebuild_due`).
+
+        A new client resumes the session's own native conversation. A fork
+        that has none yet branches from the fork source on its row
+        (``fork_source_native_id`` at ``fork_source_turn_id``, written by
+        ``SessionManager.fork_session``). Every build of the session reads
+        the same row, so a crash-retry forks again, whatever the status.
         """
         lock = self.sessions.get_lock(session_id)
         async with lock:
@@ -1635,17 +1646,23 @@ class AgentEngine:
                 if session_meta.get("observed_model"):
                     self._observed_models[session_id] = session_meta["observed_model"]
 
-            # For forks, use the source session's native ID
-            if fork_from and not sdk_resume_id:
-                sdk_resume_id = fork_from
+            # A fork keeps its source until its first completed turn
+            # (_persist_turn clears it). The source is never the fork's own
+            # conversation: resuming it without a fork would write into the
+            # parent's transcript.
+            fork_from = (session or {}).get("fork_source_native_id") or None
+            if fork_from:
+                self._fork_sources[session_id] = fork_from
+                if sdk_resume_id == fork_from:
+                    sdk_resume_id = None
+            else:
+                self._fork_sources.pop(session_id, None)
 
             # Defensive: let the backend verify the resume target is still
             # materialized (claude: the conversation .jsonl under
             # ~/.claude/projects; codex: no cheap check — create_client
-            # falls back and reports resume_dropped instead).  Forks are
-            # exempt: the source session's context lives in the source's
-            # row, and a fresh fork has nothing to recover to.
-            if sdk_resume_id and not fork_from:
+            # falls back and reports resume_dropped instead).
+            if sdk_resume_id:
                 if not backend.validate_resume_target(
                     sdk_resume_id, session_cwd,
                 ):
@@ -1659,7 +1676,20 @@ class AgentEngine:
                     )
                     sdk_resume_id = None
 
-            if sdk_resume_id:
+            is_fork = bool(fork_from) and not sdk_resume_id
+            fork_last_turn_id: str | None = None
+            if is_fork:
+                await self._check_fork_backend(session or {}, backend.name)
+                if not backend.validate_resume_target(fork_from, session_cwd):
+                    raise await self._fork_source_missing(session_id, fork_from)
+                sdk_resume_id = fork_from
+                fork_last_turn_id = (session or {}).get("fork_source_turn_id") or None
+                logger.info(
+                    "Forking session %s from native session %s%s",
+                    session_id, fork_from[:12],
+                    f" at turn {fork_last_turn_id[:12]}" if fork_last_turn_id else "",
+                )
+            elif sdk_resume_id:
                 logger.info(
                     "Resuming session %s with native session %s",
                     session_id, sdk_resume_id[:12],
@@ -1727,9 +1757,6 @@ class AgentEngine:
                 )
                 if session_meta.get("cache_ttl") != cache_ttl:
                     meta_updates["cache_ttl"] = cache_ttl
-
-            # Determine if this is a fork
-            is_fork = fork_from is not None
 
             # Static-prompt mode (agent.static_system_prompt): the session
             # id and the frozen recall stay OUT of the system prompt so its
@@ -1877,7 +1904,12 @@ class AgentEngine:
                 ),
             )
 
-            client = await backend.create_client(spec)
+            try:
+                client = await backend.create_client(spec)
+            except ForkSourceMissingError:
+                if not is_fork:
+                    raise
+                raise await self._fork_source_missing(session_id, fork_from) from None
             if getattr(client, "resume_dropped", False):
                 # The backend had to discard the stale native id (codex
                 # resume-miss recovery) — clear the persisted column AND
@@ -1922,7 +1954,9 @@ class AgentEngine:
             connected_at = session.get("connected_at") if session and sdk_resume_id else now
             await self.sessions.mark_active(
                 session_id,
-                sdk_session_id=sdk_resume_id,
+                # The resume target of a fork is its source, not its own id:
+                # the fork's own id comes from the runtime.
+                sdk_session_id=None if is_fork else sdk_resume_id,
                 connected_at=connected_at,
             )
             await self.db.update_session_fields(session_id, {"model": resolved_model})
@@ -1940,6 +1974,38 @@ class AgentEngine:
                 " (forked)" if is_fork else "",
             )
             return client
+
+    async def _check_fork_backend(self, session: dict, backend_name: str) -> None:
+        """Refuse a fork whose parent runs on another backend: a native
+        conversation cannot move between runtimes. A deleted parent is not
+        checked (``fork_session`` copied the parent's backend)."""
+        parent_id = session.get("parent_session_id")
+        parent = await self.db.get_session(parent_id) if parent_id else None
+        if parent and parent.get("backend") and parent["backend"] != backend_name:
+            raise ValueError("Cannot fork a native session across agent backends")
+
+    async def _fork_source_missing(
+        self, session_id: str, fork_from: str,
+    ) -> ForkSourceMissingError:
+        """The error for a fork whose source conversation is gone. Removes
+        the fork source first, so that the next message starts a new
+        conversation instead of failing again."""
+        logger.warning(
+            "Session %s: fork source %s is missing; the fork source is removed",
+            session_id, fork_from[:12],
+        )
+        await self._clear_fork_source(session_id)
+        return ForkSourceMissingError(
+            "The conversation that this fork branches from no longer exists, "
+            "so the agent does not have the copied messages. Your next "
+            "message starts a new conversation without them."
+        )
+
+    async def _clear_fork_source(self, session_id: str) -> None:
+        await self.db.update_session_fields(session_id, {
+            "fork_source_native_id": None, "fork_source_turn_id": None,
+        })
+        self._fork_sources.pop(session_id, None)
 
     def _wire_interaction_hooks(
         self, session_id: str, handler: InteractiveToolHandler,
@@ -3338,6 +3404,7 @@ class AgentEngine:
             st.last_usage = event.usage.to_anthropic_shape()
         if event.native_session_id:
             st.sdk_session_id = event.native_session_id
+            st.native_id_from_result = True
         if event.native_turn_id:
             st.native_turn_id = event.native_turn_id
         if event.model and not st.last_model:
@@ -3721,6 +3788,10 @@ class AgentEngine:
             await self.db.bind_native_thread(
                 backend.name, st.sdk_session_id, session_id,
             )
+            if st.native_id_from_result and session_id in self._fork_sources:
+                # The runtime finished a turn in the fork's own conversation:
+                # from now on the fork resumes it.
+                await self._clear_fork_source(session_id)
 
         # Persist usage for context bar on session switch. Backends that
         # report the serving model's context window (codex, via
@@ -4296,41 +4367,10 @@ class AgentEngine:
             st.ordered_blocks.append({"type": "wakeup"})
 
         try:
-            # Get or create persistent client for this session
-            # Check if we need to fork from a parent
-            fork_from = None
-            fork_last_turn_id = None
-            if session:
-                parent_id = session.get("parent_session_id")
-                fork_msg = session.get("forked_from_message")
-                # Workflow legs carry parent_session_id for sidebar nesting only — never fork their fresh prompt from the parent (nor cross-backend).
-                if (parent_id and session.get("status") == SessionStatus.CREATED.value
-                        and session.get("source") != "workflow"):
-                    parent = await self.db.get_session(parent_id)
-                    if parent and parent.get("sdk_session_id"):
-                        if parent.get("backend") != session.get("backend"):
-                            raise ValueError(
-                                "Cannot fork a native session across agent backends"
-                            )
-                        fork_from = parent["sdk_session_id"]
-                        if fork_msg:
-                            fork_last_turn_id = await self.db.get_native_turn_at_message(
-                                parent_id, fork_msg,
-                            )
-                            # Both backends truncate by native turn id now
-                            # (codex: thread/fork lastTurnId; claude:
-                            # --resume-session-at). A message fork without a
-                            # mapping would silently carry the FULL context —
-                            # the opposite of what was asked — so refuse.
-                            if not fork_last_turn_id:
-                                raise ValueError(
-                                    "Cannot fork this session at the selected "
-                                    "message: no native turn mapping is available."
-                                )
-
+            # Get or create persistent client for this session (a fork
+            # branches from its stored source, see _get_or_create_client)
             client = await self._get_or_create_client(
-                session_id, source, model, fork_from=fork_from,
-                fork_last_turn_id=fork_last_turn_id,
+                session_id, source, model,
                 effort_override=effort_override,
             )
 
@@ -4446,7 +4486,7 @@ class AgentEngine:
                 _lf_tags.append(f"channel:{channel}")
             _lf_metadata = {
                 "parent_session_id": session.get("parent_session_id") if session else None,
-                "fork_from": fork_from,
+                "fork_from": session.get("fork_source_native_id") if session else None,
             }
             # Live marker so the UI shows the "scheduled wakeup" chip as the
             # turn streams (the persisted block above covers reload).

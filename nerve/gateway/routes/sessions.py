@@ -609,30 +609,10 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
                 raise HTTPException(status_code=400, detail="A session cannot be its own parent")
             if not await deps.db.get_session(new_parent):
                 raise HTTPException(status_code=404, detail="Parent session not found")
-            # Fork-window guard: the engine reads parent_session_id to fork a
-            # brand-new session's first turn ONLY while status == 'created'.
-            # Refuse to set a parent in that window so a display drag can never
-            # turn a not-yet-started session into a fork. Anything already run
-            # (everything draggable in the sidebar) is unaffected.
-            if session.get("status") == "created":
-                raise HTTPException(
-                    status_code=409,
-                    detail="Send a first message before nesting this session",
-                )
             if await _would_create_cycle(deps.db, session_id, new_parent):
                 raise HTTPException(status_code=400, detail="That drop would create a cycle")
-        elif (
-            session.get("status") == "created"
-            and session.get("parent_session_id")
-        ):
-            # Symmetric fork-window guard: clearing the parent of a
-            # not-yet-started fork would silently discard the fork context
-            # its first turn is about to branch from.
-            raise HTTPException(
-                status_code=409,
-                detail="This fork hasn't started yet — send its first "
-                       "message before un-nesting it",
-            )
+        # Display only: a fork branches from the source that fork_session
+        # stored on its row, not from its parent.
         fields["parent_session_id"] = new_parent
     if not fields:
         raise HTTPException(status_code=400, detail="No valid fields to update")

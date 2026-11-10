@@ -1166,6 +1166,14 @@ a numeric message row id as a string). The fork branches the source's
 pre-populated with the source's messages up to the fork point, so the new
 chat displays exactly the history the agent remembers.
 
+The fork stores the source's native id and the fork turn when it is created
+(`fork_source_native_id`, `fork_source_turn_id`). Each start of the fork's
+runtime branches from them until a turn completes in the fork's own
+conversation. A stop, a crash, a restart, an archive, or a later change to
+the source does not change what the fork branches from. If the source
+conversation no longer exists, the fork's next turn fails with a message
+that says so, and the message after it starts a new conversation.
+
 Errors: `404` unknown source; `409` not forkable — the source has no native
 conversation yet (no completed turn), or the anchor message has no native
 turn mapping (sessions predating per-turn recording can only be forked
