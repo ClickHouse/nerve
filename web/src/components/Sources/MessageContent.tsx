@@ -13,12 +13,13 @@ interface Props {
 /**
  * Source-aware message content renderer.
  *
- * Selects the appropriate renderer based on the source type:
+ * Selects the appropriate renderer (see getRendererType):
+ * - a generic hosted record of schema linear.issue_event/1 → LinearRenderer
+ *   (issue card header + markdown + record data)
+ * - a generic hosted record of another schema → DataRenderer (markdown +
+ *   record data)
  * - gmail → EmailRenderer (sandboxed iframe for HTML, text toggle)
  * - github → GitHubRenderer (repo card header + markdown)
- * - linear → LinearRenderer (issue card header + markdown + record data)
- * - another generic hosted source (nested JSON metadata) → DataRenderer
- *   (markdown + record data)
  * - default → MarkdownRenderer
  *
  * To add a new source renderer, see renderers/index.ts for instructions.

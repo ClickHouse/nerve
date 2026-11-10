@@ -554,8 +554,8 @@ function MessageDetail() {
 
   const msg = selectedMessage;
   const hasProcessedContent = msg.processed_content && msg.processed_content !== msg.content;
-  // The record data of a generic hosted source is nested JSON, which the
-  // content renderer shows in full; chips would show it as raw text.
+  // The content renderer shows the record data of a generic hosted source in
+  // full; chips would show its nested JSON as raw text.
   const metadataChips = !showsRecordData(getRendererType(msg.source, msg.metadata));
 
   return (

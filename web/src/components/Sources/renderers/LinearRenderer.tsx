@@ -2,6 +2,7 @@ import { Badge } from '../../ui';
 import { ListTodo, ExternalLink } from '../../ui/icons';
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { RecordData } from './RecordData';
+import { recordData } from './storedRecord';
 
 interface Props {
   content: string;
@@ -12,9 +13,8 @@ interface Props {
 /**
  * A member of a JSON object, or `undefined`.
  *
- * The metadata is the data of a `linear.issue_event` record as the gateway
- * sent it. A member can be missing, or of another type in a later version, so
- * every read is tolerant.
+ * The data is that of a `linear.issue_event/1` record as the gateway sent it.
+ * A member can be missing, or of another type, so every read is tolerant.
  */
 function member(value: unknown, key: string): unknown {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -38,14 +38,18 @@ function webUrl(value: unknown): string {
 
 export function LinearRenderer({ content, metadata, summary: _summary }: Props) {
   void _summary; // Part of common renderer interface
-  const issue = member(metadata, 'issue');
+  const record = recordData(metadata);
+  const data = record?.data;
+  const issue = member(data, 'issue');
   const identifier = text(member(issue, 'identifier'));
   const title = text(member(issue, 'title'));
-  const event = text(member(metadata, 'event')).replace(/_/g, ' ');
+  const event = text(member(data, 'event')).replace(/_/g, ' ');
   const state = text(member(issue, 'state'));
-  const actor = text(member(metadata, 'actor'));
+  // An actor without a name, such as a change without an actor (kind
+  // system), is shown by its kind.
+  const actor = text(member(data, 'actor')) || text(member(member(data, 'actor'), 'kind'));
   // A comment event links to the comment, every other event to the issue.
-  const link = webUrl(member(member(metadata, 'comment'), 'url')) || webUrl(member(issue, 'url'));
+  const link = webUrl(member(member(data, 'comment'), 'url')) || webUrl(member(issue, 'url'));
 
   return (
     <div>
@@ -72,7 +76,7 @@ export function LinearRenderer({ content, metadata, summary: _summary }: Props) 
       )}
 
       <MarkdownRenderer content={content} />
-      {metadata && <RecordData data={metadata} />}
+      {record && <RecordData schema={record.schema} data={record.data} />}
     </div>
   );
 }

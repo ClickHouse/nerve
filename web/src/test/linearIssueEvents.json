@@ -1,0 +1,53 @@
+{
+  "state_changed": {
+    "event": "state_changed",
+    "via": "watch",
+    "server": {"id": "linear", "name": "Linear"},
+    "issue": {
+      "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+      "identifier": "ENG-12",
+      "title": "Fix the login page",
+      "url": "https://linear.example.test/acme/issue/ENG-12",
+      "team": {"key": "ENG"},
+      "project": {"id": "7a2c4e6f-8b1d-4f3a-9c5e-0d2b4f6a8c1e", "name": "Web"},
+      "state": {"name": "In Progress", "type": "started"},
+      "priority": 2
+    },
+    "actor": {"id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49", "name": "Alice Example", "kind": "user"},
+    "changes": [{"field": "state", "from": "Todo", "to": "In Progress"}]
+  },
+  "commented": {
+    "event": "commented",
+    "via": "inbox",
+    "server": {"id": "linear", "name": "Linear"},
+    "issue": {
+      "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+      "identifier": "ENG-12",
+      "title": "Fix the login page",
+      "url": "https://linear.example.test/acme/issue/ENG-12",
+      "project": {"id": "7a2c4e6f-8b1d-4f3a-9c5e-0d2b4f6a8c1e", "name": "Web"},
+      "assignee": {"id": "8d1e3f5a-7b9c-4d2e-a6f8-1c3e5a7b9d20", "name": "Example Agent"}
+    },
+    "comment": {
+      "id": "9e2f6a4b-1c3d-4e5f-a7b8-c9d0e1f2a3b4",
+      "url": "https://linear.example.test/acme/issue/ENG-12#comment-9e2f6a4b",
+      "body": "Can you take this one?"
+    },
+    "actor": {"id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49", "name": "Alice Example", "kind": "user"}
+  },
+  "system": {
+    "event": "state_changed",
+    "via": "watch",
+    "server": {"id": "linear", "name": "Linear"},
+    "issue": {
+      "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+      "identifier": "ENG-12",
+      "title": "Fix the login page",
+      "url": "https://linear.example.test/acme/issue/ENG-12",
+      "project": {"id": "7a2c4e6f-8b1d-4f3a-9c5e-0d2b4f6a8c1e", "name": "Web"},
+      "state": {"name": "Canceled", "type": "canceled"}
+    },
+    "actor": {"kind": "system"},
+    "changes": [{"field": "state", "from": "Todo", "to": "Canceled"}]
+  }
+}

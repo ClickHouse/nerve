@@ -1,5 +1,6 @@
 import { MarkdownRenderer } from './MarkdownRenderer';
 import { RecordData } from './RecordData';
+import { recordData } from './storedRecord';
 
 interface Props {
   content: string;
@@ -13,11 +14,12 @@ interface Props {
  */
 export function DataRenderer({ content, metadata, summary: _summary }: Props) {
   void _summary; // Part of common renderer interface
+  const record = recordData(metadata);
 
   return (
     <div>
       <MarkdownRenderer content={content} />
-      {metadata && <RecordData data={metadata} defaultOpen />}
+      {record && <RecordData schema={record.schema} data={record.data} defaultOpen />}
     </div>
   );
 }

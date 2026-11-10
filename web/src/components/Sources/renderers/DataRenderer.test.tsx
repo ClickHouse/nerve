@@ -2,45 +2,48 @@ import { render, screen } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 
 import { MessageContent } from '../MessageContent';
-import { getRendererType, hasRecordData, showsRecordData } from './index';
+import { getRendererType, recordData, showsRecordData } from './index';
 
 describe('The record data of a generic hosted source', () => {
-  it('is nested JSON in the metadata, which the flat metadata of other sources is not', () => {
-    expect(hasRecordData({ note: { key: 'NOTE-7' } })).toBe(true);
-    expect(hasRecordData({ changes: [{ field: 'state' }] })).toBe(true);
-    expect(hasRecordData({ matrix: [[1, 2]] })).toBe(true);
-    // GitHub actors, Gmail labels, Telegram ids, IMAP flags.
-    expect(hasRecordData({ actors: ['alice'], labels: [], chat_id: 42, matched: true, from: '' })).toBe(false);
-    expect(hasRecordData({ value: null })).toBe(false);
-    expect(hasRecordData(undefined)).toBe(false);
-    expect(hasRecordData(null)).toBe(false);
+  it('is the metadata of exactly a schema and a JSON object', () => {
+    expect(recordData({ schema: 'example.note/1', data: { event: 'created' } })).toEqual({
+      schema: 'example.note/1', data: { event: 'created' },
+    });
+    expect(recordData({ schema: 'example.note/1', data: {} })).toEqual({ schema: 'example.note/1', data: {} });
+    // The metadata of other sources: GitHub, Telegram, a channel drain.
+    expect(recordData({ repo_name: 'owner/repo', actors: ['alice'] })).toBeNull();
+    expect(recordData({ schema: 'x', data: {}, chat_id: 42 })).toBeNull();
+    expect(recordData({ schema: 7, data: {} })).toBeNull();
+    expect(recordData({ schema: 'x', data: ['not', 'an', 'object'] })).toBeNull();
+    expect(recordData(undefined)).toBeNull();
+    expect(recordData(null)).toBeNull();
   });
 
-  it('chooses the data view for a source without a renderer of its own', () => {
-    expect(getRendererType('example', { note: { key: 'NOTE-7' } })).toBe('data');
-    expect(getRendererType('example', { event: 'created' })).toBe('default');
+  it('chooses the data view by the schema, also for flat data', () => {
+    expect(getRendererType('example', { schema: 'example.note/1', data: { event: 'created' } })).toBe('data');
+    expect(getRendererType('example', { event: 'created', note: { key: 'NOTE-7' } })).toBe('default');
     expect(getRendererType('telegram', { chat_id: 42 })).toBe('default');
-    // A source with its own renderer keeps it.
-    expect(getRendererType('github', { nested: { a: 1 } })).toBe('github');
-    expect(getRendererType('gmail:me@example.com', { nested: { a: 1 } })).toBe('email');
+    expect(getRendererType('github', { repo_name: 'owner/repo' })).toBe('github');
+    expect(getRendererType('gmail:me@example.com', {})).toBe('email');
     expect(showsRecordData('data')).toBe(true);
     expect(showsRecordData('default')).toBe(false);
     expect(showsRecordData('github')).toBe(false);
   });
 
-  it('shows the content and every member of the data at once', () => {
+  it('shows the content and every member of the data at once, with its schema', () => {
     render(
       <MessageContent
         source="example"
         summary="[NOTE-7] New note: Plan"
         content="A **new** note"
-        metadata={{ event: 'created', note: { key: 'NOTE-7', labels: ['planning'] } }}
+        metadata={{ schema: 'example.note/1', data: { event: 'created', note: { key: 'NOTE-7', labels: ['planning'] } } }}
       />,
     );
 
     expect(screen.getByText('new', { selector: 'strong' })).toBeTruthy();
-    const toggle = screen.getByRole('button', { name: 'Record data' });
+    const toggle = screen.getByRole('button', { name: /Record data/ });
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(toggle.textContent).toContain('example.note/1');
     expect(screen.getByText(/"key": "NOTE-7"/)).toBeTruthy();
     expect(screen.getByText(/"planning"/)).toBeTruthy();
   });
@@ -49,6 +52,6 @@ describe('The record data of a generic hosted source', () => {
     render(<MessageContent source="telegram" summary="Hi" content="Hello" metadata={{ chat_id: 42 }} />);
 
     expect(screen.getByText('Hello')).toBeTruthy();
-    expect(screen.queryByRole('button', { name: 'Record data' })).toBeNull();
+    expect(screen.queryByRole('button', { name: /Record data/ })).toBeNull();
   });
 });
