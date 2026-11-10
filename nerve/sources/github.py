@@ -31,7 +31,8 @@ import json
 import logging
 import re
 from collections import OrderedDict
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -64,8 +65,8 @@ _CI_BRANCH_RE = re.compile(r"\bfor (?P<branch>\S+) branch$")
 # are the reviewers and commenters.
 PR_ACTIVITY_RECORD_TYPE = "github_pr_activity"
 
-# Reasons whose record also carries the comments posted since the thread's
-# previous update (see GitHubSource._enrich_since_previous_update).
+# Reasons whose record also carries the comments posted since the readers of
+# the inbox last read a record of the thread (see GitHubSource._look_start).
 _NEW_COMMENT_REASONS = ("mention", "assign", "review_requested", "team_mention")
 
 # How far before the sync cursor the first look at a thread starts. GitHub
@@ -176,6 +177,10 @@ class _Run:
     login: str = ""
     # Where the look at a thread starts that the source has no memory of.
     first_look: datetime | None = None
+    # Metadata of the stored records, by thread id, that a reader of the inbox
+    # has yet to read (see GitHubSource._look_start). None when that could
+    # not be read, and every thread then counts as unread.
+    unread: dict[str, dict[str, Any]] | None = field(default_factory=dict)
 
 
 @dataclass
@@ -405,9 +410,9 @@ def notification_record(notif: dict[str, Any], extra: dict[str, Any] | BaseExcep
                 f"\n{ic_user} on {loc}:\n{ic_body}"
             )
 
-    # Add the human comments posted since the thread's previous update
-    # (catches a comment buried by bot comments — see
-    # _enrich_since_previous_update). The mention text is already above.
+    # Add the human comments posted since the readers last read a record of
+    # the thread (catches a comment buried by bot comments — see
+    # _enrich_since_last_read). The mention text is already above.
     recent_comments = extra.get("recent_comments", [])
     shown_comments = [
         rc for rc in recent_comments
@@ -487,17 +492,28 @@ class GitHubSource(Source):
 
     ``config["inbox"]`` is ``sync.github.inbox``: ``"all"`` lists the whole
     inbox; anything else, or no config, the participating threads only.
+
+    ``unread`` tells, for thread ids, which stored records a reader of the
+    inbox has yet to read, with their metadata
+    (:meth:`nerve.db.sources.SourceStore.unread_source_message_metadata`).
+    Without it nothing is known about readers and every record counts as read
+    (see :meth:`_look_start`).
     """
 
     source_name = "github"
 
-    def __init__(self, config: dict[str, Any] | None = None):
+    def __init__(
+        self,
+        config: dict[str, Any] | None = None,
+        unread: Callable[[list[str]], Awaitable[dict[str, dict[str, Any]]]] | None = None,
+    ):
         self._config = config or {}
+        self._unread = unread
         # Set by every fetch run for the enrichment of its notifications.
         self._run = _Run()
         # Last look at each thread, by notification thread id. Kept in this
-        # process only: after a restart the first look at a thread starts at
-        # the sync cursor again (see _look_start).
+        # process only: after a restart the first look at a thread starts
+        # shortly before the sync cursor again (see _look_start).
         self._looks: OrderedDict[str, _Look] = OrderedDict()
         # The account the looks above belong to.
         self._looks_login = ""
@@ -579,6 +595,21 @@ class GitHubSource(Source):
                 n for n in {n.get("id", ""): n for n in listing}.values()
                 if not self._own_update(n)
             ]
+
+            # Which stored records a reader has yet to read (see _look_start).
+            # A state that cannot be read counts as unread for every thread:
+            # that can repeat a mention, and cannot lose one.
+            if self._unread is not None:
+                looked_at = [
+                    str(n.get("id", "")) for n in notifications
+                    if n.get("reason") in _NEW_COMMENT_REASONS
+                ]
+                if looked_at:
+                    try:
+                        self._run.unread = await self._unread(looked_at)
+                    except Exception as e:
+                        logger.warning("Read state of GitHub records is not known: %s", e)
+                        self._run.unread = None
 
             # Whose mentions to look for. Read in every run that has a mention
             # thread and never kept between runs, so the account that gh acts
@@ -711,7 +742,8 @@ class GitHubSource(Source):
             if subject.get("type") == "PullRequest" and subject_url:
                 await self._enrich_pr_reviews(subject_url, result)
 
-            # Read what was posted since the thread's previous update: the
+            # Read what was posted since the readers last read a record of the
+            # thread (see _look_start): the
             # human comments (GitHub's latest_comment_url always points to the
             # most recent comment — when a bot, e.g. some-ci[bot], posts
             # after a human comment, that comment is lost) and, for a mention
@@ -719,7 +751,7 @@ class GitHubSource(Source):
             reason = notif.get("reason", "")
             s_type = subject.get("type", "")
             if reason in _NEW_COMMENT_REASONS and s_type in ("PullRequest", "Issue"):
-                await self._enrich_since_previous_update(
+                await self._enrich_since_last_read(
                     notif, subject_data if isinstance(subject_data, dict) else {}, result,
                 )
 
@@ -847,10 +879,12 @@ class GitHubSource(Source):
                     for rc in rc_data[:5]  # cap to keep payload reasonable
                 ]
 
-    async def _enrich_since_previous_update(
+    async def _enrich_since_last_read(
         self, notif: dict, subject_data: dict[str, Any], result: dict[str, Any],
     ) -> None:
-        """Add what was posted since the thread's previous update.
+        """Add what was posted since the readers last read a record of the thread.
+
+        :meth:`_look_start` says which moment that is.
 
         Mutates *result* in place: ``recent_comments`` (the human comments
         posted since then, newest first, without the already-fetched
@@ -887,22 +921,49 @@ class GitHubSource(Source):
     def _look_start(self, thread_id: str, updated_at: str) -> datetime:
         """The moment after which a comment or a mention is new for this update.
 
-        It is the end of the source's previous look at the thread. A thread
-        that is listed again with the same ``updated_at`` gets the start that
-        its look had the first time: its record comes out the same and storage
-        skips it (the cursor's own second is listed again in every run). A
-        thread the source has no look of, which is every thread after a
-        restart, starts shortly before the sync cursor: what was posted since
-        the last run.
+        It is the end of the last look whose record every reader of the inbox
+        has read. Storage keeps one record per thread and replaces it when the
+        thread moves, and a reader comes on its own schedule (by default the
+        inbox job every 30 minutes, this source every 15). So while a reader
+        has yet to read the stored record, the look starts where the look of
+        that record started: a mention that one record says is new is still
+        new in the record that replaces it, with its text, and is not lost to
+        a reader that only ever sees the later one.
+
+        A thread that is listed again with the same ``updated_at`` gets the
+        start that its look had the first time: its record comes out the same
+        and storage skips it (the cursor's own second is listed again in every
+        run). A thread the source has no look of, which is every thread after
+        a restart, starts shortly before the sync cursor (what was posted
+        since the last run), and no later than the mention that an unread
+        stored record says is new.
         """
         look = self._looks.get(thread_id)
+        if look is not None and look.updated_at == updated_at:
+            return look.start
+        unread = self._unread_record(thread_id)
         if look is not None:
-            return look.start if look.updated_at == updated_at else look.end
-        if self._run.first_look is not None:
-            return self._run.first_look
-        # No run set a start: the enrichment was called on its own.
-        updated = _when(updated_at) or datetime.now(timezone.utc)
-        return updated - _FIRST_LOOK_MARGIN
+            return look.end if unread is None else look.start
+        start = self._run.first_look
+        if start is None:
+            # No run set a start: the enrichment was called on its own.
+            start = (_when(updated_at) or datetime.now(timezone.utc)) - _FIRST_LOOK_MARGIN
+        if unread and unread.get("mention") == "new":
+            mentioned = _when(unread.get("mention_at"))
+            if mentioned is not None:
+                start = min(start, mentioned - _EVENT_LAG)
+        return start
+
+    def _unread_record(self, thread_id: str) -> dict[str, Any] | None:
+        """Metadata of the thread's stored record while a reader has yet to read it.
+
+        None when every reader has read the record, and when there is no
+        record or no reader. ``{}`` when the read state is not known: the
+        record then counts as unread.
+        """
+        if self._run.unread is None:
+            return {}
+        return self._run.unread.get(thread_id)
 
     def _remember_look(
         self,
@@ -1017,7 +1078,7 @@ class GitHubSource(Source):
         Sets ``result["mention"]`` when the answer is known:
 
         * ``new``: the account is mentioned in something posted after *start*
-          (the thread's previous update), with who wrote it and where when
+          (see :meth:`_look_start`), with who wrote it and where when
           this look read that text.
         * ``old``: nothing posted after *start* mentions the account, and an
           earlier mention explains GitHub's reason.

@@ -2,8 +2,9 @@
 
 GitHub's ``reason`` belongs to the thread: once the account was mentioned in a
 thread, every later notification of that thread says ``mention``. The source
-reads what was posted since the thread's previous update and says in the
-record whether that mentions the account (``mention``: ``new`` or ``old``).
+reads what was posted since the record of the thread that the readers of the
+inbox have read, and says in the record whether that mentions the account
+(``mention``: ``new`` or ``old``).
 
 The fake below answers the calls the source makes for one thread: the REST
 reads (subject, comments, inline review comments, the gh login) and the
@@ -19,9 +20,12 @@ from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
+from nerve.config import NerveConfig
 from nerve.sources import github as gh
 from nerve.sources.github import GitHubSource, notification_record
 from nerve.sources.github_events import GitHubEventsSource
+from nerve.sources.registry import build_source_runners
+from nerve.sources.runner import SourceRunner
 
 _API = "https://api.github.com/repos/acme/widgets"
 _WEB = "https://github.com/acme/widgets"
@@ -161,8 +165,8 @@ class _FakeGitHub:
         return {"repository": {"issueOrPullRequest": thread}}
 
 
-def _source(monkeypatch, fake: _FakeGitHub, *, login: str = _ME) -> GitHubSource:
-    src = GitHubSource()
+def _source(monkeypatch, fake: _FakeGitHub, *, login: str = _ME, unread=None) -> GitHubSource:
+    src = GitHubSource(unread=unread)
     monkeypatch.setattr(src, "_gh_api_get", fake.get)
     monkeypatch.setattr(src, "_gh_graphql", fake.graphql)
     src._run = gh._Run(login=login, first_look=_START)
@@ -344,13 +348,13 @@ async def test_other_reasons_are_not_checked(monkeypatch):
     assert "mention" not in extra
     assert record.summary.endswith("(review_requested)")
     assert not [c for c in fake.calls if c.startswith("graphql")]
-    # The comments since the previous update are still added.
+    # The new comments are still added.
     assert "@alice look" in record.content
 
 
 @pytest.mark.asyncio
 async def test_a_mention_added_by_an_edit_is_new(monkeypatch):
-    # The comment is older than the previous update; the edit is not, and
+    # The comment is older than the start of the look; the edit is not, and
     # GitHub writes the mention event at the edit.
     fake = _FakeGitHub()
     fake.comments = [_comment(11, "bob", "Reproduced. cc @alice", -500, edited=30)]
@@ -568,7 +572,9 @@ async def test_the_same_update_listed_again_gives_the_same_record(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_a_mention_is_new_for_one_update_only(monkeypatch):
+async def test_a_mention_that_was_read_is_old_in_the_next_update(monkeypatch):
+    # No reader has anything left to read here (the source was given no read
+    # state), so the second look starts where the first ended.
     fake = _FakeGitHub()
     fake.comments = [_comment(11, "bob", "@alice can you look at this?", 30)]
     fake.events = [(32, "alice")]
@@ -589,6 +595,119 @@ async def test_a_mention_is_new_for_one_update_only(monkeypatch):
     assert f"{_API}/issues/7/comments?since={_ts(52)}&per_page=100" in fake.calls
     assert "Never mind, found it." in second.content
     assert "@alice can you look at this?" not in second.content
+
+
+@pytest.mark.asyncio
+async def test_a_mention_stays_new_until_a_reader_has_read_its_record(monkeypatch):
+    # Storage keeps one record per thread. The source runs more often than
+    # the reader comes, so the record that says new can be replaced before
+    # anyone read it: the record that replaces it must still say new.
+    fake = _FakeGitHub()
+    fake.comments = [_comment(11, "bob", "@alice can you look at this?", 30)]
+    fake.events = [(32, "alice")]
+    src = _source(monkeypatch, fake)
+
+    _, first = await _record(src, _notif(updated_at=52))
+    assert first.metadata["mention"] == "new"
+
+    # A bot comment moves the thread. The reader has not come yet.
+    fake.comments.append(_comment(12, "some-ci[bot]", "Build finished.", 300))
+    fake.calls.clear()
+    src._run = gh._Run(login=_ME, first_look=_START, unread={"t1": first.metadata})
+    _, second = await _record(src, _notif(updated_at=320))
+
+    assert f"{_API}/issues/7/comments?since={_ts(0)}&per_page=100" in fake.calls
+    assert second.summary == "[acme/widgets] Widget breaks (mention)"
+    assert second.metadata["mention"] == "new"
+    assert second.metadata["mention_by"] == "bob"
+    assert second.metadata["mention_url"] == f"{_WEB}/issues/7#issuecomment-11"
+    assert "--- Mention (bob, " in second.content
+    assert "@alice can you look at this?" in second.content
+
+    # The reader has read that record. The next update is an update only.
+    fake.comments.append(_comment(13, "some-ci[bot]", "Deployed.", 600))
+    fake.calls.clear()
+    src._run = gh._Run(login=_ME, first_look=_START, unread={})
+    _, third = await _record(src, _notif(updated_at=620))
+
+    assert f"{_API}/issues/7/comments?since={_ts(320)}&per_page=100" in fake.calls
+    assert third.summary.endswith("(update, no new mention)")
+    assert third.metadata["mention"] == "old"
+    assert "@alice can you look at this?" not in third.content
+
+
+@pytest.mark.asyncio
+async def test_a_read_state_that_is_not_known_counts_as_unread(monkeypatch):
+    fake = _FakeGitHub()
+    fake.comments = [_comment(11, "bob", "@alice can you look at this?", 30)]
+    fake.events = [(32, "alice")]
+    src = _source(monkeypatch, fake)
+    await _record(src, _notif(updated_at=52))
+
+    fake.comments.append(_comment(12, "some-ci[bot]", "Build finished.", 300))
+    src._run = gh._Run(login=_ME, first_look=_START, unread=None)
+    _, second = await _record(src, _notif(updated_at=320))
+
+    assert second.metadata["mention"] == "new"
+
+
+@pytest.mark.asyncio
+async def test_a_listed_again_update_keeps_its_record_after_it_was_read(monkeypatch):
+    fake = _FakeGitHub()
+    fake.comments = [_comment(11, "bob", "@alice can you look at this?", 30)]
+    fake.events = [(32, "alice")]
+    src = _source(monkeypatch, fake)
+    _, first = await _record(src, _notif(updated_at=52))
+
+    fake.comments.append(_comment(12, "some-ci[bot]", "Build finished.", 300))
+    src._run = gh._Run(login=_ME, first_look=_START, unread={"t1": first.metadata})
+    _, second = await _record(src, _notif(updated_at=320))
+
+    # The reader read the second record; the same update is listed again.
+    src._run = gh._Run(login=_ME, first_look=_START, unread={})
+    _, again = await _record(src, _notif(updated_at=320))
+
+    assert again == second
+    assert again.metadata["mention"] == "new"
+
+
+@pytest.mark.asyncio
+async def test_after_a_restart_an_unread_new_mention_is_looked_at_again(monkeypatch):
+    # No look is remembered and the cursor is past the mention, but the stored
+    # record that says new has not been read: the look reaches back to it.
+    fake = _FakeGitHub()
+    fake.comments = [
+        _comment(11, "bob", "@alice can you look at this?", 30),
+        _comment(12, "some-ci[bot]", "Build finished.", 300),
+    ]
+    fake.events = [(32, "alice")]
+    src = _source(monkeypatch, fake)
+    src._run = gh._Run(
+        login=_ME, first_look=_T0 + timedelta(seconds=200),
+        unread={"t1": {"reason": "mention", "mention": "new", "mention_at": _ts(30)}},
+    )
+
+    _, record = await _record(src, _notif(updated_at=320))
+
+    assert f"{_API}/issues/7/comments?since={_ts(15)}&per_page=100" in fake.calls
+    assert record.metadata["mention"] == "new"
+    assert record.metadata["mention_by"] == "bob"
+
+
+@pytest.mark.asyncio
+async def test_after_a_restart_a_read_mention_is_old(monkeypatch):
+    fake = _FakeGitHub()
+    fake.comments = [
+        _comment(11, "bob", "@alice can you look at this?", 30),
+        _comment(12, "some-ci[bot]", "Build finished.", 300),
+    ]
+    fake.events = [(32, "alice")]
+    src = _source(monkeypatch, fake)
+    src._run = gh._Run(login=_ME, first_look=_T0 + timedelta(seconds=200), unread={})
+
+    _, record = await _record(src, _notif(updated_at=320))
+
+    assert record.metadata["mention"] == "old"
 
 
 @pytest.mark.asyncio
@@ -636,7 +755,7 @@ async def test_only_the_latest_looks_are_remembered(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# The comments since the previous update
+# The new comments
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -651,7 +770,7 @@ async def test_new_comments_are_listed_by_time_and_shown_newest_first(monkeypatc
     extra, record = await _record(src, _notif(reason="assign"))
 
     # The listing of one thread's comments takes no sort order: it is asked
-    # for the comments since the previous update instead.
+    # for the comments since the start of the look instead.
     listing = [c for c in fake.calls if "/issues/7/comments" in c]
     assert listing == [f"{_API}/issues/7/comments?since={_ts(0)}&per_page=100"]
     assert [c["user"] for c in extra["recent_comments"]] == [
@@ -815,6 +934,157 @@ async def test_a_run_starts_its_first_looks_shortly_before_the_cursor(monkeypatc
     await src.fetch(_ts(0))
 
     assert f"{_API}/issues/7/comments?since={_ts(-120)}&per_page=100" in fake.calls
+
+
+# ---------------------------------------------------------------------------
+# What the readers of the inbox have read
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_a_run_asks_which_records_are_unread(monkeypatch):
+    asked: list[list[str]] = []
+
+    async def unread(ids):
+        asked.append(ids)
+        return {}
+
+    fake = _FakeGitHub()
+    src = _source(monkeypatch, fake, unread=unread)
+    _list_with(monkeypatch, [
+        _notif(thread_id="t1"),
+        _notif(reason="assign", thread_id="t2"),
+        _notif(reason="author", thread_id="t3"),
+    ])
+
+    await src.fetch(_ts(0))
+
+    assert asked == [["t1", "t2"]]
+
+
+@pytest.mark.asyncio
+async def test_a_run_that_cannot_read_the_read_state_treats_records_as_unread(monkeypatch):
+    async def unread(ids):
+        raise RuntimeError("database is locked")
+
+    fake = _FakeGitHub()
+    src = _source(monkeypatch, fake, unread=unread)
+    _list_with(monkeypatch, [_notif()])
+
+    await src.fetch(_ts(0))
+
+    assert src._run.unread is None
+    assert src._unread_record("t1") == {}
+
+
+def _stored(rid: str, metadata: dict):
+    from nerve.sources.models import SourceRecord
+
+    return SourceRecord(
+        id=rid, source="github", record_type="github_notification",
+        summary=f"[acme/widgets] thread {rid} (mention)", content="text",
+        timestamp=_ts(0), metadata=metadata,
+    )
+
+
+@pytest.mark.asyncio
+async def test_storage_says_a_record_is_unread_until_every_live_consumer_read_it(db):
+    # Nobody reads the source: nothing is unread.
+    await db.insert_source_messages([_stored("t0", {"mention": "new"})], source="github")
+    assert await db.unread_source_message_metadata("github", ["t0"]) == {}
+
+    # Two consumers start here; a cursor of another source does not count.
+    start = await db.get_consumer_cursor("inbox", "github")
+    assert await db.get_consumer_cursor("digest", "github") == start
+    await db.set_consumer_cursor("inbox", "gmail", 0)
+    await db.insert_source_messages(
+        [_stored("t1", {"mention": "new", "mention_at": _ts(30)}), _stored("t2", {})],
+        source="github",
+    )
+
+    assert await db.unread_source_message_metadata("github", ["t0", "t1", "t2", "missing"]) == {
+        "t1": {"mention": "new", "mention_at": _ts(30)},
+        "t2": {},
+    }
+    assert await db.unread_source_message_metadata("github", []) == {}
+    assert await db.unread_source_message_metadata("gmail", ["t1"]) == {}
+
+    # One consumer read them. The other has not.
+    rows = await db.read_source_messages_by_rowid("github", after_seq=start, limit=50)
+    newest = max(r["rowid"] for r in rows)
+    await db.set_consumer_cursor("inbox", "github", newest)
+    assert sorted(await db.unread_source_message_metadata("github", ["t1", "t2"])) == ["t1", "t2"]
+
+    # The other consumer's cursor expires: it starts again at the newest
+    # record and never reads these.
+    await db.db.execute(
+        "UPDATE consumer_cursors SET expires_at = ? WHERE consumer = 'digest'",
+        ("2000-01-01T00:00:00+00:00",),
+    )
+    await db.db.commit()
+    assert await db.unread_source_message_metadata("github", ["t1", "t2"]) == {}
+
+
+@pytest.mark.asyncio
+async def test_the_registered_source_reads_the_read_state_from_storage(db):
+    cfg = NerveConfig.from_dict({"sync": {"github": {"enabled": True}}})
+    runner = next(
+        r for r in build_source_runners(cfg, db) if r.source.source_name == "github"
+    )
+    await db.get_consumer_cursor("inbox", "github")
+    await db.insert_source_messages([_stored("t1", {"mention": "new"})], source="github")
+
+    assert await runner.source._unread(["t1", "t2"]) == {"t1": {"mention": "new"}}
+
+
+@pytest.mark.asyncio
+async def test_a_mention_replaced_before_the_reader_came_still_reaches_the_reader(db, monkeypatch):
+    # The whole path: the source runs twice between two reads of the inbox.
+    # A human mentions the account, the first run stores a record that says
+    # new, a bot comment moves the thread, and the second run replaces the
+    # record. The reader then sees one record of the thread, and it must be
+    # the mention, not an update.
+    fake = _FakeGitHub()
+    src = GitHubSource(unread=lambda ids: db.unread_source_message_metadata("github", ids))
+    monkeypatch.setattr(src, "_gh_api_get", fake.get)
+    monkeypatch.setattr(src, "_gh_graphql", fake.graphql)
+    runner = SourceRunner(src, db)
+    await db.set_sync_cursor("github", _ts(0))
+    read_until = await db.get_consumer_cursor("inbox", "github")
+
+    async def read_inbox() -> list[dict]:
+        nonlocal read_until
+        rows = await db.read_source_messages_by_rowid("github", after_seq=read_until, limit=50)
+        if rows:
+            read_until = max(r["rowid"] for r in rows)
+            await db.set_consumer_cursor("inbox", "github", read_until)
+        return rows
+
+    fake.comments = [_comment(11, "bob", "@alice can you look at this?", 30)]
+    fake.events = [(32, "alice")]
+    _list_with(monkeypatch, [_notif(updated_at=52)])
+    await runner.run()
+
+    fake.comments.append(_comment(12, "some-ci[bot]", "Build finished.", 300))
+    _list_with(monkeypatch, [_notif(updated_at=320)])
+    await runner.run()
+
+    rows = await read_inbox()
+    assert len(rows) == 1
+    assert rows[0]["summary"] == "[acme/widgets] Widget breaks (mention)"
+    metadata = rows[0]["metadata"]
+    assert metadata["mention"] == "new"
+    assert metadata["mention_by"] == "bob"
+    assert "@alice can you look at this?" in rows[0]["content"]
+
+    # The reader has read the mention. The next update is an update only.
+    fake.comments.append(_comment(13, "some-ci[bot]", "Deployed.", 600))
+    _list_with(monkeypatch, [_notif(updated_at=620)])
+    await runner.run()
+
+    rows = await read_inbox()
+    assert len(rows) == 1
+    assert rows[0]["summary"] == "[acme/widgets] Widget breaks (update, no new mention)"
+    assert rows[0]["metadata"]["mention"] == "old"
 
 
 # ---------------------------------------------------------------------------
