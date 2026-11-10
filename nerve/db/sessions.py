@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from typing import Any
 
 from nerve.identity import (
     CAUSE_FROM_ACTOR,
@@ -14,6 +15,11 @@ from nerve.identity import (
     resolve_cause,
 )
 from nerve.session_origin import Origin
+
+#: Metadata keys with a writer of their own (:meth:`SessionStore.set_session_metadata_key`).
+#: :meth:`update_session_metadata` keeps their stored values, so a caller that
+#: read the metadata before such a write cannot undo it by writing its copy back.
+OWNED_METADATA_KEYS: tuple[str, ...] = ("telegram_topic_auto",)
 
 # Sources the sidebar treats as "system" (machine-driven); everything else is a conversation by exclusion, so a new source shows up in the feed by default.
 SYSTEM_SOURCES = ("cron", "hook")
@@ -500,9 +506,22 @@ class SessionStore:
             col_sync["connected_at"] = metadata["connected_at"]
         built = self._build_session_fields_update(session_id, col_sync)
         async with self._atomic():
+            async with self.db.execute(
+                "SELECT metadata FROM sessions WHERE id = ?", (session_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            out = {k: v for k, v in metadata.items() if k not in OWNED_METADATA_KEYS}
+            try:
+                stored = json.loads((row["metadata"] if row else None) or "{}")
+            except (TypeError, ValueError):
+                stored = {}
+            if isinstance(stored, dict):
+                for key in OWNED_METADATA_KEYS:
+                    if key in stored:
+                        out[key] = stored[key]
             await self.db.execute(
                 "UPDATE sessions SET metadata = ? WHERE id = ?",
-                (json.dumps(metadata), session_id),
+                (json.dumps(out), session_id),
             )
             if built is not None:
                 await self.db.execute(*built)
@@ -634,6 +653,40 @@ class SessionStore:
                 )
                 written.append(event_type)
         return written
+
+    async def set_session_metadata_key(
+        self, session_id: str, key: str, value: Any,
+    ) -> bool:
+        """Set one owned metadata key in place, or remove it with ``None``.
+
+        For the keys in :data:`OWNED_METADATA_KEYS`. One read and one write in
+        a transaction, so a concurrent writer of other keys loses nothing.
+        Returns ``False`` for an unknown session.
+        """
+        if key not in OWNED_METADATA_KEYS:
+            raise ValueError(f"{key!r} is not an owned metadata key")
+        async with self._atomic():
+            async with self.db.execute(
+                "SELECT metadata FROM sessions WHERE id = ?", (session_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return False
+            try:
+                meta = json.loads(row["metadata"] or "{}")
+            except (TypeError, ValueError):
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            if value is None:
+                meta.pop(key, None)
+            else:
+                meta[key] = value
+            await self.db.execute(
+                "UPDATE sessions SET metadata = ? WHERE id = ?",
+                (json.dumps(meta), session_id),
+            )
+        return True
 
     async def change_session_status(
         self,

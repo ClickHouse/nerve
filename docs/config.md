@@ -1429,7 +1429,60 @@ Notifications follow the session. A push from a session that lives in a topic
 typed in the topic. Pushes from other sessions go to the
 [notification sink](#notification-sink) as before. Output that a session
 produces after its turn has ended, when a background job finishes, does not
-reach Telegram yet, topic or not.
+reach Telegram, except in a topic that `topics.auto` opened with
+`mirror_turns` on (below).
+
+#### Topics for every session (`telegram.topics.auto`)
+
+With `telegram.topics.auto.enabled`, Nerve gives sessions a topic without
+being asked. When a turn of an eligible session starts, the session gets a
+topic in the notification chat (`notifications.telegram_chat_id`, else the
+first allowed user's DM), named after it and renamed once its title is
+generated. Only sessions that run a turn after the switch is on get one;
+nothing is backfilled. Each session gets at most one this way: a topic that
+was deleted or let go of is not opened again, and a session that is on
+Telegram already (it came from there, or someone opened its topic) is left
+alone.
+
+```yaml
+telegram:
+  topics:
+    auto:
+      enabled: true
+      sources: [web, cron, hook]       # session sources that get a topic
+      exclude: ["cron:nightly-report:*"]     # fnmatch on the session id
+      close_on: [archive, delete, cron_done]
+      private_chat_close: unbind       # or: delete
+      mirror_turns: true
+```
+
+The topic is let go of on the events in `close_on`: the session is archived
+(by hand, in a cascade, or by the cleanup after
+`sessions.archive_after_days`), deleted, or, for a cron run's own session
+(`cron:<job>:<run>`), its run ended and no background work is left. The topic
+gets a last note, is unbound, and is closed in a forum. In a private chat
+Telegram cannot close a topic: `unbind` leaves it with the note, and `delete`
+deletes it with its messages. Topics opened by hand are not touched.
+
+A turn typed in the web UI does not reach Telegram on its own. With
+`mirror_turns`, each finished turn that did not come from Telegram is posted in
+the session's topic: the message, quoted, then the final answer (cut at
+`mirror_max_chars`, default 12,000). Background continuations are posted too.
+Tool calls and the streamed preview are not. A push from the session goes into
+its topic, as for any session that lives in one, so with `cron` in `sources` a
+job's alerts arrive in its run's topic rather than in the chat.
+
+| Key | Default | |
+|-----|---------|--|
+| `enabled` | `false` | The switch. `auto: true` is short for it. |
+| `sources` | `[web, cron, hook]` | Session sources that get a topic. Telegram, Slack, workflow and external sessions are never in it by default. |
+| `exclude` | `[]` | `fnmatch` patterns on the session id that get none, e.g. `cron:nightly-report:*`. |
+| `close_on` | `[archive, delete, cron_done]` | When to let go of the topic. |
+| `private_chat_close` | `unbind` | `unbind` or `delete`, for a private chat. |
+| `mirror_turns` | `false` | Post finished turns that did not come from Telegram. |
+| `mirror_max_chars` | `12000` | Longest answer mirrored. |
+
+All of it is read per turn, so it follows `nerve reload`.
 
 Telegram does not say which topic a reaction's message is in, so Nerve looks
 the message up in its recent-message cache (the last 200 messages). A reaction

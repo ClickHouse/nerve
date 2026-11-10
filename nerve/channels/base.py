@@ -14,6 +14,7 @@ from enum import Flag, auto
 from typing import Any
 
 from nerve.channels.access import Decision
+from nerve.channels.session_events import TurnFinished, TurnStarted
 from nerve.identity import Actor
 
 
@@ -301,3 +302,25 @@ class BaseChannel(abc.ABC):
         Telegram topic. The default does nothing.
         """
         return None
+
+    def on_turn_started(self, event: TurnStarted) -> None:
+        """A turn of a session started (any source, not only this channel's).
+
+        Called on the turn's path, so it must not block: a channel with work
+        to do schedules it. The default does nothing.
+        """
+        return None
+
+    def on_turn_finished(self, event: TurnFinished) -> None:
+        """A turn of a session finished and was stored. Must not block, like
+        :meth:`on_turn_started`. The default does nothing."""
+        return None
+
+    async def on_session_ending(self, session_id: str, reason: str) -> None:
+        """A session is being archived or deleted (``reason``).
+
+        For a delete this runs before the session's rows go, so the
+        channel's bindings of it are still there. The default does nothing.
+        """
+        return None
+

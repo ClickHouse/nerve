@@ -48,6 +48,8 @@ from nerve.channels.base import (
 )
 from nerve.channels.observation import ObservationPolicy
 from nerve.channels.router import turn_stop_note
+from nerve.channels.session_events import TurnFinished, TurnStarted
+from nerve.channels.telegram_auto_topics import AutoTopics
 from nerve.config import NerveConfig
 
 if TYPE_CHECKING:
@@ -1263,6 +1265,8 @@ class TelegramChannel(BaseChannel):
         # Opening a session's topic in a chat: "<chat>:<session>" -> lock, so
         # two calls at once (a retried request, a tap and a call) open one.
         self._open_topic_locks: dict[str, asyncio.Lock] = {}
+        # Topics for sessions that never asked for one (telegram.topics.auto).
+        self._auto_topics = AutoTopics(self)
         # Streaming edit budget per chat: chat_id -> monotonic ts of last edit
         self._last_chat_edit: collections.OrderedDict[int, float] = (
             collections.OrderedDict()
@@ -2473,6 +2477,71 @@ class TelegramChannel(BaseChannel):
             await self.router.switch_session(key, session_id)  # still open: keep it
             return "", f"Couldn't close {key}: {exc}"
         return "closed", ""
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the bot is up (``start`` ran and ``stop`` has not)."""
+        return self._app is not None and not self._stopping
+
+    async def post_in_topic(self, channel_key: str, session_id: str, text: str) -> bool:
+        """Post *text* (markdown) in the topic of *channel_key*; False if it did not go.
+
+        A topic found deleted is unbound from the session.
+        """
+        topic = _address_of_key(channel_key)
+        if self._app is None or topic is None or topic.thread_id is None:
+            return False
+        try:
+            await self.send(OutboundMessage(
+                target=topic.target, text=self.format_response(text), session_id=session_id,
+            ))
+        except Exception as exc:
+            if _error_says(exc, _TOPIC_GONE_ERRORS):
+                await self.router.forget_channel(channel_key)
+            else:
+                logger.warning("Could not post in %s: %s", channel_key, exc)
+            return False
+        return True
+
+    async def let_go_of_topic(
+        self, channel_key: str, session_id: str, note: str | None,
+        *, delete_in_private: bool = False,
+    ) -> tuple[str, str]:
+        """Let go of one topic of a session: ``(outcome, "")`` or ``("", why not)``.
+
+        What :meth:`close_session_topic` does for each topic, for a single
+        one: note, unbind, close. With *delete_in_private*, a topic in a
+        private chat (where Telegram cannot close one) is deleted instead,
+        messages and all, and the note is skipped.
+        """
+        topic = _address_of_key(channel_key)
+        if self._app is None:
+            return "", "Telegram is not running"
+        if topic is None or topic.thread_id is None:
+            return "", f"{channel_key} is not a topic"
+        async with self._topic_locks.setdefault(channel_key, asyncio.Lock()):
+            if delete_in_private and topic.chat_id > 0:
+                await self.router.forget_channel(channel_key)
+                try:
+                    await self._app.bot.delete_forum_topic(
+                        chat_id=topic.chat_id, message_thread_id=topic.thread_id,
+                    )
+                except Exception as exc:
+                    if _error_says(exc, _TOPIC_GONE_ERRORS):
+                        return "gone", ""
+                    await self.router.switch_session(channel_key, session_id)
+                    return "", f"Couldn't delete {channel_key}: {exc}"
+                return "deleted", ""
+            return await self._close_topic(topic, session_id, note)
+
+    def on_turn_started(self, event: TurnStarted) -> None:
+        self._auto_topics.turn_started(event)
+
+    def on_turn_finished(self, event: TurnFinished) -> None:
+        self._auto_topics.turn_finished(event)
+
+    async def on_session_ending(self, session_id: str, reason: str) -> None:
+        await self._auto_topics.session_ending(session_id, reason)
 
     async def _send_transcript(self, query: Any, session_id: str) -> None:
         """The ``📄 Send transcript`` button: the whole conversation as a ``.md`` file."""
