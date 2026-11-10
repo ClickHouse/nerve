@@ -53,6 +53,14 @@ logger = logging.getLogger(__name__)
 
 # Telegram message length limit
 MAX_MSG_LEN = 4096
+# Shown (no LLM) when a user replies to a message we can't tie to a live session,
+# rather than silently mis-routing the reply into the chat's active session.
+REPLY_UNRESOLVED_MSG = (
+    "⚠️ I couldn't find the session that produced the message you replied to "
+    "(it may be too old, or its session was archived), so nothing was sent. "
+    "Reply with /new <your message> to start a new session with it quoted, "
+    "or send the message without replying to reach the active session."
+)
 # Minimum interval between message edits (seconds) to avoid rate limits
 EDIT_INTERVAL = 1.5
 # Watchdog: check every 30s, log heartbeat every ~5 min
@@ -1132,6 +1140,7 @@ class TelegramChannel(BaseChannel):
                     text=chunk,
                 )
             self._cache_message(sent.message_id, chat_id, chunk)
+            await self._record_reply_route(sent.message_id, chat_id, message.session_id)
 
     def format_response(self, text: str) -> str:
         """Return text unchanged.
@@ -1244,11 +1253,15 @@ class TelegramChannel(BaseChannel):
     #  Files: deliver a workspace file as a Telegram document             #
     # ------------------------------------------------------------------ #
 
-    async def send_file(self, target: str, file_path: str) -> bool:
+    async def send_file(
+        self, target: str, file_path: str, *, session_id: str | None = None,
+    ) -> bool:
         """Deliver a file to a Telegram chat as a document attachment.
 
         Size limits are enforced by the Telegram API itself (50 MiB on
         api.telegram.org, up to 2 GiB on self-hosted Bot API servers).
+        A reply to the document routes to ``session_id`` (see
+        ``_record_reply_route``).
         """
         if self._app is None:
             return False
@@ -1256,11 +1269,14 @@ class TelegramChannel(BaseChannel):
         if not path.is_file():
             return False
         try:
-            await self._app.bot.send_document(
-                chat_id=int(target),
+            chat_id = int(target)
+            sent = await self._app.bot.send_document(
+                chat_id=chat_id,
                 document=path,
                 filename=path.name,
             )
+            if session_id and sent is not None:
+                await self._record_reply_route(sent.message_id, chat_id, session_id)
             return True
         except Exception as e:
             logger.warning("send_file: send_document failed for %s: %s", target, e)
@@ -1280,6 +1296,123 @@ class TelegramChannel(BaseChannel):
         self._message_cache.move_to_end(message_id)
         while len(self._message_cache) > self._message_cache_max:
             self._message_cache.popitem(last=False)
+
+    # ------------------------------------------------------------------ #
+    #  Reply routing (reply → originating session)                         #
+    # ------------------------------------------------------------------ #
+
+    def _reply_routing_enabled(self) -> bool:
+        """Whether reply→origin-session routing is on (a telegram config flag).
+
+        On by default. ``false`` restores the old behaviour: a reply is then
+        context-only and lands in the active session, and none of the resolve /
+        reject machinery runs. Routes are still recorded (see
+        ``_record_reply_route``), so turning the flag back on covers earlier
+        messages too. Read live per message so a config reload can flip it
+        without a restart.
+        """
+        return bool(self.config.telegram.reply_routes_to_origin_session)
+
+    async def _record_reply_route(
+        self, message_id: int, chat_id: int, session_id: str,
+    ) -> None:
+        """Remember which session a Telegram message belongs to.
+
+        Lets a later user REPLY to that message route back to that session
+        (see ``_resolve_reply``). Recorded whether or not routing is enabled:
+        the flag gates routing, and a map that only filled while the flag was
+        on would start empty the day it is turned on. Keyed per chat —
+        message ids repeat across chats, so keying on the id alone would let
+        one chat clobber another chat's identically-numbered message.
+
+        Stored in ``channel_reply_routes`` so it survives a restart. A failed
+        write is logged and otherwise ignored: the route is auxiliary to the
+        message it rides on, and losing it only degrades a later reply to the
+        nudge, whereas raising would abort the send or drop the inbound message.
+        """
+        if not session_id:
+            return
+        try:
+            await self.router.engine.db.record_reply_route(
+                "telegram", str(chat_id), str(message_id), session_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not record reply route for message %s in chat %s: %s",
+                message_id, chat_id, e,
+            )
+
+    async def _lookup_reply_route(
+        self, message_id: int, chat_id: int,
+    ) -> str | None:
+        """Session that produced ``message_id`` in ``chat_id``, or None.
+
+        The key is per-chat, so a ``message_id`` from one chat can never
+        route a reply into a session bound to a different chat. A notification
+        card delivered before routes were stored has no route row; its
+        delivery record still names the session that raised it. A failed
+        lookup is logged and resolves to None, which the caller turns into
+        the nudge rather than a dropped message.
+        """
+        db = self.router.engine.db
+        target, provider_id = str(chat_id), str(message_id)
+        try:
+            session_id = await db.lookup_reply_route("telegram", target, provider_id)
+            if session_id:
+                return session_id
+            delivered = await db.find_notification_for_delivery(
+                "telegram", target, provider_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Could not look up the reply route for message %s in chat %s: %s",
+                message_id, chat_id, e,
+            )
+            return None
+        return (delivered or {}).get("session_id") or None
+
+    async def _resolve_reply(
+        self, reply_message_id: int | None, chat_id: int,
+    ) -> tuple[str, str | None]:
+        """Decide how to route an inbound message given its reply target.
+
+        Returns ``(action, session_id)``:
+
+        - ``("active", None)`` — not a reply; use the chat's active session
+          (the default; plain messages are unchanged).
+        - ``("route", sid)``  — a reply to a message this bot produced whose
+          session is still live; route there and make it active.
+        - ``("reject", None)`` — a reply we cannot tie to a live session (the
+          message was never recorded or its route was pruned, or its session
+          is gone/archived). The caller nudges the user and drops the message
+          WITHOUT starting a turn — an explicit reply is never silently
+          delivered to the active session, which would be a mis-route.
+        """
+        if reply_message_id is None:
+            return ("active", None)
+        session_id = await self._lookup_reply_route(reply_message_id, chat_id)
+        if not session_id:
+            return ("reject", None)
+        try:
+            row = await self.router.get_session(session_id)
+        except Exception:
+            row = None
+        if not row or row.get("status") == "archived":
+            return ("reject", None)
+        return ("route", session_id)
+
+    async def _delivery_session(
+        self, routed_session: str | None, channel_key: str,
+    ) -> str:
+        """The session an inbound message will actually be delivered to:
+        the explicit reply target if one resolved, else the chat's active
+        session. Recorded against the incoming message id so a later reply to
+        it — including the user replying to their OWN message — routes back to
+        the same session.
+        """
+        if routed_session:
+            return routed_session
+        return await self.router.get_active_session(channel_key, source="telegram")
 
     # ------------------------------------------------------------------ #
     #  Auth                                                                #
@@ -1368,7 +1501,10 @@ class TelegramChannel(BaseChannel):
                 )
             return
         await update.message.reply_text(
-            "Connected to Nerve. Send me a message to start chatting."
+            "Connected to Nerve. Send me a message to start chatting.\n\n"
+            "Replying to a message continues the session it belongs to. "
+            "/new [message] starts a fresh session, with the message as its "
+            "first turn if given. /sessions lists and switches sessions."
         )
 
     async def _handle_pair(self, update: Update, context: Any) -> None:
@@ -1846,7 +1982,13 @@ class TelegramChannel(BaseChannel):
             )
 
     async def _handle_new_session(self, update: Update, context: Any) -> None:
-        """Handle /new [title] — stop current session, create and switch to a new one."""
+        """Handle /new [message] — stop the current session, switch to a new one.
+
+        Text after the command is the new session's first message, delivered
+        through the same pipeline as a plain message but with the new session
+        forced as the target. A reply's routing is bypassed, so this is how to
+        answer a message without continuing the session it came from.
+        """
         self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
@@ -1863,14 +2005,17 @@ class TelegramChannel(BaseChannel):
                     parse_mode=ParseMode.MARKDOWN,
                 )
 
-        title = " ".join(context.args) if context.args else None
-        session_id = await self.router.create_session(
-            channel_key, title=title, source="telegram",
-        )
+        # Taken from the raw text rather than ``context.args``, which is
+        # whitespace-split and would flatten a multi-line message. No title:
+        # the engine names the session from its first exchange.
+        parts = (update.message.text or "").split(maxsplit=1)
+        first_message = parts[1] if len(parts) > 1 else ""
+        session_id = await self.router.create_session(channel_key, source="telegram")
         await update.message.reply_text(
-            f"New session: `{session_id}`" + (f" — {title}" if title else ""),
-            parse_mode=ParseMode.MARKDOWN,
+            f"New session: `{session_id}`", parse_mode=ParseMode.MARKDOWN,
         )
+        if first_message:
+            await self._deliver_message(update, first_message, session_id=session_id)
 
     async def _handle_stop(self, update: Update, context: Any) -> None:
         """Handle /stop — stop the currently running session."""
@@ -2296,6 +2441,15 @@ class TelegramChannel(BaseChannel):
         if not handled:
             return
 
+        # A reply to a pending ask_user card is its answer — like a button tap
+        # or /reply — not a message for the agent. Checked before the sink
+        # gate so a card in the notifications group can be answered there too.
+        # An album is a message, not an answer.
+        if not update.message.media_group_id and await self._maybe_answer_question_reply(
+            update, update.message.text or update.message.caption or "",
+        ):
+            return
+
         # Delivery-only notification sink: never start an agent turn on a
         # message that arrives in the notifications group (a one-way channel).
         if self._is_delivery_only_sink(update.effective_chat):
@@ -2315,8 +2469,24 @@ class TelegramChannel(BaseChannel):
             await self._collect_media_group(update)
             return
 
+        await self._deliver_message(
+            update, update.message.text or update.message.caption or "",
+        )
+
+    async def _deliver_message(
+        self, update: Update, text: str, *, session_id: str | None = None,
+    ) -> None:
+        """Turn one inbound message into an agent turn.
+
+        Builds the agent-facing text (forward origin, reply context and quote,
+        attachments on this message and on the replied-to one), picks the
+        session and delivers. ``session_id`` forces the target: ``/new <text>``
+        passes the session it just created, so the message gets there even as
+        a reply — no routing lookup, no rejection. Otherwise a reply routes to
+        the session that produced the replied-to message when routing is on,
+        and anything else lands in the chat's active session.
+        """
         chat_id = update.effective_chat.id
-        text = update.message.text or update.message.caption or ""
 
         # Cache for reaction lookups (raw text, before reply-context prefix)
         self._cache_message(update.message.message_id, chat_id, text)
@@ -2377,11 +2547,49 @@ class TelegramChannel(BaseChannel):
         if images:
             metadata["images"] = images
 
+        # Reply routing (telegram.reply_routes_to_origin_session, on by default).
+        # When off, a reply is context-only and lands in the active session
+        # (the target stays None), exactly like a plain message. A forced
+        # target skips the lookup altogether: a reply the user sent as
+        # /new <text> must never be refused on its way to the session they
+        # just asked for.
+        channel_key = f"telegram:{chat_id}"
+        target_session: str | None = session_id
+        if target_session is None and self._reply_routing_enabled():
+            # Route a reply to the session that produced the replied-to message
+            # (and make it active). An unresolvable reply is rejected with a
+            # no-LLM nudge rather than mis-routed into the active session.
+            action, routed_session = await self._resolve_reply(
+                reply_msg.message_id if reply_msg else None, chat_id,
+            )
+            if action == "reject":
+                logger.info(
+                    "Telegram reply from chat %s not tied to a live session; nudging",
+                    chat_id,
+                )
+                try:
+                    await update.message.reply_text(REPLY_UNRESOLVED_MSG)
+                except Exception:
+                    logger.error("Failed to send reply-unresolved nudge to chat %s", chat_id)
+                return
+            if routed_session:
+                logger.info("Telegram reply routed to session %s", routed_session)
+            target_session = await self._delivery_session(routed_session, channel_key)
+        # Record this inbound message against the session it lands in, so a
+        # later reply to it — including the user replying to their own
+        # message — routes back to the same session. Recorded with routing
+        # off too, so the map is already complete when the flag is turned on.
+        await self._record_reply_route(
+            update.message.message_id, chat_id,
+            target_session or await self._delivery_session(None, channel_key),
+        )
+
         msg = InboundMessage(
             channel_name="telegram",
-            channel_key=f"telegram:{chat_id}",
+            channel_key=channel_key,
             sender_id=str(chat_id),
             text=text,
+            session_id=target_session,
             metadata=metadata,
         )
 
@@ -2558,11 +2766,46 @@ class TelegramChannel(BaseChannel):
         if images:
             metadata["images"] = images
 
+        # Reply routing (telegram.reply_routes_to_origin_session, on by default).
+        # When off, a reply is context-only and lands in the active session
+        # (session_id stays None), exactly like a plain message.
+        channel_key = f"telegram:{chat_id}"
+        target_session: str | None = None
+        if self._reply_routing_enabled():
+            # Route a reply to the session that produced the replied-to message
+            # (and make it active). An unresolvable reply is rejected with a
+            # no-LLM nudge rather than mis-routed into the active session.
+            action, routed_session = await self._resolve_reply(
+                reply_msg.message_id if reply_msg else None, chat_id,
+            )
+            if action == "reject":
+                logger.info(
+                    "Telegram reply from chat %s not tied to a live session; nudging",
+                    chat_id,
+                )
+                try:
+                    await updates[0].message.reply_text(REPLY_UNRESOLVED_MSG)
+                except Exception:
+                    logger.error("Failed to send reply-unresolved nudge to chat %s", chat_id)
+                return
+            if routed_session:
+                logger.info("Telegram reply routed to session %s", routed_session)
+            target_session = await self._delivery_session(routed_session, channel_key)
+        # Record this inbound message against the session it lands in, so a
+        # later reply to it — including the user replying to their own
+        # message — routes back to the same session. Recorded with routing
+        # off too, so the map is already complete when the flag is turned on.
+        await self._record_reply_route(
+            updates[0].message.message_id, chat_id,
+            target_session or await self._delivery_session(None, channel_key),
+        )
+
         msg = InboundMessage(
             channel_name="telegram",
-            channel_key=f"telegram:{chat_id}",
+            channel_key=channel_key,
             sender_id=str(chat_id),
             text=text,
+            session_id=target_session,
             metadata=metadata,
         )
 
@@ -2828,3 +3071,41 @@ class TelegramChannel(BaseChannel):
             )
         else:
             await update.message.reply_text("No pending questions in this chat.")
+
+    async def _maybe_answer_question_reply(self, update: Update, text: str) -> bool:
+        """Consume a reply to a pending ``ask_user`` card as its answer.
+
+        Returns True (message handled — do not route to the agent) when the
+        replied-to message is a pending question delivered to this chat and
+        the answer was recorded, or refused because the engine is draining
+        (the question stays pending, as with /reply). Anything else falls
+        through to normal routing: not a reply, no text, no service, a card
+        that is not a pending question, or an answer not accepted because the
+        question was answered or expired meanwhile. Works whether or not reply
+        routing is enabled, and in a delivery-only notifications group.
+        """
+        message = update.message
+        reply_to = getattr(message, "reply_to_message", None)
+        if reply_to is None or not text or self._notification_service is None:
+            return False
+        target = str(update.effective_chat.id)
+        notif = await self.router.engine.db.find_notification_for_delivery(
+            "telegram", target, str(reply_to.message_id),
+        )
+        if not notif or notif.get("status") != "pending" or notif.get("type") != "question":
+            return False
+        try:
+            result = await self._notification_service.answer_delivered_notification(
+                notif["id"],
+                text,
+                channel="telegram",
+                target=target,
+                actor=str(update.effective_user.id),
+            )
+        except NotAcceptingTurnsError as exc:
+            await message.reply_text(str(exc))
+            return True
+        if not result:
+            return False
+        await message.reply_text(f"Answer recorded for: {result['title']}")
+        return True

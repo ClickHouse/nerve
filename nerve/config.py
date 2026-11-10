@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 #
 # This block is the only place a default model id is spelled. Every other
 # site (the setup writer, the Bedrock geo-prefixed ids, the Claude CLI's
-# ``opus`` and ``haiku`` aliases, the terminal wizard's example line)
+# ``opus``, ``haiku`` and ``fable`` aliases, the terminal wizard's example line)
 # references these names, and ``tests/test_default_models.py`` fails on a
 # model-id literal anywhere else under ``nerve/`` — so the next update is one
 # edit here plus the regenerated goldens, examples and docs.
@@ -42,7 +42,7 @@ DEFAULT_TITLE_MODEL = "claude-haiku-5-5"        # agent.title_model
 DEFAULT_RECALL_MODEL = "claude-sonnet-5-5"      # memory.recall_model
 DEFAULT_MEMORIZE_MODEL = "claude-sonnet-5-5"    # memory.memorize_model
 DEFAULT_FAST_MODEL = "claude-haiku-5-5"         # memory.fast_model; also the CLI's ``haiku`` alias
-DEFAULT_FALLBACK_MODEL = "claude-fable-5-1"     # second entry of the built-in picker list
+DEFAULT_FALLBACK_MODEL = "claude-fable-5-2"     # second entry of the built-in picker list; also the CLI's ``fable`` alias
 DEFAULT_EFFORT = "xhigh"                        # agent.effort (conversations); max is slower for no real gain on the 5.5 models
 
 # Fallback for the composer's Claude model picker when ``agent.models`` is
@@ -1096,9 +1096,10 @@ class AgentConfig:
     # emitted as ANTHROPIC_DEFAULT_<ALIAS>_MODEL env vars so short aliases
     # ("opus" in Agent/Workflow tool calls, skill frontmatter, cron model
     # overrides) resolve to the mapped model. Supported aliases: opus,
-    # sonnet, haiku, fable. Nerve defaults opus → DEFAULT_MODEL and
-    # haiku → DEFAULT_FAST_MODEL on non-Bedrock providers; the CLI also uses
-    # the haiku model for its background calls. Entries here merge over those
+    # sonnet, haiku, fable. Nerve defaults opus → DEFAULT_MODEL,
+    # haiku → DEFAULT_FAST_MODEL and fable → DEFAULT_FALLBACK_MODEL on
+    # non-Bedrock providers; the CLI also uses the haiku model for its
+    # background calls. Entries here merge over those
     # defaults, and an empty value ("") unsets one (falls back to the CLI's
     # built-in mapping).
     model_aliases: dict[str, str] = field(default_factory=dict)
@@ -1545,6 +1546,14 @@ class TelegramConfig:
     #                         agent access for any Telegram user. A warning
     #                         is logged at startup.
     dm_policy: str = "pairing"
+    # On (the default), a Telegram *reply* is routed to the session that
+    # produced the replied-to message (and that session becomes active); a
+    # reply that can't be tied to a live session is refused with a hint rather
+    # than delivered to the active session. `/new <message>` is the escape
+    # hatch: it starts a fresh session with that message, reply or not. False
+    # restores the old behaviour: a reply is context-only — it quotes the
+    # replied-to message and lands in the active session, like a plain message.
+    reply_routes_to_origin_session: bool = True
     # Chats whose traffic feeds the inbox — see ChannelSourceConfig.
     source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
 
@@ -1590,6 +1599,9 @@ class TelegramConfig:
             allowed_users=d.get("allowed_users") or [],
             stream_mode=d.get("stream_mode", "partial"),
             dm_policy=dm_policy,
+            reply_routes_to_origin_session=d.get(
+                "reply_routes_to_origin_session", True,
+            ),
             source=ChannelSourceConfig.from_dict(
                 d.get("source", {}), subject="chats",
             ).outside_hosted_mode("chats"),

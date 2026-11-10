@@ -255,7 +255,7 @@ A reload is always explicit. Two things cause one:
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
-| `telegram.dm_policy`, `.stream_mode` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
+| `telegram.dm_policy`, `.stream_mode`, `.reply_routes_to_origin_session` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; toggling `reply_routes_to_origin_session` takes effect on the next message, and applies to replies to earlier messages too (routes are recorded while it is off); `allowed_users` does not follow it (see the restart table) |
 | `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
@@ -986,7 +986,7 @@ Backups follow the same rule:
 | `agent.models` | list | `[]` | Claude models offered in the composer's model picker. `agent.model` always leads; entries extend the list. Empty → the discovered catalog (see `agent.model_discovery`), else a built-in current-generation list (opus / fable / sonnet / haiku); on Bedrock only configured models are offered |
 | `agent.model_discovery` | bool | `true` | Ask the Anthropic Models API (`GET /v1/models`) which models the configured credentials' catalog endpoint advertises, and offer those in the picker — so a newly released model needs no config edit. Catalog membership is not a serving guarantee (an advertised ID can still 404 on send; discovery runs no serving probe — see `agent.model_discovery_excluded_models`). Primed at gateway startup, cached in-process (6h) and refreshed in the background. Best-effort: ignored when `agent.models` is set, on Bedrock (the Bedrock client has no Models API), without an API key, or when the API is unreachable — the built-in list applies |
 | `agent.model_discovery_excluded_models` | list | `[]` | Model-ID substrings pruned from **discovery** results before the picker sees them (case-insensitive; empty/whitespace patterns ignored). A proxy/provider catalog is not a serving guarantee — e.g. a retired ID that `GET /v1/models` still advertises but that 404s on send — so this drops such entries without a code change, and hot-reloads (read at pick time, not baked into the 6h discovery cache). Applied only to discovered entries: `agent.model` and an explicit `agent.models` list are never filtered, so naming a model in config overrides an exclusion. Excluding everything discovery returns just leaves the configured default (not a fallback to the built-in list) |
-| `agent.model_aliases` | map | `{opus: claude-opus-5-5, haiku: claude-haiku-5-5}` | Alias → model ID remapping for the CLI (emitted as `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` env vars). Aliases (`opus`, `sonnet`, `haiku`, `fable`) used in Agent/Workflow tool model options, skill frontmatter, and cron overrides resolve to the mapped ID. Entries merge over the built-in `opus → claude-opus-5-5` and `haiku → claude-haiku-5-5` defaults (the `agent.model` and `memory.fast_model` defaults; not applied on Bedrock — set geo-prefixed IDs explicitly there); `""` unsets an alias. The CLI also uses the `haiku` model for its background calls unless `ANTHROPIC_SMALL_FAST_MODEL` is set |
+| `agent.model_aliases` | map | `{opus: claude-opus-5-5, haiku: claude-haiku-5-5, fable: claude-fable-5-2}` | Alias → model ID remapping for the CLI (emitted as `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` env vars). Aliases (`opus`, `sonnet`, `haiku`, `fable`) used in Agent/Workflow tool model options, skill frontmatter, and cron overrides resolve to the mapped ID. Entries merge over the built-in `opus → claude-opus-5-5`, `haiku → claude-haiku-5-5` and `fable → claude-fable-5-2` defaults (the `agent.model` and `memory.fast_model` defaults and the picker's second built-in entry; not applied on Bedrock — set geo-prefixed IDs explicitly there); `""` unsets an alias. The CLI also uses the `haiku` model for its background calls unless `ANTHROPIC_SMALL_FAST_MODEL` is set |
 | `agent.max_turns` | int | `1000` | Max agentic turns (model ↔ tool round-trips) per request on the Claude backend; a request that reaches it fails with "Reached maximum number of turns (N)". A last-resort stop for a looping agent, not a budget — real work routinely passes 50 and 100. `0` = no cap (the CLI gets no `--max-turns` flag). Read when a session's CLI client is built, so a changed value applies to new sessions, and to existing ones once their client is rebuilt |
 | `agent.max_concurrent` | int | `32` | Max concurrent agent sessions |
 | `agent.cache_ttl` | string | `"5m"` | Prompt-cache write TTL policy: `5m` (status quo), `1h` (always request the 1-hour TTL), or `auto` (per session at client-build time: sparse-cadence sessions — persistent crons, wakeup loops, spaced chats — get `1h`; dense sessions stay on `5m`). Per-cron-job override via `cache_ttl` in jobs.yaml. See `nerve/agent/cache_policy.py` |
@@ -1189,6 +1189,7 @@ carry text. A `.png` or `.ico` has to be committed by a human.
 | `telegram.dm_policy` | string | `pairing` | `pairing` (allowlist + one-time pairing codes) or `open` (anyone — dangerous) |
 | `telegram.allowed_users` | list[int] | `[]` | User IDs allowed to use the bot in private and group chats |
 | `telegram.stream_mode` | string | `partial` | `partial` (edit msgs) or `full` |
+| `telegram.reply_routes_to_origin_session` | bool | `true` | A reply routes to the session that produced the replied-to message (and makes it active); a reply that cannot be tied to a live session is refused with a hint. `/new <message>` is the escape hatch: it starts a fresh session with that message, reply or not. `false` restores the old behaviour: a reply is context-only and lands in the active session. The message→session map is stored in the database (`channel_reply_routes`, kept 90 days) whether the flag is on or off, so it survives a restart and turning the flag back on covers earlier messages. Either way, a reply to a pending `ask_user` card answers the question, like `/reply` |
 
 ### Notification sink
 
@@ -2416,6 +2417,42 @@ same rules as the trigger header: local mode sends none, Nerve removes an
 inherited line for it from `ANTHROPIC_CUSTOM_HEADERS`, and a CLI process keeps
 it for its whole life. Nerve does not prove the value. Codex requests have no
 cron job header.
+
+#### Inference origin header
+
+In external mode, Nerve also adds one `X-Nerve-Inference-Origin` header to
+each model request of a session that has a specific origin. The header names
+where the session comes from: the cron job, the channel conversation, the
+hook, the plan, the workflow run or the external client that started it. The
+value is `<kind>=<value>`, from the session's `trigger` and `origin_detail`
+(see [api.md](api.md#sessions)):
+
+| Session `trigger` | Value |
+|---|---|
+| `cron`, for a cron job | `cron=` and the job ID |
+| `slack`, `telegram` or `email` | `channel=` and the conversation ID, for example a Slack channel ID. Never the thread or the channel name |
+| `api`, for a webhook | `hook=` and the hook name |
+| `plan` | `plan=` and the plan ID |
+| `workflow` | `workflow=` and the workflow run ID |
+| `external` | `client=` and the name of the external client |
+
+The value after `=` has 1 to 56 bytes of `A`-`Z`, `a`-`z`, `0`-`9`, `.`, `_`
+and `-`, and the whole header value has at most 64 bytes. Nerve replaces each
+other byte of the detail with `_` (a character outside ASCII gives one `_` for
+each byte of its UTF-8 form) and cuts the result to 56 bytes, or to 55 for
+`workflow`. For example, a session of the cron job `nightly` sends
+`cron=nightly`.
+
+A session of another trigger (`chat`, `system`, `unknown`) or without the
+detail sends no origin header: for example a "Run later" session has no cron
+job, and a session of `/api/chat` has no hook. Nerve's own model calls send
+no origin header. Nerve sets a session's origin when it creates the session
+and never changes it; a session from before the trigger field sends the
+value from the origin that Nerve derives, when that has the detail. The
+header has the same rules as the principal header: local mode sends none,
+Nerve removes an inherited line for it from `ANTHROPIC_CUSTOM_HEADERS`, and a
+CLI process keeps it for its whole life. Nerve does not prove the value.
+Codex sends no origin header.
 
 ### System principal ID
 

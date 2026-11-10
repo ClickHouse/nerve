@@ -14,6 +14,7 @@ vi.mock('../api/client', () => ({
     answerNotification: vi.fn(),
     getNotification: vi.fn(),
     dismissAllNotifications: vi.fn(),
+    dismissNotification: vi.fn(),
   },
   // ActorLabel reads the viewer through the auth store, which wires these.
   setToken: vi.fn(), clearToken: vi.fn(), getToken: vi.fn(),
@@ -34,6 +35,7 @@ const listActors = vi.mocked(api.listActors);
 const answerNotification = vi.mocked(api.answerNotification);
 const getNotification = vi.mocked(api.getNotification);
 const dismissAllNotifications = vi.mocked(api.dismissAllNotifications);
+const dismissNotification = vi.mocked(api.dismissNotification);
 
 const ALICE = 'actor-alice';
 const BOB = 'actor-bob';
@@ -347,6 +349,73 @@ describe('NotificationsPage options', () => {
   });
 });
 
+describe('NotificationsPage dismiss', () => {
+  const PENDING = { status: 'pending', answer: null, answered_by: null, answered_at: null, options: ['yes', 'no'] };
+
+  it('dismisses a pending question and folds it to "Dismissed without an answer"', async () => {
+    const asked = notification({ id: 'ask-1', ...PENDING });
+    listNotifications
+      .mockResolvedValueOnce({ notifications: [asked], pending_count: 1, pending_answer_count: 1 })
+      .mockResolvedValue({
+        notifications: [{ ...asked, status: 'dismissed' }], pending_count: 0, pending_answer_count: 0,
+      });
+    dismissNotification.mockResolvedValue({ notification_id: 'ask-1', dismissed: true });
+    renderPage();
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Dismiss' }));
+
+    expect(dismissNotification).toHaveBeenCalledWith('ask-1');
+    expect(await screen.findByText('Dismissed without an answer')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: 'Pick one' })).not.toBeInTheDocument();
+  });
+
+  it('offers Dismiss on a pending approval and a notify row, not on an answered question', async () => {
+    listNotifications.mockResolvedValue({
+      notifications: [
+        notification({ id: 'ok-1', type: 'approval', ...PENDING, options: ['approve', 'decline'] }),
+        notification({ id: 'note-1', type: 'notify', ...PENDING, options: null }),
+        notification({ id: 'ask-old' }),
+      ],
+      pending_count: 2, pending_answer_count: 1,
+    });
+    renderPage();
+    await screen.findByText('Answer:');
+    expect(screen.getAllByRole('button', { name: 'Dismiss' })).toHaveLength(2);
+  });
+
+  it('shows the answer from another place when the server refuses', async () => {
+    const answered = notification({ id: 'ask-1', answer: 'yes', answered_by: 'telegram' });
+    listNotifications
+      .mockResolvedValueOnce({
+        notifications: [notification({ id: 'ask-1', ...PENDING })], pending_count: 1, pending_answer_count: 1,
+      })
+      .mockResolvedValue({ notifications: [answered], pending_count: 0, pending_answer_count: 0 });
+    dismissNotification.mockRejectedValue(new Error('409'));
+    getNotification.mockResolvedValue(answered);
+    renderPage();
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Dismiss' }));
+
+    expect(getNotification).toHaveBeenCalledWith('ask-1');
+    expect((await screen.findByText('Answer:')).parentElement).toHaveTextContent('Answer: yes');
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('says so when the server refuses and the question still waits', async () => {
+    const asked = notification({ id: 'ask-1', ...PENDING });
+    listNotifications.mockResolvedValue({ notifications: [asked], pending_count: 1, pending_answer_count: 1 });
+    dismissNotification.mockRejectedValue(new Error('503'));
+    getNotification.mockResolvedValue(asked);
+    renderPage();
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Dismiss' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not dismiss. Try again.');
+    expect(screen.getByRole('button', { name: 'Dismiss' })).toBeEnabled();
+  });
+});
+
 describe('NotificationToast options', () => {
   const ASK = {
     notification_id: 'ask-live', notification_type: 'question', session_id: 's1',
@@ -415,6 +484,25 @@ describe('NotificationToast options', () => {
     await act(async () => { await useNotificationStore.getState().dismissAll(); });
     expect(screen.queryByText('Build finished')).not.toBeInTheDocument();
     expect(screen.getByText('Which region?')).toBeInTheDocument();
+  });
+
+  it('folds to "Dismissed without an answer" from another place, then closes', () => {
+    vi.useFakeTimers();
+    try {
+      renderAt(<NotificationToast />);
+      push(ASK);
+      act(() => {
+        useNotificationStore.getState().handleWSNotificationDismissed({
+          notification_id: 'ask-live', notification_type: 'question', actor_id: ALICE,
+        });
+      });
+      expect(screen.queryByRole('group')).not.toBeInTheDocument();
+      expect(screen.getByText('Dismissed without an answer')).toBeInTheDocument();
+      act(() => { vi.advanceTimersByTime(6000); });
+      expect(screen.queryByText('Which region?')).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('folds to the answer from another place, then closes', () => {

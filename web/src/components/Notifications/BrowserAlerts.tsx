@@ -40,7 +40,11 @@ export function BrowserAlerts() {
       if (msg.type === 'notification' && !msg.silenced) {
         const alerts = useBrowserAlertStore.getState();
         alerter.receive(msg, alertsOn(alerts) && levelWants(alerts.level, msg.notification_type, msg.priority));
-      } else if (msg.type === 'notification_answered' || msg.type === 'notification_expired') {
+      } else if (
+        msg.type === 'notification_answered'
+        || msg.type === 'notification_expired'
+        || msg.type === 'notification_dismissed'
+      ) {
         alerter.close(msg.notification_id);
       }
     });

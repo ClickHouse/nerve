@@ -66,18 +66,20 @@ An install that existed before keeps the `task-planner` prompt in its `config/cr
 
 ### Duplicate Detection
 
-`task_create` automatically checks for potential duplicates before creating a task:
+`task_create` checks what a new task would double before it writes anything, and refuses in two cases:
 
-1. **Primary: `source_url` exact match** — If the task has a `source_url` (e.g., a GitHub issue URL), checks for any existing task with the same URL. This is the most reliable dedup for source-generated tasks, since the agent may paraphrase titles differently each time.
-2. **Fallback: Fuzzy FTS5 search** — Uses OR semantics (any word can match) ranked by BM25 relevance. This catches similar tasks even with different wording — e.g., "database backup failed" matches "Fix database backup failure". Stop words and short tokens (≤1 char) are stripped to reduce noise.
+1. **Same `source_url`** — a task already tracks that URL. The URL is the identity of a source-generated item (an issue, a PR, an email), whose title the agent may word differently each time. Pass the most specific URL you have — a comment permalink for a directive, the issue URL for the issue itself — or several deliberate tasks under one issue will each need `confirm_duplicate`.
+2. **Nearly the same title** — the title scores ≥ 0.85 against an existing task (done ones included). The score is IDF-weighted token overlap over all task titles: words every title of the install shares weigh nothing, the words that identify the work (a test name, an issue number, a function) weigh the most, and dates, small numbers and time stamps are ignored (a `#41`-style ticket reference is kept at any length). It is 0..1 and does not depend on the size of the corpus or the length of the title, so the threshold holds on a ten-task install and a ten-thousand-task one. Two exceptions never refuse, however alike the words: a match whose title names a *different* ticket, and a match that tracks a different `source_url` — both are reported as related with the reason.
 
-If matches are found, the tool returns them and refuses to create — the caller must re-invoke with `confirm_duplicate=true` to override. Confirming means "create a second task": the new task gets its own ID and file, and never replaces the one it resembles.
+The refusal lists each match with its status, its similarity and the words the titles share. Tasks that merely look alike never block: those scoring ≥ 0.5, and those that share a **rare identifier** with the new title (a test name, an issue number, a symbol — a token with a digit or underscore that appears in at most five titles) whatever their score, are listed as **related** — under the duplicates on a refusal, after the new ID on a success — so the caller can link or merge them. `confirm_duplicate=true` means "create a second task": the new task gets its own ID and file, and never replaces the one it resembles; the look-alikes are still reported with it.
+
+Earlier versions matched the new title against every task's title *and body* with an FTS5 OR query and a fixed BM25 cut-off. BM25 grows with query length and corpus size, so on a large install the cut-off fell below the score of one shared rare word and every create was refused; the title index replaced it.
 
 ### Search
 
 `task_search` performs an FTS5 full-text search on task titles and content using AND semantics (all words must match). Supports an optional status filter (`all` to include done tasks, specific status, or empty for open tasks only).
 
-Note: `task_search` (user-facing) uses strict AND matching for precision. Duplicate detection (internal) uses fuzzy OR matching for recall — these are intentionally different trade-offs.
+Note: `task_search` (user-facing) uses strict AND matching for precision. Duplicate detection does not use the FTS index at all — it scores titles against titles (see above), so it keeps working when the index is being rebuilt.
 
 ### Status Transitions
 

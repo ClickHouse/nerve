@@ -8,7 +8,9 @@ partly set by REST callers, and one value can belong to different triggers
 
 ``origin_detail`` is a JSON object with the details that the UI shows, for
 example the Slack channel or the cron job. Its keys are the ``DETAIL_*``
-constants below. Each key is optional.
+constants below. Each key is optional. :func:`origin_tag` gives the one
+detail that names where a session comes from as a short tag, for the model
+requests of the session.
 
 A row from before the column existed has no trigger, and neither has a row
 whose creator gave no origin. :func:`derive_origin` gives the origin of such
@@ -19,6 +21,7 @@ metadata and the channel mapping.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
@@ -101,6 +104,31 @@ _LABELS = {
     TRIGGER_SYSTEM: "Started by Nerve",
     TRIGGER_UNKNOWN: "Started from an unknown origin",
 }
+
+# The trigger of a session, to the kind of its origin tag and the detail key
+# of the value. The other triggers have no tag.
+_TAG_DETAILS = {
+    TRIGGER_CRON: ("cron", DETAIL_CRON_JOB),
+    TRIGGER_SLACK: ("channel", DETAIL_CHANNEL),
+    TRIGGER_TELEGRAM: ("channel", DETAIL_CHANNEL),
+    TRIGGER_EMAIL: ("channel", DETAIL_CHANNEL),
+    TRIGGER_API: ("hook", DETAIL_HOOK),
+    TRIGGER_PLAN: ("plan", DETAIL_PLAN_ID),
+    TRIGGER_WORKFLOW: ("workflow", DETAIL_WORKFLOW_RUN),
+    TRIGGER_EXTERNAL: ("client", DETAIL_CLIENT),
+}
+
+# The most bytes of an origin tag, and of the value in it.
+_TAG_MAX_BYTES = 64
+_TAG_VALUE_MAX_BYTES = 56
+
+# An origin tag, for fullmatch: the kind, "=", and 1 to 56 bytes of the value.
+_ORIGIN_TAG = re.compile(
+    r"(?:cron|channel|hook|plan|workflow|client)=[A-Za-z0-9._-]{1,56}",
+)
+
+# A byte that the value of an origin tag cannot have.
+_TAG_VALUE_UNSAFE = re.compile(rb"[^A-Za-z0-9._-]")
 
 
 @dataclass(frozen=True)
@@ -235,6 +263,45 @@ def origin_label(origin: Origin) -> str:
     if trigger == TRIGGER_CHAT and detail.get(DETAIL_FORK_OF):
         return "Forked from another chat"
     return _LABELS.get(trigger, _LABELS[TRIGGER_UNKNOWN])
+
+
+def origin_tag(origin: Origin) -> str | None:
+    """The detail that names where the session comes from, as ``<kind>=<value>``.
+
+    The kind says what the value names:
+
+    - ``cron``: the cron job. A "Run later" session has none.
+    - ``channel``: the Slack, Telegram or email conversation, never the
+      thread or the display name.
+    - ``hook``: the webhook of an ``api`` session.
+    - ``plan``: the plan.
+    - ``workflow``: the workflow run.
+    - ``client``: the external client.
+
+    The value is the detail with each byte outside ``[A-Za-z0-9._-]``
+    replaced by ``_``, so a character outside ASCII gives one ``_`` for each
+    byte of its UTF-8 form. It is cut to 56 bytes, and to 55 for
+    ``workflow``, so that the tag has at most 64 bytes. ``None`` for the
+    other triggers (``chat``, ``system``, ``unknown``) and when the detail is
+    missing.
+    """
+    if origin.trigger not in _TAG_DETAILS:
+        return None
+    kind, key = _TAG_DETAILS[origin.trigger]
+    # "surrogatepass": a lone surrogate from JSON gives its three bytes too.
+    detail = origin.detail.get(key, "").encode("utf-8", "surrogatepass")
+    size = min(_TAG_VALUE_MAX_BYTES, _TAG_MAX_BYTES - len(kind) - 1)
+    value = _TAG_VALUE_UNSAFE.sub(b"_", detail)[:size].decode("ascii")
+    return f"{kind}={value}" if value else None
+
+
+def is_origin_tag(value: object) -> bool:
+    """Whether ``value`` has the form of a tag of :func:`origin_tag`."""
+    return (
+        isinstance(value, str)
+        and len(value) <= _TAG_MAX_BYTES
+        and _ORIGIN_TAG.fullmatch(value) is not None
+    )
 
 
 def origin_fields(row: Mapping, channel_key: str | None = None) -> dict:

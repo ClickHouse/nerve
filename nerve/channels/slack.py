@@ -1632,7 +1632,7 @@ class SlackChannel(BaseChannel):
         message_id: str,
         text: str,
     ) -> None:
-        """Replace a notification card with its expired state."""
+        """Replace a notification card with *text* and no buttons."""
         if not self.is_available:
             return
         channel_id, _ = parse_target(target)
@@ -1645,7 +1645,7 @@ class SlackChannel(BaseChannel):
             )
         except Exception as exc:
             logger.debug(
-                "Slack expiry edit failed for %s: %s", message_id, exc,
+                "Slack card edit failed for %s: %s", message_id, exc,
             )
 
     async def send(self, message: OutboundMessage) -> None:
@@ -1779,7 +1779,9 @@ class SlackChannel(BaseChannel):
         except Exception as e:
             logger.warning("Slack reactions.add failed for %s: %s", target, e)
 
-    async def send_file(self, target: str, file_path: str) -> bool:
+    async def send_file(
+        self, target: str, file_path: str, *, session_id: str | None = None,
+    ) -> bool:
         """Upload a file into the conversation as an attachment."""
         if not self.is_available or not target:
             return False

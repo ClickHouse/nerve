@@ -256,13 +256,45 @@ class NotificationStore:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
+    async def find_notification_for_delivery(
+        self,
+        channel: str,
+        target: str,
+        message_id: str,
+    ) -> dict | None:
+        """Find the notification delivered as one exact message in one target.
+
+        How a channel ties a user's reply to a message back to the card they
+        replied to. An empty ``message_id`` marks a delivery whose id was not
+        recorded, so it matches nothing.
+        """
+        if not message_id:
+            return None
+        async with self.db.execute(
+            """SELECT n.*, s.title AS session_title
+               FROM notification_deliveries d
+               JOIN notifications n ON n.id = d.notification_id
+               LEFT JOIN sessions s ON n.session_id = s.id
+               WHERE d.channel = ? AND d.target = ? AND d.message_id = ?
+               ORDER BY d.delivered_at DESC
+               LIMIT 1""",
+            (channel, target, message_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
     async def dismiss_notification(
         self, notification_id: str, *, attribution: Attribution = UNATTRIBUTED,
     ) -> bool:
-        """Dismiss a pending row. ``attribution.actor_id`` is who dismissed it."""
+        """Dismiss a pending row. ``attribution.actor_id`` is who dismissed it.
+
+        An approval that a press claimed (see :meth:`claim_pending_approval`)
+        is not dismissed: its dispatcher runs the decision.
+        """
         async with self._atomic():
             async with self.db.execute(
-                "SELECT id FROM notifications WHERE id = ? AND status = 'pending'",
+                """SELECT id FROM notifications
+                   WHERE id = ? AND status = 'pending' AND answered_at IS NULL""",
                 (notification_id,),
             ) as cursor:
                 if not await cursor.fetchone():

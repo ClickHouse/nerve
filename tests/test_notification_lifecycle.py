@@ -317,7 +317,9 @@ class TestSlackDeliveryBoundary:
         fake_engine.router.get_channel.return_value = channel
         service = NotificationService(fake_config, db, fake_engine)
 
-        await service._edit_slack_expired(await db.get_notification("n1"))
+        await service._edit_slack_closed(
+            await db.get_notification("n1"), "⏰ Expired unanswered",
+        )
 
         channel.expire_notification.assert_awaited_once()
         args = channel.expire_notification.await_args.args
@@ -720,6 +722,231 @@ class TestExpiryReporting:
         assert notif["status"] == "expired"
         # HTML attempt + plain-text fallback, both swallowed.
         assert bot.edit_message_text.await_count == 2
+
+
+# ----------------------------------------------------------------------
+#  Dismissal
+# ----------------------------------------------------------------------
+
+
+def _telegram_bot(fake_engine: MagicMock) -> MagicMock:
+    """A Telegram bot behind the engine's router, for card edits."""
+    bot = MagicMock()
+    bot.edit_message_text = AsyncMock()
+    channel = MagicMock()
+    channel._app.bot = bot
+    fake_engine.router.get_channel.return_value = channel
+    return bot
+
+
+def _dismissed_events(captured: list[tuple[str, dict]]) -> list[dict]:
+    return [
+        m for ch, m in captured
+        if ch == "__global__" and m.get("type") == "notification_dismissed"
+    ]
+
+
+@pytest.mark.asyncio
+class TestDismissal:
+    """A dismissed question or approval ends without an answer, as at expiry."""
+
+    async def test_a_dismissed_question_tells_the_web_and_the_session(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        await db.create_session("s1", actor=None)
+        svc = NotificationService(fake_config, db, fake_engine)
+        asked = await svc.ask_question(
+            session_id="s1", title="pick one", options=["yes", "no"],
+        )
+        nid = asked["notification_id"]
+
+        assert await svc.handle_dismiss(nid) is True
+        await asyncio.sleep(0)
+
+        assert (await db.get_notification(nid))["status"] == "dismissed"
+        events = _dismissed_events(patch_broadcaster)
+        assert len(events) == 1
+        assert events[0]["notification_id"] == nid
+        assert events[0]["session_id"] == "s1"
+        assert events[0]["notification_type"] == "question"
+        assert events[0]["title"] == "pick one"
+        fake_engine.run.assert_called_once()
+        kwargs = fake_engine.run.call_args.kwargs
+        assert kwargs["session_id"] == "s1"
+        assert kwargs["source"] == "notification:dismiss"
+        assert kwargs["internal"] is True
+        assert kwargs["user_message"] == (
+            "[Question dismissed without an answer: pick one]"
+        )
+
+    async def test_a_dismissed_question_edits_the_telegram_and_slack_cards(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        bot = _telegram_bot(fake_engine)
+        slack = MagicMock(is_available=True)
+        slack.expire_notification = AsyncMock()
+        svc = NotificationService(fake_config, db, fake_engine)
+        svc._get_slack_channel = lambda: slack
+        await db.create_session("s1", actor=None)
+        asked = await svc.ask_question(session_id="s1", title="tg question")
+        nid = asked["notification_id"]
+        await db.update_notification(
+            nid, telegram_message_id="4242", telegram_chat_id="1001",
+        )
+        await db.record_notification_delivery(
+            nid, "slack", target="C0123ABC", message_id="1.0",
+        )
+
+        assert await svc.handle_dismiss(nid) is True
+
+        bot.edit_message_text.assert_awaited_once()
+        kwargs = bot.edit_message_text.await_args.kwargs
+        assert (kwargs["chat_id"], kwargs["message_id"]) == (1001, 4242)
+        assert "Dismissed without an answer" in kwargs["text"]
+        slack.expire_notification.assert_awaited_once()
+        args = slack.expire_notification.await_args.args
+        assert args[:2] == ("C0123ABC", "1.0")
+        assert args[2].endswith("🔕 Dismissed without an answer")
+
+    async def test_a_dismissed_notify_row_is_only_broadcast(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        bot = _telegram_bot(fake_engine)
+        await db.create_session("s1", actor=None)
+        await db.create_notification(
+            notification_id="fyi-1", session_id="s1", type="notify",
+            title="fyi",
+        )
+        await db.update_notification(
+            "fyi-1", telegram_message_id="4242", telegram_chat_id="1001",
+        )
+        svc = NotificationService(fake_config, db, fake_engine)
+
+        assert await svc.handle_dismiss("fyi-1") is True
+        await asyncio.sleep(0)
+
+        assert [e["notification_id"] for e in _dismissed_events(patch_broadcaster)] == ["fyi-1"]
+        fake_engine.run.assert_not_called()
+        bot.edit_message_text.assert_not_awaited()
+
+    async def test_a_dismissed_approval_is_audited_and_not_injected(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+        audit_workspace: Path,
+    ):
+        bot = _telegram_bot(fake_engine)
+        await db.create_session("s1", actor=None)
+        svc = NotificationService(fake_config, db, fake_engine)
+        nid = await _make_approval(svc, db)
+        await db.update_notification(
+            nid, telegram_message_id="4242", telegram_chat_id="1001",
+        )
+
+        assert await svc.handle_dismiss(nid) is True
+        await asyncio.sleep(0)
+
+        assert (await db.get_notification(nid))["status"] == "dismissed"
+        fake_engine.run.assert_not_called()
+        assert "Dismissed without an answer" in (
+            bot.edit_message_text.await_args.kwargs["text"]
+        )
+        events = read_audit_jsonl(
+            audit_workspace / ".nerve" / "mechanical-actions",
+        )
+        dismissed = [e for e in events if e.get("event") == "approval-dismissed"]
+        assert len(dismissed) == 1
+        assert dismissed[0]["notification_id"] == nid
+        assert dismissed[0]["target_kind"] == "lifecycle-test"
+        assert dismissed[0]["target_id"] == "prop-1"
+        assert [e["notification_type"] for e in _dismissed_events(patch_broadcaster)] == ["approval"]
+
+    async def test_a_claimed_approval_is_not_dismissed(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        await db.create_session("s1", actor=None)
+        svc = NotificationService(fake_config, db, fake_engine)
+        nid = await _make_approval(svc, db)
+        # A press took the row; its dispatcher runs the decision.
+        assert await db.claim_pending_approval(nid)
+
+        assert await svc.handle_dismiss(nid) is False
+
+        assert (await db.get_notification(nid))["status"] == "pending"
+        assert not _dismissed_events(patch_broadcaster)
+
+    async def test_a_snoozed_approval_can_be_dismissed(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        _handlers.register("lifecycle-test", _snooze_dispatcher(_iso(24)))
+        await db.create_session("s1", actor=None)
+        svc = NotificationService(fake_config, db, fake_engine)
+        nid = await _make_approval(svc, db)
+        assert await svc.handle_answer(nid, "snooze_24h", "web")
+        assert (await db.get_notification(nid))["status"] == "pending"
+
+        assert await svc.handle_dismiss(nid) is True
+
+        assert (await db.get_notification(nid))["status"] == "dismissed"
+
+    async def test_a_row_that_is_not_pending_is_left_alone(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        await db.create_session("s1", actor=None)
+        svc = NotificationService(fake_config, db, fake_engine)
+        asked = await svc.ask_question(session_id="s1", title="pick one")
+        nid = asked["notification_id"]
+        assert await svc.handle_answer(nid, "yes", "web")
+        await asyncio.sleep(0)
+        fake_engine.run.reset_mock()
+
+        assert await svc.handle_dismiss(nid) is False
+        assert await svc.handle_dismiss("no-such-row") is False
+        await asyncio.sleep(0)
+
+        assert (await db.get_notification(nid))["status"] == "answered"
+        assert not _dismissed_events(patch_broadcaster)
+        fake_engine.run.assert_not_called()
+
+    async def test_external_and_archived_sessions_get_no_note(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        await db.create_session("sat-1", source="external", actor=None)
+        await db.create_session("old", status="archived", actor=None)
+        svc = NotificationService(fake_config, db, fake_engine)
+        external = await svc.ask_question(session_id="sat-1", title="q1")
+        archived = await svc.ask_question(session_id="old", title="q2")
+
+        assert await svc.handle_dismiss(external["notification_id"]) is True
+        assert await svc.handle_dismiss(archived["notification_id"]) is True
+        await asyncio.sleep(0)
+
+        fake_engine.run.assert_not_called()
+        assert len(_dismissed_events(patch_broadcaster)) == 2
+
+    async def test_a_question_stays_pending_while_the_engine_drains(
+        self, db: Database, fake_config, fake_engine, patch_broadcaster,
+    ):
+        from nerve.agent.engine import NotAcceptingTurnsError
+
+        await db.create_session("s1", actor=None)
+        await db.create_session("sat-1", source="external", actor=None)
+        svc = NotificationService(fake_config, db, fake_engine)
+        asked = await svc.ask_question(session_id="s1", title="pick one")
+        external = await svc.ask_question(session_id="sat-1", title="q1")
+        await db.create_notification(
+            notification_id="fyi-1", session_id="s1", type="notify",
+            title="fyi",
+        )
+        fake_engine.accepting_turns = False
+
+        with pytest.raises(NotAcceptingTurnsError):
+            await svc.handle_dismiss(asked["notification_id"])
+
+        status = (await db.get_notification(asked["notification_id"]))["status"]
+        assert status == "pending"
+        assert not _dismissed_events(patch_broadcaster)
+        # No note to deliver: these rows are dismissed during the drain.
+        assert await svc.handle_dismiss(external["notification_id"]) is True
+        assert await svc.handle_dismiss("fyi-1") is True
 
 
 # ----------------------------------------------------------------------

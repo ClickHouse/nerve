@@ -191,6 +191,27 @@ class TestPricing:
         assert c5m == 12.50
         assert c1h == 20.00
 
+    def test_fable_5_2_rates(self):
+        # Fable 5.2 (verified 2026-11-09): base $8/MTok in, $40/MTok out,
+        # 5m write = 1.25x = $10/MTok, 1h write = 2x = $16/MTok, cache reads
+        # at 0.025x = $0.20/MTok. The Fable 5.x generations differ in more
+        # than the base rate, so each carries its own row.
+        from nerve.db.usage import MODEL_PRICING, _get_pricing
+        p_in, p_out, p_read, c5m, c1h, _ = _get_pricing("claude-fable-5-2")
+        assert (p_in, p_out, p_read, c5m, c1h) == (8, 40, 0.20, 10.00, 16.00)
+        assert _get_pricing("us.anthropic.claude-fable-5-2") == MODEL_PRICING["fable-5-2"]
+
+    def test_fable_5_x_rows_do_not_bleed_into_each_other(self):
+        # "fable-5" is a substring of "fable-5-1" and "fable-5-2", so the
+        # specific rows must be checked first. Fable 5.1 kept Fable 5's
+        # $10/$50 tier but reads the cache at 0.025x ($0.25, not $1).
+        from nerve.db.usage import MODEL_PRICING, _get_pricing
+        assert _get_pricing("claude-fable-5-2") == MODEL_PRICING["fable-5-2"]
+        assert _get_pricing("claude-fable-5-1") == MODEL_PRICING["fable-5-1"]
+        assert _get_pricing("claude-fable-5-1")[2] == 0.25
+        assert _get_pricing("claude-fable-5") == MODEL_PRICING["fable-5"]
+        assert _get_pricing("claude-fable-5")[2] == 1.00
+
     def test_opus_5_rates(self):
         # Anchor: Opus 5 — same tier as 4.8 (verified against published
         # pricing 2026-07-28). Base $5/MTok in, $25/MTok out, 5m write =

@@ -18,6 +18,8 @@ import json
 import logging
 import re
 import time
+from collections import defaultdict
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -47,6 +49,10 @@ GH_UNAVAILABLE = "gh_unavailable"
 
 # A check run that ends with one of these conclusions counts as passed.
 _PASSED_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+# A check run that ends with one of these conclusions never gave a result:
+# it was stopped (a newer run of the same workflow, a fail-fast matrix, a
+# hand on the button) or GitHub set it aside. It is not a failure.
+_CANCELLED_CONCLUSIONS = {"CANCELLED", "STALE"}
 # A commit status in one of these states has no result yet.
 _PENDING_STATUS_STATES = {"PENDING", "EXPECTED"}
 
@@ -63,14 +69,69 @@ def reset_cache() -> None:
     _gh_slots = asyncio.Semaphore(MAX_CONCURRENT_GH)
 
 
+def _is_cancelled(check: dict[str, Any]) -> bool:
+    return check.get("status") == "COMPLETED" and check.get("conclusion") in _CANCELLED_CONCLUSIONS
+
+
+def _started_at(check: dict[str, Any]) -> datetime | None:
+    """When the check run started, or None when it has not or ``gh`` gave no time."""
+    value = check.get("startedAt")
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        started = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return started if started.tzinfo else started.replace(tzinfo=UTC)
+
+
+def _replaces(newer: dict[str, Any], cancelled: dict[str, Any]) -> bool:
+    """Whether the run ``newer`` of the same job replaced the run ``cancelled``.
+
+    A run that has not started yet comes after every run that has. Two runs
+    that started in the same second replace each other only when ``newer``
+    has a result or still runs, so two cancelled runs of one second both stay.
+    """
+    newer_start, cancelled_start = _started_at(newer), _started_at(cancelled)
+    if newer_start is None:
+        return newer.get("status") != "COMPLETED"
+    if cancelled_start is None or newer_start > cancelled_start:
+        return True
+    return newer_start == cancelled_start and not _is_cancelled(newer)
+
+
+def _without_replaced_runs(rollup: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The rollup without the cancelled check runs that a newer run of the same job replaced.
+
+    The head commit of a pull request often carries two runs of one workflow:
+    a second trigger fired within seconds and the concurrency group cancelled
+    the first. A job is ``(workflowName, name)``. A run with a result always
+    stays, and so does a cancelled run that no newer run replaced. Commit
+    statuses are not jobs and all stay.
+    """
+    runs_of_job: dict[tuple[Any, Any], list[dict[str, Any]]] = defaultdict(list)
+    for check in rollup:
+        if check.get("__typename") != "StatusContext":
+            runs_of_job[(check.get("workflowName"), check.get("name"))].append(check)
+    kept = []
+    for check in rollup:
+        if _is_cancelled(check):
+            others = runs_of_job[(check.get("workflowName"), check.get("name"))]
+            if any(other is not check and _replaces(other, check) for other in others):
+                continue
+        kept.append(check)
+    return kept
+
+
 def _check_counts(rollup: list[dict[str, Any]] | None) -> dict[str, int]:
-    """Passed, failed and running checks of ``statusCheckRollup``.
+    """Passed, failed, running and cancelled checks of ``statusCheckRollup``.
 
     The rollup has two kinds of item: a check run (``status`` and
-    ``conclusion``) and a commit status (``state``).
+    ``conclusion``) and a commit status (``state``). A cancelled check run
+    that a newer run of the same job replaced is not counted.
     """
-    counts = {"passed": 0, "failed": 0, "running": 0}
-    for check in rollup or []:
+    counts = {"passed": 0, "failed": 0, "running": 0, "cancelled": 0}
+    for check in _without_replaced_runs(rollup or []):
         if check.get("__typename") == "StatusContext":
             state = check.get("state") or ""
             if state in _PENDING_STATUS_STATES:
@@ -83,6 +144,8 @@ def _check_counts(rollup: list[dict[str, Any]] | None) -> dict[str, int]:
             counts["running"] += 1
         elif check.get("conclusion") in _PASSED_CONCLUSIONS:
             counts["passed"] += 1
+        elif check.get("conclusion") in _CANCELLED_CONCLUSIONS:
+            counts["cancelled"] += 1
         else:
             counts["failed"] += 1
     return counts

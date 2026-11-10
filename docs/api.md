@@ -539,10 +539,10 @@ the `reason` names the variable.
 ```json
 Response: {
   "models": [{ "id": "claude-opus-5-5", "label": "Claude Opus 5.5", "family": "opus", "recommended": true },
+             { "id": "claude-fable-5-2", "label": "Claude Fable 5.2", "family": "fable", "recommended": false },
              { "id": "claude-haiku-5-5", "label": "Claude Haiku 5.5", "family": "haiku", "recommended": false },
              { "id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "family": "sonnet", "recommended": false },
-             { "id": "claude-fable-5-1", "label": "Claude Fable 5.1", "family": "fable", "recommended": false },
-             { "id": "claude-opus-5", "label": "Claude Opus 5", "family": "opus", "recommended": false }],
+             { "id": "claude-fable-5-1", "label": "Claude Fable 5.1", "family": "fable", "recommended": false }],
   "current": { "model": "claude-opus-5-5", "effort": "xhigh" },
   "efforts": ["max", "xhigh", "high", "medium", "low"],
   "discovered": true,
@@ -873,6 +873,29 @@ Notifs badge shows. `pending_answer_count` is the number of pending questions
 and approvals among them. While it is more than 0, the tab title starts with
 "!" (see [web-ui.md](web-ui.md#browser-alerts)). The filters and the limit do
 not apply to the two counts.
+
+#### `POST /api/notifications/{id}/dismiss`
+
+Dismisses a pending notification of any type and records the signed-in
+person in `dismissed_by_actor_id`. Answers `{notification_id, dismissed: true}`,
+or `409` when the row is not pending or an answer to an approval is already
+running. Every dismissal sends a `notification_dismissed` event.
+
+A question or an approval ends without an answer, as at expiry: the Telegram
+and Slack cards get "🔕 Dismissed without an answer" and lose their buttons.
+The session that asked a question gets the internal turn
+`[Question dismissed without an answer: <title>]`, written by the person who
+dismissed it. An external, archived or missing session gets no turn. While
+the engine drains, the dismissal of a question that would start a turn is
+refused (`503`) and the question stays pending. An approval gets an
+`approval-dismissed` record in the mechanical-actions audit log. A review loop
+that waits on its card proposes a new card at its next reconcile tick, as it
+does after an expiry.
+
+#### `POST /api/notifications/dismiss-all`
+
+Dismisses the pending `notify` rows only, and sends no event. Answers
+`{dismissed: <count>}`.
 
 ### Web Push
 
@@ -1513,8 +1536,10 @@ Response: { "tags": [{ "name": "backend", "count": 7 }] }
 ```
 
 #### `POST /api/tasks`
-Create a task. Returns the created row; **409** if the duplicate guard refuses
-(retry with `confirm_duplicate: true` to override), **422** if `status` names a
+Create a task. Returns the created row plus `related` — look-alike tasks that
+did not block, each with `similarity` and the `shared` words; **409** if the
+duplicate guard refuses (the detail carries `duplicates` and `related`; retry
+with `confirm_duplicate: true` to override), **422** if `status` names a
 status that does not exist — a retry cannot fix that one, so it is kept
 distinct from the collision.
 
@@ -1911,7 +1936,7 @@ Response: {
       "pull": {
         "repo": "example/repo", "number": 12, "title": "Fix the flaky login test",
         "state": "open", "review": "approved",
-        "checks": { "passed": 12, "failed": 0, "running": 3 },
+        "checks": { "passed": 12, "failed": 0, "running": 3, "cancelled": 0 },
         "head_ref": "alice/fix-login", "base_ref": "main"
       }
     },
@@ -1921,8 +1946,19 @@ Response: {
 ```
 
 A check run that ends as success, neutral or skipped counts as passed. A check
-run that has not completed counts as running. A commit status counts as running
-while it is pending or expected.
+run that ends as cancelled or stale counts as cancelled: it gave no result (a
+newer run replaced it, a fail-fast matrix stopped it, someone cancelled it), and
+it is not a failure. Every other conclusion counts as failed. A check run that
+has not completed counts as running. A commit status counts as running while it
+is pending or expected.
+
+A cancelled check run that a newer run of the same job replaced is not counted.
+A job is the pair `workflowName` and `name`; a newer run is one that started
+later (`startedAt`) or has not started yet. The head commit of a pull request
+often carries two runs of one workflow — a second trigger fired within seconds
+and the workflow's concurrency group cancelled the first — and the card then
+counts only the second. A run with a result always counts, whichever run is
+newer, and so does a cancelled run that no newer run of its job replaced.
 
 ### Diagnostics
 
@@ -2291,6 +2327,8 @@ those for another session. Events marked *global* go to every socket.
 { type: "notification_answered", notification_id: "…", session_id: "…", answer: "…", answered_by: "…", answered_at: "…" | null, actor_id: "…" }
 // answered_at: the stored answer time (ISO 8601). A snoozed approval has approval_status: "snoozed" and snooze_until instead.
 { type: "notification_expired", notification_id: "…", session_id: "…", notification_type: "question", title: "…" }
+// One row was dismissed. actor_id: the person who dismissed it
+{ type: "notification_dismissed", notification_id: "…", session_id: "…", notification_type: "question", title: "…", actor_id: "…" }
 // An answer was relayed into the session as a message
 { type: "answer_injected", session_id: "…", notification_id: "…", title: "…", answer: "…", answered_by: "…", content: "…", actor_id: "…" }
 

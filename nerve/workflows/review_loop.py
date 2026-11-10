@@ -1865,8 +1865,8 @@ class ReviewLoopService:
                         await self._milestone(
                             fresh,
                             f"❌ **Review loop {loop['id']} closed** — its "
-                            "decision card expired "
-                            f"{count + 1}× unanswered. Last state: "
+                            "decision card closed "
+                            f"{count + 1}× without an answer. Last state: "
                             f"{loop.get('failure_reason')}.",
                             notify=True,
                         )
@@ -1876,7 +1876,8 @@ class ReviewLoopService:
                 )
                 await self._propose_card(
                     loop,
-                    f"(re-proposed — previous card expired) Parked on: "
+                    "(re-proposed: the previous card closed without an "
+                    "answer) Parked on: "
                     f"{loop.get('failure_reason')}",
                 )
             elif loop["status"] in ("implementing", "verifying"):

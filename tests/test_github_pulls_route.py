@@ -35,9 +35,13 @@ GH_ANSWER = {
     "statusCheckRollup": [
         {"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS"},
         {"__typename": "CheckRun", "name": "docs", "status": "COMPLETED", "conclusion": "SKIPPED"},
-        {"__typename": "CheckRun", "name": "unit", "status": "COMPLETED", "conclusion": "FAILURE"},
+        {"__typename": "CheckRun", "name": "unit", "status": "COMPLETED", "conclusion": "FAILURE",
+         "startedAt": "2026-01-01T10:00:30Z"},
         {"__typename": "CheckRun", "name": "e2e", "status": "IN_PROGRESS", "conclusion": ""},
         {"__typename": "CheckRun", "name": "build", "status": "QUEUED", "conclusion": ""},
+        # The run of "unit" that the one above replaced: not counted.
+        {"__typename": "CheckRun", "name": "unit", "status": "COMPLETED", "conclusion": "CANCELLED",
+         "startedAt": "2026-01-01T10:00:00Z"},
         {"__typename": "StatusContext", "context": "ci/legacy", "state": "SUCCESS"},
         {"__typename": "StatusContext", "context": "ci/deploy", "state": "PENDING"},
         {"__typename": "StatusContext", "context": "ci/scan", "state": "ERROR"},
@@ -140,7 +144,7 @@ class TestSummary:
                 "title": "Fix the flaky login test",
                 "state": "open",
                 "review": "approved",
-                "checks": {"passed": 3, "failed": 2, "running": 3},
+                "checks": {"passed": 3, "failed": 2, "running": 3, "cancelled": 0},
                 "head_ref": "alice/fix-login",
                 "base_ref": "main",
             },
@@ -164,7 +168,28 @@ class TestSummary:
         }
         pull = (await _pulls(client, URL)).json()["pulls"][0]["pull"]
         assert pull["review"] is None
-        assert pull["checks"] == {"passed": 0, "failed": 0, "running": 0}
+        assert pull["checks"] == {"passed": 0, "failed": 0, "running": 0, "cancelled": 0}
+
+    @pytest.mark.parametrize(("conclusion", "bucket"), [
+        ("SUCCESS", "passed"),
+        ("NEUTRAL", "passed"),
+        ("SKIPPED", "passed"),
+        ("CANCELLED", "cancelled"),
+        ("STALE", "cancelled"),
+        ("FAILURE", "failed"),
+        ("TIMED_OUT", "failed"),
+        ("ACTION_REQUIRED", "failed"),
+        ("STARTUP_FAILURE", "failed"),
+    ])
+    async def test_each_conclusion_of_a_completed_check_run_has_its_bucket(
+        self, client, fake_gh, conclusion, bucket,
+    ):
+        fake_gh.answers["12"] = {**GH_ANSWER, "statusCheckRollup": [
+            {"__typename": "CheckRun", "name": "ci", "status": "COMPLETED", "conclusion": conclusion},
+        ]}
+        pull = (await _pulls(client, URL)).json()["pulls"][0]["pull"]
+        none = {"passed": 0, "failed": 0, "running": 0, "cancelled": 0}
+        assert pull["checks"] == {**none, bucket: 1}
 
     async def test_review_decision_is_lower_case(self, client, fake_gh):
         fake_gh.answers["12"] = {**GH_ANSWER, "reviewDecision": "CHANGES_REQUESTED"}
@@ -182,6 +207,92 @@ class TestSummary:
         res = await _pulls(client, URL_2, URL, URL_2)
         assert [p["url"] for p in res.json()["pulls"]] == [URL_2, URL]
         assert len(fake_gh.calls) == 2
+
+
+def _run(
+    name: str, conclusion: str, *, started: str | None,
+    status: str = "COMPLETED", workflow: str = "CI",
+) -> dict[str, Any]:
+    return {
+        "__typename": "CheckRun", "workflowName": workflow, "name": name,
+        "status": status, "conclusion": conclusion, "startedAt": started,
+    }
+
+
+NONE = {"passed": 0, "failed": 0, "running": 0, "cancelled": 0}
+
+
+@pytest.mark.asyncio
+class TestReplacedRuns:
+    """A cancelled run that a newer run of the same job replaced is not counted."""
+
+    async def _checks(self, client, fake_gh, rollup: list[dict[str, Any]]) -> dict[str, int]:
+        fake_gh.answers["12"] = {**GH_ANSWER, "statusCheckRollup": rollup}
+        return (await _pulls(client, URL)).json()["pulls"][0]["pull"]["checks"]
+
+    async def test_a_newer_run_with_a_result_or_still_running_replaces_it(self, client, fake_gh):
+        checks = await self._checks(client, fake_gh, [
+            _run("build", "CANCELLED", started="2026-01-01T10:00:00Z"),
+            _run("build", "SUCCESS", started="2026-01-01T10:00:30Z"),
+            _run("test", "CANCELLED", started="2026-01-01T10:00:00Z"),
+            _run("test", "", status="IN_PROGRESS", started="2026-01-01T10:00:30Z"),
+            _run("lint", "CANCELLED", started="2026-01-01T10:00:00Z"),
+            _run("lint", "", status="QUEUED", started=None),
+        ])
+        assert checks == {**NONE, "passed": 1, "running": 2}
+
+    async def test_a_cancelled_run_without_a_newer_run_of_its_job_stays(self, client, fake_gh):
+        checks = await self._checks(client, fake_gh, [
+            _run("build", "SUCCESS", started="2026-01-01T10:00:00Z"),
+            # The newest run of "build" was cancelled: that is the job's state.
+            _run("build", "CANCELLED", started="2026-01-01T10:01:00Z"),
+            _run("docs", "CANCELLED", started="2026-01-01T10:00:00Z"),
+            # Same job name in another workflow: a different job.
+            _run("docs", "SUCCESS", started="2026-01-01T10:01:00Z", workflow="Pages"),
+        ])
+        assert checks == {**NONE, "passed": 2, "cancelled": 2}
+
+    async def test_an_older_run_with_a_result_is_never_left_out(self, client, fake_gh):
+        checks = await self._checks(client, fake_gh, [
+            _run("build", "FAILURE", started="2026-01-01T10:00:00Z"),
+            _run("build", "SUCCESS", started="2026-01-01T10:01:00Z"),
+        ])
+        assert checks == {**NONE, "passed": 1, "failed": 1}
+
+    async def test_of_two_cancelled_runs_only_the_newer_one_counts(self, client, fake_gh):
+        checks = await self._checks(client, fake_gh, [
+            _run("build", "CANCELLED", started="2026-01-01T10:00:00Z"),
+            _run("build", "CANCELLED", started="2026-01-01T10:01:00Z"),
+        ])
+        assert checks == {**NONE, "cancelled": 1}
+
+    async def test_two_cancelled_runs_of_one_second_both_stay(self, client, fake_gh):
+        checks = await self._checks(client, fake_gh, [
+            _run("build", "CANCELLED", started="2026-01-01T10:00:00Z"),
+            _run("build", "CANCELLED", started="2026-01-01T10:00:00Z"),
+        ])
+        assert checks == {**NONE, "cancelled": 2}
+
+    async def test_a_run_with_a_result_in_the_same_second_replaces_it(self, client, fake_gh):
+        checks = await self._checks(client, fake_gh, [
+            _run("build", "CANCELLED", started="2026-01-01T10:00:00Z"),
+            _run("build", "SUCCESS", started="2026-01-01T10:00:00Z"),
+        ])
+        assert checks == {**NONE, "passed": 1}
+
+    async def test_without_start_times_a_completed_run_replaces_nothing(self, client, fake_gh):
+        checks = await self._checks(client, fake_gh, [
+            _run("build", "CANCELLED", started=None),
+            _run("build", "SUCCESS", started=None),
+        ])
+        assert checks == {**NONE, "passed": 1, "cancelled": 1}
+
+    async def test_commit_statuses_are_not_jobs(self, client, fake_gh):
+        checks = await self._checks(client, fake_gh, [
+            {"__typename": "StatusContext", "context": "ci/deploy", "state": "ERROR"},
+            {"__typename": "StatusContext", "context": "ci/deploy", "state": "SUCCESS"},
+        ])
+        assert checks == {**NONE, "passed": 1, "failed": 1}
 
 
 @pytest.mark.asyncio

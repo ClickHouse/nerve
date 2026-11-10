@@ -49,6 +49,9 @@ def engine(bot: MagicMock) -> MagicMock:
     engine.run = AsyncMock()
     telegram = MagicMock()
     telegram._app.bot = bot
+    # Delivery records the reply route on the channel; a plain MagicMock
+    # attribute is not awaitable.
+    telegram._record_reply_route = AsyncMock()
     engine.router.get_channel.return_value = telegram
     return engine
 

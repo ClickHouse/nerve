@@ -60,6 +60,7 @@ def test_no_default_model_literal_outside_the_constants_block():
 def test_the_constants_agree_with_each_other():
     assert DEFAULT_MODEL == "claude-opus-5-5"
     assert DEFAULT_TITLE_MODEL == DEFAULT_FAST_MODEL == "claude-haiku-5-5"
+    assert DEFAULT_FALLBACK_MODEL == "claude-fable-5-2"
     assert DEFAULT_CLAUDE_MODELS[0] == DEFAULT_MODEL
     assert DEFAULT_CLAUDE_MODELS[1] == DEFAULT_FALLBACK_MODEL
     assert len(set(DEFAULT_CLAUDE_MODELS)) == len(DEFAULT_CLAUDE_MODELS)
@@ -119,7 +120,7 @@ def test_the_writer_and_the_cli_alias_use_the_constants():
     assert bedrock["memory"]["fast_model"] == f"{geo}.anthropic.{DEFAULT_FAST_MODEL}"
     assert bedrock["memory"]["fast_model"] == "eu.anthropic.claude-haiku-5-5"
 
-    # The Claude CLI's built-in `opus` and `haiku` aliases are the defaults.
+    # The Claude CLI's built-in `opus`, `haiku` and `fable` aliases are the defaults.
     from types import SimpleNamespace
 
     from nerve.agent.backends.claude import ClaudeBackend
@@ -137,6 +138,7 @@ def test_the_writer_and_the_cli_alias_use_the_constants():
     env = ClaudeBackend(SimpleNamespace(config=lambda: config))._build_env()
     assert env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == DEFAULT_MODEL
     assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == DEFAULT_FAST_MODEL
+    assert env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == DEFAULT_FALLBACK_MODEL
 
 
 def test_the_examples_and_templates_carry_the_default():

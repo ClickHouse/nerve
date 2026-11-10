@@ -6,6 +6,7 @@ import { useNotificationStore } from '../../../stores/notificationStore';
 import { extractResultText } from '../../../utils/extractResultText';
 import { NotificationBody } from '../../Notifications/NotificationParts';
 import { NotificationOptions } from '../../Notifications/NotificationOptions';
+import { DismissButton } from '../../Notifications/DismissButton';
 import { OptionList } from '../../Notifications/OptionList';
 import { parseAskOptions, questionIdFromResult, questionOptions } from '../../Notifications/askOptions';
 
@@ -65,6 +66,7 @@ export function AskUserBlock({ block }: { block: ToolCallBlockData }) {
         <NotificationBody body={body} className="mt-1 text-sm text-text-muted" />
       )}
       {content}
+      {waiting && <DismissButton notif={row} className="mt-2 w-full justify-end" />}
     </div>
   );
 }

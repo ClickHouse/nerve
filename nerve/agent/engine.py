@@ -100,6 +100,7 @@ from nerve.identity import (
 )
 from nerve.inference_principal import (
     inference_cron_job,
+    inference_origin,
     inference_principal,
     inference_trigger,
 )
@@ -1813,6 +1814,9 @@ class AgentEngine:
                 inference_cron_job=inference_cron_job(
                     origin.detail.get(DETAIL_CRON_JOB),
                 ),
+                # Where the session comes from (its cron job, channel, ...),
+                # also fixed for the session.
+                inference_origin=inference_origin(origin),
                 extra=(
                     # Per-session codex sandbox override (review-loop verifier
                     # legs run workspace-write instead of the global default).

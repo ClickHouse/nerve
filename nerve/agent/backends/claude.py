@@ -739,6 +739,7 @@ class ClaudeBackend:
                 inference_principal=spec.inference_principal,
                 inference_trigger=spec.inference_trigger,
                 inference_cron_job=spec.inference_cron_job,
+                inference_origin=spec.inference_origin,
             ),
             cwd=spec.cwd,
             # Load no filesystem settings/memory: Nerve owns the entire
@@ -845,12 +846,14 @@ class ClaudeBackend:
         self, cache_ttl: str = "5m", inference_principal: str | None = None,
         inference_trigger: str | None = None,
         inference_cron_job: str | None = None,
+        inference_origin: str | None = None,
     ) -> dict[str, str]:
         """Build environment variables for the SDK subprocess.
 
         ``inference_principal``, ``inference_trigger`` and
-        ``inference_cron_job``: the principal, the trigger and the cron job
-        that every model request of the process names (external mode; see
+        ``inference_cron_job`` and ``inference_origin``: the principal, the
+        trigger, the cron job and the origin that every model request of the
+        process names (external mode; see
         nerve.inference_principal).
         """
         config = self.config
@@ -896,20 +899,22 @@ class ClaudeBackend:
         # Model-alias remapping: short aliases ("opus", "sonnet", ...) used
         # in Agent/Workflow tool model options, skill frontmatter, and cron
         # overrides resolve INSIDE the CLI via ANTHROPIC_DEFAULT_<ALIAS>_MODEL
-        # env vars. Nerve defaults "opus" → nerve.config.DEFAULT_MODEL and
-        # "haiku" → nerve.config.DEFAULT_FAST_MODEL (skipped on Bedrock, where
+        # env vars. Nerve defaults "opus" → nerve.config.DEFAULT_MODEL,
+        # "haiku" → nerve.config.DEFAULT_FAST_MODEL and "fable" →
+        # nerve.config.DEFAULT_FALLBACK_MODEL (skipped on Bedrock, where
         # model IDs need a geo prefix — set agent.model_aliases with explicit
         # prefixed IDs there). The haiku value is also the CLI's small fast
         # model for background calls: the CLI reads ANTHROPIC_SMALL_FAST_MODEL
         # first and falls back to ANTHROPIC_DEFAULT_HAIKU_MODEL.
         # User-configured aliases merge over the defaults; an empty value
         # unsets one (CLI built-in mapping wins).
-        from nerve.config import DEFAULT_FAST_MODEL, DEFAULT_MODEL
+        from nerve.config import DEFAULT_FALLBACK_MODEL, DEFAULT_FAST_MODEL, DEFAULT_MODEL
 
         aliases: dict[str, str] = {}
         if not config.provider.is_bedrock:
             aliases["opus"] = DEFAULT_MODEL
             aliases["haiku"] = DEFAULT_FAST_MODEL
+            aliases["fable"] = DEFAULT_FALLBACK_MODEL
         aliases.update(config.agent.model_aliases)
         for alias, target in aliases.items():
             env_name = _MODEL_ALIAS_ENV_VARS.get(alias.strip().lower())
@@ -927,6 +932,7 @@ class ClaudeBackend:
         env.update(custom_headers_env(
             inference_principal, trigger=inference_trigger,
             cron_job=inference_cron_job,
+            origin=inference_origin,
         ))
         return env
 
@@ -1166,7 +1172,7 @@ class ClaudeBackend:
     # Ordered most-specific to least-specific; first match wins. Mirrors the
     # pattern used by MODEL_PRICING in nerve/db/usage.py.
     _MODEL_EFFORT_LEVELS: dict[str, tuple[str, ...]] = {
-        "fable-5":    ("low", "medium", "high", "xhigh", "max"),
+        "fable-5":    ("low", "medium", "high", "xhigh", "max"),  # Fable 5 / 5.1 / 5.2
         "opus-5-5":   ("low", "medium", "high", "xhigh", "max"),
         "opus-5":     ("low", "medium", "high", "xhigh", "max"),
         "sonnet-5-5": ("low", "medium", "high", "xhigh", "max"),

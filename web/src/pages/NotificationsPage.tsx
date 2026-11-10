@@ -1,12 +1,13 @@
 import { useEffect, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { Bell, CheckCheck, EyeOff, BellOff, Trash2, Plus, RotateCw, Clock } from '../components/ui/icons';
+import { Bell, CheckCheck, BellOff, Trash2, Plus, RotateCw, Clock } from '../components/ui/icons';
 import { Badge, Button, IconButton, TextField, type BadgeTone } from '../components/ui';
 import { useNotificationStore, type Notification, type Silence } from '../stores/notificationStore';
 import { PageHeader } from '../components/ui/PageHeader';
 import { ActorAttribution } from '../components/Chat/ActorLabel';
 import { NotificationBody, NotificationLinks } from '../components/Notifications/NotificationParts';
 import { NotificationOptions } from '../components/Notifications/NotificationOptions';
+import { DismissButton } from '../components/Notifications/DismissButton';
 import { BrowserAlertsLink } from '../components/Notifications/BrowserAlertOffer';
 
 /** Lifecycle state — a status, so it takes a `Badge` tone. */
@@ -86,7 +87,6 @@ function formatLocalTime(iso: string): string {
 
 function NotificationCard({ notif }: { notif: Notification }) {
   const navigate = useNavigate();
-  const dismissNotification = useNotificationStore(s => s.dismissNotification);
   const priorityDot = PRIORITY_DOTS[notif.priority];
   const isApproval = notif.type === 'approval';
 
@@ -148,12 +148,7 @@ function NotificationCard({ notif }: { notif: Notification }) {
           Session: {notif.session_title || notif.session_id}
         </Button>
         <span className="text-text-faint">{notif.created_at?.slice(0, 16).replace('T', ' ')}</span>
-        {notif.status === 'pending' && notif.type === 'notify' && (
-          <Button variant="ghost" size="xs" onClick={() => dismissNotification(notif.id)}>
-            <EyeOff size={11} />
-            <span>Dismiss</span>
-          </Button>
-        )}
+        <DismissButton notif={notif} />
       </div>
 
       {/* The options while it waits, then the answer */}

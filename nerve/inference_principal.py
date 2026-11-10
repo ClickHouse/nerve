@@ -1,4 +1,5 @@
-"""The principal, the trigger and the cron job that Nerve names on model requests in external mode.
+"""The principal, trigger, cron job and origin Nerve names on model requests
+in external mode.
 
 In external mode, a proxy in front of the model API can attribute model usage
 to a person. Nerve gives it the principal that caused the work: one
@@ -20,21 +21,28 @@ proxy can attribute model usage to the job. Job IDs are free text, so Nerve
 sends :func:`cron_job_tag_value` of the ID: 1 to 64 bytes of ASCII letters,
 digits, ``.``, ``_`` and ``-``. Nerve's own model calls send no cron job.
 
+Another header, ``X-Nerve-Inference-Origin``, names where a session comes
+from: the cron job, the channel conversation, the hook, the plan, the
+workflow run or the external client, as a tag such as ``cron=<job id>``
+(:func:`nerve.session_origin.origin_tag`). Like the trigger, it comes from
+the session's origin, which is set when the session is created. A session
+without such a detail, and Nerve's own model calls, send no origin header.
+
 Local mode sends no header, and a NULL cause sends no principal header: Nerve
-also removes a principal line, a trigger line and a cron job line from the
-``ANTHROPIC_CUSTOM_HEADERS`` that its own environment gives the CLI.
+also removes inherited principal, trigger, cron job and origin lines from
+``ANTHROPIC_CUSTOM_HEADERS`` in the environment it gives the CLI.
 
 The Claude CLI reads ``ANTHROPIC_CUSTOM_HEADERS`` from its environment when it
 builds the API client for a request: one ``Name: Value`` header per line,
 lines split on ``\\n`` or ``\\r\\n``, name and value split on the first ``:``
 and trimmed. The environment of a CLI process is fixed when it starts. That is
-enough, because the session's cause, trigger and cron job never change.
+enough, because the session's cause, trigger, cron job and origin never change.
 
 Codex sends the principal header only to ``codex.base_url``, and sends no
-trigger header and no cron job header: the provider that Nerve gives Codex for it reads the value
-from an environment variable of the Codex process (``env_http_headers``). See
-``nerve.agent.backends.codex.backend``. One Codex process serves one session,
-so the same rule applies.
+trigger, cron job or origin header: the provider that Nerve gives Codex for it
+reads the value from an environment variable of the Codex process
+(``env_http_headers``). See ``nerve.agent.backends.codex.backend``. One Codex
+process serves one session, so the same rule applies.
 """
 
 from __future__ import annotations
@@ -46,13 +54,20 @@ import re
 from collections.abc import Mapping
 from uuid import UUID
 
-from nerve.session_origin import TRIGGER_SYSTEM, TRIGGERS
+from nerve.session_origin import (
+    TRIGGER_SYSTEM,
+    TRIGGERS,
+    Origin,
+    is_origin_tag,
+    origin_tag,
+)
 
 logger = logging.getLogger(__name__)
 
 INFERENCE_PRINCIPAL_HEADER = "X-Nerve-Inference-Principal"
 INFERENCE_TRIGGER_HEADER = "X-Nerve-Inference-Trigger"
 INFERENCE_CRON_JOB_HEADER = "X-Nerve-Inference-Cron-Job"
+INFERENCE_ORIGIN_HEADER = "X-Nerve-Inference-Origin"
 CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
 
 # The headers that Nerve sets, in lower case. Nerve removes an inherited line
@@ -60,6 +75,7 @@ CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
 _NERVE_HEADERS = frozenset({
     INFERENCE_PRINCIPAL_HEADER.lower(), INFERENCE_TRIGGER_HEADER.lower(),
     INFERENCE_CRON_JOB_HEADER.lower(),
+    INFERENCE_ORIGIN_HEADER.lower(),
 })
 
 # The value rule of the cron job header, which the proxy checks again.
@@ -156,6 +172,17 @@ def inference_cron_job(job_id: str | None) -> str | None:
     return cron_job_tag_value(job_id)
 
 
+def inference_origin(origin: Origin) -> str | None:
+    """The origin to name on the model requests of a session with ``origin``.
+
+    The tag of :func:`nerve.session_origin.origin_tag`. ``None`` in local
+    mode, and for an origin without a tag.
+    """
+    if not _is_external_mode():
+        return None
+    return origin_tag(origin)
+
+
 def _system_trigger_headers() -> dict[str, str]:
     trigger = inference_trigger(TRIGGER_SYSTEM)
     return {INFERENCE_TRIGGER_HEADER: trigger} if trigger else {}
@@ -198,13 +225,13 @@ def direct_client_headers(
 
     The Anthropic SDK also adds the lines of ``ANTHROPIC_CUSTOM_HEADERS`` in
     the environment of Nerve to its default headers, with the name as written.
-    Each such name of the principal, the trigger or the cron job header gets
+    Each such name of the principal, trigger, cron job or origin header gets
     ``anthropic.omit``, which removes it. Then, in external mode, the header
     for ``principal_id`` is added, or for the system actor of the global
     database when it is ``None``, and the trigger ``system``
     (:func:`system_inference_headers`). So a request names one principal and
     one trigger in external mode, and neither in local mode. It never names
-    a cron job.
+    a cron job or an origin.
     """
     from anthropic import omit
 
@@ -225,20 +252,22 @@ def direct_client_headers(
 def custom_headers_env(
     principal: str | None, environ: Mapping[str, str] | None = None,
     *, trigger: str | None = None, cron_job: str | None = None,
+    origin: str | None = None,
 ) -> dict[str, str]:
     """Environment entries that make a Claude CLI process name ``principal``,
-    ``trigger`` and ``cron_job``.
+    ``trigger``, ``cron_job`` and ``origin``.
 
     ``principal`` comes from :func:`inference_principal`, ``trigger`` from
-    :func:`inference_trigger` and ``cron_job`` from
-    :func:`inference_cron_job`. The SDK merges the entries over the
-    environment of Nerve, which the CLI inherits. The value is the inherited
-    ``ANTHROPIC_CUSTOM_HEADERS`` without blank lines and without a line for
-    the principal, the trigger or the cron job header, plus, in external
-    mode, one line for each of ``principal``, ``trigger`` and ``cron_job``
-    that is set. So the CLI sends at most one header of each in external
-    mode, and none in local mode. No entry when that value is the inherited
-    value, and in local mode when the inherited value has no line to remove.
+    :func:`inference_trigger`, ``cron_job`` from :func:`inference_cron_job`
+    and ``origin`` from :func:`inference_origin`.
+    The SDK merges the entries over the environment of Nerve, which the CLI
+    inherits. The value is the inherited ``ANTHROPIC_CUSTOM_HEADERS`` without
+    blank lines and without a line for the principal, the trigger or the
+    cron job or origin header, plus, in external mode, one line for each of
+    ``principal``, ``trigger``, ``cron_job`` and ``origin`` that is set. So
+    the CLI sends at most one header of each in external mode, and none in
+    local mode. No entry when that value is the inherited value, and in local
+    mode when the inherited value has no line to remove.
     """
     env = os.environ if environ is None else environ
     inherited = env.get(CUSTOM_HEADERS_ENV, "")
@@ -246,7 +275,7 @@ def custom_headers_env(
     if not _is_external_mode():
         if not any(_header_name(line) in _NERVE_HEADERS for line in lines):
             return {}
-        principal = trigger = cron_job = None
+        principal = trigger = cron_job = origin = None
     kept = [
         line for line in lines
         if line.strip() and _header_name(line) not in _NERVE_HEADERS
@@ -258,6 +287,8 @@ def custom_headers_env(
         kept.append(f"{INFERENCE_TRIGGER_HEADER}: {trigger}")
     if cron_job and _CRON_JOB_VALUE.fullmatch(cron_job):
         kept.append(f"{INFERENCE_CRON_JOB_HEADER}: {cron_job}")
+    if is_origin_tag(origin):
+        kept.append(f"{INFERENCE_ORIGIN_HEADER}: {origin}")
     value = "\n".join(kept)
     if value == inherited:
         return {}

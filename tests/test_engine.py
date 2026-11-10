@@ -31,6 +31,9 @@ from tests.rate_limited_upstream import RateLimitedUpstream
         ("max",    "claude-fable-5",            "max"),
         ("xhigh",  "claude-fable-5",            "xhigh"),
         ("low",    "claude-fable-5",            "low"),
+        # Fable 5.2 keeps the full ladder (default effort high; verified 2026-11-09)
+        ("max",    "claude-fable-5-2",          "max"),
+        ("xhigh",  "claude-fable-5-2",          "xhigh"),
         # Opus 5 supports the full ladder (verified via Models API 2026-07-28)
         ("max",    "claude-opus-5",             "max"),
         ("xhigh",  "claude-opus-5",             "xhigh"),

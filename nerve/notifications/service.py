@@ -46,6 +46,11 @@ _APPROVAL_EMOJIS: dict[str, str] = {
 # Telegram caps an inline button's callback_data at 64 bytes.
 _CALLBACK_DATA_MAX_BYTES = 64
 
+# The line that a Telegram or Slack card gets when its question or approval
+# closes without an answer.
+_EXPIRED_LINE = "⏰ Expired unanswered"
+_DISMISSED_LINE = "🔕 Dismissed without an answer"
+
 
 def _fit_callback_value(notification_id: str, value: str) -> str:
     """Cut ``value`` so ``notif:<id>:<value>`` fits, dropping a split UTF-8 tail."""
@@ -939,18 +944,80 @@ class NotificationService:
     async def handle_dismiss(
         self, notification_id: str, *, actor: Actor | None = None,
     ) -> bool:
-        """Dismiss a notification (no answer routing needed).
+        """Dismiss a pending notification.
 
         ``actor`` is the person who dismissed it, recorded in
-        ``dismissed_by_actor_id``.
+        ``dismissed_by_actor_id``. Every dismissal sends a
+        ``notification_dismissed`` web broadcast. A question or an approval
+        then ends without an answer, as at expiry: the Telegram and Slack
+        cards say so and lose their buttons, an approval gets an
+        ``approval-dismissed`` audit event, and the asking session of a
+        question gets an internal note, written by ``actor``.
+
+        Raises:
+            NotAcceptingTurnsError: the dismissal of a question while the
+                engine drains, when its session takes the note. The
+                question stays pending.
         """
         notif = await self.db.get_notification(notification_id)
         if not notif or notif["status"] != "pending":
             return False
 
-        await self.db.dismiss_notification(
-            notification_id, attribution=attribution_for(actor),
+        kind = notif.get("type")
+        session_id = notif["session_id"]
+        title = notif.get("title") or ""
+        takes_note = kind == "question" and await self._takes_note(
+            session_id, "dismissal note",
         )
+        # During a drain the turn with the note is refused. Keep the
+        # question pending, so the person can dismiss it after the restart.
+        if takes_note and not self.engine.accepting_turns:
+            from nerve.agent.engine import NotAcceptingTurnsError
+
+            raise NotAcceptingTurnsError()
+
+        if not await self.db.dismiss_notification(
+            notification_id, attribution=attribution_for(actor),
+        ):
+            return False
+
+        from nerve.agent.streaming import broadcaster
+        try:
+            await broadcaster.broadcast("__global__", {
+                "type": "notification_dismissed",
+                "notification_id": notification_id,
+                "session_id": session_id,
+                "notification_type": kind,
+                "title": title,
+                "actor_id": actor_id_of(actor),
+            })
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "dismissal broadcast failed for %s: %s", notification_id, exc,
+            )
+
+        if kind in ("question", "approval"):
+            await self._edit_telegram_closed(notif, _DISMISSED_LINE)
+            await self._edit_slack_closed(notif, _DISMISSED_LINE)
+
+        if kind == "approval":
+            await self._append_approval_audit({
+                "event": "approval-dismissed",
+                "notification_id": notification_id,
+                "target_kind": notif.get("target_kind") or "",
+                "target_id": notif.get("target_id") or "",
+                "redelivery_count": notif.get("redelivery_count") or 0,
+                "dismissed_by_actor_id": actor_id_of(actor),
+            })
+
+        if takes_note:
+            self._dispatch_into_session(
+                session_id,
+                f"[Question dismissed without an answer: {title}]",
+                source="notification:dismiss",
+                actor=actor,
+                internal=True,
+            )
         return True
 
     # ------------------------------------------------------------------ #
@@ -1258,11 +1325,14 @@ class NotificationService:
             )
             msg_id = str(msg.message_id)
 
-        # Cache for reaction context lookups
+        # Cache for reaction context lookups, and record the reply route so a
+        # user replying to this notification reaches the session that raised
+        # it (e.g. a cron/background session).
         if msg_id:
             channel = self._get_telegram_channel()
             if channel:
                 channel._cache_message(int(msg_id), chat_id, text)
+                await channel._record_reply_route(int(msg_id), chat_id, session_id)
             await self.db.record_notification_delivery(
                 notification_id,
                 "telegram",
@@ -1443,10 +1513,12 @@ class NotificationService:
         )
         return message_id
 
-    async def _edit_slack_expired(self, notif: dict[str, Any]) -> None:
-        """Best-effort edit of the Slack card to show it expired.
+    async def _edit_slack_closed(
+        self, notif: dict[str, Any], status_line: str,
+    ) -> None:
+        """Best-effort edit of the Slack card of a row that closed unanswered.
 
-        Rebuilds the original text from the row and appends the status line,
+        Rebuilds the original text from the row and appends ``status_line``,
         dropping the now-dead buttons. All failures are swallowed by design.
         """
         channel = self._get_slack_channel()
@@ -1464,7 +1536,7 @@ class NotificationService:
             notif.get("body") or "",
             notif.get("priority") or "normal",
         )
-        text += "\n\n⏰ Expired unanswered"
+        text += f"\n\n{status_line}"
         await channel.expire_notification(
             delivery["target"],
             str(delivery["message_id"]),
@@ -1622,8 +1694,8 @@ class NotificationService:
                 )
 
             # Chat channels: mark the card expired, drop dead buttons.
-            await self._edit_telegram_expired(notif)
-            await self._edit_slack_expired(notif)
+            await self._edit_telegram_closed(notif, _EXPIRED_LINE)
+            await self._edit_slack_closed(notif, _EXPIRED_LINE)
 
             # Approvals: the proposer is the mechanical pipeline, not a
             # conversation — record the expiry in its audit log.
@@ -1654,36 +1726,11 @@ class NotificationService:
         Dispatched unconditionally — ``engine.run`` serializes per
         session, so a mid-turn session just processes the note when its
         current turn finishes (same pattern as the wakeup dispatcher
-        and ``handle_answer``). Skipped for external (satellite)
-        sessions, whose conversation loop Nerve doesn't own, and
-        archived/missing sessions — those got the web broadcast and
+        and ``handle_answer``). Skipped for the sessions that
+        :meth:`_takes_note` refuses; those got the web broadcast and
         nothing more.
         """
-        try:
-            session = await self.db.get_session(session_id)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(
-                "expiry injection: session lookup failed for %s: %s",
-                session_id, exc,
-            )
-            return
-        if not session:
-            logger.info(
-                "expiry injection: session %s missing — broadcast only",
-                session_id,
-            )
-            return
-        if session.get("status") == "archived":
-            logger.info(
-                "expiry injection: session %s archived — broadcast only",
-                session_id,
-            )
-            return
-        if session.get("source") == "external":
-            logger.info(
-                "expiry injection: session %s is external — broadcast only",
-                session_id,
-            )
+        if not await self._takes_note(session_id, "expiry note"):
             return
 
         if len(rows) == 1:
@@ -1704,11 +1751,41 @@ class NotificationService:
             internal=True,
         )
 
-    async def _edit_telegram_expired(self, notif: dict[str, Any]) -> None:
-        """Best-effort edit of the Telegram card to show it expired.
+    async def _takes_note(self, session_id: str, purpose: str) -> bool:
+        """Whether a session gets a note about its closed question.
+
+        False for an external (satellite) session, whose conversation
+        loop Nerve does not own, and for an archived or missing session.
+        ``purpose`` names the note in the log.
+        """
+        try:
+            session = await self.db.get_session(session_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "%s: session lookup failed for %s: %s",
+                purpose, session_id, exc,
+            )
+            return False
+        if not session:
+            reason = "missing"
+        elif session.get("status") == "archived":
+            reason = "archived"
+        elif session.get("source") == "external":
+            reason = "external"
+        else:
+            return True
+        logger.info(
+            "%s: session %s is %s, no note", purpose, session_id, reason,
+        )
+        return False
+
+    async def _edit_telegram_closed(
+        self, notif: dict[str, Any], status_line: str,
+    ) -> None:
+        """Best-effort edit of the Telegram card of a row that closed unanswered.
 
         Rebuilds the original message text from the row (same builder
-        the delivery used) and appends the status line, dropping the
+        the delivery used) and appends ``status_line``, dropping the
         now-dead inline keyboard. Telegram refuses edits on old
         messages (>48h) — all failures are swallowed by design.
         """
@@ -1739,7 +1816,7 @@ class NotificationService:
             notif.get("body") or "",
             notif.get("priority") or "normal",
         )
-        text += "\n\n⏰ Expired unanswered"
+        text += f"\n\n{status_line}"
 
         from nerve.channels.telegram import _md_to_tg_html
         from telegram.constants import ParseMode
@@ -1757,6 +1834,6 @@ class NotificationService:
                 )
             except Exception as exc:
                 logger.debug(
-                    "telegram expiry edit failed for %s: %s",
+                    "telegram card edit failed for %s: %s",
                     notif["id"], exc,
                 )

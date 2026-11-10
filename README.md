@@ -135,6 +135,7 @@ Powered by `python-telegram-bot` v21+.
 - Streaming responses via edit-in-place
 - Inline keyboard buttons for interactive tool questions
 - `/reply` command for free-text answers
+- Replying to a message continues the session it belongs to; `/new [message]` starts a fresh one
 - Configurable DM policy (`open` or `pairing`)
 
 ### 💬 Slack Bot
@@ -198,7 +199,7 @@ Memory categories adapt to mode — personal agents track relationships, health,
 Markdown files backed by SQLite FTS5 full-text search.
 
 - Statuses: `pending` → `in_progress` → `done` / `deferred`
-- Duplicate detection: exact URL match + fuzzy FTS fallback
+- Duplicate detection: exact URL match + title similarity (near-duplicates refused, look-alikes reported)
 - Escalation reminders: deadline → +30min follow-up → +2h URGENT (respects quiet hours)
 - Full markdown editor in the web UI
 
