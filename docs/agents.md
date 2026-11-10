@@ -202,6 +202,8 @@ settings changes always ask. Sessions without a person (cron, hooks,
 workflow runs) are refused; background sub-agents too, since the CLI never
 asks for them.
 
+GraphQL (`gh api graphql`) writes only through a `mutation`. An inline query asks only when it holds one (comments and strings don't count). A query in a file (`-F query=@file`, `--input file`, or `-` for stdin) passes the command check, and the `gh` wrapper reads it where the command runs: a mutation there, or a file it can't read, is refused unless approved.
+
 Writes inside a script are caught by `git` and `gh` wrappers that come first
 on the runtime's PATH (`~/.nerve/github-gate/bin`). They let a write through
 only when the command that ran them was approved: the gate exports

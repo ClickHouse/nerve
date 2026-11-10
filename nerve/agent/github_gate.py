@@ -31,6 +31,7 @@ import Nerve.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
@@ -39,6 +40,7 @@ import shutil
 import sys
 import time
 from dataclasses import dataclass
+from typing import Callable
 from pathlib import Path
 
 PUSH = "push"
@@ -252,7 +254,7 @@ def classify_git(args: list[str]) -> Write | None:
     return Write(PUSH, what)
 
 
-def classify_gh(args: list[str]) -> Write | None:
+def classify_gh(args: list[str], load: Callable[[str], str | None] | None = None) -> Write | None:
     """``gh <args>``: a write, or None for reads and local commands."""
     positional: list[str] = []
     i = 0
@@ -270,7 +272,7 @@ def classify_gh(args: list[str]) -> Write | None:
         return None
     group = positional[0]
     if group == "api":
-        return _classify_gh_api(args[args.index("api") + 1:])
+        return _classify_gh_api(args[args.index("api") + 1:], load)
     sub = positional[1] if len(positional) > 1 else ""
     kind = _GH_GROUPS.get(group, {}).get(sub)
     if kind is None:
@@ -278,11 +280,39 @@ def classify_gh(args: list[str]) -> Write | None:
     return Write(kind, "gh " + " ".join(args)[:200])
 
 
-def _classify_gh_api(args: list[str]) -> Write | None:
+_GQL_STRIP_RE = re.compile(r'"""(?:[^"]|"(?!""))*"""|"(?:\\.|[^"\\\n])*"|#[^\n]*')
+
+
+def has_mutation(document: str) -> bool:
+    """Whether a GraphQL document has a mutation operation. Comments and
+    strings are dropped first, so a ``# mutation`` note or a string that
+    says "mutation" doesn't count. Errs on the safe side otherwise: any
+    ``mutation`` keyword counts, whichever operation ``operationName`` picks."""
+    return re.search(r"\bmutation\b", _GQL_STRIP_RE.sub(" ", document)) is not None
+
+
+def _input_query(body: str) -> str | None:
+    """The ``query`` of a ``--input`` JSON body; None when it isn't one."""
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    query = data.get("query") if isinstance(data, dict) else None
+    return query if isinstance(query, str) else None
+
+
+def _classify_gh_api(
+    args: list[str], load: Callable[[str], str | None] | None = None,
+) -> Write | None:
+    """``gh api <args>``. *load* reads a file the call names (``@path``,
+    ``--input path``; ``-`` is stdin) and returns None when it can't. The
+    command-level check has no loader: a GraphQL query in a file passes
+    there, and the gh wrapper, which runs where the file is, reads it."""
     method: str | None = None
     endpoint: str | None = None
     fields: list[str] = []
     has_input = False
+    input_path: str | None = None
     i = 0
     while i < len(args):
         arg = args[i]
@@ -303,6 +333,7 @@ def _classify_gh_api(args: list[str]) -> Write | None:
             fields.append(arg.split("=", 1)[1])
         elif arg in ("--input",) or arg.startswith("--input="):
             has_input = True
+            input_path = value if arg == "--input" else arg.split("=", 1)[1]
             if arg == "--input":
                 i += 2
                 continue
@@ -317,10 +348,23 @@ def _classify_gh_api(args: list[str]) -> Write | None:
     if method is None:
         method = "POST" if (fields or has_input) else "GET"
     what = f"gh api {method} {endpoint}"[:200]
-    if endpoint.strip("/") == "graphql":
-        if has_input or any(re.search(r"\bmutation\b", f, re.I) for f in fields) \
-                or any(f.split("=", 1)[-1].startswith("@") for f in fields):
-            return Write(POST, what + " (GraphQL)")
+    if endpoint.strip("/").rsplit("/", 1)[-1] == "graphql":
+        documents: list[str | None] = []
+        for field in fields:
+            key, _, value = field.partition("=")
+            if key != "query":
+                continue  # variables and operationName run nothing
+            if value.startswith("@"):
+                if load is not None:
+                    documents.append(load(value[1:]))
+            else:
+                documents.append(value)
+        if input_path is not None and load is not None:
+            body = load(input_path)
+            documents.append(None if body is None else _input_query(body))
+        # Unreadable or not a query: ask, it could be anything.
+        if any(doc is None or has_mutation(doc) for doc in documents):
+            return Write(POST, what + " (GraphQL mutation)")
         return None
     if method in ("GET", "HEAD"):
         return None
@@ -533,11 +577,29 @@ def _refuse(writes: list[Write]) -> int:
 
 
 def wrap(tool: str, real: str, args: list[str]) -> int:
-    """The wrapper's check: run *real* unless a write lacks an approval."""
-    write = classify_git(args) if tool == "git" else classify_gh(args)
+    """The wrapper's check: run *real* unless a write lacks an approval.
+
+    For gh it reads the files a GraphQL call names, from where it runs. A
+    query on stdin is read once and handed on to *real* unchanged."""
+    stdin: list[bytes] = []
+
+    def load(path: str) -> str | None:
+        try:
+            if path == "-":
+                if not stdin:
+                    stdin.append(sys.stdin.buffer.read())
+                return stdin[0].decode("utf-8", "replace")
+            return Path(path).expanduser().read_text(errors="replace")
+        except OSError:
+            return None
+
+    write = classify_git(args) if tool == "git" else classify_gh(args, load)
     writes = [write] if write else []
     if writes and needs_person(writes) and not approval_valid(os.environ.get(APPROVAL_ENV)):
         return _refuse(writes)
+    if stdin:
+        import subprocess
+        return subprocess.run([real, *args], input=stdin[0]).returncode
     os.execv(real, [real, *args])
     return 0  # not reached
 

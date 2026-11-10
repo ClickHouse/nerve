@@ -99,7 +99,12 @@ def kinds(command: str) -> list[str]:
     ("gh api -X PUT repos/a/b/pulls/1/merge", ["destructive"]),
     ("gh api graphql -f query='query { viewer { login } }'", []),
     ("gh api graphql -f query='mutation { addComment(input:{}) { x } }'", ["post"]),
-    ("gh api graphql -f query=@q.graphql", ["post"]),
+    # A query in a file passes here; the gh wrapper reads the file.
+    ("gh api graphql -F query=@q.graphql -f path=x", []),
+    ("gh api graphql --input body.json", []),
+    ("gh api graphql -f query='# a mutation would need a card\nquery { viewer { login } }'", []),
+    ("gh api graphql -f query='query { search(query:\"mutation\") { issueCount } }'", []),
+    ("gh api graphql -F query=@q.graphql -f note=mutation", []),
     ("NERVE_GITHUB_WRITE=1 python3 -I push.py", ["declared"]),
     ("python3 -I push.py --dry-run", []),
     ("git push origin x && gh pr comment 1 -b done", ["push", "post"]),
@@ -210,18 +215,19 @@ def wrappers(tmp_path, _gate_dir, monkeypatch):
     real.mkdir()
     for tool in ("git", "gh"):
         fake = real / tool
-        fake.write_text(f'#!/bin/sh\necho "REAL-{tool} $*"\n')
+        fake.write_text(f'#!/bin/sh\necho "REAL-{tool} $*"\ncase "$*" in *@-*|*"--input -"*) printf "STDIN:"; cat;; esac\n')
         fake.chmod(0o755)
     monkeypatch.setenv("PATH", f"{real}{os.pathsep}{os.environ['PATH']}")
     bin_dir = gg.install_wrappers()
     assert bin_dir == _gate_dir / "bin"
 
-    def run(tool: str, *args: str, approval: str | None = None):
+    def run(tool: str, *args: str, approval: str | None = None, stdin: str = "", cwd=None):
         env = {**os.environ, "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
         env.pop(gg.APPROVAL_ENV, None)
         if approval is not None:
             env[gg.APPROVAL_ENV] = approval
-        return subprocess.run([tool, *args], env=env, capture_output=True, text=True, timeout=30)
+        return subprocess.run([tool, *args], env=env, capture_output=True, text=True, timeout=30,
+                              input=stdin, cwd=cwd)
     return run
 
 
@@ -245,6 +251,55 @@ def test_wrappers_let_an_approved_write_through(wrappers):
     nonce = gg.issue_approval("push")
     pushed = wrappers("git", "push", "origin", "x", approval=nonce)
     assert pushed.returncode == 0 and pushed.stdout.strip() == "REAL-git push origin x"
+
+
+QUERY = "query($p: String!) { repository(owner: \"a\", name: \"b\") { object(expression: $p) { oid } } }"
+MUTATION = "mutation { addStar(input: {starrableId: \"x\"}) { clientMutationId } }"
+
+
+def test_wrappers_read_a_graphql_query_from_its_file(wrappers, tmp_path):
+    work = tmp_path / "work"
+    (work / "q").mkdir(parents=True)
+    (work / "q" / "read.graphql").write_text(QUERY)
+    (work / "q" / "star.graphql").write_text("# stars a repo\n" + MUTATION)
+    read = wrappers("gh", "api", "graphql", "-F", "query=@q/read.graphql", "-f", "p=main", cwd=work)
+    assert read.returncode == 0 and read.stdout.startswith("REAL-gh api graphql")
+    star = wrappers("gh", "api", "graphql", "-F", "query=@q/star.graphql", cwd=work)
+    assert star.returncode == gg.REFUSED_EXIT and "GraphQL mutation" in star.stderr
+    nonce = gg.issue_approval("post")
+    assert wrappers("gh", "api", "graphql", "-F", "query=@q/star.graphql", cwd=work, approval=nonce).returncode == 0
+    missing = wrappers("gh", "api", "graphql", "-F", "query=@q/nope.graphql", cwd=work)
+    assert missing.returncode == gg.REFUSED_EXIT
+
+
+def test_wrappers_check_a_query_on_stdin_and_pass_it_on(wrappers):
+    read = wrappers("gh", "api", "graphql", "-F", "query=@-", stdin=QUERY)
+    assert read.returncode == 0 and read.stdout.strip().endswith("STDIN:" + QUERY)
+    assert wrappers("gh", "api", "graphql", "-F", "query=@-", stdin=MUTATION).returncode == gg.REFUSED_EXIT
+
+
+def test_wrappers_read_an_input_body(wrappers, tmp_path):
+    import json
+    (tmp_path / "read.json").write_text(json.dumps({"query": QUERY, "variables": {"p": "mutation"}}))
+    (tmp_path / "star.json").write_text(json.dumps({"query": MUTATION}))
+    (tmp_path / "bad.json").write_text("not json")
+    assert wrappers("gh", "api", "graphql", "--input", "read.json", cwd=tmp_path).returncode == 0
+    assert wrappers("gh", "api", "graphql", "--input", "star.json", cwd=tmp_path).returncode == gg.REFUSED_EXIT
+    assert wrappers("gh", "api", "graphql", "--input", "bad.json", cwd=tmp_path).returncode == gg.REFUSED_EXIT
+    piped = wrappers("gh", "api", "graphql", "--input", "-", stdin=json.dumps({"query": QUERY}))
+    assert piped.returncode == 0 and "STDIN:" in piped.stdout
+
+
+@pytest.mark.parametrize("document, mutation", [
+    (QUERY, False),
+    (MUTATION, True),
+    ("# mutation\nquery { viewer { login } }", False),
+    ('query { search(query: "mutation") { issueCount } }', False),
+    ('query { a } mutation M { addStar(input: {}) { x } }', True),
+    ('"""a mutation in a block string"""\nquery { a }', False),
+])
+def test_has_mutation(document, mutation):
+    assert gg.has_mutation(document) is mutation
 
 
 def test_wrappers_let_ci_reruns_through(wrappers):
