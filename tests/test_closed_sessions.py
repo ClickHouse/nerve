@@ -382,34 +382,6 @@ async def test_a_queued_turn_is_refused_when_the_session_was_archived_meanwhile(
 
 
 @pytest.mark.asyncio
-async def test_a_session_archived_while_its_turn_waits_for_the_client_gets_no_client(
-    tmp_path, db,
-):
-    """The check under the client lock: the archive lands after the checks
-    in ``_run_turn``, while the turn waits to build its client."""
-    engine, backend = _engine(tmp_path, db)
-    sid = "s-build"
-    await engine.sessions.get_or_create(sid, source="web", backend="claude", actor=None)
-    client_lock = engine.sessions.get_lock(sid)
-    await client_lock.acquire()
-    turn = asyncio.create_task(
-        engine.run(sid, "a message", source="web", channel="web", actor=None),
-    )
-    await _until(lambda: engine.sessions.is_running(sid))
-    await db.change_session_status(sid, "archived", event_type="archived")
-    client_lock.release()
-
-    with pytest.raises(SessionClosedError):
-        await asyncio.wait_for(turn, timeout=5)
-    assert backend.clients == []
-    row = await db.get_session(sid)
-    assert row["status"] == "archived"
-    assistant = [m for m in await db.get_messages(sid) if m["role"] == "assistant"]
-    assert assistant == []
-    assert "error" not in await _events(db, sid)
-
-
-@pytest.mark.asyncio
 async def test_a_turn_that_starts_during_an_archive_is_refused_before_it_stores_anything(
     tmp_path, db,
 ):

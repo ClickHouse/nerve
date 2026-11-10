@@ -1554,10 +1554,6 @@ class AgentEngine:
 
             # Session row first — backend resolution is sticky on it.
             session = await self.db.get_session(session_id)
-            # Check again before the runtime gets anything.
-            closed = await self._session_closed_reason(session_id)
-            if closed:
-                raise SessionClosedError(closed)
             backend = self._backend_for(session, source)
             requested_model = (
                 model or (session or {}).get("model")
@@ -2123,15 +2119,6 @@ class AgentEngine:
             running = self.sessions.get_running_ids()
         logger.info("Drain: all running turns ended")
         return True
-
-    async def _session_closed_reason(self, session_id: str) -> str | None:
-        """``archived`` or ``deleted`` when no turn may run in the session,
-        else ``None``. An archive or a delete in progress counts; that check
-        comes before the first await."""
-        return (
-            self.sessions.closing_reason(session_id)
-            or await self.db.closed_session_reason(session_id)
-        )
 
     async def _refuse_closed_session(
         self,
@@ -4077,7 +4064,10 @@ class AgentEngine:
             # The session can be archived or deleted before this run holds
             # the lock, or while it waits in the queue. No await since the
             # lock (see SessionManager.closing).
-            closed = await self._session_closed_reason(session_id)
+            closed = (
+                self.sessions.closing_reason(session_id)
+                or await self.db.closed_session_reason(session_id)
+            )
             if closed:
                 await self._refuse_closed_session(
                     session_id, closed, entry=entry, client_msg_id=client_msg_id,
@@ -4634,14 +4624,6 @@ class AgentEngine:
             # Memorize in background — don't block the stop path
             await self.schedule_memorize(session_id)
             return TurnResult(partial, outcome)
-
-        except SessionClosedError as e:
-            # Archived or deleted while this turn waited for its client: the
-            # runtime got nothing, so there is no reply and no error state.
-            self._end_turn(session_id, TurnOutcome("interrupted", str(e)))
-            logger.info("Session %s: turn refused (%s)", session_id, e.reason)
-            await broadcaster.broadcast_error(session_id, str(e))
-            raise
 
         except Exception as e:
             error_msg = f"Agent error: {e}"
