@@ -949,6 +949,36 @@ function reviewLoopIconTone(status: string): string {
 }
 
 
+/** "1 agent running", "3 agents running". */
+function agentsRunning(agents: number): string {
+  return `${agents} agent${agents === 1 ? '' : 's'} running`;
+}
+
+
+/**
+ * A status mark with the number of the session's live agents after it, in
+ * the mark's own colour. With fewer than `from` agents the mark stands alone.
+ */
+function WithAgentCount({ agents, from, tone, title, children }: {
+  agents: number;
+  /** The fewest agents that get a number. */
+  from: number;
+  /** Text colour class of the number, the hue of the mark it follows. */
+  tone: string;
+  /** Tooltip of the mark and number; "N agents running" when left out. */
+  title?: string;
+  children: React.ReactNode;
+}) {
+  if (agents < from) return <>{children}</>;
+  return (
+    <span className="flex items-center gap-1 shrink-0" title={title ?? agentsRunning(agents)}>
+      {children}
+      <span className={`text-2xs tabular-nums ${tone}`}>{agents}</span>
+    </span>
+  );
+}
+
+
 /**
  * Tooltip for the parked dot: what exactly the session is waiting on.
  * `scheduledBy` names who scheduled the wake-up ("Alice", "Nerve for Bob"),
@@ -957,7 +987,7 @@ function reviewLoopIconTone(status: string): string {
 function parkedTitle(session: Session, scheduledBy: string | null): string {
   const parts: string[] = [];
   const agents = session.background_count ?? 0;
-  if (agents > 0) parts.push(`${agents} agent${agents === 1 ? '' : 's'} running`);
+  if (agents > 0) parts.push(agentsRunning(agents));
   else if (session.has_background_tasks) parts.push('Background job running');
   if (session.pending_wakeup_at) {
     const at = parseTimestamp(session.pending_wakeup_at);
@@ -979,21 +1009,16 @@ function ParkedIndicator({ session }: { session: Session }) {
     session.pending_wakeup_at ? session.pending_wakeup_created_by_actor_id : null,
     session.pending_wakeup_caused_by_actor_id,
   );
-  const agents = session.background_count ?? 0;
   const title = parkedTitle(session, scheduledBy);
-  const dot = (
-    <span className="relative flex h-2 w-2 shrink-0" title={title}>
-      <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-violet opacity-75" />
-      <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-violet" />
-    </span>
-  );
-  // How many agents run, once there is more than one to count.
-  if (agents < 2) return dot;
+  // With no turn in flight the dot itself stands for the one agent at work,
+  // so the number only shows once there is more than one to count.
   return (
-    <span className="flex items-center gap-1 shrink-0" title={title}>
-      {dot}
-      <span className="text-2xs tabular-nums text-hue-violet">{agents}</span>
-    </span>
+    <WithAgentCount agents={session.background_count ?? 0} from={2} tone="text-hue-violet" title={title}>
+      <span className="relative flex h-2 w-2 shrink-0" title={title}>
+        <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-violet opacity-75" />
+        <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-violet" />
+      </span>
+    </WithAgentCount>
   );
 }
 
@@ -1024,18 +1049,28 @@ function StatusIndicator({ session, isActive, isRunning }: {
     );
   }
 
+  // While a turn runs, the spinner or dot stands for the turn itself, so
+  // every agent the session runs besides it gets a number, from one up.
+  const agents = session.background_count ?? 0;
+
   // Active + running: spinner
   if (isActive && isRunning) {
-    return <Loader2 size={12} className="shrink-0 text-accent animate-spin" />;
+    return (
+      <WithAgentCount agents={agents} from={1} tone="text-accent">
+        <Loader2 size={12} className="shrink-0 text-accent animate-spin" />
+      </WithAgentCount>
+    );
   }
 
   // Non-active but running: pulsing green dot
   if (isRunning) {
     return (
-      <span className="relative flex h-2 w-2 shrink-0">
-        <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-emerald opacity-75" />
-        <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-emerald" />
-      </span>
+      <WithAgentCount agents={agents} from={1} tone="text-hue-emerald">
+        <span className="relative flex h-2 w-2 shrink-0">
+          <span className="motion-safe:animate-ping absolute inline-flex h-full w-full rounded-full bg-hue-emerald opacity-75" />
+          <span className="relative inline-flex rounded-full h-2 w-2 bg-hue-emerald" />
+        </span>
+      </WithAgentCount>
     );
   }
 
