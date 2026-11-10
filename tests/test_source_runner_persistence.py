@@ -31,9 +31,21 @@ class _FixedSource(Source):
     def __init__(self, records: list[SourceRecord], next_cursor: str = "new"):
         self.records = records
         self.next_cursor = next_cursor
+        self.fetches = 0
 
     async def fetch(self, cursor: str | None, limit: int = 100) -> FetchResult:
+        self.fetches += 1
         return FetchResult(records=list(self.records), next_cursor=self.next_cursor)
+
+
+def _inbox_gate_context(db) -> GateContext:
+    return GateContext(job_id="inbox-processor", db=db)
+
+
+async def _poll_inbox(db) -> str:
+    """What a ``poll_all_sources`` call of the inbox consumer reads."""
+    result = await poll_all_sources_handler(ToolContext(session_id="s", db=db), {"consumer": "inbox"})
+    return result.text_content
 
 
 @pytest.mark.asyncio
@@ -202,7 +214,7 @@ async def test_a_new_source_s_first_records_are_unread_for_the_existing_consumer
     # The inbox consumer already reads another source.
     await db.insert_source_messages([dataclasses.replace(_record("x"), source="other")], source="other")
     await db.set_consumer_cursor("inbox", "other", await db.get_source_max_rowid("other"))
-    ctx = GateContext(job_id="inbox-processor", db=db)
+    ctx = _inbox_gate_context(db)
     assert not await MessagesGate().is_satisfied(ctx)
 
     result = await SourceRunner(_FixedSource([_record("a")]), db).run()
@@ -232,9 +244,7 @@ async def test_a_baseline_run_seeds_the_cursor_so_later_records_wake_the_consume
     await runner.run()
     assert await db.consumer_has_unread("inbox")
 
-    text = (await poll_all_sources_handler(
-        ToolContext(session_id="s", db=db), {"consumer": "inbox"},
-    )).text_content
+    text = await _poll_inbox(db)
     assert "Record later" in text
     assert f"{SOURCE_NAME}: 1 new" in text
 
@@ -259,13 +269,26 @@ async def test_seeding_leaves_an_existing_cursor_and_only_runs_without_a_source_
 
 
 @pytest.mark.asyncio
-async def test_a_failure_to_start_the_consumer_cursors_does_not_stop_the_run(db, monkeypatch):
+async def test_a_failure_to_start_the_consumer_cursors_fails_the_run_before_the_fetch(db, monkeypatch):
+    await db.set_consumer_cursor("inbox", "other", 0)
+    source = _FixedSource([_record("a")])
+    runner = SourceRunner(source, db)
+
     async def fail(source, ttl_days):
         raise RuntimeError("cursors unavailable")
 
     monkeypatch.setattr(db, "seed_consumer_cursors", fail)
+    result = await runner.run()
 
-    result = await SourceRunner(_FixedSource([_record("a")]), db).run()
+    assert result.records_ingested == 0
+    assert "cursors unavailable" in result.error
+    assert source.fetches == 0
+    assert await db.get_sync_cursor(SOURCE_NAME) is None
 
-    assert (result.records_ingested, result.error) == (1, None)
-    assert await db.get_sync_cursor(SOURCE_NAME) == "new"
+    # The next run tries again and delivers the first records.
+    monkeypatch.undo()
+    runner.health.backoff_until = None
+    assert (await runner.run()).records_ingested == 1
+    for sources in ([], [SOURCE_NAME]):
+        assert await MessagesGate(sources=sources).is_satisfied(_inbox_gate_context(db))
+    assert "Record a" in await _poll_inbox(db)
