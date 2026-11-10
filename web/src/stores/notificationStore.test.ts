@@ -89,4 +89,44 @@ describe('the count of pending questions and approvals', () => {
     expect(counts()).toEqual({ pendingCount: 1, pendingAnswerCount: 0 });
     expect(prefix()).toBe('(1) ');
   });
+
+  it('goes down for a dismissal, and only a question or an approval lowers the answer count', () => {
+    useNotificationStore.setState({
+      filter: 'answered',
+      notifications: [row('ask-old', 'question', 'answered')],
+      byId: { 'ask-chat': row('ask-chat', 'question', 'dismissed') },
+      pendingCount: 4, pendingAnswerCount: 2,
+    });
+    const { handleWSNotificationDismissed } = useNotificationStore.getState();
+
+    handleWSNotificationDismissed({ notification_id: 'note-1', notification_type: 'notify', actor_id: 'actor-alice' });
+    expect(counts()).toEqual({ pendingCount: 3, pendingAnswerCount: 2 });
+
+    handleWSNotificationDismissed({ notification_id: 'ask-1', notification_type: 'question', actor_id: 'actor-alice' });
+    expect(counts()).toEqual({ pendingCount: 2, pendingAnswerCount: 1 });
+
+    // Rows that are not pending here: in the list, and in the chat only.
+    handleWSNotificationDismissed({ notification_id: 'ask-old', notification_type: 'question' });
+    handleWSNotificationDismissed({ notification_id: 'ask-chat', notification_type: 'question' });
+    expect(counts()).toEqual({ pendingCount: 2, pendingAnswerCount: 1 });
+
+    handleWSNotificationDismissed({ notification_id: 'ok-1', notification_type: 'approval' });
+    expect(counts()).toEqual({ pendingCount: 1, pendingAnswerCount: 0 });
+  });
+
+  it('marks every copy of a dismissed row with the person who dismissed it', () => {
+    const pending = row('ask-1', 'question', 'pending');
+    useNotificationStore.setState({
+      notifications: [pending], toastQueue: [pending], byId: { 'ask-1': pending }, pendingCount: 1, pendingAnswerCount: 1,
+    });
+
+    useNotificationStore.getState().handleWSNotificationDismissed({
+      notification_id: 'ask-1', notification_type: 'question', actor_id: 'actor-alice',
+    });
+
+    const { notifications, toastQueue, byId } = useNotificationStore.getState();
+    for (const copy of [notifications[0], toastQueue[0], byId['ask-1']]) {
+      expect(copy).toMatchObject({ status: 'dismissed', dismissed_by_actor_id: 'actor-alice' });
+    }
+  });
 });

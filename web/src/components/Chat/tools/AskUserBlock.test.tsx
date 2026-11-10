@@ -9,6 +9,7 @@ vi.mock('../../../api/client', () => ({
   api: {
     getNotification: vi.fn(),
     answerNotification: vi.fn(),
+    dismissNotification: vi.fn(),
     listNotifications: vi.fn(async () => ({ notifications: [], pending_count: 0 })),
     listActors: vi.fn(async () => ({ actors: [{ id: 'actor-alice', kind: 'human', display_name: 'Alice', username: null }] })),
   },
@@ -25,6 +26,7 @@ const { formatMessageTime } = await import('../../../utils/messageTime');
 
 const getNotification = vi.mocked(api.getNotification);
 const answerNotification = vi.mocked(api.answerNotification);
+const dismissNotification = vi.mocked(api.dismissNotification);
 
 const ID = 'ask-1a2b3c4d';
 /** The server's answer time, from the answer event. */
@@ -149,6 +151,33 @@ describe('AskUserBlock', () => {
     });
     expect(screen.getByText('Expired without an answer')).toBeInTheDocument();
     expect(screen.queryByRole('group')).not.toBeInTheDocument();
+  });
+
+  it('dismisses the question from the chat', async () => {
+    getNotification.mockResolvedValue(row());
+    dismissNotification.mockResolvedValue({ notification_id: ID, dismissed: true });
+    renderCall();
+    await options();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+
+    expect(dismissNotification).toHaveBeenCalledWith(ID);
+    expect(await screen.findByText('Dismissed without an answer')).toBeInTheDocument();
+    expect(screen.queryByRole('group')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).not.toBeInTheDocument();
+  });
+
+  it('shows a question that was dismissed in another place', async () => {
+    getNotification.mockResolvedValue(row());
+    renderCall();
+    await options();
+    act(() => {
+      useNotificationStore.getState().handleWSNotificationDismissed({
+        notification_id: ID, notification_type: 'question', actor_id: 'actor-alice',
+      });
+    });
+    expect(screen.getByText('Dismissed without an answer')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Dismiss' })).not.toBeInTheDocument();
   });
 
   it('shows the options read-only when the question cannot be read', async () => {

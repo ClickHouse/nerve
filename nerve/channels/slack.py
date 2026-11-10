@@ -1632,7 +1632,7 @@ class SlackChannel(BaseChannel):
         message_id: str,
         text: str,
     ) -> None:
-        """Replace a notification card with its expired state."""
+        """Replace a notification card with *text* and no buttons."""
         if not self.is_available:
             return
         channel_id, _ = parse_target(target)
@@ -1645,7 +1645,7 @@ class SlackChannel(BaseChannel):
             )
         except Exception as exc:
             logger.debug(
-                "Slack expiry edit failed for %s: %s", message_id, exc,
+                "Slack card edit failed for %s: %s", message_id, exc,
             )
 
     async def send(self, message: OutboundMessage) -> None:

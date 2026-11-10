@@ -187,10 +187,29 @@ describe('the sessions that need you', () => {
     dispatch({ ...base, type: 'notification', notification_type: 'question', body: '', priority: 'normal', options: null });
     dispatch({ ...base, type: 'notification_answered', answer: 'yes', answered_by: 'web' });
     dispatch({ ...base, type: 'notification_expired', notification_type: 'question' });
+    dispatch({ ...base, type: 'notification_dismissed', notification_type: 'question' });
     expect(api.listSessions).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(500);
     expect(api.listSessions).toHaveBeenCalledTimes(1);
+  });
+
+  it('a dismissal in another place reloads the list and folds the question', async () => {
+    vi.useFakeTimers();
+    useChatStore.setState({ sessionsNextOffset: 0, sessionsHasMore: false, archivedSessions: null, systemSessions: null });
+    const { useNotificationStore } = await import('./notificationStore');
+    const asked = {
+      id: 'n1', session_id: 's1', session_title: null, type: 'question' as const, title: 't', body: '',
+      priority: 'normal', status: 'pending', options: null, answer: null, answered_by: null, answered_at: null,
+      created_at: '2026-11-07T10:00:00Z', expires_at: null,
+    };
+    useNotificationStore.setState({ byId: { n1: asked } });
+
+    dispatch({ type: 'notification_dismissed', notification_id: 'n1', session_id: 's1', notification_type: 'question', title: 't' });
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(api.listSessions).toHaveBeenCalledTimes(1);
+    expect(useNotificationStore.getState().byId.n1?.status).toBe('dismissed');
   });
 
   it('a task event reloads the list: a plan decided in another place clears "Plan to review"', async () => {

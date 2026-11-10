@@ -80,7 +80,7 @@ export function handleFileChanged(
 }
 
 // A notification event can change the pending counts of the session list
-// ("Needs you"), so each of the three reloads it.
+// ("Needs you"), so each of them reloads it.
 export function handleNotification(
   msg: Extract<WSMessage, { type: 'notification' }>,
   _get: Get,
@@ -110,6 +110,17 @@ export function handleNotificationExpired(
 ): void {
   import('../notificationStore').then(({ useNotificationStore }) =>
     useNotificationStore.getState().handleWSNotificationExpired(msg)
+  );
+  reloadSessionsSoon();
+}
+
+export function handleNotificationDismissed(
+  msg: Extract<WSMessage, { type: 'notification_dismissed' }>,
+  _get: Get,
+  _set: Set,
+): void {
+  import('../notificationStore').then(({ useNotificationStore }) =>
+    useNotificationStore.getState().handleWSNotificationDismissed(msg)
   );
   reloadSessionsSoon();
 }

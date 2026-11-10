@@ -22,6 +22,7 @@ vi.mock('../../api/client', async (orig) => ({
   api: {
     listNotifications: vi.fn(async () => ({ notifications: [], pending_count: 0, pending_answer_count: 0 })),
     dismissNotification: vi.fn(async () => ({})),
+    getNotification: vi.fn(async () => { throw new Error('offline'); }),
     dismissAllNotifications: vi.fn(async () => ({})),
   },
 }));
@@ -274,6 +275,12 @@ describe('BrowserAlerts', () => {
     expect(FakeNotification.shown[1].closed).toBe(false);
     dispatch({ type: 'notification_answered', notification_id: 'ask-2', session_id: 's1', answer: 'Yes', answered_by: 'telegram' });
     expect(FakeNotification.shown[1].closed).toBe(true);
+
+    send({ notification_id: 'ask-3', title: 'Ship it?' });
+    act(() => { vi.advanceTimersByTime(ALERT_DELAY_MS); });
+    expect(FakeNotification.shown[2]).toMatchObject({ title: 'Ship it?', closed: false });
+    dispatch({ type: 'notification_dismissed', notification_id: 'ask-3', session_id: 's1', notification_type: 'question', title: 'Ship it?' });
+    expect(FakeNotification.shown[2].closed).toBe(true);
   });
 
   it('shows no alert while alerts are off', () => {

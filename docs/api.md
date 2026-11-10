@@ -874,6 +874,29 @@ and approvals among them. While it is more than 0, the tab title starts with
 "!" (see [web-ui.md](web-ui.md#browser-alerts)). The filters and the limit do
 not apply to the two counts.
 
+#### `POST /api/notifications/{id}/dismiss`
+
+Dismisses a pending notification of any type and records the signed-in
+person in `dismissed_by_actor_id`. Answers `{notification_id, dismissed: true}`,
+or `409` when the row is not pending or an answer to an approval is already
+running. Every dismissal sends a `notification_dismissed` event.
+
+A question or an approval ends without an answer, as at expiry: the Telegram
+and Slack cards get "🔕 Dismissed without an answer" and lose their buttons.
+The session that asked a question gets the internal turn
+`[Question dismissed without an answer: <title>]`, written by the person who
+dismissed it. An external, archived or missing session gets no turn. While
+the engine drains, the dismissal of a question that would start a turn is
+refused (`503`) and the question stays pending. An approval gets an
+`approval-dismissed` record in the mechanical-actions audit log. A review loop
+that waits on its card proposes a new card at its next reconcile tick, as it
+does after an expiry.
+
+#### `POST /api/notifications/dismiss-all`
+
+Dismisses the pending `notify` rows only, and sends no event. Answers
+`{dismissed: <count>}`.
+
 ### Web Push
 
 The installable panel and its push notifications (see
@@ -2304,6 +2327,8 @@ those for another session. Events marked *global* go to every socket.
 { type: "notification_answered", notification_id: "…", session_id: "…", answer: "…", answered_by: "…", answered_at: "…" | null, actor_id: "…" }
 // answered_at: the stored answer time (ISO 8601). A snoozed approval has approval_status: "snoozed" and snooze_until instead.
 { type: "notification_expired", notification_id: "…", session_id: "…", notification_type: "question", title: "…" }
+// One row was dismissed. actor_id: the person who dismissed it
+{ type: "notification_dismissed", notification_id: "…", session_id: "…", notification_type: "question", title: "…", actor_id: "…" }
 // An answer was relayed into the session as a message
 { type: "answer_injected", session_id: "…", notification_id: "…", title: "…", answer: "…", answered_by: "…", content: "…", actor_id: "…" }
 

@@ -41,6 +41,8 @@ export type WSMessage =
   // `actor_id` is the person who answered; null for a chat-channel answer.
   | { type: 'notification_answered'; notification_id: string; session_id: string; answer: string; answered_by: string; answered_at?: string | null; actor_id?: string | null; approval_status?: 'answered' | 'snoozed'; dispatch_ok?: boolean; snooze_until?: string }
   | { type: 'notification_expired'; notification_id: string; session_id: string; notification_type: string; title: string }
+  // `actor_id` is the person who dismissed the row.
+  | { type: 'notification_dismissed'; notification_id: string; session_id: string; notification_type: string; title: string; actor_id?: string | null }
   // The answer becomes a user message written by the person who answered;
   // `actor_id` is null for a chat-channel answer.
   | { type: 'answer_injected'; session_id: string; notification_id: string; title: string; answer: string; answered_by: string; content: string; actor_id?: string | null }

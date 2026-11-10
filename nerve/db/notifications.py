@@ -286,10 +286,15 @@ class NotificationStore:
     async def dismiss_notification(
         self, notification_id: str, *, attribution: Attribution = UNATTRIBUTED,
     ) -> bool:
-        """Dismiss a pending row. ``attribution.actor_id`` is who dismissed it."""
+        """Dismiss a pending row. ``attribution.actor_id`` is who dismissed it.
+
+        An approval that a press claimed (see :meth:`claim_pending_approval`)
+        is not dismissed: its dispatcher runs the decision.
+        """
         async with self._atomic():
             async with self.db.execute(
-                "SELECT id FROM notifications WHERE id = ? AND status = 'pending'",
+                """SELECT id FROM notifications
+                   WHERE id = ? AND status = 'pending' AND answered_at IS NULL""",
                 (notification_id,),
             ) as cursor:
                 if not await cursor.fetchone():
