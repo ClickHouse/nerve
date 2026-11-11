@@ -157,11 +157,17 @@ The user can monitor, stop, or interact with the implementation session from the
 
 ### Skill Proposals
 
-Plans from the `skill-extractor` and `skill-reviser` cron jobs (`plan_type` `skill-create` / `skill-update`, auto-detected from the task's `source` field) go through the same approval path as any other plan — an `impl-<id>` session is spawned — with a skill-specific prompt:
+A plan is a skill plan when its `plan_type` is `skill-create` or `skill-update`: the `plan_propose` call states the type, or the task's `source` is `skill-extractor` or `skill-reviser`. The `skill-extractor` cron job states it. A skill plan goes through the same approval path as any other plan — an `impl-<id>` session is spawned — with a prompt for the plan type. A session that implements the plan itself (`plan_approve` with `implement_here=true`) gets no such prompt.
 
-1. The session reads the approved plan as a full SKILL.md file (YAML frontmatter + body)
-2. `skill-create` → it calls `skill_create` with the name, description and body; `skill-update` → it calls `skill_update` with the full SKILL.md content
+A `skill-create` plan is a proposal for a person to judge. It says what the skill is for, the evidence that it is needed (where the workflow occurred and what was repeated) and the direction the skill should take. The prompt has the session write the skill:
+
+1. The session looks at the evidence the plan names and at the existing skills
+2. It decides the skill's name, description and content, within the plan's direction, and calls `skill_create`
 3. It then calls `task_done` with a note describing what was done
+
+When the evidence does not support a skill, or an existing skill covers it, the session creates none, tells the user why with `notify`, and says so in the note. A plan can also hold a complete SKILL.md: one that `skill-extractor` proposed in an earlier release, one a person wrote, or one from a job with a prompt of its own. The session takes it as a draft, checks it against the evidence, and passes its body, without the frontmatter, to `skill_create`.
+
+A `skill-update` plan is the full revised SKILL.md file (YAML frontmatter + body). The session calls `skill_update` with it, and then `task_done`.
 
 The plan is marked `implementing` on approval and `failed` if the first implementation turn fails.
 

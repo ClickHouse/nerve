@@ -173,20 +173,46 @@ PRODUCTIVITY_CRONS = [
         "id": "skill-extractor",
         "name": "Skill Extractor",
         "display_name": "Skill extractor",
-        "schedule": "0 */12 * * *",
-        "description": "Every 12 hours, analyzes your recent activity to detect repeated workflows. When it finds a pattern, it proposes a reusable skill for your review.",
+        # With memory-maintenance: a machine that is parked while idle is
+        # woken once for both.
+        "schedule": "0 5 * * *",
+        "description": "Once a day, analyzes your recent activity to detect repeated workflows. When it finds a pattern, it proposes a reusable skill for your review.",
         "requires": None,
         "session_mode": "persistent",
         "context_rotate_hours": 168,
         "reminder_mode": False,
+        # One proposal per run, and a plan that is a plan: the person who
+        # reviews it judges whether the skill is worth having, and the session
+        # that implements the approved plan writes the skill
+        # (nerve.agent.plan_service). The plan type is what briefs that
+        # session for a skill; plan_propose would also take it from the
+        # task's source, which says where the task came from. The tag is how
+        # a later run finds the task whatever became of the proposal: no tool
+        # lists tasks by their source, and a search needs words to look for.
+        # The limit is there because task_list stops at 100 without one.
         "prompt": (
-            "You are a skill extraction agent. Identify repeated workflows from recent activity and propose new skills.\n\n"
+            "You are a skill extraction agent. Find a workflow that is repeated in recent activity and propose one new skill for it.\n\n"
             "1. Recall recent behavior patterns and events\n"
-            "2. Check existing skills to avoid duplicates\n"
+            "2. Check the existing skills (skill_list) and what was proposed before: "
+            "task_list with status \"all\", tag \"skill-proposal\" and limit 1000 lists the tasks of earlier proposals; "
+            "plan_list shows the plans in review and, with status \"declined\", the declined ones. "
+            "Propose nothing that a skill already covers or that was proposed before, "
+            "whether the proposal waits for review, was declined, or ended with no skill\n"
             "3. Look for repeated tool sequences, domain knowledge clusters, and reusable patterns\n"
-            "4. For each candidate (max 2): create a task and propose a plan with the full SKILL.md\n\n"
-            "If no candidates found, say so and stop.\n"
-            "plan_propose notifies the user with a link to each plan. "
+            "4. Pick the one candidate with the strongest evidence. Propose at most one skill per run.\n"
+            "5. Create a task for it with "
+            "task_create(title, content, source=\"skill-extractor\", tags=\"skill-proposal\"), "
+            "where the content says in a few sentences what the skill is for, "
+            "then call plan_propose(task_id, content, summary, plan_type=\"skill-create\") "
+            "with the plan and a summary of up to 3 short lines for the reviewer\n\n"
+            "The plan is for a person who decides whether the skill is worth having. Write in it:\n"
+            "- What: the workflow, in one or two sentences, and when the skill would be used\n"
+            "- Evidence: where the workflow occurred (the sessions, tasks or dates) and what was repeated each time\n"
+            "- Direction: what the skill should cover, what it should leave out, and what is known to go wrong\n\n"
+            "Do not write the skill in the plan: no SKILL.md, no frontmatter, no step-by-step instructions. "
+            "The session that implements the approved plan writes the skill from the evidence.\n\n"
+            "If no workflow occurred more than once, say so and stop.\n"
+            "plan_propose notifies the user with a link to the plan. "
             "Do not send another notification about it.\n"
         ),
     },
@@ -1343,6 +1369,65 @@ def loom_wording_of_shipped_job(
     if description.strip() == str(shipped["description"]).strip():
         description = _cron_description(shipped, "loom")
     return loom_prompt, description
+
+
+# What earlier releases shipped for a built-in job where this release ships
+# something else, by job id and key. Nothing writes ``system.yaml`` again when
+# Nerve is updated, so the scheduler loads an entry of that file that still
+# has one of these values with the current one
+# (:func:`current_values_of_shipped_job`). A value that is not listed here
+# was edited, and is left alone; so is every entry in ``jobs.yaml``, which is
+# the operator's file. Texts are compared without the whitespace around them.
+_SKILL_EXTRACTOR_STEPS_BEFORE_DAILY = (
+    "You are a skill extraction agent. Identify repeated workflows from recent activity and propose new skills.\n\n"
+    "1. Recall recent behavior patterns and events\n"
+    "2. Check existing skills to avoid duplicates\n"
+    "3. Look for repeated tool sequences, domain knowledge clusters, and reusable patterns\n"
+    "4. For each candidate (max 2): create a task and propose a plan with the full SKILL.md\n\n"
+    "If no candidates found, say so and stop.\n"
+)
+_SUPERSEDED_CRON_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
+    "skill-extractor": {
+        "schedule": ("0 */12 * * *",),
+        "description": (
+            "Every 12 hours, analyzes your recent activity to detect repeated workflows. "
+            "When it finds a pattern, it proposes a reusable skill for your review.",
+        ),
+        "prompt": (
+            # The first form.
+            _SKILL_EXTRACTOR_STEPS_BEFORE_DAILY
+            + "After proposing, use `notify` to alert the user.\n",
+            # The second: plan_propose had begun to notify.
+            _SKILL_EXTRACTOR_STEPS_BEFORE_DAILY
+            + "plan_propose notifies the user with a link to each plan. "
+            "Do not send another notification about it.\n",
+        ),
+    },
+}
+
+
+def current_values_of_shipped_job(job_id: str, **values: object) -> dict[str, str]:
+    """What this release writes for the keys of a built-in job that still
+    hold what an earlier release wrote: of the given ``schedule``,
+    ``description`` and ``prompt``, the ones to replace, with their new
+    values. Empty for a job that never changed, and for values that are
+    current or were edited.
+
+    Each key stands alone: an entry whose schedule was edited keeps it and
+    still gets the current prompt. A value that is not text (a bare
+    ``description:`` in the file is None) is nothing an earlier release
+    wrote.
+    """
+    superseded = _SUPERSEDED_CRON_VALUES.get(job_id)
+    if not superseded:
+        return {}
+    shipped = next(c for c in (*CORE_CRONS, *PRODUCTIVITY_CRONS) if c["id"] == job_id)
+    return {
+        key: str(shipped[key])
+        for key, value in values.items()
+        if isinstance(value, str)
+        and value.strip() in {old.strip() for old in superseded.get(key, ())}
+    }
 
 
 def existing_memory_backend(config_dir: Path, workspace: Path | None = None) -> str:
