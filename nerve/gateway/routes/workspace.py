@@ -1,11 +1,13 @@
 """Read-only browsing of the whole workspace, for the Files page.
 
-Two routes, both read-only:
+Three routes, all read-only:
 
 - ``GET /api/workspace/list?path=<dir>`` lists one directory. The tree loads a
   directory when it is expanded: a workspace can hold scratch directories with
   hundreds of thousands of files, which no single listing can carry.
 - ``GET /api/workspace/file?path=<file>`` returns a file's text.
+- ``GET /api/workspace/download?path=<file>`` sends the file itself, for the
+  binary and oversized files the page does not show.
 
 Writes stay on ``PUT /api/memory/file``, which takes memory markdown only. The
 workspace holds files the daemon runs (git runs ``core.fsmonitor`` from
@@ -27,6 +29,7 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import FileResponse
 
 from nerve.config import FilesConfig, get_config, tracked_config_write_refusal
 from nerve.gateway.auth import require_auth
@@ -207,3 +210,26 @@ async def read_workspace_file(path: str):
     """A workspace file's text, or a flag that it is binary or too large."""
     config = get_config()
     return await asyncio.to_thread(_read_file_sync, config.workspace, path, config.files)
+
+
+def _download_path_sync(workspace: Path, rel: str, files_cfg: FilesConfig) -> Path:
+    path = resolve_workspace_path(workspace, rel, files_cfg.patterns)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return path
+
+
+@router.get("/api/workspace/download")
+async def download_workspace_file(path: str):
+    """A workspace file as an attachment: same rules as the read route, no size cap.
+
+    The UI links here with the token in the query (``authUrl``), since a
+    link cannot send a header.
+    """
+    config = get_config()
+    resolved = await asyncio.to_thread(_download_path_sync, config.workspace, path, config.files)
+    # The name as asked, not the symlink target's.
+    name = Path(path.strip().strip("/")).name or resolved.name
+    return FileResponse(
+        path=str(resolved), media_type="application/octet-stream", filename=name,
+    )

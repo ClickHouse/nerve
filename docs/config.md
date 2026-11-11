@@ -2386,9 +2386,9 @@ one directory at a time, when you expand it, so a directory with a huge subtree
 costs nothing until it is opened. Only the memory markdown files (`*.md` at the
 workspace root and under `memory/`) can be edited and saved there; every other
 file opens read-only. Binary files and files over `max_file_bytes` show a
-notice instead of their content.
+notice instead of their content, with a button that downloads them.
 
-`files.exclude` hides paths from the tree, and the read route refuses them as
+`files.exclude` hides paths from the tree, and the read and download routes refuse them as
 well, so an excluded file cannot be opened by URL either. A path is judged by
 where it resolves, so a symlink cannot reach an excluded file or anything
 outside the workspace.

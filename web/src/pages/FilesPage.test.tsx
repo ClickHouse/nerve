@@ -164,6 +164,29 @@ describe('FilesPage workspace tree', () => {
     expect(screen.queryByRole('textbox')).not.toBeInTheDocument();
   });
 
+  it.each([
+    ['binary', { binary: true, too_large: false, size: 3 }, 'Download (3 B)'],
+    ['too large', { binary: false, too_large: true, size: 5 * 1024 * 1024 }, 'Download (5.0 MB)'],
+  ])('offers a download for a %s file', async (_kind, flags, label) => {
+    readWorkspaceFile.mockResolvedValueOnce({
+      path: 'notes/run.log', name: 'run.log', content: '',
+      read_only: true, read_only_reason: 'not_memory', ...flags,
+    });
+    await renderPage();
+    await userEvent.click(screen.getByRole('button', { name: 'notes' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'run.log' }));
+    const link = await screen.findByRole('link', { name: label });
+    expect(link).toHaveAttribute('href', '/api/workspace/download?path=notes%2Frun.log');
+    expect(link).toHaveAttribute('download', 'run.log');
+  });
+
+  it('offers no download for a file it shows', async () => {
+    await renderPage();
+    await userEvent.click(screen.getByRole('button', { name: 'README.md' }));
+    await screen.findByDisplayValue('# README.md');
+    expect(screen.queryByRole('link', { name: /Download/ })).not.toBeInTheDocument();
+  });
+
   it('says how many entries a capped directory left out', async () => {
     listWorkspaceDir.mockImplementation(async (path: string) => {
       const entries = LISTINGS[path] ?? [];

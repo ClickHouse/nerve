@@ -188,6 +188,31 @@ class TestFileRoute:
         assert (ws / "drafts" / "plan.md").read_text() == "plan\n"
 
 
+class TestDownloadRoute:
+    def test_sends_the_file_as_an_attachment(self, ws, monkeypatch):
+        client = _client(ws, monkeypatch, max_file_bytes=1)  # no size cap here
+        r = client.get("/api/workspace/download", params={"path": "blob.bin"})
+        assert r.status_code == 200
+        assert r.content == b"\x00\x01\x02"
+        assert r.headers["content-type"] == "application/octet-stream"
+        assert 'attachment; filename="blob.bin"' in r.headers["content-disposition"]
+
+    def test_a_symlink_downloads_under_its_own_name(self, ws, monkeypatch):
+        (ws / "plan-link.md").symlink_to(ws / "drafts" / "plan.md")
+        client = _client(ws, monkeypatch)
+        r = client.get("/api/workspace/download", params={"path": "plan-link.md"})
+        assert r.status_code == 200 and r.content == b"plan\n"
+        assert 'filename="plan-link.md"' in r.headers["content-disposition"]
+
+    def test_refusals(self, ws, monkeypatch, tmp_path):
+        (ws / "out").symlink_to(tmp_path / "outside.txt")
+        client = _client(ws, monkeypatch, exclude=["tmp"])
+        for p in ("../outside.txt", "/etc/passwd", ".git/config", "tmp/big/f.txt",
+                  "out", "drafts", "missing.bin"):
+            r = client.get("/api/workspace/download", params={"path": p})
+            assert r.status_code == 404, p
+
+
 class TestConfig:
     def test_from_dict(self):
         c = FilesConfig.from_dict({"exclude": ["repos", " tmp ", ""], "max_entries": "50",

@@ -2133,6 +2133,13 @@ Response: { "path": "TOOLS.md", "name": "TOOLS.md", "size": 17325, "content": ".
             "read_only": false, "read_only_reason": null }
 ```
 
+#### `GET /api/workspace/download?path=<file>`
+The file itself, as `application/octet-stream` with
+`Content-Disposition: attachment`, under the name the path asks for. The same
+404s as the read route apply, and `files.max_file_bytes` does not: this is how
+the Files page offers binary and oversized files. A link can't send a header,
+so the page passes the session token as `?token=`.
+
 ### Memory Files
 
 #### `GET /api/memory/files`

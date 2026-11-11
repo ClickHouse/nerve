@@ -1,8 +1,9 @@
 import { useState, useCallback } from 'react';
 import type { ReadOnlyReason } from '../../api/client';
+import { authUrl } from '../../api/hosted';
 import { MarkdownContent } from '../Chat/MarkdownContent';
 import { Button, IconButton } from '../ui';
-import { Eye, Edit3, Lock, Save } from '../ui/icons';
+import { Download, Eye, Edit3, Lock, Save } from '../ui/icons';
 
 interface FileEditorProps {
   path: string;
@@ -86,10 +87,23 @@ export function FileEditor({
 
       {/* Content */}
       {unreadable ? (
-        <div className="flex-1 flex items-center justify-center p-6 text-sm text-text-faint text-center">
-          {unreadable === 'binary'
-            ? 'Binary file: not shown.'
-            : `Too large to show${size !== undefined ? ` (${formatSize(size)})` : ''}. The limit is files.max_file_bytes.`}
+        <div className="flex-1 flex flex-col items-center justify-center gap-3 p-6 text-sm text-text-faint text-center">
+          <span>
+            {unreadable === 'binary'
+              ? 'Binary file: not shown.'
+              : `Too large to show${size !== undefined ? ` (${formatSize(size)})` : ''}. The limit is files.max_file_bytes.`}
+          </span>
+          {/* A link, not a fetch: the browser streams the file to disk, so a
+              large one never sits in memory. The token goes in the query
+              because a link sends no header. */}
+          <a
+            href={authUrl(`/api/workspace/download?path=${encodeURIComponent(path)}`)}
+            download={path.split('/').pop() || 'file'}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border bg-surface-raised text-text-secondary hover:text-text hover:bg-surface-hover"
+          >
+            <Download size={13} aria-hidden="true" />
+            Download{size !== undefined ? ` (${formatSize(size)})` : ''}
+          </a>
         </div>
       ) : !showPreview ? (
         <textarea
