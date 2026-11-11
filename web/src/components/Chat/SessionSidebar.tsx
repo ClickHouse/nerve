@@ -647,6 +647,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                     : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
                   }`}
               >
+                <ExpandSlot />
                 <MessageSquare size={13} className="shrink-0 opacity-50" />
                 <div className="flex-1 min-w-0">
                   <div className="truncate text-xs in-data-[layout=page]:text-sm leading-tight italic">New chat</div>
@@ -795,6 +796,7 @@ export function SessionSidebar({ sessions, activeSession, agentStatus, onCreate,
                             : 'text-text-faint hover:bg-surface-raised hover:text-text-muted'
                           }`}
                       >
+                        <ExpandSlot />
                         <SessionOriginIcon session={s} />
                         <div className="flex-1 min-w-0">
                           <div className="truncate">{cleanTitle(s)}</div>
@@ -929,6 +931,11 @@ function GroupHeader({ label, count, collapsed, tone, onToggle }: {
   );
 }
 
+
+/** Empty box the size of the expand chevron, so every row's icon and title sit in the same column. */
+function ExpandSlot() {
+  return <span aria-hidden="true" className="shrink-0 -ml-0.5 -mr-1 w-[17px]" />;
+}
 
 /** Sidebar icon tint for review-loop observer sessions, by loop status. */
 function reviewLoopIconTone(status: string): string {
@@ -1203,6 +1210,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
   if (renaming) {
     return (
       <div className="flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md bg-surface-raised">
+        <ExpandSlot />
         <MessageSquare size={13} className="shrink-0 opacity-50" />
         <TextField
           bare
@@ -1253,7 +1261,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
           : 'text-text-muted hover:bg-surface-raised hover:text-text-secondary'
         }${isDropTarget ? ' ring-2 ring-inset ring-accent bg-accent/10' : ''}${isDragSource ? ' opacity-50' : ''}`}
     >
-      {hasChildren && (
+      {hasChildren ? (
         <button
           type="button"
           onClick={(e) => { e.preventDefault(); e.stopPropagation(); onToggleExpand?.(session.id); }}
@@ -1262,7 +1270,7 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
         >
           {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         </button>
-      )}
+      ) : <ExpandSlot />}
       <SessionOriginIcon session={session} />
       {session.review_loop && (
         <Repeat size={13} className={`shrink-0 ${reviewLoopIconTone(session.review_loop.status)}`} />
