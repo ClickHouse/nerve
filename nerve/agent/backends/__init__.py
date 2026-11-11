@@ -20,6 +20,7 @@ from nerve.agent.backends.base import (
     SessionSpec,
     TransportDiedError,
     TurnInput,
+    TurnRefusedError,
 )
 from nerve.agent.backends.events import (
     AgentEvent,
@@ -111,5 +112,6 @@ __all__ = [
     "TransportDiedError",
     "TurnCompleted",
     "TurnInput",
+    "TurnRefusedError",
     "build_backends",
 ]

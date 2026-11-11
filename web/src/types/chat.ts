@@ -167,6 +167,9 @@ export interface Session {
   model?: string;
   backend?: string;
   cwd?: string;
+  /** The Daybreak switch of a Codex chat (the composer's toggle sets it).
+      Only Codex sessions carry it; absent is off. */
+  codex_daybreak?: boolean;
   // Real-time running status (set by backend + WS updates)
   is_running?: boolean;
   // Paused mid-turn waiting for user input (AskUserQuestion / plan mode).

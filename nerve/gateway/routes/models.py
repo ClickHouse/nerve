@@ -79,13 +79,22 @@ async def list_models():
             "models": claude_models, "available": True,
         },
     ]
+    codex_models = codex_preflight.get("models") or [config.codex.model]
     options.append({
         "id": "codex",
         "label": "Codex",
         "model": config.codex.model,
-        "models": codex_preflight.get("models") or [config.codex.model],
+        "models": codex_models,
         "available": bool(codex_preflight.get("available")),
         "reason": codex_preflight.get("reason"),
+        # Model id → Daybreak program, for the offered models that the
+        # signed-in Codex account may run with it. The composer shows its
+        # Daybreak switch only when there is one.
+        "daybreak_programs": {
+            model: program
+            for model, program in (codex_preflight.get("daybreak_programs") or {}).items()
+            if model in codex_models
+        },
     })
     backends = {
         "default": (

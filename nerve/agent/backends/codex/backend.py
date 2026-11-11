@@ -43,8 +43,10 @@ from nerve.agent.backends.base import (
     SessionSpec,
     TransportDiedError,
     TurnInput,
+    TurnRefusedError,
     config_excluded_tools,
 )
+from nerve.agent.backends.codex import daybreak
 from nerve.agent.backends.codex.appserver import (
     CodexAppServerClient,
     CodexRpcError,
@@ -165,6 +167,22 @@ _EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ul
 # Token counters in the `total` and `last` of a codex tokenUsage payload.
 _USAGE_KEYS = ("inputTokens", "cachedInputTokens", "outputTokens")
 
+# ``codexErrorInfo`` of a turn that Codex's cyber policy refused.
+_CYBER_POLICY_ERROR = "cyberPolicy"
+
+# Added to such a refusal when the chat could run with Daybreak and does not.
+_DAYBREAK_HINT = (
+    "Daybreak is available for this chat and can be turned on in the composer."
+)
+
+
+def _is_cyber_refusal(error: Any) -> bool:
+    """Whether a ``TurnError`` says that Codex's cyber policy refused the turn."""
+    return (
+        isinstance(error, dict)
+        and error.get("codexErrorInfo") == _CYBER_POLICY_ERROR
+    )
+
 
 def _catalog_entries(result: dict) -> list[dict]:
     """The model entries of a ``model/list`` result (defensive)."""
@@ -225,6 +243,14 @@ class CodexBackend:
         self._preflight_lock = asyncio.Lock()
         self._live_models: set[str] = set()
         self._rate_limits: dict[str, Any] | None = None
+        # The Daybreak part of the latest catalog that an app-server of this
+        # home listed (preflight, or a client at connect): model id → program,
+        # and whether the catalog has access-program metadata at all.
+        self._daybreak_programs: dict[str, str] = {}
+        self._access_metadata = False
+        # The version that the Codex CLI reported last (a client build and a
+        # preflight both read it). ``None``: none was read yet.
+        self._cli_version: tuple[int, ...] | None = None
 
     def catalog(self, entries: list[dict]) -> dict[str, Any]:
         """Digest a ``model/list`` (``includeHidden``) result.
@@ -235,11 +261,16 @@ class CodexBackend:
         are opt-in by name). ``allowed`` is what a session may run on: the
         whole catalog, hidden included, plus the configured models
         unconditionally. ``efforts`` maps model id → advertised reasoning
-        efforts, for clamping turn requests.
+        efforts, for clamping turn requests. ``daybreak`` maps model id → the
+        Daybreak program that the signed-in account may request on it (a
+        model without one is absent), and ``access_metadata`` says whether
+        any entry carries access-program metadata.
         """
         visible: list[str] = []
         all_ids: list[str] = []
         efforts: dict[str, list[str]] = {}
+        daybreak_programs: dict[str, str] = {}
+        access_metadata = False
         for item in entries:
             model_id = _model_id(item)
             if not model_id:
@@ -248,6 +279,11 @@ class CodexBackend:
             if not item.get("hidden"):
                 visible.append(model_id)
             efforts[model_id] = _supported_efforts(item)
+            if daybreak.advertised(item) is not None:
+                access_metadata = True
+            program = daybreak.program(item)
+            if program:
+                daybreak_programs[model_id] = program
         configured = [m for m in (self.codex.models or []) if m]
         return {
             "listed": sorted(set(all_ids)),
@@ -255,7 +291,41 @@ class CodexBackend:
             "allowed": sorted({*all_ids, *configured}),
             "hidden": sorted(set(all_ids) - set(visible)),
             "efforts": efforts,
+            "daybreak": daybreak_programs,
+            "access_metadata": access_metadata,
         }
+
+    def note_access_programs(self, catalog: dict[str, Any]) -> None:
+        """Keep the Daybreak part of a catalog that an app-server just listed."""
+        self._daybreak_programs = dict(catalog["daybreak"])
+        self._access_metadata = bool(catalog["access_metadata"])
+
+    def daybreak_program(self, model: str) -> str | None:
+        """The Daybreak program that the signed-in account may request on
+        *model*, per the latest catalog. ``None``: it has none."""
+        return self._daybreak_programs.get(model)
+
+    def worker_daybreak(self, model: str) -> dict[str, Any]:
+        """What an Ultracode ``exec`` worker needs to follow a chat that has
+        Daybreak on: the chat's model, and the program of each model in the
+        spelling of ``codex exec --cyber-access-program``.
+
+        ``workers_need_codex`` is in it only when the Codex that Nerve runs
+        cannot give a worker the program: its ``exec`` has no such flag, or
+        its version is not known. It names the first version that can, and
+        the worker wrapper then starts no worker.
+        """
+        entry: dict[str, Any] = {
+            "model": model,
+            "programs": {
+                name: daybreak.PROGRAMS[program]
+                for name, program in self._daybreak_programs.items()
+            },
+        }
+        version = self._cli_version
+        if version is None or version < daybreak.EXEC_FLAG_SINCE:
+            entry["workers_need_codex"] = ".".join(map(str, daybreak.EXEC_FLAG_SINCE))
+        return entry
 
     @property
     def config(self):
@@ -359,6 +429,7 @@ class CodexBackend:
 
         output = await asyncio.to_thread(_read)
         current = self._version_tuple(output)
+        self._cli_version = current
         minimum = self._version_tuple(self.codex.min_version)
         maximum = self._version_tuple(self.codex.max_version)
         if current < minimum or current >= maximum:
@@ -434,6 +505,7 @@ class CodexBackend:
                         f"Configured Codex model {self.codex.model!r} is unavailable"
                     )
                 self._live_models = set(catalog["allowed"])
+                self.note_access_programs(catalog)
                 rate_limits = rate_result.get("rateLimits")
                 if isinstance(rate_limits, dict):
                     self._rate_limits = rate_limits
@@ -458,6 +530,9 @@ class CodexBackend:
                     "account_type": account_type,
                     "models": model_ids or [self.codex.model],
                     "hidden_models": catalog["hidden"],
+                    # Model id → Daybreak program, for the models that the
+                    # signed-in account may run with it.
+                    "daybreak_programs": catalog["daybreak"],
                     "default_model": self.codex.model,
                     "rate_limits": self._rate_limits,
                     "ultracode": plugin,
@@ -844,6 +919,15 @@ class CodexClient(AgentClient):
         # Serving model as resolved for this thread; updated on
         # model/rerouted notifications.
         self.model: str = spec.model or backend.codex.model
+        # The model the thread asks for. A reroute changes ``model`` for the
+        # answer it serves, not what the next turn asks for, and a Daybreak
+        # program belongs to the model asked for.
+        self._thread_model: str = self.model
+        # The chat's Daybreak switch (session metadata ``codex_daybreak``);
+        # set_daybreak changes it for the turns that follow.
+        self._daybreak: bool = spec.extra.get("daybreak") is True
+        # Codex's cyber policy refused the current turn.
+        self._cyber_refusal = False
         # item id -> item payload from item/started (approval correlation
         # + fileChange fan-out bookkeeping).
         self._items: dict[str, dict] = {}
@@ -891,6 +975,7 @@ class CodexClient(AgentClient):
         spec = self._spec
         backend = self._backend
         params = backend.thread_params(spec)
+        start_params = self._thread_start_params(params)
 
         response: dict | None = None
         if spec.resume_native_id:
@@ -912,7 +997,7 @@ class CodexClient(AgentClient):
                     spec.resume_native_id[:12], spec.session_id,
                 )
                 self._resume_dropped = True
-                response = await self._transport.request("thread/start", params)
+                response = await self._transport.request("thread/start", start_params)
 
         try:
             if response is not None:
@@ -931,7 +1016,7 @@ class CodexClient(AgentClient):
                     {**params, "threadId": spec.resume_native_id},
                 )
             else:
-                response = await self._transport.request("thread/start", params)
+                response = await self._transport.request("thread/start", start_params)
         except CodexRpcError as e:
             # Resume-miss recovery: a wiped ~/.nerve/codex/sessions (or a
             # rollout the app-server refuses) must never brick the
@@ -946,7 +1031,7 @@ class CodexClient(AgentClient):
                 spec.resume_native_id[:12], spec.session_id, e,
             )
             self._resume_dropped = True
-            response = await self._transport.request("thread/start", params)
+            response = await self._transport.request("thread/start", start_params)
 
         thread = response.get("thread") if isinstance(response, dict) else None
         thread_id = (thread or {}).get("id") if isinstance(thread, dict) else None
@@ -955,6 +1040,8 @@ class CodexClient(AgentClient):
                 f"codex thread/start returned no thread id: {response!r}"
             )
         self._thread_id = str(thread_id)
+        if spec.resume_native_id and not self._resume_dropped:
+            await self._align_saved_choice(thread)
 
     async def _validate_live_model(self) -> None:
         """Confirm the selected model against the authenticated app-server.
@@ -974,6 +1061,7 @@ class CodexClient(AgentClient):
             ) from e
         catalog = self._backend.catalog(_catalog_entries(response))
         self._model_efforts = catalog["efforts"]
+        self._backend.note_access_programs(catalog)
         allowed = catalog["allowed"]
         if catalog["listed"] and self.model not in allowed:
             raise BackendError(
@@ -991,6 +1079,118 @@ class CodexClient(AgentClient):
                 self.model, effort, clamped,
             )
         return clamped
+
+    # -- Daybreak --------------------------------------------------------- #
+
+    async def set_daybreak(self, enabled: bool) -> None:
+        """Set the chat's Daybreak switch for the turns that start from now.
+
+        The program goes with each ``turn/start``, so the switch needs no new
+        runtime.
+        """
+        if enabled == self._daybreak:
+            return
+        self._daybreak = enabled
+        await self._save_daybreak_choice()
+
+    def _turn_program(self) -> str | None:
+        """The cyber access program that the next turn asks for: with the
+        switch on, the program of the thread's model. ``None`` with the
+        switch off: the request is then what it was before the switch
+        existed."""
+        if not self._daybreak:
+            return None
+        return self._backend.daybreak_program(self._thread_model)
+
+    async def turn_refusal(self) -> str | None:
+        """Why the next turn must not be sent, or ``None``.
+
+        The chat's Daybreak switch is on and the thread's model has no
+        program for the signed-in account: running the turn without the
+        program is not what the person asked for. The backend's copy of the
+        catalog can come from another app-server, so before it refuses this
+        reads the catalog again on its own runtime.
+        """
+        if not self._daybreak or self._turn_program() is not None:
+            return None
+        await self._reread_access_programs()
+        if self._turn_program() is not None:
+            return None
+        return (
+            "Daybreak is on for this chat, but "
+            f"{daybreak.no_program(self._thread_model)}. Turn Daybreak off or "
+            "choose another model."
+        )
+
+    async def _reread_access_programs(self) -> None:
+        """Read the catalog again on this runtime, for its access programs.
+        A read that fails (an error answer, no answer in time, a runtime
+        that died) leaves what the backend knows."""
+        try:
+            response = await self._transport.request(
+                "model/list", {"includeHidden": True}, timeout=10.0,
+            )
+        except (CodexRpcError, TransportDiedError) as e:
+            logger.warning(
+                "Codex session %s: the model catalog could not be read "
+                "again: %s", self._spec.session_id[:8], e,
+            )
+            return
+        self._backend.note_access_programs(
+            self._backend.catalog(_catalog_entries(response)),
+        )
+
+    def _thread_start_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        """The ``thread/start`` parameters: with the switch on, Codex also
+        saves the choice on the thread (see :meth:`_save_daybreak_choice`).
+        A catalog without access-program metadata is a Codex that does not
+        know the field."""
+        if self._daybreak and self._backend._access_metadata:
+            return {**params, "daybreakEnabled": True}
+        return params
+
+    async def _align_saved_choice(self, thread: dict[str, Any]) -> None:
+        """Bring the choice saved on a resumed or forked thread in line with
+        the chat's switch.
+
+        ``thread/resume`` and ``thread/fork`` take no Daybreak field; their
+        answer says what the thread has saved (``daybreakEnabled``). A thread
+        can say ``true`` for a chat whose switch is off: the switch went off
+        while the chat had no runtime, or the thread is a fork of one that
+        had it. Nothing is sent when the two agree, so a chat that never used
+        Daybreak gets the requests it always got.
+        """
+        saved = thread.get("daybreakEnabled") is True
+        if saved != self._daybreak:
+            await self._save_daybreak_choice()
+
+    async def _save_daybreak_choice(self) -> None:
+        """Save the switch on the Codex thread, best effort.
+
+        Codex's own helper agents read the choice there. It selects no
+        turn's program, so a failure is logged and nothing else.
+        """
+        if not self._thread_id or not self._backend._access_metadata:
+            return
+        try:
+            await self._transport.request("thread/metadata/update", {
+                "threadId": self._thread_id,
+                "daybreakEnabled": self._daybreak,
+            }, timeout=10.0)
+        except (CodexRpcError, TransportDiedError) as e:
+            logger.warning(
+                "Codex did not save the Daybreak choice of session %s on its "
+                "thread: %s", self._spec.session_id[:8], e,
+            )
+
+    def _daybreak_would_help(self, turn_error: Any) -> bool:
+        """Whether a failed turn is a cyber-policy refusal in a chat that has
+        the switch off and a model with a program."""
+        return (
+            (self._cyber_refusal or _is_cyber_refusal(turn_error))
+            and not self._daybreak
+            and self._backend.daybreak_program(self._thread_model) is not None
+        )
 
     async def _ensure_auth(self) -> None:
         """Best-effort auth check with a clear operator hint.
@@ -1044,8 +1244,15 @@ class CodexClient(AgentClient):
     async def start_turn(self, turn: TurnInput) -> None:
         if not self._thread_id:
             raise BackendError("codex client has no thread")
+        # Before anything else: a turn that Daybreak refuses is not sent. The
+        # engine asks turn_refusal first, so this is the last line of defence.
+        refusal = await self.turn_refusal()
+        if refusal:
+            raise TurnRefusedError(refusal)
+        program = self._turn_program()
         self._reset_turn_usage_accounting()
         self._last_error = None
+        self._cyber_refusal = False
         self._items.clear()
         self._ultracode_usage = None
         self._ultracode_estimated_cost = 0.0
@@ -1068,8 +1275,15 @@ class CodexClient(AgentClient):
         effort = self.turn_effort()
         if effort:
             params["effort"] = effort
+        if program:
+            params["cyberAccessProgram"] = program
 
         response = await self._transport.request("turn/start", params)
+        if program:
+            logger.info(
+                "Codex session %s: turn sent on %s with cyber access program %s",
+                self._spec.session_id[:8], self._thread_model, program,
+            )
         turn_obj = response.get("turn") if isinstance(response, dict) else None
         self._turn_id = (
             str(turn_obj["id"])
@@ -1285,6 +1499,7 @@ class CodexClient(AgentClient):
                 # a system event meanwhile.
                 logger.warning("codex error: %s", message)
                 self._last_error = message
+                self._cyber_refusal = _is_cyber_refusal(params.get("error"))
                 out.append(ev.SystemEvent(
                     subtype="codex_error",
                     data={"message": message, "will_retry": False},
@@ -1553,6 +1768,8 @@ class CodexClient(AgentClient):
                 error = str(terr.get("message") or terr)
             else:
                 error = str(terr) if terr else (self._last_error or "turn failed")
+            if self._daybreak_would_help(terr):
+                error = f"{error.rstrip().rstrip('.')}. {_DAYBREAK_HINT}"
 
         counts = self._turn_counts
         if counts is None and self._turn_usage:

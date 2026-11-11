@@ -1093,6 +1093,14 @@ Rows also carry `is_running` (the orchestrator's turn is in flight),
 `background_count` (how many). The two are independent: agents can run
 between turns. See [Sub-agents and background tasks](agents.md).
 
+The payloads of Codex sessions (`backend` is `codex`) carry `codex_daybreak`
+(boolean): the chat's Daybreak switch, see
+[Daybreak](config.md#daybreak-per-chat-switch). The payloads of other
+sessions do not have the key. `POST /api/sessions` takes
+`codex_daybreak: true` to create a Codex session with the switch on. It
+answers `400` when the session is not a Codex session, and when its model has
+no Daybreak program for the signed-in Codex account.
+
 #### `GET /api/sessions/{id}`
 Get session details.
 
@@ -1123,12 +1131,21 @@ session's pending questions; the notification rows stay. A turn never creates
 a deleted session again: a run in it is refused.
 
 #### `PATCH /api/sessions/{id}`
-Update `title`, `starred`, `model` or `parent_session_id`. A `model` change
-recreates the session's runtime, which would end its live background agents:
-while any run it answers `409` with
+Update `title`, `starred`, `model`, `parent_session_id` or `codex_daybreak`.
+A `model` change recreates the session's runtime, which would end its live
+background agents: while any run it answers `409` with
 `{"detail": {"code": "live_background_agents", "message": "…", "live": 2}}`.
 A `title` sets the session's `title_source` to `manual`, so Nerve no longer
 renames it on its own.
+
+`codex_daybreak` (boolean) sets the chat's Daybreak switch from its next
+message on. It answers `400` for a session that is not a Codex session, and
+for `true` when the session's model (the `model` of the same request, if
+any) has no Daybreak program for the signed-in Codex account; `503` for
+`true` while the Codex model catalog cannot be read. A `model` change to a
+model without a program turns the switch off: the response then has
+`codex_daybreak: false` and a `codex_daybreak_notice` sentence for the
+person.
 
 #### `POST /api/sessions/{id}/regenerate-title`
 Retitle the session with `agent.title_model` from its first request and its

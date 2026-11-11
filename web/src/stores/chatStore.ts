@@ -8,6 +8,7 @@ import type { InteractionAgentRef } from '../types/agents';
 import { hydrateMessage } from '../utils/hydrateMessage';
 import { isMobileViewport } from '../hooks/useMediaQuery';
 import { randomUUID } from '../utils/uuid';
+import { errorDetail } from './accountStore';
 import { bindSender, selfActorId } from './authStore';
 import { useAgentStore } from './agentStore';
 // Helpers
@@ -112,6 +113,48 @@ function contextUsageFrom(usage: LastUsage): NonNullable<ChatState['contextUsage
     max_context_tokens: usage.max_context_tokens || 200_000,
     num_turns: usage.num_turns || 1,
     context_tokens: usage.context_tokens,
+  };
+}
+
+/**
+ * Model id → Daybreak program, for the Codex models that the signed-in Codex
+ * account may run with Daybreak (GET /api/models). Empty when the account
+ * has none: the composer then shows no Daybreak switch.
+ */
+export function daybreakPrograms(options: ChatState['backendOptions']): Record<string, string> {
+  return options.find(o => o.id === 'codex')?.daybreak_programs ?? {};
+}
+
+/** Whether the signed-in Codex account may run this model with Daybreak. */
+export function offersDaybreak(options: ChatState['backendOptions'], model: string | null | undefined): boolean {
+  return !!model && typeof daybreakPrograms(options)[model] === 'string';
+}
+
+/**
+ * Whether a new chat on this backend and model is created with Daybreak: the
+ * person turned it on, and that model still offers it.
+ */
+function newChatHasDaybreak(state: ChatState, backend: string | null, model: string | null | undefined): boolean {
+  const effBackend = backend ?? state.backendDefault ?? 'claude';
+  return state.newChatDaybreak && effBackend === 'codex'
+    && offersDaybreak(state.backendOptions, model ?? state.modelDefaults[effBackend]);
+}
+
+/** Patch one session row where the composer finds it: the feed or a lazy group. */
+function patchSessionRow(state: ChatState, id: string, patch: Partial<Session>): Partial<ChatState> {
+  const apply = (rows: Session[]) => rows.map(s => (s.id === id ? { ...s, ...patch } : s));
+  return {
+    sessions: apply(state.sessions),
+    archivedSessions: state.archivedSessions && apply(state.archivedSessions),
+    systemSessions: state.systemSessions && apply(state.systemSessions),
+  };
+}
+
+/** A line that Nerve writes into the open chat itself. Not stored: gone on reload. */
+function chatNote(state: ChatState, sessionId: string, text: string): Partial<ChatState> {
+  if (state.activeSession !== sessionId) return {};
+  return {
+    messages: [...state.messages, { role: 'assistant' as const, blocks: [{ type: 'text', content: text }] }],
   };
 }
 
@@ -278,8 +321,9 @@ interface ChatState {
   // current pick (null = use the server default).
   availableModels: { id: string; provider: string; backend: string }[];
   modelDefaults: Record<string, string>;
-  // Agent backends for the new-chat selector (claude / codex).
-  backendOptions: { id: string; label: string; model: string; models?: string[]; available?: boolean; reason?: string }[];
+  // Agent backends for the new-chat selector (claude / codex). Codex also
+  // lists the Daybreak program of each model that has one (daybreakPrograms).
+  backendOptions: { id: string; label: string; model: string; models?: string[]; available?: boolean; reason?: string; daybreak_programs?: Record<string, string> }[];
   backendDefault: string | null;
   // Backend picked for the CURRENT virtual (unsent) chat; null = default.
   // Bound at session materialization (ensureRealSession) and reset after.
@@ -294,6 +338,11 @@ interface ChatState {
   // session row (sessions[].model) and is changed via setSessionModel, so
   // a pick in one chat never affects any other chat.
   newChatModels: Record<string, string | null>;
+  // The Daybreak switch of the CURRENT virtual (unsent) Codex chat. Bound at
+  // session materialization (like newChatBackend) and reset after. A real
+  // session's switch lives on its row (sessions[].codex_daybreak) and is
+  // changed via setSessionDaybreak.
+  newChatDaybreak: boolean;
 
   loadSessions: () => Promise<void>;
   switchSession: (id: string) => Promise<void>;
@@ -377,6 +426,11 @@ interface ChatState {
   setNewChatModel: (backend: string, model: string | null) => void;
   /** Re-point ONE existing session's model (persisted on its row). */
   setSessionModel: (sessionId: string, model: string) => Promise<void>;
+  /** Turn Daybreak on or off for the current virtual chat. */
+  setNewChatDaybreak: (enabled: boolean) => void;
+  /** Turn Daybreak on or off for ONE existing Codex session. The row takes
+   *  the server's answer; a refusal shows as an error line in the chat. */
+  setSessionDaybreak: (sessionId: string, enabled: boolean) => Promise<void>;
   /** Stop the turn (agents keep running where the runtime allows it). */
   stopSession: () => Promise<void>;
   handleWSMessage: (msg: WSMessage) => void;
@@ -506,6 +560,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   newChatBackend: null,
   newChatReviewLoop: null,
   newChatModels: {},
+  newChatDaybreak: false,
 
   addQuote: (text: string, action: QuoteAction) => {
     const id = `q${++_quoteId}`;
@@ -842,7 +897,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set((s) => {
         const drafts = { ...s.drafts };
         delete drafts[vs.id];
-        return { virtualSession: null, drafts };
+        // The next new chat starts with Daybreak off.
+        return { virtualSession: null, newChatDaybreak: false, drafts };
       });
     }
     if (id === get().activeSession && get().messages.length > 0) return;
@@ -1009,8 +1065,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // instead of the backend default until the first turn resolves it.
     const effBackend = get().newChatBackend ?? get().backendDefault ?? 'claude';
     const pickedModel = get().newChatModels[effBackend] ?? undefined;
+    // The composer's Daybreak switch, dropped when the model has no program.
+    const daybreak = newChatHasDaybreak(get(), get().newChatBackend, pickedModel);
     const real: Session = await api.createSession(
-      undefined, get().newChatBackend, rlCwd, rlPayload, pickedModel,
+      undefined, get().newChatBackend, rlCwd, rlPayload, pickedModel, daybreak,
     );
     set((state) => {
       const drafts = { ...state.drafts };
@@ -1031,6 +1089,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         virtualSession: null,
         newChatBackend: null,  // bound into the created session; reset for the next chat
         newChatModels: {},     // ditto — the pick now lives on the session row
+        newChatDaybreak: false,   // ditto — the switch now lives on the session row
         newChatReviewLoop: null,  // ditto — the loop (if any) is now running server-side
         drafts,
         // POST /api/sessions returns a partial row (no updated_at); fill the
@@ -1049,7 +1108,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   discardVirtualSession: () => {
     const vs = get().virtualSession;
     if (!vs) return;
-    set({ newChatBackend: null, newChatModels: {}, newChatReviewLoop: null });
+    set({ newChatBackend: null, newChatModels: {}, newChatDaybreak: false, newChatReviewLoop: null });
     removeDraft(vs.id);
     clearVirtualSession();
     set((s) => {
@@ -1396,10 +1455,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
     repoint(model);
     try {
-      await api.updateSession(sessionId, { model });
+      const updated = await api.updateSession(sessionId, { model });
+      // On a model without a Daybreak program the server turns the switch of
+      // a Codex chat off, and says so. The answer for a chat of another
+      // backend has no switch, and its row gets none.
+      set((state) => ({
+        ...(typeof updated?.codex_daybreak === 'boolean'
+          ? patchSessionRow(state, sessionId, { codex_daybreak: updated.codex_daybreak })
+          : {}),
+        ...(updated?.codex_daybreak_notice ? chatNote(state, sessionId, updated.codex_daybreak_notice) : {}),
+      }));
     } catch (e) {
       console.error('Failed to update session model:', e);
       repoint(prev);
+    }
+  },
+
+  setNewChatDaybreak: (enabled: boolean) => set({ newChatDaybreak: enabled }),
+
+  setSessionDaybreak: async (sessionId: string, enabled: boolean) => {
+    // Not optimistic: the switch shows what the server stored.
+    try {
+      const updated = await api.updateSession(sessionId, { codex_daybreak: enabled });
+      set((state) => patchSessionRow(state, sessionId, { codex_daybreak: updated?.codex_daybreak === true }));
+    } catch (e) {
+      console.error('Failed to update Daybreak:', e);
+      set((state) => chatNote(state, sessionId, `Error: ${errorDetail(e, 'Daybreak could not be changed.')}`));
     }
   },
 
@@ -1544,8 +1625,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const pickedModel = effBackend
       ? (get().newChatModels[effBackend] ?? null)
       : null;
+    // The Daybreak switch is the unsent chat's own: it goes with the prompt
+    // only when the composer is in that chat, and the session created here
+    // (this backend and model) offers Daybreak.
+    const daybreak = !!vs && get().activeSession === vs.id
+      && newChatHasDaybreak(get(), effBackend, pickedModel);
     const real: Session = await api.createSession(
-      undefined, effBackend, undefined, null, pickedModel,
+      undefined, effBackend, undefined, null, pickedModel, daybreak,
     );
     // If auth changed, keep the server row but do not show it in this tab.
     if (!sender.stillCurrent()) return;
@@ -1566,6 +1652,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         virtualSession: null,
         newChatBackend: null,
         newChatModels: {},
+        newChatDaybreak: false,
         newChatReviewLoop: null,
         drafts,
         streamingBlocks: [],
