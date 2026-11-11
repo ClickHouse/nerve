@@ -1209,7 +1209,10 @@ function SessionItem({ session, isActive, isRunning, onDelete, onRename, onToggl
 
   if (renaming) {
     return (
-      <div className="flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md bg-surface-raised">
+      <div
+        style={depth ? { paddingLeft: 12 + depth * 16 } : undefined}
+        className="flex items-center gap-2 px-3 py-1.5 mx-1 rounded-md bg-surface-raised"
+      >
         <ExpandSlot />
         <MessageSquare size={13} className="shrink-0 opacity-50" />
         <TextField
