@@ -247,7 +247,7 @@ Workers create their own skills during onboarding and refine them over time.
 - Skills can include reference docs (`references/`), scripts (`scripts/`), and assets (`assets/`)
 
 **Automated skill lifecycle:**
-- `skill-extractor` (every 12h) — watches for repeated workflows in conversations and completed tasks, proposes new skills via task+plan
+- `skill-extractor` (every 12h, when the agent has worked since its last run) — watches for repeated workflows in conversations and completed tasks, proposes new skills via task+plan
 - `skill-reviser` (weekly) — reviews existing skills for accuracy, completeness, and quality, proposes revisions
 
 When a skill-related plan is approved, an `impl-<id>` session is spawned like for any plan; its prompt tells it to apply the plan (a full SKILL.md) with `skill_create` or `skill_update` and close the task with `task_done`.

@@ -40,7 +40,8 @@ import json
 import logging
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
@@ -48,6 +49,7 @@ from typing import TYPE_CHECKING, ClassVar
 from nerve import paths
 
 if TYPE_CHECKING:
+    from nerve.cron.jobs import CronJob
     from nerve.db import Database
 
 logger = logging.getLogger(__name__)
@@ -68,6 +70,16 @@ class GateContext:
 
     job_id: str
     db: "Database"
+    #: The jobs the scheduler has loaded, by id, disabled ones too, for a
+    #: gate whose answer depends on how the other jobs are set up. Empty when
+    #: the caller has none to give.
+    jobs: "Mapping[str, CronJob]" = field(default_factory=dict)
+    #: The time the check is made for, when that is not now (timezone-aware).
+    #: A catch-up after a pause asks about the time the run it stands in for
+    #: came due, and the catch-up at startup about its own start, so that a
+    #: gate which reads a record of what happened can leave out what was
+    #: recorded since: the message that woke the machine, above all.
+    as_of: datetime | None = None
 
 
 @dataclass
@@ -95,6 +107,13 @@ class CronGate(ABC):
     #: "unknown" — no field checking — which is the right default for an
     #: out-of-tree gate nothing has read.
     spec_keys: ClassVar[frozenset[str]] = frozenset()
+
+    #: Whether a run that a person starts by hand ("Run now", ``nerve cron
+    #: <id>``, the trigger API) is checked too. True for a gate that says
+    #: whether the job has anything to act on: with no pending task there is
+    #: nothing to plan, whoever asks. False for a gate that only estimates
+    #: whether a run is worth it, where the person who asks may know better.
+    checked_on_manual_runs: ClassVar[bool] = True
 
     @abstractmethod
     async def is_satisfied(self, ctx: GateContext) -> bool:
@@ -337,6 +356,132 @@ class TasksGate(CronGate):
         if isinstance(tag, (list, tuple)):
             tag = [str(t) for t in tag]
         return cls(targets=targets, tag=tag, min_count=min_count)
+
+
+#: The most hours an ``agent_activity`` gate looks back before the job's
+#: last run. A year is far more than any use has, and keeps the number one
+#: that a time can be moved by.
+_MAX_OVERLAP_HOURS = 24 * 366
+
+
+class AgentActivityGate(CronGate):
+    """Satisfied when the agent has worked since the job last ran.
+
+    The motivating case: a job that looks after the agent's own work — a
+    memory check, a search for repeated workflows — has nothing to do while
+    the agent has done nothing, so it runs only after there was work.
+
+    Config::
+
+        type: agent_activity
+        ignore_jobs: [weekly-cleanup]   # jobs whose runs are not work
+        overlap_hours: 24               # also count this long before the last run
+
+    The agent has worked when, since the job's last successful run started, a
+    turn ended or a message was stored in a session
+    (:meth:`nerve.db.cron.CronStore.has_activity_since_cron_run` says exactly
+    what counts). A job that has never succeeded runs as soon as there is any
+    work at all, and a run that failed does not move the start.
+
+    Not counted:
+
+    * the job's own runs, so a run never causes the next one;
+    * the runs of the jobs in ``ignore_jobs``;
+    * the runs of every other job that has this gate. Such a job runs only
+      because the agent worked, so its run is not work of its own: if two of
+      them counted each other's runs, each run of one would start the other,
+      forever. The gate knows the other jobs from ``GateContext.jobs``, and
+      finds this gate only among a job's own gates: a plugin gate that calls
+      this one must pass the context it was given, and its job must be named
+      in ``ignore_jobs`` by the jobs that should not count it;
+    * work that leaves no message and no turn, such as a memory written
+      through the MCP endpoint;
+    * for a catch-up, what was recorded after the run it stands in for came
+      due (``GateContext.as_of``): the message that woke the machine is work
+      for the job's next scheduled time, not for a run that came due while
+      nothing had happened.
+
+    ``overlap_hours`` is for a job that looks at a fixed period before its
+    run rather than at everything since its last run (the records of the day
+    before, say): what the agent did shortly before a run is not in that
+    run's period yet, so the job must run once more for it. With an overlap,
+    the work of that many hours before the last run counts again.
+
+    The gate estimates whether a run is worth it; it does not say whether
+    the job can run. So a run that a person starts by hand is not checked:
+    the person may know of work the gate cannot see.
+
+    The check reads the database and nothing else, so the default forecast —
+    the check, made now — holds until the agent works or the job runs. A
+    turn and a run are followed by a new forecast; other work (a
+    conversation taken in, say) is seen at the next read of the schedule.
+    """
+
+    type = "agent_activity"
+    spec_keys = frozenset({"ignore_jobs", "overlap_hours"})
+    checked_on_manual_runs = False
+
+    def __init__(
+        self, ignore_jobs: list[str] | None = None, overlap_hours: float = 0.0,
+    ) -> None:
+        self.ignore_jobs = list(dict.fromkeys(ignore_jobs or []))
+        self.overlap_hours = overlap_hours
+
+    async def is_satisfied(self, ctx: GateContext) -> bool:
+        gated_alike = [
+            job_id for job_id, job in ctx.jobs.items()
+            if any(isinstance(gate, AgentActivityGate) for gate in job.gates)
+        ]
+        return await ctx.db.has_activity_since_cron_run(
+            ctx.job_id,
+            ignore_jobs=[*self.ignore_jobs, *gated_alike],
+            overlap_seconds=round(self.overlap_hours * 3600),
+            until=ctx.as_of,
+        )
+
+    def describe(self) -> str:
+        since = "this job's last run"
+        if self.overlap_hours:
+            since = f"{self.overlap_hours:g}h before {since}"
+        ignored = (
+            f", not counting the runs of {', '.join(self.ignore_jobs)}"
+            if self.ignore_jobs else ""
+        )
+        return f"agent activity since {since}{ignored}"
+
+    @classmethod
+    def from_config(cls, spec: dict) -> "AgentActivityGate":
+        # As for github_pr_activity's ignore_actors: only a bare key means
+        # "not set". A value of the wrong shape is refused, not read as an
+        # empty list — that would count the runs the spec meant to leave out.
+        ignore = spec.get("ignore_jobs")
+        if ignore is None:
+            ignore = []
+        elif isinstance(ignore, str):
+            ignore = [ignore]
+        if not isinstance(ignore, list) or not all(
+            isinstance(job, str) and job.strip() for job in ignore
+        ):
+            raise GateConfigError(
+                "'agent_activity' gate 'ignore_jobs' must be a job id or a "
+                f"list of job ids, got {ignore!r}"
+            )
+        hours = spec.get("overlap_hours")
+        if hours is None:
+            hours = 0
+        # The range is checked on the number as written: a float made of an
+        # integer too large for one raises instead of being refused. NaN
+        # fails both comparisons.
+        if (
+            isinstance(hours, bool)
+            or not isinstance(hours, (int, float))
+            or not 0 <= hours <= _MAX_OVERLAP_HOURS
+        ):
+            raise GateConfigError(
+                "'agent_activity' gate 'overlap_hours' must be a number of "
+                f"hours from 0 to {_MAX_OVERLAP_HOURS}, got {hours!r}"
+            )
+        return cls(ignore_jobs=[job.strip() for job in ignore], overlap_hours=float(hours))
 
 
 class GitHubPrActivityGate(CronGate):
@@ -685,6 +830,7 @@ def github_is_hosted() -> bool:
 GATE_REGISTRY: dict[str, type[CronGate]] = {
     MessagesGate.type: MessagesGate,
     TasksGate.type: TasksGate,
+    AgentActivityGate.type: AgentActivityGate,
     GitHubPrActivityGate.type: GitHubPrActivityGate,
 }
 
