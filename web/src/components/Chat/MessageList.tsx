@@ -1,4 +1,4 @@
-import { useEffect, useRef, useCallback, memo } from 'react';
+import { useEffect, useLayoutEffect, useRef, useCallback, useState, memo } from 'react';
 import { Link } from 'react-router-dom';
 import type { ChatMessage, Session } from '../../types/chat';
 import { useVisibleActorIds } from '../../stores/actorStore';
@@ -16,6 +16,7 @@ import { MessageActions } from './MessageActions';
 import { SessionOriginLine } from './SessionOrigin';
 import { GitBranch } from '../ui/icons';
 import { followScrollEnd } from '../../utils/followScrollEnd';
+import { recentMessageStart } from '../../utils/recentMessageWindow';
 
 function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks, unlistedSession }: {
   messages: ChatMessage[];
@@ -37,6 +38,29 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks, u
   // The count only: the blocks change for each streamed token, and
   // StreamingMessage subscribes to them itself.
   const streamingBlockCount = useChatStore(s => s.streamingBlocks.length);
+  const activeSession = useChatStore(s => s.activeSession);
+
+  // A turn can contain thousands of blocks. Mount only a bounded tail on
+  // first load; earlier messages are already fetched, just not yet rendered.
+  const [revealed, setRevealed] = useState<{ session: string; start: number } | null>(null);
+  const initialStart = recentMessageStart(messages);
+  const visibleStart = revealed?.session === activeSession
+    ? Math.min(revealed.start, initialStart) : initialStart;
+  const visibleMessages = messages.slice(visibleStart);
+  const prependAnchor = useRef<{ node: HTMLElement; top: number } | null>(null);
+
+  // Pin the initial window for this session. Recomputing the tail on every
+  // append used to unmount the oldest visible message while someone read it.
+  // Once pinned, only "Show earlier messages" may move the start backward.
+  useLayoutEffect(() => {
+    if (messages.length === 0) {
+      setRevealed(current => current?.session === activeSession ? null : current);
+    } else {
+      setRevealed(current => current?.session === activeSession
+        ? current
+        : { session: activeSession, start: initialStart });
+    }
+  }, [activeSession, messages.length, initialStart]);
 
   // A message-anchored fork resolves to a backend-native turn; sessions
   // predating turn recording can only be forked whole (header action).
@@ -68,6 +92,30 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks, u
   // Stops the follow of the end that starts after the first load, while it runs.
   const stopFollow = useRef<(() => void) | null>(null);
   useEffect(() => () => stopFollow.current?.(), []);
+
+  const showEarlier = useCallback(() => {
+    const nextStart = recentMessageStart(messages, visibleStart);
+    if (nextStart === visibleStart) return;
+    stopFollow.current?.();
+    const firstRow = containerRef.current?.querySelector<HTMLElement>('.chat-row');
+    if (firstRow) {
+      prependAnchor.current = { node: firstRow, top: firstRow.getBoundingClientRect().top };
+    }
+    setRevealed({ session: activeSession, start: nextStart });
+  }, [messages, visibleStart, activeSession]);
+
+  // Prepending older rows must leave the previously visible message in place,
+  // rather than jumping the reader up by the height of the inserted rows.
+  useLayoutEffect(() => {
+    const anchor = prependAnchor.current;
+    prependAnchor.current = null;
+    const el = containerRef.current;
+    if (anchor && el) {
+      // Measure the same existing row before/after. This also avoids double
+      // adjustment when the browser performs native scroll anchoring.
+      el.scrollTop += anchor.node.getBoundingClientRect().top - anchor.top;
+    }
+  }, [visibleStart]);
 
   useEffect(() => {
     // While the end is followed after the first load, the follow scrolls.
@@ -119,7 +167,19 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks, u
 
       {messages.length > 0 && <SessionOriginLine unlisted={unlistedSession} />}
 
-      {messages.map((msg, i) => {
+      {visibleStart > 0 && (
+        <div className="flex justify-center py-3">
+          <button
+            type="button"
+            onClick={showEarlier}
+            className="rounded-md border border-border px-3 py-1.5 text-sm text-text-secondary hover:bg-surface-hover"
+          >
+            Show earlier messages ({visibleStart} loaded)
+          </button>
+        </div>
+      )}
+
+      {visibleMessages.map((msg, i) => {
         if (msg.role === 'user' && msg.client_msg_id && queuedMsgIds.has(msg.client_msg_id)) return null;
         // "Fork from here" needs a persisted row id (live-streamed messages
         // gain one on the next reload) and at least one native turn mapping
@@ -134,7 +194,7 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks, u
         );
         const forks = msg.id != null ? messageForks?.get(String(msg.id)) : undefined;
         return (
-          <div key={msg.id ?? i} className="chat-row">
+          <div key={msg.id ?? i + visibleStart} className="chat-row">
             {msg.role === 'user'
               ? <UserMessage
                   message={msg}
