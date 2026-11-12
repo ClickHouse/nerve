@@ -12,6 +12,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from nerve.agent import workspaces
 from nerve.agent.backends.base import BackendError
 from nerve.agent.interactive import get_awaiting_ids
 from nerve.config import get_config
@@ -291,7 +292,22 @@ async def _decorate(deps, sessions: list[dict], *, add_needs_you: bool = False) 
         if s["id"] in loops:
             s["review_loop"] = _loop_summary(loops[s["id"]])
     await _attach_origins(deps, sessions)
+    await _attach_workspaces(deps, sessions)
     return sessions
+
+
+async def _attach_workspaces(deps, sessions: list[dict]) -> None:
+    try:
+        rows = await deps.db.list_session_workspaces([s["id"] for s in sessions])
+        workspace = get_config().workspace
+        # A checkout on a hung mount must stall this thread, not the event loop.
+        described = await asyncio.to_thread(
+            lambda: {sid: workspaces.describe_rows(r, workspace) for sid, r in rows.items()},
+        )
+        for s in sessions:
+            s["workspaces"] = described.get(s["id"], [])
+    except Exception:  # noqa: BLE001 — enrichment must never break listing
+        logger.debug("workspace listing failed", exc_info=True)
 
 
 def _background_count(deps, session_id: str, has_background: bool | None = None) -> int:

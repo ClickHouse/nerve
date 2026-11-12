@@ -26,6 +26,7 @@ from dataclasses import dataclass, field, replace as dc_replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from nerve.agent import workspaces
 from nerve.agent.agents import AgentRegistry
 from nerve.agent.agents.errors import (
     AgentNotFound,
@@ -3162,6 +3163,12 @@ class AgentEngine:
         if not is_error and tool_use_id:
             _maybe_broadcast_plan_update(session_id, tool_use_id, tool_calls_log)
             _maybe_broadcast_file_changed(session_id, tool_use_id, tool_calls_log)
+            try:
+                await self._track_workspaces(
+                    session_id, tool_use_id, result_content, tool_calls_log,
+                )
+            except Exception as e:
+                logger.debug("Workspace tracking failed for %s: %s", session_id, e)
 
         # Record MCP tool usage for frontend stats
         if tool_use_id:
@@ -3195,6 +3202,43 @@ class AgentEngine:
                         except Exception as e:
                             logger.debug("Failed to record MCP usage: %s", e)
                     break
+
+    async def _track_workspaces(
+        self, session_id: str, tool_use_id: str, result_content: str,
+        tool_calls_log: list[dict],
+    ) -> None:
+        """Record the git checkouts a successful tool call worked in and broadcast the session's new list."""
+        entry = next(
+            (e for e in reversed(tool_calls_log) if e.get("tool_use_id") == tool_use_id),
+            None,
+        )
+        if entry is None:
+            return
+        tool, tool_input = entry.get("tool", ""), entry.get("input") or {}
+        if tool == "EnterWorktree":
+            entered = workspaces.entered_worktree(result_content)
+            paths = [entered] if entered else []
+        else:
+            paths = workspaces.tool_paths(tool, tool_input)
+        changed = False
+        for path in paths:
+            checkout = workspaces.resolve_checkout(path)
+            if checkout is None or workspaces.is_nerve_workspace(
+                checkout.toplevel, self.config.workspace,
+            ):
+                continue
+            changed |= await self.db.touch_session_workspace(
+                session_id, checkout.toplevel, checkout.branch,
+            )
+        if changed:
+            rows = await self.db.list_session_workspaces([session_id])
+            await broadcaster.broadcast("__global__", {
+                "type": "session_workspaces",
+                "session_id": session_id,
+                "workspaces": workspaces.describe_rows(
+                    rows.get(session_id, []), self.config.workspace,
+                ),
+            })
 
     @staticmethod
     def _merge_tool_results(

@@ -256,6 +256,70 @@ class TestSessionEvents:
 
 
 @pytest.mark.asyncio
+class TestSessionWorkspaces:
+    async def test_touch_reports_new_rows_and_branch_changes(self, db: Database):
+        await db.create_session("ws-1", actor=None)
+        assert await db.touch_session_workspace("ws-1", "/r/a", "main") is True
+        assert await db.touch_session_workspace("ws-1", "/r/a", "main") is False
+        assert await db.touch_session_workspace("ws-1", "/r/a", None) is True
+        assert await db.touch_session_workspace("ws-1", "/r/b", "feat") is True
+        assert await db.touch_session_workspace("ws-1", "/r/a", None) is True
+
+        rows = (await db.list_session_workspaces(["ws-1", "none"]))["ws-1"]
+        assert [(r["toplevel"], r["branch"]) for r in rows] == [("/r/a", None), ("/r/b", "feat")]
+
+    async def test_delete_session_removes_its_workspaces(self, db: Database):
+        await db.create_session("ws-2", actor=None)
+        await db.touch_session_workspace("ws-2", "/r/a", "main")
+        await db.delete_session("ws-2")
+        assert await db.list_session_workspaces(["ws-2"]) == {}
+
+
+@pytest.mark.asyncio
+async def test_v71_backfills_linked_worktrees_from_file_snapshots(tmp_path):
+    import aiosqlite
+
+    from nerve.db.migrations.v073_session_workspaces import up
+
+    main = tmp_path / "proj"
+    git_dir = main / ".git" / "worktrees" / "wt"
+    git_dir.mkdir(parents=True)
+    (main / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (git_dir / "HEAD").write_text("ref: refs/heads/topic\n")
+    linked = tmp_path / "proj-wt"
+    (linked / "sub").mkdir(parents=True)
+    (linked / ".git").write_text(f"gitdir: {git_dir}\n")
+    linked = linked.resolve()
+    async with aiosqlite.connect(tmp_path / "legacy.db") as db:
+        await db.executescript("""
+            CREATE TABLE session_file_snapshots (
+                session_id TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                original_content TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (session_id, file_path)
+            );
+        """)
+        await db.executemany(
+            "INSERT INTO session_file_snapshots (session_id, file_path, created_at) VALUES (?, ?, ?)",
+            [
+                ("s1", str(linked / "a.py"), "2026-01-01 10:00:00"),
+                ("s1", str(linked / "sub" / "b.py"), "2026-01-02 10:00:00"),
+                ("s1", str(main / "c.py"), "2026-01-03 10:00:00"),
+                ("s1", str(main / ".claude" / "worktrees" / "gone" / "d.py"), "2026-01-04 10:00:00"),
+                ("s1", str(tmp_path / "plain.txt"), "2026-01-05 10:00:00"),
+            ],
+        )
+        await up(db)
+        await up(db)
+        async with db.execute(
+            "SELECT session_id, toplevel, branch, last_seen_at FROM session_workspaces"
+        ) as cur:
+            rows = await cur.fetchall()
+    assert rows == [("s1", str(linked), "topic", "2026-01-02T10:00:00+00:00")]
+
+
+@pytest.mark.asyncio
 class TestChannelSessions:
     """Test persistent channel-to-session mapping."""
 

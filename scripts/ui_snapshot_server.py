@@ -109,6 +109,12 @@ async def seed(db_path: Path, workspace: Path) -> None:
         await db.update_notification("notif-snap-1", channels_delivered='["web"]')
         # Otherwise every browser's first WebSocket connect creates a session with a random id.
         await db.set_channel_session("web:default", "snap-chat")
+        # The chat header shows the checkout touched last.
+        for name, branch in (("release-notes", "main"), ("date-utils", "fix/pin-clock")):
+            checkout = workspace.parent / "checkouts" / name
+            (checkout / ".git").mkdir(parents=True)
+            (checkout / ".git" / "HEAD").write_text(f"ref: refs/heads/{branch}\n")
+            await db.touch_session_workspace("snap-chat", str(checkout), branch)
 
         await pin_timestamps(db, {session_id: minute(m) for session_id, _, m, *_ in sessions})
     finally:
