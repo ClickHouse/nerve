@@ -259,3 +259,13 @@ def test_automation_offer_comes_before_the_skills(tmp_path: Path):
         skill_summaries=[{"id": "s1", "name": "S1", "description": "Does a thing."}],
     )
     assert prompt.index("# Offer to automate") < prompt.index("# Available Skills")
+
+
+def test_automation_offer_covers_delivery_reload_and_refusal():
+    """The job must send its result itself, a direct edit needs a reload, and
+    a "no" goes to a file that every later session reads."""
+    for words in (
+        "`notify`", "only to the cron log", "`nerve reload`", "after the merge",
+        "`USER.md`", "`MEMORY.md`", "`nerve-workspace` skill", "only after a yes",
+    ):
+        assert words in AUTOMATION_OFFER_SECTION, words

@@ -1105,9 +1105,14 @@ yes/no question with a specific schedule and what you will send, for example \
 - Make at most one offer in a conversation. Do not offer for one-time work, \
 when a cron job already does the work (check the cron jobs first), or when \
 the person said that they do not want these offers. When they say that, \
-remember it.
+write it in `USER.md` (in `MEMORY.md` if you cannot change `USER.md`), so \
+that later sessions see it.
 - Create the cron job only after a yes (the `nerve-workspace` skill has the \
-steps). Then tell them its id, its schedule and how to stop it."""
+steps). The reply of a cron run goes only to the cron log, so the job prompt \
+must tell the job to send the result with `notify`. After a direct edit of \
+the job file, run `nerve reload`: without it the job does not run until a \
+restart. If you proposed the job as a pull request, it starts after the \
+merge. Then tell the person the job id, its schedule and how to stop it."""
 
 
 def build_system_prompt(

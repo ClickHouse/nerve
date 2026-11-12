@@ -256,8 +256,12 @@ when the person asks for work that they will probably want again and no job
 does it yet: one yes/no question at the end of the reply, at most once in a
 conversation, and the job is created only after a yes. Cron, hook and workflow
 sessions do not get the section. The text is `AUTOMATION_OFFER_SECTION` in
-`nerve/agent/prompts.py`. A person who does not want these offers can say so
-in the chat, and the agent remembers it.
+`nerve/agent/prompts.py`. It also tells the agent that the job prompt must
+send the result with `notify` (the reply of a cron run goes only to the cron
+log) and that a direct edit of the job file needs `nerve reload`. A person who
+does not want these offers can say so in the chat. The agent then writes that
+in `USER.md`, or in `MEMORY.md` when `USER.md` is read-only, so that every
+later session sees it.
 
 ### User Message (Web UI)
 1. User sends message via WebSocket
