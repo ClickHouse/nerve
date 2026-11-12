@@ -1149,6 +1149,85 @@ default `approval_policy: never` + full-access sandbox, codex sessions
 behave like claude's auto-approved tools; tightening the policy surfaces
 Approve/Decline cards in the web UI.
 
+### Daybreak (per-chat switch)
+
+Daybreak is Codex's account-gated cyber access program. It is not a model: a
+client asks for it per turn, and Codex decides whether the signed-in account
+may use it. Nerve has one switch per chat for it. There is no config key and
+no global setting, and the switch is off unless a person turns it on.
+
+- **Where it shows.** The composer of a Codex chat has a **Daybreak** toggle
+  next to the model menu when the Codex model catalog lists a Daybreak
+  program for the signed-in account on at least one model. An older Codex
+  lists no access programs, and an account without Daybreak has none: both
+  see no toggle. On a model without a program the toggle is greyed out and
+  names the models that have one.
+- **Off.** Nerve sends to Codex what it sent before the switch existed.
+- **On.** Each turn of the chat asks for the program of the chat's model
+  (`cyberAccessProgram` on `turn/start`: `daybreakBlue`, or `daybreakRed` for
+  a model that lists only that one). A change applies from the chat's next
+  message, without a new runtime. Nerve logs one line per turn that it sends
+  with a program: the session, the model and the program.
+- **No program.** When the switch is on and the model has no program at that
+  time (the access ended, another account is signed in), Nerve does not send
+  the turn. The turn ends as failed: the error names the model and says to
+  turn Daybreak off or to choose another model. Nerve never runs such a turn
+  without the program.
+- **Model change.** A change to a model without a program turns the switch
+  off, and the chat says so.
+- **Refusals.** When Codex refuses a turn under its cyber policy in a chat
+  that has the switch off and a model with a program, the error says that
+  Daybreak can be turned on.
+- **Ultracode workers** follow the chat. For a worker of the `exec`
+  transport the worker wrapper adds `--cyber-access-program` for the
+  worker's model, and it gives a worker that names no model the chat's
+  model. It does not start a worker that would run without the program: the
+  worker's model has none, the installed Codex cannot pass the program to
+  workers (see the versions below), or the worker's command has options
+  before `exec`. Such a worker ends with an error that says why. A worker of
+  the `app-server` transport takes its turns over its own connection, where
+  the wrapper cannot add the program, so the wrapper does not start it
+  either: Ultracode then runs that worker on `exec`, unless the run set
+  `transport_strict`.
+- **Storage and API.** The switch is the session metadata key
+  `codex_daybreak` (absent: off). `POST /api/sessions` and
+  `PATCH /api/sessions/{id}` take `codex_daybreak`, see
+  [api.md](api.md#sessions). `GET /api/models` lists the program of each
+  offered model in `daybreak_programs` of the Codex backend option.
+
+Codex can also save the choice on its thread (`daybreakEnabled`), where its
+own helper agents read it. Nerve sends it when the catalog lists access
+programs: at `thread/start` of a chat that has the switch on, when the
+switch changes on a live thread, and after a resume or a fork when the
+choice that the thread has saved differs from the chat's switch (the switch
+went off while the chat had no runtime, or the thread is a fork of a chat
+that has it on). While the switch is off, a thread that has not saved `true`
+gets no such request. This save selects no turn's program, and a failure of
+it changes nothing else.
+
+Codex versions:
+
+- The model catalog lists access programs from Codex 0.156.0. An older Codex
+  shows no toggle.
+- `codex exec` takes `--cyber-access-program` from Codex 0.161.0. On Codex
+  0.156.0 to 0.160.x a chat can have Daybreak on and its turns run with the
+  program, but its `exec` workers are not started: their error says to turn
+  Daybreak off or to update Codex.
+
+Known limits:
+
+- A model named for one message (`model` on a WebSocket `message`) does not
+  turn the switch off. When that model has no program, the turn is refused,
+  as under "No program".
+- Availability follows the latest listing of the catalog. A listing without
+  access-program metadata hides the toggle until the next listing that has
+  it.
+- Other open tabs show a change of the switch after their sessions reload.
+- "Run later" from a new chat on the default backend creates the deferred
+  chat on that backend's default model, not on the model picked in the
+  composer. The switch goes with the prompt only when that default model has
+  a program.
+
 ## Gateway
 
 | Key | Type | Default | Description |

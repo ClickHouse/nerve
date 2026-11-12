@@ -1398,7 +1398,9 @@ export const api = {
       defaults?: Record<string, string>;
       backends?: {
         default: string;
-        options: { id: string; label: string; model: string; models?: string[]; available?: boolean; reason?: string }[];
+        // `daybreak_programs` (Codex only): model id → Daybreak program, for
+        // the models that the signed-in Codex account may run with Daybreak.
+        options: { id: string; label: string; model: string; models?: string[]; available?: boolean; reason?: string; daybreak_programs?: Record<string, string> }[];
         diagnostics?: Record<string, { available: boolean; reason?: string }>;
       };
       models: { id: string; provider: string; backend: string }[];
@@ -1416,7 +1418,7 @@ export const api = {
   searchSessions: (q: string) =>
     request<{ sessions: any[] }>(`/sessions/search?q=${encodeURIComponent(q)}`),
   getSession: (id: string) => request<any>(`/sessions/${id}`),
-  createSession: (title?: string, backend?: string | null, cwd?: string | null, reviewLoop?: ReviewLoopCreatePayload | null, model?: string | null) =>
+  createSession: (title?: string, backend?: string | null, cwd?: string | null, reviewLoop?: ReviewLoopCreatePayload | null, model?: string | null, daybreak?: boolean) =>
     request<any>('/sessions', {
       method: 'POST',
       body: JSON.stringify({
@@ -1428,6 +1430,8 @@ export const api = {
         ...(model ? { model } : {}),
         ...(cwd ? { cwd } : {}),
         ...(reviewLoop ? { review_loop: reviewLoop } : {}),
+        // The composer's Daybreak switch (Codex), sent only when it is on.
+        ...(daybreak ? { codex_daybreak: true } : {}),
       }),
     }),
   // Run later — defer a composed prompt into a (freshly created) session
@@ -1473,7 +1477,7 @@ export const api = {
     ),
   deleteSession: (id: string) =>
     request<any>(`/sessions/${id}`, { method: 'DELETE' }),
-  updateSession: (id: string, data: { title?: string; starred?: boolean; model?: string; parent_session_id?: string | null }) =>
+  updateSession: (id: string, data: { title?: string; starred?: boolean; model?: string; parent_session_id?: string | null; codex_daybreak?: boolean }) =>
     request<any>(`/sessions/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
   regenerateSessionTitle: (id: string) =>
     request<{ title: string }>(`/sessions/${id}/regenerate-title`, { method: 'POST' }),

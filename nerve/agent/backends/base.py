@@ -40,6 +40,14 @@ class ForkSourceMissingError(BackendError):
     """The native conversation that a fork branches from no longer exists."""
 
 
+class TurnRefusedError(BackendError):
+    """The runtime will not start the turn; the message says why.
+
+    Nothing of the turn was sent and the runtime is as healthy as before, so
+    the engine ends the turn as failed and keeps the client.
+    """
+
+
 @dataclass
 class TurnInput:
     """One user turn, engine-normalized.

@@ -253,6 +253,46 @@ class TestListModels:
         assert codex_opt["available"] is False
         assert codex_opt["reason"] == "codex binary not found"
 
+    def test_codex_option_carries_the_daybreak_programs(self, make_client):
+        """The composer's Daybreak switch reads which Codex models the
+        signed-in account may run with Daybreak. Claude gets nothing new."""
+        client = make_client(codex_preflight={
+            "available": True, "models": ["gpt-6-astra", "gpt-6-sol"],
+            "daybreak_programs": {"gpt-6-sol": "daybreakBlue"},
+        })
+        data = client.get("/api/models").json()
+
+        options = {o["id"]: o for o in data["backends"]["options"]}
+        assert options["codex"]["daybreak_programs"] == {"gpt-6-sol": "daybreakBlue"}
+        assert set(options["claude"]) == {"id", "label", "model", "models", "available"}
+        assert all(set(m) == {"id", "provider", "backend"} for m in data["models"])
+
+    def test_daybreak_programs_name_only_offered_models(self, make_client):
+        """A hidden catalog entry that the picker does not offer is left out:
+        the composer could not select it."""
+        client = make_client(codex_preflight={
+            "available": True, "models": ["gpt-6-sol"],
+            "daybreak_programs": {
+                "gpt-6-sol": "daybreakBlue", "internal-preview": "daybreakRed",
+            },
+        })
+        data = client.get("/api/models").json()
+        codex_opt = next(o for o in data["backends"]["options"] if o["id"] == "codex")
+        assert codex_opt["daybreak_programs"] == {"gpt-6-sol": "daybreakBlue"}
+
+    def test_no_daybreak_programs_without_catalog_metadata(self, make_client):
+        """An older Codex, an account without Daybreak, a failed preflight."""
+        for preflight in (
+            {"available": True, "models": ["gpt-5.6-sol"]},
+            {"available": True, "models": ["gpt-5.6-sol"], "daybreak_programs": {}},
+            {"available": False, "reason": "codex binary not found"},
+        ):
+            data = make_client(codex_preflight=preflight).get("/api/models").json()
+            codex_opt = next(
+                o for o in data["backends"]["options"] if o["id"] == "codex"
+            )
+            assert codex_opt["daybreak_programs"] == {}
+
     def test_excluded_discovered_models_are_pruned_from_the_picker(
         self, make_client, stub_discovery,
     ):

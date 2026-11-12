@@ -483,6 +483,123 @@ class TestWorkerTokenExchange:
         assert res.status_code == 401
         assert "disabled" in res.json()["detail"]
 
+    async def _exchange(
+        self, install, monkeypatch, tmp_path, codex_version: str | None = "0.164.0",
+    ) -> dict:
+        """The answer to a worker of the chat ``engine-sess-1``.
+
+        The route has the database, and a Codex backend whose account has
+        Daybreak on ``gpt-6-sol`` and not on ``gpt-6-astra``. The backend
+        read ``codex_version`` from its CLI; ``None``: it read none yet.
+        """
+        from pathlib import Path
+        from types import SimpleNamespace
+
+        from nerve.agent.backends.codex import CodexBackend
+        from nerve.config import get_config
+        from nerve.gateway.routes import codex as codex_routes
+
+        codex_config = NerveConfig.from_dict({
+            "workspace": str(tmp_path / "ws"),
+            "codex": {
+                "home_dir": str(tmp_path / "codex-home"),
+                "bin_path": str(
+                    Path(__file__).parent / "fixtures" / "fake_codex_appserver.py",
+                ),
+            },
+        })
+        backend = CodexBackend(SimpleNamespace(config=lambda: codex_config))
+        backend.note_access_programs(backend.catalog([
+            {"id": "gpt-6-sol",
+             "availableAccessPrograms": {"cyber": ["standard", "daybreakBlue"]}},
+            {"id": "gpt-6-astra", "availableAccessPrograms": {"cyber": ["standard"]}},
+        ]))
+        if codex_version is not None:
+            monkeypatch.setenv("FAKE_CODEX_VERSION", codex_version)
+            await backend._check_cli_version()
+        engine = SimpleNamespace(config=get_config(), _backends={"codex": backend})
+        monkeypatch.setattr(
+            codex_routes, "get_deps",
+            lambda: SimpleNamespace(engine=engine, db=install.db),
+        )
+        app = FastAPI()
+        app.include_router(codex_routes.router)
+        async with _client(app) as client:
+            res = await client.post(
+                "/api/codex/worker-token",
+                headers=_bearer(create_mcp_session_token(_SECRET, "engine-sess-1")),
+                json={"worker_id": "ultracode-0123456789abcdef"},
+            )
+        assert res.status_code == 200
+        return res.json()
+
+    @pytest.mark.parametrize(
+        "codex_version", [None, "0.155.1", "0.160.1", "0.161.0", "0.164.0"],
+    )
+    async def test_the_answer_is_the_same_while_daybreak_is_off(
+        self, install, monkeypatch, tmp_path, codex_version,
+    ):
+        """Off is the default: a worker of such a chat gets the three fields
+        it always got, also on an account that has Daybreak, and whatever
+        the Codex version is."""
+        await install.db.create_session(
+            "engine-sess-1", source="web", backend="codex", model="gpt-6-sol",
+            actor=None,
+        )
+        body = await self._exchange(install, monkeypatch, tmp_path, codex_version)
+        assert set(body) == {"token", "worker_id", "expires_in"}
+        assert (body["worker_id"], body["expires_in"]) == (
+            "ultracode-0123456789abcdef", 7200,
+        )
+
+    @pytest.mark.parametrize("codex_version", ["0.161.0", "0.164.0"])
+    async def test_a_chat_with_daybreak_on_tells_its_workers(
+        self, install, monkeypatch, tmp_path, codex_version,
+    ):
+        """The worker gets the chat's model and the program of each model, as
+        ``codex exec --cyber-access-program`` spells it."""
+        await install.db.create_session(
+            "engine-sess-1", source="web", backend="codex", model="gpt-6-astra",
+            metadata={"codex_daybreak": True}, actor=None,
+        )
+        body = await self._exchange(install, monkeypatch, tmp_path, codex_version)
+        assert set(body) == {"token", "worker_id", "expires_in", "daybreak"}
+        assert body["daybreak"] == {
+            "model": "gpt-6-astra",
+            "programs": {"gpt-6-sol": "daybreak_blue"},
+        }
+
+    @pytest.mark.parametrize("codex_version", ["0.156.0", "0.160.1", None])
+    async def test_a_codex_that_cannot_give_workers_the_program_is_marked(
+        self, install, monkeypatch, tmp_path, codex_version,
+    ):
+        """``codex exec`` has the flag for the program from 0.161.0, and the
+        catalog lists access programs from 0.156.0: in between, and while no
+        version is known, the answer names the version that workers need.
+        The worker wrapper then starts no worker."""
+        await install.db.create_session(
+            "engine-sess-1", source="web", backend="codex", model="gpt-6-sol",
+            metadata={"codex_daybreak": True}, actor=None,
+        )
+        body = await self._exchange(install, monkeypatch, tmp_path, codex_version)
+        assert body["daybreak"] == {
+            "model": "gpt-6-sol",
+            "programs": {"gpt-6-sol": "daybreak_blue"},
+            "workers_need_codex": "0.161.0",
+        }
+
+    async def test_a_chat_without_a_stored_model_names_the_default_model(
+        self, install, monkeypatch, tmp_path,
+    ):
+        """A session row has no model until its first client is built: its
+        turns run on the backend's default model, and so do its workers."""
+        await install.db.create_session(
+            "engine-sess-1", source="web", backend="codex",
+            metadata={"codex_daybreak": True}, actor=None,
+        )
+        body = await self._exchange(install, monkeypatch, tmp_path)
+        assert body["daybreak"]["model"] == NerveConfig().codex.model
+
 
 # --------------------------------------------------------------------------- #
 #  The grandfather clause                                                      #

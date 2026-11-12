@@ -20,6 +20,7 @@ import os
 import re
 import secrets
 import time
+import weakref
 from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace as dc_replace
@@ -54,6 +55,7 @@ from nerve.agent.backends import (
     TransportDiedError,
     TurnCompleted,
     TurnInput,
+    TurnRefusedError,
     build_backends,
 )
 from nerve.agent.backends.events import TurnStatus
@@ -523,6 +525,11 @@ class AgentEngine:
         # detect mid-session model switches (the CLI fixes its model at
         # connect time, so a change requires recreating the client).
         self._session_models: dict[str, str] = {}
+        # One lock per session for a read-modify-write of its metadata (see
+        # _metadata_lock). Weak values: a lock lives while a writer has it.
+        self._metadata_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         # Last model *observed* serving each session (from
         # AssistantMessage.model). The API may silently serve a different
         # model than requested — e.g. a capacity fallback from a frontier
@@ -1589,6 +1596,9 @@ class AgentEngine:
             )
 
             if client is not None:
+                # The row is the truth for the chat's Daybreak switch: a live
+                # client that missed a change takes it before its next turn.
+                await self._apply_daybreak(client, session_meta)
                 bound_model = self._session_models.get(session_id)
                 # Health check: verify the underlying subprocess is alive
                 if not client.is_alive():
@@ -1777,7 +1787,14 @@ class AgentEngine:
                 meta_updates["preamble_sent"] = True
 
             if meta_updates and session:
-                session_meta.update(meta_updates)
+                # Into the row as it is now. A rebuild lets go of the
+                # session's lock (remove_client), so another request can have
+                # changed the metadata since this build read it: the chat's
+                # Daybreak switch.
+                session_meta = {
+                    **self._row_metadata(await self.db.get_session(session_id)),
+                    **meta_updates,
+                }
                 await self.db.update_session_metadata(session_id, session_meta)
 
             # Create interactive hub for this session.
@@ -1895,12 +1912,20 @@ class AgentEngine:
                 # Where the session comes from (its cron job, channel, ...),
                 # also fixed for the session.
                 inference_origin=inference_origin(session_origin(session or {})),
-                extra=(
+                extra={
                     # Per-session codex sandbox override (review-loop verifier
                     # legs run workspace-write instead of the global default).
-                    {"sandbox": str(session_meta.get("codex_sandbox"))}
-                    if session_meta.get("codex_sandbox") else {}
-                ),
+                    **(
+                        {"sandbox": str(session_meta.get("codex_sandbox"))}
+                        if session_meta.get("codex_sandbox") else {}
+                    ),
+                    # The chat's Daybreak switch. A client that is live
+                    # already gets a change through set_session_daybreak.
+                    **(
+                        {"daybreak": True}
+                        if session_meta.get("codex_daybreak") is True else {}
+                    ),
+                },
             )
 
             async def _create(spec: SessionSpec) -> AgentClient:
@@ -1947,6 +1972,14 @@ class AgentEngine:
             self.agents.on_client_connected(
                 session_id, self._client_gen, backend=backend.name,
             )
+            if hasattr(client, "set_daybreak"):
+                # A rebuild lets go of the session's lock, so the chat's
+                # Daybreak switch can have changed since this build read the
+                # row. The client is registered now: a change from here on
+                # finds it, and an earlier one is in the row.
+                await self._apply_daybreak(
+                    client, self._row_metadata(await self.db.get_session(session_id)),
+                )
 
             # Stamp the sticky backend on first client build.
             if not (session or {}).get("backend"):
@@ -2887,6 +2920,79 @@ class AgentEngine:
             return {str(i) for i in ids}
         except TypeError:
             return None
+
+    async def set_session_daybreak(self, session_id: str, enabled: bool) -> None:
+        """Store a chat's Daybreak switch and give it to its live client.
+
+        The switch is session metadata (``codex_daybreak``; absent = off). A
+        live Codex client takes the change for its next turn, without a new
+        runtime; a client built later reads the metadata. Under the
+        client-build lock, so that a first build and this change do not
+        interleave. A rebuild lets go of that lock: the client that it
+        builds takes the row's switch once it is registered
+        (:meth:`_get_or_create_client`). The write itself is under the
+        session's metadata lock, so that the end of a turn, which stores its
+        usage in the same metadata, does not write over it.
+        """
+        async with self.sessions.get_lock(session_id):
+            async with self._metadata_lock(session_id):
+                session = await self.db.get_session(session_id)
+                if not session:
+                    return
+                meta = self._row_metadata(session)
+                if enabled:
+                    meta["codex_daybreak"] = True
+                else:
+                    meta.pop("codex_daybreak", None)
+                await self.db.update_session_metadata(session_id, meta)
+            client = self.sessions.get_client(session_id)
+            if client is not None:
+                await self._apply_daybreak(client, meta)
+        logger.info(
+            "Session %s: Daybreak %s", session_id, "on" if enabled else "off",
+        )
+
+    def _metadata_lock(self, session_id: str) -> asyncio.Lock:
+        """The lock for a read-modify-write of one session's metadata.
+
+        The metadata is one JSON value, and a writer stores it whole. Two
+        writers that both read before either writes lose one of the changes.
+        The writers that can meet in a live chat take this lock around their
+        read and their write: the end of a turn (its usage) and the chat's
+        Daybreak switch.
+        """
+        lock = self._metadata_locks.get(session_id)
+        if lock is None:
+            lock = self._metadata_locks[session_id] = asyncio.Lock()
+        return lock
+
+    @staticmethod
+    def _row_metadata(session: dict | None) -> dict[str, Any]:
+        """The metadata of a session row ({} for no row and for no metadata)."""
+        try:
+            meta = json.loads((session or {}).get("metadata") or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return meta if isinstance(meta, dict) else {}
+
+    @staticmethod
+    async def _turn_refusal(client: AgentClient) -> str | None:
+        """Why the client's runtime will not start the next turn, if it says
+        so. An optional seam: only a Codex client has ``turn_refusal``."""
+        turn_refusal = getattr(client, "turn_refusal", None)
+        if not inspect.iscoroutinefunction(turn_refusal):
+            return None
+        reason = await turn_refusal()
+        return reason if isinstance(reason, str) and reason else None
+
+    @staticmethod
+    async def _apply_daybreak(client: AgentClient, session_meta: dict) -> None:
+        """Give a live client the Daybreak switch of its session's metadata.
+        Only a Codex client has the switch, and one that has this value
+        already does nothing."""
+        set_daybreak = getattr(client, "set_daybreak", None)
+        if inspect.iscoroutinefunction(set_daybreak):
+            await set_daybreak(session_meta.get("codex_daybreak") is True)
 
     async def get_client_connected_at_async(self, session_id: str) -> str | None:
         """Async version: get connected_at from DB."""
@@ -3886,8 +3992,18 @@ class AgentEngine:
                 cost_basis = cost_source
                 estimated_cost = (st.result_meta or {}).get("estimated_cost_usd")
 
-            # Save metadata (includes _sdk_cumulative_cost update)
-            await self.db.update_session_metadata(session_id, meta)
+            # Save metadata (includes _sdk_cumulative_cost update). The keys
+            # of this turn go into the row as it is now, under the session's
+            # metadata lock: another writer (the chat's Daybreak switch) can
+            # have changed the row since this turn read it.
+            async with self._metadata_lock(session_id):
+                current = self._row_metadata(await self.db.get_session(session_id))
+                current.update({
+                    key: meta[key]
+                    for key in ("last_usage", "observed_model", "_sdk_cumulative_cost")
+                    if key in meta
+                })
+                await self.db.update_session_metadata(session_id, current)
 
             # The Anthropic API splits cache_creation by TTL:
             #   usage.cache_creation.ephemeral_5m_input_tokens  (1.25x base)
@@ -4390,6 +4506,14 @@ class AgentEngine:
                     session_id, TurnOutcome("interrupted", "stopped before the turn started"),
                 ))
 
+            # A runtime can refuse the turn (Codex: the chat's Daybreak
+            # switch is on and its model has no program). Asked here, before
+            # the turn takes its preamble and its agent notes, so that a
+            # refused turn uses up nothing.
+            refusal = await self._turn_refusal(client)
+            if refusal:
+                raise TurnRefusedError(refusal)
+
             # Drain autonomous-turn messages that buffered while no run was
             # active (background task settled in the race window before the
             # idle watcher claimed it).  Without this, receive_response()
@@ -4653,6 +4777,14 @@ class AgentEngine:
             # Memorize in background — don't block the stop path
             await self.schedule_memorize(session_id)
             return TurnResult(partial, outcome)
+
+        except TurnRefusedError as refused:
+            # Nothing was sent and the runtime is as healthy as before: a
+            # failed turn like one that the runtime itself failed, not a
+            # crash. The client stays.
+            await self._process_agent_event(
+                session_id, TurnCompleted(status="failed", error=str(refused)), st,
+            )
 
         except Exception as e:
             error_msg = f"Agent error: {e}"
