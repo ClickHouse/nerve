@@ -37,6 +37,7 @@ class WebChannel(BaseChannel):
             | ChannelCapability.MARKDOWN
             | ChannelCapability.INTERACTIVE
             | ChannelCapability.SEND_FILES
+            | ChannelCapability.SEND_IMAGES
         )
 
     @property
@@ -93,5 +94,16 @@ class WebChannel(BaseChannel):
         ``send_file`` tool call (input + result). Returning True signals
         that no fallback message is needed — the file is reachable via
         the inline download card in the web UI.
+        """
+        return True
+
+    async def send_image(
+        self, target: str, *, file_path: str = "", url: str = "", caption: str = "",
+    ) -> bool:
+        """Web image delivery is the persisted tool_call block, as for files.
+
+        The frontend's SendImageBlock shows the image from the stored
+        ``send_image`` call: the copy the handler made (its ``web_url:``
+        line), or the remote ``url``.
         """
         return True
