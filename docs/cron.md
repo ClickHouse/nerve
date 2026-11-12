@@ -204,7 +204,9 @@ When multiple gates are listed, the job runs only if every one passes:
 
 Gates are **fail-open while checking**: if a gate raises during evaluation (e.g.
 a transient DB issue), the run proceeds rather than being skipped — an occasional
-wasted run beats a cron that silently never fires.
+wasted run beats a cron that silently never fires. `clickhouse_query` is the
+exception: a failed check skips the run, and a series of them is reported (see
+[`clickhouse_query`](#clickhouse_query)).
 
 A gate that can't be *built* is a different matter and is **refused**. If a
 `run_if` entry names a type nothing provides — a typo, or a gate plugin that was
@@ -326,6 +328,7 @@ column and the data the agent needs in the next columns.
 | `cooldown_minutes` | number | 360 | While the value stays true, the time from one run to the next. `0` runs on each check with a true value |
 | `max_rows` | int | 50 | Rows that the run's prompt gets, at most 500. `0` gives the prompt nothing |
 | `timeout_seconds` | number | 30 | Time limit for the whole call, at most 120 |
+| `notify_after_failures` | int | 3 | The failed check in a row that is recorded as a failed run and sends the job's failure notice. `0` sends nothing |
 
 ```yaml
 run_if:
@@ -348,9 +351,10 @@ before found it false, or the last run that the gate let through started
 `cooldown_minutes` ago or more. Thus a run starts as soon as the value becomes
 true, and while the value stays true, once for each cooldown. The gate keeps
 its state in `~/.nerve/cache`, one file for each job and query. It records a
-run only when the run starts: if a later gate in `run_if` skips the run, the
-next check passes again. Put this gate last in `run_if`, after the cheap
-gates, so that the query runs only when the other gates pass.
+run only when the run starts: if a later gate in `run_if` skips the run, or
+`lock` skips the launch of a workflow run, the next check passes again. Put
+this gate last in `run_if`, after the cheap gates, so that the query runs only
+when the other gates pass.
 
 **A failed check skips the run.** This gate is not fail-open. An unknown or
 disabled server, a call that fails or times out, a tool that refuses the query,
@@ -361,6 +365,15 @@ ClickHouse Cloud server gives a failed query as a normal result,
 `{"result": {"status": "error", "message": ...}}`, and the warning names its
 message, for example `Forbidden. Service does not allow MCP calls` for a
 service where MCP is off.
+
+**A series of failed checks is reported.** The gate counts the failed checks
+in a row. The check that fails for the `notify_after_failures`-th time in a row
+(default 3) is recorded as a failed run of the job, without a session, and
+sends the job's failure notice, "Cron job `<id>` failed", with the last error.
+The checks that fail after it send nothing more. A check that works starts the
+count again, and the next run that works sends "Cron job `<id>` works again".
+One failed check is usual and sends nothing: a check that wakes an idle
+ClickHouse Cloud service fails once.
 
 **The prompt.** When the gate passes, the run's prompt gets a block after the
 job's prompt: the query, the time of the check, and up to `max_rows` rows as
@@ -524,8 +537,11 @@ that name its gate, see below):
 > sessions get, and `mcp_managed` says that they come from the MCP gateway's
 > catalog. A gate that passes can add text for the run's prompt to `ctx.notes`.
 > A gate that keeps state for the run it lets through adds a callback to
-> `ctx.on_run`: Nerve calls it only when every gate passes, so a later gate that
-> skips the run does not use up that state. A gate that needs live runtime
+> `ctx.on_run`: Nerve calls it only when the run starts, so a later gate that
+> skips the run, or a run that does not start, does not use up that state. A
+> gate whose check failed can add a message to `ctx.failures`: Nerve records it
+> as a failed run of the job and sends the job's failure notice, so add one
+> only when the failure needs attention. A gate that needs live runtime
 > state, e.g. which sessions are currently running, is **not** supported by
 > this loader; that would require widening the gate context, a separate change.
 

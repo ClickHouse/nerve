@@ -72,13 +72,14 @@ The same machine as a transition table, in the form `TASK.md` § Actions uses (`
 
 ### Gates keep jobs idle until there is work
 
-A run gate is checked right before a job fires; when it is not satisfied, no session starts ([cron.md](cron.md#run-gates)). Three gate types ship with Nerve:
+A run gate is checked right before a job fires; when it is not satisfied, no session starts ([cron.md](cron.md#run-gates)). Four gate types ship with Nerve:
 
 - `tasks`: enough tasks match a status, or a list of statuses, and an optional tag. A work job gates on the queue it owns, a monitor on the waiting status it watches, the planner on `pending`. No built-in job gates on `backlog`.
 - `messages`: a sync source has unread messages for a consumer. It drives inbox work, if the worker has sources.
 - `github_pr_activity`: something actionable changed on an author's open PRs (a merge or close, a new commit, a review, a CI transition, a human comment); `force_run_after_hours` fires it anyway after a quiet spell.
+- `clickhouse_query`: a ClickHouse query, run through an MCP server such as the ClickHouse Cloud one, gives a true first value; `cooldown_minutes` sets how often it fires while the value stays true, and the run's prompt gets the rows.
 
-Gates in one list must all pass and are checked in order, so put the cheap `tasks` gate before the network-backed `github_pr_activity`. A gate that errors while checking lets the run proceed; a gate type that does not exist keeps the job from loading. Drop-in plugins in `config/cron/gates/` add conditions the built-in types do not cover. Scan jobs stay ungated: their job is to find work nobody has recorded yet.
+Gates in one list must all pass and are checked in order, so put the cheap `tasks` gate before the network-backed `github_pr_activity` and `clickhouse_query`. A gate that errors while checking lets the run proceed, except `clickhouse_query`, which skips the run and sends the job's failure notice after three failed checks in a row; a gate type that does not exist keeps the job from loading. Drop-in plugins in `config/cron/gates/` add conditions the built-in types do not cover. Scan jobs stay ungated: their job is to find work nobody has recorded yet.
 
 ### Locks, catch-up and session modes
 

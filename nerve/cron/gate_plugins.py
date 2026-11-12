@@ -49,8 +49,9 @@ Rules (all fail-safe — a bad plugin never crashes the daemon):
   file is skipped; the remaining files still load.
 * A gate gets a ``GateContext``: ``job_id`` and ``db``, and for the check
   before a run the MCP servers of new sessions (``mcp_servers``,
-  ``mcp_managed``), plus ``notes`` (text for the run's prompt) and ``on_run``
-  (callbacks called when the run starts). A liveness/registry based gate is
+  ``mcp_managed``), plus ``notes`` (text for the run's prompt), ``on_run``
+  (callbacks called when the run starts) and ``failures`` (failed checks to
+  record as failed runs, with a notice). A liveness/registry based gate is
   out of scope for this loader: it would need the context widened, a
   separate change.
 * **A gate that does not define ``forecast`` has its check run on every

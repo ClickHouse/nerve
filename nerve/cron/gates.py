@@ -76,12 +76,16 @@ class GateContext:
     sets it for the check before a run, never for a forecast; elsewhere it is
     ``None``.
 
-    ``notes`` and ``on_run`` belong to one evaluation. A gate that passes may
-    add text to ``notes``; when every gate passes, the run's prompt gets that
-    text (:attr:`GateDecision.notes`). A gate that keeps state for the run it
-    lets through adds a callback to ``on_run`` and does not write that state
-    in its check: :func:`evaluate_gates` calls the callbacks only when every
-    gate passes, so a later gate that skips the run does not use the state up.
+    ``notes``, ``on_run`` and ``failures`` belong to one evaluation. A gate
+    that passes may add text to ``notes``; when every gate passes, the run's
+    prompt gets that text (:attr:`GateDecision.notes`). A gate that keeps
+    state for the run it lets through adds a callback to ``on_run`` and does
+    not write that state in its check: the cron service calls the callbacks
+    (:meth:`GateDecision.record_run`) only when the run starts, so a later gate
+    that skips the run, or a run that does not start, does not use the state
+    up. A gate whose check failed, and that wants the failure on record, adds
+    a message to ``failures``: the cron service records it as a failed run of
+    the job and sends the job's failure notice.
     """
 
     job_id: str
@@ -90,6 +94,7 @@ class GateContext:
     mcp_managed: bool = False
     notes: list[str] = field(default_factory=list)
     on_run: list[Callable[[], None]] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -98,13 +103,29 @@ class GateDecision:
 
     ``reason`` is a short human-readable explanation, populated only when
     ``should_run`` is False, for logging the skip. ``notes`` is the text that
-    the gates give to the run (:attr:`GateContext.notes`), in gate order;
-    empty when ``should_run`` is False.
+    the gates give to the run (:attr:`GateContext.notes`), in gate order, and
+    ``on_run`` the callbacks for the run's start; both are empty when
+    ``should_run`` is False. ``failures`` holds the failed checks that the
+    gates want on record (:attr:`GateContext.failures`), whatever the decision.
     """
 
     should_run: bool
     reason: str = ""
     notes: list[str] = field(default_factory=list)
+    on_run: list[Callable[[], None]] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
+
+    def record_run(self, job_id: str) -> None:
+        """Call the ``on_run`` callbacks, once, when the run starts. A
+        callback that raises is logged and does not stop the run."""
+        callbacks, self.on_run = self.on_run, []
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception as e:  # noqa: BLE001 (the run goes ahead)
+                logger.warning(
+                    "A cron gate of job %s could not record the run: %s", job_id, e,
+                )
 
 
 class CronGate(ABC):
@@ -709,16 +730,18 @@ class ClickHouseQueryGate(CronGate):
     * ``max_rows`` (default 50, at most 500): the rows that the run's prompt
       gets. ``0`` gives the prompt nothing.
     * ``timeout_seconds`` (default 30, at most 120): for the whole call.
+    * ``notify_after_failures`` (default 3): see below. ``0`` sends nothing.
 
     The gate passes when the value is true and either the check before found
     it false (or there was none), or the last run that the gate let through
     started ``cooldown_minutes`` ago or more. So a run starts as soon as the
     value becomes true, and while the value stays true, once for each
     cooldown; ``0`` lets every check with a true value through. The state
-    (the value at the last check, the time of the last run let through) is a
-    file under ``~/.nerve/cache`` for each job and gate spec. A true value is
-    written only when the run starts (:attr:`GateContext.on_run`), so a later
-    gate that skips the run does not use up the change.
+    (the value at the last check, the time of the last run let through, the
+    failed checks in a row) is a file under ``~/.nerve/cache`` for each job
+    and gate spec. A true value is written only when the run starts
+    (:attr:`GateContext.on_run`), so a later gate that skips the run, or a
+    workflow run that its ``lock`` skips, does not use up the change.
 
     When the gate passes, the run's prompt gets the query and the rows
     (:func:`nerve.cron.clickhouse_query.gate_note`).
@@ -728,13 +751,17 @@ class ClickHouseQueryGate(CronGate):
     tool that refuses the query, a result the gate cannot read, a first value
     that is neither a boolean nor a number. The gate logs a warning and does
     not raise. Otherwise a ClickHouse Cloud service that sleeps, or a key that
-    expired, would start a session on every tick.
+    expired, would start a session on every tick. The check that fails for the
+    ``notify_after_failures``-th time in a row adds a message to
+    :attr:`GateContext.failures`, so the cron service records a failed run and
+    sends the job's failure notice: once for each series of failures, as one
+    failed check is usual (a check that wakes an idle service fails).
     """
 
     type = "clickhouse_query"
     spec_keys = frozenset({
         "server", "service_id", "query", "tool",
-        "cooldown_minutes", "max_rows", "timeout_seconds",
+        "cooldown_minutes", "max_rows", "timeout_seconds", "notify_after_failures",
     })
 
     DEFAULT_TOOL = "run_select_query"
@@ -750,6 +777,7 @@ class ClickHouseQueryGate(CronGate):
         cooldown_minutes: float = 360.0,
         max_rows: int = 50,
         timeout_seconds: float = 30.0,
+        notify_after_failures: int = 3,
     ) -> None:
         from nerve.cron.mcp_call import MAX_CALL_TIMEOUT_SECONDS
 
@@ -772,10 +800,15 @@ class ClickHouseQueryGate(CronGate):
                 "'clickhouse_query' gate 'timeout_seconds' must be more than 0 and "
                 f"at most {MAX_CALL_TIMEOUT_SECONDS:g}"
             )
+        if notify_after_failures < 0:
+            raise GateConfigError(
+                "'clickhouse_query' gate 'notify_after_failures' must be 0 or more"
+            )
         self.server = server
         self.query = query
         self.service_id = service_id
         self.tool = tool
+        self.notify_after_failures = int(notify_after_failures)
         self.cooldown_minutes = float(cooldown_minutes)
         self.max_rows = int(max_rows)
         self.timeout_seconds = float(timeout_seconds)
@@ -784,32 +817,30 @@ class ClickHouseQueryGate(CronGate):
         from nerve.cron.clickhouse_query import QueryResultError, gate_note, is_true
         from nerve.cron.mcp_call import McpCallError
 
+        state = self._load_state(ctx.job_id)
         try:
             rows = await self._query(ctx)
             value = is_true(rows.first_value)
         except (McpCallError, QueryResultError) as e:
-            logger.warning(
-                "clickhouse_query gate of cron job %s: %s; the run is skipped",
-                ctx.job_id, e,
-            )
+            self._failed(ctx, state, str(e))
             return False
-        except Exception:  # noqa: BLE001 (a failed check skips, see the class)
-            logger.warning(
-                "clickhouse_query gate of cron job %s failed; the run is skipped",
-                ctx.job_id, exc_info=True,
-            )
+        except Exception as e:  # noqa: BLE001 (a failed check skips, see the class)
+            logger.debug("clickhouse_query check of cron job %s", ctx.job_id, exc_info=True)
+            self._failed(ctx, state, f"the check failed ({type(e).__name__}: {e})")
             return False
 
         now = datetime.now(timezone.utc)
-        last_value, last_fire = self._load_state(ctx.job_id)
+        if state["failures"]:
+            self._update_state(ctx.job_id, failures=0)
         if not value:
-            if last_value is not False:
-                self._save_state(ctx.job_id, value=False, last_fire=last_fire)
+            if state["value"] is not False:
+                self._update_state(ctx.job_id, value=False)
             return False
+        last_fire = state["last_fire"]
         cooldown_over = last_fire is None or (
             now - last_fire >= timedelta(minutes=self.cooldown_minutes)
         )
-        if last_value is True and not cooldown_over:
+        if state["value"] is True and not cooldown_over:
             return False
         if self.max_rows:
             ctx.notes.append(gate_note(
@@ -818,8 +849,24 @@ class ClickHouseQueryGate(CronGate):
                 checked_at=now.isoformat(timespec="seconds"),
             ))
         job_id = ctx.job_id
-        ctx.on_run.append(lambda: self._save_state(job_id, value=True, last_fire=now))
+        ctx.on_run.append(lambda: self._update_state(job_id, value=True, last_fire=now))
         return True
+
+    def _failed(self, ctx: GateContext, state: dict, message: str) -> None:
+        """Log a failed check, count it, and on the ``notify_after_failures``-th
+        one in a row put it on record (:attr:`GateContext.failures`)."""
+        logger.warning(
+            "clickhouse_query gate of cron job %s: %s; the run is skipped",
+            ctx.job_id, message,
+        )
+        failures = state["failures"] + 1
+        self._update_state(ctx.job_id, failures=failures)
+        if self.notify_after_failures and failures == self.notify_after_failures:
+            ctx.failures.append(
+                f"Run gate clickhouse_query (MCP server {self.server}) could not "
+                f"check {failures} times in a row, so the job does not run. "
+                f"Last error: {message}"
+            )
 
     async def forecast(self, ctx: GateContext, at: datetime) -> bool:
         """Always a run: only the query can tell, and a forecast may not reach
@@ -861,8 +908,10 @@ class ClickHouseQueryGate(CronGate):
             return value
 
         max_rows = number("max_rows", 50)
-        if max_rows != int(max_rows):
-            raise GateConfigError("'clickhouse_query' gate 'max_rows' must be an integer")
+        notify_after_failures = number("notify_after_failures", 3)
+        for key, value in (("max_rows", max_rows), ("notify_after_failures", notify_after_failures)):
+            if value != int(value):
+                raise GateConfigError(f"'clickhouse_query' gate {key!r} must be an integer")
         return cls(
             server=text("server", required=True),
             query=text("query", required=True),
@@ -871,6 +920,7 @@ class ClickHouseQueryGate(CronGate):
             cooldown_minutes=number("cooldown_minutes", 360.0),
             max_rows=int(max_rows),
             timeout_seconds=number("timeout_seconds", 30.0),
+            notify_after_failures=int(notify_after_failures),
         )
 
     # --- internals ---------------------------------------------------------
@@ -910,28 +960,41 @@ class ClickHouseQueryGate(CronGate):
         d.mkdir(parents=True, exist_ok=True)
         return d / f"clickhouse_query_{safe}_{digest}.json"
 
-    def _load_state(self, job_id: str) -> tuple[bool | None, datetime | None]:
-        """The value at the last check and the start of the last run let
-        through; ``None`` for what is not known."""
+    def _load_state(self, job_id: str) -> dict:
+        """``value``: the value at the last check; ``last_fire``: the start of
+        the last run let through; ``failures``: the failed checks in a row.
+        ``None`` (0 for ``failures``) for what is not known."""
+        state = {"value": None, "last_fire": None, "failures": 0}
         try:
             raw = json.loads(self._state_path(job_id).read_text(encoding="utf-8"))
-            value = raw.get("value")
-            fired = raw.get("last_fire")
-            return (
-                value if isinstance(value, bool) else None,
-                datetime.fromisoformat(fired) if fired else None,
-            )
         except Exception:  # noqa: BLE001 (no state reads as a first check)
-            return None, None
+            return state
+        if not isinstance(raw, dict):
+            return state
+        if isinstance(raw.get("value"), bool):
+            state["value"] = raw["value"]
+        try:
+            state["last_fire"] = datetime.fromisoformat(raw["last_fire"]) if raw.get("last_fire") else None
+        except (TypeError, ValueError):
+            pass
+        failures = raw.get("failures")
+        if isinstance(failures, int) and not isinstance(failures, bool) and failures > 0:
+            state["failures"] = failures
+        return state
 
-    def _save_state(self, job_id: str, *, value: bool, last_fire: datetime | None) -> None:
+    def _update_state(self, job_id: str, **changes) -> None:
+        """Write *changes* over the stored state (read again, so that the
+        callback of a run does not undo a later check)."""
+        state = self._load_state(job_id)
+        state.update(changes)
         try:
             path = self._state_path(job_id)
             tmp = path.with_name(path.name + ".tmp")
             tmp.write_text(
                 json.dumps({
-                    "value": value,
-                    "last_fire": last_fire.isoformat() if last_fire else None,
+                    "value": state["value"],
+                    "last_fire": state["last_fire"].isoformat() if state["last_fire"] else None,
+                    "failures": state["failures"],
                 }),
                 encoding="utf-8",
             )
@@ -1039,17 +1102,18 @@ async def evaluate_gates(
     on a transient DB error would be worse than an occasional wasted run —
     and a wasted run is just the pre-gate behaviour.
 
-    When every gate passes, the ``on_run`` callbacks of *ctx* are called, in
-    order, and the decision carries its ``notes``. What a gate added to them
-    before it raised is dropped. A callback that raises is logged and does not
-    stop the run.
+    When every gate passes, the decision carries the ``notes`` and the
+    ``on_run`` callbacks of *ctx*; the caller calls
+    :meth:`GateDecision.record_run` when the run starts. What a gate added to
+    them before it raised is dropped. The decision carries ``failures``
+    whether the job runs or not.
     """
     for gate in gates:
-        notes, callbacks = len(ctx.notes), len(ctx.on_run)
+        notes, callbacks, failures = len(ctx.notes), len(ctx.on_run), len(ctx.failures)
         try:
             ok = await gate.is_satisfied(ctx)
         except Exception as e:  # noqa: BLE001 — fail open, never block forever
-            del ctx.notes[notes:], ctx.on_run[callbacks:]
+            del ctx.notes[notes:], ctx.on_run[callbacks:], ctx.failures[failures:]
             logger.warning(
                 "Cron gate %r for job %s errored; allowing run: %s",
                 gate.type, ctx.job_id, e,
@@ -1059,15 +1123,12 @@ async def evaluate_gates(
             return GateDecision(
                 should_run=False,
                 reason=f"gate {gate.type!r} not satisfied ({gate.describe()})",
+                failures=list(ctx.failures),
             )
-    for callback in ctx.on_run:
-        try:
-            callback()
-        except Exception as e:  # noqa: BLE001 (the run goes ahead)
-            logger.warning(
-                "A cron gate of job %s could not record the run: %s", ctx.job_id, e,
-            )
-    return GateDecision(should_run=True, notes=list(ctx.notes))
+    return GateDecision(
+        should_run=True, notes=list(ctx.notes), on_run=list(ctx.on_run),
+        failures=list(ctx.failures),
+    )
 
 
 async def forecast_gates(
