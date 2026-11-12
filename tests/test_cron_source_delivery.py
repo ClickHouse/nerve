@@ -67,7 +67,7 @@ class Runs:
         self.hold: dict[str, asyncio.Event] = {}
         self.changed = asyncio.Event()
 
-    async def __call__(self, job: CronJob, attribution: Any = None) -> None:
+    async def __call__(self, job: CronJob, attribution: Any = None, **_origin: Any) -> None:
         self.started.append((job.id, attribution))
         self.changed.set()
         gate = self.hold.get(job.id)
@@ -403,7 +403,7 @@ class TestJobs:
         install(svc, job("pr-monitor", sources=["github"]), runners=[runner])
         started: list[str] = []
 
-        async def winding_down(job: CronJob, attribution: Any = None) -> None:
+        async def winding_down(job: CronJob, attribution: Any = None, **_origin: Any) -> None:
             started.append(job.id)
             try:
                 await asyncio.Event().wait()

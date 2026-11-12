@@ -45,6 +45,7 @@ from nerve.setup_writer import (
     CRON_FILE_HAND_EDITED,
     CRON_FILE_READ_ONLY,
     CRON_JOB_MISSING,
+    default_run_if,
     plan_cron_job_enabled,
     publish_text,
 )
@@ -53,7 +54,7 @@ from nerve.utils.aio import GRACEFUL_STOP_SECONDS
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterator
 
-    from nerve.cron.gates import CronGate
+    from nerve.cron.gates import CronGate, GateContext
     from nerve.sources.runner import SourceRunner
 
 logger = logging.getLogger(__name__)
@@ -534,6 +535,9 @@ class CronService:
         self._clock_sample: tuple[float, float] | None = None
         self._clock_watch_task: asyncio.Task | None = None
         self._catchup_due: dict[str, int] = {}
+        # When each of those jobs came due during the pause: the time its
+        # catch-up asks the gates about.
+        self._catchup_due_at: dict[str, datetime] = {}
         self._catchup_lock = asyncio.Lock()
         self._catchup_tasks: set[asyncio.Task] = set()
         # Called whenever the schedule may have changed (see
@@ -1268,6 +1272,7 @@ class CronService:
                 if catchup:
                     if self._may_start(sched_job.id, "catchup"):
                         due.append(sched_job.id)
+                        self._catchup_due_at[sched_job.id] = missed
                 elif func == self._run_job_wrapper:
                     asyncio.create_task(
                         self._record_paused_run(sched_job.args[0], missed),
@@ -1309,10 +1314,10 @@ class CronService:
         forecast that raises lets the run through, as a check that raises does.
         """
         if job.gates:
-            from nerve.cron.gates import GateContext, forecast_gates
+            from nerve.cron.gates import forecast_gates
 
             decision = await forecast_gates(
-                job.gates, GateContext(job_id=job.id, db=self.db), due,
+                job.gates, self._gate_context(job, as_of=due), due,
             )
             if not decision.should_run:
                 logger.debug(
@@ -1334,7 +1339,9 @@ class CronService:
         then looks each job up as the scheduler holds it now: a job removed
         meanwhile does not run, one redefined runs as it is now, and one that
         has started a run since it was queued is not caught up on top of it.
-        Gates, ``lock`` and the run log apply as for a scheduled run.
+        Gates, ``lock`` and the run log apply as for a scheduled run; the
+        gates are asked about the time the job came due (see
+        :attr:`nerve.cron.gates.GateContext.as_of`).
         """
         await asyncio.sleep(_CATCHUP_SETTLE_SECONDS)
         async with self._catchup_lock:
@@ -1354,6 +1361,7 @@ class CronService:
     def _catch_up_run(self, job_id: str, started: int) -> Awaitable[None] | None:
         """The catch-up run of *job_id*, which had started *started* runs when
         it was queued — or ``None`` when it is gone or has run since."""
+        came_due = self._catchup_due_at.pop(job_id, None)
         sched_job = self.scheduler.get_job(job_id)
         if sched_job is None:
             logger.info("Not catching up %s: it is no longer scheduled", job_id)
@@ -1362,7 +1370,9 @@ class CronService:
             logger.info("Not catching up %s: it has run since the pause", job_id)
             return None
         if sched_job.func == self._run_job_wrapper:
-            return self._run_job_wrapper(sched_job.args[0], origin="catchup")
+            return self._run_job_wrapper(
+                sched_job.args[0], origin="catchup", as_of=came_due,
+            )
         if sched_job.func == self._run_source_wrapper:
             return self._run_source_wrapper(sched_job.args[0], origin="catchup")
         if sched_job.func == self._cleanup_expired:
@@ -1438,7 +1448,10 @@ class CronService:
         )
         async with self._catchup_lock:
             await asyncio.gather(
-                *(self._run_job_wrapper(job, origin="catchup") for job in overdue),
+                *(
+                    self._run_job_wrapper(job, origin="catchup", as_of=now)
+                    for job in overdue
+                ),
             )
 
     @staticmethod
@@ -1701,8 +1714,18 @@ class CronService:
         system_file = self.config.cron.system_file
         jobs_file = self.config.cron.jobs_file
 
-        system_jobs = load_jobs(system_file, strict=strict)
         user_jobs = load_jobs(jobs_file, strict=strict)
+        # A built-in job has the gates it ships with unless its entry states
+        # some. A job that jobs.yaml replaces is not loaded for running, so
+        # it is given none (and no line in the log says it runs under them).
+        replaced = {j.id for j in user_jobs}
+        backend = self.config.memory.backend
+        system_jobs = load_jobs(
+            system_file, strict=strict,
+            default_run_if=lambda job_id: (
+                [] if job_id in replaced else default_run_if(job_id, backend)
+            ),
+        )
 
         if not system_jobs and user_jobs:
             # Backward compat: old install with everything in jobs.yaml
@@ -1741,13 +1764,15 @@ class CronService:
 
     async def _run_job_wrapper(
         self, job: CronJob, attribution: Attribution | None = None,
-        *, origin: RunOrigin = "schedule",
+        *, origin: RunOrigin = "schedule", as_of: datetime | None = None,
     ) -> None:
         """Wrapper to run a cron job with logging and optional lock.
 
         ``attribution`` names who started the run and its cause. ``None``
         (the scheduler's call) is the instance's own run. ``origin`` says how
-        the run was started; the scheduler's call is ``"schedule"``. A run that
+        the run was started; the scheduler's call is ``"schedule"``. ``as_of``
+        is the time a catch-up asks the gates about (see
+        :meth:`_run_job_inner`). A run that
         would overlap another run of the job is skipped as :meth:`_may_start`
         says; otherwise it counts as in progress until it ends.
 
@@ -1762,9 +1787,13 @@ class CronService:
                 if job.lock:
                     lock = self._job_locks.setdefault(job.id, asyncio.Lock())
                     async with lock:
-                        await self._run_job_inner(job, attribution)
+                        await self._run_job_inner(
+                            job, attribution, origin=origin, as_of=as_of,
+                        )
                 else:
-                    await self._run_job_inner(job, attribution)
+                    await self._run_job_inner(
+                        job, attribution, origin=origin, as_of=as_of,
+                    )
         finally:
             self._schedule_changed()
 
@@ -1801,23 +1830,42 @@ class CronService:
             return False
         return True
 
+    def _gate_context(self, job: CronJob, as_of: datetime | None = None) -> GateContext:
+        """What the gates of *job* are checked and forecast with: the loaded
+        jobs, and the time the check is made for when that is not now."""
+        from nerve.cron.gates import GateContext
+
+        return GateContext(
+            job_id=job.id, db=self.db, jobs={j.id: j for j in self._jobs},
+            as_of=as_of,
+        )
+
     async def _run_job_inner(
         self, job: CronJob, attribution: Attribution | None = None,
+        *, origin: RunOrigin = "schedule", as_of: datetime | None = None,
     ) -> None:
-        """Inner implementation of job execution."""
+        """Inner implementation of job execution.
+
+        ``origin`` says how the run was started: a manual run is checked only
+        by the gates that hold for one. ``as_of`` is the time a catch-up asks
+        the gates about: when the run it stands in for came due.
+        """
         # The engine is draining before a shutdown. Write no log row, so the
         # catch-up after the restart sees the job as overdue.
         if not self.engine.accepting_turns:
             logger.info("Skipping cron job %s: Nerve is draining", job.id)
             return
 
-        # Pre-check: skip if any configured run gate is unsatisfied.
-        if job.gates:
-            from nerve.cron.gates import GateContext, evaluate_gates
+        # Pre-check: skip if any configured run gate is unsatisfied. A run
+        # that a person starts is checked only by the gates that say whether
+        # the job has anything to act on (CronGate.checked_on_manual_runs).
+        gates = job.gates
+        if origin == "manual":
+            gates = [gate for gate in gates if gate.checked_on_manual_runs]
+        if gates:
+            from nerve.cron.gates import evaluate_gates
 
-            decision = await evaluate_gates(
-                job.gates, GateContext(job_id=job.id, db=self.db),
-            )
+            decision = await evaluate_gates(gates, self._gate_context(job, as_of))
             if not decision.should_run:
                 logger.info("Skipping cron job %s: %s", job.id, decision.reason)
                 return
@@ -2564,7 +2612,9 @@ class CronService:
         (``ScheduleWakeup``) does so inside its turn, which has no reference to
         this service; tasks created, moved or edited from a chat turn, the
         web UI or the API change what a ``tasks`` gate forecasts without any
-        call here; and a message a channel buffers for its
+        call here; a turn, or a message stored in a session, changes what an
+        ``agent_activity`` gate forecasts without one; and a message a channel
+        buffers for its
         ``<channel>:observed`` drain makes that drain count (see
         :meth:`_undrained`) without one. Those count from the next
         :meth:`next_scheduled` on, so a caller that keeps the answer should
@@ -2726,13 +2776,13 @@ class CronService:
         are tried, asking only the gates with a forecast of their own: a
         gate's real check never runs more than once per forecast.
         """
-        from nerve.cron.gates import GateContext, forecast_gates, has_own_forecast
+        from nerve.cron.gates import forecast_gates, has_own_forecast
 
         job = sched_job.args[0]  # the job the scheduler will run, gates included
         next_run = getattr(sched_job, "next_run_time", None)
         if next_run is None or not job.gates:
             return _Forecast("cron", next_run, runs=True, runs_at=next_run)
-        ctx = GateContext(job_id=job.id, db=self.db)
+        ctx = self._gate_context(job)
         steady = [gate for gate in job.gates if not has_own_forecast(gate)]
         timed = [gate for gate in job.gates if has_own_forecast(gate)]
         decision = await forecast_gates(steady, ctx, next_run)
