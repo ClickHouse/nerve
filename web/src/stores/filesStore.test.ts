@@ -67,4 +67,45 @@ describe('revision-aware file saves', () => {
       revision: 'r2', saveError: null,
     });
   });
+  it('refreshes an unmodified cached file when it is reopened', async () => {
+    await useFilesStore.getState().openFile('MEMORY.md');
+    read.mockResolvedValueOnce({
+      path: 'MEMORY.md', content: 'agent changed this', revision: 'r2', read_only: false,
+    });
+    await useFilesStore.getState().openFile('MEMORY.md');
+    expect(useFilesStore.getState().openFiles[0]).toMatchObject({
+      content: 'agent changed this', originalContent: 'agent changed this',
+      modified: false, revision: 'r2',
+    });
+  });
+
+  it('does not overwrite local edits made while a cached-file refresh is pending', async () => {
+    await useFilesStore.getState().openFile('MEMORY.md');
+    let finish!: (value: { path: string; content: string; revision: string; read_only: boolean }) => void;
+    read.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const refreshing = useFilesStore.getState().openFile('MEMORY.md');
+    useFilesStore.getState().updateContent('MEMORY.md', 'my newer draft');
+    finish({ path: 'MEMORY.md', content: 'agent update', revision: 'r2', read_only: false });
+    await refreshing;
+    expect(useFilesStore.getState().openFiles[0]).toMatchObject({
+      content: 'my newer draft', originalContent: 'initial',
+      modified: true, revision: 'r1',
+    });
+  });
+
+  it('keeps a tab open until its in-flight save finishes', async () => {
+    await useFilesStore.getState().openFile('MEMORY.md');
+    useFilesStore.getState().updateContent('MEMORY.md', 'new contents');
+    let finish!: (value: { path: string; saved: boolean; revision: string }) => void;
+    write.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    const saving = useFilesStore.getState().saveFile('MEMORY.md');
+    useFilesStore.getState().closeFile('MEMORY.md');
+    expect(useFilesStore.getState().openFiles).toHaveLength(1);
+    finish({ path: 'MEMORY.md', saved: true, revision: 'r2' });
+    await saving;
+    expect(useFilesStore.getState().openFiles[0]).toMatchObject({
+      content: 'new contents', modified: false, revision: 'r2',
+    });
+  });
+
 });
