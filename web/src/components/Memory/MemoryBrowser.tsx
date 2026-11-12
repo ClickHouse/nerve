@@ -15,6 +15,8 @@ export function MemoryBrowser() {
   const [selected, setSelected] = useState<string | null>(null);
   const [content, setContent] = useState('');
   const latestContent = useRef('');
+  const loadedContent = useRef('');
+  const loadSerial = useRef(0);
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
   const [revision, setRevision] = useState('');
@@ -24,13 +26,21 @@ export function MemoryBrowser() {
     api.listMemoryFiles().then(({ files }) => setFiles(files)).catch(console.error);
   }, []);
 
-  const openFile = async (path: string) => {
+  const openFile = async (path: string, discardDraft = false) => {
     if (saving) return;
+    if (!discardDraft && editing && latestContent.current !== loadedContent.current
+      && !window.confirm('Discard your unsaved memory-file edits?')) return;
+
+    const serial = ++loadSerial.current;
     try {
       const { content, revision } = await api.readMemoryFile(path);
+      // Rapidly switching files must not let an older response replace the
+      // newest selection or a draft typed after the request began.
+      if (serial !== loadSerial.current) return;
       setRevision(revision);
       setSaveError(null);
       setSelected(path);
+      loadedContent.current = content;
       latestContent.current = content;
       setContent(content);
       setEditing(false);
@@ -46,6 +56,7 @@ export function MemoryBrowser() {
     try {
       const result = await api.writeMemoryFile(selected, submittedContent, revision);
       setRevision(result.revision);
+      loadedContent.current = submittedContent;
       setSaveError(null);
       // A newer draft typed while the request was running remains unsaved.
       setEditing(latestContent.current !== submittedContent);
@@ -74,7 +85,7 @@ export function MemoryBrowser() {
         {files.map((f) => (
           <div
             key={f.path}
-            onClick={() => openFile(f.path)}
+            onClick={() => { void openFile(f.path); }}
             className={`px-3 py-1.5 text-sm cursor-pointer hover:bg-surface-raised truncate ${
               f.path === selected ? 'bg-surface-raised border-l-2 border-accent' : ''
             }`}
@@ -100,7 +111,11 @@ export function MemoryBrowser() {
                     <Button
                       size="xs"
                       disabled={saving}
-                      onClick={() => { setEditing(false); openFile(selected); }}
+                      onClick={() => {
+                        if (latestContent.current !== loadedContent.current
+                          && !window.confirm('Discard your unsaved memory-file edits?')) return;
+                        void openFile(selected, true);
+                      }}
                     >
                       Cancel
                     </Button>
