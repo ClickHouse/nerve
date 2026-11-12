@@ -82,7 +82,7 @@ describe('revision-aware file saves', () => {
   it('does not overwrite local edits made while a cached-file refresh is pending', async () => {
     await useFilesStore.getState().openFile('MEMORY.md');
     let finish!: (value: { path: string; content: string; revision: string; read_only: boolean }) => void;
-    read.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    read.mockImplementationOnce(() => new Promise<{ path: string; content: string; revision: string; read_only: boolean }>(resolve => { finish = resolve; }));
     const refreshing = useFilesStore.getState().openFile('MEMORY.md');
     useFilesStore.getState().updateContent('MEMORY.md', 'my newer draft');
     finish({ path: 'MEMORY.md', content: 'agent update', revision: 'r2', read_only: false });
@@ -97,7 +97,7 @@ describe('revision-aware file saves', () => {
     await useFilesStore.getState().openFile('MEMORY.md');
     useFilesStore.getState().updateContent('MEMORY.md', 'new contents');
     let finish!: (value: { path: string; saved: boolean; revision: string }) => void;
-    write.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    write.mockImplementationOnce(() => new Promise<{ path: string; saved: boolean; revision: string }>(resolve => { finish = resolve; }));
     const saving = useFilesStore.getState().saveFile('MEMORY.md');
     useFilesStore.getState().closeFile('MEMORY.md');
     expect(useFilesStore.getState().openFiles).toHaveLength(1);
