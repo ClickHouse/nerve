@@ -134,6 +134,13 @@ def _failure_notice_body(error: str | None) -> str:
     return f"```\n{head}\n```" if head else "The run ended with an error."
 
 
+def _with_gate_notes(prompt: str, notes: list[str]) -> str:
+    """*prompt* with the text that the job's gates gave the run after it."""
+    if not notes:
+        return prompt
+    return prompt.rstrip() + "\n\n---\n\n" + "\n\n".join(note.strip() for note in notes)
+
+
 class _RunsInFlight:
     """The runs in progress, by job id, and how each was started.
 
@@ -1812,15 +1819,21 @@ class CronService:
             return
 
         # Pre-check: skip if any configured run gate is unsatisfied.
+        gate_notes: list[str] = []
         if job.gates:
             from nerve.cron.gates import GateContext, evaluate_gates
 
             decision = await evaluate_gates(
-                job.gates, GateContext(job_id=job.id, db=self.db),
+                job.gates, GateContext(
+                    job_id=job.id, db=self.db,
+                    mcp_servers=self.engine.current_mcp_servers,
+                    mcp_managed=self.engine.managed_mcp,
+                ),
             )
             if not decision.should_run:
                 logger.info("Skipping cron job %s: %s", job.id, decision.reason)
                 return
+            gate_notes = decision.notes
 
         attribution = attribution or self._own_attribution()
         log_id = await self.db.log_cron_start(job.id, attribution=attribution)
@@ -1830,7 +1843,7 @@ class CronService:
             # Workflow-run job: launch a budget-capped workflow run and
             # return — the run executes and notifies on its own, so none
             # of the cron session machinery below applies.
-            await self._start_workflow_run(job, log_id, attribution)
+            await self._start_workflow_run(job, log_id, attribution, gate_notes=gate_notes)
             return
 
         session_id: str | None = None
@@ -1891,7 +1904,7 @@ class CronService:
 
                 result = await self.engine.run_persistent_cron(
                     job_id=job.id,
-                    prompt=prompt,
+                    prompt=_with_gate_notes(prompt, gate_notes),
                     model=model,
                     session_id=session_id,
                     cache_ttl=job.cache_ttl,
@@ -1901,7 +1914,7 @@ class CronService:
             else:
                 result = await self.engine.run_cron(
                     job_id=job.id,
-                    prompt=base_prompt,
+                    prompt=_with_gate_notes(base_prompt, gate_notes),
                     model=model,
                     run_id=run_id,
                     cache_ttl=job.cache_ttl,
@@ -1978,6 +1991,7 @@ class CronService:
 
     async def _start_workflow_run(
         self, job: CronJob, log_id: int, attribution: Attribution | None = None,
+        *, gate_notes: list[str] | None = None,
     ) -> None:
         """Start the workflow run a job declares instead of a prompt.
 
@@ -1989,7 +2003,8 @@ class CronService:
         ``attribution`` is the run log's (see :meth:`_run_job_wrapper`).
         The cron service starts the run, so its actor is the system actor;
         its cause is the cause of the cron run, and the run's turns run for
-        it.
+        it. ``gate_notes`` is the text of the job's gates for the run
+        (:attr:`nerve.cron.gates.GateDecision.notes`), added to the prompt.
         """
         from nerve.workflows import get_workflow_run_service
 
@@ -2033,7 +2048,7 @@ class CronService:
             run = await service.start_run(
                 engine_kind=w["engine"],
                 spec={
-                    "prompt": w["prompt"],
+                    "prompt": _with_gate_notes(w["prompt"], gate_notes or []),
                     "model": w.get("model") or "",
                     "effort": w.get("effort") or "",
                     "cwd": w.get("cwd") or "",

@@ -712,6 +712,16 @@ class AgentEngine:
         """Publish the local MCP listener port to backends."""
         self._mcp_loopback_port = port
 
+    @property
+    def managed_mcp(self) -> bool:
+        """Whether the MCP gateway's catalog gives the MCP servers (external mode)."""
+        return self._managed_mcp
+
+    def current_mcp_servers(self) -> list[McpServerConfig]:
+        """The MCP servers, besides Nerve's own, that new sessions get: the
+        ``mcp_servers`` config, or in external mode the gateway's catalog."""
+        return list(self._mcp_servers_cache)
+
     def _loom_tools_offered(self) -> bool:
         """Whether sessions get Loom's tools: the MCP gateway's catalog,
         read in external mode only, lists the ``loom`` server."""

@@ -185,6 +185,17 @@ class TestClients:
         }
         assert rows["nerve"]["type"] == "sdk"
 
+    @pytest.mark.asyncio
+    async def test_cron_gates_get_the_catalog_servers(self, tmp_path, db, external):
+        engine = _engine(tmp_path, db, FakeGateway(_document("docs", "nerve")))
+        await engine._refresh_mcp_catalog()
+        await engine.shutdown()
+        servers = engine.current_mcp_servers()
+        assert engine.managed_mcp is True
+        assert [(s.name, s.type, s.url) for s in servers] == [("docs", "http", f"{BASE}/s/docs/mcp")]
+        servers.clear()
+        assert len(engine.current_mcp_servers()) == 1
+
 
 class TestNewSessions:
     @pytest.mark.asyncio
@@ -590,6 +601,13 @@ class TestLocalModeUnchanged:
         assert 'mcp_servers.remote-api.url="https://mcp.example.com/v1"' in overrides
         assert not any("default_tools_approval_mode" in o and "remote-api" in o
                        for o in overrides)
+
+    def test_cron_gates_get_the_configured_servers(self, tmp_path, db):
+        engine = _engine(tmp_path, db)
+        assert engine.managed_mcp is False
+        servers = {s.name: s for s in engine.current_mcp_servers()}
+        assert set(servers) == {"local-files", "remote-api"}
+        assert servers["remote-api"].headers == {"Authorization": "Bearer placeholder"}
 
     @pytest.mark.asyncio
     async def test_reload_reads_the_files(self, tmp_path, db):

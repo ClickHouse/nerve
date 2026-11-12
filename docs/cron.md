@@ -308,6 +308,89 @@ pull request monitors that way. A job gated on `github_pr_activity` alone is
 never started by a delivery, and since the gate always passes, it runs, in full,
 on every scheduled tick; `nerve doctor` names the jobs that still use this gate.
 
+#### `clickhouse_query`
+
+Satisfied when a ClickHouse query gives a true first value. The gate calls a
+query tool of an MCP server, by default `run_select_query` of the
+[ClickHouse Cloud remote MCP server](https://clickhouse.com/docs/products/cloud/features/ai-ml/mcp/remote-mcp).
+The SQL holds the condition. The gate reads only the first value of the first
+row, and the run's prompt gets all rows, so put the condition in the first
+column and the data the agent needs in the next columns.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `server` | string | (required) | The MCP server, by name. Local mode: an `http` entry of `mcp_servers`. External mode: a server of the MCP gateway's catalog |
+| `query` | string | (required) | The SQL. The ClickHouse Cloud server runs SELECT queries only |
+| `service_id` | string | none | Sent as the `serviceId` argument. The ClickHouse Cloud server needs it; the open-source `mcp-clickhouse` server takes no such argument |
+| `tool` | string | `run_select_query` | The tool to call. It gets the arguments `query` and, when `service_id` is set, `serviceId`. The open-source `mcp-clickhouse` server (0.7) names its query tool `run_query` |
+| `cooldown_minutes` | number | 360 | While the value stays true, the time from one run to the next. `0` runs on each check with a true value |
+| `max_rows` | int | 50 | Rows that the run's prompt gets, at most 500. `0` gives the prompt nothing |
+| `timeout_seconds` | number | 30 | Time limit for the whole call, at most 120 |
+
+```yaml
+run_if:
+  - type: clickhouse_query
+    server: clickhouse
+    service_id: 00000000-0000-0000-0000-000000000000
+    query: >
+      SELECT count() > 100 AS spike, count() AS errors, max(ts) AS last_error
+      FROM logs.errors WHERE ts > now() - INTERVAL 10 MINUTE
+    cooldown_minutes: 120
+```
+
+**The first value.** True: `true`, a number other than 0, `"true"`, and a
+numeric string other than 0 (ClickHouse writes 64-bit integers in JSON as
+strings). False: no rows, `NULL`, `false`, 0, `""` and `"false"`. Any other
+value, for example text, is an error.
+
+**Cooldown.** The gate passes when the value is true and either the check
+before found it false, or the last run that the gate let through started
+`cooldown_minutes` ago or more. Thus a run starts as soon as the value becomes
+true, and while the value stays true, once for each cooldown. The gate keeps
+its state in `~/.nerve/cache`, one file for each job and query. It records a
+run only when the run starts: if a later gate in `run_if` skips the run, the
+next check passes again. Put this gate last in `run_if`, after the cheap
+gates, so that the query runs only when the other gates pass.
+
+**A failed check skips the run.** This gate is not fail-open. An unknown or
+disabled server, a call that fails or times out, a tool that refuses the query,
+a result that the gate cannot read, or a first value that is not true or false:
+the gate logs a warning and the run is skipped. A ClickHouse Cloud service that
+sleeps, or an API key that expired, does not start a session on each tick.
+
+**The prompt.** When the gate passes, the run's prompt gets a block after the
+job's prompt: the query, the time of the check, and up to `max_rows` rows as
+JSON lines, at most 8 KB. The block says that the rows are data and not
+instructions. Table content is text that anyone who writes to the table can
+set, so do not give a gated job more tools than its task needs.
+
+**Server setup, local mode.** Add the server to `mcp_servers`, with the API key
+in `config.local.yaml`. The ClickHouse Cloud server takes the key ID and the
+key secret as HTTP Basic authentication:
+
+```yaml
+# config.local.yaml
+mcp_servers:
+  clickhouse:
+    type: http
+    url: https://mcp.clickhouse.cloud/mcp
+    headers:
+      Authorization: "Basic <base64 of key_id:key_secret>"
+```
+
+The service needs MCP turned on, and for an API key, a Query API endpoint that
+includes the key. Sessions get the same server, so the agent can run more
+queries.
+
+**Server setup, external mode.** Add the ClickHouse Cloud server to the agent
+in the control plane console. The gate calls it through the MCP gateway, which
+holds the key and applies the agent's policy. `server` is the server's id in
+the catalog.
+
+**Costs.** Each check is a query on the service. A short schedule can keep an
+idle ClickHouse Cloud service from going to sleep. The schedule shows each tick
+as a run, because a forecast cannot run the query (see [Forecasts](#forecasts)).
+
 ### Forecasts
 
 A gate can also say ahead of time what it will decide. `forecast(ctx, at)`
@@ -329,7 +412,8 @@ that check.
   without starting one, and takes a cursor that will have expired by `at` as
   expired, since the check will find it so then.
 - `github_pr_activity` always forecasts a run: whether a PR moved is only known
-  by polling GitHub, which a forecast must not do.
+  by polling GitHub, which a forecast must not do. So does `clickhouse_query`,
+  for the same reason.
 - A gate whose answer changes with elapsed time — an age threshold, a cooldown —
   overrides `forecast` and reasons about `at`. So does a gate whose check writes
   anything.
@@ -372,7 +456,7 @@ class StaleTasksGate(CronGate):
         self.min_age_minutes = min_age_minutes
 
     async def is_satisfied(self, ctx: GateContext) -> bool:
-        # ctx exposes {job_id, db} — DB-only (see note below).
+        # ctx exposes job_id and db (see the note below).
         ...
 
     async def forecast(self, ctx: GateContext, at: datetime) -> bool:
@@ -427,11 +511,16 @@ that name its gate, see below):
   remove the `run_if` entry) and reload again. Deleting a plugin is not a way to
   switch a gate off; it stops those jobs instead of ungating them.
 
-> **Context is DB-only.** A gate receives `GateContext{job_id, db}`, which is
-> enough for DB-driven conditions (task counts, source cursors, age filters). A
-> gate that needs live runtime state — e.g. which sessions are currently
-> running — is **not** supported by this loader; that would require widening
-> the gate context, a separate change.
+> **Context.** A gate receives a `GateContext`. It has `job_id` and `db`, which
+> is enough for DB-driven conditions (task counts, source cursors, age filters).
+> For the check before a run, `mcp_servers()` also gives the MCP servers that new
+> sessions get, and `mcp_managed` says that they come from the MCP gateway's
+> catalog. A gate that passes can add text for the run's prompt to `ctx.notes`.
+> A gate that keeps state for the run it lets through adds a callback to
+> `ctx.on_run`: Nerve calls it only when every gate passes, so a later gate that
+> skips the run does not use up that state. A gate that needs live runtime
+> state, e.g. which sessions are currently running, is **not** supported by
+> this loader; that would require widening the gate context, a separate change.
 
 > **Trust note.** Files in the gate-plugins directory are imported (executed)
 > at daemon startup. This is the same trust model as `config.yaml`, configured
