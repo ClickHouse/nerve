@@ -32,11 +32,12 @@ export function MemoryBrowser() {
       && !window.confirm('Discard your unsaved memory-file edits?')) return;
 
     const serial = ++loadSerial.current;
+    const draftBeforeRead = latestContent.current;
     try {
       const { content, revision } = await api.readMemoryFile(path);
-      // Rapidly switching files must not let an older response replace the
-      // newest selection or a draft typed after the request began.
-      if (serial !== loadSerial.current) return;
+      // Rapidly switching files or typing during a read must not cause an
+      // older response to replace the newest selection or unsaved draft.
+      if (serial !== loadSerial.current || latestContent.current !== draftBeforeRead) return;
       setRevision(revision);
       setSaveError(null);
       setSelected(path);
