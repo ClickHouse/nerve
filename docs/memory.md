@@ -242,8 +242,8 @@ Implementation: `nerve/memory/xmemory_bridge.py` (`XmemoryBridge`), wired into `
 ## API
 
 - `GET /api/memory/files`: List the memory files: markdown at the workspace root and under `memory/`
-- `GET /api/memory/file/{path}`: Read a memory file (403 for any other path)
-- `PUT /api/memory/file/{path}`: Write a memory file (403 for any other path)
+- `GET /api/memory/file/{path}`: Read a memory file, including a SHA-256 content `revision` and `read_only`; 404 if missing, 403 for other paths
+- `PUT /api/memory/file/{path}`: Write `{ "content": "...", "expected_revision": "<revision from GET>" }`; returns the new `revision`. A changed/deleted file returns **409 Conflict** without writing. Older callers can omit `expected_revision` (unconditional overwrite); forbidden paths and locked reviewed files return 403
 - `GET /api/memory/memu` — Get memU categories, items, and resources for the UI (with the Loom backend: `available: false`, `backend: "loom"` and `dashboard_url`)
 - `POST /api/memory/memu/categories` — Create a new category
 - `PATCH /api/memory/memu/categories/{id}` — Update a category (summary, description; re-embeds)
