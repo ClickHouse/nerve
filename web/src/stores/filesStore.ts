@@ -50,6 +50,24 @@ export const useFilesStore = create<FilesState>((set, get) => ({
     const existing = get().openFiles.find(f => f.path === path);
     if (existing) {
       set({ activeFile: path });
+      // A clean cached tab may have changed while another agent was writing.
+      // Refresh it on re-selection, but never replace local edits or a tab
+      // that changed during the asynchronous read.
+      if (!existing.modified && !get().saving) {
+        try {
+          const { content, revision, read_only } = await api.readMemoryFile(path);
+          set(state => ({
+            openFiles: state.openFiles.map(tab =>
+              tab.path === path && !tab.modified && tab.revision === existing.revision && !state.saving
+                ? { ...tab, content, originalContent: content, revision,
+                    readOnly: !!read_only, saveError: null }
+                : tab
+            ),
+          }));
+        } catch (e) {
+          console.error('Failed to refresh file:', e);
+        }
+      }
       return;
     }
 
@@ -72,6 +90,8 @@ export const useFilesStore = create<FilesState>((set, get) => ({
   },
 
   closeFile: (path: string) => {
+    // A pending save must not commit its response to a newly opened tab.
+    if (get().saving) return;
     set(s => {
       const openFiles = s.openFiles.filter(f => f.path !== path);
       let activeFile = s.activeFile;
