@@ -1064,6 +1064,7 @@ order. The menu shows a model only when the Codex catalog of the account
 serves it, hidden entries included. `codex.model` is put first when the list
 does not name it. Every model in the list is also accepted as a session
 model. Unset: the newest model of each tier. `[]`: only `codex.model`.
+`nerve codex doctor` lists the catalog models that the list does not name.
 
 `codex.ultracode.dashboard` exposes run journals in Nerve's authenticated UI.
 It does not start Ultracode's detached dashboard process. Keep

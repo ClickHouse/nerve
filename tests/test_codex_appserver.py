@@ -178,6 +178,21 @@ async def test_hidden_catalog_models_are_opt_in(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_catalog_model_outside_the_menu_is_valid_before_any_preflight(tmp_path, monkeypatch):
+    """After a restart no preflight has run yet. A chat or cron job on a model
+    that the catalog serves, but that codex.models does not name, must pass on
+    its first validation: the check runs the preflight and then looks at the
+    whole catalog, not only at the menu list."""
+    _mode(monkeypatch, "basic")
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    assert "fake-internal-preview" not in cfg.codex.models
+    await backend.validate_model("fake-internal-preview")
+    with pytest.raises(Exception, match="not available"):
+        await backend.validate_model("gpt-7-not-served")
+
+
+@pytest.mark.asyncio
 async def test_effort_is_clamped_to_the_models_catalog(tmp_path, monkeypatch):
     _mode(monkeypatch, "basic")
     cfg = _config(tmp_path, models=[])       # offer no hidden entries ...

@@ -305,7 +305,12 @@ class CodexBackend:
         if model in allowed:
             return
         preflight = await self.preflight()
-        live = set(preflight.get("models") or []) if preflight.get("available") else set()
+        # The preflight fills ``_live_models`` with the whole catalog. The
+        # menu list (``models``) is only part of it.
+        live = (
+            {*(preflight.get("models") or []), *self._live_models}
+            if preflight.get("available") else set()
+        )
         if model in live:
             return
         detail = preflight.get("reason") if not preflight.get("available") else None
@@ -460,6 +465,7 @@ class CodexBackend:
                     ),
                     "account_type": account_type,
                     "models": model_ids or [self.codex.model],
+                    "catalog_models": catalog["listed"],
                     "hidden_models": catalog["hidden"],
                     "default_model": self.codex.model,
                     "rate_limits": self._rate_limits,

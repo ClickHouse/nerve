@@ -3024,12 +3024,17 @@ def codex_doctor(ctx: click.Context, json_output: bool) -> None:
             click.echo(f"[--] Endpoint: {status['base_url']} (no Codex login)")
         if status.get("available"):
             click.echo(f"[OK] {status.get('version')} ({status.get('auth')})")
-            click.echo(f"[OK] Models: {', '.join(status.get('models') or [])}")
-            hidden = status.get("hidden_models") or []
-            if hidden:
+            offered = status.get("models") or []
+            click.echo(f"[OK] Model menu (codex.models): {', '.join(offered)}")
+            hidden = set(status.get("hidden_models") or [])
+            others = [
+                m for m in status.get("catalog_models") or sorted(hidden)
+                if m not in offered
+            ]
+            if others:
                 click.echo(
-                    "[--] Hidden catalog entries (opt in via codex.models): "
-                    + ", ".join(hidden)
+                    "[--] Other catalog models (add to codex.models to offer them): "
+                    + ", ".join(f"{m} (hidden)" if m in hidden else m for m in others)
                 )
             if status.get("auth_mismatch"):
                 click.echo(
