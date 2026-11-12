@@ -250,6 +250,15 @@ file is cut there and ends with `[platform notes truncated at 16 KiB]`. The
 file is read whenever a session's prompt is built, so a change applies to new
 sessions.
 
+A session that a person chats in (web, Telegram, Slack, Discord, WhatsApp) also
+gets an "Offer to automate" section. It tells the agent to offer a cron job
+when the person asks for work that they will probably want again and no job
+does it yet: one yes/no question at the end of the reply, at most once in a
+conversation, and the job is created only after a yes. Cron, hook and workflow
+sessions do not get the section. The text is `AUTOMATION_OFFER_SECTION` in
+`nerve/agent/prompts.py`. A person who does not want these offers can say so
+in the chat, and the agent remembers it.
+
 ### User Message (Web UI)
 1. User sends message via WebSocket
 2. Gateway's WebSocket handler receives it — the connection's actor was resolved once, at accept

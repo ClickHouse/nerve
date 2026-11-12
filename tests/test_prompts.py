@@ -6,6 +6,7 @@ from pathlib import Path
 
 from nerve.agent import prompts
 from nerve.agent.prompts import (
+    AUTOMATION_OFFER_SECTION,
     SESSION_CONTEXT_TAG,
     _format_skills_list,
     _format_tool_list,
@@ -219,3 +220,42 @@ def test_rendering_follows_the_session_surface_not_the_turn(tmp_path: Path):
     )
     assert "renders fenced ```mermaid" in _rendering_line(legacy)
     assert "Do not emit" in _rendering_line(build_system_prompt(workspace=tmp_path, source="wakeup"))
+
+
+# ---------------------------------------------------------------------------
+# The automation offer: only sessions that a person chats in.
+# ---------------------------------------------------------------------------
+
+
+def test_chat_sessions_are_told_to_offer_automation(tmp_path: Path):
+    prompts._PROMPT_TOOL_REGISTRY = None
+    for source in ("web", "telegram", "slack"):
+        for static in (True, False):
+            prompt = build_system_prompt(workspace=tmp_path, source=source, static=static)
+            assert prompt.count(AUTOMATION_OFFER_SECTION) == 1, (source, static)
+
+
+def test_sessions_without_a_person_get_no_automation_offer(tmp_path: Path):
+    """A cron, hook or workflow session has no person to answer the offer."""
+    prompts._PROMPT_TOOL_REGISTRY = None
+    for source in ("cron", "hook", "wakeup", "workflow", "api"):
+        prompt = build_system_prompt(workspace=tmp_path, source=source)
+        assert "# Offer to automate" not in prompt, source
+
+
+def test_automation_offer_follows_the_session_surface_not_the_turn(tmp_path: Path):
+    """A wakeup turn of a web session gets the offer; one of a cron session does not."""
+    prompts._PROMPT_TOOL_REGISTRY = None
+    web = build_system_prompt(workspace=tmp_path, source="wakeup", rendering_source="web")
+    assert AUTOMATION_OFFER_SECTION in web
+    cron = build_system_prompt(workspace=tmp_path, source="wakeup", rendering_source="cron")
+    assert "# Offer to automate" not in cron
+
+
+def test_automation_offer_comes_before_the_skills(tmp_path: Path):
+    prompts._PROMPT_TOOL_REGISTRY = None
+    prompt = build_system_prompt(
+        workspace=tmp_path, source="web",
+        skill_summaries=[{"id": "s1", "name": "S1", "description": "Does a thing."}],
+    )
+    assert prompt.index("# Offer to automate") < prompt.index("# Available Skills")

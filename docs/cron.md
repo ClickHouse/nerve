@@ -4,6 +4,8 @@
 
 Nerve uses APScheduler for in-process async job scheduling. Jobs can run in isolated sessions (fresh each time) or persistent sessions (context preserved across runs) and deliver output to configured channels.
 
+You do not have to write jobs yourself. When you ask the agent in a chat for work that you will probably want again, it offers to do it on a schedule, and it adds the job after you say yes (see [the system prompt](architecture.md#user-message-telegram)).
+
 ## Two-File Layout
 
 Cron jobs live in two YAML files under `<workspace>/config/cron/` (the
