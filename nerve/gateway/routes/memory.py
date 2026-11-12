@@ -100,7 +100,7 @@ async def read_memory_file(file_path: str):
     full_path = config.workspace / file_path
     path = _memory_file(config.workspace, file_path)
     def _read() -> bytes:
-        with memory_file_lock:
+        with memory_file_lock(config.workspace, path):
             try:
                 return path.read_bytes()
             except (FileNotFoundError, IsADirectoryError):
@@ -136,7 +136,7 @@ async def write_memory_file(file_path: str, req: FileWriteRequest):
     path = _memory_file(config.workspace, file_path)
 
     def _write() -> str:
-        with memory_file_lock:
+        with memory_file_lock(config.workspace, path):
             # Verify the editor's read snapshot before replacing its contents.
             # Legacy callers without a revision retain their previous semantics.
             if req.expected_revision is not None:
