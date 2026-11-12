@@ -56,6 +56,7 @@ _RESTART_ONLY_PATHS = (
     "langfuse.public_key",
     "langfuse.redact_patterns",
     "langfuse.secret_key",
+    "mcp_apps",
     "mcp_endpoint.enabled",
     "mcp_endpoint.include_hoa",
     "mcp_endpoint.path",

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useCallback, useState, memo } from 'react';
+import { useContext, useEffect, useLayoutEffect, useRef, useCallback, useState, memo } from 'react';
 import { Link } from 'react-router-dom';
 import type { ChatMessage, Session } from '../../types/chat';
 import { useVisibleActorIds } from '../../stores/actorStore';
@@ -13,6 +13,7 @@ import { AssistantMessage } from './AssistantMessage';
 import { StreamingMessage } from './StreamingMessage';
 import { SelectionToolbar } from './SelectionToolbar';
 import { MessageActions } from './MessageActions';
+import { MessageChatContext } from './messageChat';
 import { SessionOriginLine } from './SessionOrigin';
 import { GitBranch } from '../ui/icons';
 import { followScrollEnd } from '../../utils/followScrollEnd';
@@ -32,6 +33,8 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks, u
   messageForks?: Map<string, { id: string; title: string }[]>;
 }) {
   const endRef = useRef<HTMLDivElement>(null);
+  // The chat of the page, for a row that this tab made itself (see below).
+  const pageChat = useContext(MessageChatContext);
   const containerRef = useRef<HTMLDivElement>(null);
   const isNearBottom = useRef(true);
   const prevMessageCount = useRef(0);
@@ -195,14 +198,20 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks, u
         const forks = msg.id != null ? messageForks?.get(String(msg.id)) : undefined;
         return (
           <div key={msg.id ?? i + visibleStart} className="chat-row">
-            {msg.role === 'user'
-              ? <UserMessage
-                  message={msg}
-                  actions={actions}
-                  showActor={!!msg.actor_id && namedSenders.has(msg.actor_id)}
-                />
-              : <AssistantMessage message={msg} actions={actions} />
-            }
+            {/* What is in a message belongs to the chat of that message: the
+                one the server handed it out for, whatever the store calls the
+                chat on screen at this moment. A row that this tab made itself
+                is of the chat on the page. */}
+            <MessageChatContext.Provider value={msg.session_id ?? pageChat}>
+              {msg.role === 'user'
+                ? <UserMessage
+                    message={msg}
+                    actions={actions}
+                    showActor={!!msg.actor_id && namedSenders.has(msg.actor_id)}
+                  />
+                : <AssistantMessage message={msg} actions={actions} />
+              }
+            </MessageChatContext.Provider>
             {forks && forks.length > 0 && (
               <div className="px-5 -mt-2 pb-2">
                 <div className="max-w-[var(--chat-width)] mx-auto pl-10 flex flex-wrap gap-1.5">

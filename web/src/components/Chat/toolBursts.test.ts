@@ -66,6 +66,22 @@ describe('groupToolBursts', () => {
     const failed = call('mcp__nerve__workflow_run_status', {}, { result: 'no such workflow run', isError: true });
     expect(isPinnedCall(failed, NO_REPEATS)).toBe(false);
   });
+
+  it('keeps a call with an MCP Apps view out of a burst, only where views are shown', () => {
+    const view = call('mcp__example-server__get-time', {}, {
+      mcpApp: { server: 'example-server', tool: 'get-time', resourceUri: 'ui://example/view.html' },
+    });
+    const blocks = [call('Bash'), view, call('mcp__example-server__get-time'), call('Read')];
+
+    expect(isPinnedCall(view, NO_REPEATS, true)).toBe(true);
+    expect(shape(groupToolBursts(blocks, NO_REPEATS, true)))
+      .toEqual(['burst[Bash]', 'mcp__example-server__get-time', 'burst[mcp__example-server__get-time,Read]']);
+
+    // The feature off: the call folds into the burst like any other.
+    expect(isPinnedCall(view, NO_REPEATS)).toBe(false);
+    expect(shape(groupToolBursts(blocks, NO_REPEATS)))
+      .toEqual(['burst[Bash,tool_call_group,Read]']);
+  });
 });
 
 describe('burstSummary', () => {

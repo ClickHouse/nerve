@@ -12,6 +12,7 @@ import { MarkdownContent } from './MarkdownContent';
 import { groupToolCalls } from '../../utils/groupToolCalls';
 import { findRepeatWorkflowRunCalls } from '../../utils/workflowRunCards';
 import { authUrl } from '../../api/hosted';
+import { useMcpAppsStore } from '../../stores/mcpAppsStore';
 
 interface BlockRendererProps {
   blocks: MessageBlock[];
@@ -33,9 +34,11 @@ export function BlockRenderer({
   rollUpTools = false,
 }: BlockRendererProps) {
   const repeatRunCalls = useMemo(() => findRepeatWorkflowRunCalls(blocks), [blocks]);
+  // On a Nerve that hosts MCP Apps, a call with a view stays out of the bursts.
+  const mcpApps = useMcpAppsStore(s => s.enabled);
   const renderItems = useMemo<RenderItem[]>(
-    () => (rollUpTools ? groupToolBursts(blocks, repeatRunCalls) : groupToolCalls(blocks)),
-    [blocks, rollUpTools, repeatRunCalls],
+    () => (rollUpTools ? groupToolBursts(blocks, repeatRunCalls, mcpApps) : groupToolCalls(blocks)),
+    [blocks, rollUpTools, repeatRunCalls, mcpApps],
   );
 
   return (

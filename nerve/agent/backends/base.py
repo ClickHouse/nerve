@@ -21,6 +21,7 @@ from typing import (
 )
 
 from nerve.agent.backends.events import AgentEvent
+from nerve.widget_state import WIDGET_STATE_TOOL, widgets_drawn
 
 # async (session_id, file_path, content_or_none) -> None
 SnapshotFn = Callable[[str, str, "str | None"], Awaitable[None]]
@@ -106,6 +107,11 @@ class SessionSpec:
     # cron job (nerve.session_origin.origin_tag), in external mode. None: no
     # origin. A backend that cannot send it ignores it.
     inference_origin: str | None = None
+    # Registry tools this session is not offered, beyond the backend's own
+    # exclusions: the ones of no use on the surface the session is read on
+    # (nerve.agent.prompts.surface_excluded_tools), which the system prompt
+    # leaves out of its list as well.
+    excluded_tools: frozenset[str] = frozenset()
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -197,6 +203,13 @@ class AgentClient(Protocol):
         :meth:`receive_turn`. The default: unsupported."""
         raise BackendError("compact unsupported")
 
+    async def mcp_app_for_tool(self, tool_name: str) -> "dict[str, str] | None":
+        """The MCP App that a call of ``tool_name`` opens:
+        ``{"server", "tool", "resource_uri"}`` when the tool belongs to a
+        third-party MCP server and is linked to a ``ui://`` view (see
+        nerve/mcp_apps.py). The default: none."""
+        return None
+
     async def disconnect(self) -> None:
         """Full teardown, owning every process/transport internal."""
         ...
@@ -281,10 +294,14 @@ def config_excluded_tools(config: Any) -> set[str]:
     and with it off no destination is reachable. The memory tools are the
     other: they serve memU, and with ``memory.backend: loom`` the agent
     uses Loom's own tools from the MCP gateway's catalog instead.
+    ``widget_state`` reads what the web chat's widgets saved, and without
+    the sandbox that draws widgets there is no widget.
     """
     excluded: set[str] = set()
     if not config.outbound_channels:
         excluded.add("send_channel_message")
+    if not widgets_drawn(config):
+        excluded.add(WIDGET_STATE_TOOL)
     if config.memory.backend == "loom":
         from nerve.agent.tools.handlers.memory import MEMORY_SPECS
 

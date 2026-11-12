@@ -2,12 +2,15 @@ import { authUrl, hostedSessionActive, isHosted, probeSession } from './hosted';
 import type { ReviewLoop, Task, WorkflowRun } from './client';
 import type { WorkflowSnapshot } from '../types/chat';
 import type { AgentSnapshot, AgentWSMessage, AutoTurnTrigger, InteractionAgentRef } from '../types/agents';
+import type { McpCallToolResult } from '../types/mcpApps';
 
 export type WSMessage =
   | { type: 'token'; session_id: string; content: string; parent_tool_use_id?: string }
   | { type: 'thinking'; session_id: string; content: string; parent_tool_use_id?: string }
-  | { type: 'tool_use'; session_id: string; tool: string; input: Record<string, unknown>; tool_use_id?: string; parent_tool_use_id?: string }
-  | { type: 'tool_result'; session_id: string; tool_use_id?: string; result: string; is_error?: boolean; parent_tool_use_id?: string }
+  // `mcp_app`: the tool has an interactive view (MCP Apps). Its `tool_result`
+  // then carries `mcp_app_result`, the result as an MCP `CallToolResult`.
+  | { type: 'tool_use'; session_id: string; tool: string; input: Record<string, unknown>; tool_use_id?: string; parent_tool_use_id?: string; mcp_app?: { server: string; tool: string; resource_uri: string } }
+  | { type: 'tool_result'; session_id: string; tool_use_id?: string; result: string; is_error?: boolean; parent_tool_use_id?: string; mcp_app_result?: McpCallToolResult }
   | { type: 'tool_output'; session_id: string; tool_use_id?: string; content: string; parent_tool_use_id?: string }
   // usage.context_tokens: the context use measured after a compact.
   // context_tokens: the input tokens of the turn's last model call (Codex).

@@ -48,6 +48,7 @@ from nerve.db.task_statuses import TaskStatusStore
 from nerve.db.tasks import TaskStore
 from nerve.db.usage import UsageStore
 from nerve.db.wakeups import WakeupStore
+from nerve.db.widget_states import WidgetStateStore
 from nerve.db.workflow_runs import WorkflowRunStore
 from nerve.identity import ACTOR_KIND_SYSTEM, Actor
 
@@ -367,6 +368,7 @@ class Database(
     AgentStore,
     OnboardingStore,
     PushSubscriptionStore,
+    WidgetStateStore,
 ):
     """Async SQLite database wrapper.
 

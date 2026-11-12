@@ -2,22 +2,34 @@
  * The fenced-code languages the chat renders instead of printing.
  *
  * A ```mermaid block becomes a diagram, a ```vega-lite (or ```vega) block a
- * chart, an ```svg block the picture itself. Every other fence stays a code
- * block. The model is told which languages render here by the system prompt's
- * "Rendering" line (nerve/agent/prompts.py), so the two lists must agree.
+ * chart, an ```svg block the picture itself, a ```widget block a live piece
+ * of HTML in the sandbox frame (Chat/widgets). Every other fence stays a code
+ * block: ```html too. The model is told which languages render here by the
+ * system prompt's "Rendering" line (nerve/agent/prompts.py), so the two lists
+ * must agree.
  */
 export type RichKind = 'mermaid' | 'vega-lite' | 'vega' | 'svg';
 
-const KIND_BY_LANGUAGE: Record<string, RichKind> = {
+/**
+ * A widget is no picture: it has no renderer, no export and no full-size
+ * view, and a block of its own. So it is a kind apart from `RichKind`.
+ */
+export type WidgetKind = 'widget';
+
+/** What a fence may render as. */
+export type FenceKind = RichKind | WidgetKind;
+
+const KIND_BY_LANGUAGE: Record<string, FenceKind> = {
   mermaid: 'mermaid',
   'vega-lite': 'vega-lite',
   vegalite: 'vega-lite',
   vega: 'vega',
   svg: 'svg',
+  widget: 'widget',
 };
 
 /** The kind a fence language renders as, or null for an ordinary code block. */
-export function richKindFor(language: string | undefined): RichKind | null {
+export function richKindFor(language: string | undefined): FenceKind | null {
   if (!language) return null;
   return KIND_BY_LANGUAGE[language.toLowerCase()] ?? null;
 }
@@ -25,7 +37,8 @@ export function richKindFor(language: string | undefined): RichKind | null {
 /**
  * Passed to rehype-highlight as `plainText`: highlighting these would be
  * wasted work, and highlighting `svg` (an XML alias) would split the source
- * into spans that the renderer then has to join back together.
+ * into spans that the renderer then has to join back together. A widget's
+ * source is highlighted by its own block, when it is shown.
  */
 export const RICH_LANGUAGES: readonly string[] = Object.keys(KIND_BY_LANGUAGE);
 

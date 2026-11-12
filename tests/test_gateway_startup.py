@@ -249,6 +249,30 @@ async def test_a_successful_startup_still_stops_everything_at_shutdown(harness):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enabled", "external", "said"),
+    [(True, False, [True]), (False, False, []), (True, True, [])],
+    ids=["enabled", "off", "enabled in external mode"],
+)
+async def test_mcp_apps_is_on_for_the_routes_only_where_the_gateway_serves_its_page(
+    harness, monkeypatch, enabled, external, said,
+):
+    """With ``mcp_apps.enabled``, in local mode, the lifespan tells the
+    routes that this gateway serves the sandbox document. Otherwise it says
+    nothing: the routes take the feature as off, and a startup that never
+    wired the routes still comes up."""
+    heard: list[bool] = []
+    monkeypatch.setattr(harness["server"], "set_mcp_apps_serving", heard.append)
+    monkeypatch.setattr("nerve.gateway.mcp_apps_sandbox.is_external_mode", lambda: external)
+    harness["config"].mcp_apps.enabled = enabled
+
+    async with harness["server"].lifespan(MagicMock()):
+        pass
+
+    assert heard == said
+
+
+@pytest.mark.asyncio
 async def test_a_failure_after_the_hosted_channels_start_stops_them(harness, monkeypatch):
     """Hosted channels that started are stopped when a later step fails."""
     import nerve.channels.hosted.runtime as hosted_module
