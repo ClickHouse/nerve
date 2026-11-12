@@ -79,6 +79,34 @@ describe('revision-aware file saves', () => {
     });
   });
 
+
+  it('refreshes a clean tab on tab selection, not only tree selection', async () => {
+    await useFilesStore.getState().openFile('MEMORY.md');
+    read.mockResolvedValueOnce({
+      path: 'MEMORY.md', content: 'agent wrote this', revision: 'r2', read_only: false,
+    });
+
+    useFilesStore.getState().setActiveFile('MEMORY.md');
+    await vi.waitFor(() => {
+      expect(useFilesStore.getState().openFiles[0]).toMatchObject({
+        content: 'agent wrote this', originalContent: 'agent wrote this',
+        revision: 'r2', modified: false,
+      });
+    });
+    expect(read).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not refresh a dirty tab when it is selected', async () => {
+    await useFilesStore.getState().openFile('MEMORY.md');
+    useFilesStore.getState().updateContent('MEMORY.md', 'my draft');
+    useFilesStore.getState().setActiveFile('MEMORY.md');
+
+    expect(read).toHaveBeenCalledTimes(1);
+    expect(useFilesStore.getState().openFiles[0]).toMatchObject({
+      content: 'my draft', revision: 'r1', modified: true,
+    });
+  });
+
   it('does not overwrite local edits made while a cached-file refresh is pending', async () => {
     await useFilesStore.getState().openFile('MEMORY.md');
     let finish!: (value: { path: string; content: string; revision: string; read_only: boolean }) => void;
