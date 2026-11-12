@@ -3,10 +3,11 @@
 Pattern mirrors test_workflow_routes.py: a minimal FastAPI app with the
 real router, auth disabled via an empty jwt_secret, and a fake engine
 carrying stub backends. The route must advertise the full selectable
-Claude model list — not just the configured default — so the composer's
-model picker renders for Claude sessions the same way it does for Codex,
-and that list must include whatever the Anthropic Models API reports for
-the configured credentials (nerve/models_catalog.py).
+Claude model list, not just the configured default, so the composer's
+model menu renders for Claude sessions the same way it does for Codex. By
+default that list is the built-in one; with ``agent.model_discovery`` on it
+is whatever the Anthropic Models API reports for the configured credentials
+(nerve/models_catalog.py).
 """
 
 from __future__ import annotations
@@ -98,8 +99,8 @@ class TestListModels:
         assert [m["id"] for m in claude_models] == get_config().claude_models
         assert len(claude_models) > 1
         assert all(m["provider"] == "anthropic" for m in claude_models)
-        # The default leads the list and matches the advertised default.
-        assert claude_models[0]["id"] == data["defaults"]["claude"]
+        # The list names the advertised default.
+        assert data["defaults"]["claude"] in [m["id"] for m in claude_models]
 
     def test_claude_backend_option_lists_models(self, make_client):
         from nerve.config import get_config
@@ -131,13 +132,15 @@ class TestListModels:
         ]
 
     def test_discovered_models_reach_the_picker(self, make_client, stub_discovery):
-        """A model released after DEFAULT_CLAUDE_MODELS still shows up."""
+        """With discovery on, the menu lists the whole catalog."""
         from nerve.config import AgentConfig, NerveConfig
 
         stub_discovery([
             "claude-opus-5", "claude-fable-5", "claude-sonnet-4-6",
         ])
-        cfg = NerveConfig(agent=AgentConfig.from_dict({"model": "claude-opus-5"}))
+        cfg = NerveConfig(agent=AgentConfig.from_dict({
+            "model": "claude-opus-5", "model_discovery": True,
+        }))
         data = make_client(cfg=cfg).get("/api/models").json()
 
         claude_ids = [
@@ -147,21 +150,35 @@ class TestListModels:
             "claude-opus-5", "claude-fable-5", "claude-sonnet-4-6",
         ]
 
-    def test_configured_default_leads_the_discovered_list(
+    def test_configured_default_missing_from_the_catalog_leads(
         self, make_client, stub_discovery,
     ):
-        """agent.model always heads the picker, wherever it sits in the API order."""
+        """agent.model is always offered: first when the catalog lacks it."""
         from nerve.config import AgentConfig, NerveConfig
 
-        stub_discovery(["claude-opus-5", "claude-fable-5"])
-        cfg = NerveConfig(agent=AgentConfig.from_dict({"model": "claude-fable-5"}))
+        stub_discovery(["claude-opus-5", "claude-sonnet-4-6"])
+        cfg = NerveConfig(agent=AgentConfig.from_dict({
+            "model": "claude-fable-5", "model_discovery": True,
+        }))
         data = make_client(cfg=cfg).get("/api/models").json()
 
         claude_ids = [
             m["id"] for m in data["models"] if m["backend"] == "claude"
         ]
-        assert claude_ids == ["claude-fable-5", "claude-opus-5"]
+        assert claude_ids == ["claude-fable-5", "claude-opus-5", "claude-sonnet-4-6"]
         assert data["defaults"]["claude"] == "claude-fable-5"
+
+    def test_discovery_is_off_by_default(self, make_client, stub_discovery):
+        """Without agent.model_discovery the catalog never reaches the menu."""
+        from nerve.config import DEFAULT_CLAUDE_MODELS
+
+        stub_discovery(["claude-opus-4-6", "claude-sonnet-4-5-20250929"])
+        data = make_client().get("/api/models").json()
+
+        claude_ids = [
+            m["id"] for m in data["models"] if m["backend"] == "claude"
+        ]
+        assert claude_ids == list(DEFAULT_CLAUDE_MODELS)
 
     def test_explicit_models_win_over_discovery(self, make_client, stub_discovery):
         from nerve.config import AgentConfig, NerveConfig
@@ -199,13 +216,14 @@ class TestListModels:
     def test_discovery_failure_falls_back_to_builtin(self, make_client, monkeypatch):
         """An unreachable Models API must not empty the picker."""
         from nerve import models_catalog
-        from nerve.config import DEFAULT_CLAUDE_MODELS
+        from nerve.config import DEFAULT_CLAUDE_MODELS, AgentConfig, NerveConfig
 
         async def _boom(config):
             return []
 
         monkeypatch.setattr(models_catalog, "get_models", _boom)
-        data = make_client().get("/api/models").json()
+        cfg = NerveConfig(agent=AgentConfig.from_dict({"model_discovery": True}))
+        data = make_client(cfg=cfg).get("/api/models").json()
 
         claude_ids = [
             m["id"] for m in data["models"] if m["backend"] == "claude"
@@ -245,7 +263,7 @@ class TestListModels:
             "claude-opus-5", "claude-3-5-haiku-20241022", "claude-sonnet-4-6",
         ])
         cfg = NerveConfig(agent=AgentConfig.from_dict({
-            "model": "claude-opus-5",
+            "model": "claude-opus-5", "model_discovery": True,
             "model_discovery_excluded_models": ["claude-3-5-haiku"],
         }))
         data = make_client(cfg=cfg).get("/api/models").json()
@@ -278,7 +296,9 @@ class TestListModels:
 
         # First render, no exclusions → the retired ID is visible; one fetch.
         client = make_client(cfg=NerveConfig(
-            agent=AgentConfig.from_dict({"model": "claude-opus-5"}),
+            agent=AgentConfig.from_dict({
+                "model": "claude-opus-5", "model_discovery": True,
+            }),
         ))
         ids = [
             m["id"] for m in client.get("/api/models").json()["models"]
@@ -290,7 +310,7 @@ class TestListModels:
         # Hot reload swaps in a config that excludes the retired ID. Same
         # credentials fingerprint → the discovery cache stays warm.
         cfg_mod._config = NerveConfig(agent=AgentConfig.from_dict({
-            "model": "claude-opus-5",
+            "model": "claude-opus-5", "model_discovery": True,
             "model_discovery_excluded_models": ["claude-3-5-haiku"],
         }))
         ids2 = [

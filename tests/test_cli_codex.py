@@ -83,6 +83,21 @@ class TestDoctorCommand:
         assert result.exit_code == 0, result.output
         assert "Endpoint: http://127.0.0.1:4000/v1" in result.output
 
+    def test_it_names_the_catalog_models_outside_the_menu(self, tmp_path, preflight):
+        """An operator sees which served models codex.models can add."""
+        preflight.update({
+            "models": ["gpt-6-astra", "gpt-5.6-sol"],
+            "catalog_models": ["gpt-5.5", "gpt-5.6-sol", "gpt-6-astra", "internal-preview"],
+            "hidden_models": ["gpt-6-astra", "internal-preview"],
+        })
+        result = CliRunner().invoke(main, ["-c", str(_config(tmp_path)), "codex", "doctor"])
+        assert result.exit_code == 0, result.output
+        assert "[OK] Model menu (codex.models): gpt-6-astra, gpt-5.6-sol" in result.output
+        assert (
+            "[--] Other catalog models (add to codex.models to offer them): "
+            "gpt-5.5, internal-preview (hidden)"
+        ) in result.output
+
     def test_json_output_is_parseable(self, tmp_path, preflight):
         result = CliRunner().invoke(
             main, ["-c", str(_config(tmp_path)), "codex", "doctor", "--json-output"]

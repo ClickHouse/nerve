@@ -190,7 +190,7 @@ def test_clamp_effort_uses_the_catalog_as_a_ceiling():
     assert clamp_effort(None, full) is None
 
 
-def test_catalog_offers_visible_plus_configured_hidden(tmp_path):
+def test_catalog_offers_the_configured_models_it_serves(tmp_path):
     entries = [
         {"id": "gpt-5.6-sol", "hidden": False, "supportedReasoningEfforts": [
             {"reasoningEffort": "low"}, {"reasoningEffort": "ultra"},
@@ -202,36 +202,45 @@ def test_catalog_offers_visible_plus_configured_hidden(tmp_path):
         {"model": "legacy-shape"},          # id-less shape still identifies
         {"garbage": True},                  # no identifier: ignored
     ]
-    backend = _client(tmp_path)._backend    # default codex.models: gpt-6-astra
+    backend = _client(tmp_path)._backend    # default codex.models: the tiers
     cat = backend.catalog(entries)
     assert cat["listed"] == [
         "gpt-5.6-sol", "gpt-6-astra", "internal-preview", "legacy-shape",
     ]
-    assert cat["offered"] == ["gpt-5.6-sol", "gpt-6-astra", "legacy-shape"]
+    # Config order; hidden Astra opted in by name; an entry the list does not
+    # name (visible or hidden) is not offered.
+    assert cat["offered"] == ["gpt-6-astra", "gpt-5.6-sol"]
     assert cat["hidden"] == ["gpt-6-astra", "internal-preview"]
-    assert cat["allowed"] == cat["listed"]
+    # The whole catalog, plus the configured models it does not serve.
+    assert cat["allowed"] == sorted({*cat["listed"], "gpt-5.6-terra", "gpt-5.6-luna"})
     assert cat["efforts"]["gpt-5.6-sol"] == ["low", "ultra"]
     assert cat["efforts"]["internal-preview"] == []
 
-    # A configured model the catalog does not serve is allowed, never offered.
+    # A configured model the catalog does not serve is allowed, never
+    # offered. codex.model is offered although the list does not name it.
     backend = _client(tmp_path, models=["gpt-6-astra", "gpt-7-preview"])._backend
     cat = backend.catalog(entries[:1])
     assert cat["offered"] == ["gpt-5.6-sol"]
     assert cat["allowed"] == ["gpt-5.6-sol", "gpt-6-astra", "gpt-7-preview"]
-    # models: [] opts out of every hidden entry.
-    cat = _client(tmp_path, models=[])._backend.catalog(entries)
+    # codex.model leads when the list does not name it.
+    cat = _client(tmp_path, models=["legacy-shape"])._backend.catalog(entries)
     assert cat["offered"] == ["gpt-5.6-sol", "legacy-shape"]
+    # models: [] offers only codex.model.
+    cat = _client(tmp_path, models=[])._backend.catalog(entries)
+    assert cat["offered"] == ["gpt-5.6-sol"]
     # An empty catalog lists nothing — callers then skip model validation.
     assert backend.catalog([])["listed"] == []
 
 
 def test_codex_models_config_parsing():
-    assert CodexConfig.from_dict({}).models == ["gpt-6-astra"]
-    assert CodexConfig.from_dict({"models": None}).models == ["gpt-6-astra"]
+    tiers = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+    assert CodexConfig.from_dict({}).models == tiers
+    assert CodexConfig().models == tiers
+    assert CodexConfig.from_dict({"models": None}).models == tiers
     assert CodexConfig.from_dict({"models": []}).models == []
     assert CodexConfig.from_dict({"models": "gpt-6-astra"}).models == ["gpt-6-astra"]
     assert CodexConfig.from_dict({"models": ["a", "a", " b ", ""]}).models == ["a", "b"]
-    assert CodexConfig.from_dict({"models": 42}).models == ["gpt-6-astra"]
+    assert CodexConfig.from_dict({"models": 42}).models == tiers
 
 
 def test_backend_notes_appended_to_developer_instructions(tmp_path):

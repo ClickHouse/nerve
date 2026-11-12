@@ -229,11 +229,11 @@ class CodexBackend:
     def catalog(self, entries: list[dict]) -> dict[str, Any]:
         """Digest a ``model/list`` (``includeHidden``) result.
 
-        ``offered`` feeds the picker: every visible entry plus the configured
-        ``codex.models`` the live catalog actually serves (hidden entries are
-        hidden upstream for a reason — internal previews, reviewers — so they
-        are opt-in by name). ``allowed`` is what a session may run on: the
-        whole catalog, hidden included, plus the configured models
+        ``offered`` feeds the model menu: the configured ``codex.models`` that
+        the live catalog serves, in config order, with ``codex.model`` first
+        when the list does not name it. Hidden entries count, because a
+        configured name opts in to them. ``allowed`` is what a session may run
+        on: the whole catalog, hidden included, plus the configured models
         unconditionally. ``efforts`` maps model id → advertised reasoning
         efforts, for clamping turn requests.
         """
@@ -249,9 +249,12 @@ class CodexBackend:
                 visible.append(model_id)
             efforts[model_id] = _supported_efforts(item)
         configured = [m for m in (self.codex.models or []) if m]
+        offered = [m for m in dict.fromkeys(configured) if m in all_ids]
+        if self.codex.model and self.codex.model not in offered:
+            offered.insert(0, self.codex.model)
         return {
             "listed": sorted(set(all_ids)),
-            "offered": sorted({*visible, *(m for m in configured if m in all_ids)}),
+            "offered": offered,
             "allowed": sorted({*all_ids, *configured}),
             "hidden": sorted(set(all_ids) - set(visible)),
             "efforts": efforts,
@@ -302,7 +305,12 @@ class CodexBackend:
         if model in allowed:
             return
         preflight = await self.preflight()
-        live = set(preflight.get("models") or []) if preflight.get("available") else set()
+        # The preflight fills ``_live_models`` with the whole catalog. The
+        # menu list (``models``) is only part of it.
+        live = (
+            {*(preflight.get("models") or []), *self._live_models}
+            if preflight.get("available") else set()
+        )
         if model in live:
             return
         detail = preflight.get("reason") if not preflight.get("available") else None
@@ -457,6 +465,7 @@ class CodexBackend:
                     ),
                     "account_type": account_type,
                     "models": model_ids or [self.codex.model],
+                    "catalog_models": catalog["listed"],
                     "hidden_models": catalog["hidden"],
                     "default_model": self.codex.model,
                     "rate_limits": self._rate_limits,

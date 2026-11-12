@@ -1,5 +1,5 @@
 /**
- * Display names and families for model ids.
+ * Display names and menu groups for model ids.
  *
  * The names come from the id alone, so they work for every model that a
  * backend lists. An id that matches no pattern shows as the id itself.
@@ -11,8 +11,11 @@ export interface ModelEntry {
   backend: string;
 }
 
-/** Models of one family, from one backend. A family never spans backends. */
-export interface ModelFamily {
+/**
+ * The models of one provider, from one backend: one top-level row of the
+ * model menu. A group never spans backends.
+ */
+export interface ModelGroup {
   key: string;
   label: string;
   backend: string;
@@ -39,47 +42,42 @@ export function modelLabel(id: string): string {
   return id;
 }
 
-const PROVIDER_FAMILIES: Record<string, string> = {
+const PROVIDER_LABELS: Record<string, string> = {
   anthropic: 'Claude',
-  openai: 'OpenAI',
+  openai: 'ChatGPT',
   ollama: 'Ollama (local)',
 };
 
-/** The family name: "Opus", "Sonnet", "GPT", or the provider for other ids. */
-export function modelFamily(model: ModelEntry): string {
-  const claude = model.id.match(/^claude-([a-z]+)-/);
-  if (claude) return cap(claude[1]);
-  if (/^gpt-/i.test(model.id)) return 'GPT';
-  return PROVIDER_FAMILIES[model.provider] ?? cap(model.provider);
+/** The menu name of a provider: "Claude", "ChatGPT", "Ollama (local)". */
+export function providerLabel(provider: string): string {
+  return PROVIDER_LABELS[provider] ?? cap(provider);
 }
 
-// Largest first. Families not named here follow, in the order of the list.
-const FAMILY_RANK = ['Opus', 'Sonnet', 'Haiku'];
+/** The key of the menu group that a model belongs to. */
+export const modelGroupKey = (model: ModelEntry) => `${model.backend}:${model.provider}`;
 
 /**
- * The models grouped by family. Families are in `backendOrder`, then in
- * FAMILY_RANK, then in the order of the list. Models keep the order of the
- * list, which the backends give newest first.
+ * The models grouped by provider. Groups are in `backendOrder`, then in the
+ * order of the list. Models keep the order of the list, which is the
+ * configured order.
  */
-export function groupModelFamilies(models: ModelEntry[], backendOrder: string[]): ModelFamily[] {
-  const families = new Map<string, ModelFamily>();
+export function groupModels(models: ModelEntry[], backendOrder: string[]): ModelGroup[] {
+  const groups = new Map<string, ModelGroup>();
   for (const model of models) {
-    const label = modelFamily(model);
-    const key = `${model.backend}:${label}`;
-    let family = families.get(key);
-    if (!family) {
-      family = { key, label, backend: model.backend, models: [] };
-      families.set(key, family);
+    const key = modelGroupKey(model);
+    let group = groups.get(key);
+    if (!group) {
+      group = { key, label: providerLabel(model.provider), backend: model.backend, models: [] };
+      groups.set(key, group);
     }
-    family.models.push(model);
+    group.models.push(model);
   }
-  const rank = (list: string[], value: string) => {
-    const i = list.indexOf(value);
-    return i === -1 ? list.length : i;
+  const rank = (value: string) => {
+    const i = backendOrder.indexOf(value);
+    return i === -1 ? backendOrder.length : i;
   };
-  const appearance = [...families.keys()];
-  return [...families.values()].sort((a, b) =>
-    rank(backendOrder, a.backend) - rank(backendOrder, b.backend)
-    || rank(FAMILY_RANK, a.label) - rank(FAMILY_RANK, b.label)
+  const appearance = [...groups.keys()];
+  return [...groups.values()].sort((a, b) =>
+    rank(a.backend) - rank(b.backend)
     || appearance.indexOf(a.key) - appearance.indexOf(b.key));
 }
