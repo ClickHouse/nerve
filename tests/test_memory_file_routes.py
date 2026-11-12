@@ -237,7 +237,7 @@ class TestMemoryFileRoutes:
                 future = pool.submit(managed_write)
                 assert started.wait(2)
                 assert not future.done()
-                assert path.read_text(encoding="utf-8") == "# Memory\\n"
+                assert path.read_text(encoding="utf-8") == "# Memory\n"
             future.result(timeout=5)
 
         assert path.read_text(encoding="utf-8") == "new agent note"
