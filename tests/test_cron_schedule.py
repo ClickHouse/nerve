@@ -364,6 +364,44 @@ async def test_a_job_whose_gate_forecasts_a_skip_is_passed_over(held):
 
 
 @pytest.mark.asyncio
+async def test_a_job_gated_on_activity_is_the_next_tick_only_after_the_agent_worked(held, db):
+    """A maintenance job with nothing to look after is not the next scheduled
+    task, so a platform that parks the machine does not wake it for the job.
+    Once the agent has worked it is, and after its run it is passed over again."""
+    now = datetime.now(UTC)
+    svc = await held(
+        [_job("tidy", run_if=[{"type": "agent_activity", "ignore_jobs": ["sweep"]}])], db=db,
+    )
+    _due(svc, "tidy", now + timedelta(minutes=10))
+
+    async def turn(session_id: str) -> None:
+        await db.create_session(session_id, source="test", actor=None)
+        await db.record_turn_usage(
+            session_id=session_id, input_tokens=1, output_tokens=1,
+            cache_creation=0, cache_read=0, max_context=200_000,
+        )
+
+    assert await svc.next_scheduled(now=now) is None
+    report = {j["id"]: j for j in (await svc.schedule_report())["jobs"]}
+    assert report["tidy"]["forecast"] == "skip"
+    assert report["tidy"]["reason"].startswith("gate 'agent_activity' not satisfied")
+
+    await turn("cron:sweep:20260102-030405-0a1b2c3d")  # another maintenance job ran
+    assert await svc.next_scheduled(now=now) is None
+
+    await turn("chat-1")
+    tick = await svc.next_scheduled(now=now)
+    assert (tick.name, tick.at) == ("tidy", now + timedelta(minutes=10))
+
+    # The job runs: its own turn, and a run on record that started after the chat.
+    await db.db.execute("UPDATE session_usage SET created_at = datetime('now', '-1 minute')")
+    await db.db.commit()
+    await db.log_cron_finish(await db.log_cron_start("tidy"), "success")
+    await turn("cron:tidy:20260102-040506-1b2c3d4e")
+    assert await svc.next_scheduled(now=now) is None
+
+
+@pytest.mark.asyncio
 async def test_a_source_runner_counts(held):
     now = datetime.now(UTC)
     svc = await held([_job("digest")], [_runner("mail")])

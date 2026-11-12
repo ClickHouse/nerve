@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent, type MouseEvent as ReactMouseEvent } from 'react';
 import { ArrowUp, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat, MoreHorizontal, Clock, ChevronRight } from '../ui/icons';
 import { Button, IconButton, TextField } from '../ui';
-import { useChatStore, EMPTY_REVIEW_LOOP, registerComposerFlush } from '../../stores/chatStore';
+import { useChatStore, EMPTY_REVIEW_LOOP, registerComposerFlush, daybreakPrograms, offersDaybreak } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { useAgentStore } from '../../stores/agentStore';
 import { useIsTouch } from '../../hooks/useMediaQuery';
@@ -11,6 +11,7 @@ import { randomUUID } from '../../utils/uuid';
 import { findSessionById } from '../../utils/findSession';
 import { FOCUS_COMPOSER_COMBO, formatCombo } from '../../utils/keyboard';
 import { PromptRewriteCard } from './PromptRewriteCard';
+import { DaybreakToggle } from './DaybreakToggle';
 import { ModelSelector } from './ModelSelector';
 import { ReviewLoopPanel } from './ReviewLoopPanel';
 import { QueuedMessages } from './agents/QueuedMessages';
@@ -175,10 +176,29 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
   // keeps its backend.
   const pickableModels = availableModels.filter(m => m.backend === activeBackend
     || (isVirtualChat && backendOptions.some(o => o.id === m.backend && o.available !== false)));
+
+  // ── Daybreak switch (per-chat, Codex only) ──
+  // Like the model: a virtual chat's switch lives in newChatDaybreak until
+  // the session is created; a real session's switch IS its row.
+  const newChatDaybreak = useChatStore(s => s.newChatDaybreak);
+  const setNewChatDaybreak = useChatStore(s => s.setNewChatDaybreak);
+  const setSessionDaybreak = useChatStore(s => s.setSessionDaybreak);
+  const daybreakModels = Object.keys(daybreakPrograms(backendOptions));
+  const daybreakOffered = offersDaybreak(backendOptions, currentModel);
+  const daybreakOn = isVirtualChat
+    ? newChatDaybreak && daybreakOffered
+    : activeSessionRow?.codex_daybreak === true;
+  const toggleDaybreak = (enabled: boolean) => {
+    if (isVirtualChat) setNewChatDaybreak(enabled);
+    else void setSessionDaybreak(activeSession, enabled);
+  };
+
   const pickModel = (backend: string, id: string) => {
     if (isVirtualChat) {
       if (backend !== activeBackend) setNewChatBackend(backend === backendDefault ? null : backend);
       setNewChatModel(backend, id === (modelDefaults[backend] ?? null) ? null : id);
+      // A new chat keeps Daybreak only on a model that offers it.
+      if (!offersDaybreak(backendOptions, id)) setNewChatDaybreak(false);
     } else if (backend === activeBackend) {
       void setSessionModel(activeSession, id);
     }
@@ -832,6 +852,20 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
                 title={liveAgents > 0
                   ? `Switching model restarts the runtime and would stop ${liveAgents} running agent${liveAgents === 1 ? '' : 's'}`
                   : 'Model for this chat (other chats keep theirs)'}
+              />
+            )}
+            {/* PER-CHAT Daybreak switch, for a Codex chat whose account has
+                Daybreak on some model. Like the model: a virtual chat binds
+                it at creation, a real session PATCHes its own row, and it
+                applies from the chat's next message. A chat that has it on
+                always shows it, so that it can be turned off. */}
+            {activeBackend === 'codex' && (daybreakModels.length > 0 || daybreakOn) && (
+              <DaybreakToggle
+                enabled={daybreakOn}
+                offered={daybreakOffered}
+                models={daybreakModels}
+                onToggle={toggleDaybreak}
+                disabled={disabled || isStreaming || rewriteActive}
               />
             )}
             {/* Prompt rewrite toggle, only on a fresh chat, where it applies */}

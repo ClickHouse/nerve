@@ -61,8 +61,10 @@ def test_the_constants_agree_with_each_other():
     assert DEFAULT_MODEL == "claude-opus-5-5"
     assert DEFAULT_TITLE_MODEL == DEFAULT_FAST_MODEL == "claude-haiku-5-5"
     assert DEFAULT_FALLBACK_MODEL == "claude-fable-5-2"
-    assert DEFAULT_CLAUDE_MODELS[0] == DEFAULT_MODEL
-    assert DEFAULT_CLAUDE_MODELS[1] == DEFAULT_FALLBACK_MODEL
+    # The built-in model menu: the newest model of each tier, largest first.
+    assert [m.split("-")[1] for m in DEFAULT_CLAUDE_MODELS] == ["fable", "opus", "sonnet", "haiku"]
+    assert DEFAULT_MODEL in DEFAULT_CLAUDE_MODELS
+    assert DEFAULT_FALLBACK_MODEL in DEFAULT_CLAUDE_MODELS
     assert len(set(DEFAULT_CLAUDE_MODELS)) == len(DEFAULT_CLAUDE_MODELS)
     for model_id in DEFAULT_CLAUDE_MODELS:
         assert _MODEL_LITERAL.match(model_id), model_id
@@ -78,7 +80,7 @@ def test_the_constants_agree_with_each_other():
         DEFAULT_RECALL_MODEL, DEFAULT_MEMORIZE_MODEL, DEFAULT_FAST_MODEL,
     )
     assert NerveConfig().agent.model == DEFAULT_MODEL
-    assert NerveConfig().selectable_claude_models()[0] == DEFAULT_MODEL
+    assert NerveConfig().selectable_claude_models() == list(DEFAULT_CLAUDE_MODELS)
 
 
 def test_the_constants_block_sits_at_the_top_of_config_py():

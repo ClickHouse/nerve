@@ -798,6 +798,20 @@ class TestGateSpecChecking:
         assert result.ok, result.errors
         assert result.warnings == []
 
+    def test_the_activity_gate_is_checked_in_full(self, tmp_path):
+        spec = {"type": "agent_activity", "ignore_jobs": ["weekly-cleanup"], "overlap_hours": 24}
+        result = self._run(tmp_path, [spec])
+        assert result.ok, result.errors
+        assert result.warnings == []
+
+        result = self._run(tmp_path, [{**spec, "overlap_hours": -1}])
+        assert not result.ok
+        assert any("overlap_hours" in e for e in result.errors)
+
+        # A misspelled field would take the default and count the job's runs.
+        result = self._run(tmp_path, [{"type": "agent_activity", "ignore_job": ["weekly-cleanup"]}])
+        assert any("ignore_job" in line and "ignore_jobs" in line for line in result.warnings)
+
     def test_spec_that_is_not_a_mapping_is_an_error(self, tmp_path):
         result = self._run(tmp_path, ["tasks"])
 

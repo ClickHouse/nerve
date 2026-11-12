@@ -538,30 +538,32 @@ the `reason` names the variable.
 
 ```json
 Response: {
-  "models": [{ "id": "claude-opus-5-5", "label": "Claude Opus 5.5", "family": "opus", "recommended": true },
-             { "id": "claude-fable-5-2", "label": "Claude Fable 5.2", "family": "fable", "recommended": false },
-             { "id": "claude-haiku-5-5", "label": "Claude Haiku 5.5", "family": "haiku", "recommended": false },
+  "models": [{ "id": "claude-fable-5-2", "label": "Claude Fable 5.2", "family": "fable", "recommended": false },
+             { "id": "claude-opus-5-5", "label": "Claude Opus 5.5", "family": "opus", "recommended": true },
              { "id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "family": "sonnet", "recommended": false },
-             { "id": "claude-fable-5-1", "label": "Claude Fable 5.1", "family": "fable", "recommended": false }],
+             { "id": "claude-haiku-5-5", "label": "Claude Haiku 5.5", "family": "haiku", "recommended": false }],
   "current": { "model": "claude-opus-5-5", "effort": "xhigh" },
   "efforts": ["max", "xhigh", "high", "medium", "low"],
-  "discovered": true,
+  "discovered": false,
   "default_model": "claude-opus-5-5"
 }
 ```
 
-The configured model comes first, then the catalogue as the Anthropic Models
-API orders it (newest first), nothing else; without discovery the built-in
-list applies. `family` is `fable`, `opus`, `sonnet`, `haiku` or `other`
-(`fable` is checked first); `recommended` marks the configured model;
+The list is the same as in the composer's model menu: `agent.models`, else
+the catalogue as the Anthropic Models API orders it (newest first) when
+`agent.model_discovery` is on, else the built-in list of the newest model of
+each tier. The configured model is put first when the list does not name it.
+`family` is `fable`, `opus`, `sonnet`, `haiku` or `other` (`fable` is checked
+first); `recommended` marks the configured model;
 `default_model` is Nerve's own default (`nerve.config.DEFAULT_MODEL`), so the
 page can say which entry it is even when this instance was changed to another
 model. On Bedrock the ids carry the geo prefix and `discovered` is `false`.
 
-The catalogue is cached per credential fingerprint (provider, base URL, key
-tail). A successful `POST /api/setup/provider/test` with an API key fetches
-the catalogue for that candidate key in the background, keyed by its
-fingerprint, so the picker is complete the moment the key is saved; a failure
+With discovery on, the catalogue is cached per credential fingerprint
+(provider, base URL, key tail). A successful `POST /api/setup/provider/test`
+with an API key fetches the catalogue for that candidate key in the
+background, keyed by its fingerprint, so the picker is complete the moment the
+key is saved; a failure
 recorded while no key was configured is never served for a configuration
 that now carries one.
 
@@ -1093,6 +1095,14 @@ Rows also carry `is_running` (the orchestrator's turn is in flight),
 `background_count` (how many). The two are independent: agents can run
 between turns. See [Sub-agents and background tasks](agents.md).
 
+The payloads of Codex sessions (`backend` is `codex`) carry `codex_daybreak`
+(boolean): the chat's Daybreak switch, see
+[Daybreak](config.md#daybreak-per-chat-switch). The payloads of other
+sessions do not have the key. `POST /api/sessions` takes
+`codex_daybreak: true` to create a Codex session with the switch on. It
+answers `400` when the session is not a Codex session, and when its model has
+no Daybreak program for the signed-in Codex account.
+
 #### `GET /api/sessions/{id}`
 Get session details.
 
@@ -1123,12 +1133,21 @@ session's pending questions; the notification rows stay. A turn never creates
 a deleted session again: a run in it is refused.
 
 #### `PATCH /api/sessions/{id}`
-Update `title`, `starred`, `model` or `parent_session_id`. A `model` change
-recreates the session's runtime, which would end its live background agents:
-while any run it answers `409` with
+Update `title`, `starred`, `model`, `parent_session_id` or `codex_daybreak`.
+A `model` change recreates the session's runtime, which would end its live
+background agents: while any run it answers `409` with
 `{"detail": {"code": "live_background_agents", "message": "…", "live": 2}}`.
 A `title` sets the session's `title_source` to `manual`, so Nerve no longer
 renames it on its own.
+
+`codex_daybreak` (boolean) sets the chat's Daybreak switch from its next
+message on. It answers `400` for a session that is not a Codex session, and
+for `true` when the session's model (the `model` of the same request, if
+any) has no Daybreak program for the signed-in Codex account; `503` for
+`true` while the Codex model catalog cannot be read. A `model` change to a
+model without a program turns the switch off: the response then has
+`codex_daybreak: false` and a `codex_daybreak_notice` sentence for the
+person.
 
 #### `POST /api/sessions/{id}/regenerate-title`
 Retitle the session with `agent.title_model` from its first request and its

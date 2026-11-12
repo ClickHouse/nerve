@@ -984,8 +984,8 @@ Backups follow the same rule:
 | `agent.model` | string | `claude-opus-5-5` | Primary model for conversations. The default (and every other default model id) is defined once, in the constants block at the top of `nerve/config.py` |
 | `agent.cron_model` | string | `claude-sonnet-5-5` | Model for cron jobs. The setup page's Model step sets it to the model you pick, so scheduled work runs on the chosen model; set a cheaper one here afterwards if you want it |
 | `agent.outcome_titles` | bool | `true` | Rename a session when the agent's answer to its first message ends (when that turn leaves background work running, the turn that settles it), with `agent.title_model`, from the first request and the agent's reply, in the style of titles people gave other sessions. A fork's first message renames it too, from what the fork does. A later message never does, nor is a session renamed that someone renamed; a first turn that fails or is stopped, a second message before it settles, or a restart in between leave the first title. Needs an API key, Bedrock or the proxy (a subscription token does not reach the API). `false` keeps the first-message title; the onboarding conversation asks about it. Hot: read when a first message arrives |
-| `agent.models` | list | `[]` | Claude models offered in the composer's model picker. `agent.model` always leads; entries extend the list. Empty → the discovered catalog (see `agent.model_discovery`), else a built-in current-generation list (opus / fable / sonnet / haiku); on Bedrock only configured models are offered |
-| `agent.model_discovery` | bool | `true` | Ask the Anthropic Models API (`GET /v1/models`) which models the configured credentials' catalog endpoint advertises, and offer those in the picker — so a newly released model needs no config edit. Catalog membership is not a serving guarantee (an advertised ID can still 404 on send; discovery runs no serving probe — see `agent.model_discovery_excluded_models`). Primed at gateway startup, cached in-process (6h) and refreshed in the background. Best-effort: ignored when `agent.models` is set, on Bedrock (the Bedrock client has no Models API), without an API key, or when the API is unreachable — the built-in list applies |
+| `agent.models` | list | `[]` | Claude models in the composer's model menu, in this order. `agent.model` is put first when the list does not name it. Empty: the whole catalog when `agent.model_discovery` is on, else the built-in list of the newest model of each tier (Fable, Opus, Sonnet, Haiku), which is updated with each release. On Bedrock only configured models are offered |
+| `agent.model_discovery` | bool | `false` | Ask the Anthropic Models API (`GET /v1/models`) which models the configured credentials' catalog endpoint advertises, and offer all of them in the menu instead of the built-in list. Catalog membership is not a serving guarantee (an advertised ID can still 404 on send; discovery runs no serving probe; see `agent.model_discovery_excluded_models`). Primed at gateway startup, cached in-process (6h) and refreshed in the background. Best-effort: ignored when `agent.models` is set, on Bedrock (the Bedrock client has no Models API), without an API key, or when the API is unreachable; the built-in list applies then |
 | `agent.model_discovery_excluded_models` | list | `[]` | Model-ID substrings pruned from **discovery** results before the picker sees them (case-insensitive; empty/whitespace patterns ignored). A proxy/provider catalog is not a serving guarantee — e.g. a retired ID that `GET /v1/models` still advertises but that 404s on send — so this drops such entries without a code change, and hot-reloads (read at pick time, not baked into the 6h discovery cache). Applied only to discovered entries: `agent.model` and an explicit `agent.models` list are never filtered, so naming a model in config overrides an exclusion. Excluding everything discovery returns just leaves the configured default (not a fallback to the built-in list) |
 | `agent.model_aliases` | map | `{opus: claude-opus-5-5, haiku: claude-haiku-5-5, fable: claude-fable-5-2}` | Alias → model ID remapping for the CLI (emitted as `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` env vars). Aliases (`opus`, `sonnet`, `haiku`, `fable`) used in Agent/Workflow tool model options, skill frontmatter, and cron overrides resolve to the mapped ID. Entries merge over the built-in `opus → claude-opus-5-5`, `haiku → claude-haiku-5-5` and `fable → claude-fable-5-2` defaults (the `agent.model` and `memory.fast_model` defaults and the picker's second built-in entry; not applied on Bedrock — set geo-prefixed IDs explicitly there); `""` unsets an alias. The CLI also uses the `haiku` model for its background calls unless `ANTHROPIC_SMALL_FAST_MODEL` is set |
 | `agent.max_turns` | int | `1000` | Max agentic turns (model ↔ tool round-trips) per request on the Claude backend; a request that reaches it fails with "Reached maximum number of turns (N)". A last-resort stop for a looping agent, not a budget — real work routinely passes 50 and 100. `0` = no cap (the CLI gets no `--max-turns` flag). Read when a session's CLI client is built, so a changed value applies to new sessions, and to existing ones once their client is rebuilt |
@@ -1032,7 +1032,7 @@ codex:                     # active when a codex backend is selected
   home_dir: ~/.nerve/codex # isolated CODEX_HOME (auth, config, sessions)
   model: gpt-5.6-sol
   cron_model: null         # null → model
-  models: [gpt-6-astra]    # hidden catalog entries to offer when the account serves them
+  models: [gpt-6-astra, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna]  # the model menu, in order; each shows when the account serves it
   auth: chatgpt            # chatgpt | api_key
   api_key: null            # config.local.yaml; or api_key_env: OPENAI_API_KEY
   base_url: ""             # OpenAI-compatible Responses endpoint; empty → Codex's own provider
@@ -1058,6 +1058,13 @@ codex:                     # active when a codex backend is selected
     default_token_budget: 250000 # default and maximum per workflow
     max_agents: 8               # lifetime worker cap per workflow
 ```
+
+`codex.models` lists the OpenAI models of the composer's model menu, in this
+order. The menu shows a model only when the Codex catalog of the account
+serves it, hidden entries included. `codex.model` is put first when the list
+does not name it. Every model in the list is also accepted as a session
+model. Unset: the newest model of each tier. `[]`: only `codex.model`.
+`nerve codex doctor` lists the catalog models that the list does not name.
 
 `codex.ultracode.dashboard` exposes run journals in Nerve's authenticated UI.
 It does not start Ultracode's detached dashboard process. Keep
@@ -1141,6 +1148,85 @@ notes rather than silently dropped. With the
 default `approval_policy: never` + full-access sandbox, codex sessions
 behave like claude's auto-approved tools; tightening the policy surfaces
 Approve/Decline cards in the web UI.
+
+### Daybreak (per-chat switch)
+
+Daybreak is Codex's account-gated cyber access program. It is not a model: a
+client asks for it per turn, and Codex decides whether the signed-in account
+may use it. Nerve has one switch per chat for it. There is no config key and
+no global setting, and the switch is off unless a person turns it on.
+
+- **Where it shows.** The composer of a Codex chat has a **Daybreak** toggle
+  next to the model menu when the Codex model catalog lists a Daybreak
+  program for the signed-in account on at least one model. An older Codex
+  lists no access programs, and an account without Daybreak has none: both
+  see no toggle. On a model without a program the toggle is greyed out and
+  names the models that have one.
+- **Off.** Nerve sends to Codex what it sent before the switch existed.
+- **On.** Each turn of the chat asks for the program of the chat's model
+  (`cyberAccessProgram` on `turn/start`: `daybreakBlue`, or `daybreakRed` for
+  a model that lists only that one). A change applies from the chat's next
+  message, without a new runtime. Nerve logs one line per turn that it sends
+  with a program: the session, the model and the program.
+- **No program.** When the switch is on and the model has no program at that
+  time (the access ended, another account is signed in), Nerve does not send
+  the turn. The turn ends as failed: the error names the model and says to
+  turn Daybreak off or to choose another model. Nerve never runs such a turn
+  without the program.
+- **Model change.** A change to a model without a program turns the switch
+  off, and the chat says so.
+- **Refusals.** When Codex refuses a turn under its cyber policy in a chat
+  that has the switch off and a model with a program, the error says that
+  Daybreak can be turned on.
+- **Ultracode workers** follow the chat. For a worker of the `exec`
+  transport the worker wrapper adds `--cyber-access-program` for the
+  worker's model, and it gives a worker that names no model the chat's
+  model. It does not start a worker that would run without the program: the
+  worker's model has none, the installed Codex cannot pass the program to
+  workers (see the versions below), or the worker's command has options
+  before `exec`. Such a worker ends with an error that says why. A worker of
+  the `app-server` transport takes its turns over its own connection, where
+  the wrapper cannot add the program, so the wrapper does not start it
+  either: Ultracode then runs that worker on `exec`, unless the run set
+  `transport_strict`.
+- **Storage and API.** The switch is the session metadata key
+  `codex_daybreak` (absent: off). `POST /api/sessions` and
+  `PATCH /api/sessions/{id}` take `codex_daybreak`, see
+  [api.md](api.md#sessions). `GET /api/models` lists the program of each
+  offered model in `daybreak_programs` of the Codex backend option.
+
+Codex can also save the choice on its thread (`daybreakEnabled`), where its
+own helper agents read it. Nerve sends it when the catalog lists access
+programs: at `thread/start` of a chat that has the switch on, when the
+switch changes on a live thread, and after a resume or a fork when the
+choice that the thread has saved differs from the chat's switch (the switch
+went off while the chat had no runtime, or the thread is a fork of a chat
+that has it on). While the switch is off, a thread that has not saved `true`
+gets no such request. This save selects no turn's program, and a failure of
+it changes nothing else.
+
+Codex versions:
+
+- The model catalog lists access programs from Codex 0.156.0. An older Codex
+  shows no toggle.
+- `codex exec` takes `--cyber-access-program` from Codex 0.161.0. On Codex
+  0.156.0 to 0.160.x a chat can have Daybreak on and its turns run with the
+  program, but its `exec` workers are not started: their error says to turn
+  Daybreak off or to update Codex.
+
+Known limits:
+
+- A model named for one message (`model` on a WebSocket `message`) does not
+  turn the switch off. When that model has no program, the turn is refused,
+  as under "No program".
+- Availability follows the latest listing of the catalog. A listing without
+  access-program metadata hides the toggle until the next listing that has
+  it.
+- Other open tabs show a change of the switch after their sessions reload.
+- "Run later" from a new chat on the default backend creates the deferred
+  chat on that backend's default model, not on the model picked in the
+  composer. The switch goes with the prompt only when that default model has
+  a program.
 
 ## Gateway
 

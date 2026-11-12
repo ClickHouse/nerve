@@ -522,12 +522,12 @@ async def lifespan(app: FastAPI):
         # Wire up routes
         init_deps(_engine, db)
 
-        # Prime the Anthropic model catalog so the composer's model picker
-        # offers every model these credentials can reach (instead of a built-in
-        # list that goes stale on each release). Off the critical path and
-        # best-effort: until it lands — or if it fails — the picker falls back
-        # to the configured/built-in list. Runs after the proxy is up, since
-        # discovery goes through it when proxy.enabled.
+        # With agent.model_discovery on, prime the Anthropic model catalog so
+        # the composer's model menu offers every model these credentials can
+        # reach. Off the critical path and best-effort: until it lands, or if
+        # it fails, the menu falls back to the configured/built-in list. Runs
+        # after the proxy is up, since discovery goes through it when
+        # proxy.enabled.
         models_prime_task = None
         if config.agent.model_discovery:
             from nerve import models_catalog

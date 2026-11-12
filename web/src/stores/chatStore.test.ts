@@ -709,6 +709,20 @@ describe('switching sessions', () => {
     expect(useAgentStore.getState().agents).toEqual({});
     expect(api.getSessionAgents).toHaveBeenCalledWith('s-next');
   });
+
+  it('drops the Daybreak switch of an untouched new chat that is left', async () => {
+    // The switch belongs to the unsent chat: the next new chat starts off.
+    useChatStore.setState({
+      sessions: [], messages: [], drafts: {}, newChatReviewLoop: null,
+      activeSession: 'v-1', virtualSession: { id: 'v-1', title: '', source: 'web', updated_at: '' },
+      newChatDaybreak: true,
+    });
+
+    await useChatStore.getState().switchSession('s-next');
+
+    expect(useChatStore.getState().virtualSession).toBeNull();
+    expect(useChatStore.getState().newChatDaybreak).toBe(false);
+  });
 });
 
 describe('archiving a session with running agents', () => {

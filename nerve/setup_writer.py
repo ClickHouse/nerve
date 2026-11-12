@@ -1352,6 +1352,60 @@ def _cron_description(cron: dict[str, Any], memory_backend: str) -> str:
     return cron["description"]
 
 
+# The built-in jobs that look after the agent's own work. A run of one is no
+# reason for another to run, so the default gates below leave them all out.
+MAINTENANCE_CRON_IDS = (
+    "memory-maintenance", "skill-extractor", "skill-reviser", "machine-maintenance",
+)
+
+
+def _other_maintenance_crons(job_id: str) -> list[str]:
+    """The maintenance jobs besides *job_id*, whose own runs never count."""
+    return [cron_id for cron_id in MAINTENANCE_CRON_IDS if cron_id != job_id]
+
+
+# Run gates that a built-in job has without ``system.yaml`` stating them: the
+# scheduler gives them to an entry of the job that has no ``run_if``
+# (:func:`default_run_if`). Unlike the gates of inbox-processor and
+# task-planner, they are not written into the file:
+#
+# * nothing writes ``system.yaml`` again when Nerve is updated, so a gate
+#   written there never changes, and an install from before it never has it;
+# * a Nerve that predates a gate type refuses a job that names it, so a file
+#   with the gate could not go back to the release before.
+_DEFAULT_RUN_IF: dict[str, list[dict[str, Any]]] = {
+    # Nothing to clean up while the agent has done nothing since the last
+    # run. The prompt reviews the records of the day before the run, so what
+    # the agent did shortly before a run is left to the next one: with the
+    # overlap, the job runs at its next two times after the last activity.
+    "memory-maintenance": [{
+        "type": "agent_activity",
+        "ignore_jobs": _other_maintenance_crons("memory-maintenance"),
+        "overlap_hours": 24,
+    }],
+    # Recent activity is all the job looks at: no run while there was none.
+    "skill-extractor": [{
+        "type": "agent_activity",
+        "ignore_jobs": _other_maintenance_crons("skill-extractor"),
+    }],
+}
+
+
+def default_run_if(job_id: str, memory_backend: str) -> list[dict[str, Any]]:
+    """The run gates of a built-in job whose ``system.yaml`` entry states
+    none, as the caller's own copy; empty for a job that has no default.
+
+    Under Loom, ``memory-maintenance`` checks the namespace as it is, not the
+    records of one day, so its gate has no overlap. What reaches Loom after a
+    check waits for the job's next run, after the agent has worked again.
+    """
+    specs = copy.deepcopy(_DEFAULT_RUN_IF.get(job_id, []))
+    if memory_backend == "loom" and job_id == "memory-maintenance":
+        for spec in specs:
+            spec.pop("overlap_hours", None)
+    return specs
+
+
 def loom_wording_of_shipped_job(
     job_id: str, prompt: str, description: str,
 ) -> tuple[str, str] | None:

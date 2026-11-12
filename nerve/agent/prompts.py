@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from nerve.agent.sessions import INTERACTIVE_SOURCES
 from nerve.agent.tools import build_default_registry
 from nerve.memory import loom_prompts
 from nerve.onboarding_catalog import (
@@ -1084,6 +1085,36 @@ def rendering_note(source: str) -> str:
     return RICH_RENDERING_NOTE if source in RENDERING_SOURCES else TEXT_RENDERING_NOTE
 
 
+# Tells the agent to offer a cron job for work the person will probably want
+# again. Only sessions that a person chats in get it (INTERACTIVE_SOURCES, by
+# the session's own surface as for the "Rendering" line): a cron, hook or
+# workflow session has no person to answer the offer. Static per source, so
+# the prompt cache keeps working.
+AUTOMATION_OFFER_SECTION = """\
+# Offer to automate
+
+Many people do not know that you can do work on a schedule, or how to set it \
+up. When a person asks for work that they will probably want again, and no \
+cron job does it yet, offer to do it for them on a schedule.
+
+- Signs: a check, a digest, a report, a reminder or a cleanup; words such as \
+"again", "every", "each time" or "as usual"; the same request on earlier days.
+- Do the work first. Then make the offer as the last line of your reply: one \
+yes/no question with a specific schedule and what you will send, for example \
+"Do you want me to do this every Monday at 9:00 and send you the summary?"
+- Make at most one offer in a conversation. Do not offer for one-time work, \
+when a cron job already does the work (check the cron jobs first), or when \
+the person said that they do not want these offers. When they say that, \
+write it in `USER.md` (in `MEMORY.md` if you cannot change `USER.md`), so \
+that later sessions see it.
+- Create the cron job only after a yes (the `nerve-workspace` skill has the \
+steps). The reply of a cron run goes only to the cron log, so the job prompt \
+must tell the job to send the result with `notify`. After a direct edit of \
+the job file, run `nerve reload`: without it the job does not run until a \
+restart. If you proposed the job as a pull request, it starts after the \
+merge. Then tell the person the job id, its schedule and how to stop it."""
+
+
 def build_system_prompt(
     workspace: Path,
     session_id: str = "",
@@ -1106,10 +1137,11 @@ def build_system_prompt(
     ``config_dir`` follows ``TOOLS.md`` (see :func:`_read_platform_notes`).
 
     ``rendering_source`` is the source the session is *read* on, for the
-    context block's "Rendering" line (:func:`rendering_note`); it defaults
-    to ``source``. The two differ when a turn's origin is not the session's
-    surface — a scheduled wakeup (``source="wakeup"``) of a web session is
-    still read in the web chat.
+    context block's "Rendering" line (:func:`rendering_note`) and for the
+    automation offer (:data:`AUTOMATION_OFFER_SECTION`, only where a person
+    chats); it defaults to ``source``. The two differ when a turn's origin
+    is not the session's surface: a scheduled wakeup (``source="wakeup"``)
+    of a web session is still read in the web chat.
 
     ``static=True`` (default) renders a prompt that is byte-identical for
     every session of the same workspace, source and tool set: the
@@ -1205,6 +1237,9 @@ You have access to the following custom tools:
         parts.append(
             loom_prompts.SYSTEM_PROMPT_SECTION if memory_tools else loom_prompts.NO_TOOLS_SECTION,
         )
+
+    if (rendering_source or source) in INTERACTIVE_SOURCES:
+        parts.append(AUTOMATION_OFFER_SECTION)
 
     # Skills summary (progressive disclosure level 1: name + description only)
     skills_section = _format_skills_list(skill_summaries)
