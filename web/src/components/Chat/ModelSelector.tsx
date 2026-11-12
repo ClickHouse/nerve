@@ -1,15 +1,17 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Button, IconButton } from '../ui';
 import { Check, ChevronDown, ChevronRight, Sparkle, SquareTerminal, Star } from '../ui/icons';
-import { groupModelFamilies, modelFamily, modelLabel, type ModelEntry } from '../../utils/modelNames';
+import { groupModels, modelGroupKey, modelLabel, providerLabel, type ModelEntry } from '../../utils/modelNames';
 import { starKey, useStarredModels } from '../../stores/starredModelsStore';
 
 /**
  * The composer's model menu. One control picks the model and, in a new chat,
- * the agent backend with it: each family (Opus, Sonnet, GPT, ...) belongs to
- * one backend. Starred models come first, then the families as submenus.
+ * the agent backend with it. The top level has one row per provider (Claude,
+ * ChatGPT, Ollama), and each belongs to one backend. A provider opens a
+ * submenu with its models, in the configured order. Starred models, when
+ * there are any, come first.
  *
- * On a wide screen a family opens to the right of the menu. On a phone it
+ * On a wide screen a provider opens to the right of the menu. On a phone it
  * opens in place, under its row, because two columns do not fit.
  *
  * The popup is a disclosure of ordinary buttons (no ARIA menu roles), the
@@ -26,6 +28,13 @@ export interface BackendChoice {
 const BACKEND_ICONS: Record<string, { icon: typeof Sparkle; color: string }> = {
   claude: { icon: Sparkle, color: 'text-hue-orange' },
   codex: { icon: SquareTerminal, color: 'text-hue-teal' },
+};
+
+// The provider of a backend's own models. Its name is the backend's name in
+// this menu: "ChatGPT" for the Codex backend.
+const BACKEND_PROVIDERS: Record<string, string> = {
+  claude: 'anthropic',
+  codex: 'openai',
 };
 
 function BackendIcon({ backend }: { backend: string }) {
@@ -58,18 +67,18 @@ export function ModelSelector({
   onPick: (backend: string, id: string) => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [openFamily, setOpenFamily] = useState<string | null>(null);
+  const [openGroup, setOpenGroup] = useState<string | null>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const starred = useStarredModels(s => s.starred);
   const toggleStar = useStarredModels(s => s.toggle);
 
-  const families = useMemo(
-    () => groupModelFamilies(models, backends.map(b => b.id)),
+  const groups = useMemo(
+    () => groupModels(models, backends.map(b => b.id)),
     [models, backends],
   );
   // A backend that fails its preflight lists no models, so it has no
-  // family. It gets a greyed-out row of its own that says why.
+  // group. It gets a greyed-out row of its own that says why.
   const unavailable = useMemo(
     () => backends.filter(b => b.available === false && !models.some(m => m.backend === b.id)),
     [backends, models],
@@ -81,10 +90,15 @@ export function ModelSelector({
     [starred, models],
   );
 
+  const backendName = (backend: string) => {
+    const provider = BACKEND_PROVIDERS[backend];
+    return provider ? providerLabel(provider) : (backends.find(b => b.id === backend)?.label ?? backend);
+  };
+
   /** Why a backend's models cannot be picked here, or null when they can. */
   const blocker = (backend: string): { note: string; why: string } | null => {
     if (backend === activeBackend) return null;
-    const label = backends.find(b => b.id === backend)?.label ?? backend;
+    const label = backendName(backend);
     if (backendFixed) {
       return { note: 'New chat', why: `${label} models are for a new chat. The agent backend is fixed once the conversation starts.` };
     }
@@ -119,9 +133,9 @@ export function ModelSelector({
 
   const toggleMenu = () => {
     if (!open) {
-      // Open on the family of the current model, so its neighbours show.
+      // Open on the provider of the current model, so its neighbours show.
       const current = models.find(m => m.id === currentModel && m.backend === activeBackend);
-      setOpenFamily(current ? `${current.backend}:${modelFamily(current)}` : null);
+      setOpenGroup(current ? modelGroupKey(current) : null);
     }
     setOpen(v => !v);
   };
@@ -131,7 +145,7 @@ export function ModelSelector({
     onPick(model.backend, model.id);
   };
 
-  // Starred rows name their backend: they mix the families of both.
+  // Starred rows name their backend: they mix the models of all providers.
   const row = (model: ModelEntry, keyPrefix: string, showBackend = false) => {
     const label = modelLabel(model.id);
     const isStarred = starred.includes(starKey(model.backend, model.id));
@@ -189,34 +203,35 @@ export function ModelSelector({
       </button>
 
       {open && (
-        // On a phone the families open in place, so this list can grow
+        // On a phone the providers open in place, so this list can grow
         // past the screen and scrolls. On a wide screen it must not clip:
-        // the families open beside it.
+        // the providers open beside it.
         <div className="absolute left-0 bottom-full mb-1 z-50 w-64 max-h-[60vh] overflow-y-auto md:max-h-none md:overflow-visible bg-surface-raised border border-border-subtle rounded-lg shadow-xl py-1">
-          <div className="px-3 pt-1 pb-0.5 text-2xs font-medium uppercase tracking-wider text-text-muted">Starred</div>
-          {starredModels.length > 0
-            ? starredModels.map(m => row(m, 'starred:', true))
-            : <div className="px-3 py-1.5 text-xs text-text-muted">Star a model to keep it here.</div>}
+          {starredModels.length > 0 && (
+            <>
+              <div className="px-3 pt-1 pb-0.5 text-2xs font-medium uppercase tracking-wider text-text-muted">Starred</div>
+              {starredModels.map(m => row(m, 'starred:', true))}
+              <div className="my-1 border-t border-border" />
+            </>
+          )}
 
-          <div className="my-1 border-t border-border" />
-
-          {families.map(family => {
-            const blocked = blocker(family.backend);
-            const isOpen = openFamily === family.key;
+          {groups.map(group => {
+            const blocked = blocker(group.backend);
+            const isOpen = openGroup === group.key;
             return (
-              <div key={family.key} className="relative">
+              <div key={group.key} className="relative">
                 <Button
                   variant="subtle"
                   size="sm"
                   fullWidth
-                  onClick={() => setOpenFamily(isOpen ? null : family.key)}
+                  onClick={() => setOpenGroup(isOpen ? null : group.key)}
                   aria-expanded={isOpen}
                   title={blocked?.why}
                   className="justify-between gap-2.5 px-3 py-1.5 rounded-none text-left"
                 >
                   <span className="flex items-center gap-2.5 min-w-0">
-                    <BackendIcon backend={family.backend} />
-                    <span className="truncate">{family.label}</span>
+                    <BackendIcon backend={group.backend} />
+                    <span className="truncate">{group.label}</span>
                   </span>
                   {' '}
                   <span className="flex items-center gap-1.5 shrink-0">
@@ -230,14 +245,14 @@ export function ModelSelector({
                 </Button>
                 {isOpen && (
                   <div className="pl-4 md:pl-0 md:absolute md:left-full md:bottom-0 md:ml-1 md:w-60 md:max-h-[60vh] md:overflow-y-auto md:bg-surface-raised md:border md:border-border-subtle md:rounded-lg md:shadow-xl md:py-1">
-                    {family.models.map(m => row(m, `${family.key}:`))}
+                    {group.models.map(m => row(m, `${group.key}:`))}
                   </div>
                 )}
               </div>
             );
           })}
 
-          {/* Greyed out like a family that cannot open; the tooltip says
+          {/* Greyed out like a provider that cannot open; the tooltip says
               why. `aria-disabled` rather than `disabled`, so that the row
               still gets the pointer and focus that show the tooltip. */}
           {unavailable.map(backend => (
@@ -247,12 +262,12 @@ export function ModelSelector({
               size="sm"
               fullWidth
               aria-disabled="true"
-              title={`${backend.label} unavailable: ${backend.reason ?? 'preflight failed'}`}
+              title={`${backendName(backend.id)} unavailable: ${backend.reason ?? 'preflight failed'}`}
               className="justify-between gap-2.5 px-3 py-1.5 rounded-none text-left opacity-50 cursor-not-allowed hover:text-text-secondary hover:bg-transparent"
             >
               <span className="flex items-center gap-2.5 min-w-0">
                 <BackendIcon backend={backend.id} />
-                <span className="truncate">{backend.label}</span>
+                <span className="truncate">{backendName(backend.id)}</span>
               </span>
               {' '}
               <span className="flex items-center gap-1.5 shrink-0">

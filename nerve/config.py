@@ -42,16 +42,16 @@ DEFAULT_TITLE_MODEL = "claude-haiku-5-5"        # agent.title_model
 DEFAULT_RECALL_MODEL = "claude-sonnet-5-5"      # memory.recall_model
 DEFAULT_MEMORIZE_MODEL = "claude-sonnet-5-5"    # memory.memorize_model
 DEFAULT_FAST_MODEL = "claude-haiku-5-5"         # memory.fast_model; also the CLI's ``haiku`` alias
-DEFAULT_FALLBACK_MODEL = "claude-fable-5-2"     # second entry of the built-in picker list; also the CLI's ``fable`` alias
+DEFAULT_FALLBACK_MODEL = "claude-fable-5-2"     # Fable entry of the built-in model menu; also the CLI's ``fable`` alias
 DEFAULT_EFFORT = "xhigh"                        # agent.effort (conversations); max is slower for no real gain on the 5.5 models
 
-# Fallback for the composer's Claude model picker when ``agent.models`` is
-# unset and live discovery is off or unavailable (see nerve/models_catalog.py)
-# — the current generation, the configured default first. Bare Anthropic API
-# IDs: they do not apply on Bedrock, where model IDs are region-prefixed.
+# The Claude models of the composer's model menu when ``agent.models`` is
+# unset: the newest model of each tier, largest first. Update it when a tier
+# gets a new model. Bare Anthropic API IDs: they do not apply on Bedrock, where
+# model IDs are region-prefixed.
 DEFAULT_CLAUDE_MODELS: tuple[str, ...] = (
-    DEFAULT_MODEL,
     DEFAULT_FALLBACK_MODEL,
+    DEFAULT_MODEL,
     "claude-sonnet-5-5",
     "claude-haiku-5-5",
 )
@@ -1103,25 +1103,24 @@ class AgentConfig:
     # defaults, and an empty value ("") unsets one (falls back to the CLI's
     # built-in mapping).
     model_aliases: dict[str, str] = field(default_factory=dict)
-    # Claude models selectable in the web composer's model picker
-    # (GET /api/models). The configured `model` above is always offered
-    # first; entries here extend the list (order-preserving, deduped).
-    # Empty → the models the configured credentials actually expose, read
-    # from the Anthropic Models API (see `model_discovery` below), falling
-    # back to a built-in current-generation list (DEFAULT_CLAUDE_MODELS).
+    # Claude models in the web composer's model menu (GET /api/models), in
+    # this order (deduped). The configured `model` above is put first when
+    # the list does not name it, so the menu always offers it.
+    # Empty → the whole catalog when `model_discovery` below is on, else the
+    # built-in list of the newest model of each tier (DEFAULT_CLAUDE_MODELS).
     # On Bedrock only the models named in config are offered (Bedrock IDs
     # are region-prefixed, so neither discovery nor the bare built-ins
     # resolve there).
     models: list[str] = field(default_factory=list)
     # Ask the Anthropic Models API (GET /v1/models) which models the
-    # configured credentials' catalog endpoint advertises, and offer those in
-    # the picker, so a newly released model needs no code change or config
-    # edit. Catalog membership is not a serving guarantee — an advertised ID
-    # can still fail on send, and discovery runs no serving probe (see
-    # `model_discovery_excluded_models` to prune such entries). Best-effort:
-    # ignored when `models` above is set explicitly, on Bedrock, without an
-    # API key, or when the API is unreachable — the built-in list applies.
-    model_discovery: bool = True
+    # configured credentials' catalog endpoint advertises, and offer all of
+    # them in the menu instead of the built-in list. Catalog membership is
+    # not a serving guarantee: an advertised ID can still fail on send, and
+    # discovery runs no serving probe (see `model_discovery_excluded_models`
+    # to prune such entries). Best-effort: ignored when `models` above is
+    # set explicitly, on Bedrock, without an API key, or when the API is
+    # unreachable; the built-in list applies then.
+    model_discovery: bool = False
     # Case-insensitive model-ID substrings pruned from the discovered catalog
     # before it reaches the picker (empty/whitespace patterns ignored). A
     # catalog advertising a model is not a serving guarantee — an advertised ID
@@ -1238,7 +1237,7 @@ class AgentConfig:
                 for k, v in (d.get("model_aliases") or {}).items()
             },
             models=_str_list(d.get("models"), clean=True),
-            model_discovery=d.get("model_discovery", True),
+            model_discovery=d.get("model_discovery", False),
             model_discovery_excluded_models=_str_list(
                 d.get("model_discovery_excluded_models")
             ),
@@ -3491,15 +3490,21 @@ _DEFAULT_CODEX_PRICING: dict[str, dict[str, float]] = {
     "gpt-5.6-luna":   {"input": 1.0,  "cached_input": 0.1,  "output": 6.0},
 }
 
-# Catalog entries the app-server hides from its default ``model/list``
-# (served only with ``includeHidden``) that Nerve still offers in the
-# picker when the authenticated account can reach them. GPT-6 Astra is
-# hidden upstream on purpose (API-key accounts; codex-cli 0.153.1+).
-_DEFAULT_CODEX_MODELS: tuple[str, ...] = ("gpt-6-astra",)
+# The OpenAI models of the composer's model menu when ``codex.models`` is
+# unset: the newest model of each tier, largest first. Update it when a tier
+# gets a new model. A model shows only when the account's catalog serves it,
+# hidden entries included: GPT-6 Astra is hidden upstream on purpose
+# (API-key accounts; codex-cli 0.153.1+).
+_DEFAULT_CODEX_MODELS: tuple[str, ...] = (
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+)
 
 
 def _codex_models(raw: Any) -> list[str]:
-    """``codex.models``: unset → built-in list; ``[]`` → offer none."""
+    """``codex.models``: unset → built-in list; ``[]`` → only ``codex.model``."""
     if raw is None:
         return list(_DEFAULT_CODEX_MODELS)
     if isinstance(raw, str):
@@ -3587,10 +3592,11 @@ class CodexConfig:
     home_dir: str = field(default_factory=lambda: str(paths.nerve_path("codex")))  # isolated CODEX_HOME (auth/config/sessions)
     model: str = "gpt-5.6-sol"
     cron_model: str = ""                    # empty → model
-    # Hidden catalog models to offer next to the visible ``model/list``
-    # (only when the live catalog serves them). Any model named here is
-    # also always accepted as a session model — the app-server stays the
-    # authority on whether a turn on it succeeds.
+    # OpenAI models in the web composer's model menu, in this order. Each
+    # shows only when the live catalog serves it (hidden entries included).
+    # ``model`` above is put first when the list does not name it. Any model
+    # named here is also always accepted as a session model: the app-server
+    # stays the authority on whether a turn on it succeeds.
     models: list[str] = field(default_factory=lambda: list(_DEFAULT_CODEX_MODELS))
     auth: str = "chatgpt"                   # chatgpt | api_key
     api_key: str = ""                       # literal key (config.local.yaml)
@@ -4207,31 +4213,34 @@ class NerveConfig:
     def selectable_claude_models(
         self, discovered: list[str] | None = None,
     ) -> list[str]:
-        """Selectable Claude chat models for the composer's model picker.
+        """Selectable Claude chat models for the composer's model menu.
 
-        The configured default (``agent.model``) always leads; the rest come
-        from the first source that has anything to say:
+        The list comes from the first source that has anything to say:
 
-        1. ``agent.models`` — an explicit list always wins,
-        2. *discovered* — what the Anthropic Models API catalog advertises for
-           the configured credentials (see :mod:`nerve.models_catalog`; catalog
-           membership does not validate servability), minus any entry matching
+        1. ``agent.models``: an explicit list always wins,
+        2. *discovered*, only when ``agent.model_discovery`` is on: what the
+           Anthropic Models API catalog advertises for the configured
+           credentials (see :mod:`nerve.models_catalog`; catalog membership
+           does not validate servability), minus any entry matching
            ``agent.model_discovery_excluded_models``,
         3. the built-in :data:`DEFAULT_CLAUDE_MODELS` list.
 
+        The list keeps its order. The configured default (``agent.model``) is
+        put first when the list does not name it, so it is always offered.
+
         Bedrock model IDs are region-prefixed, so neither discovery nor the
-        bare built-ins apply there — Bedrock offers only configured models.
+        bare built-ins apply there. Bedrock offers only configured models.
 
         Exclusions apply at pick time to the *discovered* branch only, so a
         hot-reloaded pattern re-filters the cached catalog with no refetch, and
         the configured default / an explicit ``agent.models`` list are never
         filtered. If every discovered entry is excluded the result is just the
-        configured default — not a discovery failure, so it does not fall
-        through to the built-in list and re-introduce an excluded ID.
+        configured default. That is not a discovery failure, so it does not
+        fall through to the built-in list and re-introduce an excluded ID.
         """
         if self.agent.models:
             extras = list(self.agent.models)
-        elif discovered:
+        elif discovered and self.agent.model_discovery:
             extras = [
                 m for m in discovered
                 if not self.agent.is_model_discovery_excluded(m)
@@ -4242,9 +4251,11 @@ class NerveConfig:
             extras = list(DEFAULT_CLAUDE_MODELS)
 
         ordered: list[str] = []
-        for m in (self.agent.model, *extras):
+        for m in extras:
             if m and m not in ordered:
                 ordered.append(m)
+        if self.agent.model and self.agent.model not in ordered:
+            ordered.insert(0, self.agent.model)
         return ordered
 
     @property

@@ -538,30 +538,32 @@ the `reason` names the variable.
 
 ```json
 Response: {
-  "models": [{ "id": "claude-opus-5-5", "label": "Claude Opus 5.5", "family": "opus", "recommended": true },
-             { "id": "claude-fable-5-2", "label": "Claude Fable 5.2", "family": "fable", "recommended": false },
-             { "id": "claude-haiku-5-5", "label": "Claude Haiku 5.5", "family": "haiku", "recommended": false },
+  "models": [{ "id": "claude-fable-5-2", "label": "Claude Fable 5.2", "family": "fable", "recommended": false },
+             { "id": "claude-opus-5-5", "label": "Claude Opus 5.5", "family": "opus", "recommended": true },
              { "id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "family": "sonnet", "recommended": false },
-             { "id": "claude-fable-5-1", "label": "Claude Fable 5.1", "family": "fable", "recommended": false }],
+             { "id": "claude-haiku-5-5", "label": "Claude Haiku 5.5", "family": "haiku", "recommended": false }],
   "current": { "model": "claude-opus-5-5", "effort": "xhigh" },
   "efforts": ["max", "xhigh", "high", "medium", "low"],
-  "discovered": true,
+  "discovered": false,
   "default_model": "claude-opus-5-5"
 }
 ```
 
-The configured model comes first, then the catalogue as the Anthropic Models
-API orders it (newest first), nothing else; without discovery the built-in
-list applies. `family` is `fable`, `opus`, `sonnet`, `haiku` or `other`
-(`fable` is checked first); `recommended` marks the configured model;
+The list is the same as in the composer's model menu: `agent.models`, else
+the catalogue as the Anthropic Models API orders it (newest first) when
+`agent.model_discovery` is on, else the built-in list of the newest model of
+each tier. The configured model is put first when the list does not name it.
+`family` is `fable`, `opus`, `sonnet`, `haiku` or `other` (`fable` is checked
+first); `recommended` marks the configured model;
 `default_model` is Nerve's own default (`nerve.config.DEFAULT_MODEL`), so the
 page can say which entry it is even when this instance was changed to another
 model. On Bedrock the ids carry the geo prefix and `discovered` is `false`.
 
-The catalogue is cached per credential fingerprint (provider, base URL, key
-tail). A successful `POST /api/setup/provider/test` with an API key fetches
-the catalogue for that candidate key in the background, keyed by its
-fingerprint, so the picker is complete the moment the key is saved; a failure
+With discovery on, the catalogue is cached per credential fingerprint
+(provider, base URL, key tail). A successful `POST /api/setup/provider/test`
+with an API key fetches the catalogue for that candidate key in the
+background, keyed by its fingerprint, so the picker is complete the moment the
+key is saved; a failure
 recorded while no key was configured is never served for a configuration
 that now carries one.
 

@@ -1341,7 +1341,7 @@ async def set_provider(req: ProviderRequest, actor: Actor = Depends(require_pers
     if token or remove_token or kind == "host_login":
         _refuse_managed(pre, "claude_oauth_token", "claude_oauth_token")
     discovered: list[str] = []
-    if model is not None:
+    if model is not None and pre.config.agent.model_discovery:
         try:
             from nerve import models_catalog
 
@@ -2327,7 +2327,7 @@ async def provider_test(req: ProviderRequest, actor: Actor = Depends(require_per
     except setup_checks.Busy:
         raise HTTPException(status_code=429, detail=_BUSY)
     if result.get("ok") and result.get("checked") == "api" and not candidate.provider.is_bedrock \
-            and candidate.resolve_anthropic_api_key():
+            and candidate.resolve_anthropic_api_key() and candidate.agent.model_discovery:
         # The key works: fetch the catalog for it now (in the background,
         # keyed by this candidate's fingerprint) so the picker is complete the
         # moment the key is saved instead of waiting on a cold fetch then.
@@ -2411,14 +2411,16 @@ async def setup_models(actor: Actor = Depends(require_person)):
     ctx = await _claimed_context(actor)
     config = ctx.config
     discovered: list[str] = []
-    try:
-        from nerve import models_catalog
+    if config.agent.model_discovery:
+        try:
+            from nerve import models_catalog
 
-        discovered = list(await models_catalog.get_models(config))
-    except Exception:  # noqa: BLE001
-        discovered = []
-    # The configured model first, then the catalog as the API orders it
-    # (newest first), or the built-in list when nothing was discovered.
+            discovered = list(await models_catalog.get_models(config))
+        except Exception:  # noqa: BLE001
+            discovered = []
+    # The same list as the composer's model menu: agent.models, the catalog
+    # as the API orders it (newest first) when discovery is on, or the
+    # built-in list. The configured model leads when the list lacks it.
     models = config.selectable_claude_models(discovered)
     return {
         "models": [

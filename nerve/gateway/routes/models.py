@@ -1,19 +1,19 @@
 """Model discovery routes — which chat models the UI can offer.
 
-Exposes the selectable Claude models (the configured default plus
-``agent.models``, or the live Anthropic catalog, or a built-in
-current-generation list — see :meth:`NerveConfig.selectable_claude_models`),
-the Codex app-server's advertised models, and any locally-installed Ollama
-models (auto-discovered from the running Ollama server). The web composer's
-model picker calls GET /api/models to populate its options.
+Exposes the selectable Claude models (``agent.models``, or the live Anthropic
+catalog when ``agent.model_discovery`` is on, or the built-in list of the
+newest model of each tier; see :meth:`NerveConfig.selectable_claude_models`),
+the Codex models (``codex.models`` that the app-server's catalog serves), and
+any locally-installed Ollama models (auto-discovered from the running Ollama
+server). The web composer's model menu calls GET /api/models to populate its
+options. Each list keeps its configured order.
 
-The Claude catalog comes from :mod:`nerve.models_catalog`, which asks the
-Anthropic Models API which models the configured credentials' catalog
-endpoint advertises — so a newly released model appears in the picker
-without a code change. Catalog membership is not a serving guarantee (an
-advertised ID can still 404 on send); ``agent.model_discovery_excluded_models``
-prunes such entries. It is cached (primed at startup) and falls back to the
-built-in list whenever discovery is off or unavailable.
+With ``agent.model_discovery`` on, the Claude catalog comes from
+:mod:`nerve.models_catalog`, which asks the Anthropic Models API which models
+the configured credentials' catalog endpoint advertises. Catalog membership is
+not a serving guarantee (an advertised ID can still 404 on send);
+``agent.model_discovery_excluded_models`` prunes such entries. It is cached
+(primed at startup) and falls back to the built-in list when unavailable.
 
 Ollama models are only listed when they are actually routable
 (``config.ollama_routable`` — Ollama enabled *and* the proxy running),
