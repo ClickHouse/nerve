@@ -72,6 +72,7 @@ export function FilesPage() {
   const currentFile = openFiles.find(f => f.path === activeFile);
 
   const closeWithUnsavedWarning = (path: string) => {
+    if (saving) return;
     const tab = openFiles.find(f => f.path === path);
     if (tab?.modified && !window.confirm(
       `Close ${tab.name}? Unsaved changes will be lost.`,
