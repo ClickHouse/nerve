@@ -28,17 +28,25 @@ class QueryResultError(ValueError):
 @dataclass(frozen=True)
 class QueryRows:
     """The rows of a result. Each row is a ``dict`` (column name to value)
-    when the result names its columns, else the row as it came."""
+    when the result names its columns, else the row as it came.
+    ``columns`` holds the column names when the result gives them."""
 
     rows: list[Any]
+    columns: tuple[str, ...] = ()
 
     @property
     def first_value(self) -> Any:
-        """The first value of the first row; ``None`` when there is no row."""
+        """The first value of the first row; ``None`` when there is no row.
+
+        For a row that is an object, the first column is the first name of
+        ``columns`` when the result gives them, else the object's first key.
+        """
         if not self.rows:
             return None
         row = self.rows[0]
         if isinstance(row, dict):
+            if self.columns and self.columns[0] in row:
+                return row[self.columns[0]]
             return next(iter(row.values()), None)
         if isinstance(row, (list, tuple)):
             return row[0] if row else None
@@ -57,13 +65,17 @@ def parse_rows(result: GatewayToolResult) -> QueryRows:
       and ``JSONCompact`` formats),
     * a list of rows, each an object or a list,
     * any of these in ``{"result": ...}``, as some MCP servers wrap a value.
+      The ClickHouse Cloud server gives ``{"result": {"meta": ..., "data":
+      ...}}``.
 
-    Raises :class:`QueryResultError` for other results.
+    ``{"status": "error", "message": ...}``, which the ClickHouse Cloud server
+    gives for a query that failed (in a result that is not ``isError``),
+    raises :class:`QueryResultError` with that message, as do other results.
     """
     payload = result.structured
     if payload is None:
         payload = _json_of_text(result.text)
-    return QueryRows(rows=_rows_of(payload))
+    return _rows_of(payload)
 
 
 def _json_of_text(text: str) -> Any:
@@ -84,10 +96,13 @@ def _json_of_text(text: str) -> Any:
     return rows
 
 
-def _rows_of(payload: Any, depth: int = 0) -> list[Any]:
+def _rows_of(payload: Any, depth: int = 0) -> QueryRows:
     if isinstance(payload, list):
-        return payload
+        return QueryRows(rows=payload)
     if isinstance(payload, dict):
+        if payload.get("status") == "error":
+            message = " ".join(str(payload.get("message") or "no message").split())
+            raise QueryResultError(f"the query failed: {message[:300]}")
         if "rows" in payload and isinstance(payload["rows"], list):
             return _named(payload["rows"], payload.get("columns"))
         if "data" in payload and isinstance(payload["data"], list):
@@ -105,14 +120,17 @@ def _rows_of(payload: Any, depth: int = 0) -> list[Any]:
     raise QueryResultError("the tool result does not hold rows the gate can read")
 
 
-def _named(rows: list[Any], columns: Any) -> list[Any]:
+def _named(rows: list[Any], columns: Any) -> QueryRows:
     """Rows that are lists, as objects when *columns* names each column."""
     if not (isinstance(columns, list) and columns and all(isinstance(c, str) for c in columns)):
-        return rows
-    return [
-        dict(zip(columns, row)) if isinstance(row, list) and len(row) == len(columns) else row
-        for row in rows
-    ]
+        return QueryRows(rows=rows)
+    return QueryRows(
+        rows=[
+            dict(zip(columns, row)) if isinstance(row, list) and len(row) == len(columns) else row
+            for row in rows
+        ],
+        columns=tuple(columns),
+    )
 
 
 def is_true(value: Any) -> bool:

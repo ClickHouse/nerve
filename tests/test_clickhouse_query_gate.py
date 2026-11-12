@@ -274,6 +274,26 @@ class TestParseRows:
         result = GatewayToolResult(is_error=False, structured=[{"a": 7}], text="not json")
         assert parse_rows(result).first_value == 7
 
+    def test_clickhouse_cloud_success(self):
+        """The shape of run_select_query of the ClickHouse Cloud MCP server
+        (its output schema): ClickHouse JSON format in ``result``."""
+        payload = {"result": {
+            "meta": [{"name": "ok", "type": "UInt8"}, {"name": "n", "type": "UInt64"}],
+            "data": [{"n": "1", "ok": 1}],  # keys in another order than the columns
+            "rows": 1,
+            "statistics": {"elapsed": 0.001, "rows_read": 1, "bytes_read": 1},
+        }}
+        rows = parse_rows(GatewayToolResult(is_error=False, structured=payload, text=json.dumps(payload)))
+        assert rows.columns == ("ok", "n")
+        assert rows.first_value == 1
+
+    def test_clickhouse_cloud_error(self):
+        """The ClickHouse Cloud server gives a failed query in a result that
+        is not ``isError``."""
+        payload = {"result": {"status": "error", "message": "Forbidden. Service does not allow MCP calls"}}
+        with pytest.raises(QueryResultError, match="query failed: Forbidden. Service does not allow MCP calls"):
+            parse_rows(GatewayToolResult(is_error=False, structured=payload, text=json.dumps(payload)))
+
     def test_no_rows(self):
         rows = parse_rows(self._text({"columns": ["a"], "rows": []}))
         assert rows.rows == [] and rows.first_value is None
@@ -445,6 +465,15 @@ class TestFailedChecksSkip:
         fake_call.result = _rows([1])
         clock.advance(minutes=5)
         assert (await _check(gate)).should_run is False  # still true, inside the cooldown
+
+    @pytest.mark.asyncio
+    async def test_cloud_error_message_is_logged(self, fake_call, clock, caplog):
+        payload = {"result": {"status": "error", "message": "Service is idle, retry shortly"}}
+        fake_call.result = GatewayToolResult(is_error=False, structured=payload, text=json.dumps(payload))
+        with caplog.at_level(logging.WARNING, logger="nerve.cron.gates"):
+            assert (await _check(_gate())).should_run is False
+        assert "the query failed: Service is idle, retry shortly" in caplog.text
+        assert _state_files() == []
 
     @pytest.mark.asyncio
     async def test_tool_error_text_is_logged(self, fake_call, clock, caplog):

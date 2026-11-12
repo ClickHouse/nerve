@@ -356,7 +356,11 @@ gates, so that the query runs only when the other gates pass.
 disabled server, a call that fails or times out, a tool that refuses the query,
 a result that the gate cannot read, or a first value that is not true or false:
 the gate logs a warning and the run is skipped. A ClickHouse Cloud service that
-sleeps, or an API key that expired, does not start a session on each tick.
+sleeps, or an API key that expired, does not start a session on each tick. The
+ClickHouse Cloud server gives a failed query as a normal result,
+`{"result": {"status": "error", "message": ...}}`, and the warning names its
+message, for example `Forbidden. Service does not allow MCP calls` for a
+service where MCP is off.
 
 **The prompt.** When the gate passes, the run's prompt gets a block after the
 job's prompt: the query, the time of the check, and up to `max_rows` rows as
@@ -387,9 +391,12 @@ in the control plane console. The gate calls it through the MCP gateway, which
 holds the key and applies the agent's policy. `server` is the server's id in
 the catalog.
 
-**Costs.** Each check is a query on the service. A short schedule can keep an
-idle ClickHouse Cloud service from going to sleep. The schedule shows each tick
-as a run, because a forecast cannot run the query (see [Forecasts](#forecasts)).
+**Costs.** Each check is a query on the service. A check on an idle ClickHouse
+Cloud service wakes it, and that check fails with a request to try again, so
+its run is skipped; the next check runs the query. A short schedule thus keeps
+the service from going to sleep. A stopped service is not started. The
+schedule shows each tick as a run, because a forecast cannot run the query
+(see [Forecasts](#forecasts)).
 
 ### Forecasts
 
