@@ -7,11 +7,18 @@ memU indexes it for semantic search but doesn't replace it.
 from __future__ import annotations
 
 import logging
+import threading
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+# The daemon is single-process. The gateway and MemoryManager share this lock:
+# a memory-tool write cannot slip between an editor's check and replacement.
+# External shell editors do not honor it; their writes remain detectable by
+# revision comparison when they finish before the check.
+memory_file_lock = threading.RLock()
 
 
 def memory_file_path(workspace: Path, relative_path: str) -> Path | None:
@@ -53,14 +60,16 @@ class MemoryManager:
     def read_memory(self) -> str:
         """Read the main MEMORY.md file."""
         path = self.workspace / "MEMORY.md"
-        if path.exists():
-            return path.read_text(encoding="utf-8")
-        return ""
+        with memory_file_lock:
+            if path.exists():
+                return path.read_text(encoding="utf-8")
+            return ""
 
     def write_memory(self, content: str) -> None:
         """Write the main MEMORY.md file."""
         path = self.workspace / "MEMORY.md"
-        path.write_text(content, encoding="utf-8")
+        with memory_file_lock:
+            path.write_text(content, encoding="utf-8")
 
     def get_today_log_path(self) -> Path:
         """Get the path for today's daily log."""
@@ -78,9 +87,10 @@ class MemoryManager:
         else:
             path = self.get_today_log_path()
 
-        if path.exists():
-            return path.read_text(encoding="utf-8")
-        return ""
+        with memory_file_lock:
+            if path.exists():
+                return path.read_text(encoding="utf-8")
+            return ""
 
     def append_daily_log(self, content: str, date: str | None = None) -> None:
         """Append content to a daily log."""
@@ -89,17 +99,18 @@ class MemoryManager:
         else:
             path = self.get_today_log_path()
 
-        if not path.exists():
-            path.write_text(f"# {path.stem}\n\n", encoding="utf-8")
-
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(content + "\n")
+        with memory_file_lock:
+            if not path.exists():
+                path.write_text(f"# {path.stem}\n\n", encoding="utf-8")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(content + "\n")
 
     def ensure_daily_log(self) -> Path:
         """Ensure today's daily log file exists. Returns the path."""
         path = self.get_today_log_path()
-        if not path.exists():
-            path.write_text(f"# {path.stem}\n\n", encoding="utf-8")
+        with memory_file_lock:
+            if not path.exists():
+                path.write_text(f"# {path.stem}\n\n", encoding="utf-8")
         return path
 
     def list_memory_files(self) -> list[dict]:
@@ -135,9 +146,10 @@ class MemoryManager:
             logger.warning("Refused a path that is not a memory file: %s", relative_path)
             return None
 
-        if path.is_file():
-            return path.read_text(encoding="utf-8")
-        return None
+        with memory_file_lock:
+            if path.is_file():
+                return path.read_text(encoding="utf-8")
+            return None
 
     def write_file(self, relative_path: str, content: str) -> bool:
         """Write a memory file (see :func:`memory_file_path`) by relative path.
@@ -154,6 +166,7 @@ class MemoryManager:
             logger.warning("Refused a path that is not a memory file: %s", relative_path)
             return False
 
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
+        with memory_file_lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
         return True

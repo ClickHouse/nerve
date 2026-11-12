@@ -128,3 +128,61 @@ class TestMemoryFileRoutes:
 
     def test_a_missing_memory_file_is_not_found(self, client):
         assert client.get("/api/memory/file/memory/none.md").status_code == 404
+
+    def test_revision_guard_rejects_stale_editor_save(self, client, ws):
+        url = "/api/memory/file/MEMORY.md"
+        revision = client.get(url).json()["revision"]
+        (ws / "MEMORY.md").write_text("# Memory\nAgent note\n")
+        refused = client.put(url, json={
+            "content": "# Memory\nUser edit\n",
+            "expected_revision": revision,
+        })
+        assert refused.status_code == 409
+        assert (ws / "MEMORY.md").read_text() == "# Memory\nAgent note\n"
+
+    def test_matching_revision_saves_and_rejects_reuse(self, client, ws):
+        url = "/api/memory/file/MEMORY.md"
+        revision = client.get(url).json()["revision"]
+        saved = client.put(url, json={
+            "content": "# Updated\n", "expected_revision": revision,
+        })
+        assert saved.status_code == 200
+        assert saved.json()["revision"] == client.get(url).json()["revision"]
+        assert (ws / "MEMORY.md").read_text() == "# Updated\n"
+        assert client.put(url, json={
+            "content": "stale", "expected_revision": revision,
+        }).status_code == 409
+
+    def test_deleted_file_is_not_recreated_by_stale_save(self, client, ws):
+        url = "/api/memory/file/MEMORY.md"
+        revision = client.get(url).json()["revision"]
+        (ws / "MEMORY.md").unlink()
+        refused = client.put(url, json={
+            "content": "stale", "expected_revision": revision,
+        })
+        assert refused.status_code == 409
+        assert not (ws / "MEMORY.md").exists()
+
+    @pytest.mark.asyncio
+    async def test_two_simultaneous_saves_of_one_revision_cannot_both_win(self, ws, monkeypatch):
+        import asyncio
+
+        from fastapi import HTTPException
+        from nerve.gateway.routes.memory import (FileWriteRequest, read_memory_file,
+                                                 write_memory_file)
+
+        monkeypatch.setattr(cfg, "_config", NerveConfig(workspace=ws))
+        revision = (await read_memory_file("MEMORY.md"))["revision"]
+
+        results = await asyncio.gather(
+            write_memory_file("MEMORY.md", FileWriteRequest(
+                content="first write\n", expected_revision=revision)),
+            write_memory_file("MEMORY.md", FileWriteRequest(
+                content="second write\n", expected_revision=revision)),
+            return_exceptions=True,
+        )
+
+        assert sum(isinstance(result, dict) and result["saved"] for result in results) == 1
+        assert sum(isinstance(result, HTTPException) and result.status_code == 409
+                   for result in results) == 1
+        assert (ws / "MEMORY.md").read_text() in ("first write\n", "second write\n")

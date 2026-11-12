@@ -9,6 +9,7 @@ the edits answer 409, and the health route returns the Loom backend's note.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import sqlite3
@@ -25,7 +26,7 @@ from nerve.config import (
 )
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
-from nerve.memory.manager import memory_file_path
+from nerve.memory.manager import memory_file_lock, memory_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -98,20 +99,29 @@ async def read_memory_file(file_path: str):
     config = get_config()
     full_path = config.workspace / file_path
     path = _memory_file(config.workspace, file_path)
-    if not path.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
-    content = await asyncio.to_thread(path.read_text, encoding="utf-8")
+    def _read() -> bytes:
+        with memory_file_lock:
+            try:
+                return path.read_bytes()
+            except (FileNotFoundError, IsADirectoryError):
+                raise HTTPException(status_code=404, detail="File not found")
+
+    data = await asyncio.to_thread(_read)
+    content = data.decode("utf-8")
     # An editor that opened this file needs the same answer the listing gave, or
     # it re-offers the edit the PUT below refuses.
     return {
         "path": file_path,
         "content": content,
+        "revision": hashlib.sha256(data).hexdigest(),
         "read_only": tracked_config_write_refusal(full_path) is not None,
     }
 
 
 class FileWriteRequest(BaseModel):
     content: str
+    # Optional for legacy API callers; the Files UI always sends a revision.
+    expected_revision: str | None = None
 
 
 @router.put("/api/memory/file/{file_path:path}")
@@ -125,12 +135,24 @@ async def write_memory_file(file_path: str, req: FileWriteRequest):
     ensure_path_not_tracked_config(full_path, "write")
     path = _memory_file(config.workspace, file_path)
 
-    def _write() -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(req.content, encoding="utf-8")
+    def _write() -> str:
+        with memory_file_lock:
+            # Verify the editor's read snapshot before replacing its contents.
+            # Legacy callers without a revision retain their previous semantics.
+            if req.expected_revision is not None:
+                try:
+                    current = path.read_bytes()
+                except FileNotFoundError:
+                    raise HTTPException(status_code=409, detail="File changed or was deleted since it was opened")
+                actual = hashlib.sha256(current).hexdigest()
+                if actual != req.expected_revision:
+                    raise HTTPException(status_code=409, detail="File changed since it was opened; copy your edits and reload before saving")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(req.content, encoding="utf-8")
+            return hashlib.sha256(req.content.encode("utf-8")).hexdigest()
 
-    await asyncio.to_thread(_write)
-    return {"path": file_path, "saved": True}
+    revision = await asyncio.to_thread(_write)
+    return {"path": file_path, "saved": True, "revision": revision}
 
 
 # --- memU semantic memory ---

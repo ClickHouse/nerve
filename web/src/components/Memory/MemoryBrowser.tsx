@@ -1,5 +1,6 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { api } from '../../api/client';
+import { ApiError } from '../../api/hosted';
 import { Button } from '../ui';
 
 interface MemFile {
@@ -13,17 +14,24 @@ export function MemoryBrowser() {
   const [files, setFiles] = useState<MemFile[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [content, setContent] = useState('');
+  const latestContent = useRef('');
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [revision, setRevision] = useState('');
+  const [saveError, setSaveError] = useState<string | null>(null);
 
   useEffect(() => {
     api.listMemoryFiles().then(({ files }) => setFiles(files)).catch(console.error);
   }, []);
 
   const openFile = async (path: string) => {
+    if (saving) return;
     try {
-      const { content } = await api.readMemoryFile(path);
+      const { content, revision } = await api.readMemoryFile(path);
+      setRevision(revision);
+      setSaveError(null);
       setSelected(path);
+      latestContent.current = content;
       setContent(content);
       setEditing(false);
     } catch (e) {
@@ -34,11 +42,18 @@ export function MemoryBrowser() {
   const saveFile = async () => {
     if (!selected) return;
     setSaving(true);
+    const submittedContent = latestContent.current;
     try {
-      await api.writeMemoryFile(selected, content);
-      setEditing(false);
+      const result = await api.writeMemoryFile(selected, submittedContent, revision);
+      setRevision(result.revision);
+      setSaveError(null);
+      // A newer draft typed while the request was running remains unsaved.
+      setEditing(latestContent.current !== submittedContent);
     } catch (e) {
       console.error('Failed to save:', e);
+      setSaveError(e instanceof ApiError && e.status === 409
+        ? 'File changed on disk. Copy your edits before reloading; nothing was saved.'
+        : 'Save failed. Your edits are still here.');
     } finally {
       setSaving(false);
     }
@@ -84,6 +99,7 @@ export function MemoryBrowser() {
                     </Button>
                     <Button
                       size="xs"
+                      disabled={saving}
                       onClick={() => { setEditing(false); openFile(selected); }}
                     >
                       Cancel
@@ -96,13 +112,16 @@ export function MemoryBrowser() {
                 )}
               </div>
             </div>
+            {saveError && (
+              <div role="alert" className="p-2 text-sm text-red-600">{saveError}</div>
+            )}
             {editing ? (
               // Native, like FileEditor's: the `TextArea` primitive is a form
               // field (bordered, rounded, raised surface, px-3 py-2) and this
               // is a full-height editing pane flush with the panel.
               <textarea
                 value={content}
-                onChange={(e) => setContent(e.target.value)}
+                onChange={(e) => { latestContent.current = e.target.value; setContent(e.target.value); }}
                 className="flex-1 p-4 bg-bg text-text font-mono text-sm outline-none resize-none"
               />
             ) : (

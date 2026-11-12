@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { ApiError } from '../api/hosted';
 import { buildFileTree, type FileNode } from '../utils/fileTree';
 
 interface OpenFile {
@@ -9,6 +10,8 @@ interface OpenFile {
   originalContent: string;
   modified: boolean;
   readOnly: boolean;
+  revision: string;
+  saveError: string | null;
 }
 
 interface FilesState {
@@ -52,12 +55,12 @@ export const useFilesStore = create<FilesState>((set, get) => ({
 
     set({ loading: true });
     try {
-      const { content, read_only } = await api.readMemoryFile(path);
+      const { content, revision, read_only } = await api.readMemoryFile(path);
       const name = path.split('/').pop() || path;
       set(s => ({
         openFiles: [...s.openFiles, {
           path, name, content, originalContent: content, modified: false,
-          readOnly: !!read_only,
+          readOnly: !!read_only, revision, saveError: null,
         }],
         activeFile: path,
         loading: false,
@@ -93,20 +96,30 @@ export const useFilesStore = create<FilesState>((set, get) => ({
 
   saveFile: async (path: string) => {
     const file = get().openFiles.find(f => f.path === path);
-    if (!file) return;
+    if (!file || get().saving) return;
 
     set({ saving: true });
     try {
-      await api.writeMemoryFile(path, file.content);
+      const result = await api.writeMemoryFile(path, file.content, file.revision);
       set(s => ({
         openFiles: s.openFiles.map(f =>
-          f.path === path ? { ...f, originalContent: file.content, modified: false } : f
+          f.path === path
+            ? { ...f, originalContent: file.content,
+                modified: f.content !== file.content, revision: result.revision, saveError: null }
+            : f
         ),
         saving: false,
       }));
     } catch (e) {
       console.error('Failed to save file:', e);
-      set({ saving: false });
+      set(s => ({
+        openFiles: s.openFiles.map(f => f.path === path
+          ? { ...f, saveError: e instanceof ApiError && e.status === 409
+              ? 'This file changed on disk. Your edits were not saved. Copy your changes before reloading.'
+              : 'Save failed. Your edits are still here; try again.' }
+          : f),
+        saving: false,
+      }));
     }
   },
 }));
