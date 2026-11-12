@@ -102,7 +102,9 @@ export const useFilesStore = create<FilesState>((set, get) => ({
     });
   },
 
-  setActiveFile: (path: string) => set({ activeFile: path }),
+  // Tab selection must take the same refresh path as tree selection. A
+  // clean cached tab may be stale after an agent edits it while inactive.
+  setActiveFile: (path: string) => { void get().openFile(path); },
 
   updateContent: (path: string, content: string) => {
     set(s => ({
