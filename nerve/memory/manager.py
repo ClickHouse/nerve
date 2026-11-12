@@ -7,6 +7,9 @@ memU indexes it for semantic search but doesn't replace it.
 from __future__ import annotations
 
 import logging
+import hashlib
+import os
+from contextlib import contextmanager
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +51,31 @@ def memory_file_path(workspace: Path, relative_path: str) -> Path | None:
     return None
 
 
+@contextmanager
+def memory_file_lock(workspace: Path, path: Path):
+    """Cross-process lock shared by Nerve's managed memory-file writers.
+
+    Lock the stable *path*, not the file inode: atomic replacements and
+    deletions must not allow separate concurrent locks. Keep lock files
+    permanently, as with the daemon PID lock.
+    Note: direct shell/editor writes must also participate for full safety.
+    """
+    import fcntl  # Nerve's daemon already uses flock (see pidfile.py).
+
+    lock_dir = Path(workspace).resolve() / ".nerve" / "memory-file-locks"
+    lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    key = hashlib.sha256(os.fsencode(Path(path).resolve())).hexdigest()
+    fd = os.open(lock_dir / (key + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 class MemoryManager:
     """Manages file-based memory in the workspace."""
 
@@ -69,6 +97,7 @@ class MemoryManager:
         """Write the main MEMORY.md file."""
         path = self.workspace / "MEMORY.md"
         with memory_file_lock:
+            with memory_file_lock(self.workspace, path):
             path.write_text(content, encoding="utf-8")
 
     def get_today_log_path(self) -> Path:
