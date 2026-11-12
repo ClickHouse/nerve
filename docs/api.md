@@ -2140,6 +2140,19 @@ The file itself, as `application/octet-stream` with
 the Files page offers binary and oversized files. A link can't send a header,
 so the page passes the session token as `?token=`.
 
+With `?inline=1`, a raster image (by extension: `.png`, `.jpg`/`.jpeg`, `.gif`,
+`.webp`, `.avif`, `.bmp`) comes back under its own type with
+`Content-Disposition: inline`, `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy: default-src 'none'; img-src 'self' data:; sandbox`, for
+the Files page preview. Any other file ignores the flag and stays an attachment.
+
+#### `GET /api/files/uploads/{id}`
+A file uploaded to a chat. A raster image (PNG, JPEG, GIF, WebP, AVIF, BMP, by
+its stored type) is sent inline with the headers above, so it opens in a tab
+instead of downloading. Any other type, SVG and HTML included, is an
+attachment, because opened as a page of the panel's origin a script in it could
+read the session token. `?download=1` makes an image an attachment too.
+
 ### Memory Files
 
 #### `GET /api/memory/files`

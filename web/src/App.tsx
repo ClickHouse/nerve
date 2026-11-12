@@ -37,6 +37,7 @@ import { SetupPage } from './pages/SetupPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { BrowserAlerts } from './components/Notifications/BrowserAlerts';
 import { NotificationToast } from './components/Notifications/NotificationToast';
+import { ImageViewerHost } from './components/ImageViewer/ImageViewerHost';
 import { SetupBanner } from './components/Setup/SetupBanner';
 import { SetupLanding } from './components/Setup/SetupLanding';
 import { ShortcutsModal } from './components/ShortcutsModal';
@@ -159,6 +160,7 @@ function App() {
 
       <NotificationToast />
       <BrowserAlerts />
+      <ImageViewerHost />
       <SetupLanding />
       <SetupBanner />
       <ShortcutsModal />

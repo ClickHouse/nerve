@@ -13,6 +13,7 @@ import { groupToolCalls } from '../../utils/groupToolCalls';
 import { findRepeatWorkflowRunCalls } from '../../utils/workflowRunCards';
 import { authUrl } from '../../api/hosted';
 import { useMcpAppsStore } from '../../stores/mcpAppsStore';
+import { imageLinkProps } from '../../utils/imageLinks';
 
 interface BlockRendererProps {
   blocks: MessageBlock[];
@@ -115,7 +116,7 @@ export function BlockRenderer({
             const imgUrl = authUrl(item.url);
             return (
               <div key={i} className="my-2">
-                <a href={imgUrl} target="_blank" rel="noopener noreferrer" className="inline-block rounded-lg overflow-hidden border border-border hover:border-accent/50 transition-colors">
+                <a {...imageLinkProps(item.url, item.filename)} className="inline-block rounded-lg overflow-hidden border border-border hover:border-accent/50 transition-colors">
                   <img src={imgUrl} alt={item.filename} className="max-w-[300px] max-h-[300px] object-contain" />
                 </a>
               </div>

@@ -28,7 +28,8 @@ const file = (path: string, extra: Record<string, unknown> = {}) => ({
 const dir = (path: string) => ({ name: path.split('/').pop()!, path, type: 'directory' as const });
 const LISTINGS: Record<string, ReturnType<typeof file | typeof dir>[]> = {
   '': [dir('notes'), file('README.md')],
-  notes: [file('notes/plan.md', { read_only: true, read_only_reason: 'not_memory' }), file('notes/run.log', { read_only: true, read_only_reason: 'not_memory' })],
+  notes: [file('notes/plan.md', { read_only: true, read_only_reason: 'not_memory' }), file('notes/run.log', { read_only: true, read_only_reason: 'not_memory' }),
+    file('notes/shot.png', { read_only: true, read_only_reason: 'not_memory' }), file('notes/chart.svg', { read_only: true, read_only_reason: 'not_memory' })],
 };
 
 beforeEach(() => {
@@ -178,6 +179,38 @@ describe('FilesPage workspace tree', () => {
     const link = await screen.findByRole('link', { name: label });
     expect(link).toHaveAttribute('href', '/api/workspace/download?path=notes%2Frun.log');
     expect(link).toHaveAttribute('download', 'run.log');
+  });
+
+  it('previews a raster image instead of the binary notice', async () => {
+    readWorkspaceFile.mockResolvedValueOnce({
+      path: 'notes/shot.png', name: 'shot.png', size: 2048, content: '', binary: true, too_large: false,
+      read_only: true, read_only_reason: 'not_memory',
+    });
+    await renderPage();
+    await userEvent.click(screen.getByRole('button', { name: 'notes' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'shot.png' }));
+    const img = await screen.findByRole('img', { name: 'shot.png' });
+    expect(img).toHaveAttribute('src', '/api/workspace/download?path=notes%2Fshot.png&inline=1');
+    expect(screen.queryByText('Binary file: not shown.')).not.toBeInTheDocument();
+    // The image is a viewer link: a click opens the zoomable viewer, the
+    // viewer's Download fetches the attachment.
+    const viewerLink = img.closest('a')!;
+    expect(viewerLink).toHaveAttribute('data-lightbox', '/api/workspace/download?path=notes%2Fshot.png&inline=1');
+    expect(viewerLink).toHaveAttribute('data-lightbox-download', '/api/workspace/download?path=notes%2Fshot.png');
+    const download = screen.getByRole('link', { name: 'Download (2.0 KB)' });
+    expect(download).toHaveAttribute('href', '/api/workspace/download?path=notes%2Fshot.png');
+  });
+
+  it('keeps the notice for an SVG', async () => {
+    readWorkspaceFile.mockResolvedValueOnce({
+      path: 'notes/chart.svg', name: 'chart.svg', size: 10, content: '', binary: true, too_large: false,
+      read_only: true, read_only_reason: 'not_memory',
+    });
+    await renderPage();
+    await userEvent.click(screen.getByRole('button', { name: 'notes' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'chart.svg' }));
+    expect(await screen.findByText('Binary file: not shown.')).toBeInTheDocument();
+    expect(screen.queryByRole('img')).not.toBeInTheDocument();
   });
 
   it('offers no download for a file it shows', async () => {

@@ -25,6 +25,40 @@ MAX_TOTAL_SIZE = 50 * 1024 * 1024  # 50 MB per request
 IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
 PDF_TYPES = {"application/pdf"}
 
+# Raster types a browser tab may show in place. SVG is not one: opened as a
+# document of the panel's origin, a script in it could read the session token.
+INLINE_IMAGE_TYPES = IMAGE_TYPES | {"image/avif", "image/bmp"}
+
+# The same, by extension, for a file that has no declared type. Spelled out
+# rather than asked of ``mimetypes``, whose table varies with the platform.
+INLINE_IMAGE_EXTENSIONS = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp", ".avif": "image/avif", ".bmp": "image/bmp",
+}
+
+# Sent with an image shown in place: no sniffing it into HTML, and no script
+# or request from it, should a file declared as an image be something else.
+INLINE_IMAGE_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "default-src 'none'; img-src 'self' data:; sandbox",
+}
+
+
+def file_response(path: Path, media_type: str, filename: str, *, download: bool = False) -> FileResponse:
+    """A stored file under ``filename``: in place if it is a raster image, else an attachment.
+
+    ``download`` makes even an image an attachment, for a Download button.
+    """
+    if media_type in INLINE_IMAGE_TYPES and not download:
+        return FileResponse(
+            path=str(path), media_type=media_type, filename=filename,
+            content_disposition_type="inline", headers=INLINE_IMAGE_HEADERS,
+        )
+    return FileResponse(
+        path=str(path), media_type=media_type, filename=filename,
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
+
 
 def _classify_file(media_type: str) -> str:
     """Classify an uploaded file as image, pdf, or text."""
@@ -136,8 +170,13 @@ async def upload_files(
 @router.get("/api/files/uploads/{file_id}")
 async def get_uploaded_file(
     file_id: str,
+    download: bool = False,
 ):
-    """Serve an uploaded file by its ID (for image display in chat history)."""
+    """Serve an uploaded file by its ID (for image display in chat history).
+
+    A raster image is sent inline, so the chat can open it in a tab; any
+    other file, or any file with ``?download=1``, is an attachment.
+    """
     deps = get_deps()
     record = await deps.db.get_uploaded_file(file_id)
     if not record:
@@ -147,11 +186,7 @@ async def get_uploaded_file(
     if not disk_path.exists():
         raise HTTPException(status_code=404, detail="File not found on disk")
 
-    return FileResponse(
-        path=str(disk_path),
-        media_type=record["media_type"],
-        filename=record["filename"],
-    )
+    return file_response(disk_path, record["media_type"], record["filename"], download=download)
 
 
 @router.get("/api/files/download")

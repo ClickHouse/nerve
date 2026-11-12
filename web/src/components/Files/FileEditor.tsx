@@ -4,6 +4,7 @@ import { authUrl } from '../../api/hosted';
 import { MarkdownContent } from '../Chat/MarkdownContent';
 import { Button, IconButton } from '../ui';
 import { Download, Eye, Edit3, Lock, Save } from '../ui/icons';
+import { imageLinkProps, isRasterImagePath } from '../../utils/imageLinks';
 
 interface FileEditorProps {
   path: string;
@@ -86,7 +87,9 @@ export function FileEditor({
       </div>
 
       {/* Content */}
-      {unreadable ? (
+      {unreadable && isRasterImagePath(path) ? (
+        <ImagePreview path={path} size={size} />
+      ) : unreadable ? (
         <div className="flex-1 flex flex-col items-center justify-center gap-3 p-6 text-sm text-text-faint text-center">
           <span>
             {unreadable === 'binary'
@@ -125,6 +128,39 @@ export function FileEditor({
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/** A raster image in place of the binary notice; a click opens it in the zoomable viewer. */
+function ImagePreview({ path, size }: { path: string; size?: number }) {
+  const name = path.split('/').pop() || 'image';
+  const download = `/api/workspace/download?path=${encodeURIComponent(path)}`;
+  const [dims, setDims] = useState<{ width: number; height: number } | null>(null);
+  return (
+    <div className="flex-1 min-h-0 flex flex-col items-center gap-3 p-6 overflow-auto" data-lightbox-group="">
+      <a
+        {...imageLinkProps(`${download}&inline=1`, name, download)}
+        className="block rounded-lg overflow-hidden border border-border hover:border-accent/50 transition-colors cursor-zoom-in"
+      >
+        <img
+          src={authUrl(`${download}&inline=1`)}
+          alt={name}
+          className="block max-w-full max-h-[70vh] object-contain"
+          onLoad={e => setDims({ width: e.currentTarget.naturalWidth, height: e.currentTarget.naturalHeight })}
+        />
+      </a>
+      <div className="flex items-center gap-3 text-xs text-text-faint">
+        {dims && <span className="tabular-nums">{dims.width} × {dims.height}</span>}
+        <a
+          href={authUrl(download)}
+          download={name}
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-border bg-surface-raised text-text-secondary hover:text-text hover:bg-surface-hover"
+        >
+          <Download size={13} aria-hidden="true" />
+          Download{size !== undefined ? ` (${formatSize(size)})` : ''}
+        </a>
+      </div>
     </div>
   );
 }

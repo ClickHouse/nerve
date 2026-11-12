@@ -150,4 +150,63 @@ describe('Lightbox', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
     expect(onClose).toHaveBeenCalledTimes(2);
   });
+
+  describe('a raster image', () => {
+    /** Lay the viewport out before the first render, so `fit-down` can measure it. */
+    function openImage(size: { width: number; height: number }, extra = {}) {
+      const rect = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect')
+        .mockReturnValue({ ...VIEWPORT, toJSON: () => VIEWPORT } as DOMRect);
+      const onClose = vi.fn();
+      render(<Lightbox open onClose={onClose} title="shot.png" src="/u/shot.png" size={size} initialView="fit-down" {...extra} />);
+      const viewport = screen.getByRole('img', { name: 'shot.png' });
+      const content = viewport.firstElementChild as HTMLElement;
+      return { rect, viewport, content, img: content.querySelector('img')! };
+    }
+
+    it('shows it in an <img> at its natural size, at 1:1 when it fits', () => {
+      const { rect, content, img } = openImage({ width: 400, height: 300 });
+      expect(img).toHaveAttribute('src', '/u/shot.png');
+      expect([img.style.width, img.style.height]).toEqual(['400px', '300px']);
+      expect(placeOf(content)).toEqual({ x: 0, y: 0, zoom: 1 });
+      rect.mockRestore();
+    });
+
+    it('opens a picture larger than the window fitted, not at its corner', () => {
+      const { rect, content } = openImage({ width: 3000, height: 2000 });
+      expect(placeOf(content).zoom).toBeCloseTo(952 / 3000, 5);
+      rect.mockRestore();
+    });
+
+    it('switches between fit and 1:1 on double-click', () => {
+      const { rect, viewport, content } = openImage({ width: 3000, height: 2000 });
+      fireEvent.doubleClick(viewport);
+      expect(placeOf(content)).toEqual({ x: 0, y: 0, zoom: 1 });
+      fireEvent.doubleClick(viewport);
+      expect(placeOf(content).zoom).toBeCloseTo(952 / 3000, 5);
+      rect.mockRestore();
+    });
+
+    it('keeps pixels crisp from 200% up', async () => {
+      const { rect, viewport, img } = openImage({ width: 100, height: 100 });
+      expect(img.style.imageRendering).toBe('auto');
+      viewport.focus();
+      await userEvent.keyboard('++++');
+      expect(img.style.imageRendering).toBe('pixelated');
+      rect.mockRestore();
+    });
+
+    it('steps with N and P only when there is a set', async () => {
+      const onNext = vi.fn();
+      const onPrev = vi.fn();
+      const { rect, viewport } = openImage({ width: 100, height: 100 }, {
+        nav: { index: 0, count: 2, onNext, onPrev },
+      });
+      viewport.focus();
+      await userEvent.keyboard('n{PageDown}p');
+      expect(onNext).toHaveBeenCalledTimes(2);
+      expect(onPrev).toHaveBeenCalledTimes(1);
+      expect(screen.getByText('1 / 2')).toBeInTheDocument();
+      rect.mockRestore();
+    });
+  });
 });

@@ -33,6 +33,7 @@ from fastapi.responses import FileResponse
 
 from nerve.config import FilesConfig, get_config, tracked_config_write_refusal
 from nerve.gateway.auth import require_auth
+from nerve.gateway.routes.files import INLINE_IMAGE_EXTENSIONS, file_response
 from nerve.memory.manager import memory_file_path
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -220,16 +221,22 @@ def _download_path_sync(workspace: Path, rel: str, files_cfg: FilesConfig) -> Pa
 
 
 @router.get("/api/workspace/download")
-async def download_workspace_file(path: str):
+async def download_workspace_file(path: str, inline: bool = False):
     """A workspace file as an attachment: same rules as the read route, no size cap.
 
-    The UI links here with the token in the query (``authUrl``), since a
-    link cannot send a header.
+    With ``?inline=1`` a raster image (by its name's extension) is sent in
+    place under its own type, for the Files page's preview; anything else
+    stays an attachment. The UI links here with the token in the query
+    (``authUrl``), since a link cannot send a header.
     """
     config = get_config()
     resolved = await asyncio.to_thread(_download_path_sync, config.workspace, path, config.files)
     # The name as asked, not the symlink target's.
     name = Path(path.strip().strip("/")).name or resolved.name
+    if inline:
+        media_type = INLINE_IMAGE_EXTENSIONS.get(Path(name).suffix.lower())
+        if media_type:
+            return file_response(resolved, media_type, name)
     return FileResponse(
         path=str(resolved), media_type="application/octet-stream", filename=name,
     )
