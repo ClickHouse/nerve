@@ -7,14 +7,12 @@ memU indexes it for semantic search but doesn't replace it.
 from __future__ import annotations
 
 import logging
-import hashlib
-import os
-from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
 
 def memory_file_path(workspace: Path, relative_path: str) -> Path | None:
     """The memory file that ``relative_path`` names, or None if it is not one.
@@ -43,31 +41,6 @@ def memory_file_path(workspace: Path, relative_path: str) -> Path | None:
     return None
 
 
-@contextmanager
-def memory_file_lock(workspace: Path, path: Path):
-    """Cross-process lock shared by Nerve's managed memory-file writers.
-
-    Lock the stable *path*, not the file inode: atomic replacements and
-    deletions must not allow separate concurrent locks. Keep lock files
-    permanently, as with the daemon PID lock.
-    Note: direct shell/editor writes must also participate for full safety.
-    """
-    import fcntl  # Nerve's daemon already uses flock (see pidfile.py).
-
-    lock_dir = Path(workspace).resolve() / ".nerve" / "memory-file-locks"
-    lock_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    key = hashlib.sha256(os.fsencode(Path(path).resolve())).hexdigest()
-    fd = os.open(lock_dir / (key + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-    finally:
-        os.close(fd)
-
-
 class MemoryManager:
     """Manages file-based memory in the workspace."""
 
@@ -80,16 +53,14 @@ class MemoryManager:
     def read_memory(self) -> str:
         """Read the main MEMORY.md file."""
         path = self.workspace / "MEMORY.md"
-        with memory_file_lock(self.workspace, path):
-            if path.exists():
-                return path.read_text(encoding="utf-8")
-            return ""
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
 
     def write_memory(self, content: str) -> None:
         """Write the main MEMORY.md file."""
         path = self.workspace / "MEMORY.md"
-        with memory_file_lock(self.workspace, path):
-            path.write_text(content, encoding="utf-8")
+        path.write_text(content, encoding="utf-8")
 
     def get_today_log_path(self) -> Path:
         """Get the path for today's daily log."""
@@ -107,10 +78,9 @@ class MemoryManager:
         else:
             path = self.get_today_log_path()
 
-        with memory_file_lock(self.workspace, path):
-            if path.exists():
-                return path.read_text(encoding="utf-8")
-            return ""
+        if path.exists():
+            return path.read_text(encoding="utf-8")
+        return ""
 
     def append_daily_log(self, content: str, date: str | None = None) -> None:
         """Append content to a daily log."""
@@ -119,18 +89,17 @@ class MemoryManager:
         else:
             path = self.get_today_log_path()
 
-        with memory_file_lock(self.workspace, path):
-            if not path.exists():
-                path.write_text(f"# {path.stem}\n\n", encoding="utf-8")
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(content + "\n")
+        if not path.exists():
+            path.write_text(f"# {path.stem}\n\n", encoding="utf-8")
+
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(content + "\n")
 
     def ensure_daily_log(self) -> Path:
         """Ensure today's daily log file exists. Returns the path."""
         path = self.get_today_log_path()
-        with memory_file_lock(self.workspace, path):
-            if not path.exists():
-                path.write_text(f"# {path.stem}\n\n", encoding="utf-8")
+        if not path.exists():
+            path.write_text(f"# {path.stem}\n\n", encoding="utf-8")
         return path
 
     def list_memory_files(self) -> list[dict]:
@@ -166,10 +135,9 @@ class MemoryManager:
             logger.warning("Refused a path that is not a memory file: %s", relative_path)
             return None
 
-        with memory_file_lock(self.workspace, path):
-            if path.is_file():
-                return path.read_text(encoding="utf-8")
-            return None
+        if path.is_file():
+            return path.read_text(encoding="utf-8")
+        return None
 
     def write_file(self, relative_path: str, content: str) -> bool:
         """Write a memory file (see :func:`memory_file_path`) by relative path.
@@ -186,7 +154,6 @@ class MemoryManager:
             logger.warning("Refused a path that is not a memory file: %s", relative_path)
             return False
 
-        with memory_file_lock(self.workspace, path):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content, encoding="utf-8")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
         return True
