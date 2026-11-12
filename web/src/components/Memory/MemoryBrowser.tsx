@@ -15,6 +15,7 @@ export function MemoryBrowser() {
   const [content, setContent] = useState('');
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [revision, setRevision] = useState('');
 
   useEffect(() => {
     api.listMemoryFiles().then(({ files }) => setFiles(files)).catch(console.error);
@@ -22,7 +23,8 @@ export function MemoryBrowser() {
 
   const openFile = async (path: string) => {
     try {
-      const { content } = await api.readMemoryFile(path);
+      const { content, revision } = await api.readMemoryFile(path);
+      setRevision(revision);
       setSelected(path);
       setContent(content);
       setEditing(false);
@@ -35,7 +37,8 @@ export function MemoryBrowser() {
     if (!selected) return;
     setSaving(true);
     try {
-      await api.writeMemoryFile(selected, content);
+      const saved = await api.writeMemoryFile(selected, content, revision);
+      setRevision(saved.revision);
       setEditing(false);
     } catch (e) {
       console.error('Failed to save:', e);
