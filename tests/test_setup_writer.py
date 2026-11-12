@@ -796,7 +796,8 @@ class TestApplyMode:
         assert (config.quiet_start, config.quiet_end) == ("", "")
         crons = {c.id: c.enabled for c in setup_writer.list_optional_crons(ws)}
         assert crons == {
-            "task-planner": False, "skill-extractor": True, "skill-reviser": True, "machine-maintenance": True,
+            "task-planner": False, "skill-extractor": True, "skill-reviser": True,
+            "pr-feedback-harvester": True, "machine-maintenance": True,
         }
 
     def test_personal_mode_keeps_the_installer_window(self, tmp_path: Path) -> None:
@@ -1068,6 +1069,7 @@ class TestFixRoundTwoWriterRules:
             "task-planner": "Task planner",
             "skill-extractor": "Skill extractor",
             "skill-reviser": "Skill reviser",
+            "pr-feedback-harvester": "PR feedback harvester",
             "machine-maintenance": "Machine maintenance",
         }
         assert "name" not in yaml.safe_load(setup_writer.system_cron_file(ws).read_text(encoding="utf-8"))["jobs"][0]
@@ -1125,17 +1127,20 @@ class TestModeDefaults:
         assert apply_profile_templates(ws, quiet=("22:00", "07:00")) == []
 
     def test_worker_default_crons_leave_task_planner_available_but_off(self) -> None:
-        assert setup_writer.DEFAULT_CRONS["worker"] == ["skill-reviser", "skill-extractor", "machine-maintenance"]
+        assert setup_writer.DEFAULT_CRONS["worker"] == [
+            "skill-reviser", "skill-extractor", "pr-feedback-harvester", "machine-maintenance",
+        ]
         assert setup_writer.DEFAULT_CRONS["personal"] == ["inbox-processor", "task-planner", "machine-maintenance"]
         assert setup_writer.optional_cron_ids_for("worker") == (
-            "task-planner", "skill-extractor", "skill-reviser", "machine-maintenance",
+            "task-planner", "skill-extractor", "skill-reviser", "pr-feedback-harvester", "machine-maintenance",
         )
         jobs = setup_writer.build_cron_jobs(SetupChoices(
             mode="worker", enabled_crons=list(setup_writer.DEFAULT_CRONS["worker"]),
         ))
         assert {job["id"]: job["enabled"] for job in jobs} == {
             "memory-maintenance": True, "task-planner": False,
-            "skill-extractor": True, "skill-reviser": True, "machine-maintenance": True,
+            "skill-extractor": True, "skill-reviser": True,
+            "pr-feedback-harvester": True, "machine-maintenance": True,
         }
 
 

@@ -160,7 +160,7 @@ Scheduled AI sessions via APScheduler. Three session modes:
 | **Persistent** | Accumulates context across runs. Optional rotation to manage token usage. Reminder mode for lightweight follow-ups. |
 | **Main** | Runs inside the user's primary conversation — full context access. |
 
-Built-in crons (personal mode): `skill-extractor` (12h), `skill-reviser` (weekly), `inbox-processor` (30min), `task-planner` (4h), `machine-maintenance` (weekly). Worker mode ships with `skill-reviser`, `skill-extractor` and `machine-maintenance` on and `task-planner` off; onboarding enables `task-planner` when the worker should plan through the approval loop, and configures the worker's own crons.
+Built-in crons (personal mode): `skill-extractor` (12h), `skill-reviser` (weekly), `pr-feedback-harvester` (weekly), `inbox-processor` (30min), `task-planner` (4h), `machine-maintenance` (weekly). Worker mode ships with `skill-reviser`, `skill-extractor`, `pr-feedback-harvester` and `machine-maintenance` on and `task-planner` off; onboarding enables `task-planner` when the worker should plan through the approval loop, and configures the worker's own crons.
 
 ### 📡 Source Sync
 
@@ -219,6 +219,7 @@ workspace/skills/
 - Progressive disclosure: only name + description in system prompt; full content loaded on demand
 - `skill-extractor` cron proposes new skills from repeated workflows
 - `skill-reviser` cron reviews existing skills for accuracy
+- `pr-feedback-harvester` cron turns review feedback on the agent's own PRs into skill updates
 - Usage statistics tracked per skill
 - Platform skills: an operator or a hosting platform can add read-only skills in `skills/` in the config directory ([details](docs/architecture.md#platform-skills))
 

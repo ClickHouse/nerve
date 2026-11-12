@@ -32,8 +32,8 @@ worker is configured on that page:
    This writes the worker templates (`SOUL.md`, `AGENTS.md`, `TOOLS.md`,
    `MEMORY.md`), `TASK.md` from its template with your choice in place (the
    onboarding conversation fills the rest), and `config/cron/system.yaml` with
-   `skill-extractor`, `skill-reviser` and `machine-maintenance` on and
-   `task-planner` off
+   `skill-extractor`, `skill-reviser`, `pr-feedback-harvester` and
+   `machine-maintenance` on and `task-planner` off
    (`memory-maintenance` is always on; the onboarding conversation turns
    `task-planner` on when the worker should plan through the approval loop)
 3. **Model** — an Anthropic API key, a Claude subscription token, the Claude
@@ -50,7 +50,7 @@ worker is configured on that page:
 The same choice from a terminal is `nerve init --terminal`, which asks for the
 mode and an optional task description itself and does not start the daemon
 (`nerve start` afterwards). Its worker path has no cron step, so it writes
-`skill-extractor`, `skill-reviser` and `machine-maintenance` with `enabled: false` too (`task-planner` is
+`skill-extractor`, `skill-reviser`, `pr-feedback-harvester` and `machine-maintenance` with `enabled: false` too (`task-planner` is
 off on every path until onboarding enables it): set `enabled: true` in
 `config/cron/system.yaml` (or override the job by id in `jobs.yaml`) and `nerve reload`. Unattended installs set `NERVE_MODE=worker` and
 `NERVE_TASK="…"` for `nerve init --non-interactive` (see
@@ -249,6 +249,9 @@ Workers create their own skills during onboarding and refine them over time.
 **Automated skill lifecycle:**
 - `skill-extractor` (every 12h) — watches for repeated workflows in conversations and completed tasks, proposes new skills via task+plan
 - `skill-reviser` (weekly) — reviews existing skills for accuracy, completeness, and quality, proposes revisions
+- `pr-feedback-harvester` (weekly): reads review comments on the PRs the worker opened, clusters recurring feedback, and proposes the corresponding skill or `AGENTS.md` change
+
+The first two look inward, at memory and at the skill files. The harvester is the only one that looks outward, so it's how a reviewer's correction becomes a durable rule instead of being re-learned next month. It splits its findings into **general** feedback (→ a generic skill or an instruction file) and **repo-specific** feedback (→ that repository's own dev skill).
 
 When a skill-related plan is approved, an `impl-<id>` session is spawned like for any plan; its prompt tells it to apply the plan (a full SKILL.md) with `skill_create` or `skill_update` and close the task with `task_done`.
 
@@ -330,7 +333,7 @@ Cron run history is stored in the `cron_logs` SQLite table and visible in the we
 | **Purpose** | Full-featured assistant for one human | Task-focused autonomous agent |
 | **Workspace files** | SOUL.md, IDENTITY.md, USER.md, MEMORY.md, AGENTS.md, TOOLS.md | SOUL.md, TASK.md, MEMORY.md, AGENTS.md, TOOLS.md |
 | **Memory categories** | Life-oriented (relationships, finances, health, travel) | Operational (patterns, procedures, decisions, approvals) |
-| **Default crons** | inbox-processor, task-planner, machine-maintenance, memory-maintenance | skill-extractor, skill-reviser, machine-maintenance, memory-maintenance (task-planner off until onboarding enables it) |
+| **Default crons** | inbox-processor, task-planner, machine-maintenance, memory-maintenance | skill-extractor, skill-reviser, pr-feedback-harvester, machine-maintenance, memory-maintenance (task-planner off until onboarding enables it) |
 | **Quiet hours** | 02:00–08:00 | none |
 | **Sync sources** | Telegram, Gmail, GitHub | None by default (can add custom sources) |
 | **Channels** | Web UI + Telegram bot | Web UI (+ Telegram if configured) |

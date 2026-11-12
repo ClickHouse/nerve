@@ -522,15 +522,37 @@ These ship in `<workspace>/config/cron/system.yaml`, written when the mode is ch
 | `task-planner` | Every 4 hours | persistent (168h rotation) | Reviews open tasks, explores codebases, proposes implementation plans via plan-approve workflow. Gated on `tasks` (status `pending`) — stays idle when there's nothing to plan. | ✅ default | off; onboarding enables it |
 | `skill-extractor` | Every 12 hours | persistent | Identifies repeated workflows from recent conversations, memory, and completed tasks. Proposes new skills via task+plan system. | ✅ optional | ✅ default |
 | `skill-reviser` | Weekly (Sun 3 AM) | persistent | Reviews existing skills for accuracy (outdated paths, credentials), completeness (missing steps), and quality (trigger phrases, examples). Proposes revisions via task+plan. | ✅ optional | ✅ default |
+| `pr-feedback-harvester` | Weekly (Mon 4 AM) | persistent (168h rotation) | Reads review feedback on the last week of PRs the agent authored, clusters it into recurring themes, and proposes skill or instruction-file updates via task+plan. Needs an authenticated `gh` CLI or a GitHub sync source. | ✅ optional | ✅ default |
 | `machine-maintenance` | Weekly (Sun 4 AM) | isolated | Cleans up the machine Nerve runs on. The agent first finds out what this machine has (disk use, repositories and worktrees, build and package caches, Docker, services that listen on a port), then looks only at items that are old and that nothing uses. It removes items that hold no data without asking: caches, dangling Docker images and build cache, a worktree whose pull request is merged and that has no local changes. It sends one `ask_user` for anything that can hold data (Docker volumes, stopped containers, worktrees with local work, leftover dev servers or test containers on open ports) and acts only on what the answer approves. It never touches Nerve itself, system services or anything in use. Sends a low-priority `notify` with the space freed when it changed something. | ✅ default | ✅ default |
 
 **Mode defaults:**
-- **Personal**: `memory-maintenance` (always on) + `inbox-processor` + `task-planner` + `machine-maintenance` enabled by default. `skill-extractor` and `skill-reviser` are offered as toggles on the Automation step of the setup page (and in `nerve init --terminal`).
-- **Worker**: `memory-maintenance` (always on) + `skill-extractor` + `skill-reviser` + `machine-maintenance` enabled by default when the mode is chosen on the setup page or by `NERVE_MODE=worker nerve init --non-interactive`. `task-planner` is written with `enabled: false` on every path: whether the worker plans through the approval loop is decided during onboarding (the onboarding conversation, or the session in which a worker set up without the browser sets itself up), which enables it by overriding the job by id in `jobs.yaml` with a prompt and a `tasks` gate scoped to the worker's tag (the Automation step of the setup page can also switch it on). `nerve init --terminal` has no cron step for workers and writes the two skill jobs and `machine-maintenance` with `enabled: false` as well; set `enabled: true` in `system.yaml` (or override the job by id in `jobs.yaml`), then `nerve reload`. `inbox-processor` is not included (workers don't have sync sources).
+- **Personal**: `memory-maintenance` (always on) + `inbox-processor` + `task-planner` + `machine-maintenance` enabled by default. `skill-extractor`, `skill-reviser` and `pr-feedback-harvester` are offered as toggles on the Automation step of the setup page (and in `nerve init --terminal`).
+- **Worker**: `memory-maintenance` (always on) + `skill-extractor` + `skill-reviser` + `pr-feedback-harvester` + `machine-maintenance` enabled by default when the mode is chosen on the setup page or by `NERVE_MODE=worker nerve init --non-interactive`. `task-planner` is written with `enabled: false` on every path: whether the worker plans through the approval loop is decided during onboarding (the onboarding conversation, or the session in which a worker set up without the browser sets itself up), which enables it by overriding the job by id in `jobs.yaml` with a prompt and a `tasks` gate scoped to the worker's tag (the Automation step of the setup page can also switch it on). `nerve init --terminal` has no cron step for workers and writes the three skill jobs and `machine-maintenance` with `enabled: false` as well; set `enabled: true` in `system.yaml` (or override the job by id in `jobs.yaml`), then `nerve reload`. `inbox-processor` is not included (workers don't have sync sources).
 
 `machine-maintenance` is on by default and optional in both modes: switch it off on the Automation step of the setup page, or with a job of the same id in `jobs.yaml`. Its prompt is general on purpose: the agent learns what each machine has on each run. To keep an item out of its reach, write it in `TOOLS.md` or ask the agent to remember it; the job reads both before it acts.
 
 Both skill jobs use `source="skill-extractor"` or `source="skill-reviser"` on created tasks. When their plans are approved, an `impl-<id>` session is spawned like for any plan; its prompt tells it to apply the plan (a full SKILL.md file) with `skill_create` or `skill_update` and then close the task with `task_done`.
+
+### The skill feedback loop
+
+The three skill jobs are deliberately split by where their evidence comes from:
+
+| Job | Evidence | Answers |
+|-----|----------|---------|
+| `skill-extractor` | memory + recent activity | "What do I keep doing that isn't written down?" |
+| `skill-reviser` | the SKILL.md files themselves | "Is what's written down still true?" |
+| `pr-feedback-harvester` | review comments on the agent's own PRs | "What do reviewers keep telling me I got wrong?" |
+
+Only the harvester reads anything from outside the instance, which makes it the one path by which an outside correction can reach a skill. It classifies each cluster before proposing:
+
+- **General** (commit hygiene, testing discipline, security habits) → a generic skill, or a workspace instruction file such as `AGENTS.md` via `propose_config_change`.
+- **Repo-specific** (build commands, module layout, local conventions) → that repository's own dev skill, creating one if it doesn't exist.
+
+Its tasks use `source="pr-feedback-harvester"`, which is **not** in the `plan_type` auto-detection map: a cluster can produce either a new skill or a revision, so the job passes `plan_type="skill-create"` / `"skill-update"` explicitly. Without it the plan is `generic`, and the `impl-<id>` session that its approval spawns gets the generic brief instead of the instruction to apply the plan with `skill_create` or `skill_update`.
+
+Because it ingests third-party text and then proposes edits to the agent's own instructions, its prompt carries an explicit prompt-injection guard: comments are read as evidence of what a reviewer wanted, never as instructions. Keep that guard if you customize the prompt.
+
+The prompt names no memory tool: it saves each cluster to "your memory", so the same wording works under memU and under Loom. `plan_propose` sends the notification for each plan; the job sends its own `notify` only for a `propose_config_change` pull request, which sends none.
 
 ## Persistent Timers
 

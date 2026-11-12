@@ -459,7 +459,7 @@ class TestModeLock:
         assert (optional["task-planner"]["enabled"], optional["task-planner"]["default_enabled"]) == (False, False)
         assert all(
             optional[i]["enabled"] and optional[i]["default_enabled"]
-            for i in ("skill-extractor", "skill-reviser", "machine-maintenance")
+            for i in ("skill-extractor", "skill-reviser", "pr-feedback-harvester", "machine-maintenance")
         )
         assert statuses(state)["automation"] == "pending"
 
@@ -1382,9 +1382,9 @@ class TestAutomation:
         assert auto["status"] == "done"
         assert {o["id"]: o["enabled"] for o in auto["detail"]["optional"]} == {
             "inbox-processor": False, "task-planner": True, "skill-extractor": False, "skill-reviser": False,
-            "machine-maintenance": False,
+            "pr-feedback-harvester": False, "machine-maintenance": False,
         }
-        assert auto["summary"] == "1 of 5 optional jobs on"
+        assert auto["summary"] == "1 of 6 optional jobs on"
         assert "automation" in setup_state.load_state().answered
         text = (claimed.workspace / "config" / "cron" / "system.yaml").read_text()
         assert text.startswith("# Nerve — System Cron Jobs")
@@ -1403,11 +1403,15 @@ class TestAutomation:
         async with claimed.client() as http:
             before = step((await http.get("/api/setup")).json(), "automation")
             assert {o["id"]: o["default_enabled"] for o in before["detail"]["optional"]} == {
-                "task-planner": False, "skill-extractor": True, "skill-reviser": True, "machine-maintenance": True,
+                "task-planner": False, "skill-extractor": True, "skill-reviser": True,
+                "pr-feedback-harvester": True, "machine-maintenance": True,
             }
-            assert before["summary"] == "3 of 4 optional jobs on"
+            assert before["summary"] == "4 of 5 optional jobs on"
             state = (await http.put("/api/setup/automation", json={
-                "crons": ["task-planner", "skill-extractor", "skill-reviser", "machine-maintenance"],
+                "crons": [
+                    "task-planner", "skill-extractor", "skill-reviser", "pr-feedback-harvester",
+                    "machine-maintenance",
+                ],
             })).json()
         auto = step(state, "automation")
         assert auto["status"] == "done"

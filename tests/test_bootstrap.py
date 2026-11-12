@@ -227,8 +227,13 @@ class TestNonInteractiveSetup:
         assert "task-planner" in choices.enabled_crons
 
     def test_worker_mode_defaults(self, tmp_path: Path) -> None:
-        """Worker non-interactive: the two skill jobs and machine maintenance
-        on, task-planner written but off (the onboarding conversation decides), quiet hours none."""
+        """Worker non-interactive: the three skill jobs and machine maintenance
+        on, task-planner written but off (the onboarding conversation decides), quiet hours none.
+
+        The harvester is the inbound half of the skill set: skill-reviser only
+        audits skills against themselves, so without it no reviewer feedback
+        ever reaches a skill.
+        """
         env = {
             "ANTHROPIC_API_KEY": "sk-ant-REPLACE",
             "NERVE_MODE": "worker",
@@ -238,12 +243,15 @@ class TestNonInteractiveSetup:
         with patch.dict(os.environ, env, clear=False):
             choices = run_non_interactive(tmp_path)
 
-        assert choices.enabled_crons == ["skill-reviser", "skill-extractor", "machine-maintenance"]
+        assert choices.enabled_crons == [
+            "skill-reviser", "skill-extractor", "pr-feedback-harvester", "machine-maintenance",
+        ]
         ws = tmp_path / "ws"
         system = yaml.safe_load((ws / "config" / "cron" / "system.yaml").read_text())
         assert {job["id"]: job["enabled"] for job in system["jobs"]} == {
             "memory-maintenance": True, "task-planner": False,
-            "skill-extractor": True, "skill-reviser": True, "machine-maintenance": True,
+            "skill-extractor": True, "skill-reviser": True,
+            "pr-feedback-harvester": True, "machine-maintenance": True,
         }
         settings = yaml.safe_load((ws / "config" / "settings.yaml").read_text())
         assert (settings["quiet_start"], settings["quiet_end"]) == ("", "")
@@ -258,6 +266,62 @@ class TestNonInteractiveSetup:
             run_non_interactive(tmp_path)
         settings = yaml.safe_load((tmp_path / "ws" / "config" / "settings.yaml").read_text())
         assert (settings["quiet_start"], settings["quiet_end"]) == ("02:00", "08:00")
+
+    def test_worker_crons_are_written_enabled(self, tmp_path: Path) -> None:
+        """Worker-mode crons selected above must reach system.yaml enabled."""
+        env = {
+            "ANTHROPIC_API_KEY": "sk-ant-REPLACE",
+            "NERVE_MODE": "worker",
+            "NERVE_WORKSPACE": str(tmp_path / "ws"),
+            "NERVE_TASK": "Watch the nightly build for example/repo and propose fixes.",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            run_non_interactive(tmp_path)
+
+        system_file = tmp_path / "ws" / "config" / "cron" / "system.yaml"
+        system = yaml.safe_load(system_file.read_text())
+        by_id = {j["id"]: j for j in system["jobs"]}
+        harvester = by_id["pr-feedback-harvester"]
+        assert harvester["enabled"] is True
+        assert harvester["schedule"] == "0 4 * * 1"
+        assert harvester["session_mode"] == "persistent"
+
+        # The cron service's own loader accepts the written job as it is.
+        from nerve.cron.jobs import load_jobs
+
+        loaded = {job.id: job for job in load_jobs(system_file, strict=True)}
+        job = loaded["pr-feedback-harvester"]
+        assert (job.schedule, job.session_mode, job.context_rotate_hours, job.enabled) == (
+            "0 4 * * 1", "persistent", 168, True,
+        )
+        assert job.prompt == harvester["prompt"]
+
+    def test_pr_feedback_harvester_definition(self) -> None:
+        """The harvester ships weekly, and its prompt keeps its two guardrails."""
+        from nerve.bootstrap import PRODUCTIVITY_CRONS
+        from nerve.setup_writer import describe_cron
+
+        job = next(
+            c for c in PRODUCTIVITY_CRONS if c["id"] == "pr-feedback-harvester"
+        )
+        # Weekly, and not on the same day as skill-reviser (Sun 3 AM): both
+        # propose skill edits, so they are spaced to avoid duelling proposals.
+        assert job["schedule"] == "0 4 * * 1"
+        assert describe_cron(job["schedule"]) == "Mondays at 04:00"
+        assert job["session_mode"] == "persistent"
+        assert job.get("requires"), "harvester needs GitHub access to do anything"
+
+        prompt = job["prompt"]
+        # Reads third-party text, then edits its own skills: the injection
+        # guard is load-bearing, not decoration.
+        assert "untrusted input" in prompt
+        # plan_type is NOT auto-detected for this source, so the prompt must
+        # tell the agent to pass it explicitly or skill plans silently become
+        # generic ones.
+        assert "plan_type" in prompt
+        # Loom serves none of Nerve's memory tools and this job has no Loom
+        # wording, so the prompt says "your memory" and names no memory tool.
+        assert "`memorize`" not in prompt and "memorize(" not in prompt
 
     def test_inbox_processor_default_has_idle_gate(self) -> None:
         """The default inbox-processor ships gated so idle polls are skipped."""
