@@ -3311,6 +3311,15 @@ def cron(ctx: click.Context, job_id: str) -> None:
                     if j.id not in seen_ids:
                         all_jobs.append(("system", j))
 
+                # As the daemon loads a built-in job whose system.yaml entry
+                # still holds what an earlier release shipped: the entry that
+                # runs, which is the last one with its id. It logs which job
+                # that is.
+                from nerve.cron.jobs import merge_jobs
+                from nerve.cron.service import bring_up_to_date
+
+                bring_up_to_date([j for j in merge_jobs(system_jobs, []) if j.id not in seen_ids])
+
                 for source, job in all_jobs:
                     # A reserved id is never scheduled by the daemon. Show the
                     # job rather than hiding it — the reason it isn't running is

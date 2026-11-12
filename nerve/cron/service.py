@@ -483,6 +483,81 @@ class _ClockCheckingScheduler(AsyncIOScheduler):
         return super()._process_jobs()
 
 
+def _values_of_this_release(job: CronJob) -> dict[str, str]:
+    """What this release ships for the keys of a built-in job's entry that
+    still hold what an earlier release shipped: its schedule, its description
+    and its inline prompt, each on its own
+    (:func:`nerve.setup_writer.current_values_of_shipped_job`). Empty for an
+    entry that holds none, and for a job that is not built in.
+
+    The inline prompt of a job with a ``prompt_file`` counts: it is what runs
+    when the file cannot be read. That of a workflow job is never sent, and
+    is left out."""
+    from nerve.setup_writer import current_values_of_shipped_job
+
+    values: dict[str, object] = {"schedule": job.schedule, "description": job.description}
+    if job.workflow is None:
+        values["prompt"] = job.prompt
+    return current_values_of_shipped_job(job.id, **values)
+
+
+def _keys_said(current: dict[str, str]) -> tuple[str, str]:
+    """The keys of an entry as a log line names them, and the verb that
+    follows them."""
+    return ", ".join(sorted(current)), "is" if len(current) == 1 else "are"
+
+
+def bring_up_to_date(jobs: list[CronJob]) -> None:
+    """A built-in job whose entry in ``system.yaml`` still holds what an
+    earlier release shipped is loaded as this release ships it: nothing
+    writes that file again when Nerve is updated, so without this a change to
+    a built-in job's schedule or prompt reaches new installs only. Each of
+    the schedule, the description and the inline prompt is replaced when it
+    is one that an earlier release shipped; an edited one is left alone. The
+    file is not changed.
+
+    ``jobs`` are the ``system.yaml`` entries that run. An entry in
+    ``jobs.yaml`` is the operator's and is never brought up to date
+    (:func:`_say_what_jobs_yaml_keeps`), so a schedule that an earlier
+    release shipped can still be chosen there.
+    """
+    for job in jobs:
+        current = _values_of_this_release(job)
+        if not current:
+            continue
+        for key, value in current.items():
+            setattr(job, key, value)
+        keys, verb = _keys_said(current)
+        logger.info(
+            "Cron job %s: its %s in system.yaml %s what an earlier release shipped; "
+            "the job is loaded with this release's%s",
+            job.id, keys, verb,
+            f" (schedule {job.schedule})" if "schedule" in current else "",
+        )
+
+
+def _say_what_jobs_yaml_keeps(jobs: list[CronJob]) -> None:
+    """An entry in ``jobs.yaml`` is loaded as written. One that still holds
+    the prompt an earlier release shipped for a built-in job is most likely
+    the copy that an install from before ``system.yaml`` has there, and
+    nothing but this line tells the operator that the job is not the one this
+    release ships. An entry with a prompt of its own says nothing: a schedule
+    that an earlier release shipped is then the operator's choice.
+
+    ``jobs`` are the ``jobs.yaml`` entries that are loaded."""
+    for job in jobs:
+        current = _values_of_this_release(job)
+        if "prompt" not in current:
+            continue
+        keys, verb = _keys_said(current)
+        logger.info(
+            "Cron job %s: its %s in jobs.yaml %s what an earlier release shipped; "
+            "the job is loaded as that file has it%s",
+            job.id, keys, verb,
+            f" (this release ships schedule {current['schedule']})" if "schedule" in current else "",
+        )
+
+
 def _reword_for_loom(jobs: list[CronJob]) -> None:
     """Under the Loom memory backend, a built-in job that still carries the
     prompt Nerve wrote for memU (a ``system.yaml`` from before the switch)
@@ -1736,6 +1811,7 @@ class CronService:
             # Tag all as user-sourced (no system file yet)
             for j in user_jobs:
                 j.metadata["_source"] = "user"
+            _say_what_jobs_yaml_keeps(user_jobs)
             if self.config.memory.backend == "loom":
                 # The built-in jobs live here too on such an install.
                 _reword_for_loom(user_jobs)
@@ -1745,10 +1821,15 @@ class CronService:
         # Tag sources for display in CLI
         for j in system_jobs:
             j.metadata["_source"] = "system"
-        if self.config.memory.backend == "loom":
-            _reword_for_loom(system_jobs)
         for j in user_jobs:
             j.metadata["_source"] = "user"
+        merged = merge_jobs(system_jobs, user_jobs)
+        # The system.yaml entries that run, and before the Loom wording: that
+        # is told by the memU prompt this release ships.
+        bring_up_to_date([j for j in merged if j.metadata["_source"] == "system"])
+        if self.config.memory.backend == "loom":
+            _reword_for_loom(system_jobs)
+        _say_what_jobs_yaml_keeps([j for j in merged if j.metadata["_source"] == "user"])
 
         # Merge: user jobs override system jobs with same ID
         system_ids = {j.id for j in system_jobs}
@@ -1759,7 +1840,7 @@ class CronService:
                     job.id,
                 )
 
-        kept, self._rejected_job_ids = _drop_reserved(merge_jobs(system_jobs, user_jobs))
+        kept, self._rejected_job_ids = _drop_reserved(merged)
         return kept
 
     async def _run_job_wrapper(

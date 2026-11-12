@@ -157,9 +157,9 @@ Filesystem-based skill system (Claude SDK compatible):
 - SQLite index for metadata + usage statistics (`skills`, `skill_usage` tables)
 - Progressive disclosure: name+description in system prompt, full content loaded on demand via `skill_get` tool
 - Agent can create/update skills dynamically via `skill_create`/`skill_update` MCP tools
-- Automated extraction: `skill-extractor` cron identifies repeated workflows and proposes new skills via task+plan system
+- Automated extraction: `skill-extractor` cron identifies repeated workflows and proposes at most one new skill per run via task+plan system; the plan states the evidence and the direction, and the session that implements the approved plan writes the skill
 - Automated revision: `skill-reviser` cron reviews existing skills for accuracy, completeness, and quality
-- Plan approval handler creates/updates skills directly when approving skill-extractor/skill-reviser proposals
+- An approved skill plan (`skill-create` / `skill-update`) is implemented by an `impl-<id>` session, like any plan, which creates or updates the skill with `skill_create`/`skill_update`
 
 #### Platform skills
 

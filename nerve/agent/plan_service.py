@@ -72,6 +72,14 @@ def _build_impl_prompt(
     (call ``skill_create`` / ``skill_update``); everything else gets the
     generic "follow the plan step by step" prompt. Kept here so the WebUI,
     MCP, and Telegram approve paths all spawn identically-briefed sessions.
+
+    A ``skill-create`` plan says what the skill is for, what shows that it is
+    needed and where it should go. The session writes the skill, within that
+    direction: the plan was approved as a proposal, and whoever writes the
+    skill should work from what was done, not copy a draft. A plan can still
+    hold a complete SKILL.md (one proposed before this, by a person, or under
+    a prompt of the operator's own); that is a draft to check, and its body
+    alone is the skill's content.
     """
     if plan_type in ("skill-create", "skill-update"):
         prompt = (
@@ -83,11 +91,24 @@ def _build_impl_prompt(
         )
         if plan_type == "skill-create":
             prompt += (
-                "The plan contains a skill specification. "
-                "Use the `skill_create` tool to create the skill. "
-                "Extract the name, description, and content from the plan. "
-                "If the plan contains a full SKILL.md with frontmatter, parse out the name and description "
-                "from the frontmatter and use the body as the content.\n"
+                "The plan proposes a new skill: what it is for, the evidence that it is needed, "
+                "and the direction it should take. "
+                "You write the skill, and you decide what goes into it, within the direction the plan gives.\n\n"
+                "1. Look at the evidence the plan names (the sessions, tasks and dates) with the tools you have, "
+                "your memory included, so that the skill says what was really done.\n"
+                "2. Look at the existing skills (`skill_list`; `skill_get` for one that looks close), "
+                "so that the new skill repeats none of them.\n"
+                "3. Decide the skill's name (one that no existing skill has), its description (third person, "
+                "with the phrases that should trigger it) and its content: the steps, the commands, examples, "
+                "and what is known to go wrong.\n"
+                "4. Create the skill with the `skill_create` tool.\n\n"
+                "If the plan holds a complete SKILL.md, take it as a draft: check it against the evidence, "
+                "change what the evidence does not support, and pass its body, without the frontmatter, "
+                "as the content.\n"
+                "If the evidence does not support a skill, or an existing skill already covers it, "
+                "create none, and tell the user why with `notify`: they approved the plan and expect a skill.\n"
+                "\nWhen you are done, mark the task as done using `task_done`, with a note that says "
+                "what was done, or why no skill was created.\n"
             )
         else:
             prompt += (
@@ -95,11 +116,9 @@ def _build_impl_prompt(
                 "Use the `skill_update` tool to update the existing skill. "
                 "Pass the skill ID (directory name) as the name parameter and the full SKILL.md content "
                 "(frontmatter + body).\n"
+                "\nAfter the skill is created/updated, mark the task as done using "
+                "`task_done` with a note describing what was done.\n"
             )
-        prompt += (
-            "\nAfter the skill is created/updated, mark the task as done using "
-            "`task_done` with a note describing what was done.\n"
-        )
         return prompt
 
     return (
