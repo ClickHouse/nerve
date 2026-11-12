@@ -186,3 +186,58 @@ class TestMemoryFileRoutes:
         assert sum(isinstance(result, HTTPException) and result.status_code == 409
                    for result in results) == 1
         assert (ws / "MEMORY.md").read_text() in ("first write\n", "second write\n")
+
+    def test_managed_writer_lock_blocks_stale_editor_save(self, client, ws):
+        """The gateway must hold the same lock as managed memory writers."""
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        from nerve.memory.manager import memory_file_lock
+
+        path = ws / "MEMORY.md"
+        url = "/api/memory/file/MEMORY.md"
+        revision = client.get(url).json()["revision"]
+        started = Event()
+
+        def save():
+            started.set()
+            return client.put(url, json={
+                "content": "browser", "expected_revision": revision,
+            })
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with memory_file_lock(ws, path):
+                future = pool.submit(save)
+                assert started.wait(2)
+                # A Nerve-managed writer owns the lock during its update.
+                path.write_text("agent update", encoding="utf-8")
+                assert not future.done()
+            result = future.result(timeout=5)
+
+        assert result.status_code == 409
+        assert path.read_text(encoding="utf-8") == "agent update"
+
+    def test_memory_manager_and_editor_share_the_same_lock(self, client, ws):
+        """Manager writes cannot pass an in-progress editor critical section."""
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event
+
+        from nerve.memory.manager import memory_file_lock
+
+        manager = MemoryManager(ws)
+        path = ws / "MEMORY.md"
+        started = Event()
+
+        def managed_write():
+            started.set()
+            manager.write_file("MEMORY.md", "new agent note")
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            with memory_file_lock(ws, path):
+                future = pool.submit(managed_write)
+                assert started.wait(2)
+                assert not future.done()
+                assert path.read_text(encoding="utf-8") == "# Memory\\n"
+            future.result(timeout=5)
+
+        assert path.read_text(encoding="utf-8") == "new agent note"
