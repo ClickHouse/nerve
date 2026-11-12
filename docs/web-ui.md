@@ -576,6 +576,27 @@ npx vite build
 
 The dev server proxies `/api` and `/ws` to `localhost:8900`.
 
+### Snapshot tests
+
+`web/e2e/snapshots.spec.ts` screenshots a few pages at desktop and phone size
+and compares them with the PNGs committed in `web/e2e/snapshots.spec.ts-snapshots/`.
+The pages are served by a throwaway passwordless Nerve that
+`scripts/ui_snapshot_server.py` seeds with synthetic data and fixed timestamps.
+The browser clock, timezone and locale are pinned, so the pixels do not change
+between runs.
+
+The tests run in the official Playwright image, so the result is the same on
+every machine, including Apple Silicon. Docker is required:
+
+```bash
+web/e2e/snapshots.sh                      # compare, as the `UI snapshots` CI job does
+web/e2e/snapshots.sh --update-snapshots   # rewrite the baselines after a UI change
+```
+
+Commit the rewritten PNGs with the change. GitHub shows each one as a
+before/after image diff in the pull request. When the CI job fails, its
+`ui-snapshots-report` artifact holds the expected, actual and diff images.
+
 ## Build & Deploy
 
 ```bash
