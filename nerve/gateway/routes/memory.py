@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,11 +27,16 @@ from nerve.config import (
 )
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
-from nerve.memory.manager import memory_file_lock, memory_file_path
+from nerve.memory.manager import memory_file_path
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(dependencies=[Depends(require_auth)])
+
+# Serializes read/check/write among requests handled by this gateway process.
+# External agent/shell writes bypass this lock. The content revision protects
+# stale editor saves after those writes have completed.
+_memory_file_route_lock = threading.Lock()
 
 
 # --- Memory files ---
@@ -100,7 +106,7 @@ async def read_memory_file(file_path: str):
     full_path = config.workspace / file_path
     path = _memory_file(config.workspace, file_path)
     def _read() -> bytes:
-        with memory_file_lock(config.workspace, path):
+        with _memory_file_route_lock:
             try:
                 return path.read_bytes()
             except (FileNotFoundError, IsADirectoryError):
@@ -136,7 +142,7 @@ async def write_memory_file(file_path: str, req: FileWriteRequest):
     path = _memory_file(config.workspace, file_path)
 
     def _write() -> str:
-        with memory_file_lock(config.workspace, path):
+        with _memory_file_route_lock:
             # Verify the editor's read snapshot before replacing its contents.
             # Legacy callers without a revision retain their previous semantics.
             if req.expected_revision is not None:
