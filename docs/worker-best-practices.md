@@ -79,7 +79,7 @@ A run gate is checked right before a job fires; when it is not satisfied, no ses
 - `github_pr_activity`: something actionable changed on an author's open PRs (a merge or close, a new commit, a review, a CI transition, a human comment); `force_run_after_hours` fires it anyway after a quiet spell.
 - `clickhouse_query`: a ClickHouse query, run through an MCP server such as the ClickHouse Cloud one, gives a true first value; `cooldown_minutes` sets how often it fires while the value stays true, and the run's prompt gets the rows.
 
-Gates in one list must all pass and are checked in order, so put the cheap `tasks` gate before the network-backed `github_pr_activity` and `clickhouse_query`. A gate that errors while checking lets the run proceed, except `clickhouse_query`, which skips the run and sends the job's failure notice after three failed checks in a row; a gate type that does not exist keeps the job from loading. Drop-in plugins in `config/cron/gates/` add conditions the built-in types do not cover. Scan jobs stay ungated: their job is to find work nobody has recorded yet.
+Gates in one list must all pass and are checked in order, so put the cheap `tasks` gate before the network-backed `github_pr_activity` and `clickhouse_query`. A gate that errors while checking lets the run proceed, except `clickhouse_query`, which skips the run and sends a notice after three failed checks in a row; a gate type that does not exist keeps the job from loading. Drop-in plugins in `config/cron/gates/` add conditions the built-in types do not cover. Scan jobs stay ungated: their job is to find work nobody has recorded yet.
 
 ### Locks, catch-up and session modes
 

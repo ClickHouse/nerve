@@ -328,7 +328,7 @@ column and the data the agent needs in the next columns.
 | `cooldown_minutes` | number | 360 | While the value stays true, the time from one run to the next. `0` runs on each check with a true value |
 | `max_rows` | int | 50 | Rows that the run's prompt gets, at most 500. `0` gives the prompt nothing |
 | `timeout_seconds` | number | 30 | Time limit for the whole call, at most 120 |
-| `notify_after_failures` | int | 3 | The failed check in a row that is recorded as a failed run and sends the job's failure notice. `0` sends nothing |
+| `notify_after_failures` | int | 3 | The failed check in a row that sends the "run gate check failed" notice. `0` sends no notice |
 
 ```yaml
 run_if:
@@ -368,12 +368,15 @@ service where MCP is off.
 
 **A series of failed checks is reported.** The gate counts the failed checks
 in a row. The check that fails for the `notify_after_failures`-th time in a row
-(default 3) is recorded as a failed run of the job, without a session, and
-sends the job's failure notice, "Cron job `<id>` failed", with the last error.
-The checks that fail after it send nothing more. A check that works starts the
-count again, and the next run that works sends "Cron job `<id>` works again".
-One failed check is usual and sends nothing: a check that wakes an idle
-ClickHouse Cloud service fails once.
+(default 3) sends the notice "Cron job `<id>`: run gate check failed" (high),
+with the last error. The checks that fail after it send nothing more. The
+first check that works after the notice sends "Cron job `<id>`: run gate check
+works again" (low), whether the value is true or false. A second series of
+failures sends its own pair. One failed check is usual and sends nothing: a
+check that wakes an idle ClickHouse Cloud service fails once. A gate check is
+not a run: the notices write no row to the job's run history, and the job's
+run status and its run notices ("Cron job `<id>` failed", "works again") stay
+as its runs left them.
 
 **The prompt.** When the gate passes, the run's prompt gets a block after the
 job's prompt: the query, the time of the check, and up to `max_rows` rows as
@@ -539,9 +542,10 @@ that name its gate, see below):
 > A gate that keeps state for the run it lets through adds a callback to
 > `ctx.on_run`: Nerve calls it only when the run starts, so a later gate that
 > skips the run, or a run that does not start, does not use up that state. A
-> gate whose check failed can add a message to `ctx.failures`: Nerve records it
-> as a failed run of the job and sends the job's failure notice, so add one
-> only when the failure needs attention. A gate that needs live runtime
+> gate can add a `GateNotice` to `ctx.notices` when its own check fails, or
+> works again after failures it reported: Nerve sends each notice to the user,
+> so the gate decides when one is due (for example once for each series of
+> failures). A gate that needs live runtime
 > state, e.g. which sessions are currently running, is **not** supported by
 > this loader; that would require widening the gate context, a separate change.
 

@@ -36,6 +36,7 @@ from nerve.cron.gates import (
     CronGate,
     GateConfigError,
     GateContext,
+    GateNotice,
     build_gate,
     evaluate_gates,
 )
@@ -471,8 +472,8 @@ class TestFailedChecksSkip:
         with caplog.at_level(logging.WARNING, logger="nerve.cron.gates"):
             decision = await _check(gate)
         assert decision.should_run is False
-        assert decision.failures == []  # one failure is not on record
-        assert _state(gate) == {"value": None, "last_fire": None, "failures": 1}
+        assert decision.notices == []  # one failure gives no notice
+        assert _state(gate) == {"value": None, "last_fire": None, "failures": 1, "reported": False}
         assert "the run is skipped" in caplog.text
 
     @pytest.mark.asyncio
@@ -517,48 +518,95 @@ class TestFailedChecksSkip:
         assert fake_call.calls == []
 
 
-class TestFailuresOnRecord:
-    """The ``notify_after_failures``-th failed check in a row is on record."""
+def _kinds(decision) -> list[str]:
+    return ["failed" if n.failed else "works again" for n in decision.notices]
+
+
+class TestGateNotices:
+    """A series of failed checks gives one "failed" notice and one "works
+    again" notice."""
 
     @pytest.mark.asyncio
-    async def test_the_third_failure_in_a_row_is_on_record_once(self, fake_call, clock):
+    async def test_the_third_failure_in_a_row_gives_one_notice(self, fake_call, clock):
         fake_call.result = McpCallError("MCP server 'clickhouse' refused run_select_query: expired")
         gate = _gate()
-        failures = [(await _check(gate)).failures for _ in range(5)]
-        assert [len(f) for f in failures] == [0, 0, 1, 0, 0]
-        message = failures[2][0]
+        decisions = [await _check(gate) for _ in range(5)]
+        assert [_kinds(d) for d in decisions] == [[], [], ["failed"], [], []]
+        message = decisions[2].notices[0].message
         assert "could not check 3 times in a row" in message
         assert "MCP server clickhouse" in message
         assert "expired" in message
-        assert _state(gate)["failures"] == 5
+        assert _state(gate)["failures"] == 5 and _state(gate)["reported"] is True
 
     @pytest.mark.asyncio
-    async def test_a_check_that_works_starts_the_count_again(self, fake_call, clock):
+    async def test_the_check_that_works_after_a_notice_says_so_once(self, fake_call, clock):
+        gate = _gate()
+        fake_call.result = McpCallError("down")
+        for _ in range(4):
+            await _check(gate)
+        fake_call.result = _rows([0])
+        decision = await _check(gate)
+        assert _kinds(decision) == ["works again"]
+        assert "after 4 failed checks in a row" in decision.notices[0].message
+        assert _kinds(await _check(gate)) == []
+        assert _state(gate)["failures"] == 0 and _state(gate)["reported"] is False
+
+    @pytest.mark.asyncio
+    async def test_works_again_comes_with_a_run(self, fake_call, clock):
+        gate = _gate()
+        fake_call.result = McpCallError("down")
+        for _ in range(3):
+            await _check(gate)
+        fake_call.result = _rows([1])
+        decision = await _check(gate)
+        assert decision.should_run is True and _kinds(decision) == ["works again"]
+
+    @pytest.mark.asyncio
+    async def test_a_second_series_gives_a_second_notice(self, fake_call, clock):
+        """The case of the review: two outages with no run between them."""
+        gate = _gate()
+        kinds: list[str] = []
+        for result in [McpCallError("down")] * 3 + [_rows([0])] + [McpCallError("down again")] * 3:
+            fake_call.result = result
+            kinds += _kinds(await _check(gate))
+        assert kinds == ["failed", "works again", "failed"]
+
+    @pytest.mark.asyncio
+    async def test_failures_without_a_notice_give_no_works_again(self, fake_call, clock):
         gate = _gate()
         for result in [McpCallError("down"), McpCallError("down"), _rows([0])]:
             fake_call.result = result
-            assert (await _check(gate)).failures == []
+            assert (await _check(gate)).notices == []
         assert _state(gate)["failures"] == 0
         fake_call.result = McpCallError("down")
-        assert [len((await _check(gate)).failures) for _ in range(3)] == [0, 0, 1]
+        assert [len((await _check(gate)).notices) for _ in range(3)] == [0, 0, 1]
 
     @pytest.mark.asyncio
     async def test_the_count_is_kept_on_disk(self, fake_call, clock):
         fake_call.result = McpCallError("down")
         await _check(_gate())
         await _check(_gate())
-        assert len((await _check(_gate())).failures) == 1
+        assert _kinds(await _check(_gate())) == ["failed"]
+        fake_call.result = _rows([0])
+        assert _kinds(await _check(_gate())) == ["works again"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("after, reported_at", [(1, 0), (0, None)])
     async def test_notify_after_failures(self, fake_call, clock, after, reported_at):
         fake_call.result = McpCallError("down")
         gate = _gate(notify_after_failures=after)
-        counts = [len((await _check(gate)).failures) for _ in range(4)]
+        counts = [len((await _check(gate)).notices) for _ in range(4)]
         assert counts == [1 if i == reported_at else 0 for i in range(4)]
 
     @pytest.mark.asyncio
-    async def test_a_failure_on_record_keeps_the_value_and_the_cooldown(self, fake_call, clock):
+    async def test_a_lower_limit_during_a_series_gives_the_notice(self, fake_call, clock):
+        fake_call.result = McpCallError("down")
+        for _ in range(4):
+            await _check(_gate(notify_after_failures=10))
+        assert _kinds(await _check(_gate(notify_after_failures=3))) == ["failed"]
+
+    @pytest.mark.asyncio
+    async def test_failed_checks_keep_the_value_and_the_cooldown(self, fake_call, clock):
         gate = _gate(cooldown_minutes=60)
         assert (await _check(gate)).should_run is True
         fired = _state(gate)["last_fire"]
@@ -566,7 +614,7 @@ class TestFailuresOnRecord:
         for _ in range(3):
             clock.advance(minutes=1)
             await _check(gate)
-        assert _state(gate) == {"value": True, "last_fire": fired, "failures": 3}
+        assert _state(gate) == {"value": True, "last_fire": fired, "failures": 3, "reported": True}
 
 
 # ---------------------------------------------------------------------------
@@ -584,7 +632,7 @@ class _Recorder(CronGate):
     async def is_satisfied(self, ctx: GateContext) -> bool:
         ctx.notes.append(f"note {self.name}")
         ctx.on_run.append(lambda: self.log.append(self.name))
-        ctx.failures.append(f"failure {self.name}")
+        ctx.notices.append(GateNotice(failed=True, message=f"notice {self.name}"))
         if self.raises:
             raise RuntimeError("broken")
         return True
@@ -633,19 +681,21 @@ class TestEvaluateGatesNotesAndOnRun:
         assert decision.should_run is True  # fail-open
         decision.record_run("j")
         assert decision.notes == ["note b"] and log == ["b"]
-        assert decision.failures == ["failure b"]
+        assert [n.message for n in decision.notices] == ["notice b"]
 
     @pytest.mark.asyncio
-    async def test_failures_come_with_a_skip_and_with_a_run(self):
-        class _Failing(_Stub):
+    async def test_notices_come_with_a_skip_and_with_a_run(self):
+        notice = GateNotice(failed=True, message="could not check")
+
+        class _Noticing(_Stub):
             async def is_satisfied(self, ctx):
-                ctx.failures.append("could not check")
+                ctx.notices.append(notice)
                 return self.satisfied
 
         ctx = GateContext(job_id="j", db=AsyncMock())
-        assert (await evaluate_gates([_Failing(False)], ctx)).failures == ["could not check"]
+        assert (await evaluate_gates([_Noticing(False)], ctx)).notices == [notice]
         ctx = GateContext(job_id="j", db=AsyncMock())
-        assert (await evaluate_gates([_Failing(True)], ctx)).failures == ["could not check"]
+        assert (await evaluate_gates([_Noticing(True)], ctx)).notices == [notice]
 
     @pytest.mark.asyncio
     async def test_a_callback_that_raises_does_not_stop_the_run(self, caplog):
@@ -962,7 +1012,7 @@ class TestPromptGetsTheNotes:
 
 
 # ---------------------------------------------------------------------------
-# The cron service: when the run is recorded, and failures on record
+# The cron service: when the run is recorded, and the gate notices
 # ---------------------------------------------------------------------------
 
 class _OnRunGate(_Stub):
@@ -1098,48 +1148,92 @@ async def real_db_service(db):
     return service
 
 
-class TestGateFailuresAreFailedRuns:
+def _titles(svc: CronService) -> list[tuple[str, str]]:
+    return [
+        (c.kwargs["title"], c.kwargs["priority"])
+        for c in svc.notification_service.send_notification.call_args_list
+    ]
+
+
+def _spike_job() -> CronJob:
+    return CronJob(
+        id="spike", schedule="5m", prompt="look at the spike",
+        run_if=[{"type": "clickhouse_query", "server": "clickhouse", "query": "SELECT 1"}],
+    )
+
+
+class TestGateNoticesAreSent:
     @pytest.mark.asyncio
-    async def test_a_series_of_failures_is_one_failed_run_and_one_notice(
+    async def test_a_series_of_failures_gives_one_notice_and_no_run_row(
         self, real_db_service, db, fake_call, clock,
     ):
-        svc = real_db_service
-        job = CronJob(
-            id="spike", schedule="5m", prompt="look at the spike",
-            run_if=[{"type": "clickhouse_query", "server": "clickhouse", "query": "SELECT 1"}],
-        )
+        svc, job = real_db_service, _spike_job()
         fake_call.result = McpCallError("MCP server 'clickhouse' refused run_select_query: key expired")
         for _ in range(5):
             await svc._run_job_inner(job)
         svc.engine.run_cron.assert_not_called()
-        logs = sorted(await db.get_cron_logs("spike"), key=lambda row: row["id"])
-        assert [(row["status"], row["session_id"]) for row in logs] == [("error", None)]
-        assert "could not check 3 times in a row" in logs[0]["error"]
-        assert "key expired" in logs[0]["error"]
-        calls = svc.notification_service.send_notification.call_args_list
-        assert [(c.kwargs["title"], c.kwargs["priority"]) for c in calls] == [("Cron job spike failed", "high")]
-        assert "key expired" in calls[0].kwargs["body"]
+        assert await db.get_cron_logs("spike") == []
+        assert _titles(svc) == [("Cron job spike: run gate check failed", "high")]
+        call = svc.notification_service.send_notification.call_args
+        assert "key expired" in call.kwargs["body"]
+        assert call.kwargs["metadata"] == {"cron_job_id": "spike"}
 
-        # The check works again and the value is true: the run says so.
         fake_call.result = _rows([1])
         await svc._run_job_inner(job)
         svc.engine.run_cron.assert_awaited_once()
-        calls = svc.notification_service.send_notification.call_args_list
-        assert calls[-1].kwargs["title"] == "Cron job spike works again"
+        assert _titles(svc)[1:] == [("Cron job spike: run gate check works again", "low")]
 
     @pytest.mark.asyncio
-    async def test_a_record_that_fails_does_not_stop_the_skip(self, real_db_service, caplog):
-        svc = real_db_service
-        svc.db.log_cron_start = AsyncMock(side_effect=RuntimeError("db down"))
+    async def test_two_outages_with_no_run_between_give_two_notices(
+        self, real_db_service, db, fake_call, clock,
+    ):
+        """The case of the review: the value stays false between the outages."""
+        svc, job = real_db_service, _spike_job()
+        for result in [McpCallError("down")] * 3 + [_rows([0])] + [McpCallError("down again")] * 3:
+            fake_call.result = result
+            await svc._run_job_inner(job)
+        assert _titles(svc) == [
+            ("Cron job spike: run gate check failed", "high"),
+            ("Cron job spike: run gate check works again", "low"),
+            ("Cron job spike: run gate check failed", "high"),
+        ]
+        assert await db.get_cron_logs("spike") == []
 
-        class _Failing(_Stub):
+    @pytest.mark.asyncio
+    async def test_a_run_that_fails_after_an_outage_still_gives_its_notice(
+        self, real_db_service, db, fake_call, clock,
+    ):
+        """The run notices see only runs, so a gate outage hides no run failure."""
+        svc, job = real_db_service, _spike_job()
+        fake_call.result = _rows([1])
+        await svc._run_job_inner(job)  # a run that works
+        fake_call.result = McpCallError("down")
+        for _ in range(3):
+            await svc._run_job_inner(job)
+        svc.engine.run_cron = AsyncMock(side_effect=RuntimeError("the agent failed"))
+        fake_call.result = _rows([1])
+        clock.advance(hours=7)  # after the cooldown
+        await svc._run_job_inner(job)
+        assert _titles(svc) == [
+            ("Cron job spike: run gate check failed", "high"),
+            ("Cron job spike: run gate check works again", "low"),
+            ("Cron job spike failed", "high"),
+        ]
+        assert [row["status"] for row in await db.get_cron_logs("spike")] == ["error", "success"]
+
+    @pytest.mark.asyncio
+    async def test_a_notice_that_fails_does_not_stop_the_skip(self, real_db_service, caplog):
+        svc = real_db_service
+        svc.notification_service.send_notification = AsyncMock(side_effect=RuntimeError("down"))
+
+        class _Noticing(_Stub):
             async def is_satisfied(self, ctx):
-                ctx.failures.append("could not check")
+                ctx.notices.append(GateNotice(failed=True, message="could not check"))
                 return False
 
         job = _make_job()
-        job.gates = [_Failing(False)]
+        job.gates = [_Noticing(False)]
         with caplog.at_level(logging.WARNING, logger="nerve.cron.service"):
             await svc._run_job_inner(job)
-        assert "Could not record a gate failure" in caplog.text
+        assert "Gate notice for cron job" in caplog.text
         svc.engine.run_cron.assert_not_called()

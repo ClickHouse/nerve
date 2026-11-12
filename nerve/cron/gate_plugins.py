@@ -50,10 +50,10 @@ Rules (all fail-safe — a bad plugin never crashes the daemon):
 * A gate gets a ``GateContext``: ``job_id`` and ``db``, and for the check
   before a run the MCP servers of new sessions (``mcp_servers``,
   ``mcp_managed``), plus ``notes`` (text for the run's prompt), ``on_run``
-  (callbacks called when the run starts) and ``failures`` (failed checks to
-  record as failed runs, with a notice). A liveness/registry based gate is
-  out of scope for this loader: it would need the context widened, a
-  separate change.
+  (callbacks called when the run starts) and ``notices`` (``GateNotice``
+  messages about the gate's own check, sent to the user). A liveness/registry
+  based gate is out of scope for this loader: it would need the context
+  widened, a separate change.
 * **A gate that does not define ``forecast`` has its check run on every
   schedule read, so that check must be side-effect-free.** A gate also answers
   ``forecast(ctx, at)``: what it would decide for a run at ``at``, judged from

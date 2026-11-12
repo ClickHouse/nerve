@@ -1838,8 +1838,8 @@ class CronService:
                     mcp_managed=self.engine.managed_mcp,
                 ),
             )
-            if decision.failures:
-                await self._record_gate_failures(job, decision.failures, attribution)
+            if decision.notices:
+                await self._send_gate_notices(job.id, decision.notices)
             if not decision.should_run:
                 logger.info("Skipping cron job %s: %s", job.id, decision.reason)
                 return
@@ -1967,29 +1967,37 @@ class CronService:
                 job.id, log_id, "error", error=str(e), session_id=session_id,
             )
 
-    async def _record_gate_failures(
-        self, job: CronJob, failures: list[str], attribution: Attribution | None,
-    ) -> None:
-        """Record each gate failure as a failed run of *job*, without a
-        session, and send the job's failure notice (:meth:`_send_health_notice`).
+    async def _send_gate_notices(self, job_id: str, notices: list) -> None:
+        """Send the notices that the job's gates give about their own checks
+        (:class:`nerve.cron.gates.GateNotice`).
 
-        A gate adds a failure only when it wants it on record, for example
-        after some failed checks in a row (:attr:`nerve.cron.gates.GateContext.failures`).
-        The next run that works sends "works again". A failure to record is
-        logged and does not change the run.
+        "Cron job <id>: run gate check failed" (high) carries the gate's
+        message, "Cron job <id>: run gate check works again" (low) follows
+        it. A gate gives each notice once, so this sends each one. A gate
+        check is not a run: no run log row is written, and the job's run
+        status and its run notices (:meth:`_send_health_notice`) stay as the
+        runs left them. A notice that fails is logged.
         """
-        for message in failures:
+        for notice in notices:
+            if notice.failed:
+                logger.warning("Cron job %s: %s", job_id, notice.message)
+            else:
+                logger.info("Cron job %s: %s", job_id, notice.message)
+            service = self.notification_service
+            if service is None:
+                continue
+            title = f"Cron job {job_id}: run gate check " + (
+                "failed" if notice.failed else "works again"
+            )
             try:
-                log_id = await self.db.log_cron_start(
-                    job.id, attribution=attribution or self._own_attribution(),
+                await service.send_notification(
+                    session_id="system", title=title,
+                    body=_failure_notice_body(notice.message) if notice.failed else notice.message,
+                    priority="high" if notice.failed else "low",
+                    metadata={"cron_job_id": job_id},
                 )
-                await self.db.log_cron_finish(log_id, "error", error=message)
-                logger.warning("Cron job %s: %s", job.id, message)
-                await self._send_health_notice(job.id, log_id, "error", error=message)
             except Exception:
-                logger.warning(
-                    "Could not record a gate failure of cron job %s", job.id, exc_info=True,
-                )
+                logger.warning("Gate notice for cron job %s failed", job_id, exc_info=True)
 
     async def _send_health_notice(
         self, job_id: str, log_id: int, status: str, *,
