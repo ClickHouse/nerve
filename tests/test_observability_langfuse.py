@@ -586,6 +586,52 @@ def test_other_attributes_keep_plain_text_redaction(key):
     assert changed == {key: "[REDACTED]"}
 
 
+# A pattern that spans JSON syntax only matches the text form of a value.
+_JSON_TEXT_PATTERNS = (
+    (r'token":"[^"]*"', '{"token":"TOP-SECRET"}', '{"[REDACTED]}'),
+    (r'token": "[^"]*"', '{"token": "TOP-SECRET"}', '{"[REDACTED]}'),
+)
+
+
+@pytest.mark.parametrize("key", [
+    "langfuse.trace.metadata.note", "langfuse.observation.metadata",
+])
+@pytest.mark.parametrize(("pattern", "text", "expected"), _JSON_TEXT_PATTERNS)
+def test_metadata_string_that_holds_json_is_matched_as_text(key, pattern, text, expected):
+    changed = lf.redact_attributes(
+        {key: json.dumps(text)}, lf._compile_patterns([pattern]),
+    )
+    assert json.loads(changed[key]) == expected
+    assert "TOP-SECRET" not in changed[key]
+
+
+@pytest.mark.parametrize("key", ["input", "gen_ai.prompt"])
+@pytest.mark.parametrize(("pattern", "text", "expected"), _JSON_TEXT_PATTERNS)
+def test_attribute_that_holds_json_is_matched_as_text(key, pattern, text, expected):
+    changed = lf.redact_attributes({key: text}, lf._compile_patterns([pattern]))
+    assert changed == {key: expected}
+
+
+def test_text_match_and_escaped_match_in_one_json_value_are_both_redacted():
+    # The second secret has an escaped character, so only the decoded
+    # value shows it. The first pattern breaks the JSON text.
+    value = json.dumps({"token": "TOP-SECRET", "note": "private-π-token"})
+    patterns = lf._compile_patterns([r'token": "[^"]*"', "private-π-token"])
+    for key in ("input", "langfuse.trace.metadata.note"):
+        attribute = json.dumps(value) if key.startswith("langfuse.") else value
+        redacted = lf.redact_attributes({key: attribute}, patterns)[key]
+        text = json.loads(redacted) if key.startswith("langfuse.") else redacted
+        assert text == '{"[REDACTED], "note": "[REDACTED]"}'
+
+
+def test_number_in_json_text_is_redacted_and_json_stays_valid():
+    value = json.dumps({"account": 1234567890123, "ok": 7})
+    changed = lf.redact_attributes(
+        {"input": value}, lf._compile_patterns([r"\d{10,}"]),
+    )
+    assert json.loads(changed["input"]) == {"account": "[REDACTED]", "ok": 7}
+
+
 def test_mask_hook_patches_only_spans_with_secrets():
     types = pytest.importorskip("langfuse.types", reason="langfuse not installed")
     lf._redact_patterns = _default_patterns()
@@ -778,6 +824,32 @@ async def test_anthropic_json_text_is_redacted_on_export(real_export_pipeline):
     assert len(exported) == 1
     messages = json.loads(exported[0].attributes["gen_ai.input.messages"])
     assert messages[0]["parts"][0]["content"] == "[REDACTED] [REDACTED]"
+
+
+def test_json_text_in_strings_is_matched_as_text_on_export(real_export_pipeline):
+    """A pattern that spans JSON syntax redacts metadata strings and other
+    attributes that hold JSON text. The metadata attributes stay JSON."""
+    from langfuse._client.attributes import create_span_attributes
+    from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
+
+    provider, delegate, _ = real_export_pipeline
+    lf._redact_patterns = lf._compile_patterns([r'token":"[^"]*"'])
+    lf._enabled = True
+    text = json.dumps({"token": "TOP-SECRET"}, separators=(",", ":"))
+    tracer = provider.get_tracer("langsmith")
+    with lf.attributes(session_id="session-1", metadata={"note": text}):
+        with tracer.start_as_current_span("claude.assistant.turn") as span:
+            span.set_attributes(create_span_attributes(metadata={"note": text}))
+            span.set_attribute("input", text)
+    provider.force_flush()
+
+    exported = [span for batch in delegate.batches for span in batch]
+    assert len(exported) == 1
+    attributes = exported[0].attributes
+    for key in ("langfuse.trace.metadata.note", "langfuse.observation.metadata.note"):
+        assert json.loads(attributes[key]) == '{"[REDACTED]}'
+    assert attributes["input"] == '{"[REDACTED]}'
+    assert b"TOP-SECRET" not in encode_spans(exported).SerializeToString()
 
 
 def test_sdk_metadata_is_redacted_on_export_and_stays_json(real_export_pipeline):
