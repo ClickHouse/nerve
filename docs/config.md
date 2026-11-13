@@ -1529,6 +1529,16 @@ was delivered, and the card then shows the answer without buttons. A press
 that answers nothing, for example a second press, gets a short notice and
 the card stays. An expired card is edited without buttons.
 
+A message in the thread under a notification card goes to the session that
+raised the notification, and Nerve answers in that thread. The session must
+exist and must not be archived; otherwise the message goes where a message
+without a card goes. In a direct message too, only that thread goes to the
+session: the direct message keeps its own session for every other message.
+An event can also name the message that it replies to (`reply_to`). When
+that is a card, for example because the gateway posted the card as copies in
+other conversations and the person replied under a copy, the message goes to
+the session of that card in the same way.
+
 `/nerve` commands, including the host commands
 `doctor` and `restart`, are not available in hosted mode; `nerve doctor`
 reports this and the local settings that still apply.
