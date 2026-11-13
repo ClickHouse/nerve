@@ -99,8 +99,12 @@ patterns match each value as text. If the text is JSON, Nerve also decodes
 it and matches each string, key, number and boolean in it, so a secret
 that the JSON text shows with an escaped character is redacted too. A
 pattern that matches JSON syntax, for example a quote, can leave text
-that is not valid JSON in the attribute. Bytes that are not valid UTF-8
-are replaced with `[REDACTED]`.
+that is not valid JSON in the attribute. If such a match makes the JSON
+text invalid and the decoded value also has a match, the whole value
+becomes `[REDACTED]` (a metadata value becomes the JSON string
+`"[REDACTED]"`). The default patterns do not match JSON syntax, so
+prompts and completions stay valid JSON with them. Bytes that are not
+valid UTF-8 are replaced with `[REDACTED]`.
 
 The metadata attributes (`langfuse.trace.metadata.*` and
 `langfuse.observation.metadata.*`) hold JSON text. Nerve decodes the

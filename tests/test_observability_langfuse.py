@@ -612,24 +612,31 @@ def test_attribute_that_holds_json_is_matched_as_text(key, pattern, text, expect
     assert changed == {key: expected}
 
 
-def test_text_match_and_escaped_match_in_one_json_value_are_both_redacted():
-    # The second secret has an escaped character, so only the decoded
-    # value shows it. The first pattern breaks the JSON text.
-    value = json.dumps({"token": "TOP-SECRET", "note": "private-π-token"})
-    patterns = lf._compile_patterns([r'token": "[^"]*"', "private-π-token"])
-    for key in ("input", "langfuse.trace.metadata.note"):
-        attribute = json.dumps(value) if key.startswith("langfuse.") else value
-        redacted = lf.redact_attributes({key: attribute}, patterns)[key]
-        text = json.loads(redacted) if key.startswith("langfuse.") else redacted
-        assert text == '{"[REDACTED], "note": "[REDACTED]"}'
+@pytest.mark.parametrize(("indent", "pattern"), [
+    (None, r'token": "[^"]*"'),
+    (2, r'\n  "token": "[^"]*"'),
+])
+@pytest.mark.parametrize("key", [
+    "input", "langfuse.trace.metadata.note", "langfuse.observation.metadata",
+])
+def test_text_match_and_decoded_match_in_one_json_value_fail_closed(key, indent, pattern):
+    # The text match breaks the JSON text. The second secret has an escaped
+    # character, so only the decoded value shows it. A new encoding drops
+    # the indentation that the indented pattern needs.
+    value = json.dumps({"token": "TOP-SECRET", "note": "private-π-token"}, indent=indent)
+    patterns = lf._compile_patterns([pattern, "private-π-token"])
+    metadata = key.startswith("langfuse.")
+    attribute = json.dumps(value) if metadata else value
+    redacted = lf.redact_attributes({key: attribute}, patterns)[key]
+    assert (json.loads(redacted) if metadata else redacted) == "[REDACTED]"
 
 
-def test_number_in_json_text_is_redacted_and_json_stays_valid():
+def test_number_in_json_text_fails_closed_when_the_text_match_breaks_json():
     value = json.dumps({"account": 1234567890123, "ok": 7})
     changed = lf.redact_attributes(
         {"input": value}, lf._compile_patterns([r"\d{10,}"]),
     )
-    assert json.loads(changed["input"]) == {"account": "[REDACTED]", "ok": 7}
+    assert changed == {"input": "[REDACTED]"}
 
 
 def test_mask_hook_patches_only_spans_with_secrets():
@@ -833,23 +840,32 @@ def test_json_text_in_strings_is_matched_as_text_on_export(real_export_pipeline)
     from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
 
     provider, delegate, _ = real_export_pipeline
-    lf._redact_patterns = lf._compile_patterns([r'token":"[^"]*"'])
+    lf._redact_patterns = lf._compile_patterns([
+        r'token":"[^"]*"', r'\n  "token": "[^"]*"', "private-π-token",
+    ])
     lf._enabled = True
     text = json.dumps({"token": "TOP-SECRET"}, separators=(",", ":"))
+    # The indented pattern breaks this JSON text, and the escaped second
+    # secret only shows in the decoded value: the value fails closed.
+    indented = json.dumps({"token": "TOP-SECRET", "note": "private-π-token"}, indent=2)
+    metadata = {"note": text, "indented": indented}
     tracer = provider.get_tracer("langsmith")
-    with lf.attributes(session_id="session-1", metadata={"note": text}):
+    with lf.attributes(session_id="session-1", metadata=metadata):
         with tracer.start_as_current_span("claude.assistant.turn") as span:
-            span.set_attributes(create_span_attributes(metadata={"note": text}))
+            span.set_attributes(create_span_attributes(metadata=metadata))
             span.set_attribute("input", text)
     provider.force_flush()
 
     exported = [span for batch in delegate.batches for span in batch]
     assert len(exported) == 1
     attributes = exported[0].attributes
-    for key in ("langfuse.trace.metadata.note", "langfuse.observation.metadata.note"):
-        assert json.loads(attributes[key]) == '{"[REDACTED]}'
+    for prefix in ("langfuse.trace.metadata", "langfuse.observation.metadata"):
+        assert json.loads(attributes[f"{prefix}.note"]) == '{"[REDACTED]}'
+        assert json.loads(attributes[f"{prefix}.indented"]) == "[REDACTED]"
     assert attributes["input"] == '{"[REDACTED]}'
-    assert b"TOP-SECRET" not in encode_spans(exported).SerializeToString()
+    serialized = encode_spans(exported).SerializeToString()
+    assert b"TOP-SECRET" not in serialized
+    assert b"private-" not in serialized
 
 
 def test_sdk_metadata_is_redacted_on_export_and_stays_json(real_export_pipeline):

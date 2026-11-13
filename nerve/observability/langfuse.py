@@ -317,11 +317,14 @@ def _redact_string(value: str, patterns: list[re.Pattern[str]]) -> str:
     The patterns match the string as text first. If the result is JSON
     text, they also match each string, key and scalar in the decoded
     value. If a decoded part changes, the value is encoded again with the
-    same separators and the patterns match the new text. If the text
-    match makes JSON text invalid, the decoded original value gets the
-    same steps. Thus a match in the text and a match that only the
-    decoded value shows (for example an escaped character) are both
-    redacted.
+    same separators and the patterns match the new text. A match that
+    the first step removed is not in the decoded value, so the new
+    encoding cannot bring it back.
+
+    If the text match makes JSON text invalid and the decoded original
+    value also has a match (for example behind an escaped character), no
+    single form is safe: a new encoding can lose the layout that the text
+    match needed. The whole string then becomes the redaction marker.
     """
     text = _redact_text(value, patterns)
     decoded = _decode_json(text)
@@ -331,10 +334,9 @@ def _redact_string(value: str, patterns: list[re.Pattern[str]]) -> str:
         decoded = _decode_json(value)
         if decoded is _NOT_JSON:
             return text
-        redacted = _redact_json(decoded, patterns)
-        if redacted is decoded:
+        if _redact_json(decoded, patterns) is decoded:
             return text
-        return _redact_text(_encode_json(redacted, value), patterns)
+        return REDACTED
     redacted = _redact_json(decoded, patterns)
     if redacted is not decoded:
         text = _redact_text(_encode_json(redacted, text), patterns)
