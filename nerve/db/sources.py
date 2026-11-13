@@ -453,6 +453,36 @@ class SourceStore:
         ) as cursor:
             return [dict(row) async for row in cursor]
 
+    async def unread_source_message_metadata(
+        self, source: str, ids: list[str],
+    ) -> dict[str, dict]:
+        """Metadata of the stored records among *ids* that a consumer has yet to read.
+
+        A record is unread while a live consumer cursor of *source* sits below
+        its rowid. An expired cursor does not count: its consumer starts again
+        at the source's newest message and never reads the record. Left out
+        are a record that every live consumer has read, a record of a source
+        that no consumer reads, and an id with no stored record. Read-only.
+        """
+        unread: dict[str, dict] = {}
+        now = datetime.now(UTC).isoformat()
+        for first in range(0, len(ids), 500):
+            chunk = ids[first:first + 500]
+            marks = ", ".join("?" for _ in chunk)
+            async with self.db.execute(
+                f"""SELECT sm.id, sm.metadata FROM source_messages sm
+                    WHERE sm.source = ? AND sm.id IN ({marks})
+                      AND EXISTS (
+                          SELECT 1 FROM consumer_cursors cc
+                          WHERE cc.source = sm.source
+                            AND (cc.expires_at IS NULL OR cc.expires_at > ?)
+                            AND cc.cursor_seq < sm.rowid)""",
+                (source, *chunk, now),
+            ) as cursor:
+                async for row in cursor:
+                    unread[row[0]] = json.loads(row[1]) if row[1] else {}
+        return unread
+
     async def consumer_has_unread(self, consumer: str) -> bool:
         """True if any source this consumer tracks has messages past its cursor.
 
