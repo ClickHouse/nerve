@@ -27,7 +27,7 @@ A plugin file looks like any other module defining a gate::
             self.min_age_minutes = min_age_minutes
 
         async def is_satisfied(self, ctx: GateContext) -> bool:
-            ...                       # ctx gives {job_id, db, jobs, as_of}
+            ...                       # ctx gives job_id, db, jobs, as_of (see below)
 
         async def forecast(self, ctx: GateContext, at: datetime) -> bool:
             ...                       # a task too young now may be old enough at `at`
@@ -47,10 +47,14 @@ Rules (all fail-safe — a bad plugin never crashes the daemon):
   **first loaded (filename-sorted) wins**.
 * Any import/exec error in a plugin file is logged (naming the file) and the
   file is skipped; the remaining files still load.
-* A gate gets only ``GateContext{job_id, db, jobs, as_of}``: the database,
-  the loaded jobs by id, and for a catch-up the time its run came due. A
-  liveness/registry based gate is out of scope for this loader — it would
-  need the context widened, a separate change.
+* A gate gets a ``GateContext``: ``job_id``, ``db``, the loaded jobs by id
+  (``jobs``) and, for a catch-up, the time its run came due (``as_of``). For
+  the check before a run it also gets the MCP servers of new sessions
+  (``mcp_servers``, ``mcp_managed``), plus ``notes`` (text for the run's
+  prompt), ``on_run`` (callbacks called when the run starts) and ``notices``
+  (``GateNotice`` messages about the gate's own check, sent to the user). A
+  liveness/registry based gate is out of scope for this loader: it would need
+  the context widened, a separate change.
 * **A gate that does not define ``forecast`` has its check run on every
   schedule read, so that check must be side-effect-free.** A gate also answers
   ``forecast(ctx, at)``: what it would decide for a run at ``at``, judged from

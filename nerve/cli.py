@@ -54,6 +54,7 @@ def setup_logging(verbose: bool = False) -> None:
     )
     # Quiet noisy loggers
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)
 

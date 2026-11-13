@@ -78,8 +78,9 @@ A run gate is checked right before a job fires; when it is not satisfied, no ses
 - `messages`: a sync source has unread messages for a consumer. It drives inbox work, if the worker has sources.
 - `agent_activity`: the agent has worked since the job's last run, not counting the job's own runs, the runs of the jobs in `ignore_jobs`, or the runs of other jobs with this gate. The built-in `memory-maintenance` and `skill-extractor` have it by default, so neither runs while the agent has done nothing since its last run. A worker with a scan job works at every scan, so both go on running there.
 - `github_pr_activity`: something actionable changed on an author's open PRs (a merge or close, a new commit, a review, a CI transition, a human comment); `force_run_after_hours` fires it anyway after a quiet spell.
+- `clickhouse_query`: a ClickHouse query, run through an MCP server such as the ClickHouse Cloud one, gives a true first value; `cooldown_minutes` sets how often it fires while the value stays true, and the run's prompt gets the rows.
 
-Gates in one list must all pass and are checked in order, so put the cheap `tasks` gate before the network-backed `github_pr_activity`. A gate that errors while checking lets the run proceed; a gate type that does not exist keeps the job from loading. Drop-in plugins in `config/cron/gates/` add conditions the built-in types do not cover. Scan jobs stay ungated: their job is to find work nobody has recorded yet.
+Gates in one list must all pass and are checked in order, so put the cheap `tasks` gate before the network-backed `github_pr_activity` and `clickhouse_query`. A gate that errors while checking lets the run proceed, except `clickhouse_query`, which skips the run and sends a notice after three failed checks in a row; a gate type that does not exist keeps the job from loading. Drop-in plugins in `config/cron/gates/` add conditions the built-in types do not cover. Scan jobs stay ungated: their job is to find work nobody has recorded yet.
 
 ### Locks, catch-up and session modes
 
