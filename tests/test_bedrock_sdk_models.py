@@ -36,10 +36,21 @@ from nerve.config import BEDROCK_SDK_MIN_CLAUDE_VERSION, NerveConfig, claude_mod
     ("us.anthropic.claude-haiku-5-5", (5, 5)),
     ("arn:aws:bedrock:us-east-1:123456789012:inference-profile/"
      "us.anthropic.claude-sonnet-4-5-20250929-v1:0", (4, 5)),
+    # Bedrock IDs with a context window.
+    ("anthropic.claude-3-sonnet-20240229-v1:0:28k", (3, 0)),
+    ("us.anthropic.claude-3-haiku-20240307-v1:0:48k", (3, 0)),
+    # The first IDs, on the API and on Bedrock.
+    ("claude-2.1", (2, 1)),
+    ("claude-2.0", (2, 0)),
+    ("claude-instant-1.2", (1, 2)),
+    ("anthropic.claude-v2:1", (2, 1)),
+    ("anthropic.claude-v2", (2, 0)),
+    ("anthropic.claude-v1", (1, 0)),
+    ("anthropic.claude-instant-v1", (1, 0)),
+    ("anthropic.claude-v2:1:200k", (2, 1)),
     # IDs that name no readable version.
     ("arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123", None),
-    ("anthropic.claude-v2:1", None),
-    ("anthropic.claude-instant-v1", None),
+    ("claude", None),
     ("haiku", None),
     ("gateway-small", None),
     ("", None),
@@ -104,6 +115,17 @@ def test_the_doctor_warns_for_each_older_model_on_bedrock():
     assert warnings[0].startswith(f"[WARN] agent.title_model '{old_title}' is older than Claude 4.7.")
     assert warnings[1].startswith(f"[WARN] agent.prompt_rewrite.model '{old_rewrite}'")
     assert all("set Claude 4.7 or later" in w for w in warnings)
+
+
+@pytest.mark.parametrize("model", [
+    "anthropic.claude-v2:1",
+    "anthropic.claude-instant-v1",
+    "anthropic.claude-3-haiku-20240307-v1:0:48k",
+])
+def test_the_doctor_warns_for_the_first_bedrock_models(model):
+    warnings = _sdk_warnings(_bedrock(memory={"fast_model": model}))
+    assert len(warnings) == 1
+    assert warnings[0].startswith(f"[WARN] memory.fast_model '{model}' is older than Claude 4.7.")
 
 
 def test_the_doctor_does_not_warn_for_new_or_unreadable_models():

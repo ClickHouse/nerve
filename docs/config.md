@@ -2686,8 +2686,10 @@ settings name the models of these calls:
 `nerve doctor` shows a warning for each of these settings that names a Claude
 model older than 4.7, for example
 `us.anthropic.claude-sonnet-4-5-20250929-v1:0`. It reads the version from the
-model ID, also with a region prefix (`us.`, `eu.`, `apac.`, `global.`) or in an
-inference profile ARN. An ID that it cannot read, such as an application
+model ID, also with a region prefix (`us.`, `eu.`, `apac.`, `global.`), with a
+context window (`:200k`) or in an inference profile ARN. It also reads the
+first IDs, such as `anthropic.claude-v2:1` and `anthropic.claude-instant-v1`.
+An ID that it cannot read, such as an application
 inference profile ARN, gets no warning. Nerve starts with an older model in
 these settings. Only the calls above fail.
 

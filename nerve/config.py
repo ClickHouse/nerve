@@ -1043,25 +1043,34 @@ BEDROCK_SDK_MIN_CLAUDE_VERSION = (4, 7)
 _CLAUDE_VERSION_NEW = re.compile(r"claude-[a-z]+-(\d+)(?:-(\d+))?")
 # ``claude-<major>[-<minor>]-<family>``, for example ``claude-3-5-haiku``.
 _CLAUDE_VERSION_OLD = re.compile(r"claude-(\d+)(?:-(\d+))?-[a-z]+")
+# The first IDs: ``claude-2.1`` and ``claude-instant-1.2``, and on Bedrock
+# ``claude-v2:1`` and ``claude-instant-v1``.
+_CLAUDE_VERSION_FIRST = re.compile(r"claude-(?:instant-)?v?(\d+)(?:[.:](\d+))?")
 
 
 def claude_model_version(model: str) -> tuple[int, int] | None:
     """The ``(major, minor)`` version that a Claude model ID names.
 
     Reads bare and dated IDs (``claude-opus-4-1-20250805``), the ``[1m]``
-    suffix, Bedrock IDs with a region prefix and a version suffix
-    (``us.anthropic.claude-sonnet-4-5-20250929-v1:0``), and an ARN that
-    ends in such an ID. ``None`` for an ID that it cannot read, for example
-    an application inference profile ARN or an alias.
+    suffix, Bedrock IDs with a region prefix, a version suffix and a
+    context window (``us.anthropic.claude-sonnet-4-5-20250929-v1:0``,
+    ``anthropic.claude-3-haiku-20240307-v1:0:48k``), the first IDs
+    (``claude-2.1``, ``anthropic.claude-v2:1``,
+    ``anthropic.claude-instant-v1``), and an ARN that ends in such an ID.
+    ``None`` for an ID that it cannot read, for example an application
+    inference profile ARN or an alias.
     """
     m = model.strip().lower().rsplit("/", 1)[-1]
     if "anthropic." in m:
         m = m.rsplit("anthropic.", 1)[1]
     m = m.split("[", 1)[0]
-    m = re.sub(r"-v\d+(?::\d+)?$", "", m)
-    m = re.sub(r"-latest$", "", m)
-    m = re.sub(r"-20\d{6}$", "", m)
-    match = _CLAUDE_VERSION_NEW.fullmatch(m) or _CLAUDE_VERSION_OLD.fullmatch(m)
+    m = re.sub(r":\d+k$", "", m)
+    match = _CLAUDE_VERSION_FIRST.fullmatch(m)
+    if match is None:
+        m = re.sub(r"-v\d+(?::\d+)?$", "", m)
+        m = re.sub(r"-latest$", "", m)
+        m = re.sub(r"-20\d{6}$", "", m)
+        match = _CLAUDE_VERSION_NEW.fullmatch(m) or _CLAUDE_VERSION_OLD.fullmatch(m)
     if match is None:
         return None
     return int(match.group(1)), int(match.group(2) or 0)
