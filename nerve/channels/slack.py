@@ -1267,6 +1267,13 @@ class SlackChannel(BaseChannel):
 
         try:
             try:
+                # A delete since the check leaves no row, and the router does
+                # not report that as a closed session.
+                if (
+                    msg.session_id is not None
+                    and await self.router.get_session(msg.session_id) is None
+                ):
+                    raise SessionClosedError("deleted")
                 await self.router.handle_message(msg)
             except SessionClosedError:
                 if msg.session_id is None:

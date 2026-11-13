@@ -765,6 +765,8 @@ def _with_card(channel: SlackChannel, session_id: str | None = "s-raised") -> As
     """Give *channel* a notification service whose cards belong to *session_id*."""
     channel._notification_service = MagicMock()
     channel._notification_service.reply_session = AsyncMock(return_value=session_id)
+    # The session of the card still has its row when the turn starts.
+    channel.router.get_session = AsyncMock(return_value={"id": session_id})
     return channel._notification_service.reply_session
 
 
@@ -878,6 +880,23 @@ class TestNotificationReplies:
         assert seen == [("slack:D1:2.1", "D1:2.1", "s-raised"), ("slack:D1", "D1", None)]
         assert channel._last_inbound_ts["D1"] == "2.2"
         assert channel._message_cache["D1:2.2"] == ("D1", "roll it back")
+        channel._web.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_session_that_is_deleted_before_the_turn_does_not_lose_the_message(self):
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
+        _with_card(channel)
+        # The row of the card's session is gone when the turn starts.
+        channel.router.get_session = AsyncMock(return_value=None)
+
+        await channel._handle_message_event(dict(_DM_REPLY))
+
+        channel.router.get_session.assert_awaited_once_with("s-raised")
+        # The router gets the message once, as a message of the direct message.
+        channel.router.handle_message.assert_awaited_once()
+        msg = channel.router.handle_message.await_args[0][0]
+        assert (msg.channel_key, msg.sender_id, msg.session_id) == ("slack:D1", "D1", None)
+        assert channel._last_inbound_ts["D1"] == "2.2"
         channel._web.chat_postMessage.assert_not_awaited()
 
     @pytest.mark.asyncio

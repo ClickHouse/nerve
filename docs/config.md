@@ -1537,7 +1537,11 @@ session: the direct message keeps its own session for every other message.
 An event can also name the message that it replies to (`reply_to`). When
 that is a card, for example because the gateway posted the card as copies in
 other conversations and the person replied under a copy, the message goes to
-the session of that card in the same way.
+the session of that card in the same way. This holds for every person whose
+message the gateway admits: the turn runs in the session that raised the
+notification, as that person, and the answer is posted in the thread of the
+reply. That session can be one that another person started, for example in
+the web interface.
 
 `/nerve` commands, including the host commands
 `doctor` and `restart`, are not available in hosted mode; `nerve doctor`
@@ -1775,7 +1779,10 @@ sender is resolved.
   raised the notification, while that session exists and is not archived, and
   the answer stays in that thread. In a DM, only that thread goes there: the
   DM keeps its own session. In a shared channel, the reply must still mention
-  the bot, until the thread has that session.
+  the bot, until the thread has that session. This holds for every person
+  who may talk to the bot there: the turn runs in the session that raised the
+  notification, which another person may have started, and the answer is
+  posted in the thread.
 - Messages another app wrote itself are ignored, so two agents in one channel
   cannot answer each other without end. A person posting through an
   integration still reaches the agent, because they keep their own user ID.
