@@ -438,6 +438,77 @@ async def test_only_catch_up_jobs_run_but_every_trigger_moves_on(held_service):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("worked_before_the_pause", [False, True])
+async def test_the_message_that_woke_the_machine_starts_no_catch_up_of_a_job_that_waits_for_work(
+    held_service, db, worked_before_the_pause,
+):
+    """A machine parked for hours is woken by a message. A job gated on the
+    agent's activity came due while it was parked, when nothing had happened.
+    Its catch-up asks about that time, so the message, stored since, does not
+    start the job beside the turn it began; work from before the pause does.
+    The message counts for the job's next scheduled time."""
+    from tests.actor_rows import ensure_system_principal
+
+    await ensure_system_principal(db)
+    job = CronJob(
+        id="tidy", schedule=EVERY_TEN_MINUTES, prompt="p", run_if=[{"type": "agent_activity"}],
+    )
+    svc = await held_service([job], db=db)
+    paused, resumed = _pause_window()
+    svc.scheduler.modify_job("tidy", next_run_time=resumed - timedelta(hours=1))
+    for session_id in ("before", "woke-it"):
+        await db.create_session(session_id, source="test", actor=None)
+    if worked_before_the_pause:
+        await db.add_message("before", "user", "earlier", actor=None)
+        await db.db.execute(
+            "UPDATE sessions SET updated_at = ? WHERE id = 'before'",
+            ((paused - timedelta(minutes=10)).isoformat(),),
+        )
+        await db.db.commit()
+    await db.add_message("woke-it", "user", "hello", actor=None)
+
+    await _resume(svc, paused, resumed)
+
+    assert svc.engine.run_cron.await_count == (1 if worked_before_the_pause else 0)
+    forecast = {j["id"]: j["forecast"] for j in (await svc.schedule_report())["jobs"]}
+    assert forecast["tidy"] == "run"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worked_before_the_pause", [False, True])
+async def test_a_job_that_waits_for_work_misses_only_a_run_it_would_have_made(
+    held_service, db, worked_before_the_pause,
+):
+    """With ``catchup: false`` the run that came due during the pause is
+    recorded as missed unless its gates would have skipped it then. The
+    message that woke the machine came later: it makes no run missed."""
+    job = CronJob(
+        id="tidy", schedule=EVERY_TEN_MINUTES, prompt="p", catchup=False,
+        run_if=[{"type": "agent_activity"}],
+    )
+    svc = await held_service([job], db=db)
+    paused, resumed = _pause_window()
+    svc.scheduler.modify_job("tidy", next_run_time=resumed - timedelta(hours=1))
+    for session_id in ("before", "woke-it"):
+        await db.create_session(session_id, source="test", actor=None)
+    if worked_before_the_pause:
+        await db.add_message("before", "user", "earlier", actor=None)
+        await db.db.execute(
+            "UPDATE sessions SET updated_at = ? WHERE id = 'before'",
+            ((paused - timedelta(minutes=10)).isoformat(),),
+        )
+        await db.db.commit()
+    await db.add_message("woke-it", "user", "hello", actor=None)
+
+    await _resume(svc, paused, resumed)
+    await asyncio.sleep(0.3)  # the record is written by a task of its own
+
+    statuses = [log["status"] for log in await db.get_cron_logs("tidy")]
+    assert statuses == (["missed"] if worked_before_the_pause else [])
+    svc.engine.run_cron.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_the_catch_up_gives_the_network_time_to_come_back(held_service, monkeypatch):
     monkeypatch.setattr(cron_service, "_CATCHUP_SETTLE_SECONDS", 0.3)
     job = CronJob(id="every-ten", schedule=EVERY_TEN_MINUTES, prompt="p")

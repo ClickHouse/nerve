@@ -87,6 +87,7 @@ On a phone (narrower than 768 px), a bar at the bottom replaces the nav rail: **
 - **Resumable sessions** — Sessions persist across server restarts via SDK `--resume` flag; full conversation context is restored
 - **Stop button** — While a turn streams, a split red Stop replaces send. The button stops the orchestrator's turn only: background agents keep running. Its caret offers "Stop turn and send" (stop, then send the composer's text) and "Stop all agents…". If the turn does not end within 5 s while agents run, a banner offers "Force stop…" (it restarts the runtime and lists what ends); on a runtime that cannot spare background agents, the banner asks before stopping them. See [agents.md](agents.md#stopping)
 - **Queued messages**: The composer always sends. While a turn streams, Enter queues the message: a row above the composer shows it (also in other tabs, with its source when it came from a channel or the API) until it runs, and its bubble shows at the end of the transcript when it starts, in every tab. The rows are in run order, the top one runs next; the arrows on a row move it up or down, for any queued message. Your own rows can be edited (✎: cancel it and continue editing its text in the composer) or cancelled (×); either way its text comes back into the composer, so nothing typed is lost
+- **Daybreak**: in a Codex chat, when the signed-in Codex account has Daybreak on at least one model, the composer has a **Daybreak** toggle next to the model menu. It turns Codex's Daybreak cyber access program on or off for this chat, from the chat's next message. On a model without Daybreak the toggle is greyed out and names the models that offer it. See [Daybreak](config.md#daybreak-per-chat-switch).
 
 ### Agent Status
 - **Live indicator** — Header shows current agent state: "Thinking...", "Writing...", "Using Read...", etc.
@@ -575,6 +576,27 @@ npx vite build
 ```
 
 The dev server proxies `/api` and `/ws` to `localhost:8900`.
+
+### Snapshot tests
+
+`web/e2e/snapshots.spec.ts` screenshots a few pages at desktop and phone size
+and compares them with the PNGs committed in `web/e2e/snapshots.spec.ts-snapshots/`.
+The pages are served by a throwaway passwordless Nerve that
+`scripts/ui_snapshot_server.py` seeds with synthetic data and fixed timestamps.
+The browser clock, timezone and locale are pinned, so the pixels do not change
+between runs.
+
+The tests run in the official Playwright image, so the result is the same on
+every machine, including Apple Silicon. Docker is required:
+
+```bash
+web/e2e/snapshots.sh                      # compare, as the `UI snapshots` CI job does
+web/e2e/snapshots.sh --update-snapshots   # rewrite the baselines after a UI change
+```
+
+Commit the rewritten PNGs with the change. GitHub shows each one as a
+before/after image diff in the pull request. When the CI job fails, its
+`ui-snapshots-report` artifact holds the expected, actual and diff images.
 
 ## Build & Deploy
 

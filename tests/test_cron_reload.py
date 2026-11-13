@@ -1069,6 +1069,88 @@ class TestReservedIdsInCli:
         assert "reserved" in result.output
 
 
+_BEFORE_DAILY = Path(__file__).parent / "fixtures" / "cron" / "system-before-daily-skill-extractor.yaml"
+
+
+def _shipped_skill_extractor() -> dict:
+    from nerve.setup_writer import PRODUCTIVITY_CRONS
+
+    return next(c for c in PRODUCTIVITY_CRONS if c["id"] == "skill-extractor")
+
+
+class TestAnEarlierSystemFile:
+    """A built-in job whose system.yaml entry still holds what an earlier
+    release shipped is loaded as this release ships it (tests/test_cron.py).
+    Here: what the scheduler and the CLI make of the file such a release
+    wrote."""
+
+    @staticmethod
+    def _trigger(service, job_id: str) -> dict[str, str]:
+        trigger = service.scheduler.get_job(job_id).trigger
+        return {field.name: str(field) for field in trigger.fields}
+
+    @pytest.mark.asyncio
+    async def test_the_trigger_is_built_from_the_schedule_this_release_ships(self, svc):
+        service, jobs_file = svc
+        service.config.cron.system_file.write_bytes(_BEFORE_DAILY.read_bytes())
+        shipped = _shipped_skill_extractor()
+
+        result = await service.reload()
+
+        assert "skill-extractor" in result["added"]
+        trigger = self._trigger(service, "skill-extractor")
+        assert (trigger["hour"], trigger["minute"]) == ("5", "0")
+        row = next(r for r in await service.list_jobs() if r["id"] == "skill-extractor")
+        assert (row["schedule"], row["description"]) == (shipped["schedule"], shipped["description"])
+        job = next(j for j in service._jobs if j.id == "skill-extractor")
+        assert job.resolve_prompt() == shipped["prompt"]
+
+        # The earlier schedule, chosen in jobs.yaml, is the one that runs.
+        _write_jobs(jobs_file, [_job_dict("skill-extractor", schedule="0 */12 * * *")])
+        result = await service.reload()
+
+        assert "skill-extractor" in result["updated"]
+        trigger = self._trigger(service, "skill-extractor")
+        assert (trigger["hour"], trigger["minute"]) == ("*/12", "0")
+
+    def test_the_cli_lists_the_job_with_the_description_it_is_loaded_with(self, tmp_path, monkeypatch):
+        from click.testing import CliRunner
+
+        import nerve.agent.engine as engine_mod
+        import nerve.db as db_mod
+        from nerve.cli import main
+
+        monkeypatch.setattr(db_mod, "init_db", AsyncMock(return_value=AsyncMock()))
+        monkeypatch.setattr(db_mod, "close_db", AsyncMock())
+        monkeypatch.setattr(
+            engine_mod, "AgentEngine", MagicMock(return_value=AsyncMock()),
+        )
+        before = yaml.safe_load(_BEFORE_DAILY.read_text(encoding="utf-8"))["jobs"]
+        mine = next(job for job in before if job["id"] == "skill-extractor")
+        now, earlier = _shipped_skill_extractor()["description"], mine["description"]
+        assert now != earlier
+
+        def listed(system: list[dict], user: list[dict]) -> str:
+            cfg = TestReservedIdsInCli._config_dir(tmp_path, system, user)
+            result = CliRunner().invoke(main, ["-c", str(cfg), "cron"])
+            assert result.exit_code == 0, result.output
+            return result.output
+
+        # In system.yaml: as this release ships it.
+        output = listed(before, [])
+        assert f"[system] skill-extractor: {now} (" in output and earlier not in output
+        # In jobs.yaml, which replaces it, and in jobs.yaml alone: as written.
+        for system in (before, []):
+            output = listed(system, [mine])
+            assert f"[user  ] skill-extractor: {earlier} (" in output and now not in output
+        # Of two entries with the id in system.yaml the last one runs: the
+        # list brings that one up to date and leaves the other as written.
+        output = listed([{**mine, "description": "Mine."}, mine], [])
+        assert f"[system] skill-extractor: {now} (" in output and "skill-extractor: Mine. (" in output
+        output = listed([mine, {**mine, "description": "Mine."}], [])
+        assert f"[system] skill-extractor: {earlier} (" in output and "skill-extractor: Mine. (" in output
+
+
 class TestSourceScheduleReporting:
     """``list_jobs`` must report the trigger the scheduler actually used.
 

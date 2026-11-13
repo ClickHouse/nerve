@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -286,12 +287,31 @@ def merge_jobs(system_jobs: list[CronJob], user_jobs: list[CronJob]) -> list[Cro
     return list(jobs_by_id.values())
 
 
+def _with_default_run_if(
+    item: Any, default_run_if: Callable[[str], list[dict]] | None,
+) -> Any:
+    """*item* with the default gates of its job as ``run_if``, when it states
+    none; otherwise *item* itself.
+
+    A ``run_if`` or ``skip_when_idle`` key that is there, even bare or empty,
+    is the file's answer: only an entry with neither gets a default.
+    """
+    if default_run_if is None or not isinstance(item, dict):
+        return item
+    if "run_if" in item or "skip_when_idle" in item:
+        return item
+    job_id = item.get("id")
+    specs = default_run_if(job_id) if isinstance(job_id, str) else None
+    return {**item, "run_if": specs} if specs else item
+
+
 def load_jobs(
     jobs_file: Path,
     strict: bool = False,
     errors: list[str] | None = None,
     *,
     build_gates: bool = True,
+    default_run_if: Callable[[str], list[dict]] | None = None,
 ) -> list[CronJob]:
     """Load cron jobs from a YAML file.
 
@@ -311,6 +331,14 @@ def load_jobs(
 
     ``build_gates=False`` is passed straight to :meth:`CronJob.from_dict`; see
     there for who wants it and why.
+
+    ``default_run_if`` gives the run gates of a job whose entry states none.
+    It is called with the id of each entry that has neither a ``run_if`` nor
+    a ``skip_when_idle`` key, and a non-empty answer becomes the entry's
+    ``run_if``; each job that gets one is logged. A default that does not
+    build is logged as an error and left out: the entry loads as the file has
+    it. The scheduler passes it for ``system.yaml``, so that a built-in job
+    has the gates it ships with without the file stating them.
     """
     if not jobs_file.exists():
         logger.info("No cron jobs file at %s", jobs_file)
@@ -339,9 +367,35 @@ def load_jobs(
     jobs = []
     for item in jobs_data:
         try:
-            jobs.append(CronJob.from_dict(
-                item, base_dir=jobs_file.parent, gates=build_gates,
-            ))
+            entry = _with_default_run_if(item, default_run_if)
+            try:
+                job = CronJob.from_dict(
+                    entry, base_dir=jobs_file.parent, gates=build_gates,
+                )
+            except (KeyError, TypeError, ValueError) as e:
+                if entry is item:
+                    raise
+                # The default may be what does not build, and the file never
+                # stated it: the entry loads as written. If the entry itself
+                # is at fault, this raises what it would have raised.
+                job = CronJob.from_dict(
+                    item, base_dir=jobs_file.parent, gates=build_gates,
+                )
+                logger.error(
+                    "Cron job %s: its default gates do not build (%s). It "
+                    "runs as %s has it, on every schedule.",
+                    job.id, e, jobs_file.name,
+                )
+                entry = item
+            jobs.append(job)
+            if entry is not item:
+                logger.info(
+                    "Cron job %s: %s states no run_if for it, so it runs "
+                    "under its default gates (%s). Write `run_if: []` to run "
+                    "it on every schedule.",
+                    job.id, jobs_file.name,
+                    "; ".join(gate.describe() for gate in job.gates) or "not built",
+                )
         except (KeyError, TypeError, ValueError) as e:
             message = f"Invalid cron job in {jobs_file}: {item!r} — {e}"
             if errors is not None:

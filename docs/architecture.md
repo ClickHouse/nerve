@@ -157,9 +157,9 @@ Filesystem-based skill system (Claude SDK compatible):
 - SQLite index for metadata + usage statistics (`skills`, `skill_usage` tables)
 - Progressive disclosure: name+description in system prompt, full content loaded on demand via `skill_get` tool
 - Agent can create/update skills dynamically via `skill_create`/`skill_update` MCP tools
-- Automated extraction: `skill-extractor` cron identifies repeated workflows and proposes new skills via task+plan system
+- Automated extraction: `skill-extractor` cron identifies repeated workflows and proposes at most one new skill per run via task+plan system; the plan states the evidence and the direction, and the session that implements the approved plan writes the skill
 - Automated revision: `skill-reviser` cron reviews existing skills for accuracy, completeness, and quality
-- Plan approval handler creates/updates skills directly when approving skill-extractor/skill-reviser proposals
+- An approved skill plan (`skill-create` / `skill-update`) is implemented by an `impl-<id>` session, like any plan, which creates or updates the skill with `skill_create`/`skill_update`
 
 #### Platform skills
 
@@ -249,6 +249,19 @@ instance. Nerve never writes the file. Its content goes in as written, after
 file is cut there and ends with `[platform notes truncated at 16 KiB]`. The
 file is read whenever a session's prompt is built, so a change applies to new
 sessions.
+
+A session that a person chats in (web, Telegram, Slack, Discord, WhatsApp) also
+gets an "Offer to automate" section. It tells the agent to offer a cron job
+when the person asks for work that they will probably want again and no job
+does it yet: one yes/no question at the end of the reply, at most once in a
+conversation, and the job is created only after a yes. Cron, hook and workflow
+sessions do not get the section. The text is `AUTOMATION_OFFER_SECTION` in
+`nerve/agent/prompts.py`. It also tells the agent that the job prompt must
+send the result with `notify` (the reply of a cron run goes only to the cron
+log) and that a direct edit of the job file needs `nerve reload`. A person who
+does not want these offers can say so in the chat. The agent then writes that
+in `USER.md`, or in `MEMORY.md` when `USER.md` is read-only, so that every
+later session sees it.
 
 ### User Message (Web UI)
 1. User sends message via WebSocket

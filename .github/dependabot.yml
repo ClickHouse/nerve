@@ -85,14 +85,16 @@ updates:
           - "@vitest/*"
       # One PR for all other minor and patch updates. Each other major update
       # gets its own PR. @clickhouse/click-ui also gets its own PR: its 0.x
-      # minors can change the UI, and CI does not check styles (Vitest runs
-      # with css: false).
+      # minors can change the UI, and only the UI snapshots check styles
+      # (Vitest runs with css: false). @playwright/test gets its own PR too:
+      # its Chromium can move pixels, so the baselines may need rewriting.
       npm-minor-patch:
         update-types:
           - "minor"
           - "patch"
         exclude-patterns:
           - "@clickhouse/click-ui"
+          - "@playwright/test"
 
   - package-ecosystem: "github-actions"
     directory: "/"

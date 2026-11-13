@@ -42,7 +42,8 @@ jobs:
           # `version` and `revision`) and it is also the tool asserting the lock
           # is current, so letting CI float to whatever uv shipped this morning
           # puts a moving part underneath the reproducibility this file exists to
-          # provide. Bump this alongside a `uv lock` refresh.
+          # provide. Bump this, and the pin in web/e2e/snapshots.sh, alongside a
+          # `uv lock` refresh.
           version: "0.12.0"
           enable-cache: true
           # uv.lock is the single input that determines the resolution.
@@ -161,3 +162,25 @@ jobs:
 
       - name: Build frontend (tsc -b && vite build)
         run: npm run build
+
+  ui-snapshots:
+    # Screenshots the UI over a seeded throwaway backend and compares them with
+    # the committed baselines. `web/e2e/snapshots.sh --update-snapshots` rewrites them.
+    name: UI snapshots (Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Compare with the baselines
+        run: web/e2e/snapshots.sh
+
+      - name: Upload the diff report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ui-snapshots-report
+          path: |
+            web/playwright-report
+            web/test-results

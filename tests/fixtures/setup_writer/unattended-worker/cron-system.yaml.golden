@@ -48,28 +48,55 @@ jobs:
   - type: tasks
     status: pending
 - id: skill-extractor
-  schedule: 0 */12 * * *
-  prompt: 'You are a skill extraction agent. Identify repeated workflows from recent
-    activity and propose new skills.
+  schedule: 0 5 * * *
+  prompt: 'You are a skill extraction agent. Find a workflow that is repeated in recent
+    activity and propose one new skill for it.
 
 
     1. Recall recent behavior patterns and events
 
-    2. Check existing skills to avoid duplicates
+    2. Check the existing skills (skill_list) and what was proposed before: task_list
+    with status "all", tag "skill-proposal" and limit 1000 lists the tasks of earlier
+    proposals; plan_list shows the plans in review and, with status "declined", the
+    declined ones. Propose nothing that a skill already covers or that was proposed
+    before, whether the proposal waits for review, was declined, or ended with no
+    skill
 
     3. Look for repeated tool sequences, domain knowledge clusters, and reusable patterns
 
-    4. For each candidate (max 2): create a task and propose a plan with the full
-    SKILL.md
+    4. Pick the one candidate with the strongest evidence. Propose at most one skill
+    per run.
+
+    5. Create a task for it with task_create(title, content, source="skill-extractor",
+    tags="skill-proposal"), where the content says in a few sentences what the skill
+    is for, then call plan_propose(task_id, content, summary, plan_type="skill-create")
+    with the plan and a summary of up to 3 short lines for the reviewer
 
 
-    If no candidates found, say so and stop.
+    The plan is for a person who decides whether the skill is worth having. Write
+    in it:
 
-    plan_propose notifies the user with a link to each plan. Do not send another notification
+    - What: the workflow, in one or two sentences, and when the skill would be used
+
+    - Evidence: where the workflow occurred (the sessions, tasks or dates) and what
+    was repeated each time
+
+    - Direction: what the skill should cover, what it should leave out, and what is
+    known to go wrong
+
+
+    Do not write the skill in the plan: no SKILL.md, no frontmatter, no step-by-step
+    instructions. The session that implements the approved plan writes the skill from
+    the evidence.
+
+
+    If no workflow occurred more than once, say so and stop.
+
+    plan_propose notifies the user with a link to the plan. Do not send another notification
     about it.
 
     '
-  description: Every 12 hours, analyzes your recent activity to detect repeated workflows.
+  description: Once a day, analyzes your recent activity to detect repeated workflows.
     When it finds a pattern, it proposes a reusable skill for your review.
   model: ''
   session_mode: persistent

@@ -5,11 +5,14 @@ from __future__ import annotations
 import asyncio
 import re
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_asyncio
+import yaml
 
 from nerve.agent.engine import TurnOutcome, TurnResult
 from nerve.cron.jobs import CronJob
@@ -1398,3 +1401,288 @@ class TestLiveSessionLink:
         cron_service.engine.run_cron.assert_called_once()
         args, kwargs = cron_service.db.log_cron_finish.call_args
         assert args[1] == "success"
+
+
+# ---------------------------------------------------------------------------
+# An entry that an earlier release wrote
+# ---------------------------------------------------------------------------
+
+_CRON_FILES = Path(__file__).parent / "fixtures" / "cron"
+# What a worker's system.yaml held in the release before the skill extractor
+# became a daily job, and in the last one whose prompt for it still asked for
+# a notification: the two forms the entry shipped in.
+_BEFORE_DAILY = _CRON_FILES / "system-before-daily-skill-extractor.yaml"
+_FIRST_PROMPT = _CRON_FILES / "system-with-the-first-skill-extractor-prompt.yaml"
+
+
+def _loaded(tmp_path, system: list[dict] | Path | None, user: list[dict] | Path | None = None,
+            backend: str = "memu", strict: bool = False) -> dict[str, CronJob]:
+    """The jobs the scheduler loads from the two files, by id: the loader
+    that its start and its reload use (the reload is the strict one; a real
+    scheduler is in tests/test_cron_reload.py). A path is a file to load as
+    it is."""
+    for name, jobs in (("system.yaml", system), ("jobs.yaml", user)):
+        if isinstance(jobs, Path):
+            (tmp_path / name).write_bytes(jobs.read_bytes())
+        elif jobs is not None:
+            (tmp_path / name).write_text(yaml.safe_dump({"jobs": jobs}), encoding="utf-8")
+    service = SimpleNamespace(
+        config=SimpleNamespace(
+            cron=SimpleNamespace(
+                system_file=tmp_path / "system.yaml", jobs_file=tmp_path / "jobs.yaml",
+            ),
+            memory=SimpleNamespace(backend=backend),
+        ),
+        _rejected_job_ids=[],
+    )
+    return {job.id: job for job in CronService._load_merged_jobs(service, strict=strict)}
+
+
+def _said(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "earlier release" in r.getMessage()]
+
+
+def _loaded_and_said(caplog, *args, **kwargs) -> tuple[dict[str, CronJob], list[str]]:
+    """The loaded jobs, and what this load alone said."""
+    caplog.clear()
+    with caplog.at_level("INFO", logger="nerve.cron.service"):
+        loaded = _loaded(*args, **kwargs)
+    return loaded, _said(caplog)
+
+
+class TestAnEntryOfAnEarlierRelease:
+    """Nothing writes system.yaml again when Nerve is updated, so a built-in
+    job whose entry there still holds what an earlier release shipped is
+    loaded as this release ships it. An entry in jobs.yaml is the operator's
+    and is never brought up to date. The files are the ones earlier releases
+    wrote for a worker."""
+
+    @staticmethod
+    def _before() -> list[dict]:
+        return yaml.safe_load(_BEFORE_DAILY.read_text(encoding="utf-8"))["jobs"]
+
+    @classmethod
+    def _entry(cls, **changes) -> dict:
+        """The job's entry as the release before wrote it."""
+        return {**next(job for job in cls._before() if job["id"] == "skill-extractor"), **changes}
+
+    @staticmethod
+    def _shipped() -> dict:
+        from nerve.setup_writer import PRODUCTIVITY_CRONS
+
+        return next(c for c in PRODUCTIVITY_CRONS if c["id"] == "skill-extractor")
+
+    @pytest.mark.parametrize("file, ending", [
+        (_BEFORE_DAILY, "Do not send another notification about it."),
+        (_FIRST_PROMPT, "After proposing, use `notify` to alert the user."),
+    ], ids=["the release before", "the first prompt"])
+    @pytest.mark.parametrize("strict", [False, True], ids=["tolerant", "strict"])
+    def test_the_skill_extractor_is_loaded_daily_with_its_current_prompt(
+        self, tmp_path, caplog, file, ending, strict,
+    ):
+        before = {job["id"]: job for job in yaml.safe_load(file.read_text(encoding="utf-8"))["jobs"]}
+        assert before["skill-extractor"]["schedule"] == "0 */12 * * *"
+        assert "(max 2)" in before["skill-extractor"]["prompt"]
+        assert before["skill-extractor"]["prompt"].rstrip().endswith(ending)
+
+        with caplog.at_level("INFO", logger="nerve.cron.service"):
+            loaded = _loaded(tmp_path, file, strict=strict)
+
+        job, shipped = loaded["skill-extractor"], self._shipped()
+        assert (job.schedule, job.prompt, job.description) == (
+            shipped["schedule"], shipped["prompt"], shipped["description"],
+        )
+        # And with the gate that an entry of the job gets when it states none.
+        assert [gate.type for gate in job.gates] == ["agent_activity"]
+        assert _said(caplog) == [
+            "Cron job skill-extractor: its description, prompt, schedule in system.yaml are "
+            "what an earlier release shipped; the job is loaded with this release's (schedule 0 5 * * *)"
+        ]
+        # The file's other keys, and every other job, are as the file has them.
+        assert job.enabled is before["skill-extractor"]["enabled"]
+        assert job.session_mode == "persistent" and job.context_rotate_hours == 168
+        for job_id, entry in before.items():
+            if job_id != "skill-extractor":
+                assert (loaded[job_id].schedule, loaded[job_id].prompt) == (
+                    entry["schedule"], entry["prompt"],
+                )
+
+    def test_what_was_edited_stays(self, tmp_path, caplog):
+        """Each of the three is judged on its own."""
+        jobs = [self._entry(schedule="0 9 * * 1", description="Mine.")]
+        with caplog.at_level("INFO", logger="nerve.cron.service"):
+            loaded = _loaded(tmp_path, jobs)["skill-extractor"]
+        assert (loaded.schedule, loaded.description) == ("0 9 * * 1", "Mine.")
+        assert loaded.prompt == self._shipped()["prompt"]
+        assert _said(caplog) == [
+            "Cron job skill-extractor: its prompt in system.yaml is "
+            "what an earlier release shipped; the job is loaded with this release's"
+        ]
+
+        jobs = [self._entry(prompt="Find what I do twice.")]
+        loaded = _loaded(tmp_path, jobs)["skill-extractor"]
+        assert loaded.schedule == self._shipped()["schedule"]
+        assert loaded.prompt == "Find what I do twice."
+
+    def test_a_prompt_kept_in_a_file_is_still_the_one_sent(self, tmp_path):
+        """The inline prompt beside it is what runs when the file cannot be
+        read, so it is brought up to date like any other."""
+        (tmp_path / "extract.md").write_text("Find what I do twice.", encoding="utf-8")
+        loaded = _loaded(tmp_path, [self._entry(prompt_file="extract.md")])["skill-extractor"]
+
+        assert loaded.resolve_prompt() == "Find what I do twice."
+        assert loaded.prompt == self._shipped()["prompt"]
+        assert loaded.schedule == self._shipped()["schedule"]
+
+    def test_the_inline_prompt_of_a_workflow_job_stays(self, tmp_path, caplog):
+        """A job that launches a workflow run never sends its inline prompt:
+        replacing it would change nothing, and the log would say that it
+        did."""
+        workflow = {"engine": "claude-workflow", "prompt": "Mine.", "budget_usd": 5}
+        loaded, said = _loaded_and_said(caplog, tmp_path, [self._entry(workflow=workflow)])
+
+        job = loaded["skill-extractor"]
+        assert job.workflow == workflow and "(max 2)" in job.prompt
+        assert job.schedule == self._shipped()["schedule"]
+        assert said == [
+            "Cron job skill-extractor: its description, schedule in system.yaml are "
+            "what an earlier release shipped; the job is loaded with this release's (schedule 0 5 * * *)"
+        ]
+
+    def test_of_two_entries_with_the_id_the_one_that_runs_is_meant(self, tmp_path, caplog):
+        """The last one runs. Nothing is said about the other."""
+        mine = self._entry(schedule="0 9 * * 1", prompt="Mine.", description="Mine.")
+
+        loaded, said = _loaded_and_said(caplog, tmp_path, [self._entry(), mine])
+        assert (loaded["skill-extractor"].schedule, loaded["skill-extractor"].prompt) == ("0 9 * * 1", "Mine.")
+        assert not said
+
+        loaded, said = _loaded_and_said(caplog, tmp_path, [mine, self._entry()])
+        assert loaded["skill-extractor"].schedule == self._shipped()["schedule"]
+        assert len(said) == 1
+
+    def test_a_value_that_is_not_text_is_left_alone(self, tmp_path):
+        """A bare ``description:`` is None. The jobs still load, and the
+        entry's schedule and prompt still change."""
+        jobs = self._before()
+        for job in jobs:
+            if job["id"] == "skill-extractor":
+                job["description"] = None
+        loaded = _loaded(tmp_path, jobs)
+
+        assert len(loaded) == len(jobs)
+        assert loaded["skill-extractor"].description is None
+        assert loaded["skill-extractor"].schedule == self._shipped()["schedule"]
+        assert loaded["skill-extractor"].prompt == self._shipped()["prompt"]
+
+    @pytest.mark.parametrize("strict", [False, True], ids=["tolerant", "strict"])
+    def test_an_entry_in_jobs_yaml_is_loaded_as_written(self, tmp_path, caplog, strict):
+        """Also the one an earlier release wrote: an install from before
+        system.yaml has its built-in jobs in jobs.yaml, where they replace
+        the ones of a system.yaml written since. The log says that the job is
+        not the one this release ships, and nothing about the entry in
+        system.yaml, which does not run."""
+        loaded, said = _loaded_and_said(
+            caplog, tmp_path, _BEFORE_DAILY, [self._entry(model="mine", enabled=False)], strict=strict,
+        )
+
+        job = loaded["skill-extractor"]
+        assert job.metadata["_source"] == "user" and (job.model, job.enabled) == ("mine", False)
+        assert job.schedule == "0 */12 * * *" and "(max 2)" in job.prompt
+        assert job.description.startswith("Every 12 hours")
+        assert said == [
+            "Cron job skill-extractor: its description, prompt, schedule in jobs.yaml are "
+            "what an earlier release shipped; the job is loaded as that file has it "
+            "(this release ships schedule 0 5 * * *)"
+        ]
+
+    def test_an_earlier_prompt_in_jobs_yaml_is_named_beside_a_schedule_of_its_own(self, tmp_path, caplog):
+        loaded, said = _loaded_and_said(
+            caplog, tmp_path, _BEFORE_DAILY, [self._entry(schedule="0 9 * * 1")],
+        )
+
+        assert loaded["skill-extractor"].schedule == "0 9 * * 1" and "(max 2)" in loaded["skill-extractor"].prompt
+        assert said == [
+            "Cron job skill-extractor: its description, prompt in jobs.yaml are "
+            "what an earlier release shipped; the job is loaded as that file has it"
+        ]
+
+    def test_the_earlier_schedule_can_be_chosen_in_jobs_yaml(self, tmp_path, caplog):
+        """With the prompt this release ships, or one of the operator's own,
+        twice a day again. That is a choice: nothing is said about it."""
+        for prompt in (self._shipped()["prompt"], "Find what I do twice."):
+            mine = self._entry(schedule="0 */12 * * *", prompt=prompt)
+            loaded, said = _loaded_and_said(caplog, tmp_path, _BEFORE_DAILY, [mine])
+
+            assert (loaded["skill-extractor"].schedule, loaded["skill-extractor"].prompt) == ("0 */12 * * *", prompt)
+            assert not said
+
+    def test_a_jobs_yaml_entry_that_does_not_load_replaces_nothing(self, tmp_path, caplog):
+        """It has no prompt. The system.yaml entry runs, brought up to date."""
+        loaded, said = _loaded_and_said(
+            caplog, tmp_path, _BEFORE_DAILY, [{"id": "skill-extractor", "schedule": "0 9 * * 1"}],
+        )
+
+        job = loaded["skill-extractor"]
+        assert job.metadata["_source"] == "system"
+        assert (job.schedule, job.prompt) == (self._shipped()["schedule"], self._shipped()["prompt"])
+        assert len(said) == 1 and "in system.yaml are" in said[0]
+
+    def test_built_in_jobs_kept_in_jobs_yaml_alone_are_loaded_as_written_too(self, tmp_path, caplog):
+        """An old install with every job in jobs.yaml and no system.yaml."""
+        line = (
+            "Cron job skill-extractor: its description, prompt, schedule in jobs.yaml are "
+            "what an earlier release shipped; the job is loaded as that file has it "
+            "(this release ships schedule 0 5 * * *)"
+        )
+        loaded, said = _loaded_and_said(caplog, tmp_path, None, _BEFORE_DAILY)
+
+        assert loaded["skill-extractor"].schedule == "0 */12 * * *" and "(max 2)" in loaded["skill-extractor"].prompt
+        assert said == [line]
+
+        # Every entry of that file is loaded, two with one id too: each is
+        # spoken of, whichever of them the scheduler then runs.
+        mine = self._entry(schedule="0 9 * * 1", prompt="Mine.", description="Mine.", enabled=False)
+        for jobs in ([self._entry(), mine], [mine, self._entry()]):
+            _, said = _loaded_and_said(caplog, tmp_path, None, jobs)
+            assert said == [line]
+
+    def test_the_loom_wording_is_told_by_the_prompt_this_release_ships(self, tmp_path, monkeypatch):
+        """So an earlier memU prompt is brought up to date first, and then
+        reworded: the other order would run memU's prompt under Loom."""
+        from nerve import setup_writer
+        from nerve.memory import loom_prompts
+
+        monkeypatch.setitem(
+            setup_writer._SUPERSEDED_CRON_VALUES, "memory-maintenance",
+            {"prompt": ("Prune yesterday's memories.",)},
+        )
+        jobs = self._before()
+        for job in jobs:
+            if job["id"] == "memory-maintenance":
+                job["prompt"] = "Prune yesterday's memories."
+
+        assert _loaded(tmp_path, jobs)["memory-maintenance"].prompt == next(
+            c for c in setup_writer.CORE_CRONS if c["id"] == "memory-maintenance"
+        )["prompt"]
+        assert _loaded(tmp_path, jobs, backend="loom")["memory-maintenance"].prompt == (
+            loom_prompts.MAINTENANCE_PROMPT
+        )
+
+    def test_the_loom_wording_of_the_other_jobs_still_applies(self, tmp_path):
+        from nerve.memory import loom_prompts
+
+        loaded = _loaded(tmp_path, _BEFORE_DAILY, backend="loom")
+
+        assert loaded["memory-maintenance"].prompt == loom_prompts.MAINTENANCE_PROMPT
+        assert loaded["skill-extractor"].prompt == self._shipped()["prompt"]
+
+    def test_a_file_written_now_loads_as_it_is(self, tmp_path, caplog):
+        from nerve.setup_writer import DEFAULT_CRONS, SetupChoices, build_cron_jobs
+
+        jobs = build_cron_jobs(SetupChoices(mode="worker", enabled_crons=list(DEFAULT_CRONS["worker"])))
+        with caplog.at_level("INFO", logger="nerve.cron.service"):
+            loaded = _loaded(tmp_path, jobs)
+
+        assert not _said(caplog)
+        assert loaded["skill-extractor"].schedule == "0 5 * * *"
