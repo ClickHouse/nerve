@@ -40,7 +40,8 @@ Two options:
   `https://jp.cloud.langfuse.com` (JP).
 - **Self-hosted** — follow the upstream deployment guide at
   <https://langfuse.com/self-hosting/deployment/docker-compose>, then
-  point Nerve at the resulting host URL.
+  point Nerve at the resulting host URL. The server must be Langfuse
+  v4.59.0 or later (see [Server version](#server-version)).
 
 ### 2. Get API keys
 
@@ -97,13 +98,46 @@ This includes UTF-8 bytes and nested mappings and sequences. JSON is
 decoded before matching patterns against its text. Bytes that are not
 valid UTF-8 are replaced with `[REDACTED]`.
 
+The metadata attributes (`langfuse.trace.metadata.*` and
+`langfuse.observation.metadata.*`) hold JSON text. Nerve decodes the
+value, redacts the strings, keys, numbers and booleans in it, and encodes
+it again, so the value stays valid JSON. A number or boolean that a
+pattern matches becomes the string `"[REDACTED]"`. A metadata value that
+is not JSON text is redacted as plain text.
+
 Masking runs before the Langfuse SDK extracts media for upload. A matching
 data URI is redacted before it can enter the upload queue. This uses the
-exporter layout of Langfuse 4.17 and OpenTelemetry 1.45; if masking cannot
-be installed, tracing stays off. If masking raises, the batch is dropped
-before media processing or export. Span names and span events (for
-example exception messages) are not redacted. Patterns do not inspect the
-contents of encoded images or other media.
+exporter layout of Langfuse Python SDK 5 and OpenTelemetry 1.45; if
+masking cannot be installed, tracing stays off. If masking raises, the
+batch is dropped before media processing or export. Span names and span
+events (for example exception messages) are not redacted. Patterns do not
+inspect the contents of encoded images or other media.
+
+## Langfuse SDK 5: server version, compression and metadata
+
+Nerve uses the Langfuse Python SDK 5.
+
+### Server version
+
+Langfuse Cloud works. A self-hosted Langfuse server must be v4.59.0 or
+later. SDK 5 does not support Langfuse v3 or a v4 server older than
+v4.59.0. Upgrade the server before you upgrade Nerve.
+
+### Compression
+
+The SDK sends each span batch gzip-compressed. If a proxy between Nerve
+and `host` rejects compressed requests, set `LANGFUSE_OTEL_COMPRESSION=none`
+in the environment of the Nerve process (for example `Environment=` in a
+systemd unit, or `docker run -e`) and restart Nerve. The SDK also reads
+`OTEL_EXPORTER_OTLP_TRACES_COMPRESSION` and `OTEL_EXPORTER_OTLP_COMPRESSION`
+when `LANGFUSE_OTEL_COMPRESSION` is not set.
+
+### Metadata values
+
+The SDK sends each metadata value as JSON text, strings included. For
+example, `metadata.parent_session_id` goes out as `"<id>"`, with the
+quotes. Langfuse decodes these values for spans from SDK 5. A saved
+metadata filter that you wrote for data from SDK 4 may not match new data.
 
 ## Privacy note
 
@@ -172,6 +206,9 @@ key).
   - `enabled: true` with `auth_ok: false`: the host did not answer the
     startup check. Spans are sent when it answers; check the network path
     to `host`.
+  - `enabled: true` with `auth_ok: true` on a self-hosted server: check
+    that the server is v4.59.0 or later, and that no proxy rejects
+    gzip-compressed requests (see [Compression](#compression)).
 - **No Langfuse link in the chat header.** The link needs `project_id`
   from a successful startup check. Restart Nerve once the host answers.
 - **The host runs out of memory under heavy load.** The Langfuse SDK
