@@ -1771,6 +1771,11 @@ sender is resolved.
   session.
 - Each shared-channel thread has its own session and all replies stay there;
   shared channels never have a channel-wide session.
+- A reply in the thread under a notification card goes to the session that
+  raised the notification, while that session exists and is not archived, and
+  the answer stays in that thread. In a DM, only that thread goes there: the
+  DM keeps its own session. In a shared channel, the reply must still mention
+  the bot, until the thread has that session.
 - Messages another app wrote itself are ignored, so two agents in one channel
   cannot answer each other without end. A person posting through an
   integration still reaches the agent, because they keep their own user ID.
@@ -1806,7 +1811,9 @@ scoped to the caller. Unknown command names are ignored with a warning;
 
 Slack slash-command payloads have no thread ID. In a shared channel, `new` and
 `sessions` therefore refuse, while `stop`, `star`, and `unstar` select among
-that channel's active thread sessions. Commands work normally in DMs.
+that channel's active thread sessions. Commands work normally in DMs. In a DM
+where a reply under a notification card reached the card's session, `stop`,
+`star`, and `unstar` select between that session and the DM's own.
 
 `doctor` and `restart` are **DM-only**, whatever the allow lists say. Enabling
 one decides whether this instance offers it; it does not decide that every

@@ -148,6 +148,7 @@ behind NAT with no public URL.
 - Each thread is its own conversation, so several people can work in one channel
 - In a channel it stays quiet until you `@mention` it
 - Reply to its questions by pressing a button, or send it a file to read
+- Replying in the thread under a notification continues the session that sent it
 - You decide who may talk to it and where — by person, by channel, or both
 
 ### ⏰ Cron Jobs
