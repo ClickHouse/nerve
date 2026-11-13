@@ -122,6 +122,19 @@ class TestDecoding:
         assert event.content[0].text.body == "hello"
         assert event.occurred_at == datetime(2026, 9, 16, 10, 0, 0, 100000, tzinfo=timezone.utc)
 
+    def test_an_event_can_name_the_message_that_it_replies_to(self):
+        reply, plain = (
+            decode(page(direct_message(thread="1.0", **members))).body.events[0]
+            for members in ({"reply_to": "card-7"}, {})
+        )
+
+        assert reply.reply_to == MessageReference(id="card-7")
+        assert json.loads(dumps(reply))["reply_to"] == {"id": "card-7"}
+        # An older gateway leaves the member out, and so does the encoding.
+        assert plain.reply_to is None
+        assert "reply_to" not in json.loads(dumps(plain))
+        assert dataclasses.replace(reply, reply_to=None) == plain
+
     def test_unknown_members_are_ignored(self):
         value = page(direct_message())
         value["trace"] = {"traceparent": "00-" + "1" * 32 + "-" + "2" * 16 + "-01"}
