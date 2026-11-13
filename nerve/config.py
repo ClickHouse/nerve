@@ -1028,6 +1028,13 @@ class PromptRewriteConfig:
 # SDK default of two gives up after about 1.5 s.
 PROXY_CLIENT_MAX_RETRIES = 6
 
+# Arguments that every Anthropic SDK client of Nerve gets. The SDK makes no
+# OpenTelemetry span of its own and sends no trace context headers. With
+# Langfuse on, ``AnthropicInstrumentor`` makes the span of each call (see
+# nerve.observability.langfuse). A span of the SDK would give Langfuse a
+# second span of the same call, with the same token counts.
+ANTHROPIC_CLIENT_OPTIONS: dict[str, Any] = {"open_telemetry": False}
+
 
 # The default model ids live in the constants block at the top of this file
 # (DEFAULT_MODEL and friends, DEFAULT_CLAUDE_MODELS).
@@ -4263,6 +4270,28 @@ class NerveConfig:
         """Config-only view of :meth:`selectable_claude_models` (no discovery)."""
         return self.selectable_claude_models()
 
+    def bedrock_region(self) -> str:
+        """The ``aws_region`` argument for Nerve's Bedrock SDK clients.
+
+        ``provider.aws_region`` when it is set. Else ``""``, which lets the
+        SDK find the region in ``AWS_REGION``, ``AWS_DEFAULT_REGION`` or the
+        AWS profile. When none of them gives a region, ``us-east-1``: the SDK
+        does not make a Bedrock client without a region.
+        """
+        if self.provider.aws_region:
+            return self.provider.aws_region
+        if os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"):
+            return ""
+        try:
+            import boto3
+
+            profile = self.provider.aws_profile or None
+            if boto3.Session(profile_name=profile).region_name:
+                return ""
+        except Exception:  # noqa: BLE001 - a profile that does not load gives no region
+            pass
+        return "us-east-1"
+
     def _client_retry_kwargs(self, max_retries: int | None) -> dict[str, Any]:
         """The ``max_retries`` argument for an Anthropic client, if any.
 
@@ -4309,11 +4338,12 @@ class NerveConfig:
         if self.provider.is_bedrock:
             from anthropic import AnthropicBedrock
             kwargs: dict[str, Any] = {
-                "timeout": timeout, **self._client_retry_kwargs(max_retries),
+                "timeout": timeout, **ANTHROPIC_CLIENT_OPTIONS,
+                **self._client_retry_kwargs(max_retries),
                 **self._client_header_kwargs(principal_id),
             }
-            if self.provider.aws_region:
-                kwargs["aws_region"] = self.provider.aws_region
+            if region := self.bedrock_region():
+                kwargs["aws_region"] = region
             if self.provider.aws_profile:
                 kwargs["aws_profile"] = self.provider.aws_profile
             if self.provider.aws_access_key_id:
@@ -4326,6 +4356,7 @@ class NerveConfig:
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
         kwargs = {
+            **ANTHROPIC_CLIENT_OPTIONS,
             **self._client_retry_kwargs(max_retries),
             **self._client_header_kwargs(principal_id),
         }
@@ -4355,11 +4386,12 @@ class NerveConfig:
         if self.provider.is_bedrock:
             from anthropic import AsyncAnthropicBedrock
             kwargs: dict[str, Any] = {
-                "timeout": timeout, **self._client_retry_kwargs(max_retries),
+                "timeout": timeout, **ANTHROPIC_CLIENT_OPTIONS,
+                **self._client_retry_kwargs(max_retries),
                 **self._client_header_kwargs(principal_id),
             }
-            if self.provider.aws_region:
-                kwargs["aws_region"] = self.provider.aws_region
+            if region := self.bedrock_region():
+                kwargs["aws_region"] = region
             if self.provider.aws_profile:
                 kwargs["aws_profile"] = self.provider.aws_profile
             if self.provider.aws_access_key_id:
@@ -4371,6 +4403,7 @@ class NerveConfig:
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
         kwargs = {
+            **ANTHROPIC_CLIENT_OPTIONS,
             **self._client_retry_kwargs(max_retries),
             **self._client_header_kwargs(principal_id),
         }

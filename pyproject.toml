@@ -65,7 +65,11 @@ dependencies = [
     "telethon>=1.38.0",
     # [bedrock] pulls boto3/botocore, required by AnthropicBedrock for AWS SigV4
     # request signing (session title generation and other direct-SDK fast-model calls).
-    "anthropic[bedrock]>=0.45.0",  # used by memu_bridge for event date resolution
+    # 2.0 is the first version that sends API version 2026-10-21. The code and
+    # the tests expect it: no sampling parameters, the API key in
+    # `Authorization: Bearer`, and the `open_telemetry` client argument. On
+    # Bedrock, this API version accepts only Claude 4.7 and later models.
+    "anthropic[bedrock]>=2.0.0",  # used by memu_bridge for event date resolution
     "memu-py==1.4.0",  # pinned — nerve monkey-patches memU internals (see memu_bridge._patch_sqlite_bugs)
     "watchfiles>=1.0.0",
     "html2text>=2024.2.26",

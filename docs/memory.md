@@ -107,11 +107,13 @@ memory:
 > which shadows `settings.yaml`. The prefix must match the configured region
 > or every call 400s, so they can't be shared. `categories` stays portable.
 
-memU does not send `temperature` to Claude 5 and later models, which reject
-it. Nerve reads the generation from the model ID, bare or Bedrock-prefixed. An
-ID with no generation in it, such as a Bedrock application inference profile
-ARN, gets `temperature` until the model rejects it with a 400. Nerve then sends
-the request again without it, and omits it for that ID until the next restart.
+On Bedrock, memU sends no `temperature` for any model: the Anthropic SDK has
+no sampling parameters. On the other providers, memU's OpenAI client does not
+send `temperature` to Claude 5 and later models, which reject it. Nerve reads
+the generation from the model ID. An ID with no generation in it, such as a
+gateway alias, gets `temperature` until the model rejects it with a 400. Nerve
+then sends the request again without it, and omits it for that ID until the
+next restart.
 
 ### Event Date Resolution
 
