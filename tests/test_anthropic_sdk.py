@@ -230,6 +230,77 @@ def test_other_inherited_lines_keep_the_bearer_key(stand_in, monkeypatch, route,
 
 
 @pytest.mark.parametrize("use_async", [False, True])
+@pytest.mark.parametrize("route", ["api_key", "proxy"])
+@pytest.mark.parametrize("lines", [
+    "Authorization: Bearer gateway-token\nX-Api-Key: upstream-key",
+    # Names in another case, blank lines and spaces around the name.
+    "\n  \nx-api-key: upstream-key\r\n\n  AUTHORIZATION : Bearer gateway-token\n",
+])
+def test_inherited_authorization_and_x_api_key_lines_both_go_out(
+    stand_in, monkeypatch, route, use_async, lines,
+):
+    """A gateway token in ``Authorization`` and the key for the API behind
+    the gateway in ``X-Api-Key``: both lines go out, the configured key does
+    not."""
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", lines)
+    config, _ = _route_config(route, stand_in.url, stand_in.port)
+
+    _call(config, use_async=use_async)
+
+    (request,) = stand_in.requests
+    assert sorted(_credentials(request)) == [
+        ("authorization", "Bearer gateway-token"), ("x-api-key", "upstream-key"),
+    ]
+
+
+@pytest.mark.parametrize("value, named", [
+    ("X-Api-Key: k", True),
+    ("x-api-key: k", True),
+    ("  X-API-KEY  :k", True),
+    ("\n \nX-Api-Key: k\r\n", True),
+    ("X-Api-Key:", True),
+    ("X-Api-Key-Hint: k", False),
+    ("X-Api-Key", False),
+    ("", False),
+    ("\n  \n", False),
+])
+def test_a_header_line_is_read_as_the_sdk_and_the_principal_rule_read_it(
+    stand_in, monkeypatch, value, named,
+):
+    """``has_custom_header_line`` finds a line exactly when the SDK sends a
+    header for it, and reads the variable as ``direct_client_headers`` does."""
+    import anthropic
+
+    from nerve.inference_principal import (
+        CUSTOM_HEADERS_ENV,
+        INFERENCE_PRINCIPAL_HEADER,
+        direct_client_headers,
+        has_custom_header_line,
+    )
+
+    assert has_custom_header_line("X-Api-Key", {CUSTOM_HEADERS_ENV: value}) is named
+
+    monkeypatch.setenv(CUSTOM_HEADERS_ENV, value)
+    anthropic.Anthropic(
+        api_key=_KEY, base_url=stand_in.url, max_retries=0, open_telemetry=False,
+    ).messages.create(
+        model="claude-haiku-5-5", max_tokens=5, messages=[{"role": "user", "content": "hi"}],
+    )
+    (request,) = stand_in.requests
+    assert any(name == "x-api-key" for name, _ in request["header_lines"]) is named
+
+    principal = {CUSTOM_HEADERS_ENV: value.replace("X-Api-Key", INFERENCE_PRINCIPAL_HEADER)
+                 .replace("x-api-key", INFERENCE_PRINCIPAL_HEADER.lower())
+                 .replace("X-API-KEY", INFERENCE_PRINCIPAL_HEADER.upper())}
+    omitted = any(
+        name.lower() == INFERENCE_PRINCIPAL_HEADER.lower()
+        for name in direct_client_headers(principal)
+    )
+    assert omitted is named
+    assert has_custom_header_line(INFERENCE_PRINCIPAL_HEADER, principal) is named
+
+
+@pytest.mark.parametrize("use_async", [False, True])
 def test_an_inherited_authorization_line_replaces_the_key(stand_in, monkeypatch, use_async):
     """The SDK merges header names in any case, so the line replaces the
     configured key: one credential, and the key does not go out."""

@@ -2732,8 +2732,11 @@ send it as `Authorization: Bearer <key>`. The Claude CLI sends it as
 `X-Api-Key: <key>`. The endpoint must read the key from both headers.
 
 When `ANTHROPIC_CUSTOM_HEADERS` in Nerve's environment has an `X-Api-Key`
-line, the direct SDK calls and model discovery send that line and no
-`Authorization` header. A request then carries one key, the one in that line.
+line and no `Authorization` line, the direct SDK calls and model discovery send
+that line and no `Authorization` header. A request then carries one key, the
+one in that line. When it has both lines, for example a gateway token and the
+key for the API behind the gateway, both lines go out and the configured key
+does not. Header names match in any case.
 
 It cannot be set together with `proxy.enabled` or `provider.type: bedrock`, and a
 change needs a restart.

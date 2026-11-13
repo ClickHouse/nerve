@@ -4383,12 +4383,17 @@ class NerveConfig:
 
         ``api`` is true for a client of the Anthropic API or the proxy (not
         Bedrock). Such a client sends the API key in ``Authorization``, and
-        also the lines of ``ANTHROPIC_CUSTOM_HEADERS``. When these lines name
-        ``X-Api-Key``, the client sends no ``Authorization``: a request
-        carries one credential, the one in that line.
+        also the lines of ``ANTHROPIC_CUSTOM_HEADERS``. A line replaces a
+        header of the same name. When the lines name ``X-Api-Key`` and not
+        ``Authorization``, the client sends no ``Authorization``, so the
+        request carries only the key of that line. When they name both, both
+        lines go out, and the configured key does not.
         """
         headers = direct_client_headers(principal_id=principal_id)
-        if api and has_custom_header_line("X-Api-Key"):
+        if (
+            api and has_custom_header_line("X-Api-Key")
+            and not has_custom_header_line("Authorization")
+        ):
             from anthropic import omit
 
             headers["Authorization"] = omit
