@@ -2663,6 +2663,39 @@ reason.
 |-----|------|---------|-------------|
 | `setup.local_secrets` | bool | `true` | Whether the browser setup page may store a credential it is given (an API key, a bot token, a Telegram sign-in) in the files on this machine. `false` on an instance whose connections the operator provides: the Memory, Channels, Sources and Agents steps are closed, the setup page does not show them, and their writes are refused (`409`); the Model step accepts Bedrock or a credential from the environment, never a pasted key; Slack through a channel gateway keeps its switch, and so does the GitHub source when its token comes from the environment (`GH_TOKEN` / `GITHUB_TOKEN`, or a `${VAR}` reference); the Sources step then offers that one toggle while Gmail and Telegram stay closed. Usually set in the tracked `settings.yaml`. `NERVE_SETUP_LOCAL_SECRETS=0` in the service environment forces it off, one way only, like `NERVE_LOCKDOWN`: the variable can turn the storage off, never on. Read per request, so a reload applies it. See [Instances that keep no credentials](setup.md#instances-that-keep-no-credentials). |
 
+## Amazon Bedrock
+
+With `provider.type: bedrock`, Nerve's own model calls go to Bedrock through
+the Anthropic Python SDK: session titles, plan summaries, the prompt rewrite,
+memU, source condensing, image description and the model check of
+`nerve doctor` and of the setup page. The agent runs in the Claude CLI, which
+has its own client.
+
+The SDK sends API version `2026-10-21`. On Bedrock, this version accepts only
+Claude 4.7 and later models, so these calls fail with an older model. These
+settings name the models of these calls:
+
+| Setting | Used for |
+|---------|----------|
+| `agent.title_model` | Session titles, plan summaries, the model check |
+| `memory.recall_model`, `memory.memorize_model` | memU (not with `memory.backend: loom`) |
+| `memory.fast_model` | memU, source condensing, image description when `sync.imap.vision.model` is empty |
+| `agent.prompt_rewrite.model` | The prompt rewrite. When it is empty, `agent.model` |
+| `sync.imap.vision.model` | Image description |
+
+`nerve doctor` shows a warning for each of these settings that names a Claude
+model older than 4.7, for example
+`us.anthropic.claude-sonnet-4-5-20250929-v1:0`. It reads the version from the
+model ID, also with a region prefix (`us.`, `eu.`, `apac.`, `global.`), with a
+context window (`:200k`) or in an inference profile ARN. It also reads the
+first IDs, such as `anthropic.claude-v2:1` and `anthropic.claude-instant-v1`.
+An ID that it cannot read, such as an application
+inference profile ARN, gets no warning. Nerve starts with an older model in
+these settings. Only the calls above fail.
+
+When `provider.aws_region` is empty, these calls use `AWS_REGION`,
+`AWS_DEFAULT_REGION` or the region of the AWS profile, else `us-east-1`.
+
 ## API Keys (config.local.yaml)
 
 | Key | Type | Description |
@@ -2693,6 +2726,17 @@ The endpoint must serve `POST /v1/messages`. memU also needs
 `POST /v1/chat/completions`, and model discovery uses `GET /v1/models`. The model
 IDs in `agent.*` and `memory.*` must be ones the endpoint serves, including the
 CLI aliases in `agent.model_aliases`.
+
+The key comes in two headers. The direct SDK calls, memU and model discovery
+send it as `Authorization: Bearer <key>`. The Claude CLI sends it as
+`X-Api-Key: <key>`. The endpoint must read the key from both headers.
+
+When `ANTHROPIC_CUSTOM_HEADERS` in Nerve's environment has an `X-Api-Key`
+line and no `Authorization` line, the direct SDK calls and model discovery send
+that line and no `Authorization` header. A request then carries one key, the
+one in that line. When it has both lines, for example a gateway token and the
+key for the API behind the gateway, both lines go out and the configured key
+does not. Header names match in any case.
 
 It cannot be set together with `proxy.enabled` or `provider.type: bedrock`, and a
 change needs a restart.

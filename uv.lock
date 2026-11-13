@@ -1,5 +1,5 @@
 version = 1
-revision = 5
+revision = 3
 requires-python = ">=3.13"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -193,21 +193,21 @@ wheels = [
 
 [[package]]
 name = "anthropic"
-version = "0.123.0"
+version = "2.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
-    { name = "distro" },
     { name = "docstring-parser" },
-    { name = "httpx" },
+    { name = "httpx2" },
     { name = "jiter" },
+    { name = "opentelemetry-api" },
     { name = "pydantic" },
     { name = "sniffio" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2e/b0/ec9d0bc45a71a223d88b94da25061e361efc4403eb2a33ee762031ce8dd9/anthropic-0.123.0.tar.gz", hash = "sha256:5b69bebe20ca0123d1ef36c8dc7c52007d96fcfb6ab2cfd0193c486a0abea909", size = 1025318, upload-time = "2026-08-19T13:32:08.658Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4a/a8/0e50326e4c408f4b4ee3aae4c3bbd60012570b88bc5887effc8542509068/anthropic-2.6.0.tar.gz", hash = "sha256:a38d8698258a4cb33a9bc9d2f0ced1d96b71010870e5ed703807d21021a0da24", size = 1958763, upload-time = "2026-11-05T18:59:09.557Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/96/33/cd7a2e9980d4b9dceb674120a07643b2d7243a70ced6b3018b708f151a73/anthropic-0.123.0-py3-none-any.whl", hash = "sha256:88da3376fff0b467e7394d7b8296a0234570f6af44d0a21d956c139255656ab4", size = 1042948, upload-time = "2026-08-19T13:32:06.756Z" },
+    { url = "https://files.pythonhosted.org/packages/38/0b/705a05ab68558914e725cf1143d7e409fa3bb596c35bca1eceab42402abe/anthropic-2.6.0-py3-none-any.whl", hash = "sha256:4325cdf9346fa29183674b6ee6289ebad5b2b0a935758f7350fa504032da1d9b", size = 2445307, upload-time = "2026-11-05T18:59:11.474Z" },
 ]
 
 [package.optional-dependencies]
@@ -1658,7 +1658,7 @@ test = [
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.14.4" },
     { name = "aiosqlite", specifier = ">=0.21.0" },
-    { name = "anthropic", extras = ["bedrock"], specifier = ">=0.45.0" },
+    { name = "anthropic", extras = ["bedrock"], specifier = ">=2.0.0" },
     { name = "apscheduler", specifier = ">=3.11.0" },
     { name = "bcrypt", specifier = ">=4.2.0" },
     { name = "claude-agent-sdk", specifier = ">=0.2.180" },

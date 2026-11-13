@@ -22,7 +22,7 @@ from nerve.coerce import FALSY, TRUTHY
 from nerve.coerce import as_bool as _as_bool
 from nerve.coerce import coerced as _coerced
 from nerve.coerce import lenient_int as _lenient_int
-from nerve.inference_principal import direct_client_headers
+from nerve.inference_principal import direct_client_headers, has_custom_header_line
 
 import yaml
 
@@ -1027,6 +1027,53 @@ class PromptRewriteConfig:
 # roughly 18-24 s in total, long enough to outlast a short rate limit. The
 # SDK default of two gives up after about 1.5 s.
 PROXY_CLIENT_MAX_RETRIES = 6
+
+# Arguments that every Anthropic SDK client of Nerve gets. The SDK makes no
+# OpenTelemetry span of its own and sends no trace context headers. With
+# Langfuse on, ``AnthropicInstrumentor`` makes the span of each call (see
+# nerve.observability.langfuse). A span of the SDK would give Langfuse a
+# second span of the same call, with the same token counts.
+ANTHROPIC_CLIENT_OPTIONS: dict[str, Any] = {"open_telemetry": False}
+
+# The Anthropic SDK sends API version 2026-10-21. On Amazon Bedrock, this
+# version accepts only Claude 4.7 and later models.
+BEDROCK_SDK_MIN_CLAUDE_VERSION = (4, 7)
+
+# ``claude-<family>-<major>[-<minor>]``, for example ``claude-sonnet-4-5``.
+_CLAUDE_VERSION_NEW = re.compile(r"claude-[a-z]+-(\d+)(?:-(\d+))?")
+# ``claude-<major>[-<minor>]-<family>``, for example ``claude-3-5-haiku``.
+_CLAUDE_VERSION_OLD = re.compile(r"claude-(\d+)(?:-(\d+))?-[a-z]+")
+# The first IDs: ``claude-2.1`` and ``claude-instant-1.2``, and on Bedrock
+# ``claude-v2:1`` and ``claude-instant-v1``.
+_CLAUDE_VERSION_FIRST = re.compile(r"claude-(?:instant-)?v?(\d+)(?:[.:](\d+))?")
+
+
+def claude_model_version(model: str) -> tuple[int, int] | None:
+    """The ``(major, minor)`` version that a Claude model ID names.
+
+    Reads bare and dated IDs (``claude-opus-4-1-20250805``), the ``[1m]``
+    suffix, Bedrock IDs with a region prefix, a version suffix and a
+    context window (``us.anthropic.claude-sonnet-4-5-20250929-v1:0``,
+    ``anthropic.claude-3-haiku-20240307-v1:0:48k``), the first IDs
+    (``claude-2.1``, ``anthropic.claude-v2:1``,
+    ``anthropic.claude-instant-v1``), and an ARN that ends in such an ID.
+    ``None`` for an ID that it cannot read, for example an application
+    inference profile ARN or an alias.
+    """
+    m = model.strip().lower().rsplit("/", 1)[-1]
+    if "anthropic." in m:
+        m = m.rsplit("anthropic.", 1)[1]
+    m = m.split("[", 1)[0]
+    m = re.sub(r":\d+k$", "", m)
+    match = _CLAUDE_VERSION_FIRST.fullmatch(m)
+    if match is None:
+        m = re.sub(r"-v\d+(?::\d+)?$", "", m)
+        m = re.sub(r"-latest$", "", m)
+        m = re.sub(r"-20\d{6}$", "", m)
+        match = _CLAUDE_VERSION_NEW.fullmatch(m) or _CLAUDE_VERSION_OLD.fullmatch(m)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
 
 
 # The default model ids live in the constants block at the top of this file
@@ -4263,6 +4310,54 @@ class NerveConfig:
         """Config-only view of :meth:`selectable_claude_models` (no discovery)."""
         return self.selectable_claude_models()
 
+    def bedrock_region(self) -> str:
+        """The ``aws_region`` argument for Nerve's Bedrock SDK clients.
+
+        ``provider.aws_region`` when it is set. Else ``""``, which lets the
+        SDK find the region in ``AWS_REGION``, ``AWS_DEFAULT_REGION`` or the
+        AWS profile. When none of them gives a region, ``us-east-1``: the SDK
+        does not make a Bedrock client without a region.
+        """
+        if self.provider.aws_region:
+            return self.provider.aws_region
+        if os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"):
+            return ""
+        try:
+            import boto3
+
+            profile = self.provider.aws_profile or None
+            if boto3.Session(profile_name=profile).region_name:
+                return ""
+        except Exception:  # noqa: BLE001 - a profile that does not load gives no region
+            pass
+        return "us-east-1"
+
+    def anthropic_sdk_models(self) -> list[tuple[str, str]]:
+        """``(setting, model)`` for each model that Nerve's own calls use.
+
+        These calls go through the Anthropic Python SDK: session titles and
+        plan summaries, memory, source condensing, image description and the
+        prompt rewrite. The agent runs in the Claude CLI, which has its own
+        client, so ``agent.model`` is here only for the prompt rewrite.
+        """
+        models = [("agent.title_model", self.agent.title_model)]
+        if self.memory.backend == "memu":
+            models += [
+                ("memory.recall_model", self.memory.recall_model),
+                ("memory.memorize_model", self.memory.memorize_model),
+            ]
+        models.append(("memory.fast_model", self.memory.fast_model))
+        rewrite = self.agent.prompt_rewrite
+        if rewrite.enabled:
+            models.append(
+                ("agent.prompt_rewrite.model", rewrite.model) if rewrite.model
+                else ("agent.model (prompt rewrite)", self.agent.model)
+            )
+        imap = self.sync.imap
+        if imap.enabled and imap.vision.enabled and imap.vision.model:
+            models.append(("sync.imap.vision.model", imap.vision.model))
+        return models
+
     def _client_retry_kwargs(self, max_retries: int | None) -> dict[str, Any]:
         """The ``max_retries`` argument for an Anthropic client, if any.
 
@@ -4276,15 +4371,32 @@ class NerveConfig:
         return {}
 
     @staticmethod
-    def _client_header_kwargs(principal_id: str | None = None) -> dict[str, Any]:
+    def _client_header_kwargs(
+        principal_id: str | None = None, *, api: bool = False,
+    ) -> dict[str, Any]:
         """The ``default_headers`` argument for an Anthropic client, if any.
 
         In external mode, Nerve's own model calls name ``principal_id``, or
         the system actor of the server's database when it is ``None``, as the
         principal of the request, and never another principal from the
         environment (see :func:`nerve.inference_principal.direct_client_headers`).
+
+        ``api`` is true for a client of the Anthropic API or the proxy (not
+        Bedrock). Such a client sends the API key in ``Authorization``, and
+        also the lines of ``ANTHROPIC_CUSTOM_HEADERS``. A line replaces a
+        header of the same name. When the lines name ``X-Api-Key`` and not
+        ``Authorization``, the client sends no ``Authorization``, so the
+        request carries only the key of that line. When they name both, both
+        lines go out, and the configured key does not.
         """
         headers = direct_client_headers(principal_id=principal_id)
+        if (
+            api and has_custom_header_line("X-Api-Key")
+            and not has_custom_header_line("Authorization")
+        ):
+            from anthropic import omit
+
+            headers["Authorization"] = omit
         return {"default_headers": headers} if headers else {}
 
     def create_anthropic_client(
@@ -4309,11 +4421,12 @@ class NerveConfig:
         if self.provider.is_bedrock:
             from anthropic import AnthropicBedrock
             kwargs: dict[str, Any] = {
-                "timeout": timeout, **self._client_retry_kwargs(max_retries),
+                "timeout": timeout, **ANTHROPIC_CLIENT_OPTIONS,
+                **self._client_retry_kwargs(max_retries),
                 **self._client_header_kwargs(principal_id),
             }
-            if self.provider.aws_region:
-                kwargs["aws_region"] = self.provider.aws_region
+            if region := self.bedrock_region():
+                kwargs["aws_region"] = region
             if self.provider.aws_profile:
                 kwargs["aws_profile"] = self.provider.aws_profile
             if self.provider.aws_access_key_id:
@@ -4326,8 +4439,9 @@ class NerveConfig:
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
         kwargs = {
+            **ANTHROPIC_CLIENT_OPTIONS,
             **self._client_retry_kwargs(max_retries),
-            **self._client_header_kwargs(principal_id),
+            **self._client_header_kwargs(principal_id, api=True),
         }
         # The key the checks accept (config, else the environment). An explicit
         # ``api_key`` — ``""`` included — stops the SDK from reading the
@@ -4355,11 +4469,12 @@ class NerveConfig:
         if self.provider.is_bedrock:
             from anthropic import AsyncAnthropicBedrock
             kwargs: dict[str, Any] = {
-                "timeout": timeout, **self._client_retry_kwargs(max_retries),
+                "timeout": timeout, **ANTHROPIC_CLIENT_OPTIONS,
+                **self._client_retry_kwargs(max_retries),
                 **self._client_header_kwargs(principal_id),
             }
-            if self.provider.aws_region:
-                kwargs["aws_region"] = self.provider.aws_region
+            if region := self.bedrock_region():
+                kwargs["aws_region"] = region
             if self.provider.aws_profile:
                 kwargs["aws_profile"] = self.provider.aws_profile
             if self.provider.aws_access_key_id:
@@ -4371,8 +4486,9 @@ class NerveConfig:
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
         kwargs = {
+            **ANTHROPIC_CLIENT_OPTIONS,
             **self._client_retry_kwargs(max_retries),
-            **self._client_header_kwargs(principal_id),
+            **self._client_header_kwargs(principal_id, api=True),
         }
         return anthropic.AsyncAnthropic(
             api_key=self.resolve_anthropic_api_key(),  # see create_anthropic_client
