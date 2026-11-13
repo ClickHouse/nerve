@@ -1180,15 +1180,16 @@ class TestMachineMaintenance:
 
 
 class TestMaintenanceJobsWaitForActivity:
-    """memory-maintenance and skill-extractor look after the agent's own work,
-    so each has a default gate on the agent's activity: an agent that has done
-    nothing since the job's last run is not started, or woken, for it. The
-    scheduler gives the gate to an entry that states none
-    (``default_run_if``)."""
+    """The four maintenance jobs look after the agent's own work, so each has
+    a default gate on the agent's activity: an agent that has done nothing
+    since the job's last run is not started, or woken, for it. The scheduler
+    gives the gate to an entry that states none (``default_run_if``)."""
 
     OTHERS = {
         "memory-maintenance": ["skill-extractor", "skill-reviser", "machine-maintenance"],
         "skill-extractor": ["memory-maintenance", "skill-reviser", "machine-maintenance"],
+        "skill-reviser": ["memory-maintenance", "skill-extractor", "machine-maintenance"],
+        "machine-maintenance": ["memory-maintenance", "skill-extractor", "skill-reviser"],
     }
 
     @staticmethod
@@ -1199,21 +1200,26 @@ class TestMaintenanceJobsWaitForActivity:
         return {job["id"]: job for job in setup_writer.build_cron_jobs(choices)}
 
     @pytest.mark.parametrize("backend", ["memu", "loom"])
-    def test_both_jobs_have_a_default_gate_on_activity(self, backend: str) -> None:
+    def test_each_job_has_a_default_gate_on_activity(self, backend: str) -> None:
         for job_id, others in self.OTHERS.items():
             (spec,) = setup_writer.default_run_if(job_id, backend)
             assert (spec["type"], spec["ignore_jobs"]) == ("agent_activity", others)
 
     def test_no_maintenance_job_counts_as_work_for_another(self) -> None:
-        """The weekly ones are left out too: their run is no reason for a
-        memory check or a search for new skills."""
+        """A run of one is no reason for a memory check, a search for new
+        skills, a review of the skills or a cleanup of the machine. Every
+        maintenance job has the gate, and each leaves the other three out."""
         assert set(setup_writer.MAINTENANCE_CRON_IDS) == {
             "memory-maintenance", "skill-extractor", "skill-reviser", "machine-maintenance",
         }
         known = {c["id"] for c in (*setup_writer.CORE_CRONS, *setup_writer.PRODUCTIVITY_CRONS)}
         assert set(setup_writer.MAINTENANCE_CRON_IDS) <= known
-        for job_id, others in self.OTHERS.items():
-            assert set(others) == set(setup_writer.MAINTENANCE_CRON_IDS) - {job_id}
+        for backend in ("memu", "loom"):
+            gated = {job_id for job_id in known if setup_writer.default_run_if(job_id, backend)}
+            assert gated == set(setup_writer.MAINTENANCE_CRON_IDS)
+            for job_id in gated:
+                (spec,) = setup_writer.default_run_if(job_id, backend)
+                assert set(spec["ignore_jobs"]) == set(setup_writer.MAINTENANCE_CRON_IDS) - {job_id}
 
     def test_only_memus_memory_job_looks_back_before_its_last_run(self) -> None:
         """memU's prompt reviews the records of the day before the run, so
@@ -1225,8 +1231,12 @@ class TestMaintenanceJobsWaitForActivity:
         assert "overlap_hours" not in loom
         prompt = self._jobs("worker", "memu")["memory-maintenance"]["prompt"]
         assert "memory_records_by_date(date=yesterday" in prompt
+        # No other job looks back. skill-reviser checks the skills as they
+        # are. machine-maintenance removes only what is old: what was too new
+        # for a run waits for the first run after the agent works again.
         for backend in ("memu", "loom"):
-            assert "overlap_hours" not in setup_writer.default_run_if("skill-extractor", backend)[0]
+            for job_id in ("skill-extractor", "skill-reviser", "machine-maintenance"):
+                assert "overlap_hours" not in setup_writer.default_run_if(job_id, backend)[0]
         # Giving Loom its gate leaves memU's as it is.
         assert setup_writer.default_run_if("memory-maintenance", "memu") == [memu]
 
@@ -1245,7 +1255,7 @@ class TestMaintenanceJobsWaitForActivity:
     def test_system_yaml_does_not_state_them(self, mode: str, backend: str) -> None:
         """Nothing writes the file again when Nerve is updated, so a gate
         written there would never change again; and a Nerve from before the
-        gate type would refuse the two jobs of a file that names it."""
+        gate type would refuse the jobs of a file that names it."""
         jobs = self._jobs(mode, backend)
         for job_id in self.OTHERS:
             assert "run_if" not in jobs[job_id]
@@ -1255,7 +1265,9 @@ class TestMaintenanceJobsWaitForActivity:
 
     @pytest.mark.parametrize("backend", ["memu", "loom"])
     def test_no_other_job_has_a_default_gate(self, backend: str) -> None:
-        for other in ("inbox-processor", "task-planner", "skill-reviser", "machine-maintenance", "mine"):
+        """inbox-processor and task-planner wait for what they act on, with
+        the gates that the file states."""
+        for other in ("inbox-processor", "task-planner", "mine"):
             assert setup_writer.default_run_if(other, backend) == []
 
     def test_a_default_gate_is_the_callers_copy(self) -> None:

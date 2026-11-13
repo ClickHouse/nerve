@@ -1612,24 +1612,30 @@ def _said_about_defaults(caplog) -> list[str]:
 
 
 class TestDefaultGatesOfBuiltInJobs:
-    """memory-maintenance and skill-extractor wait for the agent to work. The
-    gates are not in system.yaml, which nothing writes again when Nerve is
-    updated: the scheduler gives them to an entry that states none, so an
-    install from before them has them too, and a later change reaches all."""
+    """The four maintenance jobs (memory-maintenance, skill-extractor,
+    skill-reviser, machine-maintenance) wait for the agent to work. The gates
+    are not in system.yaml, which nothing writes again when Nerve is updated:
+    the scheduler gives them to an entry that states none, so an install from
+    before them has them too, and a later change reaches all."""
 
     MEMORY = ["skill-extractor", "skill-reviser", "machine-maintenance"]
     SKILLS = ["memory-maintenance", "skill-reviser", "machine-maintenance"]
+    REVISER = ["memory-maintenance", "skill-extractor", "machine-maintenance"]
+    MACHINE = ["memory-maintenance", "skill-extractor", "skill-reviser"]
+    GATED = {"memory-maintenance", "skill-extractor", "skill-reviser", "machine-maintenance"}
 
     @pytest.mark.parametrize("strict", [False, True], ids=["at startup", "on a reload"])
-    def test_the_two_jobs_have_their_gates_without_the_file_stating_them(self, tmp_path, strict):
+    def test_the_jobs_have_their_gates_without_the_file_stating_them(self, tmp_path, strict):
         written = {job["id"]: job for job in _system_yaml()}
-        assert "run_if" not in written["memory-maintenance"]
-        assert "run_if" not in written["skill-extractor"]
+        for job_id in self.GATED:
+            assert "run_if" not in written[job_id]
 
         loaded = _load(tmp_path, list(written.values()), strict=strict)
 
         assert _gates(loaded["memory-maintenance"]) == [(AgentActivityGate, self.MEMORY, 24.0)]
         assert _gates(loaded["skill-extractor"]) == [(AgentActivityGate, self.SKILLS, 0.0)]
+        assert _gates(loaded["skill-reviser"]) == [(AgentActivityGate, self.REVISER, 0.0)]
+        assert _gates(loaded["machine-maintenance"]) == [(AgentActivityGate, self.MACHINE, 0.0)]
 
     def test_the_memory_backend_decides_the_overlap_not_the_file(self, tmp_path):
         """memU's job reviews the records of the day before the run, so it
@@ -1639,20 +1645,25 @@ class TestDefaultGatesOfBuiltInJobs:
 
         assert _gates(loaded["memory-maintenance"]) == [(AgentActivityGate, self.MEMORY, 0.0)]
         assert _gates(loaded["skill-extractor"]) == [(AgentActivityGate, self.SKILLS, 0.0)]
+        # The weekly jobs look at what there is, under either backend.
+        assert _gates(loaded["skill-reviser"]) == [(AgentActivityGate, self.REVISER, 0.0)]
+        assert _gates(loaded["machine-maintenance"]) == [(AgentActivityGate, self.MACHINE, 0.0)]
 
+    @pytest.mark.parametrize("job_id", ["memory-maintenance", "machine-maintenance"])
     @pytest.mark.parametrize("said", [
         {"run_if": []},
         {"run_if": None},
         {"skip_when_idle": []},
         {"run_if": [{"type": "tasks", "status": "pending"}]},
     ])
-    def test_an_entry_that_says_anything_about_gates_is_left_alone(self, tmp_path, said):
-        """``run_if: []`` is how a file says "on every schedule"."""
+    def test_an_entry_that_says_anything_about_gates_is_left_alone(self, tmp_path, said, job_id):
+        """``run_if: []`` is how a file says "on every schedule": a weekly
+        cleanup that must run whatever the agent did, for example."""
         jobs = _system_yaml()
         for job in jobs:
-            if job["id"] == "memory-maintenance":
+            if job["id"] == job_id:
                 job.update(said)
-        loaded = _load(tmp_path, jobs)["memory-maintenance"]
+        loaded = _load(tmp_path, jobs)[job_id]
 
         assert not any(isinstance(gate, AgentActivityGate) for gate in loaded.gates)
         assert len(loaded.gates) == len(said.get("run_if") or [])
@@ -1679,8 +1690,8 @@ class TestDefaultGatesOfBuiltInJobs:
         loaded = _load(tmp_path, jobs)
 
         gated = {job_id for job_id, job in loaded.items() if job.gates}
-        assert gated == {"memory-maintenance", "skill-extractor"}
-        assert {"inbox-processor", "task-planner", "skill-reviser", "machine-maintenance"} <= set(loaded)
+        assert gated == self.GATED
+        assert {"inbox-processor", "task-planner"} <= set(loaded)
 
     def test_a_job_that_jobs_yaml_replaces_keeps_what_that_file_says(self, tmp_path, caplog):
         mine = {"id": "memory-maintenance", "schedule": "0 6 * * *", "prompt": "My own tidy-up."}
@@ -1689,24 +1700,26 @@ class TestDefaultGatesOfBuiltInJobs:
 
         assert loaded["memory-maintenance"].prompt == "My own tidy-up."
         assert loaded["memory-maintenance"].gates == []
-        assert loaded["skill-extractor"].gates
+        others = self.GATED - {"memory-maintenance"}
+        assert all(loaded[job_id].gates for job_id in others)
         said = _said_about_defaults(caplog)
-        assert len(said) == 1 and "skill-extractor" in said[0]
+        assert len(said) == len(others)
+        assert {job_id for job_id in self.GATED if any(f"Cron job {job_id}:" in line for line in said)} == others
 
     def test_built_in_jobs_kept_in_jobs_yaml_are_left_alone(self, tmp_path):
         """An old install with every job in jobs.yaml and no system.yaml: that
         file is the user's."""
         loaded = _load(tmp_path, None, _system_yaml())
 
-        assert loaded["memory-maintenance"].gates == []
-        assert loaded["skill-extractor"].gates == []
+        for job_id in self.GATED:
+            assert loaded[job_id].gates == []
 
     def test_the_load_says_which_gates_it_gave(self, tmp_path, caplog):
         with caplog.at_level("INFO", logger="nerve.cron.jobs"):
             _load(tmp_path, _system_yaml())
 
         said = _said_about_defaults(caplog)
-        assert len(said) == 2
+        assert len(said) == len(self.GATED)
         assert all(
             "system.yaml" in line and "agent activity since" in line and "run_if: []" in line
             for line in said
@@ -1777,3 +1790,117 @@ class TestDefaultGatesOfBuiltInJobs:
         assert [type(gate) for gate in jobs["plain"].gates] == [TasksGate]
         assert jobs["stated"].gates == [] and jobs["none-for-it"].gates == []
         assert [type(gate) for gate in jobs["legacy"].gates] == [MessagesGate]
+
+
+@pytest.mark.asyncio
+class TestBuiltInMaintenanceJobsOnAnAgent:
+    """The four maintenance jobs as the scheduler loads them from the
+    system.yaml that the installer writes, asked about an agent's records."""
+
+    JOBS = ("memory-maintenance", "skill-extractor", "skill-reviser", "machine-maintenance")
+
+    async def _due(self, db, loaded: dict[str, CronJob]) -> set[str]:
+        """The maintenance jobs whose gates let a scheduled run start now."""
+        due = set()
+        for job_id in self.JOBS:
+            ctx = GateContext(job_id=job_id, db=db, jobs=loaded)
+            if (await evaluate_gates(loaded[job_id].gates, ctx)).should_run:
+                due.add(job_id)
+        return due
+
+    @pytest.mark.parametrize("backend", ["memu", "loom"])
+    async def test_none_runs_on_an_agent_that_does_nothing(self, db, tmp_path, backend):
+        loaded = _load(tmp_path, _system_yaml(backend), backend=backend)
+        assert await self._due(db, loaded) == set()  # nothing has ever happened
+
+        for job_id in self.JOBS:
+            await _ran(db, job_id, minutes_ago=60 * 24 * 8)
+
+        assert await self._due(db, loaded) == set()  # more than a week on, still nothing
+
+    @WORK
+    async def test_a_run_of_one_starts_none_of_the_others(self, db, tmp_path, work):
+        """A run is a turn of the agent too, in a session of its job."""
+        loaded = _load(tmp_path, _system_yaml())
+        for job_id in self.JOBS:
+            await _ran(db, job_id, minutes_ago=60 * 24 * 3)
+        for job_id in self.JOBS:
+            await work(db, _run_session(job_id), minutes_ago=60)
+
+        assert await self._due(db, loaded) == set()
+
+    @WORK
+    @pytest.mark.parametrize("ungated", ["skill-reviser", "machine-maintenance"])
+    async def test_a_job_put_back_on_every_schedule_starts_none_either(self, db, tmp_path, work, ungated):
+        """``run_if: []`` takes the gate off a job. Its runs still are not work
+        for the others: each names the other three in ``ignore_jobs``."""
+        jobs = _system_yaml()
+        for job in jobs:
+            if job["id"] == ungated:
+                job["run_if"] = []
+        loaded = _load(tmp_path, jobs)
+        assert loaded[ungated].gates == []
+        for job_id in self.JOBS:
+            await _ran(db, job_id, minutes_ago=60 * 24 * 3)
+        await work(db, _run_session(ungated), minutes_ago=60)
+
+        assert await self._due(db, loaded) == {ungated}
+
+    @WORK
+    @pytest.mark.parametrize("backend, once_more", [("memu", {"memory-maintenance"}), ("loom", set())])
+    async def test_work_starts_each_of_them_once(self, db, tmp_path, work, backend, once_more):
+        """After their runs only memU's memory job is due again: it reviews
+        the day before its run. The weekly jobs have no overlap: what
+        machine-maintenance found too new to remove waits for the first run
+        after the agent works again."""
+        loaded = _load(tmp_path, _system_yaml(backend), backend=backend)
+        for job_id in self.JOBS:
+            await _ran(db, job_id, minutes_ago=60 * 24 * 3)
+        await work(db, "chat-1", minutes_ago=120)
+
+        assert await self._due(db, loaded) == set(self.JOBS)
+
+        for job_id in self.JOBS:
+            await _ran(db, job_id, minutes_ago=60)
+
+        assert await self._due(db, loaded) == once_more
+
+    async def test_the_weekly_jobs_on_the_real_scheduler(self, agent_db, tmp_path):
+        """Loaded by the scheduler from the installer's file and run by it:
+        no run while nothing has happened, one run of each for one piece of
+        work, and neither run starts the other. A person can still start the
+        cleanup of an agent that does nothing."""
+        import yaml
+
+        engine, _ = await _engine(agent_db, tmp_path, [OK])
+        svc = CronService(engine.config, engine, agent_db)
+        system_file = engine.config.cron.system_file
+        system_file.parent.mkdir(parents=True, exist_ok=True)
+        system_file.write_text(yaml.safe_dump({"jobs": _system_yaml()}), encoding="utf-8")
+        svc._jobs = svc._load_merged_jobs()
+        weekly = [job for job in svc._jobs if job.id in ("skill-reviser", "machine-maintenance")]
+        assert len(weekly) == 2
+
+        async def scheduled_time() -> None:
+            for job in weekly:
+                await svc._run_job_inner(job)
+            await _age(agent_db, 10)
+
+        async def runs() -> dict[str, list[str]]:
+            return {
+                job.id: [log["status"] for log in await agent_db.get_cron_logs(job.id)]
+                for job in weekly
+            }
+
+        await scheduled_time()
+        assert await runs() == {"skill-reviser": [], "machine-maintenance": []}
+
+        await _session(engine, "chat")
+        await _real_turn(engine, "chat")
+        await _age(agent_db, 10)
+        for _ in range(3):
+            await scheduled_time()
+        assert await runs() == {"skill-reviser": ["success"], "machine-maintenance": ["success"]}
+
+        await svc.run_job("machine-maintenance")
+        assert (await runs())["machine-maintenance"] == ["success", "success"]
