@@ -1530,6 +1530,20 @@ was delivered, and the card then shows the answer without buttons. A press
 that answers nothing, for example a second press, gets a short notice and
 the card stays. An expired card is edited without buttons.
 
+A message in the thread under a notification card goes to the session that
+raised the notification, and Nerve answers in that thread. The session must
+exist and must not be archived; otherwise the message goes where a message
+without a card goes. In a direct message too, only that thread goes to the
+session: the direct message keeps its own session for every other message.
+An event can also name the message that it replies to (`reply_to`). When
+that is a card, for example because the gateway posted the card as copies in
+other conversations and the person replied under a copy, the message goes to
+the session of that card in the same way. This holds for every person whose
+message the gateway admits: the turn runs in the session that raised the
+notification, as that person, and the answer is posted in the thread of the
+reply. That session can be one that another person started, for example in
+the web interface.
+
 `/nerve` commands, including the host commands
 `doctor` and `restart`, are not available in hosted mode; `nerve doctor`
 reports this and the local settings that still apply.
@@ -1762,6 +1776,14 @@ sender is resolved.
   session.
 - Each shared-channel thread has its own session and all replies stay there;
   shared channels never have a channel-wide session.
+- A reply in the thread under a notification card goes to the session that
+  raised the notification, while that session exists and is not archived, and
+  the answer stays in that thread. In a DM, only that thread goes there: the
+  DM keeps its own session. In a shared channel, the reply must still mention
+  the bot, until the thread has that session. This holds for every person
+  who may talk to the bot there: the turn runs in the session that raised the
+  notification, which another person may have started, and the answer is
+  posted in the thread.
 - Messages another app wrote itself are ignored, so two agents in one channel
   cannot answer each other without end. A person posting through an
   integration still reaches the agent, because they keep their own user ID.
@@ -1797,7 +1819,9 @@ scoped to the caller. Unknown command names are ignored with a warning;
 
 Slack slash-command payloads have no thread ID. In a shared channel, `new` and
 `sessions` therefore refuse, while `stop`, `star`, and `unstar` select among
-that channel's active thread sessions. Commands work normally in DMs.
+that channel's active thread sessions. Commands work normally in DMs. In a DM
+where a reply under a notification card reached the card's session, `stop`,
+`star`, and `unstar` select between that session and the DM's own.
 
 `doctor` and `restart` are **DM-only**, whatever the allow lists say. Enabling
 one decides whether this instance offers it; it does not decide that every

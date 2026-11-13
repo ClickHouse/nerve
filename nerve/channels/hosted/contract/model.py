@@ -385,7 +385,10 @@ class SourceRecordPayload:
 class Event:
     """One normalized provider event.
 
-    ``event_id`` is the logical event and the duplicate key.
+    ``event_id`` is the logical event and the duplicate key. ``reply_to`` is
+    the message that this message replies to. It can be a message of another
+    conversation: a reply under a copy of a notification names the message
+    that the ``notify`` result named. An older gateway leaves it out.
     """
 
     event_id: str = ""
@@ -396,6 +399,7 @@ class Event:
     thread: ThreadReference | None = omit_empty(None)
     topic: TopicReference | None = omit_empty(None)
     message: MessageReference | None = omit_empty(None)
+    reply_to: MessageReference | None = omit_empty(None)
     author: AuthorReference | None = omit_empty(None)
     admission: EventAdmission | None = omit_empty(None)
     delivery: EventDelivery | None = omit_empty(None)

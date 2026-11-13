@@ -283,6 +283,33 @@ class NotificationStore:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
+    async def find_notification_for_message(
+        self,
+        channel: str,
+        message_id: str,
+    ) -> dict | None:
+        """Find the notification delivered as one exact message in any target.
+
+        For a reply that names the message and not the target of its
+        delivery. A message ID is unique only within a target, so an ID that
+        was delivered in more than one target matches nothing, like an empty
+        one.
+        """
+        if not message_id:
+            return None
+        async with self.db.execute(
+            """SELECT DISTINCT target FROM notification_deliveries
+               WHERE channel = ? AND message_id = ?
+               LIMIT 2""",
+            (channel, message_id),
+        ) as cursor:
+            targets = [row[0] async for row in cursor]
+        if len(targets) != 1:
+            return None
+        return await self.find_notification_for_delivery(
+            channel, targets[0], message_id,
+        )
+
     async def dismiss_notification(
         self, notification_id: str, *, attribution: Attribution = UNATTRIBUTED,
     ) -> bool:

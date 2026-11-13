@@ -532,6 +532,32 @@ class NotificationService:
             return None
         return await self.db.get_notification(pending["id"])
 
+    async def reply_session(
+        self,
+        *,
+        channel: str,
+        message_id: str,
+        target: str | None = None,
+    ) -> str | None:
+        """The session that takes a reply to a delivered notification, or ``None``.
+
+        The notification is the one delivered on ``channel`` as the message
+        ``message_id``: in ``target``, or in whichever target when the caller
+        knows only the message. The session that raised it takes the reply
+        while it exists and is not archived.
+        """
+        if target is None:
+            notif = await self.db.find_notification_for_message(channel, message_id)
+        else:
+            notif = await self.db.find_notification_for_delivery(
+                channel, target, message_id,
+            )
+        session_id = (notif or {}).get("session_id")
+        session = await self.db.get_session(session_id) if session_id else None
+        if not session or session.get("status") == "archived":
+            return None
+        return session_id
+
     async def handle_answer(
         self,
         notification_id: str,

@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from nerve.agent.engine import NotAcceptingTurnsError
+from nerve.agent.engine import NotAcceptingTurnsError, SessionClosedError
 from nerve.channels.access import (
     Decision,
     Identity,
@@ -1216,6 +1216,16 @@ class SlackChannel(BaseChannel):
         if not handled:
             return
 
+        # A reply in the thread under a notification card goes to the session
+        # that raised the notification. Its target is that thread, in a DM
+        # too, so the answer lands there and the DM keeps its own session.
+        session_id = await self._notification_session(
+            channel_id, event.get("thread_ts") or "",
+        )
+        if session_id:
+            target = format_target(channel_id, event["thread_ts"])
+            channel_key = f"slack:{target}"
+
         text = slack_to_plain(event.get("text") or "", self._bot_user_id)
         self._cache_message(ts, target, text)
 
@@ -1250,18 +1260,63 @@ class SlackChannel(BaseChannel):
             channel_key=channel_key,
             sender_id=target,
             text=text,
+            session_id=session_id,
             metadata=metadata,
             conversation_title=next(iter(conversation.names), ""),
         )
 
         try:
-            await self.router.handle_message(msg)
+            try:
+                # A delete since the check leaves no row, and the router does
+                # not report that as a closed session.
+                if (
+                    msg.session_id is not None
+                    and await self.router.get_session(msg.session_id) is None
+                ):
+                    raise SessionClosedError("deleted")
+                await self.router.handle_message(msg)
+            except SessionClosedError:
+                if msg.session_id is None:
+                    raise
+                # The notification's session closed after the check. The
+                # message goes once more, to where it goes without a card.
+                target = format_target(channel_id, thread_ts)
+                msg.channel_key, msg.sender_id = f"slack:{target}", target
+                msg.session_id = None
+                self._cache_message(
+                    ts, target,
+                    slack_to_plain(event.get("text") or "", self._bot_user_id),
+                )
+                self._remember(self._last_inbound_ts, target, ts, _INBOUND_TS_MAX)
+                await self.router.handle_message(msg)
         except NotAcceptingTurnsError:
             # The stream adapter already sent the engine's error event.
             logger.info("Draining: refused a message from %s", target)
         except Exception as e:
             logger.error("Agent error for %s: %s", target, e, exc_info=True)
             await self._post(target, f"Error: {e}")
+
+    async def _notification_session(
+        self, channel_id: str, thread_ts: str,
+    ) -> str | None:
+        """The session behind the notification card that roots a thread.
+
+        That is the session that raised the notification, while it exists
+        and is not archived, else ``None``. A lookup that fails is logged and
+        gives ``None``: the message then goes where it goes without a card.
+        """
+        if not thread_ts or self._notification_service is None:
+            return None
+        try:
+            return await self._notification_service.reply_session(
+                channel="slack", message_id=thread_ts, target=channel_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Slack could not look up the notification of thread %s: %s",
+                thread_ts, e,
+            )
+            return None
 
     async def _handle_reaction_event(self, event: dict[str, Any]) -> None:
         """Forward an emoji reaction on a cached message as text."""

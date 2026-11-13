@@ -153,11 +153,13 @@ def message_event(
     connection_id: str = CONNECTION_ID,
     kind: str = "message",
     provider: str = "slack",
+    reply_to: str | None = None,
 ) -> dict[str, Any]:
     """A message event in the shape of the contract samples, without a delivery.
 
     An invoke event gets the trigger that the contract's precedence selects,
-    as the gateway sets it.
+    as the gateway sets it. With *reply_to*, the event names that message as
+    the one that it replies to.
     """
     event = copy.deepcopy(MESSAGE_EVENT)
     event["provider"] = provider
@@ -170,6 +172,8 @@ def message_event(
     event["author"] = {"id": author, "kind": "human", "display_name": "Example Member"}
     if thread is not None:
         event["thread"] = {"id": thread}
+    if reply_to is not None:
+        event["reply_to"] = {"id": reply_to}
     content: list[dict[str, Any]] = []
     if mention_agent:
         content.append({"kind": "reference", "reference": {

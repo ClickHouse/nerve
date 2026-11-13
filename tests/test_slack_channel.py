@@ -16,9 +16,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nerve.agent.engine import NotAcceptingTurnsError
+from nerve.agent.engine import NotAcceptingTurnsError, SessionClosedError
+from nerve.agent.sessions import SessionManager
+from nerve.agent.streaming import broadcaster
 from nerve.channels import slack as slack_module
 from nerve.channels.base import ChannelCapability, OutboundMessage
+from nerve.channels.router import ChannelRouter
 from nerve.channels.slack import (
     MAX_MSG_LEN,
     SlackChannel,
@@ -35,6 +38,7 @@ from nerve.channels.slack import (
 )
 from nerve.channels.slack_presentation import build_notification_blocks
 from nerve.config import NerveConfig, SlackConfig
+from nerve.notifications.service import NotificationService
 
 
 def _config(**slack_kwargs) -> NerveConfig:
@@ -755,6 +759,209 @@ class TestMessageEvents:
             "user": "U1", "ts": "1.1", "text": "",
         })
         channel.router.handle_message.assert_not_called()
+
+
+def _with_card(channel: SlackChannel, session_id: str | None = "s-raised") -> AsyncMock:
+    """Give *channel* a notification service whose cards belong to *session_id*."""
+    channel._notification_service = MagicMock()
+    channel._notification_service.reply_session = AsyncMock(return_value=session_id)
+    # The session of the card still has its row when the turn starts.
+    channel.router.get_session = AsyncMock(return_value={"id": session_id})
+    return channel._notification_service.reply_session
+
+
+# A reply in the thread under the card "2.1" of a direct message.
+_DM_REPLY = {
+    "type": "message", "channel": "D1", "channel_type": "im",
+    "user": "U1", "ts": "2.2", "thread_ts": "2.1", "text": "roll it back",
+}
+
+
+class TestNotificationReplies:
+    """A reply in the thread under a notification card goes to its session."""
+
+    @pytest.mark.asyncio
+    async def test_a_reply_in_a_direct_message_goes_to_the_session_of_the_card(self):
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
+        lookup = _with_card(channel)
+
+        await channel._handle_message_event(dict(_DM_REPLY))
+
+        lookup.assert_awaited_once_with(channel="slack", message_id="2.1", target="D1")
+        msg = channel.router.handle_message.await_args[0][0]
+        assert msg.session_id == "s-raised"
+        # The thread has its own key and target, so the DM keeps its session.
+        assert (msg.channel_key, msg.sender_id) == ("slack:D1:2.1", "D1:2.1")
+        assert channel._last_inbound_ts["D1:2.1"] == "2.2"
+
+    @pytest.mark.asyncio
+    async def test_a_reply_in_a_channel_that_addresses_the_bot_goes_there_too(self):
+        channel = _channel(allow_users=["U1"])
+        lookup = _with_card(channel)
+
+        await channel._handle_message_event({
+            "type": "message", "channel": "C1", "channel_type": "channel",
+            "user": "U1", "ts": "2.2", "thread_ts": "2.1",
+            "text": "<@U0BOT> roll it back",
+        })
+
+        lookup.assert_awaited_once_with(channel="slack", message_id="2.1", target="C1")
+        msg = channel.router.handle_message.await_args[0][0]
+        assert (msg.session_id, msg.channel_key, msg.sender_id) == (
+            "s-raised", "slack:C1:2.1", "C1:2.1",
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_reply_in_a_channel_that_does_not_address_the_bot_is_still_ignored(self):
+        channel = _channel(allow_users=["U1"])
+        lookup = _with_card(channel)
+
+        await channel._handle_message_event({
+            "type": "message", "channel": "C1", "channel_type": "channel",
+            "user": "U1", "ts": "2.2", "thread_ts": "2.1", "text": "who is on call?",
+        })
+
+        channel.router.handle_message.assert_not_called()
+        lookup.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_thread_that_no_card_roots_is_a_message_of_the_direct_message(self):
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
+        _with_card(channel, session_id=None)
+
+        await channel._handle_message_event(dict(_DM_REPLY))
+
+        msg = channel.router.handle_message.await_args[0][0]
+        assert (msg.session_id, msg.channel_key, msg.sender_id) == (None, "slack:D1", "D1")
+
+    @pytest.mark.asyncio
+    async def test_a_message_outside_a_thread_is_not_looked_up(self):
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
+        lookup = _with_card(channel)
+
+        await channel._handle_message_event({
+            "type": "message", "channel": "D1", "channel_type": "im",
+            "user": "U1", "ts": "3.1", "text": "good morning",
+        })
+
+        lookup.assert_not_awaited()
+        msg = channel.router.handle_message.await_args[0][0]
+        assert (msg.session_id, msg.channel_key) == (None, "slack:D1")
+
+    @pytest.mark.asyncio
+    async def test_a_lookup_that_fails_does_not_lose_the_message(self, caplog):
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
+        _with_card(channel).side_effect = RuntimeError("database is locked")
+
+        with caplog.at_level(logging.WARNING, logger="nerve.channels.slack"):
+            await channel._handle_message_event(dict(_DM_REPLY))
+
+        msg = channel.router.handle_message.await_args[0][0]
+        assert (msg.session_id, msg.channel_key, msg.sender_id) == (None, "slack:D1", "D1")
+        assert "could not look up the notification of thread 2.1" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_a_session_that_closes_before_the_turn_does_not_lose_the_message(self):
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
+        _with_card(channel)
+        seen: list[tuple[str, str, str | None]] = []
+
+        async def handle(msg):
+            seen.append((msg.channel_key, msg.sender_id, msg.session_id))
+            if len(seen) == 1:
+                raise SessionClosedError("archived")
+            return "done"
+
+        channel.router.handle_message = handle
+
+        await channel._handle_message_event(dict(_DM_REPLY))
+
+        # Once more, as a message of the direct message.
+        assert seen == [("slack:D1:2.1", "D1:2.1", "s-raised"), ("slack:D1", "D1", None)]
+        assert channel._last_inbound_ts["D1"] == "2.2"
+        assert channel._message_cache["D1:2.2"] == ("D1", "roll it back")
+        channel._web.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_session_that_is_deleted_before_the_turn_does_not_lose_the_message(self):
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
+        _with_card(channel)
+        # The row of the card's session is gone when the turn starts.
+        channel.router.get_session = AsyncMock(return_value=None)
+
+        await channel._handle_message_event(dict(_DM_REPLY))
+
+        channel.router.get_session.assert_awaited_once_with("s-raised")
+        # The router gets the message once, as a message of the direct message.
+        channel.router.handle_message.assert_awaited_once()
+        msg = channel.router.handle_message.await_args[0][0]
+        assert (msg.channel_key, msg.sender_id, msg.session_id) == ("slack:D1", "D1", None)
+        assert channel._last_inbound_ts["D1"] == "2.2"
+        channel._web.chat_postMessage.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_a_closed_session_of_another_message_is_reported_as_before(self):
+        channel = _channel(allow_users=["U1"], allow_direct_messages=True)
+        _with_card(channel, session_id=None)
+        channel.router.handle_message = AsyncMock(side_effect=SessionClosedError("deleted"))
+
+        await channel._handle_message_event(dict(_DM_REPLY))
+
+        channel.router.handle_message.assert_awaited_once()
+        posted = channel._web.chat_postMessage.await_args.kwargs
+        assert (posted["channel"], posted["thread_ts"]) == ("D1", None)
+        assert posted["text"] == f"Error: {SessionClosedError('deleted')}"
+
+    @pytest.mark.asyncio
+    async def test_the_answer_lands_in_the_thread_and_the_dm_keeps_its_session(self, db):
+        """The real router, session manager, database and notification service."""
+        channel = _channel(
+            allow_users=["U1"], allow_direct_messages=True, stream_mode="full",
+        )
+        channel.config.notifications.slack_channel_id = "D0123ABC"
+        runs: list[dict] = []
+
+        async def run(**kwargs):
+            runs.append(kwargs)
+            await broadcaster.broadcast_token(kwargs["session_id"], "On it.")
+            await broadcaster.broadcast_done(kwargs["session_id"])
+            return "On it."
+
+        engine = MagicMock()
+        engine.db = db
+        engine.sessions = SessionManager(db)
+        engine.run = run
+        engine.router = channel.router = ChannelRouter(engine)
+        engine.router.BATCH_DEBOUNCE = 0.0
+        engine.router.register(channel)
+        service = NotificationService(channel.config, db, engine)
+        channel.set_notification_service(service)
+        await db.create_session("s-raised", source="cron", actor=None)
+        notification_id = await service.send_notification(
+            session_id="s-raised", title="Deploy finished",
+        )
+        delivery = await db.get_latest_notification_delivery(notification_id, "slack")
+        assert (delivery["target"], delivery["message_id"]) == ("D0123ABC", "1.1")
+        channel._web.chat_postMessage.reset_mock()
+
+        for ts, thread_ts in (("2.1", None), ("2.2", "1.1"), ("2.3", None)):
+            event = {
+                "type": "message", "channel": "D0123ABC", "channel_type": "im",
+                "user": "U1", "ts": ts, "text": f"message {ts}",
+            }
+            if thread_ts:
+                event["thread_ts"] = thread_ts
+            await channel._handle_message_event(event)
+
+        own = (await db.get_channel_session("slack:D0123ABC"))["session_id"]
+        assert [run["session_id"] for run in runs] == [own, "s-raised", own]
+        assert own != "s-raised"
+        assert (await db.get_channel_session("slack:D0123ABC:1.1"))["session_id"] == "s-raised"
+        answers = [
+            (call.kwargs["channel"], call.kwargs["thread_ts"])
+            for call in channel._web.chat_postMessage.await_args_list
+        ]
+        assert answers == [("D0123ABC", None), ("D0123ABC", "1.1"), ("D0123ABC", None)]
 
 
 class TestReactionEvents:

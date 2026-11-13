@@ -64,6 +64,13 @@ does not choose this conversation. A button press
 arrives as an invoke ``interaction`` event: it answers the notification when
 the card was delivered in that conversation, and the ``interaction``
 operation then replaces the card without its buttons.
+
+A message that replies to a notification goes to the session that raised the
+notification, while that session exists and is not archived. The
+notification is the one that the event's ``reply_to`` names, or else the one
+delivered as the root of the message's thread. The message has the session
+key and the target of its own thread, in a direct conversation too: the
+answer goes to that thread, and the conversation keeps its own session.
 """
 
 from __future__ import annotations
@@ -78,7 +85,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping
 
-from nerve.agent.engine import NotAcceptingTurnsError
+from nerve.agent.engine import NotAcceptingTurnsError, SessionClosedError
 from nerve.channels.access import Decision, Identity, PatternGate, needs_name_resolution
 from nerve.channels.base import (
     BaseChannel,
@@ -945,27 +952,58 @@ class HostedChannel(BaseChannel):
         while len(self._connections) > _CONNECTION_CACHE_MAX:
             self._connections.popitem(last=False)
 
-    def _target(self, event: Event) -> str:
+    def _target(self, event: Event, *, in_thread: bool = False) -> str:
+        """The target of an event's message.
+
+        A direct conversation is one target, unless *in_thread*. Elsewhere,
+        and with *in_thread*, the target is the message's thread, which a
+        top-level message roots.
+        """
         conversation = event.conversation
-        if conversation.kind == "direct":
+        if conversation.kind == "direct" and not in_thread:
             return conversation.id
         thread_id = event.thread.id if event.thread is not None else event.message.id
         return f"{conversation.id}:{thread_id}"
+
+    async def _notification_session(self, event: Event) -> str | None:
+        """The session that takes a message as a reply to a notification, or ``None``.
+
+        The notification is the one that the event's ``reply_to`` names, in
+        whichever conversation this provider delivered it. Without
+        ``reply_to``, it is the one delivered as the root of the event's
+        thread. The session that raised it must exist and must not be
+        archived. A lookup that fails raises, and the reader takes the event
+        again later.
+        """
+        if self._notifications is None:
+            return None
+        reply_to = event.reply_to.id if event.reply_to is not None else ""
+        if reply_to:
+            return await self._notifications.reply_session(channel=self._provider, message_id=reply_to)
+        if event.thread is None:
+            return None
+        return await self._notifications.reply_session(
+            channel=self._provider, message_id=event.thread.id, target=event.conversation.id,
+        )
 
     async def _invoke_message(self, event: Event) -> Disposition:
         """Start a turn for a message that addresses the agent.
 
         A thread reply needs no local session: the agent also takes part in
-        threads that it started with its own posts.
+        threads that it started with its own posts. A reply to a
+        notification goes to the session that raised it (see
+        :meth:`_notification_session`). Its target is its own thread, in a
+        direct conversation too, so the answer goes to that thread, and the
+        session gets the session key of the thread, not of the conversation.
         """
-        target = self._target(event)
-        channel_key = f"{self._provider}:{target}"
         body = render_content(event.content)
         attachments = describe_attachments(event)
         text = f"{attachments}\n\n{body}" if attachments and body else attachments or body
         if not text:
             return Disposition.rejected("admission_rejected", "the message carries no text")
 
+        session_id = await self._notification_session(event)
+        target = self._target(event, in_thread=session_id is not None)
         self.remember_message(event.conversation.id, event.message.id, target, text)
         self._note_turn_message(event, target)
         self._note_handled(event)
@@ -978,13 +1016,19 @@ class HostedChannel(BaseChannel):
             "Hosted %s message in %s: %s", self._provider, target,
             text[:80] + ("..." if len(text) > 80 else ""),
         )
+        if session_id is not None:
+            logger.info(
+                "Hosted %s message in %s goes to session %s, which raised its notification",
+                self._provider, target, session_id,
+            )
         # The turn reads the attachments before it starts and puts them
         # before the text.
         return self._dispatch(InboundMessage(
             channel_name=self._provider,
-            channel_key=channel_key,
+            channel_key=f"{self._provider}:{target}",
             sender_id=target,
             text=body if event.attachments else text,
+            session_id=session_id,
             metadata=metadata,
             # Untrusted presentation text, for the origin of a new session.
             conversation_title=(
@@ -1163,9 +1207,12 @@ class HostedChannel(BaseChannel):
         """Run the turn of one message.
 
         When the connection does not post answers, :func:`answer_note` comes
-        first, before the attachments that were read and the text. When the
-        connection keeps sessions, the turn goes to the conversation's last
-        session, if it still has one.
+        first, before the attachments that were read and the text. A reply
+        to a notification goes to the session that raised it. When that
+        session closed after the check, the reply goes once more, as a
+        message without a notification (:meth:`_retarget`). For such a
+        message, when the connection keeps sessions, the turn goes to the
+        conversation's last session, if it still has one.
         """
         try:
             message.actor = await self.router.actor_for_principal(
@@ -1177,6 +1224,21 @@ class HostedChannel(BaseChannel):
             if not behaviour.posts_answer:
                 note = answer_note(self._provider, behaviour.reply_tool)
                 message.text = f"{note}\n\n{message.text}" if message.text else note
+            if message.session_id is not None:
+                try:
+                    # A delete since the check leaves no row, and the router
+                    # does not report that as a closed session.
+                    if await self.router.get_session(message.session_id) is None:
+                        raise SessionClosedError("deleted")
+                    await self.router.handle_message(message)
+                    return
+                except SessionClosedError:
+                    logger.info(
+                        "Hosted %s: session %s closed before a reply to its notification ran; "
+                        "the reply goes to %s without it",
+                        self._provider, message.session_id, self._target(event),
+                    )
+                    self._retarget(message, event)
             if behaviour.keeps_session:
                 message.session_id = await self.router.get_last_session(message.channel_key)
             await self.router.handle_message(message)
@@ -1197,6 +1259,19 @@ class HostedChannel(BaseChannel):
         key = (event.conversation.id, event.message.id)
         _remember(self._targets, key, (event.connection_id, _origin(event)), _TARGET_CACHE_MAX)
         _remember(self._last_inbound, target, key, _TARGET_CACHE_MAX)
+
+    def _retarget(self, message: InboundMessage, event: Event) -> None:
+        """Move a reply to a notification to where a message without one goes.
+
+        The message gets the session key and the target of its conversation
+        or thread, and no session. A later reaction to it goes there too.
+        """
+        target = self._target(event)
+        key = (event.conversation.id, event.message.id)
+        message.channel_key, message.sender_id, message.session_id = f"{self._provider}:{target}", target, None
+        if key in self._message_cache:
+            self._message_cache[key] = (target, self._message_cache[key][1])
+        self._note_turn_message(event, target)
 
     def _note_handled(self, event: Event) -> None:
         key = (event.connection_id, event.conversation.id, event.message.id)
