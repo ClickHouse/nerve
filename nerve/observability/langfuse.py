@@ -25,7 +25,9 @@ Implementation notes
   OpenTelemetry context.
 - ``langfuse.redact_patterns`` are applied to text in span attributes,
   including bytes, nested values and serialized JSON, before the SDK
-  extracts media. Span names and span events are not redacted.
+  extracts media. Span names and span events are not redacted. The SDK
+  writes Langfuse metadata attributes as JSON text. They are decoded,
+  redacted and encoded again, so they stay JSON text.
 
 Failure mode
 ------------
@@ -50,6 +52,14 @@ from typing import Any, Iterator
 logger = logging.getLogger(__name__)
 
 REDACTED = "[REDACTED]"
+
+# The Langfuse SDK writes the value of these attributes, and of each
+# ``<prefix>.<key>`` attribute, as JSON text. A string value is also
+# JSON-encoded.
+_METADATA_ATTRIBUTE_PREFIXES = (
+    "langfuse.trace.metadata",
+    "langfuse.observation.metadata",
+)
 
 # HTTP statuses with which a Langfuse host rejects a key pair.
 _REJECTED_KEY_STATUSES = frozenset({401, 403})
@@ -316,6 +326,61 @@ def _redact_value(value: Any, patterns: list[re.Pattern[str]]) -> Any:
     return value
 
 
+def _is_metadata_attribute(key: Any) -> bool:
+    return isinstance(key, str) and any(
+        key == prefix or key.startswith(prefix + ".")
+        for prefix in _METADATA_ATTRIBUTE_PREFIXES
+    )
+
+
+def _redact_json(value: Any, patterns: list[re.Pattern[str]]) -> Any:
+    """Return a redacted copy of a decoded JSON value.
+
+    Returns ``value`` itself when nothing matched. Strings go through
+    :func:`_redact_value`, which also decodes JSON text in a string. A
+    number, boolean or null whose JSON text a pattern matches becomes the
+    redacted text, as a string.
+    """
+    if isinstance(value, str):
+        return _redact_value(value, patterns)
+    if isinstance(value, dict):
+        items: dict[str, Any] = {}
+        changed = False
+        for key, item in value.items():
+            new_key = _redact_text(key, patterns)
+            new_item = _redact_json(item, patterns)
+            changed = changed or new_key != key or new_item is not item
+            items[new_key] = new_item
+        return items if changed else value
+    if isinstance(value, list):
+        items_list = [_redact_json(item, patterns) for item in value]
+        if any(a is not b for a, b in zip(value, items_list)):
+            return items_list
+        return value
+    text = json.dumps(value)
+    redacted = _redact_text(text, patterns)
+    return value if redacted == text else redacted
+
+
+def _redact_metadata_value(value: Any, patterns: list[re.Pattern[str]]) -> Any:
+    """Return a redacted copy of a Langfuse metadata attribute value.
+
+    Returns ``value`` itself when nothing matched. JSON text is decoded,
+    redacted and encoded again, so the result is JSON text. A value that
+    is not JSON text is redacted as plain text.
+    """
+    if not isinstance(value, str):
+        return _redact_value(value, patterns)
+    try:
+        decoded = json.loads(value)
+    except ValueError:
+        return _redact_value(value, patterns)
+    redacted = _redact_json(decoded, patterns)
+    if redacted is decoded:
+        return value
+    return json.dumps(redacted, ensure_ascii=False, separators=(",", ":"))
+
+
 def redact_attributes(
     attributes: Any, patterns: list[re.Pattern[str]],
 ) -> dict[str, Any]:
@@ -324,7 +389,10 @@ def redact_attributes(
     if not patterns:
         return changed
     for key, value in attributes.items():
-        redacted = _redact_value(value, patterns)
+        if _is_metadata_attribute(key):
+            redacted = _redact_metadata_value(value, patterns)
+        else:
+            redacted = _redact_value(value, patterns)
         if redacted is not value:
             changed[key] = redacted
     return changed

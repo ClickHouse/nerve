@@ -504,6 +504,88 @@ def test_redact_attributes_preserves_unmatched_values():
     assert lf.redact_attributes(attributes, _default_patterns()) == {}
 
 
+_METADATA_KEYS = (
+    "langfuse.trace.metadata.note",
+    "langfuse.observation.metadata.note",
+    "langfuse.trace.metadata",
+    "langfuse.observation.metadata",
+)
+
+
+@pytest.mark.parametrize("key", _METADATA_KEYS)
+@pytest.mark.parametrize(("decoded", "expected"), [
+    (f"key {_FAKE_ANTHROPIC_KEY} here", "key [REDACTED] here"),
+    ({"outer": {"inner": _FAKE_ANTHROPIC_KEY}, "count": 3},
+     {"outer": {"inner": "[REDACTED]"}, "count": 3}),
+    ([_FAKE_LANGFUSE_SECRET, {"items": [1, _FAKE_ANTHROPIC_KEY]}, None, True],
+     ["[REDACTED]", {"items": [1, "[REDACTED]"]}, None, True]),
+    (json.dumps({"input": _FAKE_ANTHROPIC_KEY}), '{"input": "[REDACTED]"}'),
+])
+def test_redact_attributes_keeps_metadata_json(key, decoded, expected):
+    value = json.dumps(decoded, ensure_ascii=False)
+    changed = lf.redact_attributes({key: value}, _default_patterns())
+
+    assert json.loads(changed[key]) == expected
+    assert _FAKE_ANTHROPIC_KEY not in changed[key]
+    assert _FAKE_LANGFUSE_SECRET not in changed[key]
+
+
+@pytest.mark.parametrize(("pattern", "decoded", "expected"), [
+    (r'"', 'say "hi"', "say [REDACTED]hi[REDACTED]"),
+    (r'"', {"quote": 'a "b"'}, {"quote": "a [REDACTED]b[REDACTED]"}),
+    (r'token="[^"]*"', 'token="abc" end', "[REDACTED] end"),
+    (r"(?s).+", "line1\nline2", "[REDACTED]"),
+    (r"(?s).+", {"a": "b"}, {"[REDACTED]": "[REDACTED]"}),
+])
+def test_metadata_pattern_that_matches_quotes_keeps_json(pattern, decoded, expected):
+    key = "langfuse.trace.metadata.note"
+    changed = lf.redact_attributes(
+        {key: json.dumps(decoded)}, lf._compile_patterns([pattern]),
+    )
+    assert json.loads(changed[key]) == expected
+
+
+@pytest.mark.parametrize(("decoded", "expected"), [
+    (1234567890123, "[REDACTED]"),
+    ({"account": 1234567890123, "ok": 7}, {"account": "[REDACTED]", "ok": 7}),
+    ([1234567890123], ["[REDACTED]"]),
+])
+def test_metadata_numbers_that_match_become_redacted_strings(decoded, expected):
+    key = "langfuse.observation.metadata.account"
+    changed = lf.redact_attributes(
+        {key: json.dumps(decoded)}, lf._compile_patterns([r"\d{10,}"]),
+    )
+    assert json.loads(changed[key]) == expected
+
+
+def test_metadata_value_that_is_not_json_is_redacted_as_text():
+    key = "langfuse.trace.metadata.note"
+    raw = f"raw {_FAKE_ANTHROPIC_KEY} value"
+    changed = lf.redact_attributes({key: raw}, _default_patterns())
+    assert changed == {key: "raw [REDACTED] value"}
+
+
+def test_metadata_without_matches_is_unchanged():
+    attributes = {
+        "langfuse.trace.metadata.note": json.dumps("plain text"),
+        "langfuse.observation.metadata.nested": json.dumps({"a": [1, "b", None]}),
+        "langfuse.trace.metadata.count": "3",
+    }
+    assert lf.redact_attributes(attributes, _default_patterns()) == {}
+
+
+@pytest.mark.parametrize("key", [
+    "gen_ai.custom",
+    "langfuse.trace.metadatax",
+    "langfuse.trace.tags",
+])
+def test_other_attributes_keep_plain_text_redaction(key):
+    changed = lf.redact_attributes(
+        {key: "1234567890123"}, lf._compile_patterns([r"\d{10,}"]),
+    )
+    assert changed == {key: "[REDACTED]"}
+
+
 def test_mask_hook_patches_only_spans_with_secrets():
     types = pytest.importorskip("langfuse.types", reason="langfuse not installed")
     lf._redact_patterns = _default_patterns()
@@ -696,6 +778,45 @@ async def test_anthropic_json_text_is_redacted_on_export(real_export_pipeline):
     assert len(exported) == 1
     messages = json.loads(exported[0].attributes["gen_ai.input.messages"])
     assert messages[0]["parts"][0]["content"] == "[REDACTED] [REDACTED]"
+
+
+def test_sdk_metadata_is_redacted_on_export_and_stays_json(real_export_pipeline):
+    """The real SDK writes the trace and observation metadata attributes."""
+    from langfuse._client.attributes import create_span_attributes
+    from opentelemetry.exporter.otlp.proto.common.trace_encoder import encode_spans
+
+    provider, delegate, _ = real_export_pipeline
+    lf._redact_patterns = _default_patterns()
+    lf._enabled = True
+    tracer = provider.get_tracer("langsmith")
+    with lf.attributes(
+        session_id="session-1",
+        metadata={"parent_session_id": f"p-{_FAKE_ANTHROPIC_KEY}", "fork_from": None},
+    ):
+        with tracer.start_as_current_span("claude.assistant.turn") as span:
+            span.set_attributes(create_span_attributes(metadata={
+                "note": f"key {_FAKE_LANGFUSE_SECRET}",
+                "nested": {"items": [_FAKE_ANTHROPIC_KEY, 3]},
+                "count": 3,
+            }))
+    provider.force_flush()
+
+    exported = [span for batch in delegate.batches for span in batch]
+    assert len(exported) == 1
+    metadata = {
+        key: json.loads(value)
+        for key, value in exported[0].attributes.items()
+        if lf._is_metadata_attribute(key)
+    }
+    assert metadata == {
+        "langfuse.trace.metadata.parent_session_id": "p-[REDACTED]",
+        "langfuse.observation.metadata.note": "key [REDACTED]",
+        "langfuse.observation.metadata.nested": {"items": ["[REDACTED]", 3]},
+        "langfuse.observation.metadata.count": 3,
+    }
+    serialized = encode_spans(exported).SerializeToString()
+    assert _FAKE_ANTHROPIC_KEY.encode() not in serialized
+    assert _FAKE_LANGFUSE_SECRET.encode() not in serialized
 
 
 @pytest.mark.asyncio
