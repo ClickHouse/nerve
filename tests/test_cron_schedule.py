@@ -402,6 +402,37 @@ async def test_a_job_gated_on_activity_is_the_next_tick_only_after_the_agent_wor
 
 
 @pytest.mark.asyncio
+async def test_a_job_that_waits_for_its_proposals_to_be_decided_is_not_the_next_tick(held, db):
+    """A job with three of its proposals in review does not add a fourth, so
+    it is not the next scheduled task, and a platform that parks the machine
+    does not wake it for the job. It is again once one is decided."""
+    now = datetime.now(UTC)
+    svc = await held([_job("scout", run_if=[{"type": "plans_in_review", "below": 3}])], db=db)
+    _due(svc, "scout", now + timedelta(minutes=10))
+
+    for n in (1, 2, 3):
+        tick = await svc.next_scheduled(now=now)
+        assert (tick.name, tick.at) == ("scout", now + timedelta(minutes=10))
+        await db.upsert_task(task_id=f"t{n}", file_path=f"t{n}.md", title=f"Proposal {n}")
+        await db.create_plan(
+            plan_id=f"plan-{n}", task_id=f"t{n}", content="What, evidence, direction.",
+            session_id="cron:scout:20260102-030405-0a1b2c3d",
+        )
+
+    assert await svc.next_scheduled(now=now) is None
+    report = {j["id"]: j for j in (await svc.schedule_report())["jobs"]}
+    assert report["scout"]["forecast"] == "skip"
+    assert report["scout"]["reason"] == (
+        "gate 'plans_in_review' not satisfied "
+        "(fewer than 3 of this job's proposals wait for review)"
+    )
+
+    await db.update_plan("plan-2", status="declined")
+    tick = await svc.next_scheduled(now=now)
+    assert (tick.name, tick.at) == ("scout", now + timedelta(minutes=10))
+
+
+@pytest.mark.asyncio
 async def test_a_source_runner_counts(held):
     now = datetime.now(UTC)
     svc = await held([_job("digest")], [_runner("mail")])

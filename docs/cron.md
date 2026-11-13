@@ -211,8 +211,9 @@ exception: a failed check skips the run, and a series of them is reported (see
 [`clickhouse_query`](#clickhouse_query)).
 
 A run that a person starts (**Run now**, `nerve cron <id>`, the trigger API) is
-checked like a scheduled one, with one exception: an
-[`agent_activity`](#agent_activity) gate is not checked for it.
+checked like a scheduled one, with two exceptions: an
+[`agent_activity`](#agent_activity) gate and a
+[`plans_in_review`](#plans_in_review) gate are not checked for it.
 
 A gate that can't be *built* is a different matter and is **refused**. If a
 `run_if` entry names a type nothing provides — a typo, or a gate plugin that was
@@ -344,7 +345,58 @@ The gate estimates whether a run is worth it. It does not say whether the job
 has anything to act on, as `tasks` and `messages` do. So a run that a person
 starts (**Run now**, `nerve cron <id>`, `POST /api/cron/jobs/{job_id}/trigger`)
 is not checked by this gate: the person may know of work that it cannot see.
-The other gates of the job are checked as usual.
+The other gates of the job are checked as usual, except
+[`plans_in_review`](#plans_in_review), which estimates in the same way.
+
+#### `plans_in_review`
+
+Satisfied while fewer than a number of the job's own proposals wait for review.
+It is for a job that proposes a plan on each run, for a person who decides on
+each one. While that person does not get to them, another proposal only adds to
+the pile, so the job waits until some are decided.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `below` | int | 3 | The job runs only while fewer than this many of its proposals wait for review. A whole number, 1 or more. A bare `below:` means unset; any other value is refused |
+
+```yaml
+run_if:
+  - type: plans_in_review
+    below: 3      # the job does not run while 3 or more wait
+```
+
+A proposal is a task with a plan in review: a plan that was proposed and is
+neither approved nor declined yet (the status `pending`). A plan that the
+reviewer sent back for a revision still waits, and so does the revision.
+
+Only the job's own proposals count:
+
+- A plan is the job's when one of the job's sessions proposed it. The sessions
+  of a job are the ones [`agent_activity`](#agent_activity) leaves out for it:
+  `cron:<job>`, `cron:<job>:<run id>`, and the sessions of the workflow runs
+  that the job or one of those sessions started, the legs of a review loop
+  included. A plan keeps the id of its session, so it stays the job's after
+  that session is deleted.
+- A revision counts with the plan it replaces, whichever session wrote it: the
+  job's own, the planner session that takes the revision when the job's
+  session was deleted, or a chat.
+- A plan that a chat or another job proposed does not count, so the plans of
+  other work never stop the job. Neither does a plan that somebody else
+  proposes for a task after the job's proposal for it was decided.
+
+Only a decision takes a proposal out of review: its plan approved or declined.
+Time does not, and neither does closing its task: a plan stays in review after
+its task is done, and the Plans page goes on listing it. So the gate counts what
+a person finds there to decide. A job whose proposals nobody decides stops at
+`below` of them, and runs again once enough are decided.
+
+While the job waits, the Cron page shows its next run as "Will skip". The reason
+it gives is the first gate of the job that is not satisfied, so list this gate
+first to have it named. The Plans page lists the newest 100 plans in review; an
+older one is on the page of its task.
+
+Like `agent_activity`, the gate estimates whether a run is worth it. So a run
+that a person starts is not checked by it.
 
 #### `github_pr_activity`
 
@@ -511,10 +563,13 @@ that check.
   instance schedules itself, after which the forecast is read afresh, but also a
   task created or moved from a chat, the web UI or the API, which is only seen
   the next time the schedule is read (see [What runs next](#what-runs-next)).
-  `tasks` and `agent_activity` forecast this way: what `agent_activity`
-  reads changes when the agent works or the job runs, and Nerve reads the
-  forecast afresh after a turn and after a run. Other work, such as a
-  conversation taken in from an external agent, is seen at the next read.
+  `tasks`, `agent_activity` and `plans_in_review` forecast this way: what
+  `agent_activity` reads changes when the agent works or the job runs, and
+  Nerve reads the forecast afresh after a turn and after a run. Other work,
+  such as a conversation taken in from an external agent, is seen at the
+  next read. What `plans_in_review` counts changes when the job proposes a
+  plan, in a run, and when a plan is decided: an approval starts a turn,
+  and a plan declined on the Plans page is seen at the next read.
   `messages` reads the consumer's cursors
   without starting one, and takes a cursor that will have expired by `at` as
   expired, since the check will find it so then.
@@ -729,7 +784,7 @@ These ship in `<workspace>/config/cron/system.yaml`, written when the mode is ch
 | `memory-maintenance` | Daily 5 AM, when the agent has worked (see below) | isolated | Dedup, prune stale entries, improve memory wording. Runs silently. On an install set up with `memory.backend: loom`: runs Loom's integrity report (`loom_namespace_validate`) on the home namespace and fixes what is its own, leaving deduplication to Loom; a `system.yaml` written for memU runs in this wording while its prompt is the shipped one. | ✅ always | ✅ always |
 | `inbox-processor` | Every 30 min | persistent (24h rotation, reminder mode) | Polls all sync sources (email, GitHub, Telegram). Triages, creates tasks, memorizes facts, sends notifications for urgent items. | ✅ default | — |
 | `task-planner` | Every 4 hours | persistent (168h rotation) | Reviews open tasks, explores codebases, proposes implementation plans via plan-approve workflow. Gated on `tasks` (status `pending`) — stays idle when there's nothing to plan. | ✅ default | off; onboarding enables it |
-| `skill-extractor` | Daily 5 AM, when the agent has worked (see below) | persistent | Identifies repeated workflows from recent conversations, memory, and completed tasks. Proposes at most one new skill per run, as a task with a plan. The plan says what the skill is for, the evidence for it and the direction it should take; it does not hold the skill. | ✅ optional | ✅ default |
+| `skill-extractor` | Daily 5 AM, when the agent has worked and fewer than three of its proposals wait for review (see below) | persistent | Identifies repeated workflows from recent conversations, memory, and completed tasks. Proposes at most one new skill per run, as a task with a plan. The plan says what the skill is for, the evidence for it and the direction it should take; it does not hold the skill. | ✅ optional | ✅ default |
 | `skill-reviser` | Weekly (Sun 3 AM) | persistent | Reviews existing skills for accuracy (outdated paths, credentials), completeness (missing steps), and quality (trigger phrases, examples). Proposes revisions via task+plan. | ✅ optional | ✅ default |
 | `machine-maintenance` | Weekly (Sun 4 AM) | isolated | Cleans up the machine Nerve runs on. The agent first finds out what this machine has (disk use, repositories and worktrees, build and package caches, Docker, services that listen on a port), then looks only at items that are old and that nothing uses. It removes items that hold no data without asking: caches, dangling Docker images and build cache, a worktree whose pull request is merged and that has no local changes. It sends one `ask_user` for anything that can hold data (Docker volumes, stopped containers, worktrees with local work, leftover dev servers or test containers on open ports) and acts only on what the answer approves. It never touches Nerve itself, system services or anything in use. Sends a low-priority `notify` with the space freed when it changed something. | ✅ default | ✅ default |
 
@@ -745,16 +800,36 @@ These ship in `<workspace>/config/cron/system.yaml`, written when the mode is ch
 - Under memU, the gate of `memory-maintenance` has `overlap_hours: 24`: the job reviews the records of the day before the run, so it runs at its next two scheduled times after the agent's last work. Under Loom it checks the namespace as it is and has no overlap; what reaches Loom after a check waits for the job's next run.
 - **Run now** starts either job whatever the gate says.
 
-`system.yaml` does not state these two gates. The scheduler gives them to an entry of the two jobs that has neither `run_if` nor `skip_when_idle`, in the form for the configured memory backend, and logs one line for each when it loads the file. Nothing writes `system.yaml` again when Nerve is updated, so this is how an install from before the gates has them, and how a later change to them reaches every install.
+`skill-extractor` also waits for its proposals to be decided, with a [`plans_in_review`](#plans_in_review) gate (`below: 3`):
+
+- While three or more of the skills it proposed wait for review, it does not run: a fourth would only add to a pile that nobody gets to. Once fewer than three wait and the agent has worked, it runs again: at its next scheduled time, or in a catch-up before that. Approve or decline its plans on the Plans page to let it go on. Closing the task of a proposal does not decide its plan.
+- Only its own proposals count. Plans that a chat, `task-planner` or `skill-reviser` proposed do not stop it.
+- Proposals from earlier releases count too. On an install where three or more of them still wait, the job stops from the first load of this release, until enough are decided.
+- On a platform that parks an idle machine, the machine is not woken for the job while it waits (see [What runs next](#what-runs-next)).
+- **Run now** starts the job whatever the gate says.
+
+`system.yaml` states none of these gates. The scheduler gives them to an entry of the two jobs that has neither `run_if` nor `skip_when_idle`, the gate on activity in the form for the configured memory backend, and logs one line for each job when it loads the file. Nothing writes `system.yaml` again when Nerve is updated, so this is how an install from before the gates has them, and how a later change to them reaches every install.
 
 | The entry in `system.yaml` | What runs |
 |---|---|
-| No `run_if` key | The job with its default gate. The prompt and the schedule of the entry do not matter: an edited entry gets the gate too |
+| No `run_if` key | The job with its default gates. The prompt and the schedule of the entry do not matter: an edited entry gets the gates too |
 | `run_if: []`, or a bare `run_if:` | The job on every schedule |
-| A `run_if` of its own | The job with those gates |
+| A `run_if` of its own | The job with those gates, and none of the default ones |
 | The job is replaced in `jobs.yaml` | The job as `jobs.yaml` has it |
 
-An old install that keeps every job in `jobs.yaml`, with no `system.yaml`, is not changed. `inbox-processor` and `task-planner` have their gates in the file, and an entry of theirs without one runs on every schedule. Only the scheduler gives the default: `nerve config validate` and `nerve doctor` read the file as it is.
+A `run_if` of its own replaces every default gate of the job. So to have `skill-extractor` stop at another number, state both of its gates:
+
+```yaml
+  - id: skill-extractor
+    # ...
+    run_if:
+      - type: plans_in_review
+        below: 5
+      - type: agent_activity
+        ignore_jobs: [memory-maintenance, skill-reviser, machine-maintenance]
+```
+
+An old install that keeps every job in `jobs.yaml`, with no `system.yaml`, is not changed; an entry there can state the gates in the same way. `inbox-processor` and `task-planner` have their gates in the file, and an entry of theirs without one runs on every schedule. Only the scheduler gives the default: `nerve config validate` and `nerve doctor` read the file as it is.
 
 `machine-maintenance` is on by default and optional in both modes: switch it off on the Automation step of the setup page, or with a job of the same id in `jobs.yaml`. Its prompt is general on purpose: the agent learns what each machine has on each run. To keep an item out of its reach, write it in `TOOLS.md` or ask the agent to remember it; the job reads both before it acts.
 
@@ -762,7 +837,7 @@ An old install that keeps every job in `jobs.yaml`, with no `system.yaml`, is no
 
 `skill-extractor` runs at the same time as `memory-maintenance`, so a machine that is parked while idle is woken once for both. Earlier releases ran it every 12 hours, let it propose up to two skills a run, and had it put the full SKILL.md into the plan. Nothing writes `system.yaml` again when Nerve is updated, so the scheduler loads an entry of the job in that file that still holds what an earlier release shipped with the current schedule, description and prompt. It logs one line for the job, and `nerve cron` lists the job with its current description. Each of the three is replaced on its own, and only when it is what a release shipped, the whitespace around it aside: an edited schedule or prompt stays, and a `prompt_file` is still the prompt that is sent. The file itself is not changed, so it still shows the earlier values.
 
-An entry in `jobs.yaml` is yours, and this never changes it. To run `skill-extractor` on another schedule, the earlier one included, put a job with the same id there. An install from before `system.yaml` has its built-in jobs in `jobs.yaml`, as that release wrote them; they replace the ones in `system.yaml` and are loaded as written. The scheduler logs a line for such an entry while it holds the earlier prompt. The Automation step of the setup page marks a job that `jobs.yaml` replaces as set there, and shows the built-in job's schedule and description beside it, not the entry's. To get the job as this release ships it, remove the entry from `jobs.yaml` once the install has a `system.yaml`: the job then runs from `system.yaml`, which also says whether it is enabled.
+An entry in `jobs.yaml` is yours, and this never changes it. To run `skill-extractor` on another schedule, the earlier one included, put a job with the same id there. Such an entry has none of the default gates: state them in its `run_if`, as shown above, to keep them. An install from before `system.yaml` has its built-in jobs in `jobs.yaml`, as that release wrote them; they replace the ones in `system.yaml` and are loaded as written. The scheduler logs a line for such an entry while it holds the earlier prompt. The Automation step of the setup page marks a job that `jobs.yaml` replaces as set there, and shows the built-in job's schedule and description beside it, not the entry's. To get the job as this release ships it, remove the entry from `jobs.yaml` once the install has a `system.yaml`: the job then runs from `system.yaml`, which also says whether it is enabled.
 
 ## Persistent Timers
 
@@ -779,7 +854,7 @@ If a job should have fired while the server was down, it fires **once** on start
 - **First-ever run**: No catch-up (no history to compare against).
 - **Multiple missed fires**: Coalesced into a single catch-up run.
 - **Catch-up runs concurrently**: All overdue jobs fire in parallel, in the background (doesn't block startup).
-- **Run gates apply**: a job whose gates are not satisfied is not caught up. A run that a gate skipped leaves no row, so a gated job can count as overdue at every start; its gates decide. They are asked about the moment the catch-up began, so `agent_activity` counts only work recorded before it.
+- **Run gates apply**: a job whose gates are not satisfied is not caught up. A run that a gate skipped leaves no row, so a gated job can count as overdue at every start; its gates decide. They are asked about the moment the catch-up began, so `agent_activity` counts only work recorded before it; `plans_in_review` counts the proposals as they are when it is asked.
 
 ### Opting out
 
@@ -821,7 +896,8 @@ them start late or be dropped as [late runs](#late-runs):
   Run gates and `lock` apply as for a scheduled run, and the run is logged as
   usual. The gates are asked about the time the run came due: `agent_activity`
   leaves out what was recorded since, such as the message that woke the
-  machine.
+  machine. `plans_in_review` counts the proposals as they are when it is
+  asked.
 - Jobs with `catchup: false` only move on; the run each one skipped is recorded
   in `cron_logs` with status `missed`. A run that the job's gates would have
   skipped, going by their [forecast](#forecasts) for the time it came due, is
@@ -924,7 +1000,9 @@ synced by hand (`POST /api/sources/{name}/sync`, `POST /api/sources/sync-all`).
 Not every change is announced. A wakeup that a session records during its turn,
 tasks created, moved or edited from a chat turn, the web UI or the API (which
 can change what a `tasks` gate forecasts), a turn or a stored message (which
-can change what an `agent_activity` gate forecasts), and a message a channel
+can change what an `agent_activity` gate forecasts), a plan that is proposed
+or decided (which can change what a `plans_in_review` gate forecasts), and a
+message a channel
 buffers for its `<channel>:observed` drain (which makes that drain count) count
 only from the next time the schedule is read. Code that keeps the answer should
 therefore also refresh it periodically, and when a turn ends.

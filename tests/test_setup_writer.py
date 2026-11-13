@@ -1198,11 +1198,21 @@ class TestMaintenanceJobsWaitForActivity:
         )
         return {job["id"]: job for job in setup_writer.build_cron_jobs(choices)}
 
+    @staticmethod
+    def _activity(job_id: str, backend: str) -> dict:
+        """The job's default gate on the agent's activity."""
+        (spec,) = [
+            spec for spec in setup_writer.default_run_if(job_id, backend)
+            if spec["type"] == "agent_activity"
+        ]
+        return spec
+
     @pytest.mark.parametrize("backend", ["memu", "loom"])
     def test_both_jobs_have_a_default_gate_on_activity(self, backend: str) -> None:
         for job_id, others in self.OTHERS.items():
-            (spec,) = setup_writer.default_run_if(job_id, backend)
-            assert (spec["type"], spec["ignore_jobs"]) == ("agent_activity", others)
+            assert self._activity(job_id, backend)["ignore_jobs"] == others
+        # It is the one gate of memory-maintenance.
+        assert len(setup_writer.default_run_if("memory-maintenance", backend)) == 1
 
     def test_no_maintenance_job_counts_as_work_for_another(self) -> None:
         """The weekly ones are left out too: their run is no reason for a
@@ -1226,19 +1236,24 @@ class TestMaintenanceJobsWaitForActivity:
         prompt = self._jobs("worker", "memu")["memory-maintenance"]["prompt"]
         assert "memory_records_by_date(date=yesterday" in prompt
         for backend in ("memu", "loom"):
-            assert "overlap_hours" not in setup_writer.default_run_if("skill-extractor", backend)[0]
+            assert "overlap_hours" not in self._activity("skill-extractor", backend)
         # Giving Loom its gate leaves memU's as it is.
         assert setup_writer.default_run_if("memory-maintenance", "memu") == [memu]
 
     def test_the_gates_build_and_validate(self) -> None:
-        from nerve.cron.gates import AgentActivityGate, build_gates
+        from nerve.cron.gates import AgentActivityGate, PlansInReviewGate, build_gates
 
+        kinds = {
+            "memory-maintenance": [AgentActivityGate],
+            "skill-extractor": [PlansInReviewGate, AgentActivityGate],
+        }
         for backend in ("memu", "loom"):
             for job_id in self.OTHERS:
                 specs = setup_writer.default_run_if(job_id, backend)
-                (gate,) = build_gates(specs)
-                assert isinstance(gate, AgentActivityGate)
-                assert set(specs[0]) - {"type"} <= AgentActivityGate.spec_keys
+                gates = build_gates(specs)
+                assert [type(gate) for gate in gates] == kinds[job_id]
+                for spec, gate in zip(specs, gates, strict=True):
+                    assert set(spec) - {"type"} <= gate.spec_keys
 
     @pytest.mark.parametrize("mode", ["personal", "worker"])
     @pytest.mark.parametrize("backend", ["memu", "loom"])
@@ -1249,7 +1264,8 @@ class TestMaintenanceJobsWaitForActivity:
         jobs = self._jobs(mode, backend)
         for job_id in self.OTHERS:
             assert "run_if" not in jobs[job_id]
-        assert "agent_activity" not in yaml.safe_dump(list(jobs.values()))
+        written = yaml.safe_dump(list(jobs.values()))
+        assert "agent_activity" not in written and "plans_in_review" not in written
         # The gates that are older than this rule stay in the file.
         assert jobs["task-planner"]["run_if"] == [{"type": "tasks", "status": "pending"}]
 
@@ -1259,8 +1275,25 @@ class TestMaintenanceJobsWaitForActivity:
             assert setup_writer.default_run_if(other, backend) == []
 
     def test_a_default_gate_is_the_callers_copy(self) -> None:
-        setup_writer.default_run_if("skill-extractor", "memu")[0]["ignore_jobs"].append("x")
-        assert "x" not in setup_writer.default_run_if("skill-extractor", "memu")[0]["ignore_jobs"]
+        self._activity("skill-extractor", "memu")["ignore_jobs"].append("x")
+        assert "x" not in self._activity("skill-extractor", "memu")["ignore_jobs"]
+        setup_writer.default_run_if("skill-extractor", "memu")[0]["below"] = 99
+        assert setup_writer.default_run_if("skill-extractor", "memu")[0]["below"] == 3
+
+
+class TestSkillExtractorWaitsForItsProposalsToBeDecided:
+    """The job proposes a skill a run, for a person to decide on. While three
+    of its proposals wait for that decision, it does not add a fourth: a
+    default gate, given by the scheduler like the one on activity."""
+
+    @pytest.mark.parametrize("backend", ["memu", "loom"])
+    def test_the_job_stops_at_three_proposals_in_review(self, backend: str) -> None:
+        review, activity = setup_writer.default_run_if("skill-extractor", backend)
+
+        assert review == {"type": "plans_in_review", "below": 3}
+        # After it, so that a job that waits for both names this one: the
+        # reason that a person can do something about.
+        assert activity["type"] == "agent_activity"
 
 
 def test_task_planner_asks_for_a_plan_summary() -> None:
