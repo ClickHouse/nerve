@@ -935,6 +935,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // never reorders the session list.
     try {
       const data = await api.getMessages(id);
+      // The person opened another chat while this one's history was on its
+      // way: the answer is not that chat's, and must not take its place.
+      if (get().activeSession !== id) return;
       const hydrated = data.messages.map(hydrateMessage);
       const update: Record<string, unknown> = {
         messages: hydrated,
@@ -951,7 +954,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       get().fetchModifiedFiles(id);
       void get().fetchSessionTasks(id);
     } catch {
-      set({ loading: false });
+      if (get().activeSession === id) set({ loading: false });
     }
   },
 

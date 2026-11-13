@@ -43,6 +43,33 @@ describe('buffer replay', () => {
     expect(activePanelId).toBe('toolu_wf');
   });
 
+  it('rebuilds the view of an MCP Apps tool call and its result', () => {
+    const app = { server: 'example-server', tool: 'get-time', resource_uri: 'ui://example/view.html' };
+    const appResult = { content: [{ type: 'text', text: '10:00' }], structuredContent: { time: '10:00' } };
+    const call = { type: 'tool_use' as const, session_id: SID, tool: 'mcp__example-server__get-time', input: {} };
+
+    const blocks = replay([
+      { ...call, tool_use_id: 'toolu_app', mcp_app: app },
+      { ...call, tool_use_id: 'toolu_plain' },
+      { type: 'tool_result', session_id: SID, tool_use_id: 'toolu_app', result: '10:00', mcp_app_result: appResult },
+      { type: 'tool_result', session_id: SID, tool_use_id: 'toolu_plain', result: '10:00', mcp_app_result: appResult },
+    ]);
+
+    expect(blocks).toEqual([
+      {
+        type: 'tool_call', toolUseId: 'toolu_app', tool: 'mcp__example-server__get-time', input: {},
+        status: 'complete', result: '10:00', isError: undefined,
+        mcpApp: { server: 'example-server', tool: 'get-time', resourceUri: 'ui://example/view.html' },
+        mcpAppResult: appResult,
+      },
+      {
+        type: 'tool_call', toolUseId: 'toolu_plain', tool: 'mcp__example-server__get-time', input: {},
+        status: 'complete', result: '10:00', isError: undefined,
+      },
+    ]);
+    expect('mcpAppResult' in blocks[1]).toBe(false);
+  });
+
   it('keeps what triggered an autonomous turn', () => {
     const trigger: AutoTurnTrigger = { agent_id: 'ag_000000000001', label: 'build-chart', kind: 'agent', status: 'completed' };
 

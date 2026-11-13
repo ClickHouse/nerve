@@ -1,6 +1,9 @@
 import type { ChatMessage, MessageBlock } from '../types/chat';
+import { mcpAppFields } from './mcpAppFields';
 
 export function hydrateMessage(raw: any): ChatMessage {
+  // The chat the row belongs to: what a widget or a view in it is kept under.
+  const session = typeof raw.session_id === 'string' && raw.session_id ? { session_id: raw.session_id } : {};
   if (raw.role === 'user') {
     const userBlocks: MessageBlock[] = [{ type: 'text', content: raw.content || '' }];
     // Restore image/file blocks from DB (uploaded files)
@@ -15,6 +18,7 @@ export function hydrateMessage(raw: any): ChatMessage {
     }
     return {
       id: raw.id,
+      ...session,
       role: 'user',
       blocks: userBlocks,
       channel: raw.channel,
@@ -50,6 +54,9 @@ export function hydrateMessage(raw: any): ChatMessage {
         // Monitor / background Bash), stamped when the turn finalized. Old
         // history has none and renders the legacy card.
         ...(typeof b.agent_id === 'string' && b.agent_id ? { agentId: b.agent_id } : {}),
+        // The view of an MCP Apps tool and the result it reads, so that a
+        // chat opened again shows the view. Other calls carry neither.
+        ...mcpAppFields(b),
       };
     }
     if (b.type === 'image') {
@@ -87,6 +94,7 @@ export function hydrateMessage(raw: any): ChatMessage {
   // field prevents backend payloads from attaching a principal accidentally.
   return {
     id: raw.id,
+    ...session,
     role: 'assistant',
     blocks,
     channel: raw.channel,

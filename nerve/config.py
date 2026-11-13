@@ -3453,6 +3453,30 @@ class McpEndpointConfig:
 
 
 @dataclass
+class McpAppsConfig:
+    """MCP Apps host (MCP extension ``io.modelcontextprotocol/ui``).
+
+    With ``enabled`` on, the web chat shows the interactive view that a tool
+    of a third-party MCP server links to, inside the message, and draws the
+    ```widget blocks of an answer. Both run in a frame whose document the
+    gateway serves from its own address with a policy that takes the
+    document's origin away, so that it shares none with the web UI (see
+    nerve/gateway/mcp_apps_sandbox.py). Views: Claude backend only. Off by
+    default; see docs/mcp-apps.md.
+
+    Not to be confused with :class:`McpServerConfig` (the servers themselves)
+    or :class:`McpEndpointConfig` (Nerve as an MCP server).
+    """
+
+    enabled: bool = False
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> McpAppsConfig:
+        return cls(enabled=d.get("enabled", False))
+
+
+@dataclass
 class ExternalAgentTargetConfig:
     """One configured external agent (Codex, Claude Code, ...).
 
@@ -4156,6 +4180,7 @@ class NerveConfig:
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
     xmemory: XmemoryConfig = field(default_factory=XmemoryConfig)
     mcp_endpoint: McpEndpointConfig = field(default_factory=McpEndpointConfig)
+    mcp_apps: McpAppsConfig = field(default_factory=McpAppsConfig)
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
     # Base URL of the MCP gateway, without a trailing "/". In external mode
     # Nerve takes its MCP servers only from the gateway's catalog and does not
@@ -4245,6 +4270,13 @@ class NerveConfig:
         the Anthropic↔OpenAI translation layer Ollama is reached through).
         """
         return self.ollama.enabled and self.proxy.enabled
+
+    @property
+    def mcp_apps_active(self) -> bool:
+        """True when MCP Apps is enabled in the configuration. Whether the
+        gateway shows views is decided at its startup, in local mode only
+        (:func:`nerve.gateway.mcp_apps_sandbox.serves_sandbox`)."""
+        return bool(self.mcp_apps.enabled)
 
     @property
     def outbound_channels(self) -> list[str]:
@@ -4644,6 +4676,7 @@ class NerveConfig:
             langfuse=LangfuseConfig.from_dict(d.get("langfuse", {})),
             xmemory=XmemoryConfig.from_dict(d.get("xmemory", {})),
             mcp_endpoint=McpEndpointConfig.from_dict(d.get("mcp_endpoint", {})),
+            mcp_apps=McpAppsConfig.from_dict(d.get("mcp_apps") or {}),
             mcp_servers=_parse_mcp_servers(d),
             mcp_gateway_url=_normalize_mcp_gateway_url(d.get("mcp_gateway_url")),
             external_agents=ExternalAgentsConfig.from_dict(d.get("external_agents", {})),

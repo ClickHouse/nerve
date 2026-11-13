@@ -270,16 +270,39 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
   const inputRef = useRef(input);
   useEffect(() => { inputRef.current = input; }, [input]);
 
+  // Whether the composer holds text, for what must not write into text of
+  // the person's own (a view of an MCP App).
+  useEffect(() => {
+    useAgentStore.getState().setComposerHasText(input.trim().length > 0);
+  }, [input]);
+  useEffect(() => () => useAgentStore.getState().setComposerHasText(false), []);
+
   // Text other surfaces put into the composer (Follow up…, Relaunch…, a
   // cancelled queued message): applied once per request — it replaces an
   // empty composer and goes on a new paragraph after existing text — then
   // the composer takes focus with the caret at the end.
+  //
+  // An `offer` is text the person neither wrote nor asked for: it goes in
+  // only when the composer is empty, and the focus stays where it is. Put
+  // next to their own words, or under their caret, it would go out with
+  // their next Enter.
   useEffect(() => {
     let handled = useAgentStore.getState().composerInsert?.nonce ?? null;
     return useAgentStore.subscribe((state) => {
       const insert = state.composerInsert;
       if (!insert || insert.nonce === handled) return;
       handled = insert.nonce;
+      if (insert.mode === 'offer') {
+        const empty = !inputRef.current.trim();
+        if (empty) {
+          inputRef.current = insert.text;
+          setInput(insert.text);
+          historyIndexRef.current = -1;
+          scheduleDraft(activeSession, insert.text);
+        }
+        insert.taken?.(empty);
+        return;
+      }
       const current = inputRef.current;
       const next = insert.mode === 'replace' || !current.trim()
         ? insert.text

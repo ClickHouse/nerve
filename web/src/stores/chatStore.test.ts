@@ -725,6 +725,73 @@ describe('switching sessions', () => {
   });
 });
 
+describe('a chat that is left while its history is on its way', () => {
+  const row = (id: number, session: string) => ({
+    id, role: 'assistant', session_id: session, blocks: [{ type: 'text', content: `of ${session}` }],
+  });
+  /** `chat-a` answers when the test says so; every other chat at once, with one message of its own. */
+  function slowChatA() {
+    const held: { answer: (value: unknown) => void; fail: (error: Error) => void } = { answer: () => {}, fail: () => {} };
+    vi.mocked(api.getMessages).mockImplementation(((id: string) => (id === 'chat-a'
+      ? new Promise((resolve, reject) => { held.answer = resolve; held.fail = reject; })
+      : Promise.resolve({ messages: [row(2, id)] }))) as never);
+    return held;
+  }
+
+  beforeEach(() => {
+    useChatStore.setState({ activeSession: '', messages: [], virtualSession: null, loading: false });
+  });
+
+  afterEach(() => {
+    vi.mocked(api.getMessages).mockImplementation(async () => ({ messages: [] }) as never);
+  });
+
+  it('does not show that history under the chat the person opened next', async () => {
+    const chatA = slowChatA();
+    const opening = useChatStore.getState().switchSession('chat-a');
+    await useChatStore.getState().switchSession('chat-b');
+    expect(useChatStore.getState().messages.map(m => [m.id, m.session_id])).toEqual([[2, 'chat-b']]);
+    const asked = vi.mocked(api.getModifiedFiles).mock.calls.length;
+
+    // The history of the chat that was left arrives now.
+    chatA.answer({ messages: [row(1, 'chat-a')], last_usage: { input_tokens: 9, output_tokens: 9 } });
+    await opening;
+
+    expect(useChatStore.getState().activeSession).toBe('chat-b');
+    expect(useChatStore.getState().messages.map(m => [m.id, m.session_id])).toEqual([[2, 'chat-b']]);
+    expect(useChatStore.getState().loading).toBe(false);
+    // Nor is anything more read for the chat that was left.
+    expect(vi.mocked(api.getModifiedFiles).mock.calls.length).toBe(asked);
+    expect(vi.mocked(api.getModifiedFiles)).not.toHaveBeenCalledWith('chat-a');
+  });
+
+  it('does not end the loading of the next chat when that history fails', async () => {
+    const chatA = slowChatA();
+    const opening = useChatStore.getState().switchSession('chat-a');
+    // The next chat is still loading (its own history has not answered yet).
+    useChatStore.setState({ activeSession: 'chat-b', messages: [], loading: true });
+
+    chatA.fail(new Error('timeout'));
+    await opening;
+
+    expect(useChatStore.getState()).toMatchObject({ activeSession: 'chat-b', loading: true, messages: [] });
+  });
+
+  it('shows the history when the person came back to the chat before it arrived', async () => {
+    const chatA = slowChatA();
+    const opening = useChatStore.getState().switchSession('chat-a');
+    await useChatStore.getState().switchSession('chat-b');
+    // Back to the first chat, whose first read is still out.
+    useChatStore.setState({ activeSession: 'chat-a', messages: [], loading: true });
+
+    chatA.answer({ messages: [row(1, 'chat-a')] });
+    await opening;
+
+    expect(useChatStore.getState().messages.map(m => [m.id, m.session_id])).toEqual([[1, 'chat-a']]);
+    expect(useChatStore.getState().loading).toBe(false);
+  });
+});
+
 describe('archiving a session with running agents', () => {
   const busy = { archived: true, archived_ids: [], skipped: [{ id: SID, reason: 'background agents running' }] };
 

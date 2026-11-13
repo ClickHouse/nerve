@@ -444,6 +444,8 @@ class SessionStore:
             await self.db.execute("DELETE FROM session_events WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM session_usage WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM channel_sessions WHERE session_id = ?", (session_id,))
+            # What the session's widgets saved goes with it.
+            await self.db.execute("DELETE FROM widget_states WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             if row is not None:

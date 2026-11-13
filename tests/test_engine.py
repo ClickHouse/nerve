@@ -1957,7 +1957,7 @@ def test_build_options_forwards_subagent_text(tmp_path):
             claude_plugins=lambda: [],
             managed_mcp=False,
         ))
-        backend._build_mcp_servers = lambda sid: {}
+        backend._build_mcp_servers = lambda sid, excluded=frozenset(): {}
         spec = SessionSpec(
             session_id="s-opts", source="web", model="claude-test", effort="high",
             system_prompt="", cwd=str(ws),

@@ -25,6 +25,8 @@ import { AskUserBlock } from './tools/AskUserBlock';
 import { toolBaseName } from '../../utils/toolNames';
 import { WorkflowRunRepeatBlock, WorkflowRunToolBlock } from './tools/WorkflowRunToolBlock';
 import { workflowRunCardId } from '../../utils/workflowRunCards';
+import { McpAppBlock } from './mcpApps/McpAppBlock';
+import { useMcpAppsStore } from '../../stores/mcpAppsStore';
 
 const TOOL_ICONS: Record<string, typeof Terminal> = {
   Bash: Terminal,
@@ -48,6 +50,14 @@ export function ToolCallBlock({
    */
   repeatRunCard?: boolean;
 }) {
+  // A tool of an MCP server that has an interactive view (MCP Apps), on a
+  // Nerve that hosts them: the ordinary card, folded, and the view under it.
+  // With the feature off the call is routed below like any other.
+  const mcpAppsEnabled = useMcpAppsStore(s => s.enabled);
+  if (block.mcpApp && mcpAppsEnabled) {
+    return <McpAppBlock block={block} app={block.mcpApp} chrome={<GenericToolBlock block={block} />} />;
+  }
+
   // Route to specialized renderers
   switch (block.tool) {
     case 'Edit':

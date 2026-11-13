@@ -688,6 +688,11 @@ SKILL_UPDATE_SCHEMA = {
 ONBOARDING_DONE_SCHEMA = {"type": "object", "properties": {}, "required": []}
 
 
+# What the widgets of the calling session's chat saved. No argument: a tool
+# call cannot name another chat.
+WIDGET_STATE_SCHEMA = {"type": "object", "properties": {}, "required": []}
+
+
 NOTIFY_SCHEMA = {
     "type": "object",
     "properties": {

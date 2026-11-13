@@ -204,6 +204,62 @@ describe('agent spawns and subagent events', () => {
   });
 });
 
+describe('MCP Apps fields of tool events', () => {
+  const app = { server: 'example-server', tool: 'get-time', resource_uri: 'ui://example/view.html' };
+  const appResult = { content: [{ type: 'text', text: '10:00' }], structuredContent: { time: '10:00' } };
+  const toolUse = { type: 'tool_use' as const, session_id: 's1', tool: 'mcp__example-server__get-time', input: { zone: 'UTC' }, tool_use_id: 't1' };
+
+  it('keeps the view of a tool call on its block', () => {
+    send({ ...toolUse, mcp_app: app });
+
+    expect(useChatStore.getState().streamingBlocks).toEqual([{
+      type: 'tool_call', toolUseId: 't1', tool: 'mcp__example-server__get-time', input: { zone: 'UTC' }, status: 'running',
+      mcpApp: { server: 'example-server', tool: 'get-time', resourceUri: 'ui://example/view.html' },
+    }]);
+  });
+
+  it('adds the result for the view, and keeps the text result', () => {
+    send({ ...toolUse, mcp_app: app });
+    send({ type: 'tool_result', session_id: 's1', tool_use_id: 't1', result: '10:00', is_error: false, mcp_app_result: appResult });
+
+    expect(useChatStore.getState().streamingBlocks[0]).toMatchObject({
+      status: 'complete', result: '10:00', isError: false, mcpAppResult: appResult,
+    });
+  });
+
+  it('keeps both when the turn ends', () => {
+    useChatStore.setState({ messages: [] });
+    send({ ...toolUse, mcp_app: app });
+    send({ type: 'tool_result', session_id: 's1', tool_use_id: 't1', result: '10:00', mcp_app_result: appResult });
+    send({ type: 'done', session_id: 's1' });
+
+    expect(useChatStore.getState().messages[0].blocks[0]).toMatchObject({
+      mcpApp: { server: 'example-server', tool: 'get-time', resourceUri: 'ui://example/view.html' },
+      mcpAppResult: appResult,
+    });
+  });
+
+  it('adds no key to an ordinary call', () => {
+    send(toolUse);
+    // A result for a view on a call that has none is not kept.
+    send({ type: 'tool_result', session_id: 's1', tool_use_id: 't1', result: '10:00', mcp_app_result: appResult });
+
+    const [block] = useChatStore.getState().streamingBlocks;
+    expect(block).toEqual({
+      type: 'tool_call', toolUseId: 't1', tool: 'mcp__example-server__get-time', input: { zone: 'UTC' },
+      status: 'complete', result: '10:00', isError: undefined,
+    });
+    expect('mcpApp' in block).toBe(false);
+    expect('mcpAppResult' in block).toBe(false);
+  });
+
+  it('shows a call whose mcp_app is not valid as an ordinary call', () => {
+    send({ ...toolUse, mcp_app: { ...app, resource_uri: 'https://example.com/view.html' } });
+
+    expect('mcpApp' in useChatStore.getState().streamingBlocks[0]).toBe(false);
+  });
+});
+
 describe('context usage', () => {
   const usage = {
     input_tokens: 10, output_tokens: 400, cache_read_input_tokens: 60000,

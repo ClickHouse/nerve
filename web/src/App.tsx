@@ -41,6 +41,7 @@ import { SetupBanner } from './components/Setup/SetupBanner';
 import { SetupLanding } from './components/Setup/SetupLanding';
 import { ShortcutsModal } from './components/ShortcutsModal';
 import { useSetupStore } from './stores/setupStore';
+import { useMcpAppsStore } from './stores/mcpAppsStore';
 
 function App() {
   const {
@@ -70,6 +71,10 @@ function App() {
     // the landing on an instance that has never been set up; one read per
     // app session, in both auth modes. Silent on an older backend without it.
     void useSetupStore.getState().load();
+    // Whether tool calls may show the interactive view of their MCP server
+    // (MCP Apps). One read per page; off until it answers, and off on a
+    // gateway without the feature.
+    void useMcpAppsStore.getState().load();
     return () => { unsub(); ws.disconnect(); };
   }, [live]);
 

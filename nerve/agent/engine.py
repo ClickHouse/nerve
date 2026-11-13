@@ -75,6 +75,7 @@ from nerve.agent.prompts import (
     memory_unavailable_note,
     prepend_session_preamble,
     set_skill_manager,
+    surface_excluded_tools,
 )
 from nerve.agent.session_titles import REPLACEABLE_SOURCES, STYLE_EXAMPLES, outcome_title
 from nerve.agent.sessions import SessionManager, SessionStatus, new_cron_run_id
@@ -106,6 +107,7 @@ from nerve.inference_principal import (
     inference_principal,
     inference_trigger,
 )
+from nerve.mcp_apps import is_third_party_tool, tool_event_result
 from nerve.mcp_gateway import McpGatewayCatalog
 from nerve.memory.backend import (
     MemoryBackendUnavailable,
@@ -221,6 +223,17 @@ def _parse_mcp_tool_name(tool_name: str) -> tuple[str, str] | None:
     if len(parts) == 3:
         return parts[1], parts[2]
     return None
+
+
+def _mcp_app_result(event: ToolResult) -> dict[str, Any] | None:
+    """The MCP ``CallToolResult`` that a view gets for a finished tool call
+    (the ``mcp_app_result`` field), or None when it cannot be built: the call
+    is then shown as an ordinary one."""
+    try:
+        return tool_event_result(event.content, event.structured, bool(event.is_error))
+    except Exception as e:  # noqa: BLE001 — never break a tool event
+        logger.debug("MCP App result of %s could not be built: %s", event.tool_use_id, e)
+        return None
 
 
 def _model_family(model: str) -> str:
@@ -1016,6 +1029,13 @@ class AgentEngine:
             await self.db.upsert_mcp_server(
                 name=srv.name, server_type=srv.type, enabled=srv.enabled,
             )
+
+    def has_mcp_server(self, name: str) -> bool:
+        """Whether ``name`` is an enabled external MCP server of the current
+        configuration: one of the servers a new session gets."""
+        return any(
+            server.name == name and server.enabled for server in self._mcp_servers_cache
+        )
 
     async def reload_mcp_config(self) -> list:
         """Re-read MCP server config from YAML files and update cache + DB.
@@ -1841,6 +1861,9 @@ class AgentEngine:
                 # The session's own surface decides what renders: a wakeup
                 # turn of a web session is still read in the web chat.
                 rendering_source=(session or {}).get("source"),
+                # The web chat draws ```widget blocks in the MCP Apps
+                # sandbox, which runs in local mode only.
+                widgets=bool(self.config.mcp_apps_active) and not self._managed_mcp,
             )
 
             # Observer sessions of a review loop get a context block so the
@@ -1922,6 +1945,11 @@ class AgentEngine:
                 # Where the session comes from (its cron job, channel, ...),
                 # also fixed for the session.
                 inference_origin=inference_origin(session_origin(session or {})),
+                # The tools of no use on the surface the session is read on:
+                # the system prompt above leaves them out of its list as well.
+                excluded_tools=frozenset(surface_excluded_tools(
+                    (session or {}).get("source") or source,
+                )),
                 extra={
                     # Per-session codex sandbox override (review-loop verifier
                     # legs run workspace-write instead of the global default).
@@ -3219,6 +3247,31 @@ class AgentEngine:
     #  Tool-result helpers                                                 #
     # ------------------------------------------------------------------ #
 
+    async def _mcp_app_for(
+        self, session_id: str, tool_name: str,
+    ) -> dict[str, str] | None:
+        """The MCP App that a tool call opens (the ``mcp_app`` field of its
+        event and block), or None.
+
+        Only a tool of a third-party MCP server can open one, and only the
+        session's live client knows (``AgentClient.mcp_app_for_tool``): a
+        runtime that does not host MCP Apps answers None. A lookup that fails
+        is logged, and the call goes on as an ordinary one.
+        """
+        if not is_third_party_tool(tool_name):
+            return None
+        try:
+            lookup = getattr(
+                self.sessions.get_client(session_id), "mcp_app_for_tool", None,
+            )
+            app = await lookup(tool_name) if lookup is not None else None
+        except Exception as e:  # noqa: BLE001 — never break a tool event
+            logger.debug(
+                "MCP App lookup of %s failed for session %s: %s", tool_name, session_id, e,
+            )
+            return None
+        return app if isinstance(app, dict) else None
+
     async def _process_tool_result(
         self,
         event: ToolResult,
@@ -3246,11 +3299,21 @@ class AgentEngine:
         }
 
         # Update matching tool_call in ordered_blocks
+        mcp_app_result = None
         if tool_use_id:
             for ob in reversed(ordered_blocks):
                 if ob.get("type") == "tool_call" and ob.get("tool_use_id") == tool_use_id:
                     ob["result"] = result_content
                     ob["is_error"] = is_error
+                    if ob.get("mcp_app") and not event.rejected:
+                        # The call opened an MCP App: its view gets the
+                        # result as an MCP CallToolResult. A call that the
+                        # person stopped or refused has none (what the
+                        # runtime says to the model in its place is not the
+                        # tool's): the view is told that it was cancelled.
+                        mcp_app_result = _mcp_app_result(event)
+                        if mcp_app_result is not None:
+                            ob["mcp_app_result"] = mcp_app_result
                     break
 
         await broadcaster.broadcast_tool_result(
@@ -3258,6 +3321,7 @@ class AgentEngine:
             tool_use_id=tool_use_id,
             is_error=is_error or False,
             parent_tool_use_id=event.parent_tool_use_id,
+            mcp_app_result=mcp_app_result,
         )
 
         await self._tool_result_side_effects(
@@ -3432,10 +3496,12 @@ class AgentEngine:
 
         elif isinstance(event, ToolUse):
             st.got_content = True
+            mcp_app = await self._mcp_app_for(session_id, event.name)
             await broadcaster.broadcast_tool_use(
                 session_id, event.name, event.input,
                 tool_use_id=event.tool_use_id,
                 parent_tool_use_id=event.parent_tool_use_id,
+                mcp_app=mcp_app,
             )
             # Track dynamic workflows.  A ``Workflow`` tool call spawns
             # a background runtime; later task_* system events carry
@@ -3452,12 +3518,15 @@ class AgentEngine:
                 "input": event.input,
                 "tool_use_id": event.tool_use_id,
             })
-            st.ordered_blocks.append({
+            block: dict[str, Any] = {
                 "type": "tool_call",
                 "tool": event.name,
                 "input": event.input,
                 "tool_use_id": event.tool_use_id,
-            })
+            }
+            if mcp_app:
+                block["mcp_app"] = mcp_app
+            st.ordered_blocks.append(block)
             # A spawning call (Agent/Task/Workflow/Monitor, background Bash)
             # creates the agent's record; TaskStop marks its target.
             await self.agents.note_main_tool_use(session_id, event)
