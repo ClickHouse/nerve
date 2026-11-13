@@ -21,12 +21,20 @@ function open({ size = { width: 400, height: 200 }, markup = MARKUP } = {}) {
   return { onClose, viewport, content, host };
 }
 
-/** The picture's place: its zoom, and how far it was moved from where 1:1 puts it. */
+/**
+ * The picture's place: its zoom, and how far it was moved from where 1:1 puts it.
+ * jsdom writes `translate(Xpx)` when the y offset is 0, and keeps 6 significant
+ * digits of each number. A value computed from the place is exact to about
+ * 3 decimal places only.
+ */
 function placeOf(content: HTMLElement) {
-  const match = /translate\((-?[\d.e-]+)px, (-?[\d.e-]+)px\) scale\(([\d.e-]+)\)/.exec(content.style.transform);
+  const match = /translate\((-?[\d.e-]+)px(?:, (-?[\d.e-]+)px)?\) scale\(([\d.e-]+)\)/.exec(content.style.transform);
   if (!match) throw new Error(`unexpected transform: ${content.style.transform}`);
-  return { x: Number(match[1]), y: Number(match[2]), zoom: Number(match[3]) };
+  return { x: Number(match[1]), y: Number(match[2] ?? 0), zoom: Number(match[3]) };
 }
+
+/** Decimal places for `toBeCloseTo` on a value computed from {@link placeOf}. */
+const PLACE_DIGITS = 3;
 
 const zoomLevel = () => screen.getByLabelText('Zoom level').textContent;
 
@@ -76,9 +84,9 @@ describe('Lightbox', () => {
     const notCancelled = fireEvent.wheel(viewport, { deltaY: -200, clientX: 340, clientY: 320 });
     expect(notCancelled).toBe(false);
     const place = placeOf(content);
-    expect(place.zoom).toBeCloseTo(Math.exp(0.3), 5);
-    expect((340 - 300 - place.x) / place.zoom).toBeCloseTo(40, 5);
-    expect((320 - 300 - place.y) / place.zoom).toBeCloseTo(20, 5);
+    expect(place.zoom).toBeCloseTo(Math.exp(0.3), PLACE_DIGITS);
+    expect((340 - 300 - place.x) / place.zoom).toBeCloseTo(40, PLACE_DIGITS);
+    expect((320 - 300 - place.y) / place.zoom).toBeCloseTo(20, PLACE_DIGITS);
     expect(zoomLevel()).toBe('135%');
   });
 
@@ -112,11 +120,11 @@ describe('Lightbox', () => {
     expect(offset(content.style.left)).toMatch(/^max\(24px,(?:calc\()?50%-1000px\)?\)$/);
     await userEvent.click(screen.getByRole('button', { name: 'Fit to window' }));
     const place = placeOf(content);
-    expect(place.zoom).toBeCloseTo(952 / 2000, 5);
+    expect(place.zoom).toBeCloseTo(952 / 2000, PLACE_DIGITS);
     expect(zoomLevel()).toBe('48%');
     // Centred: the corner at 1:1 is (24, 150), the fitted picture 952 × 238.
-    expect(24 + place.x).toBeCloseTo((1000 - 952) / 2, 5);
-    expect(150 + place.y).toBeCloseTo((800 - 238) / 2, 5);
+    expect(24 + place.x).toBeCloseTo((1000 - 952) / 2, PLACE_DIGITS);
+    expect(150 + place.y).toBeCloseTo((800 - 238) / 2, PLACE_DIGITS);
     viewport.focus();
     await userEvent.keyboard('0');
     expect(placeOf(content)).toEqual({ x: 0, y: 0, zoom: 1 });
