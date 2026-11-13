@@ -2729,6 +2729,10 @@ The key comes in two headers. The direct SDK calls, memU and model discovery
 send it as `Authorization: Bearer <key>`. The Claude CLI sends it as
 `X-Api-Key: <key>`. The endpoint must read the key from both headers.
 
+When `ANTHROPIC_CUSTOM_HEADERS` in Nerve's environment has an `X-Api-Key`
+line, the direct SDK calls and model discovery send that line and no
+`Authorization` header. A request then carries one key, the one in that line.
+
 It cannot be set together with `proxy.enabled` or `provider.type: bedrock`, and a
 change needs a restart.
 

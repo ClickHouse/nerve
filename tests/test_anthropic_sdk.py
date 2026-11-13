@@ -48,6 +48,7 @@ class _StandIn:
                 stand_in.requests.append({
                     "path": self.path,
                     "headers": {k.lower(): v for k, v in self.headers.items()},
+                    "header_lines": [(k.lower(), v) for k, v in self.headers.items()],
                     "body": json.loads(raw or b"{}"),
                 })
                 status, body = stand_in.reply
@@ -133,6 +134,11 @@ def _bedrock_config() -> NerveConfig:
     }})
 
 
+def _credentials(request: dict) -> list[tuple[str, str]]:
+    """Each ``Authorization`` and ``X-Api-Key`` line of a recorded request."""
+    return [(k, v) for k, v in request["header_lines"] if k in ("authorization", "x-api-key")]
+
+
 def _call(config: NerveConfig, *, use_async: bool, model: str = "claude-haiku-5-5") -> None:
     """One ``messages.create`` through Nerve's sync or async client factory."""
     kwargs = {"model": model, "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
@@ -164,9 +170,101 @@ def test_the_key_goes_out_as_a_bearer_token(stand_in, route, use_async):
 
     (request,) = stand_in.requests
     assert request["path"] == "/v1/messages"
-    assert request["headers"]["authorization"] == f"Bearer {key}"
-    assert "x-api-key" not in request["headers"]
+    assert _credentials(request) == [("authorization", f"Bearer {key}")]
     assert request["headers"]["anthropic-version"] == API_VERSION
+
+
+# --------------------------------------------------------------------------- #
+#  One credential for each request                                             #
+# --------------------------------------------------------------------------- #
+
+
+def _route_config(route: str, url: str, port: int) -> tuple[NerveConfig, str]:
+    if route == "api_key":
+        return _api_config(url), _KEY
+    return _proxy_config(port), "sk-local-proxy-key"
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+@pytest.mark.parametrize("route", ["api_key", "proxy"])
+@pytest.mark.parametrize("line", ["X-Api-Key: gateway-key", "x-api-key: gateway-key"])
+def test_an_inherited_x_api_key_line_is_the_only_credential(
+    stand_in, monkeypatch, route, use_async, line,
+):
+    """``ANTHROPIC_CUSTOM_HEADERS`` names ``X-Api-Key``: the SDK sends that
+    line, and the configured key does not go out in ``Authorization``."""
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", f"X-Proxy-Tag: blue\n{line}")
+    config, _ = _route_config(route, stand_in.url, stand_in.port)
+
+    _call(config, use_async=use_async)
+
+    (request,) = stand_in.requests
+    assert _credentials(request) == [("x-api-key", "gateway-key")]
+    assert request["headers"]["x-proxy-tag"] == "blue"
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+def test_an_inherited_x_api_key_line_works_without_a_configured_key(
+    stand_in, monkeypatch, use_async,
+):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Api-Key: gateway-key")
+
+    _call(NerveConfig.from_dict({"anthropic_base_url": stand_in.url}), use_async=use_async)
+
+    (request,) = stand_in.requests
+    assert _credentials(request) == [("x-api-key", "gateway-key")]
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+@pytest.mark.parametrize("route", ["api_key", "proxy"])
+def test_other_inherited_lines_keep_the_bearer_key(stand_in, monkeypatch, route, use_async):
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Proxy-Tag: blue\nX-Api-Key-Hint: none")
+    config, key = _route_config(route, stand_in.url, stand_in.port)
+
+    _call(config, use_async=use_async)
+
+    (request,) = stand_in.requests
+    assert _credentials(request) == [("authorization", f"Bearer {key}")]
+    assert request["headers"]["x-proxy-tag"] == "blue"
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+def test_an_inherited_authorization_line_replaces_the_key(stand_in, monkeypatch, use_async):
+    """The SDK merges header names in any case, so the line replaces the
+    configured key: one credential, and the key does not go out."""
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "authorization: Bearer gateway-token")
+
+    _call(_api_config(stand_in.url), use_async=use_async)
+
+    (request,) = stand_in.requests
+    assert _credentials(request) == [("authorization", "Bearer gateway-token")]
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+def test_credentials_in_the_environment_are_not_sent(stand_in, monkeypatch, use_async):
+    """The factories pass ``api_key``, so the SDK reads no credential from
+    the environment: an ``ANTHROPIC_AUTH_TOKEN`` does not go out."""
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "environment-token")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "environment-key")
+
+    _call(_api_config(stand_in.url), use_async=use_async)
+
+    (request,) = stand_in.requests
+    assert _credentials(request) == [("authorization", f"Bearer {_KEY}")]
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+def test_bedrock_ignores_an_inherited_x_api_key_line(stand_in, monkeypatch, use_async):
+    """The Bedrock clients do not read ``ANTHROPIC_CUSTOM_HEADERS``; they
+    sign each request."""
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Api-Key: gateway-key")
+
+    _call(_bedrock_config(), use_async=use_async, model="us.anthropic.claude-haiku-5-5")
+
+    (request,) = stand_in.requests
+    ((name, value),) = _credentials(request)
+    assert name == "authorization" and value.startswith("AWS4-HMAC-SHA256 ")
 
 
 @pytest.mark.parametrize("use_async", [False, True])

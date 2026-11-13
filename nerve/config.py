@@ -22,7 +22,7 @@ from nerve.coerce import FALSY, TRUTHY
 from nerve.coerce import as_bool as _as_bool
 from nerve.coerce import coerced as _coerced
 from nerve.coerce import lenient_int as _lenient_int
-from nerve.inference_principal import direct_client_headers
+from nerve.inference_principal import direct_client_headers, has_custom_header_line
 
 import yaml
 
@@ -4362,15 +4362,27 @@ class NerveConfig:
         return {}
 
     @staticmethod
-    def _client_header_kwargs(principal_id: str | None = None) -> dict[str, Any]:
+    def _client_header_kwargs(
+        principal_id: str | None = None, *, api: bool = False,
+    ) -> dict[str, Any]:
         """The ``default_headers`` argument for an Anthropic client, if any.
 
         In external mode, Nerve's own model calls name ``principal_id``, or
         the system actor of the server's database when it is ``None``, as the
         principal of the request, and never another principal from the
         environment (see :func:`nerve.inference_principal.direct_client_headers`).
+
+        ``api`` is true for a client of the Anthropic API or the proxy (not
+        Bedrock). Such a client sends the API key in ``Authorization``, and
+        also the lines of ``ANTHROPIC_CUSTOM_HEADERS``. When these lines name
+        ``X-Api-Key``, the client sends no ``Authorization``: a request
+        carries one credential, the one in that line.
         """
         headers = direct_client_headers(principal_id=principal_id)
+        if api and has_custom_header_line("X-Api-Key"):
+            from anthropic import omit
+
+            headers["Authorization"] = omit
         return {"default_headers": headers} if headers else {}
 
     def create_anthropic_client(
@@ -4415,7 +4427,7 @@ class NerveConfig:
         kwargs = {
             **ANTHROPIC_CLIENT_OPTIONS,
             **self._client_retry_kwargs(max_retries),
-            **self._client_header_kwargs(principal_id),
+            **self._client_header_kwargs(principal_id, api=True),
         }
         # The key the checks accept (config, else the environment). An explicit
         # ``api_key`` — ``""`` included — stops the SDK from reading the
@@ -4462,7 +4474,7 @@ class NerveConfig:
         kwargs = {
             **ANTHROPIC_CLIENT_OPTIONS,
             **self._client_retry_kwargs(max_retries),
-            **self._client_header_kwargs(principal_id),
+            **self._client_header_kwargs(principal_id, api=True),
         }
         return anthropic.AsyncAnthropic(
             api_key=self.resolve_anthropic_api_key(),  # see create_anthropic_client
