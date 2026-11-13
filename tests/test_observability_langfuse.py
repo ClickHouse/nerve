@@ -530,12 +530,15 @@ def test_redact_attributes_keeps_metadata_json(key, decoded, expected):
     assert _FAKE_LANGFUSE_SECRET not in changed[key]
 
 
+# A string value: the patterns do not see the quotes that the SDK adds. An
+# object value: the patterns see its text, the match breaks the JSON and the
+# decoded value also has a match, so the whole value fails closed.
 @pytest.mark.parametrize(("pattern", "decoded", "expected"), [
     (r'"', 'say "hi"', "say [REDACTED]hi[REDACTED]"),
-    (r'"', {"quote": 'a "b"'}, {"quote": "a [REDACTED]b[REDACTED]"}),
+    (r'"', {"quote": 'a "b"'}, "[REDACTED]"),
     (r'token="[^"]*"', 'token="abc" end', "[REDACTED] end"),
     (r"(?s).+", "line1\nline2", "[REDACTED]"),
-    (r"(?s).+", {"a": "b"}, {"[REDACTED]": "[REDACTED]"}),
+    (r"(?s).+", {"a": "b"}, "[REDACTED]"),
 ])
 def test_metadata_pattern_that_matches_quotes_keeps_json(pattern, decoded, expected):
     key = "langfuse.trace.metadata.note"
@@ -545,17 +548,41 @@ def test_metadata_pattern_that_matches_quotes_keeps_json(pattern, decoded, expec
     assert json.loads(changed[key]) == expected
 
 
-@pytest.mark.parametrize(("decoded", "expected"), [
-    (1234567890123, "[REDACTED]"),
-    ({"account": 1234567890123, "ok": 7}, {"account": "[REDACTED]", "ok": 7}),
-    ([1234567890123], ["[REDACTED]"]),
+@pytest.mark.parametrize("decoded", [
+    1234567890123, {"account": 1234567890123, "ok": 7}, [1234567890123],
 ])
-def test_metadata_numbers_that_match_become_redacted_strings(decoded, expected):
+def test_metadata_number_that_matches_makes_the_value_a_redacted_string(decoded):
+    # The text match on the number breaks the JSON text, and the decoded
+    # number also matches, so an object or array fails closed.
     key = "langfuse.observation.metadata.account"
     changed = lf.redact_attributes(
         {key: json.dumps(decoded)}, lf._compile_patterns([r"\d{10,}"]),
     )
-    assert json.loads(changed[key]) == expected
+    assert json.loads(changed[key]) == "[REDACTED]"
+
+
+def test_metadata_object_with_leaf_match_keeps_its_shape():
+    key = "langfuse.trace.metadata.cfg"
+    value = json.dumps({"token": _FAKE_ANTHROPIC_KEY, "keep": "x"}, separators=(",", ":"))
+    changed = lf.redact_attributes({key: value}, _default_patterns())
+    assert json.loads(changed[key]) == {"token": "[REDACTED]", "keep": "x"}
+
+
+def test_metadata_object_text_that_is_not_json_becomes_a_json_string():
+    key = "langfuse.trace.metadata.cfg"
+    value = json.dumps({"a": {"token": "TOP-SECRET"}}, separators=(",", ":"))
+    changed = lf.redact_attributes({key: value}, lf._compile_patterns([r'token":"[^"]*"']))
+    assert json.loads(changed[key]) == '{"a":{"[REDACTED]}}'
+
+
+def test_metadata_json_string_form_with_a_match_becomes_the_marker():
+    # The text match breaks the JSON and leaves text with quotes. The JSON
+    # string form escapes each quote, and the backslash pattern matches it.
+    key = "langfuse.observation.metadata.cfg"
+    value = json.dumps({"token": "TOP-SECRET", "b": "c"}, separators=(",", ":"))
+    patterns = lf._compile_patterns([r'token":"[^"]*"', r"\\"])
+    changed = lf.redact_attributes({key: value}, patterns)
+    assert changed == {key: '"[REDACTED]"'}
 
 
 def test_metadata_value_that_is_not_json_is_redacted_as_text():
@@ -842,17 +869,24 @@ def test_json_text_in_strings_is_matched_as_text_on_export(real_export_pipeline)
     provider, delegate, _ = real_export_pipeline
     lf._redact_patterns = lf._compile_patterns([
         r'token":"[^"]*"', r'\n  "token": "[^"]*"', "private-π-token",
+        r"leaf-secret-\d+",
     ])
     lf._enabled = True
     text = json.dumps({"token": "TOP-SECRET"}, separators=(",", ":"))
     # The indented pattern breaks this JSON text, and the escaped second
     # secret only shows in the decoded value: the value fails closed.
     indented = json.dumps({"token": "TOP-SECRET", "note": "private-π-token"}, indent=2)
-    metadata = {"note": text, "indented": indented}
+    shared = {
+        "s": text,
+        "indented": indented,
+        "leaf": {"key": "leaf-secret-42", "keep": "x"},
+    }
+    trace_metadata = {**shared, "cfg": {"token": "TOP-SECRET"}}
+    observation_metadata = {**shared, "cfg": {"a": {"token": "TOP-SECRET"}}}
     tracer = provider.get_tracer("langsmith")
-    with lf.attributes(session_id="session-1", metadata=metadata):
+    with lf.attributes(session_id="session-1", metadata=trace_metadata):
         with tracer.start_as_current_span("claude.assistant.turn") as span:
-            span.set_attributes(create_span_attributes(metadata=metadata))
+            span.set_attributes(create_span_attributes(metadata=observation_metadata))
             span.set_attribute("input", text)
     provider.force_flush()
 
@@ -860,12 +894,17 @@ def test_json_text_in_strings_is_matched_as_text_on_export(real_export_pipeline)
     assert len(exported) == 1
     attributes = exported[0].attributes
     for prefix in ("langfuse.trace.metadata", "langfuse.observation.metadata"):
-        assert json.loads(attributes[f"{prefix}.note"]) == '{"[REDACTED]}'
+        assert json.loads(attributes[f"{prefix}.s"]) == '{"[REDACTED]}'
         assert json.loads(attributes[f"{prefix}.indented"]) == "[REDACTED]"
+        assert json.loads(attributes[f"{prefix}.leaf"]) == {"key": "[REDACTED]", "keep": "x"}
+    # Object values: the patterns match the attribute text.
+    assert json.loads(attributes["langfuse.trace.metadata.cfg"]) == '{"[REDACTED]}'
+    assert json.loads(attributes["langfuse.observation.metadata.cfg"]) == '{"a":{"[REDACTED]}}'
     assert attributes["input"] == '{"[REDACTED]}'
     serialized = encode_spans(exported).SerializeToString()
     assert b"TOP-SECRET" not in serialized
     assert b"private-" not in serialized
+    assert b"leaf-secret" not in serialized
 
 
 def test_sdk_metadata_is_redacted_on_export_and_stays_json(real_export_pipeline):

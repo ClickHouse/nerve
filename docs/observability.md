@@ -107,13 +107,20 @@ prompts and completions stay valid JSON with them. Bytes that are not
 valid UTF-8 are replaced with `[REDACTED]`.
 
 The metadata attributes (`langfuse.trace.metadata.*` and
-`langfuse.observation.metadata.*`) hold JSON text. Nerve decodes the
-value, redacts the strings, keys, numbers and booleans in it, and encodes
-it again, so the value stays valid JSON. The patterns match each string
-as text, also a string that holds JSON text, but not the quotes that the
-SDK adds around the value. A number or boolean that a pattern matches
-becomes the string `"[REDACTED]"`. A metadata value that is not JSON text
-is redacted as plain text.
+`langfuse.observation.metadata.*`) hold JSON text, and they stay valid
+JSON after redaction:
+
+- For a string value, the SDK adds quotes. Nerve decodes the string and
+  redacts it with the rules above, so the patterns do not match the
+  quotes that the SDK adds.
+- For an object, array, number or boolean, the patterns match the
+  attribute text with the rules above, as for other attributes. If the
+  result is not valid JSON, Nerve sends it as a JSON string. If a
+  pattern matches that JSON string form, the value becomes
+  `"[REDACTED]"`.
+- A pattern match on a number or boolean in the text makes the JSON
+  text invalid, so the whole value becomes `"[REDACTED]"`.
+- A metadata value that is not JSON text is redacted as plain text.
 
 Masking runs before the Langfuse SDK extracts media for upload. A matching
 data URI is redacted before it can enter the upload queue. This uses the

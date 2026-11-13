@@ -409,11 +409,17 @@ def _redact_json(value: Any, patterns: list[re.Pattern[str]]) -> Any:
 def _redact_metadata_value(value: Any, patterns: list[re.Pattern[str]]) -> Any:
     """Return a redacted copy of a Langfuse metadata attribute value.
 
-    Returns ``value`` itself when nothing matched. The SDK encodes each
-    metadata value as JSON text, so this text is decoded, the decoded
-    value is redacted, and the result is encoded again as JSON text. The
-    patterns do not match the quotes that the SDK adds. A value that is
-    not JSON text is redacted as plain text.
+    Returns ``value`` itself when nothing matched. The result is always
+    JSON text. The SDK encodes each metadata value as JSON text:
+
+    - A string value gets quotes from the SDK. The string is decoded and
+      goes through :func:`_redact_string`, so the patterns do not match
+      the quotes that the SDK adds.
+    - An object, array, number or boolean gets no quotes. The attribute
+      text goes through :func:`_redact_string`, as for other attributes.
+      If the result is not JSON text, it is encoded as a JSON string.
+
+    A value that is not JSON text is redacted as plain text.
     """
     if not isinstance(value, str):
         return _redact_value(value, patterns)
@@ -421,10 +427,33 @@ def _redact_metadata_value(value: Any, patterns: list[re.Pattern[str]]) -> Any:
         decoded = json.loads(value)
     except ValueError:
         return _redact_value(value, patterns)
-    redacted = _redact_json(decoded, patterns)
-    if redacted is decoded:
+    if isinstance(decoded, str):
+        redacted = _redact_string(decoded, patterns)
+        if redacted is decoded:
+            return value
+        return json.dumps(redacted, ensure_ascii=False)
+    redacted = _redact_string(value, patterns)
+    if redacted is value:
         return value
-    return json.dumps(redacted, ensure_ascii=False, separators=(",", ":"))
+    try:
+        json.loads(redacted)
+    except ValueError:
+        return _encode_json_string(redacted, patterns)
+    return redacted
+
+
+def _encode_json_string(text: str, patterns: list[re.Pattern[str]]) -> str:
+    """Encode text that has no match as a JSON string.
+
+    The encoding adds an escape character in front of each quote and
+    backslash. If a pattern matches the escaped text, the result is the
+    JSON string of the redaction marker.
+    """
+    encoded = json.dumps(text, ensure_ascii=False)
+    escaped = encoded[1:-1]
+    if _redact_text(escaped, patterns) != escaped:
+        return json.dumps(REDACTED)
+    return encoded
 
 
 def redact_attributes(
