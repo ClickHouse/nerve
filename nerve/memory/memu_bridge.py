@@ -997,7 +997,7 @@ class MemUBridge:
 
     # memU version these patches were written for. If the installed version
     # differs, the internal APIs we monkey-patch may have changed.
-    _MEMU_PATCHED_VERSION = "1.4.0"
+    _MEMU_PATCHED_VERSION = "1.5.1"
 
     @classmethod
     def _check_memu_version(cls) -> bool:
@@ -1027,7 +1027,8 @@ class MemUBridge:
         """Monkey-patch memU's SQLite backend to fix bugs in memu-py 1.4.0.
 
         WARNING: These patches reach into memU internals and are tightly
-        coupled to memu-py==1.4.0.  If you upgrade memU, verify that all
+        coupled to the memu-py version in pyproject.toml.  If you upgrade
+        memU, verify that all
         patched symbols still exist and behave the same way.  See
         _MEMU_PATCHED_VERSION and the pin in pyproject.toml.
 
