@@ -1080,3 +1080,35 @@ def test_cron_next_with_nothing_scheduled(tmp_path, monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert result.output.splitlines()[0] == "Next: nothing scheduled in the next 7 days"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["worker", "personal"])
+async def test_the_built_in_jobs_give_an_agent_that_does_nothing_no_next_tick(held, db, tmp_path, mode):
+    """The jobs as the installer writes them and the scheduler loads them.
+    While the agent does nothing, none of them is the next scheduled task, so
+    a platform that parks the machine is given no time to wake it at. After
+    one turn, each maintenance job that is switched on is forecast to run."""
+    from nerve.setup_writer import MAINTENANCE_CRON_IDS
+    from tests.test_cron_gates import _load, _system_yaml
+
+    loaded = _load(tmp_path, _system_yaml(mode=mode))
+    switched_on = {job_id for job_id in MAINTENANCE_CRON_IDS if loaded[job_id].enabled}
+    assert {"memory-maintenance", "machine-maintenance"} <= switched_on
+    svc = await held(list(loaded.values()), db=db)
+
+    async def forecasts() -> dict[str, str]:
+        report = {job["id"]: job for job in (await svc.schedule_report())["jobs"]}
+        return {job_id: report[job_id]["forecast"] for job_id in switched_on}
+
+    assert await svc.next_scheduled() is None
+    assert set((await forecasts()).values()) == {"skip"}
+
+    await db.create_session("chat-1", source="test", actor=None)
+    await db.record_turn_usage(
+        session_id="chat-1", input_tokens=1, output_tokens=1,
+        cache_creation=0, cache_read=0, max_context=200_000,
+    )
+
+    assert set((await forecasts()).values()) == {"run"}
+    assert (await svc.next_scheduled()).name in switched_on
