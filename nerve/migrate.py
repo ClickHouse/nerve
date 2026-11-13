@@ -234,6 +234,9 @@ _MACHINE_LOCAL_PATHS = frozenset({
     # Certificate and key paths into this box's filesystem. host/port describe
     # the deployment and belong in the tracked layer.
     "gateway.ssl",
+    # The address at which people reach this box's web UI. Shared, it would
+    # send the links of every instance to one of them.
+    "gateway.public_url",
     # Names an entry in one machine's AWS credentials file. provider.type and
     # .aws_region are shared, and the geo-scoped model ids go with the region.
     "provider.aws_profile",

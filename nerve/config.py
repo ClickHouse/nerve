@@ -917,12 +917,69 @@ class SSLConfig:
 # here because ``uvicorn[standard]`` pulls it in.
 _GATEWAY_LOOPS = ("asyncio", "uvloop", "auto")
 
+#: The environment variable that gives the address of the web UI when no
+#: settings layer names ``gateway.public_url``. A hosted platform can set it
+#: for each agent.
+PUBLIC_URL_ENV = "NERVE_PUBLIC_ORIGIN"
+# The refused addresses that this process logged already, each with where it
+# came from: a config is built again at every reload.
+_refused_public_urls: set[tuple[str, str]] = set()
+# A scheme, a host and an optional port, in ASCII. The host is a name of
+# letters, digits, ``-``, ``.`` and ``_``, an IPv4 address or a bracketed IPv6
+# address. Nothing else is in the address, so it goes into a message's markup
+# as it is.
+_PUBLIC_URL_RE = re.compile(
+    r"https?://"
+    r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
+    r"(?::(?P<port>[0-9]{1,5}))?",
+    re.IGNORECASE,
+)
+
+
+def _public_url(value: Any, source: str) -> str:
+    """``value`` as the address of the web UI, or ``""`` when it is not one.
+
+    The address is ``http://`` or ``https://``, a host and an optional port; a
+    ``/`` at its end is dropped. The web UI is served at the root of its
+    address, so an address with a path cannot open a page and is refused,
+    like one with credentials, a query or a fragment. A refused value gives
+    ``""`` and one warning that names ``source``, the setting or the variable
+    that the value came from: a wrong address costs the links in messages and
+    must not stop the gateway. A value that still holds a ``${VAR}`` reference
+    gives ``""`` without a warning, because the loader reports the reference.
+    """
+    url = "" if value is None else str(value).strip()
+    if not url or "${" in url:
+        return ""
+    address = url.rstrip("/")
+    match = _PUBLIC_URL_RE.fullmatch(address)
+    if match and (match["port"] is None or 0 < int(match["port"]) <= 65535):
+        return address
+    refused = (source, url)
+    if refused not in _refused_public_urls:
+        _refused_public_urls.add(refused)
+        logger.warning(
+            "%s must be the address of the web UI: http:// or https://, a host "
+            "name or an IP address, an optional port, and nothing after it; "
+            "messages get no links to the web UI",
+            source,
+        )
+    return ""
+
 
 @dataclass
 class GatewayConfig:
     host: str = "0.0.0.0"
     port: int = 8900
     ssl: SSLConfig = field(default_factory=SSLConfig)
+    # The address at which people open the web UI, for example
+    # ``https://nerve.example.com``. Nerve cannot tell it from the bind address
+    # (a reverse proxy, a tunnel or a host name can stand in front), so links
+    # to the web UI in messages that leave it, such as the session link of a
+    # Telegram or Slack notification, are built from this value. Empty means
+    # that those messages carry no links. Read at every use, so a reload
+    # applies it.
+    public_url: str = ""
     # The stdlib loop is the default on purpose. uvloop spawns subprocesses with a
     # full ``fork()``, which copies the parent's page tables: at the ~100 GB RSS a
     # memU-loaded gateway reaches, every spawn — each agent CLI session, each
@@ -947,12 +1004,21 @@ class GatewayConfig:
             raise ValueError(
                 f"gateway.loop must be one of {_GATEWAY_LOOPS}, got {loop!r}"
             )
+        # A blank value is unset, as for the path settings: the environment's
+        # address then applies. A value that is refused does not fall back to
+        # it.
+        named = _setting_str(d.get("public_url"))
+        public_url = (
+            _public_url(named, "gateway.public_url") if named
+            else _public_url(os.environ.get(PUBLIC_URL_ENV), PUBLIC_URL_ENV)
+        )
         return cls(
             host=d.get("host", "0.0.0.0"),
             port=d.get("port", 8900),
             ssl=SSLConfig.from_dict(d.get("ssl", {})),
             loop=loop,
             drain_timeout_seconds=d.get("drain_timeout_seconds", 0),
+            public_url=public_url,
         )
 
 

@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from nerve.identity import actor_id_of, attribution_for
+from nerve.links import link_stays_whole, markdown_link, session_url, without_code
 from nerve.notifications import handlers as _handlers
 from nerve.notifications import webpush
 from nerve.notifications.date_render import render_iso_dates
@@ -45,6 +46,25 @@ _APPROVAL_EMOJIS: dict[str, str] = {
 
 # Telegram caps an inline button's callback_data at 64 bytes.
 _CALLBACK_DATA_MAX_BYTES = 64
+
+# An http or https address that Telegram makes a link of: its host has a dot
+# or is an IPv6 address.
+_OWN_ADDRESS_RE = re.compile(
+    r"https?://(?:\[[0-9A-Fa-f:.]+\]|[^\s/?#\[\]]*[^\s/?#\[\].]\.[^\s/?#\[\].])",
+    re.IGNORECASE,
+)
+
+
+
+def _at_address(text: str, start: int, address: str) -> bool:
+    """Whether the address that begins at ``start`` in ``text`` is under
+    ``address``, a scheme with a host and an optional port: the same up to
+    there, and then no more of a host or a port."""
+    end = start + len(address)
+    if text[start:end].lower() != address.lower():
+        return False
+    return end == len(text) or not (text[end].isalnum() or text[end] in "._:-")
+
 
 # The line that a Telegram or Slack card gets when its question or approval
 # closes without an answer.
@@ -1288,7 +1308,31 @@ class NotificationService:
             return None
         return channel._app.bot
 
-    def _build_notification_text(
+    async def _session_link(self, session_id: str) -> str | None:
+        """A Markdown link to the page of a session in the web UI, or ``None``.
+
+        There is a link with ``gateway.public_url`` and a stored session: an
+        ID such as ``system`` names no session. The link text is the
+        session's title, or its ID while it has no title.
+        """
+        url = session_url(self.config, session_id)
+        if not url:
+            return None
+        try:
+            session = await self.db.get_session(session_id)
+        except Exception as exc:
+            # The link is a convenience: a failed lookup must not cost the
+            # delivery of the notification.
+            logger.warning(
+                "Session lookup for the link of %s failed: %s", session_id, exc,
+            )
+            return None
+        if not session:
+            return None
+        label = (session.get("title") or "").strip() or session_id
+        return markdown_link(label, url)
+
+    async def _build_notification_text(
         self, session_id: str, title: str, body: str, priority: str,
     ) -> str:
         """Compose the chat message text for a notification.
@@ -1297,6 +1341,13 @@ class NotificationService:
         delivery, the re-delivery tick, and the expiry edit (which rebuilds
         the original text to append a status line). Markdown is converted
         per channel at send time.
+
+        The last line names the session that raised the notification, unless
+        the label is switched off for it (``show_session_label``). It is a
+        link to the session in the web UI when there is one
+        (:meth:`_session_link`) and the text before it leaves the link whole
+        (:func:`nerve.links.link_stays_whole`). Otherwise it names the session
+        by its ID.
         """
         priority_prefix = self.config.notifications.priority_prefixes.get(priority, "")
         if title:
@@ -1306,8 +1357,30 @@ class NotificationService:
         else:
             text = body or ""
         if self._should_show_session_label(session_id):
-            text += f"\n\nSession: {session_id}"
+            text += "\n\nSession: "
+            link = await self._session_link(session_id)
+            text += link if link and link_stays_whole(text, link) else session_id
         return text
+
+    def _telegram_link_preview(self, session_id: str, title: str, body: str, text: str):
+        """The link preview options of a Telegram message with this ``text``.
+
+        Telegram shows a preview of the first address in a message. Where
+        that would be a page of the web UI, the preview is a card of the web
+        UI's own page under every notification, so it is switched off. A
+        message keeps Telegram's default when the first ``http://`` or
+        ``https://`` address in its title or body leads somewhere else, and
+        when it has no session link. An address inside code is none: Telegram
+        makes no link of it, and the session link would be the first.
+        """
+        url = session_url(self.config, session_id)
+        if not url or f"]({url})" not in text:
+            return None
+        own = _OWN_ADDRESS_RE.search(without_code(f"{title}\n{body}"))
+        if own and not _at_address(own.string, own.start(), self.config.gateway.public_url):
+            return None
+        from telegram import LinkPreviewOptions
+        return LinkPreviewOptions(is_disabled=True)
 
     async def _deliver_telegram(
         self,
@@ -1337,7 +1410,8 @@ class NotificationService:
         if not chat_id:
             return None
 
-        text = self._build_notification_text(session_id, title, body, priority)
+        text = await self._build_notification_text(session_id, title, body, priority)
+        link_preview = self._telegram_link_preview(session_id, title, body, text)
 
         if notif_type in ("question", "approval") and options:
             button_labels: list[str | tuple[str, str]] = []
@@ -1354,6 +1428,7 @@ class NotificationService:
                     button_labels.append(value)
             msg_id = await self._send_telegram_inline(
                 chat_id, notification_id, text, button_labels, silent=silent,
+                link_preview=link_preview,
             )
         else:
             markup = None
@@ -1365,6 +1440,7 @@ class NotificationService:
                 )
             msg = await self._send_telegram_html(
                 bot, chat_id, text, reply_markup=markup, silent=silent,
+                link_preview=link_preview,
             )
             msg_id = str(msg.message_id)
 
@@ -1393,11 +1469,18 @@ class NotificationService:
         *,
         reply_markup: object | None = None,
         silent: bool = False,
+        link_preview: object | None = None,
     ) -> object:
-        """Send a message with markdown→HTML conversion and plain-text fallback."""
+        """Send a message with markdown→HTML conversion and plain-text fallback.
+
+        ``link_preview`` is Telegram's ``link_preview_options`` for the
+        message (:meth:`_telegram_link_preview`); ``None`` leaves Telegram's
+        default.
+        """
         from nerve.channels.telegram import _md_to_tg_html
         from telegram.constants import ParseMode
 
+        preview = {"link_preview_options": link_preview} if link_preview is not None else {}
         html_text = _md_to_tg_html(text)
         try:
             return await bot.send_message(
@@ -1405,12 +1488,14 @@ class NotificationService:
                 parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup,
                 disable_notification=silent,
+                **preview,
             )
         except Exception:
             return await bot.send_message(
                 chat_id=chat_id, text=text,
                 reply_markup=reply_markup,
                 disable_notification=silent,
+                **preview,
             )
 
     async def _send_telegram_inline(
@@ -1420,6 +1505,7 @@ class NotificationService:
         text: str,
         options: list[str | tuple[str, str]],
         silent: bool = False,
+        link_preview: object | None = None,
     ) -> str | None:
         """Send Telegram message with inline keyboard buttons.
 
@@ -1456,6 +1542,7 @@ class NotificationService:
 
         msg = await self._send_telegram_html(
             bot, chat_id, text, reply_markup=keyboard, silent=silent,
+            link_preview=link_preview,
         )
 
         await self.db.update_notification(
@@ -1524,7 +1611,7 @@ class NotificationService:
                 )
             return None
 
-        text = self._build_notification_text(session_id, title, body, priority)
+        text = await self._build_notification_text(session_id, title, body, priority)
 
         button_options: list[tuple[str, str]] = []
         if notif_type in ("question", "approval") and options:
@@ -1573,7 +1660,7 @@ class NotificationService:
         if not delivery or not delivery.get("message_id"):
             return
 
-        text = self._build_notification_text(
+        text = await self._build_notification_text(
             notif["session_id"],
             notif.get("title") or "",
             notif.get("body") or "",
@@ -1870,12 +1957,14 @@ class NotificationService:
         if not chat_id:
             return
 
-        text = self._build_notification_text(
-            notif["session_id"],
-            notif.get("title") or "",
-            notif.get("body") or "",
-            notif.get("priority") or "normal",
+        title = notif.get("title") or ""
+        body = notif.get("body") or ""
+        text = await self._build_notification_text(
+            notif["session_id"], title, body, notif.get("priority") or "normal",
         )
+        # An edit sets the preview again, so it gets the choice of the delivery.
+        link_preview = self._telegram_link_preview(notif["session_id"], title, body, text)
+        preview = {"link_preview_options": link_preview} if link_preview is not None else {}
         text += f"\n\n{status_line}"
 
         from nerve.channels.telegram import _md_to_tg_html
@@ -1885,12 +1974,14 @@ class NotificationService:
             await bot.edit_message_text(
                 chat_id=int(chat_id), message_id=int(message_id),
                 text=_md_to_tg_html(text), parse_mode=ParseMode.HTML,
+                **preview,
             )
         except Exception:
             try:
                 await bot.edit_message_text(
                     chat_id=int(chat_id), message_id=int(message_id),
                     text=text,
+                    **preview,
                 )
             except Exception as exc:
                 logger.debug(

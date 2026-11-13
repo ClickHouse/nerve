@@ -1675,7 +1675,10 @@ class SlackChannel(BaseChannel):
         if not target:
             return None
         blocks = build_notification_blocks(text, notification_id, options)
-        message_id = await self._post(target, text, blocks)
+        # Beside blocks, the text is what Slack shows in a toast and a push
+        # notification, where it reads mrkdwn: a Markdown link would show
+        # there with its brackets and its address.
+        message_id = await self._post(target, _md_to_slack(text), blocks)
         if not message_id:
             return None
         self._cache_message(message_id, target, text)
