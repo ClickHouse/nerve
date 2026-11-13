@@ -77,7 +77,11 @@ dependencies = [
     "xmemory-ai>=0.10.0",
     # Optional observability stack — only active when langfuse keys are
     # configured. All three are pure-Python wheels.
-    "langfuse>=4.17.0",
+    # langfuse 5 writes metadata span attributes as JSON text, and the span
+    # redaction in nerve/observability/langfuse.py is written for that shape.
+    # 5.0.1 is the first 5.x release. A self-hosted Langfuse server must be
+    # v4.59.0 or later (docs/observability.md).
+    "langfuse>=5.0.1",
     "langsmith[claude-agent-sdk]>=0.4.0",
     "opentelemetry-instrumentation-anthropic>=0.40.0",
 ]

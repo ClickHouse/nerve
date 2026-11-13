@@ -7,7 +7,7 @@ public function is a no-op and Nerve runs identically.
 
 Implementation notes
 --------------------
-- Built on the Langfuse Python SDK (>= 4.17), which itself wraps
+- Built on the Langfuse Python SDK (>= 5.0.1), which itself wraps
   OpenTelemetry.
 - The keys go only to the ``Langfuse`` client constructor. Nerve does not
   write them to ``os.environ``, so child processes (the Claude CLI, the
@@ -356,7 +356,7 @@ def _mask_otel_spans(*, params: Any) -> Any:
 def _install_redaction(client: Any) -> None:
     """Install masking ahead of the client's media-processing exporter.
 
-    Requires the Langfuse 4.17 / OpenTelemetry 1.45 exporter layout. The
+    Requires the Langfuse 5 / OpenTelemetry 1.45 exporter layout. The
     client's span filter stays closed until this setup succeeds.
     """
     from langfuse._client.span_exporter import LangfuseTransformingSpanExporter
