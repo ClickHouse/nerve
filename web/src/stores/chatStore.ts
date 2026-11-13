@@ -23,7 +23,7 @@ import { onViewerStorageChange } from './helpers/viewerStorage';
 import { registerSessionsLoader, reloadSessionsSoon } from './helpers/sessionsReload';
 // Handlers
 import { discardStreamDeltas, flushStreamDeltas, handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
-import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate, exitStreaming } from './handlers/sessionHandlers';
+import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionNotFound, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate, emptyChatView, exitStreaming } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleWorkflowProgress } from './handlers/panelHandlers';
 import { handleInteraction, handleInteractionResolved, handlePlanSummary, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired, handleNotificationDismissed } from './handlers/auxiliaryHandlers';
 
@@ -168,7 +168,7 @@ function chatNote(state: ChatState, sessionId: string, text: string): Partial<Ch
 // session_agents, …) stay unguarded so background sessions keep updating their row.
 const VIEW_SCOPED_EVENTS = new Set<WSMessage['type']>([
   'thinking', 'token', 'tool_use', 'tool_result', 'tool_output', 'done', 'stopped', 'error',
-  'wakeup', 'auto_turn', 'model_changed', 'session_status', 'plan_update', 'plan_summary',
+  'wakeup', 'auto_turn', 'model_changed', 'session_status', 'session_not_found', 'plan_update', 'plan_summary',
   'backend_status', 'workflow_progress',
   'agent_update', 'agent_event', 'queue_update', 'interaction',
   'interaction_resolved', 'file_changed',
@@ -207,6 +207,11 @@ interface ChatState {
   // Not-yet-persisted "new chat" from the + button. Materializes in the API
   // on the first sent message; rendered pinned at the top of the sidebar.
   virtualSession: Session | null;
+  // The session on screen when the server does not have it: a link that
+  // outlived its session, or a session deleted in another tab. The chat page
+  // says so in place of the messages and the composer. It counts only while
+  // it equals activeSession, and a session_status for it clears it.
+  missingSession: string | null;
   // Per-session unsent input text, keyed by session id (incl. the virtual one).
   drafts: Record<string, string>;
   // Per-session "last seen" moment (ms) + a one-time baseline. A session is
@@ -352,6 +357,11 @@ interface ChatState {
    * one runs makes that one read the messages again.
    */
   catchUp: () => Promise<void>;
+  /**
+   * Open the unsent new chat, or make one. When the session on screen does
+   * not exist (`missingSession`), what was typed for it moves into the new
+   * chat, after the text that the unsent chat holds already.
+   */
   createSession: () => Promise<void>;
   /**
    * Materialize the virtual "new chat" in the API and adopt the server-minted
@@ -518,6 +528,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   // so losing the id on reload orphaned the draft. Restoring it brings the
   // half-written prompt back with the chat.
   virtualSession: restoreVirtualSession(),
+  missingSession: null,
   // Rehydrated from localStorage so unsent composer text survives a reload.
   drafts: loadDrafts(),
   // Read/unread tracking (client-only): per-session last-seen stamps + the
@@ -904,16 +915,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     if (id === get().activeSession && get().messages.length > 0) return;
     discardStreamDeltas();
     tabFocus.clear();
-    set({
-      activeSession: id, messages: [], loading: true, streamingBlocks: [],
-      isStreaming: false, agentStatus: { state: 'idle' }, contextUsage: null,
-      backendStatus: null,
-      currentTodos: [], currentCCTasks: [], pendingInteraction: null,
-      planSummaries: {}, planEditRequest: null,
-      panels: [], activePanelId: null, panelVisible: false,
-      modifiedFiles: [], modifiedFilesCount: 0,
-      sessionTasks: null, sessionTasksFailed: false,
-    });
+    set({ ...emptyChatView(), activeSession: id, missingSession: null, loading: true });
     // The agent roster follows the view (it unsubscribes the old transcripts).
     useAgentStore.getState().reset(id);
     // A virtual chat isn't known to the server (it's created on first send),
@@ -1008,8 +1010,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // the server id. Reuse an existing unsent one rather than stacking empty
     // chats. The temp id is a full UUID so it never collides with a real
     // server id (uuid4()[:8]) and is never sent to the backend.
+    //
+    // What was typed for a session that does not exist has no chat to wait
+    // in: it moves into the new chat. The composer reads a chat's draft when
+    // the chat opens, so the text goes into the draft before the switch.
+    const from = get().activeSession;
+    const typed = from && get().missingSession === from ? (get().drafts[from] ?? '') : '';
+    const moveTyped = (to: string) => {
+      if (!typed.trim() || to === from) return;
+      const own = get().drafts[to] ?? '';
+      get().setDraft(to, own.trim() ? `${own}\n\n${typed}` : typed);
+      get().setDraft(from, '');
+    };
     const existing = get().virtualSession;
     if (existing) {
+      moveTyped(existing.id);
       if (get().activeSession !== existing.id) await get().switchSession(existing.id);
       return;
     }
@@ -1024,6 +1039,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // remembers.
     persistVirtualSession(id, now);
     set({ virtualSession: virtual });
+    moveTyped(id);
     await get().switchSession(id);
   },
 
@@ -1736,6 +1752,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'session_updated':  return handleSessionUpdated(msg, get, set);
       case 'session_status':   return handleSessionStatus(msg, get, set);
       case 'session_switched': return handleSessionSwitched(msg, get, set);
+      case 'session_not_found':
+        // The composer goes out of sight with the notice: what it holds is
+        // written to the session's draft first, for the new chat to take.
+        flushComposer?.();
+        return handleSessionNotFound(msg, get, set);
       case 'session_forked':   return handleSessionForked(msg, get, set);
       case 'session_resumed':  return handleSessionResumed(msg, get, set);
       case 'session_archived': return handleSessionArchived(msg, get, set);
@@ -1864,6 +1885,8 @@ let socketOpenedBefore = false;
 if (typeof ws.onOpen === 'function') {
   ws.onOpen(() => {
     const s = useChatStore.getState();
+    // A session that the server did not have is named again too: it can
+    // exist by now, and the answer says which.
     if (s.activeSession && s.activeSession !== s.virtualSession?.id) {
       ws.switchSession(s.activeSession);
       useAgentStore.getState().resubscribeAll();

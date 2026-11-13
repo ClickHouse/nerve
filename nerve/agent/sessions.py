@@ -93,6 +93,11 @@ class SessionBusyError(RuntimeError):
     ``force=True`` to archive anyway)."""
 
 
+class SessionNotFoundError(ValueError):
+    """A switch names a session that does not exist. A ``ValueError``, which
+    is what the switch raised before the error had a name."""
+
+
 class SessionManager:
     """Manages agent sessions with full lifecycle tracking.
 
@@ -460,7 +465,7 @@ class SessionManager:
         """Switch the active session for a channel (persisted to DB)."""
         session = await self.db.get_session(session_id)
         if not session:
-            raise ValueError(f"Session not found: {session_id}")
+            raise SessionNotFoundError(f"Session not found: {session_id}")
         await self.db.set_channel_session(channel_key, session_id)
         # An explicit switch is a deliberate choice: the next inbound message must
         # route to this session regardless of how long it has been idle. Mark it

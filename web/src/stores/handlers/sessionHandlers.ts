@@ -6,11 +6,27 @@ import { reloadSessionsSoon } from '../helpers/sessionsReload';
 import { useAgentStore } from '../agentStore';
 import type { ChatState } from '../chatStore';
 import { planOpensPanel } from './panelHandlers';
-import { finalizeRunningPanels } from './streamingHandlers';
+import { discardStreamDeltas, finalizeRunningPanels } from './streamingHandlers';
 import type { Get, Set } from './types';
 
 /** Tabs the person opened that a replayed buffer knows nothing about. */
 const KEPT_ON_REPLAY: ReadonlySet<PanelTab['type']> = new Set(['agents', 'agent', 'files', 'tasks']);
+
+/**
+ * The view of a chat with nothing of a session in it: what opening a session
+ * starts from, and what is left of a session that the server does not have.
+ */
+export function emptyChatView(): Partial<ChatState> {
+  return {
+    messages: [], streamingBlocks: [], isStreaming: false,
+    agentStatus: { state: 'idle' }, contextUsage: null, backendStatus: null,
+    currentTodos: [], currentCCTasks: [], pendingInteraction: null,
+    planSummaries: {}, planEditRequest: null,
+    panels: [], activePanelId: null, panelVisible: false,
+    modifiedFiles: [], modifiedFilesCount: 0,
+    sessionTasks: null, sessionTasksFailed: false,
+  };
+}
 
 /**
  * Leave streaming mode: running tool calls complete and the streamed blocks
@@ -104,6 +120,9 @@ export function handleSessionStatus(
   get: Get,
   set: Set,
 ): void {
+  // The server bound the socket to this session, so it has it: a session
+  // that was missing a connect ago exists now.
+  if (get().missingSession === msg.session_id) set({ missingSession: null });
   // The roster snapshot rides on every bind and switch, idle sessions included.
   if (msg.agents) {
     useAgentStore.getState().hydrate(msg.agents);
@@ -273,6 +292,22 @@ export function handleSessionSwitched(
   get().switchSession(msg.session_id);
 }
 
+export function handleSessionNotFound(
+  msg: Extract<WSMessage, { type: 'session_not_found' }>,
+  get: Get,
+  set: Set,
+): void {
+  // The server does not have the session on screen. The dispatcher drops the
+  // answer for another session; an answer that names none is for no view.
+  if (!msg.session_id || msg.session_id !== get().activeSession) return;
+  // The chat page shows that in place of the chat. A tab can learn it at a
+  // reconnect, with the session's messages, panels and task lists still in
+  // the view: nothing of them stays.
+  discardStreamDeltas();
+  set({ ...emptyChatView(), missingSession: msg.session_id, loading: false });
+  useAgentStore.getState().reset(msg.session_id);
+}
+
 export function handleSessionForked(
   _msg: Extract<WSMessage, { type: 'session_forked' }>,
   get: Get,
@@ -312,6 +347,10 @@ export function handleSessionRunning(
   get: Get,
   set: Set,
 ): void {
+  // The session on screen that the server did not have runs or ran: it
+  // exists now. Its row takes the event as any row does, and then the
+  // session is opened again (below), which asks the server and loads it.
+  const reopen = msg.session_id === get().activeSession && get().missingSession === msg.session_id;
   // Global broadcast: a session started or stopped running. The event also
   // carries the session's pending work (scheduled wake-up / live background
   // task), so a session that only *looks* idle keeps its parked indicator
@@ -341,6 +380,7 @@ export function handleSessionRunning(
     // so the response is visible and input is disabled.
     // Guard: sendMessage() already sets isStreaming before the WS message,
     // so this only fires for server-initiated runs.
+    if (reopen) return updates;
     if (msg.session_id === s.activeSession && msg.is_running && !s.isStreaming) {
       updates.isStreaming = true;
       updates.streamingBlocks = [];
@@ -361,6 +401,14 @@ export function handleSessionRunning(
     }
     return updates;
   });
+
+  if (reopen) {
+    // The view gets its state from the session's status after the switch. A
+    // row that no list has yet comes with the next read of the lists.
+    void get().switchSession(msg.session_id);
+    reloadSessionsSoon();
+    return;
+  }
 
   // A backgrounded feed session that just STOPPED may have produced new content;
   // its updated_at only refreshes via loadSessions() (session_running carries

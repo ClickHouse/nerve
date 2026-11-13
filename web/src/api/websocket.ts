@@ -19,6 +19,9 @@ export type WSMessage =
   // client_msg_id: the refused message, when the error refuses a message (Nerve is shutting down).
   | { type: 'error'; session_id: string; error: string; client_msg_id?: string | null }
   | { type: 'session_switched'; session_id: string }
+  // The answer to a switch that names a session the server does not have: a
+  // link that outlived its session, or a session deleted in another tab.
+  | { type: 'session_not_found'; session_id: string }
   | { type: 'session_updated'; session_id: string; title: string }
   // `agents` is the roster snapshot, sent on every bind and switch (also when
   // the session is idle); `buffered_events` only while a turn runs.

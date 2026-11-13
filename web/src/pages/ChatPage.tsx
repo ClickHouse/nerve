@@ -107,6 +107,9 @@ function ChatPageView() {
     openTasksPanel: s.openTasksPanel,
   })));
   const hasPanels = useChatStore(s => s.panels.length > 0);
+  // The server does not have the session of this address: a link that
+  // outlived its session, or a session deleted in another tab.
+  const sessionMissing = useChatStore(s => !!s.activeSession && s.missingSession === s.activeSession);
   const filesPanelActive = useChatStore(s => s.panels.some(p => p.id === 'files-panel'));
   const tasksPanelActive = useChatStore(s => s.panels.some(p => p.id === TASKS_PANEL_ID));
 
@@ -307,11 +310,12 @@ function ChatPageView() {
         if (sessionId !== activeSession || messages.length === 0) {
           switchSession(sessionId);
         }
-      } else if (!activeSession) {
-        // No URL param and no active session yet. A restored unsent chat wins
-        // over the most recent real one: it only survives a reload when it
-        // still holds draft text, and dropping the user somewhere else would
-        // hide the very prompt they were writing. A suggested first message
+      } else if (!activeSession || useChatStore.getState().missingSession === useChatStore.getState().activeSession) {
+        // No URL param, and no active session yet or one that the server does
+        // not have. A restored unsent chat wins over the most recent real
+        // one: it only survives a reload when it still holds draft text, and
+        // dropping the user somewhere else would hide the very prompt they
+        // were writing. A suggested first message
         // (from setup) opens a fresh chat rather than landing in an old one.
         const { sessions: loaded, virtualSession } = useChatStore.getState();
         if (suggestedMessage && !virtualSession) {
@@ -369,11 +373,14 @@ function ChatPageView() {
             <div className="flex items-center gap-2 min-w-0">
               <PaneToggle open={sessionListOpen} onToggle={toggleSessionList} label="sidebar" />
               <span className="font-medium text-base truncate">
-                {virtualSession?.id === activeSession
-                  ? 'New chat'
-                  : (activeSessionRow?.title || activeSession)}
+                {sessionMissing
+                  ? 'Session not found'
+                  : virtualSession?.id === activeSession
+                    ? 'New chat'
+                    : (activeSessionRow?.title || activeSession)}
               </span>
-              {(() => {
+              {/* A session that does not exist has no backend to name. */}
+              {!sessionMissing && (() => {
                 const backend = virtualSession?.id === activeSession
                   ? (newChatBackend ?? backendDefault ?? 'claude')
                   : (activeSessionRow?.backend ?? 'claude');
@@ -507,7 +514,7 @@ function ChatPageView() {
                   sessionCostUsd={activeSessionRow?.total_cost_usd}
                 />
               )}
-              {langfuseUrl && (
+              {langfuseUrl && !sessionMissing && (
                 <a
                   href={langfuseUrl}
                   target="_blank"
@@ -566,6 +573,17 @@ function ChatPageView() {
           <div className="relative flex-1 flex flex-col min-h-0">
             {loading ? (
               <div className="flex-1 flex items-center justify-center text-text-faint">Loading...</div>
+            ) : sessionMissing ? (
+              <div role="status" className="flex-1 flex flex-col items-center justify-center gap-2 text-center px-6">
+                <p className="text-text-faint text-lg">This session does not exist</p>
+                <p className="text-sm text-text-muted max-w-md">
+                  It was deleted, or it was a new chat that was never sent. Open another session
+                  from the list, or start a new chat.
+                </p>
+                <Button variant="secondary" size="sm" onClick={() => void handleCreateSession()}>
+                  New chat
+                </Button>
+              </div>
             ) : (
               <MessageList
                 messages={messages}
@@ -592,12 +610,17 @@ function ChatPageView() {
               Send for Queue next to the split Stop, and a message sent then
               waits in the server's queue and runs next. Agents running in the
               background never put it in that state. */}
-          <ChatInput
-            onSend={sendMessage}
-            onStop={stopSession}
-            isStreaming={isStreaming}
-            seed={suggestedMessage}
-          />
+          {/* No composer in sight for a session that does not exist: a message
+              for it has nowhere to go. It stays mounted, so that what it holds
+              is not lost and it does not start over when it comes back. */}
+          <div className={sessionMissing ? 'hidden' : 'contents'}>
+            <ChatInput
+              onSend={sendMessage}
+              onStop={stopSession}
+              isStreaming={isStreaming}
+              seed={suggestedMessage}
+            />
+          </div>
 
           {/* Portals: the stop confirmations. */}
           <StopAllDialog />
