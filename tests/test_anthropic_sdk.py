@@ -1,0 +1,441 @@
+"""Nerve's Anthropic SDK clients against a stand-in Messages API.
+
+The stand-in records each request. The tests check what the SDK sends for
+Nerve's own model calls: API version 2026-10-21, the API key as
+``Authorization: Bearer``, no sampling parameters and no trace context. With
+Langfuse on, ``AnthropicInstrumentor`` makes the one span of each call, also
+for the Bedrock clients.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
+
+from nerve import setup_checks
+from nerve.config import NerveConfig
+
+API_VERSION = "2026-10-21"
+_KEY = "sk-ant-test-key-not-real"
+_OK = {
+    "id": "msg_test", "type": "message", "role": "assistant",
+    "model": "claude-test", "content": [{"type": "text", "text": "ok"}],
+    "stop_reason": "end_turn", "stop_sequence": None,
+    "usage": {"input_tokens": 3, "output_tokens": 1},
+}
+
+
+class _StandIn:
+    """A local HTTP server for ``POST /v1/messages`` and Bedrock's
+    ``POST /model/<id>/invoke``. It records each request and answers with
+    ``reply`` (status, JSON body)."""
+
+    def __init__(self) -> None:
+        self.requests: list[dict] = []
+        self.reply: tuple[int, dict] = (200, _OK)
+        stand_in = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args: object) -> None:
+                pass
+
+            def do_POST(self) -> None:  # noqa: N802 - http.server naming
+                raw = self.rfile.read(int(self.headers.get("content-length") or 0))
+                stand_in.requests.append({
+                    "path": self.path,
+                    "headers": {k.lower(): v for k, v in self.headers.items()},
+                    "header_lines": [(k.lower(), v) for k, v in self.headers.items()],
+                    "body": json.loads(raw or b"{}"),
+                })
+                status, body = stand_in.reply
+                data = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self._server.server_address[1]
+        self.url = f"http://127.0.0.1:{self.port}"
+        threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True,
+        ).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
+@pytest.fixture
+def stand_in(monkeypatch):
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy",
+                 "https_proxy", "all_proxy", "ANTHROPIC_CUSTOM_HEADERS"):
+        monkeypatch.delenv(name, raising=False)
+    server = _StandIn()
+    # The Bedrock clients send their requests here.
+    monkeypatch.setenv("ANTHROPIC_BEDROCK_BASE_URL", server.url)
+    try:
+        yield server
+    finally:
+        server.close()
+
+
+@pytest.fixture
+def spans(monkeypatch):
+    """A recording tracer provider as the global one, for this test only."""
+    from opentelemetry import trace
+    from opentelemetry.sdk.trace import TracerProvider
+    from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    exporter = InMemorySpanExporter()
+    provider = TracerProvider()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(trace, "_TRACER_PROVIDER", provider)
+    yield exporter
+    provider.shutdown()
+
+
+@pytest.fixture
+def instrumented(spans):
+    """``AnthropicInstrumentor``, as Langfuse installs it, on the recording provider."""
+    from opentelemetry import trace
+    from opentelemetry.instrumentation.anthropic import AnthropicInstrumentor
+
+    instrumentor = AnthropicInstrumentor()
+    if instrumentor.is_instrumented_by_opentelemetry:
+        instrumentor.uninstrument()
+    instrumentor.instrument(tracer_provider=trace.get_tracer_provider())
+    try:
+        yield spans
+    finally:
+        instrumentor.uninstrument()
+
+
+def _api_config(url: str) -> NerveConfig:
+    return NerveConfig.from_dict({"anthropic_api_key": _KEY, "anthropic_base_url": url})
+
+
+def _proxy_config(port: int) -> NerveConfig:
+    return NerveConfig.from_dict({
+        "proxy": {"enabled": True, "port": port, "api_key": "sk-local-proxy-key"},
+    })
+
+
+def _bedrock_config() -> NerveConfig:
+    return NerveConfig.from_dict({"provider": {
+        "type": "bedrock", "aws_region": "us-east-1",
+        "aws_access_key_id": "test", "aws_secret_access_key": "test",
+    }})
+
+
+def _credentials(request: dict) -> list[tuple[str, str]]:
+    """Each ``Authorization`` and ``X-Api-Key`` line of a recorded request."""
+    return [(k, v) for k, v in request["header_lines"] if k in ("authorization", "x-api-key")]
+
+
+def _call(config: NerveConfig, *, use_async: bool, model: str = "claude-haiku-5-5") -> None:
+    """One ``messages.create`` through Nerve's sync or async client factory."""
+    kwargs = {"model": model, "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]}
+    if use_async:
+        async def run() -> None:
+            async with config.create_async_anthropic_client(max_retries=0) as client:
+                await client.messages.create(**kwargs)
+        asyncio.run(run())
+    else:
+        config.create_anthropic_client(max_retries=0).messages.create(**kwargs)
+
+
+# --------------------------------------------------------------------------- #
+#  What a request carries                                                      #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+@pytest.mark.parametrize("route", ["api_key", "proxy"])
+def test_the_key_goes_out_as_a_bearer_token(stand_in, route, use_async):
+    """The API key, or the proxy's local key, is in ``Authorization``. A
+    proxy or gateway at the base URL must read it there."""
+    if route == "api_key":
+        config, key = _api_config(stand_in.url), _KEY
+    else:
+        config, key = _proxy_config(stand_in.port), "sk-local-proxy-key"
+
+    _call(config, use_async=use_async)
+
+    (request,) = stand_in.requests
+    assert request["path"] == "/v1/messages"
+    assert _credentials(request) == [("authorization", f"Bearer {key}")]
+    assert request["headers"]["anthropic-version"] == API_VERSION
+
+
+# --------------------------------------------------------------------------- #
+#  One credential for each request                                             #
+# --------------------------------------------------------------------------- #
+
+
+def _route_config(route: str, url: str, port: int) -> tuple[NerveConfig, str]:
+    if route == "api_key":
+        return _api_config(url), _KEY
+    return _proxy_config(port), "sk-local-proxy-key"
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+@pytest.mark.parametrize("route", ["api_key", "proxy"])
+@pytest.mark.parametrize("line", ["X-Api-Key: gateway-key", "x-api-key: gateway-key"])
+def test_an_inherited_x_api_key_line_is_the_only_credential(
+    stand_in, monkeypatch, route, use_async, line,
+):
+    """``ANTHROPIC_CUSTOM_HEADERS`` names ``X-Api-Key``: the SDK sends that
+    line, and the configured key does not go out in ``Authorization``."""
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", f"X-Proxy-Tag: blue\n{line}")
+    config, _ = _route_config(route, stand_in.url, stand_in.port)
+
+    _call(config, use_async=use_async)
+
+    (request,) = stand_in.requests
+    assert _credentials(request) == [("x-api-key", "gateway-key")]
+    assert request["headers"]["x-proxy-tag"] == "blue"
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+def test_an_inherited_x_api_key_line_works_without_a_configured_key(
+    stand_in, monkeypatch, use_async,
+):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Api-Key: gateway-key")
+
+    _call(NerveConfig.from_dict({"anthropic_base_url": stand_in.url}), use_async=use_async)
+
+    (request,) = stand_in.requests
+    assert _credentials(request) == [("x-api-key", "gateway-key")]
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+@pytest.mark.parametrize("route", ["api_key", "proxy"])
+def test_other_inherited_lines_keep_the_bearer_key(stand_in, monkeypatch, route, use_async):
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Proxy-Tag: blue\nX-Api-Key-Hint: none")
+    config, key = _route_config(route, stand_in.url, stand_in.port)
+
+    _call(config, use_async=use_async)
+
+    (request,) = stand_in.requests
+    assert _credentials(request) == [("authorization", f"Bearer {key}")]
+    assert request["headers"]["x-proxy-tag"] == "blue"
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+@pytest.mark.parametrize("route", ["api_key", "proxy"])
+@pytest.mark.parametrize("lines", [
+    "Authorization: Bearer gateway-token\nX-Api-Key: upstream-key",
+    # Names in another case, blank lines and spaces around the name.
+    "\n  \nx-api-key: upstream-key\r\n\n  AUTHORIZATION : Bearer gateway-token\n",
+])
+def test_inherited_authorization_and_x_api_key_lines_both_go_out(
+    stand_in, monkeypatch, route, use_async, lines,
+):
+    """A gateway token in ``Authorization`` and the key for the API behind
+    the gateway in ``X-Api-Key``: both lines go out, the configured key does
+    not."""
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", lines)
+    config, _ = _route_config(route, stand_in.url, stand_in.port)
+
+    _call(config, use_async=use_async)
+
+    (request,) = stand_in.requests
+    assert sorted(_credentials(request)) == [
+        ("authorization", "Bearer gateway-token"), ("x-api-key", "upstream-key"),
+    ]
+
+
+@pytest.mark.parametrize("value, named", [
+    ("X-Api-Key: k", True),
+    ("x-api-key: k", True),
+    ("  X-API-KEY  :k", True),
+    ("\n \nX-Api-Key: k\r\n", True),
+    ("X-Api-Key:", True),
+    ("X-Api-Key-Hint: k", False),
+    ("X-Api-Key", False),
+    ("", False),
+    ("\n  \n", False),
+])
+def test_a_header_line_is_read_as_the_sdk_and_the_principal_rule_read_it(
+    stand_in, monkeypatch, value, named,
+):
+    """``has_custom_header_line`` finds a line exactly when the SDK sends a
+    header for it, and reads the variable as ``direct_client_headers`` does."""
+    import anthropic
+
+    from nerve.inference_principal import (
+        CUSTOM_HEADERS_ENV,
+        INFERENCE_PRINCIPAL_HEADER,
+        direct_client_headers,
+        has_custom_header_line,
+    )
+
+    assert has_custom_header_line("X-Api-Key", {CUSTOM_HEADERS_ENV: value}) is named
+
+    monkeypatch.setenv(CUSTOM_HEADERS_ENV, value)
+    anthropic.Anthropic(
+        api_key=_KEY, base_url=stand_in.url, max_retries=0, open_telemetry=False,
+    ).messages.create(
+        model="claude-haiku-5-5", max_tokens=5, messages=[{"role": "user", "content": "hi"}],
+    )
+    (request,) = stand_in.requests
+    assert any(name == "x-api-key" for name, _ in request["header_lines"]) is named
+
+    principal = {CUSTOM_HEADERS_ENV: value.replace("X-Api-Key", INFERENCE_PRINCIPAL_HEADER)
+                 .replace("x-api-key", INFERENCE_PRINCIPAL_HEADER.lower())
+                 .replace("X-API-KEY", INFERENCE_PRINCIPAL_HEADER.upper())}
+    omitted = any(
+        name.lower() == INFERENCE_PRINCIPAL_HEADER.lower()
+        for name in direct_client_headers(principal)
+    )
+    assert omitted is named
+    assert has_custom_header_line(INFERENCE_PRINCIPAL_HEADER, principal) is named
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+def test_an_inherited_authorization_line_replaces_the_key(stand_in, monkeypatch, use_async):
+    """The SDK merges header names in any case, so the line replaces the
+    configured key: one credential, and the key does not go out."""
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "authorization: Bearer gateway-token")
+
+    _call(_api_config(stand_in.url), use_async=use_async)
+
+    (request,) = stand_in.requests
+    assert _credentials(request) == [("authorization", "Bearer gateway-token")]
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+def test_credentials_in_the_environment_are_not_sent(stand_in, monkeypatch, use_async):
+    """The factories pass ``api_key``, so the SDK reads no credential from
+    the environment: an ``ANTHROPIC_AUTH_TOKEN`` does not go out."""
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "environment-token")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "environment-key")
+
+    _call(_api_config(stand_in.url), use_async=use_async)
+
+    (request,) = stand_in.requests
+    assert _credentials(request) == [("authorization", f"Bearer {_KEY}")]
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+def test_bedrock_ignores_an_inherited_x_api_key_line(stand_in, monkeypatch, use_async):
+    """The Bedrock clients do not read ``ANTHROPIC_CUSTOM_HEADERS``; they
+    sign each request."""
+    monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "X-Api-Key: gateway-key")
+
+    _call(_bedrock_config(), use_async=use_async, model="us.anthropic.claude-haiku-5-5")
+
+    (request,) = stand_in.requests
+    ((name, value),) = _credentials(request)
+    assert name == "authorization" and value.startswith("AWS4-HMAC-SHA256 ")
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+def test_bedrock_requests_use_the_new_api_version(stand_in, use_async):
+    _call(_bedrock_config(), use_async=use_async, model="us.anthropic.claude-haiku-5-5")
+
+    (request,) = stand_in.requests
+    assert request["path"] == "/model/us.anthropic.claude-haiku-5-5/invoke"
+    assert request["headers"]["authorization"].startswith("AWS4-HMAC-SHA256 ")
+    assert request["body"]["anthropic_version"] == API_VERSION
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", [
+    "us.anthropic.claude-haiku-5-5",
+    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123",
+])
+async def test_the_memory_bedrock_client_sends_no_temperature(stand_in, model):
+    """memU gives a temperature; the real SDK client gets none for any model."""
+    from nerve.memory.memu_bridge import MemUBridge
+
+    client = MemUBridge(_bedrock_config())._make_bedrock_client(model)
+    try:
+        text, _ = await client.chat("hello", temperature=0.3)
+    finally:
+        await client.close()
+
+    assert text == "ok"
+    (request,) = stand_in.requests
+    assert request["path"].startswith("/model/")
+    assert "temperature" not in request["body"]
+    assert request["body"]["anthropic_version"] == API_VERSION
+
+
+# --------------------------------------------------------------------------- #
+#  The key check                                                               #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [
+    # What the Claude API answered on 2026-11-13 for a key that it does not
+    # know, sent as a bearer token.
+    {"type": "error", "error": {"type": "authentication_error", "message": "invalid x-api-key"}},
+    # A body that names no header and no error type: the status decides.
+    {"error": "Invalid API key"},
+])
+@pytest.mark.parametrize("route", ["api_key", "proxy"])
+async def test_a_401_for_the_bearer_key_is_an_invalid_key(stand_in, body, route):
+    stand_in.reply = (401, body)
+    config = _api_config(stand_in.url) if route == "api_key" else _proxy_config(stand_in.port)
+
+    result = await setup_checks.provider_test(config)
+
+    assert result["code"] == "invalid_key", result
+    assert result["ok"] is False
+    assert stand_in.requests[0]["headers"]["authorization"].startswith("Bearer ")
+
+
+# --------------------------------------------------------------------------- #
+#  Spans                                                                       #
+# --------------------------------------------------------------------------- #
+
+
+def test_nerve_clients_make_no_sdk_span_and_send_no_trace_context(stand_in, spans):
+    import anthropic
+
+    # Control: a client with the SDK defaults makes its own span and sends
+    # the trace context.
+    anthropic.Anthropic(api_key=_KEY, base_url=stand_in.url, max_retries=0).messages.create(
+        model="claude-haiku-5-5", max_tokens=5, messages=[{"role": "user", "content": "hi"}],
+    )
+    assert [s.name for s in spans.get_finished_spans()] == ["anthropic.messages.create"]
+    assert "traceparent" in stand_in.requests[0]["headers"]
+    spans.clear()
+
+    for config in (_api_config(stand_in.url), _bedrock_config()):
+        for use_async in (False, True):
+            _call(config, use_async=use_async)
+
+    assert spans.get_finished_spans() == ()
+    assert len(stand_in.requests) == 5
+    assert not any("traceparent" in r["headers"] for r in stand_in.requests[1:])
+
+
+@pytest.mark.parametrize("use_async", [False, True])
+@pytest.mark.parametrize("provider", ["anthropic", "bedrock"])
+def test_the_instrumentor_wraps_each_client(stand_in, instrumented, provider, use_async):
+    """One span for each call, from ``AnthropicInstrumentor``, with the model
+    and the token counts."""
+    if provider == "anthropic":
+        config, model = _api_config(stand_in.url), "claude-haiku-5-5"
+    else:
+        config, model = _bedrock_config(), "us.anthropic.claude-haiku-5-5"
+
+    _call(config, use_async=use_async, model=model)
+
+    (span,) = instrumented.get_finished_spans()
+    assert span.instrumentation_scope.name == "opentelemetry.instrumentation.anthropic"
+    assert span.attributes["gen_ai.request.model"] == model
+    assert span.attributes["gen_ai.usage.input_tokens"] == 3
+    assert span.attributes["gen_ai.usage.output_tokens"] == 1

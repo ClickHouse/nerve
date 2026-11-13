@@ -167,7 +167,14 @@ def build_source_runners(
         else:
             from nerve.sources.github import GitHubSource
 
-            source = GitHubSource(config={"inbox": gh.inbox})
+            source = GitHubSource(
+                config={"inbox": gh.inbox},
+                # A mention stays new in a thread's record until every reader
+                # of the inbox has read a record that says so.
+                unread=lambda ids: db.unread_source_message_metadata(
+                    GitHubSource.source_name, ids,
+                ),
+            )
         gh_filter = github_inbox_filter(gh)
         gh_runner = SourceRunner(
             source=source,

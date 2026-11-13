@@ -38,9 +38,12 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
+import os
 import time
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
@@ -48,6 +51,8 @@ from typing import TYPE_CHECKING, ClassVar
 from nerve import paths
 
 if TYPE_CHECKING:
+    from nerve.config import McpServerConfig
+    from nerve.cron.jobs import CronJob
     from nerve.db import Database
 
 logger = logging.getLogger(__name__)
@@ -64,10 +69,56 @@ class GateConfigError(ValueError):
 
 @dataclass
 class GateContext:
-    """Runtime dependencies handed to a gate at evaluation time."""
+    """Runtime dependencies handed to a gate at evaluation time.
+
+    ``mcp_servers`` returns the MCP servers that new sessions get: the
+    ``mcp_servers`` config in local mode, the servers of the MCP gateway's
+    catalog in external mode (then ``mcp_managed`` is true). The cron service
+    sets it for the check before a run, never for a forecast; elsewhere it is
+    ``None``.
+
+    ``notes``, ``on_run`` and ``notices`` belong to one evaluation. A gate
+    that passes may add text to ``notes``; when every gate passes, the run's
+    prompt gets that text (:attr:`GateDecision.notes`). A gate that keeps
+    state for the run it lets through adds a callback to ``on_run`` and does
+    not write that state in its check: the cron service calls the callbacks
+    (:meth:`GateDecision.record_run`) only when the run starts, so a later gate
+    that skips the run, or a run that does not start, does not use the state
+    up. A gate whose own check fails, or works again after failures that it
+    reported, adds a :class:`GateNotice` to ``notices``: the cron service
+    sends it to the user. A gate decides itself when a notice is due; the
+    cron service sends each one.
+    """
 
     job_id: str
     db: "Database"
+    #: The jobs the scheduler has loaded, by id, disabled ones too, for a
+    #: gate whose answer depends on how the other jobs are set up. Empty when
+    #: the caller has none to give.
+    jobs: "Mapping[str, CronJob]" = field(default_factory=dict)
+    #: The time the check is made for, when that is not now (timezone-aware).
+    #: A catch-up after a pause asks about the time the run it stands in for
+    #: came due, and the catch-up at startup about its own start, so that a
+    #: gate which reads a record of what happened can leave out what was
+    #: recorded since: the message that woke the machine, above all.
+    as_of: datetime | None = None
+    mcp_servers: Callable[[], list["McpServerConfig"]] | None = None
+    mcp_managed: bool = False
+    notes: list[str] = field(default_factory=list)
+    on_run: list[Callable[[], None]] = field(default_factory=list)
+    notices: list["GateNotice"] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class GateNotice:
+    """A notice that a gate gives about its own check, not about a run.
+
+    ``failed`` is True for "the check fails" and False for "the check works
+    again". ``message`` says what happened, for example the last error.
+    """
+
+    failed: bool
+    message: str
 
 
 @dataclass
@@ -75,11 +126,30 @@ class GateDecision:
     """Outcome of evaluating a job's gates.
 
     ``reason`` is a short human-readable explanation, populated only when
-    ``should_run`` is False, for logging the skip.
+    ``should_run`` is False, for logging the skip. ``notes`` is the text that
+    the gates give to the run (:attr:`GateContext.notes`), in gate order, and
+    ``on_run`` the callbacks for the run's start; both are empty when
+    ``should_run`` is False. ``notices`` holds the notices of the gates about
+    their own checks (:attr:`GateContext.notices`), whatever the decision.
     """
 
     should_run: bool
     reason: str = ""
+    notes: list[str] = field(default_factory=list)
+    on_run: list[Callable[[], None]] = field(default_factory=list)
+    notices: list[GateNotice] = field(default_factory=list)
+
+    def record_run(self, job_id: str) -> None:
+        """Call the ``on_run`` callbacks, once, when the run starts. A
+        callback that raises is logged and does not stop the run."""
+        callbacks, self.on_run = self.on_run, []
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception as e:  # noqa: BLE001 (the run goes ahead)
+                logger.warning(
+                    "A cron gate of job %s could not record the run: %s", job_id, e,
+                )
 
 
 class CronGate(ABC):
@@ -95,6 +165,13 @@ class CronGate(ABC):
     #: "unknown" — no field checking — which is the right default for an
     #: out-of-tree gate nothing has read.
     spec_keys: ClassVar[frozenset[str]] = frozenset()
+
+    #: Whether a run that a person starts by hand ("Run now", ``nerve cron
+    #: <id>``, the trigger API) is checked too. True for a gate that says
+    #: whether the job has anything to act on: with no pending task there is
+    #: nothing to plan, whoever asks. False for a gate that only estimates
+    #: whether a run is worth it, where the person who asks may know better.
+    checked_on_manual_runs: ClassVar[bool] = True
 
     @abstractmethod
     async def is_satisfied(self, ctx: GateContext) -> bool:
@@ -337,6 +414,132 @@ class TasksGate(CronGate):
         if isinstance(tag, (list, tuple)):
             tag = [str(t) for t in tag]
         return cls(targets=targets, tag=tag, min_count=min_count)
+
+
+#: The most hours an ``agent_activity`` gate looks back before the job's
+#: last run. A year is far more than any use has, and keeps the number one
+#: that a time can be moved by.
+_MAX_OVERLAP_HOURS = 24 * 366
+
+
+class AgentActivityGate(CronGate):
+    """Satisfied when the agent has worked since the job last ran.
+
+    The motivating case: a job that looks after the agent's own work — a
+    memory check, a search for repeated workflows — has nothing to do while
+    the agent has done nothing, so it runs only after there was work.
+
+    Config::
+
+        type: agent_activity
+        ignore_jobs: [weekly-cleanup]   # jobs whose runs are not work
+        overlap_hours: 24               # also count this long before the last run
+
+    The agent has worked when, since the job's last successful run started, a
+    turn ended or a message was stored in a session
+    (:meth:`nerve.db.cron.CronStore.has_activity_since_cron_run` says exactly
+    what counts). A job that has never succeeded runs as soon as there is any
+    work at all, and a run that failed does not move the start.
+
+    Not counted:
+
+    * the job's own runs, so a run never causes the next one;
+    * the runs of the jobs in ``ignore_jobs``;
+    * the runs of every other job that has this gate. Such a job runs only
+      because the agent worked, so its run is not work of its own: if two of
+      them counted each other's runs, each run of one would start the other,
+      forever. The gate knows the other jobs from ``GateContext.jobs``, and
+      finds this gate only among a job's own gates: a plugin gate that calls
+      this one must pass the context it was given, and its job must be named
+      in ``ignore_jobs`` by the jobs that should not count it;
+    * work that leaves no message and no turn, such as a memory written
+      through the MCP endpoint;
+    * for a catch-up, what was recorded after the run it stands in for came
+      due (``GateContext.as_of``): the message that woke the machine is work
+      for the job's next scheduled time, not for a run that came due while
+      nothing had happened.
+
+    ``overlap_hours`` is for a job that looks at a fixed period before its
+    run rather than at everything since its last run (the records of the day
+    before, say): what the agent did shortly before a run is not in that
+    run's period yet, so the job must run once more for it. With an overlap,
+    the work of that many hours before the last run counts again.
+
+    The gate estimates whether a run is worth it; it does not say whether
+    the job can run. So a run that a person starts by hand is not checked:
+    the person may know of work the gate cannot see.
+
+    The check reads the database and nothing else, so the default forecast —
+    the check, made now — holds until the agent works or the job runs. A
+    turn and a run are followed by a new forecast; other work (a
+    conversation taken in, say) is seen at the next read of the schedule.
+    """
+
+    type = "agent_activity"
+    spec_keys = frozenset({"ignore_jobs", "overlap_hours"})
+    checked_on_manual_runs = False
+
+    def __init__(
+        self, ignore_jobs: list[str] | None = None, overlap_hours: float = 0.0,
+    ) -> None:
+        self.ignore_jobs = list(dict.fromkeys(ignore_jobs or []))
+        self.overlap_hours = overlap_hours
+
+    async def is_satisfied(self, ctx: GateContext) -> bool:
+        gated_alike = [
+            job_id for job_id, job in ctx.jobs.items()
+            if any(isinstance(gate, AgentActivityGate) for gate in job.gates)
+        ]
+        return await ctx.db.has_activity_since_cron_run(
+            ctx.job_id,
+            ignore_jobs=[*self.ignore_jobs, *gated_alike],
+            overlap_seconds=round(self.overlap_hours * 3600),
+            until=ctx.as_of,
+        )
+
+    def describe(self) -> str:
+        since = "this job's last run"
+        if self.overlap_hours:
+            since = f"{self.overlap_hours:g}h before {since}"
+        ignored = (
+            f", not counting the runs of {', '.join(self.ignore_jobs)}"
+            if self.ignore_jobs else ""
+        )
+        return f"agent activity since {since}{ignored}"
+
+    @classmethod
+    def from_config(cls, spec: dict) -> "AgentActivityGate":
+        # As for github_pr_activity's ignore_actors: only a bare key means
+        # "not set". A value of the wrong shape is refused, not read as an
+        # empty list — that would count the runs the spec meant to leave out.
+        ignore = spec.get("ignore_jobs")
+        if ignore is None:
+            ignore = []
+        elif isinstance(ignore, str):
+            ignore = [ignore]
+        if not isinstance(ignore, list) or not all(
+            isinstance(job, str) and job.strip() for job in ignore
+        ):
+            raise GateConfigError(
+                "'agent_activity' gate 'ignore_jobs' must be a job id or a "
+                f"list of job ids, got {ignore!r}"
+            )
+        hours = spec.get("overlap_hours")
+        if hours is None:
+            hours = 0
+        # The range is checked on the number as written: a float made of an
+        # integer too large for one raises instead of being refused. NaN
+        # fails both comparisons.
+        if (
+            isinstance(hours, bool)
+            or not isinstance(hours, (int, float))
+            or not 0 <= hours <= _MAX_OVERLAP_HOURS
+        ):
+            raise GateConfigError(
+                "'agent_activity' gate 'overlap_hours' must be a number of "
+                f"hours from 0 to {_MAX_OVERLAP_HOURS}, got {hours!r}"
+            )
+        return cls(ignore_jobs=[job.strip() for job in ignore], overlap_hours=float(hours))
 
 
 class GitHubPrActivityGate(CronGate):
@@ -650,6 +853,329 @@ class GitHubPrActivityGate(CronGate):
             logger.warning("github_pr_activity: could not persist state: %s", e)
 
 
+class ClickHouseQueryGate(CronGate):
+    """Satisfied when a ClickHouse query, run through an MCP server, gives a
+    true first value.
+
+    The motivating case: start an agent only when the data says that there is
+    work, for example more errors than a limit. The SQL holds the condition,
+    and the gate reads the first value of the first row
+    (:func:`nerve.cron.clickhouse_query.is_true`)::
+
+        run_if:
+          - type: clickhouse_query
+            server: clickhouse        # mcp_servers entry, or catalog server id
+            service_id: <uuid>        # ClickHouse Cloud service
+            query: >
+              SELECT count() > 100 AS spike, count() AS errors
+              FROM logs.errors WHERE ts > now() - INTERVAL 10 MINUTE
+            cooldown_minutes: 360
+
+    Config:
+
+    * ``server`` (required): the MCP server, by name. In local mode it is an
+      ``http`` entry of ``mcp_servers``; in external mode a server of the MCP
+      gateway's catalog (see :mod:`nerve.cron.mcp_call`).
+    * ``query`` (required): the SQL. The ClickHouse Cloud server runs SELECT
+      queries only.
+    * ``service_id``: sent as the ``serviceId`` argument. The ClickHouse Cloud
+      server needs it; the open-source ``mcp-clickhouse`` server takes none.
+    * ``tool`` (default ``run_select_query``): the tool to call, with the
+      arguments ``query`` and, when ``service_id`` is set, ``serviceId``. The
+      open-source server (0.7) names its query tool ``run_query``.
+    * ``cooldown_minutes`` (default 360): see below.
+    * ``max_rows`` (default 50, at most 500): the rows that the run's prompt
+      gets. ``0`` gives the prompt nothing.
+    * ``timeout_seconds`` (default 30, at most 120): for the whole call.
+    * ``notify_after_failures`` (default 3): see below. ``0`` sends no notice.
+
+    The gate passes when the value is true and either the check before found
+    it false (or there was none), or the last run that the gate let through
+    started ``cooldown_minutes`` ago or more. So a run starts as soon as the
+    value becomes true, and while the value stays true, once for each
+    cooldown; ``0`` lets every check with a true value through. The state
+    (the value at the last check, the time of the last run let through, the
+    failed checks in a row) is a file under ``~/.nerve/cache`` for each job
+    and gate spec. A true value is written only when the run starts
+    (:attr:`GateContext.on_run`), so a later gate that skips the run, or a
+    workflow run that its ``lock`` skips, does not use up the change.
+
+    When the gate passes, the run's prompt gets the query and the rows
+    (:func:`nerve.cron.clickhouse_query.gate_note`).
+
+    **A failed check skips the run**, unlike the fail-open rule of
+    :func:`evaluate_gates`: no such server, a call that fails or times out, a
+    tool that refuses the query, a result the gate cannot read, a first value
+    that is neither a boolean nor a number. The gate logs a warning and does
+    not raise. Otherwise a ClickHouse Cloud service that sleeps, or a key that
+    expired, would start a session on every tick. The check that fails for the
+    ``notify_after_failures``-th time in a row gives a "check failed" notice
+    (:class:`GateNotice`), and the first check that works after it gives a
+    "works again" notice: one pair for each series of failures. One failed
+    check is usual (a check that wakes an idle service fails) and gives none.
+    The notices are not runs: they write no run log row, and so they do not
+    change the job's run status or its own failure notices.
+    """
+
+    type = "clickhouse_query"
+    spec_keys = frozenset({
+        "server", "service_id", "query", "tool",
+        "cooldown_minutes", "max_rows", "timeout_seconds", "notify_after_failures",
+    })
+
+    DEFAULT_TOOL = "run_select_query"
+    MAX_ROWS_LIMIT = 500
+
+    def __init__(
+        self,
+        server: str,
+        query: str,
+        *,
+        service_id: str = "",
+        tool: str = DEFAULT_TOOL,
+        cooldown_minutes: float = 360.0,
+        max_rows: int = 50,
+        timeout_seconds: float = 30.0,
+        notify_after_failures: int = 3,
+    ) -> None:
+        from nerve.cron.mcp_call import MAX_CALL_TIMEOUT_SECONDS
+
+        if not server or not query or not tool:
+            raise GateConfigError(
+                "'clickhouse_query' gate requires a non-empty 'server', 'query' and 'tool'"
+            )
+        if server == "nerve":
+            raise GateConfigError(
+                "'clickhouse_query' gate 'server' cannot be 'nerve', Nerve's own MCP server"
+            )
+        if cooldown_minutes < 0:
+            raise GateConfigError("'clickhouse_query' gate 'cooldown_minutes' must be 0 or more")
+        if not 0 <= max_rows <= self.MAX_ROWS_LIMIT:
+            raise GateConfigError(
+                f"'clickhouse_query' gate 'max_rows' must be from 0 to {self.MAX_ROWS_LIMIT}"
+            )
+        if not 0 < timeout_seconds <= MAX_CALL_TIMEOUT_SECONDS:
+            raise GateConfigError(
+                "'clickhouse_query' gate 'timeout_seconds' must be more than 0 and "
+                f"at most {MAX_CALL_TIMEOUT_SECONDS:g}"
+            )
+        if notify_after_failures < 0:
+            raise GateConfigError(
+                "'clickhouse_query' gate 'notify_after_failures' must be 0 or more"
+            )
+        self.server = server
+        self.query = query
+        self.service_id = service_id
+        self.tool = tool
+        self.notify_after_failures = int(notify_after_failures)
+        self.cooldown_minutes = float(cooldown_minutes)
+        self.max_rows = int(max_rows)
+        self.timeout_seconds = float(timeout_seconds)
+
+    async def is_satisfied(self, ctx: GateContext) -> bool:
+        from nerve.cron.clickhouse_query import QueryResultError, gate_note, is_true
+        from nerve.cron.mcp_call import McpCallError
+
+        state = self._load_state(ctx.job_id)
+        try:
+            rows = await self._query(ctx)
+            value = is_true(rows.first_value)
+        except (McpCallError, QueryResultError) as e:
+            self._failed(ctx, state, str(e))
+            return False
+        except Exception as e:  # noqa: BLE001 (a failed check skips, see the class)
+            logger.debug("clickhouse_query check of cron job %s", ctx.job_id, exc_info=True)
+            self._failed(ctx, state, f"the check failed ({type(e).__name__}: {e})")
+            return False
+
+        now = datetime.now(timezone.utc)
+        if state["failures"] or state["reported"]:
+            self._update_state(ctx.job_id, failures=0, reported=False)
+        if state["reported"]:
+            ctx.notices.append(GateNotice(failed=False, message=(
+                f"Run gate clickhouse_query (MCP server {self.server}) can check "
+                f"again, after {state['failures']} failed checks in a row."
+            )))
+        if not value:
+            if state["value"] is not False:
+                self._update_state(ctx.job_id, value=False)
+            return False
+        last_fire = state["last_fire"]
+        cooldown_over = last_fire is None or (
+            now - last_fire >= timedelta(minutes=self.cooldown_minutes)
+        )
+        if state["value"] is True and not cooldown_over:
+            return False
+        if self.max_rows:
+            ctx.notes.append(gate_note(
+                server=self.server, service_id=self.service_id, query=self.query,
+                rows=rows, max_rows=self.max_rows,
+                checked_at=now.isoformat(timespec="seconds"),
+            ))
+        job_id = ctx.job_id
+        ctx.on_run.append(lambda: self._update_state(job_id, value=True, last_fire=now))
+        return True
+
+    def _failed(self, ctx: GateContext, state: dict, message: str) -> None:
+        """Log a failed check and count it. The ``notify_after_failures``-th
+        one in a row, when this series has no notice yet, gives a notice."""
+        logger.warning(
+            "clickhouse_query gate of cron job %s: %s; the run is skipped",
+            ctx.job_id, message,
+        )
+        failures = state["failures"] + 1
+        report = (
+            not state["reported"]
+            and self.notify_after_failures > 0
+            and failures >= self.notify_after_failures
+        )
+        self._update_state(ctx.job_id, failures=failures, reported=state["reported"] or report)
+        if report:
+            ctx.notices.append(GateNotice(failed=True, message=(
+                f"Run gate clickhouse_query (MCP server {self.server}) could not "
+                f"check {failures} times in a row, so the job does not run. "
+                f"Last error: {message}"
+            )))
+
+    async def forecast(self, ctx: GateContext, at: datetime) -> bool:
+        """Always a run: only the query can tell, and a forecast may not reach
+        the network. The check when the run comes still decides."""
+        return True
+
+    def describe(self) -> str:
+        return (
+            f"ClickHouse query on MCP server {self.server} gives a true first "
+            f"value (cooldown {self.cooldown_minutes:g} min)"
+        )
+
+    @classmethod
+    def from_config(cls, spec: dict) -> "ClickHouseQueryGate":
+        def text(key: str, *, required: bool = False, default: str = "") -> str:
+            value = spec.get(key)
+            if value is None:
+                if required:
+                    raise GateConfigError(f"'clickhouse_query' gate requires {key!r}")
+                return default
+            if not isinstance(value, str) or not value.strip():
+                raise GateConfigError(
+                    f"'clickhouse_query' gate {key!r} must be a non-empty string"
+                )
+            return value.strip()
+
+        def number(key: str, default: float) -> float:
+            value = spec.get(key)
+            if value is None:
+                return default
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+            ):
+                raise GateConfigError(
+                    f"'clickhouse_query' gate {key!r} must be a number, got {value!r}"
+                )
+            return value
+
+        max_rows = number("max_rows", 50)
+        notify_after_failures = number("notify_after_failures", 3)
+        for key, value in (("max_rows", max_rows), ("notify_after_failures", notify_after_failures)):
+            if value != int(value):
+                raise GateConfigError(f"'clickhouse_query' gate {key!r} must be an integer")
+        return cls(
+            server=text("server", required=True),
+            query=text("query", required=True),
+            service_id=text("service_id"),
+            tool=text("tool", default=cls.DEFAULT_TOOL),
+            cooldown_minutes=number("cooldown_minutes", 360.0),
+            max_rows=int(max_rows),
+            timeout_seconds=number("timeout_seconds", 30.0),
+            notify_after_failures=int(notify_after_failures),
+        )
+
+    # --- internals ---------------------------------------------------------
+
+    async def _query(self, ctx: GateContext):
+        from nerve.cron.clickhouse_query import parse_rows
+        from nerve.cron.mcp_call import McpCallError, call_tool, find_server, one_line
+
+        if ctx.mcp_servers is None:
+            raise McpCallError("this process gives cron gates no MCP servers")
+        server = find_server(ctx.mcp_servers(), self.server)
+        if server is None:
+            where = "the MCP gateway's catalog" if ctx.mcp_managed else "mcp_servers"
+            raise McpCallError(f"no MCP server {self.server!r} in {where}")
+        arguments = {"query": self.query}
+        if self.service_id:
+            arguments["serviceId"] = self.service_id
+        result = await call_tool(
+            server, self.tool, arguments,
+            managed=ctx.mcp_managed, timeout=self.timeout_seconds,
+        )
+        if result.is_error:
+            detail = one_line(result.text) or "no text"
+            raise McpCallError(
+                f"{self.tool} of MCP server {self.server!r} gave an error: {detail}"
+            )
+        return parse_rows(result)
+
+    def _state_path(self, job_id: str) -> Path:
+        safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in job_id)
+        spec = json.dumps(
+            [self.server, self.service_id, self.tool, self.query], separators=(",", ":"),
+        )
+        digest = hashlib.sha256(spec.encode("utf-8")).hexdigest()[:12]
+        d = paths.cache_dir()
+        paths.ensure_nerve_home()  # cache_dir is under the state dir; create it owner-only
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"clickhouse_query_{safe}_{digest}.json"
+
+    def _load_state(self, job_id: str) -> dict:
+        """``value``: the value at the last check; ``last_fire``: the start of
+        the last run let through; ``failures``: the failed checks in a row;
+        ``reported``: whether this series of failures gave its notice.
+        ``None`` (0 for ``failures``, False for ``reported``) for what is not
+        known."""
+        state = {"value": None, "last_fire": None, "failures": 0, "reported": False}
+        try:
+            raw = json.loads(self._state_path(job_id).read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 (no state reads as a first check)
+            return state
+        if not isinstance(raw, dict):
+            return state
+        if isinstance(raw.get("value"), bool):
+            state["value"] = raw["value"]
+        try:
+            state["last_fire"] = datetime.fromisoformat(raw["last_fire"]) if raw.get("last_fire") else None
+        except (TypeError, ValueError):
+            pass
+        failures = raw.get("failures")
+        if isinstance(failures, int) and not isinstance(failures, bool) and failures > 0:
+            state["failures"] = failures
+        state["reported"] = raw.get("reported") is True
+        return state
+
+    def _update_state(self, job_id: str, **changes) -> None:
+        """Write *changes* over the stored state (read again, so that the
+        callback of a run does not undo a later check)."""
+        state = self._load_state(job_id)
+        state.update(changes)
+        try:
+            path = self._state_path(job_id)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(
+                json.dumps({
+                    "value": state["value"],
+                    "last_fire": state["last_fire"].isoformat() if state["last_fire"] else None,
+                    "failures": state["failures"],
+                    "reported": state["reported"],
+                }),
+                encoding="utf-8",
+            )
+            os.replace(tmp, path)
+        except Exception as e:  # noqa: BLE001 (non-fatal; worst case is an extra run)
+            logger.warning("clickhouse_query: could not save the gate state: %s", e)
+
+
 def _consumer_cursor_ttl_days() -> int:
     """``sync.consumer_cursor_ttl_days`` of the loaded config, never loading
     one; its default without a config or with an unusable value."""
@@ -685,7 +1211,9 @@ def github_is_hosted() -> bool:
 GATE_REGISTRY: dict[str, type[CronGate]] = {
     MessagesGate.type: MessagesGate,
     TasksGate.type: TasksGate,
+    AgentActivityGate.type: AgentActivityGate,
     GitHubPrActivityGate.type: GitHubPrActivityGate,
+    ClickHouseQueryGate.type: ClickHouseQueryGate,
 }
 
 
@@ -747,11 +1275,19 @@ async def evaluate_gates(
     (the run proceeds) and a warning is logged. Silently skipping forever
     on a transient DB error would be worse than an occasional wasted run —
     and a wasted run is just the pre-gate behaviour.
+
+    When every gate passes, the decision carries the ``notes`` and the
+    ``on_run`` callbacks of *ctx*; the caller calls
+    :meth:`GateDecision.record_run` when the run starts. What a gate added to
+    them before it raised is dropped. The decision carries ``notices``
+    whether the job runs or not.
     """
     for gate in gates:
+        notes, callbacks, notices = len(ctx.notes), len(ctx.on_run), len(ctx.notices)
         try:
             ok = await gate.is_satisfied(ctx)
         except Exception as e:  # noqa: BLE001 — fail open, never block forever
+            del ctx.notes[notes:], ctx.on_run[callbacks:], ctx.notices[notices:]
             logger.warning(
                 "Cron gate %r for job %s errored; allowing run: %s",
                 gate.type, ctx.job_id, e,
@@ -761,8 +1297,12 @@ async def evaluate_gates(
             return GateDecision(
                 should_run=False,
                 reason=f"gate {gate.type!r} not satisfied ({gate.describe()})",
+                notices=list(ctx.notices),
             )
-    return GateDecision(should_run=True)
+    return GateDecision(
+        should_run=True, notes=list(ctx.notes), on_run=list(ctx.on_run),
+        notices=list(ctx.notices),
+    )
 
 
 async def forecast_gates(

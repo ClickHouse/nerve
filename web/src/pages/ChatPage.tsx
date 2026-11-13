@@ -12,6 +12,7 @@ import { TodoPanel } from '../components/Chat/TodoPanel';
 import { SidePanel } from '../components/Chat/SidePanel';
 import { ChatWidthHandle } from '../components/Chat/ChatWidthHandle';
 import { AgentDock } from '../components/Chat/agents/AgentDock';
+import { MessageChatContext } from '../components/Chat/messageChat';
 import { ForceStopDialog } from '../components/Chat/agents/ForceStopDialog';
 import { StopAllDialog } from '../components/Chat/agents/StopAllDialog';
 import { StopEscalationBanner } from '../components/Chat/agents/StopEscalationBanner';
@@ -36,7 +37,22 @@ const STATUS_LABELS: Record<string, string> = {
   writing: 'Writing...',
 };
 
+/**
+ * The chat page. What a widget of an answer saves is kept with its chat, so
+ * everything the page shows is told which chat it is in. A stored message
+ * says that for itself (`MessageList`); this is for what the server has not
+ * handed out yet, the answer that is being written.
+ */
 export function ChatPage() {
+  const activeSession = useChatStore(s => s.activeSession);
+  return (
+    <MessageChatContext.Provider value={activeSession || null}>
+      <ChatPageView />
+    </MessageChatContext.Provider>
+  );
+}
+
+function ChatPageView() {
   const { sessionId } = useParams();
   const navigate = useNavigate();
   const location = useLocation();

@@ -100,6 +100,93 @@ async def _plan_notifications(db) -> list[dict]:
 
 
 @pytest.mark.asyncio
+async def test_the_skill_extractors_plan_is_a_skill_proposal_either_way(db, tmp_path):
+    """The built-in job states the plan type and creates its task with its
+    source. Each alone makes the plan a ``skill-create`` plan, whose approval
+    briefs a session to write the skill; a plan with neither is generic."""
+    await _task(db, tmp_path)
+    ctx = _ctx(db, tmp_path)
+
+    async def proposed_as(**args) -> str:
+        await plan_propose_handler(ctx, {"task_id": TASK_ID, "content": "Why and where to.", **args})
+        (plan,) = [p for p in await db.get_plans_for_task(TASK_ID) if p["status"] == "pending"]
+        await db.update_plan(plan["id"], status="declined")
+        return plan["plan_type"]
+
+    assert await proposed_as() == "generic"
+    assert await proposed_as(plan_type="skill-create") == "skill-create"
+
+    await db.upsert_task(
+        task_id=TASK_ID, file_path="task.md", title="Fix the encoder", status="pending",
+        content=(tmp_path / "task.md").read_text(), source="skill-extractor",
+    )
+    assert await proposed_as() == "skill-create"
+
+
+@pytest.mark.asyncio
+async def test_the_tag_lists_every_earlier_skill_proposal_whatever_became_of_it(db, tmp_path):
+    """The skill extractor is told to propose nothing that it proposed before
+    (its prompt, ``nerve.setup_writer``). It tags the task of each proposal
+    and lists the tasks by the tag. The task stays when the plan is declined,
+    and when the plan is approved and its session closes the task with no
+    skill: a plan that ``plan_list`` shows neither by default nor as
+    declined."""
+    import re
+
+    from nerve.agent.tools.handlers.plans import plan_list_handler
+    from nerve.agent.tools.handlers.tasks import (
+        task_create_handler, task_done_handler, task_list_handler,
+    )
+
+    engine = FakeEngine(db)
+    tools_mod.init_tools(workspace=tmp_path, db=db, engine=engine)
+    ctx = ToolContext(
+        session_id="cron:skill-extractor", workspace=tmp_path, db=db,
+        notification_service=None, actor=db.system_actor,
+    )
+
+    def text(result) -> str:
+        return result.content[0]["text"]
+
+    async def proposed(title: str) -> tuple[str, str]:
+        created = await task_create_handler(ctx, {
+            "title": title, "content": "What the skill is for.",
+            "source": "skill-extractor", "tags": "skill-proposal",
+        })
+        task_id = re.match(r"Task created: (\S+)", text(created)).group(1)
+        await plan_propose_handler(ctx, {
+            "task_id": task_id, "content": "What, evidence, direction.", "plan_type": "skill-create",
+        })
+        (plan,) = [p for p in await db.get_plans_for_task(task_id) if p["status"] == "pending"]
+        return task_id, plan["id"]
+
+    in_review = "Release notes from merged pull requests"
+    declined = "Weekly audit of dependencies"
+    closed = "Triage of flaky tests"
+    await proposed(in_review)
+    _, plan_id = await proposed(declined)
+    await decline_plan(db=db, engine=engine, plan_id=plan_id, actor=None, cause=None)
+    task_id, plan_id = await proposed(closed)
+    await approve_plan(db=db, engine=engine, plan_id=plan_id, actor=None, cause=None)
+    await asyncio.wait_for(engine.run_event.wait(), timeout=5.0)
+    await task_done_handler(ctx, {"task_id": task_id, "note": "No skill: the evidence does not support one."})
+    assert (await db.get_plan(plan_id))["status"] == "done"
+    await task_create_handler(ctx, {"title": "Fix the encoder", "content": "Body."})
+
+    listed = text(await task_list_handler(ctx, {"status": "all", "tag": "skill-proposal"}))
+    assert all(title in listed for title in (in_review, declined, closed))
+    assert "Fix the encoder" not in listed
+    # Without the status, the tasks that are done are left out.
+    still_open = text(await task_list_handler(ctx, {"tag": "skill-proposal"}))
+    assert in_review in still_open and declined not in still_open and closed not in still_open
+
+    shown = text(await plan_list_handler(ctx, {}))
+    assert in_review in shown and declined not in shown and closed not in shown
+    shown = text(await plan_list_handler(ctx, {"status": "declined"}))
+    assert declined in shown and closed not in shown
+
+
+@pytest.mark.asyncio
 class TestTaskStatus:
     @pytest.mark.parametrize("start", ["pending", "backlog", "in_progress"])
     async def test_propose_moves_the_task_to_plan_review(self, db, tmp_path, start):

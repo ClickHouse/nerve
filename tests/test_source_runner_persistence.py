@@ -3,6 +3,9 @@ import sqlite3
 
 import pytest
 
+from nerve.agent.tools.handlers.sources import poll_all_sources_handler
+from nerve.agent.tools.registry import ToolContext
+from nerve.cron.gates import GateContext, MessagesGate
 from nerve.sources.base import Source
 from nerve.sources.models import FetchResult, SourceRecord
 from nerve.sources.runner import SourceRunner
@@ -28,9 +31,21 @@ class _FixedSource(Source):
     def __init__(self, records: list[SourceRecord], next_cursor: str = "new"):
         self.records = records
         self.next_cursor = next_cursor
+        self.fetches = 0
 
     async def fetch(self, cursor: str | None, limit: int = 100) -> FetchResult:
+        self.fetches += 1
         return FetchResult(records=list(self.records), next_cursor=self.next_cursor)
+
+
+def _inbox_gate_context(db) -> GateContext:
+    return GateContext(job_id="inbox-processor", db=db)
+
+
+async def _poll_inbox(db) -> str:
+    """What a ``poll_all_sources`` call of the inbox consumer reads."""
+    result = await poll_all_sources_handler(ToolContext(session_id="s", db=db), {"consumer": "inbox"})
+    return result.text_content
 
 
 @pytest.mark.asyncio
@@ -192,3 +207,128 @@ async def test_runner_condenses_and_counts_a_repeated_id_once(db, monkeypatch, r
 
     assert result.records_ingested == 1
     assert condensed == [[repeat_content]]
+
+
+@pytest.mark.asyncio
+async def test_a_new_source_s_first_records_are_unread_for_the_existing_consumers(db):
+    # The inbox consumer already reads another source.
+    await db.insert_source_messages([dataclasses.replace(_record("x"), source="other")], source="other")
+    await db.set_consumer_cursor("inbox", "other", await db.get_source_max_rowid("other"))
+    ctx = _inbox_gate_context(db)
+    assert not await MessagesGate().is_satisfied(ctx)
+
+    result = await SourceRunner(_FixedSource([_record("a")]), db).run()
+
+    assert result.records_ingested == 1
+    assert await db.peek_consumer_cursor("inbox", SOURCE_NAME) == 0
+    # A gate on any source and a gate on the new source both see the records.
+    assert await MessagesGate().is_satisfied(ctx)
+    assert await MessagesGate(sources=[SOURCE_NAME]).is_satisfied(ctx)
+    messages = await db.read_source_messages_by_rowid(
+        SOURCE_NAME, after_seq=await db.get_consumer_cursor("inbox", SOURCE_NAME),
+    )
+    assert [m["id"] for m in messages] == ["a"]
+
+
+@pytest.mark.asyncio
+async def test_a_baseline_run_seeds_the_cursor_so_later_records_wake_the_consumer(db):
+    await db.set_consumer_cursor("inbox", "other", 0)
+    source = _FixedSource([], next_cursor="baseline")
+    runner = SourceRunner(source, db)
+
+    await runner.run()
+    assert await db.peek_consumer_cursor("inbox", SOURCE_NAME) == 0
+    assert not await db.consumer_has_unread("inbox")
+
+    source.records, source.next_cursor = [_record("later")], "next"
+    await runner.run()
+    assert await db.consumer_has_unread("inbox")
+
+    text = await _poll_inbox(db)
+    assert "Record later" in text
+    assert f"{SOURCE_NAME}: 1 new" in text
+
+
+@pytest.mark.asyncio
+async def test_seeding_leaves_a_live_cursor_and_only_runs_without_a_source_cursor(db):
+    await db.insert_source_messages([_record("old")], source=SOURCE_NAME)
+    newest = await db.get_source_max_rowid(SOURCE_NAME)
+    await db.set_consumer_cursor("inbox", SOURCE_NAME, 0)
+    await db.set_consumer_cursor("other-consumer", "other", 0)
+    # A consumer whose only cursor, on the source, has expired.
+    await db.set_consumer_cursor("lapsed", SOURCE_NAME, 0, ttl_days=-1)
+
+    assert await db.seed_consumer_cursors(SOURCE_NAME) == 2
+    assert await db.peek_consumer_cursor("inbox", SOURCE_NAME) == 0
+    # A consumer new to the source, or with an expired cursor on it, starts
+    # past what is already stored.
+    assert await db.peek_consumer_cursor("other-consumer", SOURCE_NAME) == newest
+    assert await db.peek_consumer_cursor("lapsed", SOURCE_NAME) == newest
+
+    await db.set_sync_cursor(SOURCE_NAME, "stored")
+    await db.set_consumer_cursor("late", "other", 0)
+    await SourceRunner(_FixedSource([]), db).run()
+    assert await db.peek_consumer_cursor("late", SOURCE_NAME) is None
+
+
+@pytest.mark.asyncio
+async def test_seeding_skips_a_consumer_that_reads_only_some_sources(db):
+    for name in ("alpha", "beta"):
+        await db.insert_source_messages([dataclasses.replace(_record("x"), source=name)], source=name)
+    alpha, beta = await db.get_source_max_rowid("alpha"), await db.get_source_max_rowid("beta")
+    # "inbox" reads every source. "alpha-only" polls only alpha. "lapsed" reads
+    # every source, but its cursor on beta has expired.
+    await db.set_consumer_cursor("inbox", "alpha", alpha)
+    await db.set_consumer_cursor("inbox", "beta", beta)
+    await db.set_consumer_cursor("alpha-only", "alpha", alpha)
+    await db.set_consumer_cursor("lapsed", "alpha", alpha)
+    await db.set_consumer_cursor("lapsed", "beta", beta, ttl_days=-1)
+
+    await SourceRunner(_FixedSource([_record("a")]), db).run()
+
+    assert await db.peek_consumer_cursor("inbox", SOURCE_NAME) == 0
+    assert await db.peek_consumer_cursor("lapsed", SOURCE_NAME) == 0
+    assert await db.peek_consumer_cursor("alpha-only", SOURCE_NAME) is None
+    # The gate of a job that polls only alpha does not see the new source.
+    ctx = _inbox_gate_context(db)
+    assert not await MessagesGate(consumer="alpha-only").is_satisfied(ctx)
+    assert await MessagesGate().is_satisfied(ctx)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sources", [[], [SOURCE_NAME]], ids=["any-source-gate", "new-source-gate"])
+async def test_an_expired_cursor_on_a_new_source_starts_again_before_its_first_records(db, sources):
+    await db.set_consumer_cursor("inbox", "other", 0)
+    await db.set_consumer_cursor("inbox", SOURCE_NAME, 0, ttl_days=-1)
+
+    result = await SourceRunner(_FixedSource([_record("a")]), db).run()
+
+    assert result.records_ingested == 1
+    assert await MessagesGate(sources=sources).is_satisfied(_inbox_gate_context(db))
+    assert "Record a" in await _poll_inbox(db)
+
+
+@pytest.mark.asyncio
+async def test_a_failure_to_start_the_consumer_cursors_fails_the_run_before_the_fetch(db, monkeypatch):
+    await db.set_consumer_cursor("inbox", "other", 0)
+    source = _FixedSource([_record("a")])
+    runner = SourceRunner(source, db)
+
+    async def fail(source, ttl_days):
+        raise RuntimeError("cursors unavailable")
+
+    monkeypatch.setattr(db, "seed_consumer_cursors", fail)
+    result = await runner.run()
+
+    assert result.records_ingested == 0
+    assert "cursors unavailable" in result.error
+    assert source.fetches == 0
+    assert await db.get_sync_cursor(SOURCE_NAME) is None
+
+    # The next run tries again and delivers the first records.
+    monkeypatch.undo()
+    runner.health.backoff_until = None
+    assert (await runner.run()).records_ingested == 1
+    for sources in ([], [SOURCE_NAME]):
+        assert await MessagesGate(sources=sources).is_satisfied(_inbox_gate_context(db))
+    assert "Record a" in await _poll_inbox(db)

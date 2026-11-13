@@ -6,11 +6,12 @@ import { copyToClipboard } from '../../../utils/clipboard';
 import { IconButton } from '../../ui';
 import { Check, CodeXml, Copy, Download, Maximize2 } from '../../ui/icons';
 import { MarkdownStreamingContext } from '../streamingContext';
+import { WidgetBlock } from '../widgets/WidgetBlock';
 import {
   downloadBlob, downloadSvg, ensureViewBox, exportFileName, pngOver, svgMarkupOf, svgSizeOf, svgToPngBlob,
   type Size,
 } from './export';
-import { KIND_LABEL, MAX_RICH_SOURCE_CHARS, type RichKind } from './kinds';
+import { KIND_LABEL, MAX_RICH_SOURCE_CHARS, type FenceKind, type RichKind } from './kinds';
 import { Lightbox } from './Lightbox';
 import { readThemeTokens } from './tokens';
 import type { Mount, Mounted } from './types';
@@ -326,6 +327,16 @@ function ToolButton({ label, onClick, text = false, ref, children }: {
 }
 
 /**
+ * A fenced code block the chat renders instead of printing. A widget is live
+ * HTML in the sandbox frame and has a block of its own (Chat/widgets); every
+ * other kind is a picture, drawn here as a figure.
+ */
+export function RichCodeBlock({ kind, source }: { kind: FenceKind; source: string }) {
+  if (kind === 'widget') return <WidgetBlock source={source} />;
+  return <RichFigure kind={kind} source={source} />;
+}
+
+/**
  * A fenced code block the chat renders — a mermaid diagram, a Vega chart,
  * an SVG — as a figure, with its source one click away.
  *
@@ -346,7 +357,7 @@ function ToolButton({ label, onClick, text = false, ref, children }: {
  * switches between the two. Expand opens it full size (Lightbox); Download
  * saves it as SVG or PNG.
  */
-export function RichCodeBlock({ kind, source }: { kind: RichKind; source: string }) {
+function RichFigure({ kind, source }: { kind: RichKind; source: string }) {
   const streaming = useContext(MarkdownStreamingContext);
   const theme = useThemeStore(s => s.resolved);
   const settled = useSettledValue(source, streaming ? SETTLE_MS : 0);

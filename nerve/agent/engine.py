@@ -20,9 +20,10 @@ import os
 import re
 import secrets
 import time
+import weakref
 from collections import OrderedDict
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -40,6 +41,7 @@ from nerve.agent.backends import (
     AgentBackend,
     AgentClient,
     BackendDeps,
+    ForkSourceMissingError,
     ModelObserved,
     SessionSpec,
     SubagentStarted,
@@ -53,6 +55,7 @@ from nerve.agent.backends import (
     TransportDiedError,
     TurnCompleted,
     TurnInput,
+    TurnRefusedError,
     build_backends,
 )
 from nerve.agent.backends.events import TurnStatus
@@ -72,6 +75,7 @@ from nerve.agent.prompts import (
     memory_unavailable_note,
     prepend_session_preamble,
     set_skill_manager,
+    surface_excluded_tools,
 )
 from nerve.agent.session_titles import REPLACEABLE_SOURCES, STYLE_EXAMPLES, outcome_title
 from nerve.agent.sessions import SessionManager, SessionStatus, new_cron_run_id
@@ -103,6 +107,7 @@ from nerve.inference_principal import (
     inference_principal,
     inference_trigger,
 )
+from nerve.mcp_apps import is_third_party_tool, tool_event_result
 from nerve.mcp_gateway import McpGatewayCatalog
 from nerve.memory.backend import (
     MemoryBackendUnavailable,
@@ -218,6 +223,17 @@ def _parse_mcp_tool_name(tool_name: str) -> tuple[str, str] | None:
     if len(parts) == 3:
         return parts[1], parts[2]
     return None
+
+
+def _mcp_app_result(event: ToolResult) -> dict[str, Any] | None:
+    """The MCP ``CallToolResult`` that a view gets for a finished tool call
+    (the ``mcp_app_result`` field), or None when it cannot be built: the call
+    is then shown as an ordinary one."""
+    try:
+        return tool_event_result(event.content, event.structured, bool(event.is_error))
+    except Exception as e:  # noqa: BLE001 — never break a tool event
+        logger.debug("MCP App result of %s could not be built: %s", event.tool_use_id, e)
+        return None
 
 
 def _model_family(model: str) -> str:
@@ -365,6 +381,9 @@ class _TurnState:
     ordered_blocks: list[dict] = field(default_factory=list)
     last_usage: dict | None = None
     sdk_session_id: str | None = None
+    # True when ``sdk_session_id`` comes from the turn's terminal event, not
+    # from the live client after a Stop or an error.
+    native_id_from_result: bool = False
     native_turn_id: str | None = None
     result_meta: dict | None = None
     last_model: str | None = None
@@ -519,6 +538,11 @@ class AgentEngine:
         # detect mid-session model switches (the CLI fixes its model at
         # connect time, so a change requires recreating the client).
         self._session_models: dict[str, str] = {}
+        # One lock per session for a read-modify-write of its metadata (see
+        # _metadata_lock). Weak values: a lock lives while a writer has it.
+        self._metadata_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         # Last model *observed* serving each session (from
         # AssistantMessage.model). The API may silently serve a different
         # model than requested — e.g. a capacity fallback from a frontier
@@ -548,6 +572,9 @@ class AgentEngine:
         self._mcp_catalog_task: asyncio.Task | None = None
         # The catalog revision that each session's client was built with.
         self._client_mcp_revisions: dict[str, str | None] = {}
+        # The fork source of each session whose last client build found one
+        # on the row (a fork before its first completed turn).
+        self._fork_sources: dict[str, str] = {}
         self._mcp_servers_cache = (  # hot-reloadable
             [] if self._managed_mcp else list(config.mcp_servers)
         )
@@ -704,6 +731,16 @@ class AgentEngine:
     def set_mcp_loopback_port(self, port: int | None) -> None:
         """Publish the local MCP listener port to backends."""
         self._mcp_loopback_port = port
+
+    @property
+    def managed_mcp(self) -> bool:
+        """Whether the MCP gateway's catalog gives the MCP servers (external mode)."""
+        return self._managed_mcp
+
+    def current_mcp_servers(self) -> list[McpServerConfig]:
+        """The MCP servers, besides Nerve's own, that new sessions get: the
+        ``mcp_servers`` config, or in external mode the gateway's catalog."""
+        return list(self._mcp_servers_cache)
 
     def _loom_tools_offered(self) -> bool:
         """Whether sessions get Loom's tools: the MCP gateway's catalog,
@@ -992,6 +1029,13 @@ class AgentEngine:
             await self.db.upsert_mcp_server(
                 name=srv.name, server_type=srv.type, enabled=srv.enabled,
             )
+
+    def has_mcp_server(self, name: str) -> bool:
+        """Whether ``name`` is an enabled external MCP server of the current
+        configuration: one of the servers a new session gets."""
+        return any(
+            server.name == name and server.enabled for server in self._mcp_servers_cache
+        )
 
     async def reload_mcp_config(self) -> list:
         """Re-read MCP server config from YAML files and update cache + DB.
@@ -1532,8 +1576,6 @@ class AgentEngine:
 
     async def _get_or_create_client(
         self, session_id: str, source: str, model: str | None,
-        fork_from: str | None = None,
-        fork_last_turn_id: str | None = None,
         effort_override: str | None = None,
     ) -> AgentClient:
         """Get an existing persistent client or create a new one.
@@ -1547,6 +1589,12 @@ class AgentEngine:
         A live client is built again when its process is dead, its model
         changed, or the MCP gateway catalog changed after its build
         (:meth:`_mcp_catalog_rebuild_due`).
+
+        A new client resumes the session's own native conversation. A fork
+        that has none yet branches from the fork source on its row
+        (``fork_source_native_id`` at ``fork_source_turn_id``, written by
+        ``SessionManager.fork_session``). Every build of the session reads
+        the same row, so a crash-retry forks again, whatever the status.
         """
         lock = self.sessions.get_lock(session_id)
         async with lock:
@@ -1578,6 +1626,9 @@ class AgentEngine:
             )
 
             if client is not None:
+                # The row is the truth for the chat's Daybreak switch: a live
+                # client that missed a change takes it before its next turn.
+                await self._apply_daybreak(client, session_meta)
                 bound_model = self._session_models.get(session_id)
                 # Health check: verify the underlying subprocess is alive
                 if not client.is_alive():
@@ -1635,17 +1686,23 @@ class AgentEngine:
                 if session_meta.get("observed_model"):
                     self._observed_models[session_id] = session_meta["observed_model"]
 
-            # For forks, use the source session's native ID
-            if fork_from and not sdk_resume_id:
-                sdk_resume_id = fork_from
+            # A fork keeps its source until its first completed turn
+            # (_persist_turn clears it). The source is never the fork's own
+            # conversation: resuming it without a fork would write into the
+            # parent's transcript.
+            fork_from = (session or {}).get("fork_source_native_id") or None
+            if fork_from:
+                self._fork_sources[session_id] = fork_from
+                if sdk_resume_id == fork_from:
+                    sdk_resume_id = None
+            else:
+                self._fork_sources.pop(session_id, None)
 
             # Defensive: let the backend verify the resume target is still
             # materialized (claude: the conversation .jsonl under
             # ~/.claude/projects; codex: no cheap check — create_client
-            # falls back and reports resume_dropped instead).  Forks are
-            # exempt: the source session's context lives in the source's
-            # row, and a fresh fork has nothing to recover to.
-            if sdk_resume_id and not fork_from:
+            # falls back and reports resume_dropped instead).
+            if sdk_resume_id:
                 if not backend.validate_resume_target(
                     sdk_resume_id, session_cwd,
                 ):
@@ -1659,7 +1716,19 @@ class AgentEngine:
                     )
                     sdk_resume_id = None
 
-            if sdk_resume_id:
+            is_fork = bool(fork_from) and not sdk_resume_id
+            fork_last_turn_id: str | None = None
+            if is_fork:
+                if not backend.validate_resume_target(fork_from, session_cwd):
+                    raise await self._fork_source_missing(session_id, fork_from)
+                sdk_resume_id = fork_from
+                fork_last_turn_id = (session or {}).get("fork_source_turn_id") or None
+                logger.info(
+                    "Forking session %s from native session %s%s",
+                    session_id, fork_from[:12],
+                    f" at turn {fork_last_turn_id[:12]}" if fork_last_turn_id else "",
+                )
+            elif sdk_resume_id:
                 logger.info(
                     "Resuming session %s with native session %s",
                     session_id, sdk_resume_id[:12],
@@ -1728,9 +1797,6 @@ class AgentEngine:
                 if session_meta.get("cache_ttl") != cache_ttl:
                     meta_updates["cache_ttl"] = cache_ttl
 
-            # Determine if this is a fork
-            is_fork = fork_from is not None
-
             # Static-prompt mode (agent.static_system_prompt): the session
             # id and the frozen recall stay OUT of the system prompt so its
             # bytes are shared across sessions (exact-prefix cache), and
@@ -1751,7 +1817,14 @@ class AgentEngine:
                 meta_updates["preamble_sent"] = True
 
             if meta_updates and session:
-                session_meta.update(meta_updates)
+                # Into the row as it is now. A rebuild lets go of the
+                # session's lock (remove_client), so another request can have
+                # changed the metadata since this build read it: the chat's
+                # Daybreak switch.
+                session_meta = {
+                    **self._row_metadata(await self.db.get_session(session_id)),
+                    **meta_updates,
+                }
                 await self.db.update_session_metadata(session_id, session_meta)
 
             # Create interactive hub for this session.
@@ -1788,6 +1861,9 @@ class AgentEngine:
                 # The session's own surface decides what renders: a wakeup
                 # turn of a web session is still read in the web chat.
                 rendering_source=(session or {}).get("source"),
+                # The web chat draws ```widget blocks in the MCP Apps
+                # sandbox, which runs in local mode only.
+                widgets=bool(self.config.mcp_apps_active) and not self._managed_mcp,
             )
 
             # Observer sessions of a review loop get a context block so the
@@ -1869,15 +1945,36 @@ class AgentEngine:
                 # Where the session comes from (its cron job, channel, ...),
                 # also fixed for the session.
                 inference_origin=inference_origin(session_origin(session or {})),
-                extra=(
+                # The tools of no use on the surface the session is read on:
+                # the system prompt above leaves them out of its list as well.
+                excluded_tools=frozenset(surface_excluded_tools(
+                    (session or {}).get("source") or source,
+                )),
+                extra={
                     # Per-session codex sandbox override (review-loop verifier
                     # legs run workspace-write instead of the global default).
-                    {"sandbox": str(session_meta.get("codex_sandbox"))}
-                    if session_meta.get("codex_sandbox") else {}
-                ),
+                    **(
+                        {"sandbox": str(session_meta.get("codex_sandbox"))}
+                        if session_meta.get("codex_sandbox") else {}
+                    ),
+                    # The chat's Daybreak switch. A client that is live
+                    # already gets a change through set_session_daybreak.
+                    **(
+                        {"daybreak": True}
+                        if session_meta.get("codex_daybreak") is True else {}
+                    ),
+                },
             )
 
-            client = await backend.create_client(spec)
+            async def _create(spec: SessionSpec) -> AgentClient:
+                try:
+                    return await backend.create_client(spec)
+                except ForkSourceMissingError:
+                    if not spec.fork:
+                        raise
+                    raise await self._fork_source_missing(session_id, fork_from) from None
+
+            client = await _create(spec)
             if getattr(client, "resume_dropped", False):
                 # The backend had to discard the stale native id (codex
                 # resume-miss recovery) — clear the persisted column AND
@@ -1889,6 +1986,17 @@ class AgentEngine:
                 sdk_resume_id = None
                 # The transcript is fresh after all — it needs the preamble.
                 deliver_preamble = static_prompt
+                if fork_from:
+                    # A fork whose own conversation is gone branches from
+                    # its source again, not from nothing.
+                    await self._safe_disconnect(client)
+                    is_fork = True
+                    fork_last_turn_id = (session or {}).get("fork_source_turn_id") or None
+                    spec = dc_replace(
+                        spec, resume_native_id=fork_from, fork=True,
+                        fork_last_turn_id=fork_last_turn_id,
+                    )
+                    client = await _create(spec)
             if deliver_preamble:
                 self._pending_preambles[session_id] = build_session_preamble(
                     session_id, source, recalled_memories or None,
@@ -1902,6 +2010,14 @@ class AgentEngine:
             self.agents.on_client_connected(
                 session_id, self._client_gen, backend=backend.name,
             )
+            if hasattr(client, "set_daybreak"):
+                # A rebuild lets go of the session's lock, so the chat's
+                # Daybreak switch can have changed since this build read the
+                # row. The client is registered now: a change from here on
+                # finds it, and an earlier one is in the row.
+                await self._apply_daybreak(
+                    client, self._row_metadata(await self.db.get_session(session_id)),
+                )
 
             # Stamp the sticky backend on first client build.
             if not (session or {}).get("backend"):
@@ -1922,7 +2038,9 @@ class AgentEngine:
             connected_at = session.get("connected_at") if session and sdk_resume_id else now
             await self.sessions.mark_active(
                 session_id,
-                sdk_session_id=sdk_resume_id,
+                # The resume target of a fork is its source, not its own id:
+                # the fork's own id comes from the runtime.
+                sdk_session_id=None if is_fork else sdk_resume_id,
                 connected_at=connected_at,
             )
             await self.db.update_session_fields(session_id, {"model": resolved_model})
@@ -1940,6 +2058,29 @@ class AgentEngine:
                 " (forked)" if is_fork else "",
             )
             return client
+
+    async def _fork_source_missing(
+        self, session_id: str, fork_from: str,
+    ) -> ForkSourceMissingError:
+        """The error for a fork whose source conversation is gone. Removes
+        the fork source first, so that the next message starts a new
+        conversation instead of failing again."""
+        logger.warning(
+            "Session %s: fork source %s is missing; the fork source is removed",
+            session_id, fork_from[:12],
+        )
+        await self._clear_fork_source(session_id)
+        return ForkSourceMissingError(
+            "The conversation that this fork branches from no longer exists, "
+            "so the agent does not have the copied messages. Your next "
+            "message starts a new conversation without them."
+        )
+
+    async def _clear_fork_source(self, session_id: str) -> None:
+        await self.db.update_session_fields(session_id, {
+            "fork_source_native_id": None, "fork_source_turn_id": None,
+        })
+        self._fork_sources.pop(session_id, None)
 
     def _wire_interaction_hooks(
         self, session_id: str, handler: InteractiveToolHandler,
@@ -2818,6 +2959,79 @@ class AgentEngine:
         except TypeError:
             return None
 
+    async def set_session_daybreak(self, session_id: str, enabled: bool) -> None:
+        """Store a chat's Daybreak switch and give it to its live client.
+
+        The switch is session metadata (``codex_daybreak``; absent = off). A
+        live Codex client takes the change for its next turn, without a new
+        runtime; a client built later reads the metadata. Under the
+        client-build lock, so that a first build and this change do not
+        interleave. A rebuild lets go of that lock: the client that it
+        builds takes the row's switch once it is registered
+        (:meth:`_get_or_create_client`). The write itself is under the
+        session's metadata lock, so that the end of a turn, which stores its
+        usage in the same metadata, does not write over it.
+        """
+        async with self.sessions.get_lock(session_id):
+            async with self._metadata_lock(session_id):
+                session = await self.db.get_session(session_id)
+                if not session:
+                    return
+                meta = self._row_metadata(session)
+                if enabled:
+                    meta["codex_daybreak"] = True
+                else:
+                    meta.pop("codex_daybreak", None)
+                await self.db.update_session_metadata(session_id, meta)
+            client = self.sessions.get_client(session_id)
+            if client is not None:
+                await self._apply_daybreak(client, meta)
+        logger.info(
+            "Session %s: Daybreak %s", session_id, "on" if enabled else "off",
+        )
+
+    def _metadata_lock(self, session_id: str) -> asyncio.Lock:
+        """The lock for a read-modify-write of one session's metadata.
+
+        The metadata is one JSON value, and a writer stores it whole. Two
+        writers that both read before either writes lose one of the changes.
+        The writers that can meet in a live chat take this lock around their
+        read and their write: the end of a turn (its usage) and the chat's
+        Daybreak switch.
+        """
+        lock = self._metadata_locks.get(session_id)
+        if lock is None:
+            lock = self._metadata_locks[session_id] = asyncio.Lock()
+        return lock
+
+    @staticmethod
+    def _row_metadata(session: dict | None) -> dict[str, Any]:
+        """The metadata of a session row ({} for no row and for no metadata)."""
+        try:
+            meta = json.loads((session or {}).get("metadata") or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return meta if isinstance(meta, dict) else {}
+
+    @staticmethod
+    async def _turn_refusal(client: AgentClient) -> str | None:
+        """Why the client's runtime will not start the next turn, if it says
+        so. An optional seam: only a Codex client has ``turn_refusal``."""
+        turn_refusal = getattr(client, "turn_refusal", None)
+        if not inspect.iscoroutinefunction(turn_refusal):
+            return None
+        reason = await turn_refusal()
+        return reason if isinstance(reason, str) and reason else None
+
+    @staticmethod
+    async def _apply_daybreak(client: AgentClient, session_meta: dict) -> None:
+        """Give a live client the Daybreak switch of its session's metadata.
+        Only a Codex client has the switch, and one that has this value
+        already does nothing."""
+        set_daybreak = getattr(client, "set_daybreak", None)
+        if inspect.iscoroutinefunction(set_daybreak):
+            await set_daybreak(session_meta.get("codex_daybreak") is True)
+
     async def get_client_connected_at_async(self, session_id: str) -> str | None:
         """Async version: get connected_at from DB."""
         session = await self.db.get_session(session_id)
@@ -2855,20 +3069,25 @@ class AgentEngine:
     ) -> dict:
         """Resume a stopped/idle session.
 
-        Records a ``created`` status event with reason ``resume`` and
-        ``attribution``, only when the status changes: a session that is
-        resumed already stays as it is, so of two resumes at the same time
-        only one is recorded.
+        A ``stopped``, ``idle`` or ``error`` session goes to ``created``, with
+        a ``created`` status event with reason ``resume`` and
+        ``attribution``. Any other status stays as it is and records
+        nothing: a session that runs keeps ``active``, and of two resumes at
+        the same time only one is recorded. The next message resumes the
+        stored native conversation.
         """
         info = await self.sessions.get_resume_info(session_id)
         if not info or not info.get("sdk_session_id"):
             raise ValueError(
                 f"Session {session_id} cannot be resumed (no SDK session)",
             )
-        # Mark as created so the next message will reconnect the client
         await self.sessions.transition(
             session_id, SessionStatus.CREATED, {"reason": "resume"},
             attribution=attribution,
+            only_from=(
+                SessionStatus.STOPPED.value, SessionStatus.IDLE.value,
+                SessionStatus.ERROR.value,
+            ),
         )
         session = await self.db.get_session(session_id)
         return session
@@ -3028,6 +3247,31 @@ class AgentEngine:
     #  Tool-result helpers                                                 #
     # ------------------------------------------------------------------ #
 
+    async def _mcp_app_for(
+        self, session_id: str, tool_name: str,
+    ) -> dict[str, str] | None:
+        """The MCP App that a tool call opens (the ``mcp_app`` field of its
+        event and block), or None.
+
+        Only a tool of a third-party MCP server can open one, and only the
+        session's live client knows (``AgentClient.mcp_app_for_tool``): a
+        runtime that does not host MCP Apps answers None. A lookup that fails
+        is logged, and the call goes on as an ordinary one.
+        """
+        if not is_third_party_tool(tool_name):
+            return None
+        try:
+            lookup = getattr(
+                self.sessions.get_client(session_id), "mcp_app_for_tool", None,
+            )
+            app = await lookup(tool_name) if lookup is not None else None
+        except Exception as e:  # noqa: BLE001 — never break a tool event
+            logger.debug(
+                "MCP App lookup of %s failed for session %s: %s", tool_name, session_id, e,
+            )
+            return None
+        return app if isinstance(app, dict) else None
+
     async def _process_tool_result(
         self,
         event: ToolResult,
@@ -3055,11 +3299,21 @@ class AgentEngine:
         }
 
         # Update matching tool_call in ordered_blocks
+        mcp_app_result = None
         if tool_use_id:
             for ob in reversed(ordered_blocks):
                 if ob.get("type") == "tool_call" and ob.get("tool_use_id") == tool_use_id:
                     ob["result"] = result_content
                     ob["is_error"] = is_error
+                    if ob.get("mcp_app") and not event.rejected:
+                        # The call opened an MCP App: its view gets the
+                        # result as an MCP CallToolResult. A call that the
+                        # person stopped or refused has none (what the
+                        # runtime says to the model in its place is not the
+                        # tool's): the view is told that it was cancelled.
+                        mcp_app_result = _mcp_app_result(event)
+                        if mcp_app_result is not None:
+                            ob["mcp_app_result"] = mcp_app_result
                     break
 
         await broadcaster.broadcast_tool_result(
@@ -3067,6 +3321,7 @@ class AgentEngine:
             tool_use_id=tool_use_id,
             is_error=is_error or False,
             parent_tool_use_id=event.parent_tool_use_id,
+            mcp_app_result=mcp_app_result,
         )
 
         await self._tool_result_side_effects(
@@ -3241,10 +3496,12 @@ class AgentEngine:
 
         elif isinstance(event, ToolUse):
             st.got_content = True
+            mcp_app = await self._mcp_app_for(session_id, event.name)
             await broadcaster.broadcast_tool_use(
                 session_id, event.name, event.input,
                 tool_use_id=event.tool_use_id,
                 parent_tool_use_id=event.parent_tool_use_id,
+                mcp_app=mcp_app,
             )
             # Track dynamic workflows.  A ``Workflow`` tool call spawns
             # a background runtime; later task_* system events carry
@@ -3261,12 +3518,15 @@ class AgentEngine:
                 "input": event.input,
                 "tool_use_id": event.tool_use_id,
             })
-            st.ordered_blocks.append({
+            block: dict[str, Any] = {
                 "type": "tool_call",
                 "tool": event.name,
                 "input": event.input,
                 "tool_use_id": event.tool_use_id,
-            })
+            }
+            if mcp_app:
+                block["mcp_app"] = mcp_app
+            st.ordered_blocks.append(block)
             # A spawning call (Agent/Task/Workflow/Monitor, background Bash)
             # creates the agent's record; TaskStop marks its target.
             await self.agents.note_main_tool_use(session_id, event)
@@ -3338,6 +3598,7 @@ class AgentEngine:
             st.last_usage = event.usage.to_anthropic_shape()
         if event.native_session_id:
             st.sdk_session_id = event.native_session_id
+            st.native_id_from_result = True
         if event.native_turn_id:
             st.native_turn_id = event.native_turn_id
         if event.model and not st.last_model:
@@ -3721,6 +3982,10 @@ class AgentEngine:
             await self.db.bind_native_thread(
                 backend.name, st.sdk_session_id, session_id,
             )
+            if st.native_id_from_result and session_id in self._fork_sources:
+                # The runtime finished a turn in the fork's own conversation:
+                # from now on the fork resumes it.
+                await self._clear_fork_source(session_id)
 
         # Persist usage for context bar on session switch. Backends that
         # report the serving model's context window (codex, via
@@ -3806,8 +4071,18 @@ class AgentEngine:
                 cost_basis = cost_source
                 estimated_cost = (st.result_meta or {}).get("estimated_cost_usd")
 
-            # Save metadata (includes _sdk_cumulative_cost update)
-            await self.db.update_session_metadata(session_id, meta)
+            # Save metadata (includes _sdk_cumulative_cost update). The keys
+            # of this turn go into the row as it is now, under the session's
+            # metadata lock: another writer (the chat's Daybreak switch) can
+            # have changed the row since this turn read it.
+            async with self._metadata_lock(session_id):
+                current = self._row_metadata(await self.db.get_session(session_id))
+                current.update({
+                    key: meta[key]
+                    for key in ("last_usage", "observed_model", "_sdk_cumulative_cost")
+                    if key in meta
+                })
+                await self.db.update_session_metadata(session_id, current)
 
             # The Anthropic API splits cache_creation by TTL:
             #   usage.cache_creation.ephemeral_5m_input_tokens  (1.25x base)
@@ -4296,41 +4571,10 @@ class AgentEngine:
             st.ordered_blocks.append({"type": "wakeup"})
 
         try:
-            # Get or create persistent client for this session
-            # Check if we need to fork from a parent
-            fork_from = None
-            fork_last_turn_id = None
-            if session:
-                parent_id = session.get("parent_session_id")
-                fork_msg = session.get("forked_from_message")
-                # Workflow legs carry parent_session_id for sidebar nesting only — never fork their fresh prompt from the parent (nor cross-backend).
-                if (parent_id and session.get("status") == SessionStatus.CREATED.value
-                        and session.get("source") != "workflow"):
-                    parent = await self.db.get_session(parent_id)
-                    if parent and parent.get("sdk_session_id"):
-                        if parent.get("backend") != session.get("backend"):
-                            raise ValueError(
-                                "Cannot fork a native session across agent backends"
-                            )
-                        fork_from = parent["sdk_session_id"]
-                        if fork_msg:
-                            fork_last_turn_id = await self.db.get_native_turn_at_message(
-                                parent_id, fork_msg,
-                            )
-                            # Both backends truncate by native turn id now
-                            # (codex: thread/fork lastTurnId; claude:
-                            # --resume-session-at). A message fork without a
-                            # mapping would silently carry the FULL context —
-                            # the opposite of what was asked — so refuse.
-                            if not fork_last_turn_id:
-                                raise ValueError(
-                                    "Cannot fork this session at the selected "
-                                    "message: no native turn mapping is available."
-                                )
-
+            # Get or create persistent client for this session (a fork
+            # branches from its stored source, see _get_or_create_client)
             client = await self._get_or_create_client(
-                session_id, source, model, fork_from=fork_from,
-                fork_last_turn_id=fork_last_turn_id,
+                session_id, source, model,
                 effort_override=effort_override,
             )
 
@@ -4340,6 +4584,14 @@ class AgentEngine:
                 return TurnResult("", self._end_turn(
                     session_id, TurnOutcome("interrupted", "stopped before the turn started"),
                 ))
+
+            # A runtime can refuse the turn (Codex: the chat's Daybreak
+            # switch is on and its model has no program). Asked here, before
+            # the turn takes its preamble and its agent notes, so that a
+            # refused turn uses up nothing.
+            refusal = await self._turn_refusal(client)
+            if refusal:
+                raise TurnRefusedError(refusal)
 
             # Drain autonomous-turn messages that buffered while no run was
             # active (background task settled in the race window before the
@@ -4446,7 +4698,7 @@ class AgentEngine:
                 _lf_tags.append(f"channel:{channel}")
             _lf_metadata = {
                 "parent_session_id": session.get("parent_session_id") if session else None,
-                "fork_from": fork_from,
+                "fork_from": session.get("fork_source_native_id") if session else None,
             }
             # Live marker so the UI shows the "scheduled wakeup" chip as the
             # turn streams (the persisted block above covers reload).
@@ -4604,6 +4856,14 @@ class AgentEngine:
             # Memorize in background — don't block the stop path
             await self.schedule_memorize(session_id)
             return TurnResult(partial, outcome)
+
+        except TurnRefusedError as refused:
+            # Nothing was sent and the runtime is as healthy as before: a
+            # failed turn like one that the runtime itself failed, not a
+            # crash. The client stays.
+            await self._process_agent_event(
+                session_id, TurnCompleted(status="failed", error=str(refused)), st,
+            )
 
         except Exception as e:
             error_msg = f"Agent error: {e}"

@@ -55,6 +55,7 @@ Consumers read from the inbox using the `poll_source` agent tool with a named co
 **Key properties:**
 - Consumer cursors are independent — multiple consumers can read the same source at different positions
 - New consumer cursors initialize to the latest message (no backlog flooding)
+- Before a source's first run, each consumer that reads every source gets a live cursor on the new source at its newest message (a live cursor that is already there stays as it is), so the first records of the new source are unread for that consumer and its `messages` gates see them. Such a consumer has a cursor on each other source that has messages, as `poll_all_sources` leaves it. A consumer that reads only some sources with `poll_source` gets no cursor on the new source
 - Consumer cursors expire after N days of inactivity (configurable, default: 2 days); a `messages` gate that checks the consumer renews the cursors it reads (see [cron.md](cron.md#messages))
 - Cross-source deduplication happens naturally because one agent session sees messages from all sources
 
@@ -148,8 +149,16 @@ visible rather than failing the fetch.
 - **First run:** Fetches from the last 24 hours
 - **Subsequent runs:** Uses `since=<cursor>` (inclusive: the cursor's own second is listed again, and an unchanged re-listed thread is skipped by storage) with `Z` suffix (not `+00:00` — the `+` in a URL query string is decoded as a space, breaking the filter)
 - **Filter:** `sync.github.inbox` decides which threads are listed. `participating` (the default) sends `participating=true`: only the threads the account takes part in (assigned, review requested, mentioned, its own, commented on). `all` leaves that parameter out, so GitHub lists the account's whole inbox as its GitHub watch settings produce it: the participating threads plus `subscribed` threads of watched repositories (new issues and pull requests, per the repository's watch or Custom watch setting), `ci_activity` for the account's own workflow runs, and whatever else GitHub puts in the inbox; the guardrails pick within it (see [GitHub reason guardrail](#github-reason-guardrail)). Both modes send `all=true` (read threads too). GitHub marks a thread read as soon as a mail client renders the notification email with its images, which can happen seconds after the notification, so a listing of unread threads alone can miss a thread before anyone has seen it; a re-listed thread whose stored record is unchanged is skipped by storage, and the record carries no read state. A thread that GitHub lists as read and that was last read more than a minute before its update is left out: GitHub moves the thread of the account's own merge or review and leaves it read. Note that in participating mode it never returns `ci_activity` — workflow-run notifications are not "participating", so CI never reaches the inbox through this source in participating mode (verified against a live account: 25 `ci_activity` listed with `all=true` alone, 0 once `participating=true` is added)
-- **Enrichment:** Each notification is enriched with actual content from the subject (PR/issue body, state, assignees, labels) and the latest comment, fetched in parallel (up to 5 concurrent `gh api` calls)
-- **Metadata:** `reason`, `repo_name`, `actors` (every login involved) and `ci_branch` (branch of a CheckSuite run, `""` otherwise) — all four are guardrail-filterable, see [Guardrails](#guardrails-inbox-filtering)
+- **Enrichment:** Each notification is enriched with actual content from the subject (PR/issue body, state, assignees, labels) and the latest comment, fetched in parallel (up to 5 concurrent `gh api` calls). A `mention`, `assign`, `review_requested` or `team_mention` thread also gets the human comments posted since the readers of the inbox last read a record of the thread, newest first (the latest comment is often a bot's, and a human comment before it would be lost). They are listed with `since`: the listing of one thread's comments takes no sort order and returns the oldest first
+- **Mentions:** GitHub's `reason` belongs to the thread, not to the update: once the account was mentioned anywhere in a thread, every later notification of that thread says `mention` (GitHub: "The reason remains as mention, regardless of whether you're ever mentioned again"). For an issue or pull request with that reason, the source reads what was posted since the readers of the inbox last read a record of the thread, and says in the record whether that mentions the account:
+  - `mention: new`: it does. With `mention_at`, and with `mention_by` and `mention_url` when the source read the text; the text is quoted in the content under `--- Mention ---`, also when a bot wrote it
+  - `mention: old`: it does not, and an earlier mention (`mention_at`) explains GitHub's reason. The summary line ends with `(update, no new mention)` instead of `(mention)`
+  - no `mention` key: not known, and the record says `mention` as GitHub does. That is the case when the login could not be read, when a read failed, and when no mention of the account was found at all. A record is moved away from `mention` on evidence only
+
+  `reason` stays `mention` in all three cases, so the [reason guardrail](#github-reason-guardrail) works as before. The description and the comments are checked against GitHub's own mention events of the thread (one GraphQL call), which also date a mention that an edit added. A pull request's reviews and inline review comments are checked by their text, as a whole `@login` outside Markdown code: GitHub writes no mention event for them, though it notifies. The login is the account `gh` acts as, read in every run that has such a thread and never kept between runs, so another account or a renamed one is used from the next run on. Not checked: `team_mention`, and subjects other than issues and pull requests
+
+  **New until read.** Storage keeps one record per thread and replaces it when the thread moves, and a reader comes on its own schedule (by default the inbox job every 30 minutes, this source every 15). So "new" is counted from the last record of the thread that every live consumer of the source has read: a mention that one record says is `new` is still `new`, with its text, in the record that replaces it, and it becomes `old` only in a record that follows one a reader has read. A consumer that stopped reading counts until its cursor expires (`sync.consumer_cursor_ttl_days`); until then a mention can be `new` again in later records of the thread, with the same `mention_at`. Where each look ended is remembered in the process. After a restart a thread is checked for the time since the sync cursor, and no later than a mention that an unread record says is `new`
+- **Metadata:** `reason`, `repo_name`, `actors` (every login involved) and `ci_branch` (branch of a CheckSuite run, `""` otherwise) — all four are guardrail-filterable, see [Guardrails](#guardrails-inbox-filtering). A `mention` thread can also carry `mention`, `mention_at`, `mention_by` and `mention_url` (see Mentions above). The summary line and the metadata reach a reader of the inbox as they are, also when the content was condensed
 - **Default schedule:** `*/15 * * * *` (every 15 min)
 - **Hosted mode:** with `sync.github.mode: hosted` the channel gateway polls GitHub instead; see below
 
@@ -289,7 +298,7 @@ on the `github_pr_activity` gate.
 - **First run:** Fetches the latest batch to establish a cursor baseline — no backfill of historical events
 - **Subsequent runs:** Fetches newest events, stops at the last-seen event ID
 - **Purpose:** Captures the user's **own** GitHub activity (pushes, PR creates/merges, reviews, comments, branch operations). Complements the notification source which only shows what *others* did involving you
-- **Username:** Auto-detected from `gh auth` on first call, or set manually via `username` config
+- **Username:** Set manually via `username` config, or else the account `gh` is signed in as, read in every run (a failed read falls back to the last login it returned)
 - **Repo filter:** Optional `repos` list — empty means all repos
 - **Event types:** PushEvent, PullRequestEvent, IssueCommentEvent, IssuesEvent, PullRequestReviewEvent, CreateEvent, DeleteEvent, ForkEvent (with type-specific formatting); other event types get generic formatting
 - **Note:** GitHub's Events API returns truncated payloads (e.g., PR titles and URLs may be missing). The source constructs URLs from repo name + number and handles missing fields gracefully
@@ -886,6 +895,12 @@ one account — and a non-empty `allow_actors` would drop it fail-closed. If you
 thread), `mention`, `team_mention`, `assign`, `review_requested`, `comment` (you commented
 on it once), `subscribed` (you only watch it), `manual` (you subscribed by hand),
 `ci_activity`, `state_change`, `security_alert`.
+
+A reason describes the thread, not the update, and it can outlive its cause: GitHub keeps
+`mention` on a thread after the first mention, so a later comment that mentions nobody
+arrives as `mention` too. The guardrail filters on the value as GitHub gives it. Whether
+the update itself mentions the account is in the `mention` metadata key (`new` or `old`,
+see Mentions under [GitHub](#github)).
 
 ```yaml
 sync:

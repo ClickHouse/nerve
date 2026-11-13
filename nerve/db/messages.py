@@ -121,6 +121,18 @@ class MessageStore:
             row = await cursor.fetchone()
         return str(row[0]) if row else None
 
+    async def get_last_native_turn(self, session_id: str) -> str | None:
+        """Return the native turn of the session's last completed turn, or
+        ``None`` when no message has one."""
+        async with self.db.execute(
+            """SELECT native_turn_id FROM messages
+               WHERE session_id = ? AND native_turn_id IS NOT NULL
+               ORDER BY id DESC LIMIT 1""",
+            (session_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return str(row[0]) if row else None
+
     async def copy_messages_to_session(
         self,
         source_session_id: str,

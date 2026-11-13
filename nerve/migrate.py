@@ -247,6 +247,10 @@ _MACHINE_LOCAL_PATHS = frozenset({
     # enable/disable, so it must not live in a git-tracked file.
     "external_agents",
     "mcp_endpoint",
+    # Whether this machine's gateway runs third-party views next to its web
+    # UI: decided for each box, where its web UI is built and its address is
+    # known, not for every instance that shares the settings.
+    "mcp_apps",
     # Only the journal location, not the rest of the section: the budget caps
     # and cadence are policy worth reviewing and sharing, while this is one
     # box's runtime directory. Publishing it would point every instance at a

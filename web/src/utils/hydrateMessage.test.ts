@@ -2,6 +2,15 @@ import { describe, expect, it } from 'vitest';
 import { hydrateMessage } from './hydrateMessage';
 
 describe('hydrateMessage', () => {
+  it('keeps the session a stored row is part of, and names none where the row names none', () => {
+    expect(hydrateMessage({ id: 1, role: 'assistant', session_id: 'chat-a', blocks: [] }).session_id).toBe('chat-a');
+    expect(hydrateMessage({ id: 2, role: 'user', session_id: 'chat-a', content: 'hi' }).session_id).toBe('chat-a');
+    // A row this tab made itself, and what is no session id.
+    expect('session_id' in hydrateMessage({ role: 'user', content: 'hi' })).toBe(false);
+    expect('session_id' in hydrateMessage({ role: 'assistant', session_id: 7, blocks: [] })).toBe(false);
+    expect('session_id' in hydrateMessage({ role: 'assistant', session_id: '', blocks: [] })).toBe(false);
+  });
+
   it('maps a spawn block\'s agent_id to agentId', () => {
     const message = hydrateMessage({
       id: 7, role: 'assistant',
@@ -16,6 +25,29 @@ describe('hydrateMessage', () => {
       { type: 'tool_call', toolUseId: 'toolu_b', tool: 'Read', input: { file_path: 'a.py' }, result: undefined, isError: undefined, status: 'complete', workflow: undefined },
     ]);
     expect('agentId' in message.blocks[1]).toBe(false);
+  });
+
+  it('maps the MCP Apps fields of a stored tool call', () => {
+    const appResult = { content: [{ type: 'text', text: '10:00' }], structuredContent: { time: '10:00' } };
+    const message = hydrateMessage({
+      id: 8, role: 'assistant',
+      blocks: [
+        {
+          type: 'tool_call', tool_use_id: 'toolu_app', tool: 'mcp__example-server__get-time', input: {}, result: '10:00',
+          mcp_app: { server: 'example-server', tool: 'get-time', resource_uri: 'ui://example/view.html' },
+          mcp_app_result: appResult,
+        },
+        { type: 'tool_call', tool_use_id: 'toolu_plain', tool: 'Read', input: { file_path: 'a.py' } },
+      ],
+    });
+
+    expect(message.blocks[0]).toMatchObject({
+      toolUseId: 'toolu_app', result: '10:00', status: 'complete',
+      mcpApp: { server: 'example-server', tool: 'get-time', resourceUri: 'ui://example/view.html' },
+      mcpAppResult: appResult,
+    });
+    expect('mcpApp' in message.blocks[1]).toBe(false);
+    expect('mcpAppResult' in message.blocks[1]).toBe(false);
   });
 
   it('keeps the triggers of an auto marker, and reads old markers as before', () => {

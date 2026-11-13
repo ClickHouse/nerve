@@ -155,6 +155,282 @@ def test_worker_wrapper_exchanges_token_and_injects_config(monkeypatch):
     assert captured["env"]["ULTRACODE_NO_AUTO_UPDATE"] == "1"
 
 
+# -- Daybreak: workers follow the switch of their parent chat ------------- #
+
+_REAL_BIN = "/usr/bin/codex-real"
+_CONFIG = ["--config", "mcp_servers.nerve.required=true"]
+# The command lines that Ultracode builds for a new worker and a warm one.
+_EXEC = [
+    "exec", "--json", "--ephemeral", "--skip-git-repo-check",
+    "--sandbox", "read-only", "-c", 'approval_policy="never"',
+    "--output-last-message", "/tmp/last.txt", "--cd", "/tmp/ws",
+]
+_RESUME = [
+    "exec", "resume", "--json", "--skip-git-repo-check", "th_1",
+    "-o", "/tmp/last.txt",
+]
+_GRANT = {
+    "token": "worker-token", "worker_id": "ultracode-0123456789abcdef",
+    "expires_in": 7200,
+}
+# The broker's entry for a chat on gpt-6-sol that has Daybreak on.
+_DAYBREAK = {
+    "model": "gpt-6-sol",
+    "programs": {"gpt-6-sol": "daybreak_blue", "gpt-6-luna": "daybreak_red"},
+}
+_BLUE = ["--cyber-access-program", "daybreak_blue"]
+# The same entry from a Codex whose ``exec`` has no flag for the program.
+_NO_FLAG = {**_DAYBREAK, "workers_need_codex": "0.161.0"}
+# Root-level options before the subcommand.
+_OPTIONS_FIRST = ["-c", 'model_reasoning_effort="high"', *_EXEC, "-m", "gpt-6-sol", "-"]
+
+
+def _as_before_the_switch(worker_argv):
+    """The command line that a Nerve without the Daybreak switch starts:
+    Nerve's MCP configuration right after ``exec`` or ``app-server``, and
+    before any other command."""
+    if worker_argv[0] in ("exec", "app-server"):
+        return [_REAL_BIN, worker_argv[0], *_CONFIG, *worker_argv[1:]]
+    return [_REAL_BIN, *_CONFIG, *worker_argv]
+
+
+class _CodexStarted(Exception):
+    pass
+
+
+def _run_worker_wrapper(monkeypatch, worker_argv, grant):
+    """Run the wrapper with a broker that answers ``grant``.
+
+    Returns the exit code and the command line it starts Codex with. A
+    started Codex has no exit code; a wrapper that returns started none.
+    """
+    class Response:
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def read(self):
+            return json.dumps(grant).encode()
+
+    started = []
+    monkeypatch.setenv("NERVE_CODEX_REAL_BIN", _REAL_BIN)
+    monkeypatch.setenv("NERVE_MCP_TOKEN", "parent-token")
+    monkeypatch.setenv("NERVE_MCP_WORKER_TOKEN_URL", "http://127.0.0.1/token")
+    monkeypatch.setenv("NERVE_CODEX_CHILD_CONFIG", json.dumps(_CONFIG[1:]))
+    monkeypatch.setattr(worker_wrapper.urllib.request, "urlopen", lambda *a, **k: Response())
+    monkeypatch.setattr(worker_wrapper.sys, "argv", ["codex-worker", *worker_argv])
+
+    def fake_exec(file, argv, env):
+        started.append(argv)
+        raise _CodexStarted
+
+    monkeypatch.setattr(worker_wrapper.os, "execvpe", fake_exec)
+    try:
+        return worker_wrapper.main(), None
+    except _CodexStarted:
+        return None, started[0]
+
+
+@pytest.mark.parametrize("worker_argv", [
+    [*_EXEC, "-m", "gpt-6-sol", "-"],
+    [*_EXEC, "-mgpt-6-sol", "-"],
+    [*_EXEC, "-m=gpt-6-astra", "-"],
+    [*_EXEC, "-"],
+    [*_RESUME, "-m", "gpt-6-astra", "-"],
+    ["e", *_EXEC[1:], "-m", "gpt-6-sol", "-"],
+    _OPTIONS_FIRST,
+    ["app-server"],
+    ["--version"],
+])
+def test_worker_command_line_is_unchanged_without_daybreak(monkeypatch, worker_argv):
+    """Off is the default: the broker's answer has no ``daybreak`` entry, and
+    the worker starts with the command line it always had."""
+    code, argv = _run_worker_wrapper(monkeypatch, worker_argv, _GRANT)
+    assert code is None
+    assert argv == _as_before_the_switch(worker_argv)
+    if worker_argv[0] == "exec":
+        assert argv == [_REAL_BIN, "exec", *_CONFIG, *worker_argv[1:]]
+
+
+@pytest.mark.parametrize("model_args", [
+    ["-m", "gpt-6-sol"], ["-mgpt-6-sol"], ["-m=gpt-6-sol"],
+    ["--model", "gpt-6-sol"], ["--model=gpt-6-sol"],
+])
+def test_worker_gets_the_program_of_its_model(monkeypatch, model_args):
+    """Every way to name the model: the program is the model's, and the
+    wrapper adds no model of its own."""
+    worker_argv = [*_EXEC, *model_args, "-"]
+    code, argv = _run_worker_wrapper(
+        monkeypatch, worker_argv, {**_GRANT, "daybreak": _DAYBREAK},
+    )
+    assert code is None
+    assert argv == [_REAL_BIN, "exec", *_CONFIG, *_BLUE, *worker_argv[1:]]
+
+
+@pytest.mark.parametrize("model_args", [
+    ["-m", "gpt-6-luna"], ["-mgpt-6-luna"], ["-m=gpt-6-luna"],
+])
+def test_worker_program_is_the_one_of_the_workers_own_model(monkeypatch, model_args):
+    worker_argv = [*_EXEC, *model_args, "-"]
+    _, argv = _run_worker_wrapper(
+        monkeypatch, worker_argv, {**_GRANT, "daybreak": _DAYBREAK},
+    )
+    assert argv == [
+        _REAL_BIN, "exec", *_CONFIG, "--cyber-access-program", "daybreak_red",
+        *worker_argv[1:],
+    ]
+
+
+def test_worker_without_a_model_runs_on_the_model_of_the_chat(monkeypatch):
+    worker_argv = [*_EXEC, "-"]
+    _, argv = _run_worker_wrapper(
+        monkeypatch, worker_argv, {**_GRANT, "daybreak": _DAYBREAK},
+    )
+    assert argv == [
+        _REAL_BIN, "exec", *_CONFIG, *_BLUE, "-m", "gpt-6-sol", *worker_argv[1:],
+    ]
+
+
+@pytest.mark.parametrize("model_args, added", [
+    (["-m", "gpt-6-sol"], _BLUE),
+    (["-mgpt-6-sol"], _BLUE),
+    ([], [*_BLUE, "-m", "gpt-6-sol"]),
+])
+def test_warm_worker_gets_the_program_after_resume(monkeypatch, model_args, added):
+    worker_argv = [*_RESUME, *model_args, "-"]
+    _, argv = _run_worker_wrapper(
+        monkeypatch, worker_argv, {**_GRANT, "daybreak": _DAYBREAK},
+    )
+    assert argv == [_REAL_BIN, "exec", *_CONFIG, "resume", *added, *worker_argv[2:]]
+
+
+@pytest.mark.parametrize("worker_argv, added_at", [
+    (["e", *_EXEC[1:], "-m", "gpt-6-sol", "-"], 1),
+    (["e", *_RESUME[1:], "-m", "gpt-6-sol", "-"], 2),
+])
+def test_worker_started_with_the_alias_of_exec_gets_the_program(
+    monkeypatch, worker_argv, added_at,
+):
+    """``codex e`` is ``codex exec``."""
+    code, argv = _run_worker_wrapper(
+        monkeypatch, worker_argv, {**_GRANT, "daybreak": _DAYBREAK},
+    )
+    assert code is None
+    assert argv == [
+        _REAL_BIN, *_CONFIG, *worker_argv[:added_at], *_BLUE, *worker_argv[added_at:],
+    ]
+
+
+@pytest.mark.parametrize("worker_argv, daybreak, model", [
+    # The worker names a model that has no program.
+    ([*_EXEC, "-m", "gpt-6-astra", "-"], _DAYBREAK, "gpt-6-astra"),
+    ([*_EXEC, "-mgpt-6-astra", "-"], _DAYBREAK, "gpt-6-astra"),
+    ([*_EXEC, "-m=gpt-6-astra", "-"], _DAYBREAK, "gpt-6-astra"),
+    ([*_RESUME, "--model=gpt-6-astra", "-"], _DAYBREAK, "gpt-6-astra"),
+    (["e", *_EXEC[1:], "-m", "gpt-6-astra", "-"], _DAYBREAK, "gpt-6-astra"),
+    # The worker takes the chat's model, which has none (access was lost).
+    ([*_EXEC, "-"], {"model": "gpt-6-sol", "programs": {}}, "gpt-6-sol"),
+    # An entry that is not what the broker sends.
+    ([*_EXEC, "-m", "gpt-6-sol", "-"], "on", "gpt-6-sol"),
+])
+def test_worker_whose_model_has_no_program_is_not_started(
+    monkeypatch, capsys, worker_argv, daybreak, model,
+):
+    code, argv = _run_worker_wrapper(
+        monkeypatch, worker_argv, {**_GRANT, "daybreak": daybreak},
+    )
+    assert code == 1
+    assert argv is None                     # Codex was not started
+    message = capsys.readouterr().err
+    assert f"model '{model}' has no Daybreak program" in message
+    assert "Turn Daybreak off or choose another model." in message
+
+
+@pytest.mark.parametrize("worker_argv", [
+    _OPTIONS_FIRST,
+    ["--config", "features.plan=false", *_RESUME, "-"],
+    ["-c", "features.plan=false", "e", *_EXEC[1:], "-m", "gpt-6-sol", "-"],
+])
+def test_worker_with_options_before_exec_is_not_started(monkeypatch, capsys, worker_argv):
+    """Options before ``exec`` are a form that the wrapper cannot put the
+    flag into. It does not guess, and it does not let the worker run
+    without the program."""
+    code, argv = _run_worker_wrapper(
+        monkeypatch, worker_argv, {**_GRANT, "daybreak": _DAYBREAK},
+    )
+    assert code == 1
+    assert argv is None                     # Codex was not started
+    assert capsys.readouterr().err.strip() == (
+        "nerve: Daybreak is on for this chat, but Nerve cannot add its program "
+        "to a worker command that has options before `exec`. The worker was "
+        "not started. Turn Daybreak off to run such a worker."
+    )
+
+
+@pytest.mark.parametrize("worker_argv", [
+    [*_EXEC, "-m", "gpt-6-sol", "-"],
+    [*_EXEC, "-"],
+    [*_RESUME, "-m", "gpt-6-sol", "-"],
+])
+def test_worker_is_not_started_on_a_codex_whose_exec_has_no_flag(
+    monkeypatch, capsys, worker_argv,
+):
+    """``codex exec`` takes ``--cyber-access-program`` from 0.161.0, and the
+    broker marks an older Codex (and one of an unknown version). The model
+    has a program here, and the worker is still not started: with the flag
+    that Codex stops on its command line, and without it the worker runs
+    without the program."""
+    code, argv = _run_worker_wrapper(
+        monkeypatch, worker_argv, {**_GRANT, "daybreak": _NO_FLAG},
+    )
+    assert code == 1
+    assert argv is None                     # Codex was not started
+    assert capsys.readouterr().err.strip() == (
+        "nerve: Daybreak is on for this chat, but this Codex version cannot "
+        "pass it to workers: that needs Codex 0.161.0 or newer. The worker "
+        "was not started. Turn Daybreak off or update Codex."
+    )
+
+
+@pytest.mark.parametrize("daybreak", [_DAYBREAK, _NO_FLAG], ids=["flag", "no-flag"])
+@pytest.mark.parametrize("worker_argv", [
+    ["app-server"],
+    ["-c", "features.plan=false", "app-server"],
+])
+def test_worker_of_the_app_server_transport_is_not_started(
+    monkeypatch, capsys, worker_argv, daybreak,
+):
+    """A worker of the ``app-server`` transport takes its turns over its own
+    connection: the wrapper cannot add the program there, and it does not let
+    the worker run without it. (Ultracode then runs the worker on ``exec``,
+    where the wrapper adds the program.)"""
+    code, argv = _run_worker_wrapper(
+        monkeypatch, worker_argv, {**_GRANT, "daybreak": daybreak},
+    )
+    assert code == 1
+    assert argv is None                     # Codex was not started
+    assert capsys.readouterr().err.strip() == (
+        "nerve: Daybreak is on for this chat, but Nerve cannot give its program "
+        "to a worker of the `app-server` transport. The worker was not started. "
+        "Run the worker on the `exec` transport, or turn Daybreak off."
+    )
+
+
+@pytest.mark.parametrize("daybreak", [_DAYBREAK, _NO_FLAG], ids=["flag", "no-flag"])
+@pytest.mark.parametrize("worker_argv", [
+    ["--version"],
+    ["login", "status"],
+])
+def test_command_that_runs_no_worker_is_left_alone(monkeypatch, worker_argv, daybreak):
+    """A command with neither ``exec`` nor ``app-server`` runs no worker: it
+    starts as it always did, also for a chat that has Daybreak on."""
+    code, argv = _run_worker_wrapper(
+        monkeypatch, worker_argv, {**_GRANT, "daybreak": daybreak},
+    )
+    assert code is None
+    assert argv == _as_before_the_switch(worker_argv)
+
+
 def test_external_mcp_secrets_are_env_referenced_and_inherited_by_worker(
     tmp_path, monkeypatch,
 ):

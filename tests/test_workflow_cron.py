@@ -339,6 +339,31 @@ class TestRunWorkflowJob:
         cron_service.db.log_cron_start.assert_not_called()
         workflow_service.start_run.assert_not_called()
 
+    async def test_gate_notes_follow_the_workflow_prompt(self, cron_service, workflow_service):
+        from nerve.cron.gates import CronGate
+
+        class _Noting(CronGate):
+            type = "noting"
+
+            async def is_satisfied(self, ctx):
+                ctx.notes.append("## Run gate: test\n\nrows")
+                return True
+
+            def describe(self):
+                return "noting"
+
+            @classmethod
+            def from_config(cls, spec):
+                return cls()
+
+        job = _workflow_job()
+        job.gates = [_Noting()]
+
+        await cron_service._run_job_inner(job)
+
+        spec = workflow_service.start_run.await_args.kwargs["spec"]
+        assert spec["prompt"] == "audit the repo\n\n---\n\n## Run gate: test\n\nrows"
+
     async def test_prompt_jobs_unaffected(self, cron_service, workflow_service):
         job = CronJob(id="plain", schedule="1h", prompt="do stuff")
 

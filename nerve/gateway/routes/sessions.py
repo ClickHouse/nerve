@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from nerve.agent.backends.base import BackendError
+from nerve.agent.backends.codex import daybreak
 from nerve.agent.interactive import get_awaiting_ids
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
@@ -100,6 +101,10 @@ class SessionCreateRequest(BaseModel):
     # overrides on the WS path can still change it later.
     model: str | None = None
     cwd: str | None = None
+    # The Daybreak switch of a new Codex chat (the composer's toggle). Off
+    # when omitted; refused for another backend, and for a model without a
+    # Daybreak program for the signed-in Codex account.
+    codex_daybreak: bool | None = None
     # Optional review loop attached at creation: this session becomes the
     # loop's observer (milestones land here; cwd is the shared workspace).
     review_loop: ReviewLoopRequest | None = None
@@ -235,6 +240,89 @@ async def _attach_origins(deps, sessions: list[dict]) -> None:
         s.update(origin_fields(s, channel_keys.get(s["id"])))
 
 
+def _is_codex(session: dict) -> bool:
+    """Whether a session row is a Codex chat. The backend is on the row, and
+    stays what it is for the life of the session."""
+    return session.get("backend") == "codex"
+
+
+def _stamp_daybreak(session: dict) -> dict:
+    """Add ``codex_daybreak``, the chat's Daybreak switch, to the payload of
+    a Codex session. The payload of another backend's session stays as it
+    is: such a session has no switch."""
+    if _is_codex(session):
+        session["codex_daybreak"] = daybreak.enabled(session)
+    return session
+
+
+async def _daybreak_programs(deps) -> dict[str, str] | None:
+    """Model id → Daybreak program of the signed-in Codex account, from the
+    Codex backend's (cached) preflight of the live catalog. ``None`` when the
+    catalog cannot be read now."""
+    backend = deps.engine._backends.get("codex")
+    preflight = await backend.preflight() if backend is not None else {}
+    if not preflight.get("available"):
+        return None
+    return dict(preflight.get("daybreak_programs") or {})
+
+
+async def _validate_daybreak(deps, codex: bool, model: str, enabled: bool) -> None:
+    """Refuse a Daybreak switch that cannot work: any value for a session of
+    another backend (400), and on for a model that has no program for the
+    signed-in Codex account (400), or while nothing can tell (503)."""
+    if not codex:
+        raise HTTPException(
+            status_code=400,
+            detail="Daybreak is only available for Codex sessions",
+        )
+    if not enabled:
+        return
+    programs = await _daybreak_programs(deps)
+    if programs is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Daybreak cannot be turned on: Codex is unavailable",
+        )
+    if model not in programs:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Daybreak cannot be turned on: {daybreak.no_program(model)}",
+        )
+
+
+async def _daybreak_change(
+    deps, session: dict, req: dict, new_model: str | None,
+) -> tuple[bool | None, str | None]:
+    """What an update does to a chat's Daybreak switch: ``(value, notice)``.
+
+    ``value`` is the switch after the update, or ``None`` when it stays as it
+    is. A request for the switch is validated against the model that the
+    session has after the update. A model change alone keeps the switch,
+    unless the catalog shows no program for the new model: then the switch
+    goes off, and ``notice`` says so.
+    """
+    if "codex_daybreak" in req:
+        wanted = req["codex_daybreak"]
+        if not isinstance(wanted, bool):
+            raise HTTPException(
+                status_code=400, detail="codex_daybreak must be true or false",
+            )
+        codex = _is_codex(session)
+        model = new_model or session.get("model")
+        if not model and codex and "codex" in deps.engine._backends:
+            # No model on the row yet: the engine takes the backend's default.
+            model = deps.engine._backends["codex"].default_model(
+                session.get("source") or "web",
+            )
+        await _validate_daybreak(deps, codex, model or "", wanted)
+        return (wanted if wanted != daybreak.enabled(session) else None), None
+    if new_model and _is_codex(session) and daybreak.enabled(session):
+        programs = await _daybreak_programs(deps)
+        if programs is not None and new_model not in programs:
+            return False, f"Daybreak was turned off: {daybreak.no_program(new_model)}."
+    return None, None
+
+
 def _page_size() -> int | None:
     """Sidebar page size from config; ``None`` when configured unlimited."""
     size = get_config().sessions.sidebar_page_size
@@ -290,6 +378,7 @@ async def _decorate(deps, sessions: list[dict], *, add_needs_you: bool = False) 
         s["background_count"] = _background_count(deps, s["id"], s["has_background_tasks"])
         if s["id"] in loops:
             s["review_loop"] = _loop_summary(loops[s["id"]])
+        _stamp_daybreak(s)
     await _attach_origins(deps, sessions)
     return sessions
 
@@ -413,6 +502,10 @@ async def create_session(req: SessionCreateRequest, actor: Actor = Depends(requi
             except BackendError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
     model = requested_model or selected_backend.default_model(req.source)
+    if req.codex_daybreak is not None:
+        await _validate_daybreak(deps, backend == "codex", model, req.codex_daybreak)
+        if req.codex_daybreak:
+            metadata = {**(metadata or {}), daybreak.METADATA_KEY: True}
     session_id = str(uuid.uuid4())[:8]
     session = await deps.engine.sessions.get_or_create(
         session_id, title=req.title, source=req.source, metadata=metadata,
@@ -424,7 +517,7 @@ async def create_session(req: SessionCreateRequest, actor: Actor = Depends(requi
     if req.review_loop is not None:
         session = await _attach_review_loop(deps, session, session_id, cwd, req, actor)
     await _attach_origins(deps, [session])
-    return session
+    return _stamp_daybreak(session)
 
 
 async def _attach_review_loop(
@@ -490,7 +583,7 @@ async def get_session(session_id: str, actor: Actor = Depends(require_auth)):
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
     await _attach_origins(deps, [session])
-    return session
+    return _stamp_daybreak(session)
 
 
 @router.get("/api/sessions/{session_id}/messages")
@@ -538,7 +631,8 @@ async def _would_create_cycle(db, child_id: str, new_parent_id: str) -> bool:
 
 @router.patch("/api/sessions/{session_id}")
 async def update_session(session_id: str, req: dict, actor: Actor = Depends(require_auth)):
-    """Update session fields (title, starred, model, parent_session_id).
+    """Update session fields (title, starred, model, parent_session_id,
+    codex_daybreak).
 
     ``parent_session_id`` is the sidebar drag-to-nest relationship (null clears
     it → top-level). It is display-only: guarded against self/cycle links and
@@ -548,6 +642,12 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
     per-chat, not a global preference. The engine re-reads the session
     row each turn (per-message override -> ``sessions.model`` -> backend
     default), so the switch takes effect on the session's next message.
+
+    ``codex_daybreak`` sets the Daybreak switch of a Codex chat for its next
+    message (400 for another backend, and for turning it on with a model that
+    has no Daybreak program for the signed-in Codex account). A ``model``
+    change to a model without a program turns the switch off; the response
+    then carries ``codex_daybreak_notice``.
 
     When ``sessions.star_project_hook`` is enabled (default off), a ``starred``
     0<->1 transition fires a one-shot internal turn in that same session so the
@@ -609,32 +709,13 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
                 raise HTTPException(status_code=400, detail="A session cannot be its own parent")
             if not await deps.db.get_session(new_parent):
                 raise HTTPException(status_code=404, detail="Parent session not found")
-            # Fork-window guard: the engine reads parent_session_id to fork a
-            # brand-new session's first turn ONLY while status == 'created'.
-            # Refuse to set a parent in that window so a display drag can never
-            # turn a not-yet-started session into a fork. Anything already run
-            # (everything draggable in the sidebar) is unaffected.
-            if session.get("status") == "created":
-                raise HTTPException(
-                    status_code=409,
-                    detail="Send a first message before nesting this session",
-                )
             if await _would_create_cycle(deps.db, session_id, new_parent):
                 raise HTTPException(status_code=400, detail="That drop would create a cycle")
-        elif (
-            session.get("status") == "created"
-            and session.get("parent_session_id")
-        ):
-            # Symmetric fork-window guard: clearing the parent of a
-            # not-yet-started fork would silently discard the fork context
-            # its first turn is about to branch from.
-            raise HTTPException(
-                status_code=409,
-                detail="This fork hasn't started yet — send its first "
-                       "message before un-nesting it",
-            )
+        # Display only: a fork branches from the source that fork_session
+        # stored on its row, not from its parent.
         fields["parent_session_id"] = new_parent
-    if not fields:
+    switch, notice = await _daybreak_change(deps, session, req, fields.get("model"))
+    if not fields and "codex_daybreak" not in req:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     old_starred = int(session.get("starred") or 0)
     attribution = attribution_for(actor)
@@ -648,6 +729,8 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
             fields["status"] = "idle"
             fields["archived_at"] = None
     await deps.db.change_session_fields(session_id, fields, attribution=attribution)
+    if switch is not None:
+        await deps.engine.set_session_daybreak(session_id, switch)
     updated = await deps.db.get_session(session_id)
     # Star = opt-in project registration (sessions.star_project_hook, default
     # off). On a starred transition fire a one-shot internal turn. An
@@ -678,6 +761,10 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
             )
         except Exception as e:  # a hook failure must never break the PATCH
             logger.warning("star-project hook failed for %s: %s", session_id, e)
+    if updated:
+        _stamp_daybreak(updated)
+        if notice:
+            updated["codex_daybreak_notice"] = notice
     return updated
 
 
@@ -814,7 +901,7 @@ async def fork_session(req: ForkRequest, actor: Actor = Depends(require_auth)):
             actor=actor,
         )
         await _attach_origins(deps, [fork])
-        return fork
+        return _stamp_daybreak(fork)
     except ValueError as e:
         status = 404 if "not found" in str(e).lower() else 409
         raise HTTPException(status_code=status, detail=str(e))
@@ -963,7 +1050,7 @@ async def resume_session(session_id: str, actor: Actor = Depends(require_auth)):
         session = await deps.engine.resume_session(
             session_id, attribution=attribution_for(actor),
         )
-        return session
+        return _stamp_daybreak(session) if session else session
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

@@ -107,6 +107,11 @@ class ToolResult:
     carried exactly one tool result). For the Agent tool it is the launch
     receipt (``status``, ``agentId``, ``outputFile``) or the foreground
     completion (``content``, ``totalTokens``, ``totalToolUseCount``).
+
+    ``rejected`` is true when the person stopped or refused the call
+    (Claude: the CLI's ``tool_use_result`` is its rejection notice).
+    ``content`` is then the runtime's notice to the model, not a result of
+    the tool.
     """
 
     tool_use_id: str | None
@@ -114,6 +119,7 @@ class ToolResult:
     is_error: bool = False
     parent_tool_use_id: str | None = None
     structured: dict[str, Any] | None = None
+    rejected: bool = False
 
 
 @dataclass

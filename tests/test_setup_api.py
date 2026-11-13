@@ -895,10 +895,27 @@ class TestProviderKinds:
         agent = claimed.settings_yaml()["agent"]
         assert (agent["model"], agent["cron_model"]) == (DEFAULT_MODEL, DEFAULT_CRON_MODEL)
 
+    async def test_models_endpoint_without_discovery(self, claimed, monkeypatch):
+        """By default the page lists the built-in models, the same list as the
+        composer's model menu, and fetches no catalog."""
+        from nerve import models_catalog
+        from nerve.config import DEFAULT_CLAUDE_MODELS
+
+        async def _models(_config):
+            raise AssertionError("discovery is off: no catalog fetch")
+
+        monkeypatch.setattr(models_catalog, "get_models", _models)
+        async with claimed.client() as http:
+            body = (await http.get("/api/setup/models")).json()
+        assert [m["id"] for m in body["models"]] == list(DEFAULT_CLAUDE_MODELS)
+        assert [m["id"] for m in body["models"] if m["recommended"]] == [DEFAULT_MODEL]
+        assert body["discovered"] is False
+
     async def test_models_endpoint(self, claimed, monkeypatch):
-        """The configured (default) model first, then the catalog as the API
-        orders it; Fable is its own family; ``default_model`` names Nerve's
-        default even when the instance is changed to another model."""
+        """With discovery on: the catalog as the API orders it (the configured
+        model leads only when the catalog lacks it); Fable is its own family;
+        ``default_model`` names Nerve's default even when the instance is
+        changed to another model."""
         from nerve import models_catalog
 
         catalog = ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "claude-fable-5-1", "claude-opus-5"]
@@ -907,11 +924,11 @@ class TestProviderKinds:
             return list(catalog)
 
         monkeypatch.setattr(models_catalog, "get_models", _models)
+        merge_settings_paths(claimed.workspace, {"agent.model_discovery": True})
+        claimed.reload()
         async with claimed.client() as http:
             body = (await http.get("/api/setup/models")).json()
-            assert [m["id"] for m in body["models"]] == [
-                "claude-opus-5-5", "claude-haiku-5-5", "claude-sonnet-5-5", "claude-fable-5-1", "claude-opus-5",
-            ]
+            assert [m["id"] for m in body["models"]] == catalog
             by_id = {m["id"]: m for m in body["models"]}
             assert by_id["claude-opus-5-5"] == {
                 "id": "claude-opus-5-5", "label": "Claude Opus 5.5", "family": "opus", "recommended": True,
@@ -919,7 +936,7 @@ class TestProviderKinds:
             assert by_id["claude-fable-5-1"] == {
                 "id": "claude-fable-5-1", "label": "Claude Fable 5.1", "family": "fable", "recommended": False,
             }
-            assert [m["family"] for m in body["models"]] == ["opus", "haiku", "sonnet", "fable", "opus"]
+            assert [m["family"] for m in body["models"]] == ["haiku", "sonnet", "opus", "fable", "opus"]
             assert body["current"] == {"model": DEFAULT_MODEL, "effort": DEFAULT_EFFORT}
             assert body["default_model"] == DEFAULT_MODEL == "claude-opus-5-5"
             assert body["efforts"] == ["max", "xhigh", "high", "medium", "low"]
@@ -928,7 +945,7 @@ class TestProviderKinds:
             # the default is still named so the page can say which one it is.
             await http.put("/api/setup/provider", json={"model": "claude-fable-5-1"})
             body = (await http.get("/api/setup/models")).json()
-        assert [m["id"] for m in body["models"]][:2] == ["claude-fable-5-1", "claude-haiku-5-5"]
+        assert [m["id"] for m in body["models"]] == catalog
         assert [m["id"] for m in body["models"] if m["recommended"]] == ["claude-fable-5-1"]
         assert body["current"]["model"] == "claude-fable-5-1"
         assert body["default_model"] == "claude-opus-5-5"
@@ -951,6 +968,8 @@ class TestProviderKinds:
 
         monkeypatch.setattr(models_catalog, "fetch_models", _fetch)
         monkeypatch.setattr(setup_checks, "provider_test", _probe)
+        merge_settings_paths(claimed.workspace, {"agent.model_discovery": True})
+        claimed.reload()
         async with claimed.client() as http:
             # No key yet: the picker falls back to the built-in list and the
             # catalog remembers a no-key failure for *this* fingerprint.
@@ -985,6 +1004,8 @@ class TestProviderKinds:
             return ["claude-opus-5-5", "claude-sonnet-5-5"] if key else []
 
         monkeypatch.setattr(models_catalog, "fetch_models", _fetch)
+        merge_settings_paths(claimed.workspace, {"agent.model_discovery": True})
+        claimed.reload()
         async with claimed.client() as http:
             assert (await http.get("/api/setup/models")).json()["discovered"] is False
             assert (await http.get("/api/setup/models")).json()["discovered"] is False
@@ -2662,7 +2683,7 @@ def test_model_labels_are_formatted_consistently():
     from nerve.config import DEFAULT_CLAUDE_MODELS
 
     assert [setup_routes._label(m) for m in DEFAULT_CLAUDE_MODELS] == [
-        "Claude Opus 5.5", "Claude Fable 5.2", "Claude Sonnet 5.5", "Claude Haiku 5.5",
+        "Claude Fable 5.2", "Claude Opus 5.5", "Claude Sonnet 5.5", "Claude Haiku 5.5",
     ]
 
 
@@ -3828,6 +3849,9 @@ class TestNoLocalSecrets:
 
         monkeypatch.setattr(setup_checks, "telegram_get_me", _get_me_then_flip)
         monkeypatch.setattr(models_catalog, "get_models", _catalogue_then_flip)
+        # The catalogue is fetched only with discovery on.
+        merge_settings_paths(claimed.workspace, {"agent.model_discovery": True})
+        claimed.reload()
         async with claimed.client() as http:
             refused = await http.put("/api/setup/channels", json={"telegram": {"bot_token": _TG_TOKEN}})
             assert refused.status_code == 409 and refused.json()["detail"] == _NO_SECRETS

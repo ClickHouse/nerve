@@ -171,6 +171,17 @@ def _header_name(line: str) -> str:
     return line[:index].strip().lower() if index >= 0 else ""
 
 
+def has_custom_header_line(name: str, environ: Mapping[str, str] | None = None) -> bool:
+    """Whether ``ANTHROPIC_CUSTOM_HEADERS`` in the environment has a line for
+    the header ``name``, in any case. The Anthropic SDK reads the lines the
+    same way: split on ``\\n``, the name before the first ``:``."""
+    env = os.environ if environ is None else environ
+    return any(
+        _header_name(line) == name.lower()
+        for line in env.get(CUSTOM_HEADERS_ENV, "").split("\n")
+    )
+
+
 def direct_client_headers(
     environ: Mapping[str, str] | None = None, *, principal_id: str | None = None,
 ) -> dict[str, object]:

@@ -4,6 +4,8 @@
 
 Nerve uses APScheduler for in-process async job scheduling. Jobs can run in isolated sessions (fresh each time) or persistent sessions (context preserved across runs) and deliver output to configured channels.
 
+You do not have to write jobs yourself. When you ask the agent in a chat for work that you will probably want again, it offers to do it on a schedule, and it adds the job after you say yes (see [the system prompt](architecture.md#user-message-telegram)).
+
 ## Two-File Layout
 
 Cron jobs live in two YAML files under `<workspace>/config/cron/` (the
@@ -204,7 +206,13 @@ When multiple gates are listed, the job runs only if every one passes:
 
 Gates are **fail-open while checking**: if a gate raises during evaluation (e.g.
 a transient DB issue), the run proceeds rather than being skipped — an occasional
-wasted run beats a cron that silently never fires.
+wasted run beats a cron that silently never fires. `clickhouse_query` is the
+exception: a failed check skips the run, and a series of them is reported (see
+[`clickhouse_query`](#clickhouse_query)).
+
+A run that a person starts (**Run now**, `nerve cron <id>`, the trigger API) is
+checked like a scheduled one, with one exception: an
+[`agent_activity`](#agent_activity) gate is not checked for it.
 
 A gate that can't be *built* is a different matter and is **refused**. If a
 `run_if` entry names a type nothing provides — a typo, or a gate plugin that was
@@ -253,6 +261,13 @@ run_if:
     consumer: inbox
 ```
 
+Without `sources`, the gate checks the sources on which the consumer has a
+cursor. A consumer that reads every source with `poll_all_sources` gets a cursor
+on a new source before the source's first run, so the gate sees the first records
+of the new source (see [sources.md](sources.md)). A consumer that reads only some
+sources with `poll_source` does not get one. For such a job, name its sources in
+`sources`.
+
 Checking the gate keeps the consumer's cursors from expiring: each check renews
 the TTL (`sync.consumer_cursor_ttl_days`) of the live cursors it reads. A cursor
 expires when nothing reads it for that long, and an expired cursor starts again at
@@ -263,6 +278,73 @@ already expired still starts again at the newest message, as a new one does.
 > **Legacy shorthand.** The older `skip_when_idle: [<sources>]` /
 > `idle_consumer: <name>` fields still work — they are translated into an
 > equivalent `messages` gate at load time. Prefer `run_if` for new jobs.
+
+#### `agent_activity`
+
+Satisfied when the agent has worked since the job last ran. It is for a job
+that looks after the agent's own work, such as a memory check or a search for
+repeated workflows: while the agent has done nothing, the job has nothing to do.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `ignore_jobs` | list | — | Ids of cron jobs whose runs do not count as work. A single id may be written as a string. A bare `ignore_jobs:` means unset; any other value is refused |
+| `overlap_hours` | number | 0 | Also count the work of this many hours before the job's last run (see below). From 0 to 8784 |
+
+```yaml
+run_if:
+  - type: agent_activity
+    ignore_jobs: [weekly-cleanup]
+```
+
+The agent has worked when one of these happened since the job's last
+successful run started:
+
+- A turn ended and reported its usage, whatever started it: a chat, a message
+  from a channel, a wakeup, a hook, another cron job, a workflow run.
+- A message was stored in a session. A turn that somebody asked for stores
+  what it was asked when it starts, so it counts from then on, also when it is
+  stopped or fails. So does a conversation that Nerve takes in from an external
+  agent. A turn that the agent starts for itself (a wakeup, a continuation
+  after background work) stores its messages without moving the session's
+  time, so it counts when it ends and reports its usage. If it fails before
+  that, it can leave no record.
+
+A job that has not succeeded yet runs as soon as there is any work at all. A
+run that failed does not move the start of the window, so the job runs again
+at its next time.
+
+Not counted:
+
+- The job's own runs, so a run is never the reason for the next one. The
+  sessions of a job are `cron:<job>`, `cron:<job>:<run id>`, and the sessions
+  of the workflow runs that the job or one of those sessions started, the legs
+  of a review loop included. What a person writes in the job's own chat is in
+  such a session too.
+- The runs of the jobs in `ignore_jobs`.
+- The runs of every other job that has this gate. Such a job runs only because
+  the agent worked, so its run is not work of its own. Two jobs with the gate
+  therefore never start each other, and need not name each other.
+- Work that leaves neither a turn nor a message: a memory written through the
+  MCP endpoint or on the Memory page, for example.
+- Work in a session that was deleted since: its records go with it.
+- For a catch-up, what was recorded after the moment it asks about:
+  [after a pause](#after-a-pause-sleep-suspend-snapshot-restore), the time the
+  run came due; at startup, the start of the catch-up. The message that wakes a
+  parked machine is work for the job's next scheduled time. It does not start a
+  run that came due while nothing had happened.
+
+`overlap_hours` is for a job that looks at a fixed period before its run, and
+not at everything since its last run. `memory-maintenance` under memU reviews
+the records of the day before the run, so what the agent did in the hours
+before a run is not in that run's day yet. With `overlap_hours: 24` that work
+counts again for the next run: a daily job runs at its next two scheduled times
+after the agent's last work, and then waits.
+
+The gate estimates whether a run is worth it. It does not say whether the job
+has anything to act on, as `tasks` and `messages` do. So a run that a person
+starts (**Run now**, `nerve cron <id>`, `POST /api/cron/jobs/{job_id}/trigger`)
+is not checked by this gate: the person may know of work that it cannot see.
+The other gates of the job are checked as usual.
 
 #### `github_pr_activity`
 
@@ -308,6 +390,110 @@ pull request monitors that way. A job gated on `github_pr_activity` alone is
 never started by a delivery, and since the gate always passes, it runs, in full,
 on every scheduled tick; `nerve doctor` names the jobs that still use this gate.
 
+#### `clickhouse_query`
+
+Satisfied when a ClickHouse query gives a true first value. The gate calls a
+query tool of an MCP server, by default `run_select_query` of the
+[ClickHouse Cloud remote MCP server](https://clickhouse.com/docs/products/cloud/features/ai-ml/mcp/remote-mcp).
+The SQL holds the condition. The gate reads only the first value of the first
+row, and the run's prompt gets all rows, so put the condition in the first
+column and the data the agent needs in the next columns.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `server` | string | (required) | The MCP server, by name. Local mode: an `http` entry of `mcp_servers`. External mode: a server of the MCP gateway's catalog |
+| `query` | string | (required) | The SQL. The ClickHouse Cloud server runs SELECT queries only |
+| `service_id` | string | none | Sent as the `serviceId` argument. The ClickHouse Cloud server needs it; the open-source `mcp-clickhouse` server takes no such argument |
+| `tool` | string | `run_select_query` | The tool to call. It gets the arguments `query` and, when `service_id` is set, `serviceId`. The open-source `mcp-clickhouse` server (0.7) names its query tool `run_query` |
+| `cooldown_minutes` | number | 360 | While the value stays true, the time from one run to the next. `0` runs on each check with a true value |
+| `max_rows` | int | 50 | Rows that the run's prompt gets, at most 500. `0` gives the prompt nothing |
+| `timeout_seconds` | number | 30 | Time limit for the whole call, at most 120 |
+| `notify_after_failures` | int | 3 | The failed check in a row that sends the "run gate check failed" notice. `0` sends no notice |
+
+```yaml
+run_if:
+  - type: clickhouse_query
+    server: clickhouse
+    service_id: 00000000-0000-0000-0000-000000000000
+    query: >
+      SELECT count() > 100 AS spike, count() AS errors, max(ts) AS last_error
+      FROM logs.errors WHERE ts > now() - INTERVAL 10 MINUTE
+    cooldown_minutes: 120
+```
+
+**The first value.** True: `true`, a number other than 0, `"true"`, and a
+numeric string other than 0 (ClickHouse writes 64-bit integers in JSON as
+strings). False: no rows, `NULL`, `false`, 0, `""` and `"false"`. Any other
+value, for example text, is an error.
+
+**Cooldown.** The gate passes when the value is true and either the check
+before found it false, or the last run that the gate let through started
+`cooldown_minutes` ago or more. Thus a run starts as soon as the value becomes
+true, and while the value stays true, once for each cooldown. The gate keeps
+its state in `~/.nerve/cache`, one file for each job and query. It records a
+run only when the run starts: if a later gate in `run_if` skips the run, or
+`lock` skips the launch of a workflow run, the next check passes again. Put
+this gate last in `run_if`, after the cheap gates, so that the query runs only
+when the other gates pass.
+
+**A failed check skips the run.** This gate is not fail-open. An unknown or
+disabled server, a call that fails or times out, a tool that refuses the query,
+a result that the gate cannot read, or a first value that is not true or false:
+the gate logs a warning and the run is skipped. A ClickHouse Cloud service that
+sleeps, or an API key that expired, does not start a session on each tick. The
+ClickHouse Cloud server gives a failed query as a normal result,
+`{"result": {"status": "error", "message": ...}}`, and the warning names its
+message, for example `Forbidden. Service does not allow MCP calls` for a
+service where MCP is off.
+
+**A series of failed checks is reported.** The gate counts the failed checks
+in a row. The check that fails for the `notify_after_failures`-th time in a row
+(default 3) sends the notice "Cron job `<id>`: run gate check failed" (high),
+with the last error. The checks that fail after it send nothing more. The
+first check that works after the notice sends "Cron job `<id>`: run gate check
+works again" (low), whether the value is true or false. A second series of
+failures sends its own pair. One failed check is usual and sends nothing: a
+check that wakes an idle ClickHouse Cloud service fails once. A gate check is
+not a run: the notices write no row to the job's run history, and the job's
+run status and its run notices ("Cron job `<id>` failed", "works again") stay
+as its runs left them.
+
+**The prompt.** When the gate passes, the run's prompt gets a block after the
+job's prompt: the query, the time of the check, and up to `max_rows` rows as
+JSON lines, at most 8 KB. The block says that the rows are data and not
+instructions. Table content is text that anyone who writes to the table can
+set, so do not give a gated job more tools than its task needs.
+
+**Server setup, local mode.** Add the server to `mcp_servers`, with the API key
+in `config.local.yaml`. The ClickHouse Cloud server takes the key ID and the
+key secret as HTTP Basic authentication:
+
+```yaml
+# config.local.yaml
+mcp_servers:
+  clickhouse:
+    type: http
+    url: https://mcp.clickhouse.cloud/mcp
+    headers:
+      Authorization: "Basic <base64 of key_id:key_secret>"
+```
+
+The service needs MCP turned on, and for an API key, a Query API endpoint that
+includes the key. Sessions get the same server, so the agent can run more
+queries.
+
+**Server setup, external mode.** Add the ClickHouse Cloud server to the agent
+in the control plane console. The gate calls it through the MCP gateway, which
+holds the key and applies the agent's policy. `server` is the server's id in
+the catalog.
+
+**Costs.** Each check is a query on the service. A check on an idle ClickHouse
+Cloud service wakes it, and that check fails with a request to try again, so
+its run is skipped; the next check runs the query. A short schedule thus keeps
+the service from going to sleep. A stopped service is not started. The
+schedule shows each tick as a run, because a forecast cannot run the query
+(see [Forecasts](#forecasts)).
+
 ### Forecasts
 
 A gate can also say ahead of time what it will decide. `forecast(ctx, at)`
@@ -325,11 +511,16 @@ that check.
   instance schedules itself, after which the forecast is read afresh, but also a
   task created or moved from a chat, the web UI or the API, which is only seen
   the next time the schedule is read (see [What runs next](#what-runs-next)).
-  `tasks` forecasts this way. `messages` reads the consumer's cursors
+  `tasks` and `agent_activity` forecast this way: what `agent_activity`
+  reads changes when the agent works or the job runs, and Nerve reads the
+  forecast afresh after a turn and after a run. Other work, such as a
+  conversation taken in from an external agent, is seen at the next read.
+  `messages` reads the consumer's cursors
   without starting one, and takes a cursor that will have expired by `at` as
   expired, since the check will find it so then.
 - `github_pr_activity` always forecasts a run: whether a PR moved is only known
-  by polling GitHub, which a forecast must not do.
+  by polling GitHub, which a forecast must not do. So does `clickhouse_query`,
+  for the same reason.
 - A gate whose answer changes with elapsed time — an age threshold, a cooldown —
   overrides `forecast` and reasons about `at`. So does a gate whose check writes
   anything.
@@ -372,7 +563,7 @@ class StaleTasksGate(CronGate):
         self.min_age_minutes = min_age_minutes
 
     async def is_satisfied(self, ctx: GateContext) -> bool:
-        # ctx exposes {job_id, db} — DB-only (see note below).
+        # ctx exposes job_id, db, jobs and as_of (see the note below).
         ...
 
     async def forecast(self, ctx: GateContext, at: datetime) -> bool:
@@ -427,11 +618,29 @@ that name its gate, see below):
   remove the `run_if` entry) and reload again. Deleting a plugin is not a way to
   switch a gate off; it stops those jobs instead of ungating them.
 
-> **Context is DB-only.** A gate receives `GateContext{job_id, db}`, which is
-> enough for DB-driven conditions (task counts, source cursors, age filters). A
-> gate that needs live runtime state — e.g. which sessions are currently
-> running — is **not** supported by this loader; that would require widening
-> the gate context, a separate change.
+> **Context.** A gate receives a `GateContext`. It has `job_id` and `db`, which
+> is enough for DB-driven conditions (task counts, source cursors, age filters).
+> `jobs` maps the id of each loaded job, disabled ones too, to its definition,
+> for a condition that depends on how the other jobs are set up. `as_of` is set
+> for a catch-up: the time the run it stands in for came due, for a gate that
+> reads a record of what happened and must leave out what was recorded since.
+> For the check before a run, `mcp_servers()` also gives the MCP servers that new
+> sessions get, and `mcp_managed` says that they come from the MCP gateway's
+> catalog. A gate that passes can add text for the run's prompt to `ctx.notes`.
+> A gate that keeps state for the run it lets through adds a callback to
+> `ctx.on_run`: Nerve calls it only when the run starts, so a later gate that
+> skips the run, or a run that does not start, does not use up that state. A
+> gate can add a `GateNotice` to `ctx.notices` when its own check fails, or
+> works again after failures it reported: Nerve sends each notice to the user,
+> so the gate decides when one is due (for example once for each series of
+> failures). A gate that needs live runtime state, e.g. which sessions are
+> currently running, is **not** supported by this loader; that would require
+> widening the gate context, a separate change.
+>
+> A plugin gate that calls a built-in gate passes on the context it was given.
+> `agent_activity` finds the jobs that carry it among each job's own gates, so
+> a job whose plugin gate only calls it is not found: name that job in the
+> `ignore_jobs` of the jobs that must not count its runs.
 
 > **Trust note.** Files in the gate-plugins directory are imported (executed)
 > at daemon startup. This is the same trust model as `config.yaml`, configured
@@ -517,10 +726,10 @@ These ship in `<workspace>/config/cron/system.yaml`, written when the mode is ch
 
 | Job | Schedule | Session Mode | Description | Personal | Worker |
 |-----|----------|-------------|-------------|:--------:|:------:|
-| `memory-maintenance` | Daily 5 AM | isolated | Dedup, prune stale entries, improve memory wording. Runs silently. On an install set up with `memory.backend: loom`: runs Loom's integrity report (`loom_namespace_validate`) on the home namespace and fixes what is its own, leaving deduplication to Loom; a `system.yaml` written for memU runs in this wording while its prompt is the shipped one. | ✅ always | ✅ always |
+| `memory-maintenance` | Daily 5 AM, when the agent has worked (see below) | isolated | Dedup, prune stale entries, improve memory wording. Runs silently. On an install set up with `memory.backend: loom`: runs Loom's integrity report (`loom_namespace_validate`) on the home namespace and fixes what is its own, leaving deduplication to Loom; a `system.yaml` written for memU runs in this wording while its prompt is the shipped one. | ✅ always | ✅ always |
 | `inbox-processor` | Every 30 min | persistent (24h rotation, reminder mode) | Polls all sync sources (email, GitHub, Telegram). Triages, creates tasks, memorizes facts, sends notifications for urgent items. | ✅ default | — |
 | `task-planner` | Every 4 hours | persistent (168h rotation) | Reviews open tasks, explores codebases, proposes implementation plans via plan-approve workflow. Gated on `tasks` (status `pending`) — stays idle when there's nothing to plan. | ✅ default | off; onboarding enables it |
-| `skill-extractor` | Every 12 hours | persistent | Identifies repeated workflows from recent conversations, memory, and completed tasks. Proposes new skills via task+plan system. | ✅ optional | ✅ default |
+| `skill-extractor` | Daily 5 AM, when the agent has worked (see below) | persistent | Identifies repeated workflows from recent conversations, memory, and completed tasks. Proposes at most one new skill per run, as a task with a plan. The plan says what the skill is for, the evidence for it and the direction it should take; it does not hold the skill. | ✅ optional | ✅ default |
 | `skill-reviser` | Weekly (Sun 3 AM) | persistent | Reviews existing skills for accuracy (outdated paths, credentials), completeness (missing steps), and quality (trigger phrases, examples). Proposes revisions via task+plan. | ✅ optional | ✅ default |
 | `machine-maintenance` | Weekly (Sun 4 AM) | isolated | Cleans up the machine Nerve runs on. The agent first finds out what this machine has (disk use, repositories and worktrees, build and package caches, Docker, services that listen on a port), then looks only at items that are old and that nothing uses. It removes items that hold no data without asking: caches, dangling Docker images and build cache, a worktree whose pull request is merged and that has no local changes. It sends one `ask_user` for anything that can hold data (Docker volumes, stopped containers, worktrees with local work, leftover dev servers or test containers on open ports) and acts only on what the answer approves. It never touches Nerve itself, system services or anything in use. Sends a low-priority `notify` with the space freed when it changed something. | ✅ default | ✅ default |
 
@@ -528,9 +737,32 @@ These ship in `<workspace>/config/cron/system.yaml`, written when the mode is ch
 - **Personal**: `memory-maintenance` (always on) + `inbox-processor` + `task-planner` + `machine-maintenance` enabled by default. `skill-extractor` and `skill-reviser` are offered as toggles on the Automation step of the setup page (and in `nerve init --terminal`).
 - **Worker**: `memory-maintenance` (always on) + `skill-extractor` + `skill-reviser` + `machine-maintenance` enabled by default when the mode is chosen on the setup page or by `NERVE_MODE=worker nerve init --non-interactive`. `task-planner` is written with `enabled: false` on every path: whether the worker plans through the approval loop is decided during onboarding (the onboarding conversation, or the session in which a worker set up without the browser sets itself up), which enables it by overriding the job by id in `jobs.yaml` with a prompt and a `tasks` gate scoped to the worker's tag (the Automation step of the setup page can also switch it on). `nerve init --terminal` has no cron step for workers and writes the two skill jobs and `machine-maintenance` with `enabled: false` as well; set `enabled: true` in `system.yaml` (or override the job by id in `jobs.yaml`), then `nerve reload`. `inbox-processor` is not included (workers don't have sync sources).
 
+`memory-maintenance` and `skill-extractor` look after the agent's own work, so both wait for it with an [`agent_activity`](#agent_activity) gate:
+
+- Each runs at its next scheduled time after the agent has worked, and not again until the agent works again. A catch-up can start it at another time: when Nerve starts, or the machine resumes, after a scheduled time of the job has passed without a run (see [Startup catch-up](#startup-catch-up) and [After a pause](#after-a-pause-sleep-suspend-snapshot-restore)). Only work from before that moment counts for it, so the message that wakes a parked machine does not start either job.
+- The runs of the four maintenance jobs (these two, `skill-reviser` and `machine-maintenance`) do not count as work for either, so one of them never starts another.
+- An agent that does nothing runs neither: nobody uses it, and no other job of it runs. On a platform that parks an idle machine, the machine is not woken for them (see [What runs next](#what-runs-next)). An agent with a scheduled job of its own, a scan every hour for example, works at each run of it, so both jobs go on running. `inbox-processor` and `task-planner` count too when they run.
+- Under memU, the gate of `memory-maintenance` has `overlap_hours: 24`: the job reviews the records of the day before the run, so it runs at its next two scheduled times after the agent's last work. Under Loom it checks the namespace as it is and has no overlap; what reaches Loom after a check waits for the job's next run.
+- **Run now** starts either job whatever the gate says.
+
+`system.yaml` does not state these two gates. The scheduler gives them to an entry of the two jobs that has neither `run_if` nor `skip_when_idle`, in the form for the configured memory backend, and logs one line for each when it loads the file. Nothing writes `system.yaml` again when Nerve is updated, so this is how an install from before the gates has them, and how a later change to them reaches every install.
+
+| The entry in `system.yaml` | What runs |
+|---|---|
+| No `run_if` key | The job with its default gate. The prompt and the schedule of the entry do not matter: an edited entry gets the gate too |
+| `run_if: []`, or a bare `run_if:` | The job on every schedule |
+| A `run_if` of its own | The job with those gates |
+| The job is replaced in `jobs.yaml` | The job as `jobs.yaml` has it |
+
+An old install that keeps every job in `jobs.yaml`, with no `system.yaml`, is not changed. `inbox-processor` and `task-planner` have their gates in the file, and an entry of theirs without one runs on every schedule. Only the scheduler gives the default: `nerve config validate` and `nerve doctor` read the file as it is.
+
 `machine-maintenance` is on by default and optional in both modes: switch it off on the Automation step of the setup page, or with a job of the same id in `jobs.yaml`. Its prompt is general on purpose: the agent learns what each machine has on each run. To keep an item out of its reach, write it in `TOOLS.md` or ask the agent to remember it; the job reads both before it acts.
 
-Both skill jobs use `source="skill-extractor"` or `source="skill-reviser"` on created tasks. When their plans are approved, an `impl-<id>` session is spawned like for any plan; its prompt tells it to apply the plan (a full SKILL.md file) with `skill_create` or `skill_update` and then close the task with `task_done`.
+`skill-extractor` creates its task with `source="skill-extractor"` and the tag `skill-proposal`, and proposes its plan with `plan_type="skill-create"`. Its prompt has it check the existing skills and what was proposed before, and propose nothing that a skill covers or that was proposed before, whether that proposal waits for review, was declined or ended with no skill. The tag is how it finds earlier proposals: `task_list` with the status `all`, the tag and a limit of 1000 lists their tasks whatever became of the plans; `plan_list` adds the plans in review and the declined ones, up to 100 of each. When a skill plan is approved, an `impl-<id>` session is spawned like for any plan, with a prompt for its plan type (see [Skill Proposals](plans.md#skill-proposals)). For a `skill-create` plan the prompt has the session write the skill itself, within the plan's direction: look at the evidence the plan names and at the existing skills, decide the name, the description and the content, and call `skill_create`. When the evidence does not support a skill, the session is to create none and tell the user why with `notify`. A `skill-update` plan holds the full revised SKILL.md, and the session applies it with `skill_update`. Both close the task with `task_done`.
+
+`skill-extractor` runs at the same time as `memory-maintenance`, so a machine that is parked while idle is woken once for both. Earlier releases ran it every 12 hours, let it propose up to two skills a run, and had it put the full SKILL.md into the plan. Nothing writes `system.yaml` again when Nerve is updated, so the scheduler loads an entry of the job in that file that still holds what an earlier release shipped with the current schedule, description and prompt. It logs one line for the job, and `nerve cron` lists the job with its current description. Each of the three is replaced on its own, and only when it is what a release shipped, the whitespace around it aside: an edited schedule or prompt stays, and a `prompt_file` is still the prompt that is sent. The file itself is not changed, so it still shows the earlier values.
+
+An entry in `jobs.yaml` is yours, and this never changes it. To run `skill-extractor` on another schedule, the earlier one included, put a job with the same id there. An install from before `system.yaml` has its built-in jobs in `jobs.yaml`, as that release wrote them; they replace the ones in `system.yaml` and are loaded as written. The scheduler logs a line for such an entry while it holds the earlier prompt. The Automation step of the setup page marks a job that `jobs.yaml` replaces as set there, and shows the built-in job's schedule and description beside it, not the entry's. To get the job as this release ships it, remove the entry from `jobs.yaml` once the install has a `system.yaml`: the job then runs from `system.yaml`, which also says whether it is enabled.
 
 ## Persistent Timers
 
@@ -547,6 +779,7 @@ If a job should have fired while the server was down, it fires **once** on start
 - **First-ever run**: No catch-up (no history to compare against).
 - **Multiple missed fires**: Coalesced into a single catch-up run.
 - **Catch-up runs concurrently**: All overdue jobs fire in parallel, in the background (doesn't block startup).
+- **Run gates apply**: a job whose gates are not satisfied is not caught up. A run that a gate skipped leaves no row, so a gated job can count as overdue at every start; its gates decide. They are asked about the moment the catch-up began, so `agent_activity` counts only work recorded before it.
 
 ### Opting out
 
@@ -586,7 +819,9 @@ them start late or be dropped as [late runs](#late-runs):
   start 15 seconds after the resume is noticed, because the network is often not
   back yet the moment a laptop wakes, and a run that starts without it fails.
   Run gates and `lock` apply as for a scheduled run, and the run is logged as
-  usual.
+  usual. The gates are asked about the time the run came due: `agent_activity`
+  leaves out what was recorded since, such as the message that woke the
+  machine.
 - Jobs with `catchup: false` only move on; the run each one skipped is recorded
   in `cron_logs` with status `missed`. A run that the job's gates would have
   skipped, going by their [forecast](#forecasts) for the time it came due, is
@@ -688,10 +923,11 @@ synced by hand (`POST /api/sources/{name}/sync`, `POST /api/sources/sync-all`).
 
 Not every change is announced. A wakeup that a session records during its turn,
 tasks created, moved or edited from a chat turn, the web UI or the API (which
-can change what a `tasks` gate forecasts), and a message a channel buffers for
-its `<channel>:observed` drain (which makes that drain count) count only from
-the next time the schedule is read. Code that keeps the answer should therefore
-also refresh it periodically, and when a turn ends.
+can change what a `tasks` gate forecasts), a turn or a stored message (which
+can change what an `agent_activity` gate forecasts), and a message a channel
+buffers for its `<channel>:observed` drain (which makes that drain count) count
+only from the next time the schedule is read. Code that keeps the answer should
+therefore also refresh it periodically, and when a turn ends.
 
 ## Source Runners
 

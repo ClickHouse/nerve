@@ -157,9 +157,9 @@ Filesystem-based skill system (Claude SDK compatible):
 - SQLite index for metadata + usage statistics (`skills`, `skill_usage` tables)
 - Progressive disclosure: name+description in system prompt, full content loaded on demand via `skill_get` tool
 - Agent can create/update skills dynamically via `skill_create`/`skill_update` MCP tools
-- Automated extraction: `skill-extractor` cron identifies repeated workflows and proposes new skills via task+plan system
+- Automated extraction: `skill-extractor` cron identifies repeated workflows and proposes at most one new skill per run via task+plan system; the plan states the evidence and the direction, and the session that implements the approved plan writes the skill
 - Automated revision: `skill-reviser` cron reviews existing skills for accuracy, completeness, and quality
-- Plan approval handler creates/updates skills directly when approving skill-extractor/skill-reviser proposals
+- An approved skill plan (`skill-create` / `skill-update`) is implemented by an `impl-<id>` session, like any plan, which creates or updates the skill with `skill_create`/`skill_update`
 
 #### Platform skills
 
@@ -250,6 +250,19 @@ file is cut there and ends with `[platform notes truncated at 16 KiB]`. The
 file is read whenever a session's prompt is built, so a change applies to new
 sessions.
 
+A session that a person chats in (web, Telegram, Slack, Discord, WhatsApp) also
+gets an "Offer to automate" section. It tells the agent to offer a cron job
+when the person asks for work that they will probably want again and no job
+does it yet: one yes/no question at the end of the reply, at most once in a
+conversation, and the job is created only after a yes. Cron, hook and workflow
+sessions do not get the section. The text is `AUTOMATION_OFFER_SECTION` in
+`nerve/agent/prompts.py`. It also tells the agent that the job prompt must
+send the result with `notify` (the reply of a cron run goes only to the cron
+log) and that a direct edit of the job file needs `nerve reload`. A person who
+does not want these offers can say so in the chat. The agent then writes that
+in `USER.md`, or in `MEMORY.md` when `USER.md` is read-only, so that every
+later session sees it.
+
 ### User Message (Web UI)
 1. User sends message via WebSocket
 2. Gateway's WebSocket handler receives it — the connection's actor was resolved once, at accept
@@ -314,7 +327,7 @@ Every database open runs the runner: the gateway's start and every CLI command t
 ### Schema
 
 SQLite with WAL mode (schema version 16):
-- `sessions` — Session metadata with lifecycle columns (`status`, `sdk_session_id`, `connected_at`, `parent_session_id`, `forked_from_message`, `last_activity_at`, `archived_at`, `message_count`, `total_cost_usd`) and `created_by_actor_id` → `actor_refs`: who caused the session to exist
+- `sessions` — Session metadata with lifecycle columns (`status`, `sdk_session_id`, `connected_at`, `parent_session_id`, `forked_from_message`, `fork_source_native_id`, `fork_source_turn_id`, `last_activity_at`, `archived_at`, `message_count`, `total_cost_usd`) and `created_by_actor_id` → `actor_refs`: who caused the session to exist
 - `messages` — Conversation messages with tool call data and ordered `blocks` JSON column (preserves interleaving of text/thinking/tool_call blocks across page reloads), plus `actor_id` → `actor_refs`: whose input the row records. NULL means attribution was not recorded (legacy history, unidentified external people, and assistant/tool output). Nothing is backfilled — see [Accounts and identity](accounts.md)
 - `session_events`: append-only lifecycle audit log (created, started, idle, stopped, archived, error, and the changes listed in [Session changes](accounts.md#session-changes)), with `actor_id` and `caused_by_actor_id` → `actor_refs`
 - `session_deletions`: one row for each deleted session: last title, time, `actor_id` and `caused_by_actor_id`. Written in the transaction of the delete, which removes the session's events

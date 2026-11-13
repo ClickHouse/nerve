@@ -55,10 +55,17 @@ from nerve.identity import (
     actor_for_account,
     attribution_for,
 )
+from nerve.gateway.mcp_apps_sandbox import (
+    SANDBOX_DOCUMENT,
+    SANDBOX_PATH,
+    SandboxDocument,
+    serves_sandbox as _serves_mcp_apps_sandbox,
+)
 from nerve.gateway.routes import (
     init_deps,
     register_all_routes,
     set_external_agents_sync,
+    set_mcp_apps_serving,
     set_notification_service,
 )
 from nerve.mcp_server import build_manager as _build_mcp_manager, mount_deferred as _mount_mcp_deferred
@@ -72,6 +79,9 @@ from nerve.setup_checks import scrub_secrets as _scrub
 from nerve.utils.aio import stop_background_task
 
 logger = logging.getLogger(__name__)
+
+# The built web UI (``npm run build`` in web/).
+WEB_DIST = Path(__file__).parent.parent.parent / "web" / "dist"
 
 # FastAPI's native OpenTelemetry support is off for each app that Nerve
 # builds. Langfuse installs the global tracer provider, and FastAPI uses it.
@@ -522,12 +532,12 @@ async def lifespan(app: FastAPI):
         # Wire up routes
         init_deps(_engine, db)
 
-        # Prime the Anthropic model catalog so the composer's model picker
-        # offers every model these credentials can reach (instead of a built-in
-        # list that goes stale on each release). Off the critical path and
-        # best-effort: until it lands — or if it fails — the picker falls back
-        # to the configured/built-in list. Runs after the proxy is up, since
-        # discovery goes through it when proxy.enabled.
+        # With agent.model_discovery on, prime the Anthropic model catalog so
+        # the composer's model menu offers every model these credentials can
+        # reach. Off the critical path and best-effort: until it lands, or if
+        # it fails, the menu falls back to the configured/built-in list. Runs
+        # after the proxy is up, since discovery goes through it when
+        # proxy.enabled.
         models_prime_task = None
         if config.agent.model_discovery:
             from nerve import models_catalog
@@ -593,6 +603,14 @@ async def lifespan(app: FastAPI):
                     )
                 except Exception as e:
                     logger.error("Failed to start Codex MCP loopback listener: %s", e)
+
+        # MCP Apps: this gateway serves the sandbox document that the views
+        # of MCP tools and widgets run in, at a path of its own address (see
+        # nerve/gateway/mcp_apps_sandbox.py). Only with mcp_apps.enabled, in
+        # local mode: decided here, once, and the log says why not. Until
+        # then, and without it, the routes take the feature as off.
+        if _serves_mcp_apps_sandbox(config, WEB_DIST):
+            set_mcp_apps_serving(True)
 
         # Start Telegram bot if enabled. A channel must never take the gateway
         # down: ``TelegramChannel.start()`` runs ``Application.initialize()``,
@@ -1661,6 +1679,25 @@ def create_app() -> FastAPI:
             str(path), media_type=content_type, headers=FAVICON_RESPONSE_HEADERS,
         )
 
+    # The sandbox document of MCP Apps: third-party HTML runs in it, at a path
+    # of this address. Every answer for the path carries the policy that takes
+    # the document's origin away (see nerve/gateway/mcp_apps_sandbox.py), also
+    # the 404 while the feature is off and the answer to another method, so
+    # the path never holds a document with the origin of the web UI. No
+    # authentication, like the files of the web UI: the document is static
+    # and holds nothing, and a frame's load carries no token. Registered ahead
+    # of the SPA fallback, which never serves the file (see _bundle_file).
+    sandbox_document = SandboxDocument(WEB_DIST / SANDBOX_DOCUMENT)
+
+    @app.api_route(
+        SANDBOX_PATH,
+        methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        include_in_schema=False,
+    )
+    async def mcp_app_sandbox(request: Request):
+        sandbox_document.host = get_config().gateway.host
+        return await sandbox_document.respond(request, serving=_mcp_apps_serving())
+
     # Every API path that no router claimed answers 404 JSON — registered
     # after all routers (route order decides) and ahead of the SPA fallback,
     # so an unregistered route (the claim in external mode, a typo) never
@@ -1677,7 +1714,7 @@ def create_app() -> FastAPI:
         return JSONResponse({"detail": "Not found"}, status_code=404)
 
     # Serve static web UI files if built
-    web_dist = Path(__file__).parent.parent.parent / "web" / "dist"
+    web_dist = WEB_DIST
     if web_dist.exists():
         _serve_web_ui(app, web_dist)
     else:
@@ -1706,6 +1743,13 @@ def _bundle_file(web_dist: Path, path: str) -> Path | None:
     is resolved and has to land inside the resolved bundle directory; anything
     else — a symlink that leaves it included — is not a bundle file, and the
     caller answers with index.html as it does for any SPA route.
+
+    The sandbox document of MCP Apps is in the bundle and is not a bundle file
+    either: only its own route serves it, with the policy that takes its
+    origin away (see ``create_app``). Served from here it would be a document
+    with the origin of the web UI that runs the HTML it is handed. It is
+    recognised as the file itself, so no other spelling of its path (another
+    case on a case-insensitive filesystem, ``..`` segments) names it.
     """
     root = web_dist.resolve()
     try:
@@ -1714,10 +1758,51 @@ def _bundle_file(web_dist: Path, path: str) -> Path | None:
             return None
         if not candidate.is_file():
             return None
+        sandbox = root / SANDBOX_DOCUMENT
+        if sandbox.exists() and candidate.samefile(sandbox):
+            return None
     except (OSError, RuntimeError, ValueError):
         # A name too long, a symlink loop, an embedded NUL byte: not a file.
         return None
     return candidate
+
+
+# Sent with the documents of the web UI while MCP Apps is on.
+#
+# A view of an MCP App is third-party script in a frame of this address (the
+# sandbox document). If it could hold the web UI in a frame of its own, the
+# web UI would sit inside the view, for the person to click on where the view
+# wants. Which origins a view may frame is its policy's business, and a
+# policy can be wrong; this header is the web UI's own word, and the browser
+# asks no one else: no page may frame it.
+#
+# Only with MCP Apps on. Nothing of Nerve's holds the web UI in a frame (the
+# one frame it uses, for an email's HTML, has its document written into it),
+# but a page of the person's own may, and without the feature that is none of
+# this header's business.
+WEB_UI_FRAMING_HEADERS: dict[str, str] = {
+    "Content-Security-Policy": "frame-ancestors 'none'",
+}
+
+
+def _mcp_apps_serving() -> bool:
+    """True while this gateway serves the sandbox document of MCP Apps."""
+    from nerve.gateway.routes._deps import get_deps
+
+    try:
+        return bool(get_deps().mcp_apps_serving)
+    except RuntimeError:  # before startup: nothing is served to a view yet
+        return False
+
+
+def _web_ui_headers(path: Path) -> dict[str, str] | None:
+    """Headers for the file ``path`` of the web UI: ``WEB_UI_FRAMING_HEADERS``
+    for an HTML document while the gateway serves the sandbox document of
+    MCP Apps, else none. Only a document can be shown in a frame; the service
+    worker, the icons and the scripts get none."""
+    if path.suffix.lower() not in (".html", ".htm"):
+        return None
+    return WEB_UI_FRAMING_HEADERS if _mcp_apps_serving() else None
 
 
 def _serve_web_ui(app: FastAPI, web_dist: Path) -> None:
@@ -1735,10 +1820,10 @@ def _serve_web_ui(app: FastAPI, web_dist: Path) -> None:
         # name. Not the favicon: that has its own route above and is served
         # from tracked config rather than the bundle, so it never gets here.
         file_path = _bundle_file(web_dist, path)
-        if file_path is not None:
-            return FileResponse(str(file_path))
-        # Otherwise serve index.html for SPA routing
-        return FileResponse(str(web_dist / "index.html"))
+        if file_path is None:
+            # Otherwise serve index.html for SPA routing
+            file_path = web_dist / "index.html"
+        return FileResponse(str(file_path), headers=_web_ui_headers(file_path))
 
 
 _UI_NOT_BUILT_PAGE = """<!doctype html>

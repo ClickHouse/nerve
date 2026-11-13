@@ -21,7 +21,9 @@ from pathlib import Path
 
 import pytest
 
-from nerve.agent.backends import BackendDeps, SessionSpec, TransportDiedError
+from nerve.agent.backends import (
+    BackendDeps, ForkSourceMissingError, SessionSpec, TransportDiedError,
+)
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.codex import CodexBackend
 from nerve.agent.backends.base import TurnInput
@@ -139,14 +141,15 @@ async def test_basic_turn_streams_and_completes(tmp_path, monkeypatch):
 async def test_hidden_catalog_models_are_opt_in(tmp_path, monkeypatch):
     """GPT-6 Astra is hidden upstream (``model/list`` needs includeHidden):
     it is offered only through ``codex.models`` (the default names it),
-    while every catalog entry — hidden or not — stays a legal session
-    model. The picker never sees the other hidden entries."""
+    while every catalog entry, hidden or not, stays a legal session model.
+    The menu never sees the other hidden entries, and it keeps the order
+    of ``codex.models``."""
     _mode(monkeypatch, "account_api_key")
     cfg = _config(tmp_path, auth="api_key", api_key="sk-fake")
     backend = CodexBackend(_deps(cfg))
     status = await backend.preflight(force=True)
     assert status["available"] is True
-    assert status["models"] == ["gpt-5.6-sol", "gpt-6-astra"]
+    assert status["models"] == ["gpt-6-astra", "gpt-5.6-sol"]
     assert status["hidden_models"] == ["fake-internal-preview", "gpt-6-astra"]
     await backend.validate_model("gpt-6-astra")
     await backend.validate_model("fake-internal-preview")   # allowed, not offered
@@ -172,6 +175,21 @@ async def test_hidden_catalog_models_are_opt_in(tmp_path, monkeypatch):
         assert done.cost_basis == "api_billed"
     finally:
         await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_a_catalog_model_outside_the_menu_is_valid_before_any_preflight(tmp_path, monkeypatch):
+    """After a restart no preflight has run yet. A chat or cron job on a model
+    that the catalog serves, but that codex.models does not name, must pass on
+    its first validation: the check runs the preflight and then looks at the
+    whole catalog, not only at the menu list."""
+    _mode(monkeypatch, "basic")
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    assert "fake-internal-preview" not in cfg.codex.models
+    await backend.validate_model("fake-internal-preview")
+    with pytest.raises(Exception, match="not available"):
+        await backend.validate_model("gpt-7-not-served")
 
 
 @pytest.mark.asyncio
@@ -706,6 +724,17 @@ async def test_fork_uses_selected_native_turn(tmp_path, monkeypatch):
         assert client.native_session_id == "fork:turn_selected"
     finally:
         await client.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_fork_of_a_missing_thread_reports_a_missing_fork_source(tmp_path, monkeypatch):
+    # A fork never falls back to a fresh thread: the engine removes the fork
+    # source and says so (ForkSourceMissingError).
+    _mode(monkeypatch, "resume_fail")
+    cfg = _config(tmp_path)
+    backend = CodexBackend(_deps(cfg))
+    with pytest.raises(ForkSourceMissingError, match="th_gone"):
+        await backend.create_client(_spec(cfg, resume_native_id="th_gone", fork=True))
 
 
 @pytest.mark.asyncio

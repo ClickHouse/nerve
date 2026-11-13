@@ -483,6 +483,16 @@ memory:
 #   path: /mcp/v1
 #   include_hoa: false   # Expose the deprecated houseofagents stub tools externally (default off)
 
+# MCP Apps (optional) — show the interactive view of an MCP tool inside the
+# chat message (MCP extension io.modelcontextprotocol/ui), and draw the
+# ```widget blocks of an answer. Views: Claude backend only. Off by default.
+# Both run in a frame whose page the gateway serves from its own address
+# with a policy that takes the page's origin away, so that it shares none
+# with the web UI. No other port is opened. Local mode only. Restart to
+# apply changes. See docs/mcp-apps.md.
+# mcp_apps:
+#   enabled: false
+
 # MCP gateway (external mode only, NERVE_AUTH_MODE=external). Nerve then takes
 # its MCP servers only from the gateway's catalog, and mcp_servers has no
 # effect. A change needs a restart. See docs/config.md "MCP servers in

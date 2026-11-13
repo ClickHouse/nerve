@@ -157,6 +157,62 @@ class TestApprovePlan:
         await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
         assert "skill_create" in engine.runs[0]["user_message"]
 
+    async def test_the_session_of_a_skill_proposal_writes_the_skill_itself(self, db, tmp_path):
+        """The plan says what the skill is for, what shows that it is needed
+        and where it should go. It is not the skill's text to copy."""
+        engine, _ = await _setup(db, tmp_path, plan_type="skill-create")
+        await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER, cause=APPROVER)
+        await asyncio.wait_for(engine.run_event.wait(), timeout=5.0)
+        prompt = engine.runs[0]["user_message"]
+
+        assert "step one; step two" in prompt  # the plan is still what it works from
+        assert (
+            "The plan proposes a new skill: what it is for, the evidence that it is needed, "
+            "and the direction it should take. "
+            "You write the skill, and you decide what goes into it, within the direction the plan gives."
+        ) in prompt
+        assert "Extract the name, description, and content from the plan" not in prompt
+        for step in (
+            "1. Look at the evidence the plan names (the sessions, tasks and dates)",
+            # skill_get records a use of the skill it reads.
+            "2. Look at the existing skills (`skill_list`; `skill_get` for one that looks close)",
+            "3. Decide the skill's name (one that no existing skill has), its description",
+            "4. Create the skill with the `skill_create` tool.",
+        ):
+            assert step in prompt
+        # A plan can still hold a whole SKILL.md, whoever wrote it: a draft to
+        # check, and its body alone is the skill's content (skill_create
+        # writes the frontmatter from the name and the description).
+        assert (
+            "If the plan holds a complete SKILL.md, take it as a draft: check it against the evidence, "
+            "change what the evidence does not support, and pass its body, without the frontmatter, "
+            "as the content."
+        ) in prompt
+        # Checking the evidence can end with no skill. The person who approved
+        # the plan expects one, so they are told.
+        assert (
+            "If the evidence does not support a skill, or an existing skill already covers it, "
+            "create none, and tell the user why with `notify`: they approved the plan and expect a skill."
+        ) in prompt
+        assert "mark the task as done using `task_done`" in prompt and "why no skill was created" in prompt
+        assert "After the skill is created/updated" not in prompt
+
+    async def test_a_skill_revision_is_briefed_as_before(self, db, tmp_path):
+        engine, _ = await _setup(db, tmp_path, plan_type="skill-update")
+        await approve_plan(db=db, engine=engine, plan_id="plan-act", actor=APPROVER, cause=APPROVER)
+        await asyncio.wait_for(engine.run_event.wait(), timeout=5.0)
+        prompt = engine.runs[0]["user_message"]
+
+        assert prompt.endswith(
+            "## Instructions\n"
+            "The plan contains a skill revision. "
+            "Use the `skill_update` tool to update the existing skill. "
+            "Pass the skill ID (directory name) as the name parameter and the full SKILL.md content "
+            "(frontmatter + body).\n"
+            "\nAfter the skill is created/updated, mark the task as done using "
+            "`task_done` with a note describing what was done.\n"
+        )
+
     async def test_refuses_non_pending(self, db, tmp_path):
         engine, _ = await _setup(db, tmp_path, status="implementing")
         with pytest.raises(PlanNotPending):

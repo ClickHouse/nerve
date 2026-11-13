@@ -1,4 +1,5 @@
 import type { AutoTurnTrigger } from './agents';
+import type { McpAppRef, McpCallToolResult } from './mcpApps';
 
 export interface ThinkingBlockData {
   type: 'thinking';
@@ -24,6 +25,12 @@ export interface ToolCallBlockData {
    *  transcript's `child_agent_id`). Absent on old history and on calls that
    *  spawn nothing; the store also resolves records by `toolUseId`. */
   agentId?: string;
+  /** The interactive view of the tool (MCP Apps): the call is linked to a
+   *  `ui://` resource of its MCP server. Absent on every other call. */
+  mcpApp?: McpAppRef;
+  /** The call's result as the view takes it: an MCP `CallToolResult`. Only on
+   *  a call with `mcpApp`, once it has a result; `result` stays the text. */
+  mcpAppResult?: McpCallToolResult;
 }
 
 // --- Dynamic workflow (Claude Code Workflow tool) progress ---
@@ -104,6 +111,10 @@ export type MessageBlock = ThinkingBlockData | TextBlockData | ToolCallBlockData
 
 export interface ChatMessage {
   id?: number;
+  /** The session this message is part of, as the server says with every
+      stored row. A row that this tab made itself has none until the server
+      hands it out. */
+  session_id?: string;
   role: 'user' | 'assistant';
   blocks: MessageBlock[];
   channel?: string;
@@ -167,6 +178,9 @@ export interface Session {
   model?: string;
   backend?: string;
   cwd?: string;
+  /** The Daybreak switch of a Codex chat (the composer's toggle sets it).
+      Only Codex sessions carry it; absent is off. */
+  codex_daybreak?: boolean;
   // Real-time running status (set by backend + WS updates)
   is_running?: boolean;
   // Paused mid-turn waiting for user input (AskUserQuestion / plan mode).

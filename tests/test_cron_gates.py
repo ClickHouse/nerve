@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 
+import nerve.workflows
+from nerve.agent.sessions import new_cron_run_id
+from nerve.agent.streaming import broadcaster
 from nerve.cron.gates import (
     GATE_REGISTRY,
+    AgentActivityGate,
     CronGate,
     GateConfigError,
     GateContext,
@@ -21,7 +28,13 @@ from nerve.cron.gates import (
     evaluate_gates,
 )
 from nerve.cron.jobs import CronJob
+from nerve.cron.service import CronService
 from nerve.sources.models import SourceRecord
+from nerve.workflows.service import ENGINE_CLAUDE, WorkflowRunService
+from tests.actor_rows import ensure_system_principal
+from tests.test_turn_outcomes import _engine, _session, _token_seen
+from tests.test_turn_outcomes import _turn as _real_turn
+from tests.test_workflow_runs import _drain, _make_config
 
 
 # ---------------------------------------------------------------------------
@@ -940,3 +953,827 @@ class TestGitHubPrActivityCommentActivity:
 
     def test_describe_mentions_comments(self):
         assert "comment" in GitHubPrActivityGate(author="my-bot").describe()
+
+
+# ---------------------------------------------------------------------------
+# AgentActivityGate
+# ---------------------------------------------------------------------------
+
+def _ago(minutes: float) -> datetime:
+    return datetime.now(UTC) - timedelta(minutes=minutes)
+
+
+def _run_session(job_id: str) -> str:
+    """The id of a session of one run, or one generation, of ``job_id``."""
+    return f"cron:{job_id}:{new_cron_run_id()}"
+
+
+async def _turn(db, session_id: str, *, minutes_ago: float = 0) -> None:
+    """A turn that ended that long ago in ``session_id`` (made on demand) and
+    reported its usage. Nothing else is stored: only the usage row says so."""
+    if await db.get_session(session_id) is None:
+        await db.create_session(session_id, source="test", actor=None)
+    await db.record_turn_usage(
+        session_id=session_id, input_tokens=10, output_tokens=5,
+        cache_creation=0, cache_read=0, max_context=200_000,
+    )
+    await db.db.execute(
+        "UPDATE session_usage SET created_at = ? WHERE id = (SELECT MAX(id) FROM session_usage)",
+        (_ago(minutes_ago).strftime("%Y-%m-%d %H:%M:%S"),),
+    )
+    await db.db.commit()
+
+
+async def _stored_message(db, session_id: str, *, minutes_ago: float = 0, **kwargs) -> None:
+    """A message stored that long ago in ``session_id`` (made on demand), as a
+    turn stores what it was asked. No usage row."""
+    if await db.get_session(session_id) is None:
+        await db.create_session(session_id, source="test", actor=None)
+        await db.db.execute(  # the session is older than anything a test asks about
+            "UPDATE sessions SET updated_at = datetime('now', '-400 days') WHERE id = ?",
+            (session_id,),
+        )
+        await db.db.commit()
+    await db.add_message(session_id, "user", "hello", actor=None, **kwargs)
+    if kwargs.get("bump_updated_at", True):
+        await db.db.execute(  # the form add_message writes
+            "UPDATE sessions SET updated_at = ? WHERE id = ?",
+            (_ago(minutes_ago).isoformat(), session_id),
+        )
+        await db.db.commit()
+
+
+async def _ran(db, job_id: str, *, minutes_ago: float = 0, status: str = "success") -> None:
+    """A finished run of ``job_id`` that started that long ago."""
+    log_id = await db.log_cron_start(job_id)
+    await db.log_cron_finish(log_id, status)
+    await db.db.execute(
+        "UPDATE cron_logs SET started_at = ? WHERE id = ?",
+        (_ago(minutes_ago).strftime("%Y-%m-%d %H:%M:%S"), log_id),
+    )
+    await db.db.commit()
+
+
+async def _workflow_run(db, run_id: str, created_by: str) -> str:
+    """A dispatched workflow run, linked to its ``workflow:<run>`` session."""
+    session_id = f"workflow:{run_id}"
+    await db.create_session(session_id, source="workflow", actor=None)
+    await db.create_workflow_run(run_id, "claude-workflow", {"prompt": "x"}, 5.0, created_by=created_by)
+    assert await db.transition_workflow_run(run_id, "running", expect=("pending",))
+    await db.update_workflow_run(run_id, {"session_id": session_id})
+    return session_id
+
+
+# How the agent's work reaches the database: a turn that ended and reported
+# its usage, or a message that a turn stored.
+WORK = pytest.mark.parametrize("work", [_turn, _stored_message], ids=["a turn that ended", "a stored message"])
+
+
+@pytest.mark.asyncio
+class TestAgentActivityGate:
+    async def _open(self, db, gate: AgentActivityGate | None = None, job_id: str = "tidy", jobs=()) -> bool:
+        ctx = GateContext(job_id=job_id, db=db, jobs={job.id: job for job in jobs})
+        return await (gate or AgentActivityGate()).is_satisfied(ctx)
+
+    async def test_an_agent_that_never_worked_has_no_activity(self, db):
+        assert await self._open(db) is False
+
+    @WORK
+    async def test_a_job_that_never_ran_runs_after_any_work(self, db, work):
+        await work(db, "chat-1", minutes_ago=60 * 24 * 90)
+
+        assert await self._open(db) is True
+
+    @WORK
+    async def test_work_before_the_last_run_is_not_activity(self, db, work):
+        await work(db, "chat-1", minutes_ago=60)
+        await _ran(db, "tidy", minutes_ago=30)
+
+        assert await self._open(db) is False
+
+    @WORK
+    async def test_work_since_the_last_run_is_activity(self, db, work):
+        await _ran(db, "tidy", minutes_ago=60)
+        await work(db, "chat-1", minutes_ago=30)
+
+        assert await self._open(db) is True
+
+    @pytest.mark.parametrize("stored", ["2026-01-02T03:04:05.678901+00:00", "2026-01-02 03:04:05"])
+    async def test_a_session_is_compared_by_its_time_in_either_stored_form(self, db, stored):
+        """``updated_at`` is ISO 8601 where a message moved it and SQLite's
+        own text where a status change did. As text, the first is later than
+        any time of its day in the second form, and the second earlier."""
+        await _stored_message(db, "chat-1")
+        await _ran(db, "tidy")
+        await db.db.execute("UPDATE sessions SET updated_at = ?", (stored,))
+
+        for run_started, open_ in (("2026-01-02 03:04:06", False), ("2026-01-02 03:04:05", True),
+                                   ("2026-01-01 23:59:59", True), ("2026-01-03 00:00:00", False)):
+            await db.db.execute("UPDATE cron_logs SET started_at = ?", (run_started,))
+            await db.db.commit()
+            assert await self._open(db) is open_, run_started
+
+    async def test_a_turn_in_the_second_the_run_started_counts(self, db):
+        """Seconds are all the two clocks have: a turn that ended in the
+        second the run started may have ended after it began."""
+        await _ran(db, "tidy")
+        await _turn(db, "chat-1")
+        await db.db.execute("UPDATE cron_logs SET started_at = '2026-01-02 03:04:05'")
+        await db.db.execute("UPDATE session_usage SET created_at = '2026-01-02 03:04:04'")
+        await db.db.commit()
+        assert await self._open(db) is False
+
+        await db.db.execute("UPDATE session_usage SET created_at = '2026-01-02 03:04:05'")
+        await db.db.commit()
+        assert await self._open(db) is True
+
+    async def test_a_session_nothing_was_stored_in_is_not_activity(self, db):
+        await _ran(db, "tidy", minutes_ago=60)
+        await db.create_session("empty", source="test", actor=None)
+
+        assert await self._open(db) is False
+
+    async def test_a_wakeups_message_is_seen_through_its_turn(self, db):
+        """A turn nobody asked for stores its messages without moving the
+        session's ``updated_at``. Its usage row is what says it ran."""
+        await _ran(db, "tidy", minutes_ago=60)
+        await _stored_message(db, "chat-1", bump_updated_at=False)
+        assert await self._open(db) is False
+
+        await _turn(db, "chat-1")
+        assert await self._open(db) is True
+
+    async def test_a_conversation_taken_in_from_an_external_agent_is_activity(self, db):
+        """Its messages keep their own times; the session moves when they are
+        stored."""
+        await _ran(db, "tidy", minutes_ago=60)
+        await db.create_session("thread-1", source="codex", actor=None)
+        await db.db.execute("UPDATE sessions SET updated_at = datetime('now', '-400 days')")
+        await db.db.commit()
+        assert await self._open(db) is False
+
+        await db.add_message_idempotent(
+            "thread-1", "assistant", "done", external_id="ext-1",
+            created_at=_ago(60 * 24 * 3).isoformat(), actor=None,
+        )
+        assert await self._open(db) is True
+
+    @WORK
+    @pytest.mark.parametrize("session_id", [
+        _run_session("tidy"), "cron:tidy:20260102-030405", "cron:tidy",
+    ], ids=["a run", "a run of an older release", "the stable session of an old persistent job"])
+    async def test_the_jobs_own_runs_are_not_activity(self, db, work, session_id):
+        """A run of the job must not be the reason for its next run."""
+        await _ran(db, "tidy", minutes_ago=60)
+        await work(db, session_id, minutes_ago=59)
+
+        assert await self._open(db) is False
+
+    @WORK
+    async def test_the_runs_of_another_job_are_activity(self, db, work):
+        await _ran(db, "tidy", minutes_ago=60)
+        await work(db, _run_session("report"), minutes_ago=30)
+
+        assert await self._open(db) is True
+
+    @WORK
+    async def test_the_runs_of_an_ignored_job_are_not_activity(self, db, work):
+        await _ran(db, "tidy", minutes_ago=60)
+        await work(db, _run_session("sweep"), minutes_ago=30)
+        await work(db, "cron:sweep", minutes_ago=30)
+
+        assert await self._open(db, AgentActivityGate(ignore_jobs=["sweep"])) is False
+        assert await self._open(db, AgentActivityGate(ignore_jobs=["other"])) is True
+
+    @WORK
+    @pytest.mark.parametrize(
+        "session_id", [_run_session("tidy:deep"), "cron:tidy:deep"],
+        ids=["a run of it", "its stable session"],
+    )
+    async def test_a_job_whose_id_extends_this_one_is_another_job(self, db, work, session_id):
+        """What follows ``cron:tidy:`` in a session of ``tidy`` is a run id:
+        these are sessions of the job ``tidy:deep``."""
+        await _ran(db, "tidy", minutes_ago=60)
+        await work(db, session_id, minutes_ago=30)
+
+        assert await self._open(db) is True
+        assert await self._open(db, AgentActivityGate(ignore_jobs=["tidy:deep"])) is False
+
+    @pytest.mark.parametrize("job_id", ["50%_off", "a*b[c]?", "it's \"quoted\"", "задача"])
+    async def test_a_job_id_is_text_not_a_pattern(self, db, job_id):
+        await _ran(db, job_id, minutes_ago=60)
+        await _turn(db, _run_session(job_id), minutes_ago=30)
+        assert await self._open(db, job_id=job_id) is False
+
+        await _turn(db, _run_session("50x_off"), minutes_ago=30)
+        await _turn(db, _run_session("axb[c]?"), minutes_ago=30)
+        assert await self._open(db, job_id=job_id) is True
+
+    @pytest.mark.parametrize("started_by", ["cron:tidy", "session:cron:tidy", "session:{run}"])
+    async def test_a_workflow_run_the_job_started_is_its_own_run(self, db, started_by):
+        """A workflow-run job does its work in ``workflow:<run>``, and a
+        prompt job can start a workflow run from its session. Counted as
+        activity, either would start the job again at every scheduled time."""
+        await _ran(db, "tidy", minutes_ago=60)
+        mine = await _workflow_run(db, "run-1", started_by.format(run=_run_session("tidy")))
+        await _turn(db, mine, minutes_ago=30)
+        await _stored_message(db, mine, minutes_ago=30)
+        assert await self._open(db) is False
+        assert await self._open(db, AgentActivityGate(ignore_jobs=["tidy"]), "other") is False
+
+        theirs = await _workflow_run(db, "run-2", "cron:report")
+        await _turn(db, theirs, minutes_ago=30)
+        assert await self._open(db) is True
+        assert await self._open(db, AgentActivityGate(ignore_jobs=["report"])) is False
+
+    async def test_a_workflow_run_a_person_started_is_activity(self, db):
+        await _ran(db, "tidy", minutes_ago=60)
+        await _turn(db, await _workflow_run(db, "run-1", "session:chat-1"), minutes_ago=30)
+
+        assert await self._open(db) is True
+
+    async def test_a_failed_run_does_not_move_the_window(self, db):
+        """What the agent did before a run that failed is still to be looked
+        at: the next run is not skipped for it."""
+        await _ran(db, "tidy", minutes_ago=120)
+        await _turn(db, "chat-1", minutes_ago=90)
+        await _ran(db, "tidy", minutes_ago=60, status="error")
+
+        assert await self._open(db) is True
+
+    @WORK
+    async def test_the_overlap_counts_the_time_before_the_last_run_again(self, db, work):
+        await work(db, "chat-1", minutes_ago=120)
+        await _ran(db, "tidy", minutes_ago=60)
+
+        assert await self._open(db, AgentActivityGate()) is False
+        assert await self._open(db, AgentActivityGate(overlap_hours=2)) is True
+        assert await self._open(db, AgentActivityGate(overlap_hours=0.5)) is False
+
+    @pytest.mark.parametrize("hours_before_first_run", [15, 3], ids=["an afternoon turn", "a turn in the small hours"])
+    async def test_a_daily_job_with_a_days_overlap_runs_twice_after_the_last_work(
+        self, db, hours_before_first_run,
+    ):
+        """The job reviews the day before each run. Whenever the turn was,
+        the two runs between them review the day it fell on, and then the job
+        waits: no third run."""
+        gate = AgentActivityGate(overlap_hours=24)
+        await _turn(db, "chat-1", minutes_ago=60 * (72 + hours_before_first_run))
+        assert await self._open(db, gate) is True   # the first scheduled time after it
+
+        await _ran(db, "tidy", minutes_ago=60 * 72)
+        assert await self._open(db, gate) is True   # a day later: once more
+
+        await _ran(db, "tidy", minutes_ago=60 * 48)
+        assert await self._open(db, gate) is False  # and then it waits
+
+    async def test_jobs_with_this_gate_are_not_activity_for_each_other(self, db):
+        """One piece of work, then nothing: each job runs once for it. Neither
+        names the other. A run of one that counted for the other would start
+        it, whose run would start the first again, for as long as the
+        instance lives."""
+        gated = [{"type": "agent_activity"}]
+        memory = CronJob(id="memory", schedule="1h", prompt="p", run_if=gated)
+        skills = CronJob(id="skills", schedule="1h", prompt="p", run_if=gated)
+        digest = CronJob(id="digest", schedule="1h", prompt="p")
+        jobs = [memory, skills, digest]
+        await _turn(db, "chat-1", minutes_ago=50)
+        assert await self._open(db, memory.gates[0], "memory", jobs) is True
+        assert await self._open(db, skills.gates[0], "skills", jobs) is True
+
+        await _ran(db, "memory", minutes_ago=40)
+        await _turn(db, _run_session("memory"), minutes_ago=39)
+        assert await self._open(db, memory.gates[0], "memory", jobs) is False
+        assert await self._open(db, skills.gates[0], "skills", jobs) is True
+
+        await _ran(db, "skills", minutes_ago=30)
+        await _turn(db, _run_session("skills"), minutes_ago=29)
+        assert await self._open(db, memory.gates[0], "memory", jobs) is False
+        assert await self._open(db, skills.gates[0], "skills", jobs) is False
+        # Without the other jobs to look at, the run of ``skills`` is work.
+        assert await self._open(db, memory.gates[0], "memory") is True
+
+        # A job without the gate is work for both.
+        await _turn(db, _run_session("digest"), minutes_ago=20)
+        assert await self._open(db, memory.gates[0], "memory", jobs) is True
+        assert await self._open(db, skills.gates[0], "skills", jobs) is True
+
+    @WORK
+    async def test_a_catch_up_counts_only_what_was_recorded_before_the_run_came_due(self, db, work):
+        """A catch-up stands in for a run that came due while the machine was
+        paused. What was recorded since, the message that woke the machine
+        above all, is work for the job's next scheduled time."""
+        gate = AgentActivityGate()
+        await _ran(db, "tidy", minutes_ago=600)
+        await work(db, "chat-1", minutes_ago=1)
+
+        async def open_as_of(minutes_ago: float | None) -> bool:
+            as_of = _ago(minutes_ago) if minutes_ago is not None else None
+            return await gate.is_satisfied(GateContext(job_id="tidy", db=db, as_of=as_of))
+
+        assert await open_as_of(60) is False
+        assert await open_as_of(None) is True
+
+        await work(db, "chat-2", minutes_ago=300)
+        assert await open_as_of(60) is True
+        assert await open_as_of(301) is False
+
+    async def test_the_time_a_catch_up_asks_about_names_its_zone(self, db):
+        """A time without a zone would be read as the machine's local time."""
+        naive = datetime.now(UTC).replace(tzinfo=None)
+
+        with pytest.raises(ValueError, match="timezone-aware"):
+            await db.has_activity_since_cron_run("tidy", until=naive)
+
+    async def test_the_legs_of_a_review_loop_the_job_started_are_its_own_run(self, db):
+        """The legs run in workflow sessions that name the loop, and the loop
+        names the session that started it."""
+        async def loop(loop_id: str, session_id: str) -> str:
+            if await db.get_session(session_id) is None:
+                await db.create_session(session_id, source="test", actor=None)
+            await db.create_review_loop(
+                loop_id, title="t", session_id=session_id, goal_prompt="g", verifier_prompt="v",
+                criteria_adoption="no", criteria=[], implementer={}, verifier={}, cwd=None,
+                max_iterations=1, budget_usd=1.0,
+            )
+            return await _workflow_run(db, f"leg-{loop_id}", f"review-loop:{loop_id}")
+
+        await _ran(db, "tidy", minutes_ago=60)
+        await _turn(db, await loop("mine", _run_session("tidy")), minutes_ago=30)
+        assert await self._open(db) is False
+        assert await self._open(db, AgentActivityGate(ignore_jobs=["tidy"]), "other") is False
+
+        await _turn(db, await loop("theirs", "chat-1"), minutes_ago=30)
+        assert await self._open(db) is True
+
+
+class TestAgentActivityGateConfig:
+    def test_from_config(self):
+        gate = build_gate({"type": "agent_activity"})
+        assert isinstance(gate, AgentActivityGate)
+        assert (gate.ignore_jobs, gate.overlap_hours) == ([], 0.0)
+
+        gate = build_gate({
+            "type": "agent_activity", "ignore_jobs": ["a", " b ", "a"], "overlap_hours": 24,
+        })
+        assert (gate.ignore_jobs, gate.overlap_hours) == (["a", "b"], 24.0)
+        assert build_gate({"type": "agent_activity", "ignore_jobs": "a"}).ignore_jobs == ["a"]
+        # A bare key is the one way to say "not set".
+        bare = build_gate({"type": "agent_activity", "ignore_jobs": None, "overlap_hours": None})
+        assert (bare.ignore_jobs, bare.overlap_hours) == ([], 0.0)
+
+    @pytest.mark.parametrize("bad", [0, False, "", {}, {"a": 1}, [""], ["a", 3], [None]])
+    def test_a_malformed_ignore_list_is_refused(self, bad):
+        """Read as an empty list, it would count the runs the spec left out."""
+        with pytest.raises(GateConfigError, match="ignore_jobs"):
+            build_gate({"type": "agent_activity", "ignore_jobs": bad})
+
+    @pytest.mark.parametrize("bad", [
+        -1, True, "24", [24], float("nan"), float("inf"), 24 * 366 + 1, 10 ** 400,
+    ])
+    def test_a_malformed_overlap_is_refused(self, bad):
+        """Refused as a gate that does not build, which costs the one job. An
+        integer too large for a float must not escape as another error: that
+        would cost every job of the file."""
+        with pytest.raises(GateConfigError, match="overlap_hours"):
+            build_gate({"type": "agent_activity", "overlap_hours": bad})
+
+    def test_describe(self):
+        assert AgentActivityGate().describe() == "agent activity since this job's last run"
+        described = AgentActivityGate(ignore_jobs=["a", "b"], overlap_hours=24).describe()
+        assert described == (
+            "agent activity since 24h before this job's last run, "
+            "not counting the runs of a, b"
+        )
+
+    def test_only_this_gate_lets_a_manual_run_through(self):
+        """It estimates whether a run is worth it. The other gates say whether
+        the job has anything to act on."""
+        unchecked = [key for key, cls in GATE_REGISTRY.items() if not cls.checked_on_manual_runs]
+        assert unchecked == ["agent_activity"]
+
+
+# ---------------------------------------------------------------------------
+# AgentActivityGate on real turns and real runs
+# ---------------------------------------------------------------------------
+
+@pytest_asyncio.fixture
+async def agent_db(db):
+    """The database with the agent's identity, as a real engine needs it."""
+    await ensure_system_principal(db)
+    return db
+
+
+async def _age(db, minutes: int) -> None:
+    """Move everything recorded so far that long into the past."""
+    step = f"-{minutes} minutes"
+    await db.db.execute("UPDATE session_usage SET created_at = datetime(created_at, ?)", (step,))
+    await db.db.execute("UPDATE sessions SET updated_at = datetime(updated_at, ?)", (step,))
+    await db.db.execute("UPDATE cron_logs SET started_at = datetime(started_at, ?)", (step,))
+    await db.db.commit()
+
+
+OK = [("text", "done"), ("result", "sdk-ok")]
+
+
+@pytest.mark.asyncio
+class TestAgentActivityOfRealTurns:
+    """Every way a turn can end leaves a record the gate reads, and leaves it
+    before the session stops counting as running. That is the moment the next
+    scheduled task is forecast again: a platform that parks an idle machine
+    must hear then that the job will run."""
+
+    @staticmethod
+    def _asked_when_a_session_stops(engine, db) -> tuple[list[bool], list[asyncio.Future]]:
+        answers: list[bool] = []
+        asked: list[asyncio.Future] = []
+
+        async def ask() -> None:
+            answers.append(await AgentActivityGate().is_satisfied(GateContext(job_id="tidy", db=db)))
+
+        def stopped(_session_id: str, running: bool) -> None:
+            if not running:
+                asked.append(asyncio.ensure_future(ask()))
+
+        engine.sessions.add_running_listener(stopped)
+        return answers, asked
+
+    @pytest.mark.parametrize("script, status", [
+        (OK, "completed"),
+        ([("text", "half an answer"), ("raise",)], "failed"),
+        ([("text", "done"), ("result", "sdk-1", {"usage": None})], "completed"),
+    ], ids=["completed", "the runtime died", "a result without usage"])
+    async def test_a_turn_is_activity_however_it_ends(self, agent_db, tmp_path, script, status):
+        engine, _ = await _engine(agent_db, tmp_path, [script])
+        await _session(engine, "chat")
+        await _ran(agent_db, "tidy")
+        await _age(agent_db, 10)
+        gate = AgentActivityGate()
+        assert await gate.is_satisfied(_ctx(agent_db, "tidy")) is False
+        answers, asked = self._asked_when_a_session_stops(engine, agent_db)
+
+        result = await _real_turn(engine, "chat")
+        await asyncio.gather(*asked)
+
+        assert result.outcome.status == status
+        assert answers == [True]
+
+    async def test_a_turn_that_was_stopped_is_activity(self, agent_db, tmp_path):
+        engine, _ = await _engine(agent_db, tmp_path, [[("text", "x"), ("hang",)]])
+        await _session(engine, "chat")
+        await _ran(agent_db, "tidy")
+        await _age(agent_db, 10)
+        answers, asked = self._asked_when_a_session_stops(engine, agent_db)
+        token = await _token_seen("chat")
+        try:
+            turn = asyncio.create_task(_real_turn(engine, "chat"))
+            await asyncio.wait_for(token.wait(), 5)
+            turn.cancel()
+            result = await turn
+        finally:
+            await broadcaster.unregister("chat", "turn-outcome-test")
+        await asyncio.gather(*asked)
+
+        assert result.outcome.status == "interrupted"
+        assert answers == [True]
+
+
+@pytest.mark.asyncio
+class TestAgentActivityOfRealRuns:
+    """The gate on runs of the real scheduler, with the session ids the code
+    itself makes: one piece of work, then several scheduled times with the
+    agent otherwise idle."""
+
+    GATED = [{"type": "agent_activity"}]
+
+    async def _scheduled_times(self, svc: CronService, job: CronJob, times: int, settle=None) -> list[dict]:
+        for _ in range(times):
+            await svc._run_job_inner(job)
+            if settle is not None:
+                await settle()
+            await _age(svc.db, 10)
+        return await svc.db.get_cron_logs(job.id)
+
+    async def _one_chat_turn(self, engine, db) -> None:
+        await _session(engine, "chat")
+        await _real_turn(engine, "chat")
+        await _age(db, 10)
+
+    @pytest.mark.parametrize("mode", ["isolated", "persistent"])
+    async def test_a_job_runs_once_for_one_piece_of_work(self, agent_db, tmp_path, mode):
+        engine, _ = await _engine(agent_db, tmp_path, [OK])
+        svc = CronService(engine.config, engine, agent_db)
+        job = CronJob(id="tidy", schedule="1h", prompt="p", session_mode=mode,
+                      context_rotate_hours=0, run_if=self.GATED)
+        assert await self._scheduled_times(svc, job, 1) == []  # nothing has happened yet
+
+        await self._one_chat_turn(engine, agent_db)
+        logs = await self._scheduled_times(svc, job, 3)
+
+        assert [log["status"] for log in logs] == ["success"]
+
+    async def test_a_workflow_run_job_runs_once_for_one_piece_of_work(
+        self, agent_db, tmp_path, monkeypatch,
+    ):
+        """Its work is done in ``workflow:<run>``, not in a cron session."""
+        engine, _ = await _engine(agent_db, tmp_path, [OK])
+        service = WorkflowRunService(_make_config(tmp_path), agent_db, engine)
+        monkeypatch.setattr(nerve.workflows, "_service", service)
+        svc = CronService(engine.config, engine, agent_db)
+        job = CronJob(id="nightly-audit", schedule="1h", run_if=self.GATED,
+                      workflow={"engine": ENGINE_CLAUDE, "prompt": "audit", "budget_usd": 1.0})
+        await self._one_chat_turn(engine, agent_db)
+
+        logs = await self._scheduled_times(svc, job, 4, settle=lambda: _drain(service))
+
+        assert len(logs) == 1
+        assert logs[0]["session_id"].startswith("workflow:")
+
+    async def test_jobs_with_the_gate_do_not_start_each_other(self, agent_db, tmp_path):
+        """Neither names the other: the scheduler tells each gate which jobs
+        carry it. One piece of work, then six scheduled times."""
+        engine, _ = await _engine(agent_db, tmp_path, [OK])
+        svc = CronService(engine.config, engine, agent_db)
+        memory = CronJob(id="memory", schedule="1h", prompt="p", run_if=self.GATED)
+        skills = CronJob(id="skills", schedule="1h", prompt="p", run_if=self.GATED)
+        svc._jobs = [memory, skills]
+        await self._one_chat_turn(engine, agent_db)
+
+        for _ in range(3):
+            await self._scheduled_times(svc, memory, 1)
+            await self._scheduled_times(svc, skills, 1)
+
+        assert len(await agent_db.get_cron_logs("memory")) == 1
+        assert len(await agent_db.get_cron_logs("skills")) == 1
+
+    @pytest.mark.parametrize("origin", ["schedule", "catchup", "delivery"])
+    async def test_a_run_that_nobody_started_is_checked(self, agent_db, tmp_path, origin):
+        engine, _ = await _engine(agent_db, tmp_path, [OK])
+        svc = CronService(engine.config, engine, agent_db)
+        job = CronJob(id="tidy", schedule="1h", prompt="p", run_if=self.GATED)
+        svc._jobs = [job]
+
+        await svc._run_job_wrapper(job, origin=origin)
+
+        assert await agent_db.get_cron_logs("tidy") == []
+
+    @pytest.mark.parametrize("worked_before", [False, True])
+    async def test_the_startup_catch_up_asks_about_its_own_start(
+        self, agent_db, tmp_path, monkeypatch, worked_before,
+    ):
+        """A run that the gate skipped leaves no row, so the job counts as
+        overdue at every start. A message that arrives while the catch-up is
+        under way is work for the job's next scheduled time; work from before
+        the start is what the catch-up is for."""
+        engine, _ = await _engine(agent_db, tmp_path, [OK])
+        svc = CronService(engine.config, engine, agent_db)
+        job = CronJob(id="tidy", schedule="1h", prompt="p", run_if=self.GATED)
+        svc._jobs = [job]
+        await _ran(agent_db, "tidy", minutes_ago=180)
+        await agent_db.db.execute("UPDATE cron_logs SET finished_at = ?", (_ago(179).isoformat(),))
+        await agent_db.db.commit()
+        if worked_before:
+            await _turn(agent_db, "chat-0", minutes_ago=30)
+        last_run = agent_db.get_last_successful_cron_run
+
+        async def then_a_message_arrives(job_id: str):
+            row = await last_run(job_id)
+            await _stored_message(agent_db, "chat-1")
+            return row
+
+        monkeypatch.setattr(agent_db, "get_last_successful_cron_run", then_a_message_arrives)
+
+        await svc._catchup_missed_jobs()
+
+        runs = [log["status"] for log in await agent_db.get_cron_logs("tidy")]
+        assert len(runs) == (2 if worked_before else 1)
+
+    async def test_a_run_that_a_person_starts_is_not_checked(self, agent_db, tmp_path):
+        """The gate estimates whether a run is worth it. A person who starts
+        the job may know of work it cannot see, such as a memory written
+        through the MCP endpoint. A gate that says whether the job has
+        anything to act on still holds."""
+        engine, _ = await _engine(agent_db, tmp_path, [OK])
+        svc = CronService(engine.config, engine, agent_db)
+        tidy = CronJob(id="tidy", schedule="1h", prompt="p", run_if=self.GATED)
+        planner = CronJob(id="planner", schedule="1h", prompt="p",
+                          run_if=[*self.GATED, {"type": "tasks", "status": "pending"}])
+        svc._jobs = [tidy, planner]
+
+        await svc._run_job_wrapper(tidy)  # as the scheduler starts it
+        assert await agent_db.get_cron_logs("tidy") == []
+
+        await svc.run_job("tidy")
+        await svc.run_job("planner")
+
+        assert [log["status"] for log in await agent_db.get_cron_logs("tidy")] == ["success"]
+        assert await agent_db.get_cron_logs("planner") == []
+
+
+# ---------------------------------------------------------------------------
+# The default gates of built-in jobs
+# ---------------------------------------------------------------------------
+
+def _load(tmp_path, system: list[dict] | None, user: list[dict] | None = None,
+          backend: str = "memu", strict: bool = False) -> dict[str, CronJob]:
+    """The jobs the scheduler loads from the two files, by id."""
+    import yaml
+
+    for name, jobs in (("system.yaml", system), ("jobs.yaml", user)):
+        if jobs is not None:
+            (tmp_path / name).write_text(yaml.safe_dump({"jobs": jobs}), encoding="utf-8")
+    service = SimpleNamespace(
+        config=SimpleNamespace(
+            cron=SimpleNamespace(
+                system_file=tmp_path / "system.yaml", jobs_file=tmp_path / "jobs.yaml",
+            ),
+            memory=SimpleNamespace(backend=backend),
+        ),
+        _rejected_job_ids=[],
+    )
+    return {job.id: job for job in CronService._load_merged_jobs(service, strict=strict)}
+
+
+def _system_yaml(backend: str = "memu", mode: str = "worker") -> list[dict]:
+    """The system.yaml job list the installer writes."""
+    from nerve.setup_writer import DEFAULT_CRONS, SetupChoices, build_cron_jobs
+
+    return build_cron_jobs(SetupChoices(
+        mode=mode, enabled_crons=list(DEFAULT_CRONS[mode]), memory_backend=backend,
+    ))
+
+
+def _gates(job: CronJob) -> list[tuple]:
+    return [(type(g), g.ignore_jobs, g.overlap_hours) for g in job.gates]
+
+
+def _said_about_defaults(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "default gates" in r.getMessage()]
+
+
+class TestDefaultGatesOfBuiltInJobs:
+    """memory-maintenance and skill-extractor wait for the agent to work. The
+    gates are not in system.yaml, which nothing writes again when Nerve is
+    updated: the scheduler gives them to an entry that states none, so an
+    install from before them has them too, and a later change reaches all."""
+
+    MEMORY = ["skill-extractor", "skill-reviser", "machine-maintenance"]
+    SKILLS = ["memory-maintenance", "skill-reviser", "machine-maintenance"]
+
+    @pytest.mark.parametrize("strict", [False, True], ids=["at startup", "on a reload"])
+    def test_the_two_jobs_have_their_gates_without_the_file_stating_them(self, tmp_path, strict):
+        written = {job["id"]: job for job in _system_yaml()}
+        assert "run_if" not in written["memory-maintenance"]
+        assert "run_if" not in written["skill-extractor"]
+
+        loaded = _load(tmp_path, list(written.values()), strict=strict)
+
+        assert _gates(loaded["memory-maintenance"]) == [(AgentActivityGate, self.MEMORY, 24.0)]
+        assert _gates(loaded["skill-extractor"]) == [(AgentActivityGate, self.SKILLS, 0.0)]
+
+    def test_the_memory_backend_decides_the_overlap_not_the_file(self, tmp_path):
+        """memU's job reviews the records of the day before the run, so it
+        looks back a day before its last run; Loom's checks the namespace as
+        it is. The file here was written for memU, and the backend changed."""
+        loaded = _load(tmp_path, _system_yaml("memu"), backend="loom")
+
+        assert _gates(loaded["memory-maintenance"]) == [(AgentActivityGate, self.MEMORY, 0.0)]
+        assert _gates(loaded["skill-extractor"]) == [(AgentActivityGate, self.SKILLS, 0.0)]
+
+    @pytest.mark.parametrize("said", [
+        {"run_if": []},
+        {"run_if": None},
+        {"skip_when_idle": []},
+        {"run_if": [{"type": "tasks", "status": "pending"}]},
+    ])
+    def test_an_entry_that_says_anything_about_gates_is_left_alone(self, tmp_path, said):
+        """``run_if: []`` is how a file says "on every schedule"."""
+        jobs = _system_yaml()
+        for job in jobs:
+            if job["id"] == "memory-maintenance":
+                job.update(said)
+        loaded = _load(tmp_path, jobs)["memory-maintenance"]
+
+        assert not any(isinstance(gate, AgentActivityGate) for gate in loaded.gates)
+        assert len(loaded.gates) == len(said.get("run_if") or [])
+
+    def test_an_edited_entry_without_run_if_gets_them_too(self, tmp_path):
+        """The gates go by the job's id and the missing key, nothing else: the
+        wording of the prompt has changed between releases, so it cannot say
+        whether an entry is the shipped one."""
+        jobs = _system_yaml()
+        for job in jobs:
+            if job["id"] == "skill-extractor":
+                job.update(prompt="Look for what I do twice.", schedule="0 9 * * 1")
+        loaded = _load(tmp_path, jobs)["skill-extractor"]
+
+        assert loaded.prompt == "Look for what I do twice."
+        assert _gates(loaded) == [(AgentActivityGate, self.SKILLS, 0.0)]
+
+    def test_no_other_built_in_job_gets_a_gate_it_does_not_state(self, tmp_path):
+        """inbox-processor and task-planner have their gates in the file. An
+        entry of theirs without one goes on running on every schedule."""
+        jobs = _system_yaml(mode="personal")
+        for job in jobs:
+            job.pop("run_if", None)
+        loaded = _load(tmp_path, jobs)
+
+        gated = {job_id for job_id, job in loaded.items() if job.gates}
+        assert gated == {"memory-maintenance", "skill-extractor"}
+        assert {"inbox-processor", "task-planner", "skill-reviser", "machine-maintenance"} <= set(loaded)
+
+    def test_a_job_that_jobs_yaml_replaces_keeps_what_that_file_says(self, tmp_path, caplog):
+        mine = {"id": "memory-maintenance", "schedule": "0 6 * * *", "prompt": "My own tidy-up."}
+        with caplog.at_level("INFO", logger="nerve.cron.jobs"):
+            loaded = _load(tmp_path, _system_yaml(), [mine])
+
+        assert loaded["memory-maintenance"].prompt == "My own tidy-up."
+        assert loaded["memory-maintenance"].gates == []
+        assert loaded["skill-extractor"].gates
+        said = _said_about_defaults(caplog)
+        assert len(said) == 1 and "skill-extractor" in said[0]
+
+    def test_built_in_jobs_kept_in_jobs_yaml_are_left_alone(self, tmp_path):
+        """An old install with every job in jobs.yaml and no system.yaml: that
+        file is the user's."""
+        loaded = _load(tmp_path, None, _system_yaml())
+
+        assert loaded["memory-maintenance"].gates == []
+        assert loaded["skill-extractor"].gates == []
+
+    def test_the_load_says_which_gates_it_gave(self, tmp_path, caplog):
+        with caplog.at_level("INFO", logger="nerve.cron.jobs"):
+            _load(tmp_path, _system_yaml())
+
+        said = _said_about_defaults(caplog)
+        assert len(said) == 2
+        assert all(
+            "system.yaml" in line and "agent activity since" in line and "run_if: []" in line
+            for line in said
+        )
+
+    def test_only_the_scheduler_gives_them(self, tmp_path):
+        """A plain load of the file returns what the file says: the default
+        is the scheduler's to give."""
+        import yaml
+
+        from nerve.cron.jobs import load_jobs
+
+        path = tmp_path / "system.yaml"
+        path.write_text(yaml.safe_dump({"jobs": _system_yaml()}), encoding="utf-8")
+
+        assert all(job.gates == [] for job in load_jobs(path) if job.id != "task-planner")
+
+    def test_a_default_that_does_not_build_leaves_the_job_as_the_file_has_it(self, tmp_path, caplog):
+        """The file never stated the gate: a default that fails must not cost
+        the job, nor blame the entry."""
+        import yaml
+
+        from nerve.cron.jobs import load_jobs
+
+        path = tmp_path / "system.yaml"
+        path.write_text(yaml.safe_dump({"jobs": [
+            {"id": "tidy", "schedule": "1h", "prompt": "p"},
+            "not a mapping",
+            {"id": "broken", "schedule": "1h"},
+        ]}), encoding="utf-8")
+
+        with caplog.at_level("INFO", logger="nerve.cron.jobs"):
+            jobs = load_jobs(path, default_run_if=lambda job_id: [{"type": "no-such-gate"}])
+
+        assert [(job.id, job.gates) for job in jobs] == [("tidy", [])]
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1 and "tidy" in errors[0] and "no-such-gate" in errors[0]
+        assert _said_about_defaults(caplog) == errors
+        # An entry that is itself at fault is refused for what it lacks, with
+        # or without a default that builds.
+        path.write_text(yaml.safe_dump({"jobs": [{"id": "broken", "schedule": "1h"}]}), encoding="utf-8")
+        for default in ([{"type": "tasks"}], [{"type": "no-such-gate"}]):
+            with pytest.raises(Exception, match="needs a 'prompt'"):
+                load_jobs(path, strict=True, default_run_if=lambda job_id, d=default: d)
+
+    def test_the_default_is_asked_only_for_an_entry_without_the_keys(self, tmp_path):
+        import yaml
+
+        from nerve.cron.jobs import load_jobs
+
+        entry = {"schedule": "1h", "prompt": "p"}
+        path = tmp_path / "jobs.yaml"
+        path.write_text(yaml.safe_dump({"jobs": [
+            {"id": "plain", **entry},
+            {"id": "stated", **entry, "run_if": []},
+            {"id": "legacy", **entry, "skip_when_idle": ["mail"]},
+            {"id": "none-for-it", **entry},
+        ]}), encoding="utf-8")
+        asked: list[str] = []
+
+        def default(job_id: str) -> list[dict]:
+            asked.append(job_id)
+            return [] if job_id == "none-for-it" else [{"type": "tasks", "status": "pending"}]
+
+        jobs = {job.id: job for job in load_jobs(path, default_run_if=default)}
+
+        assert asked == ["plain", "none-for-it"]
+        assert [type(gate) for gate in jobs["plain"].gates] == [TasksGate]
+        assert jobs["stated"].gates == [] and jobs["none-for-it"].gates == []
+        assert [type(gate) for gate in jobs["legacy"].gates] == [MessagesGate]

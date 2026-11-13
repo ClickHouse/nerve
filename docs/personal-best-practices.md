@@ -90,7 +90,7 @@ On an instance whose memory is Loom (`memory.backend: loom`), this tier is Loom 
 
 ### Housekeeping
 
-The built-in `memory-maintenance` cron ([cron.md](cron.md#built-in-system-crons)) runs daily and silently over long-term memory: it deduplicates, prunes and rewords with `memory_records_by_date`, `memory_update` and `memory_delete`. On a Loom instance it runs Loom's integrity report on the agent's home namespace instead and leaves deduplication to Loom. It does not touch `MEMORY.md` or the context files. Their housekeeping (stubs over the cap, tag review, eviction, archiving dormant files) is yours: do it by hand in a quiet turn, or add a daily isolated job to `config/cron/jobs.yaml` that notifies only when it needs a ruling. A maintenance job that reports routine work teaches the human to ignore notifications.
+The built-in `memory-maintenance` cron ([cron.md](cron.md#built-in-system-crons)) runs silently over long-term memory, daily while the agent is in use (it waits while the agent has done nothing since its last run): it deduplicates, prunes and rewords with `memory_records_by_date`, `memory_update` and `memory_delete`. On a Loom instance it runs Loom's integrity report on the agent's home namespace instead and leaves deduplication to Loom. It does not touch `MEMORY.md` or the context files. Their housekeeping (stubs over the cap, tag review, eviction, archiving dormant files) is yours: do it by hand in a quiet turn, or add a daily isolated job to `config/cron/jobs.yaml` that notifies only when it needs a ruling. A maintenance job that reports routine work teaches the human to ignore notifications.
 
 ## Working Discipline
 

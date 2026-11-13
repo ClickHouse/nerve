@@ -23,8 +23,16 @@ import { isAskFormTool } from './tools/formQuestions';
  * or the live card of a workflow run. Only the first call for a run in a
  * message shows that card; later calls for the run show a compact row, which
  * a burst can hold.
+ *
+ * With `mcpApps` (this Nerve hosts MCP Apps), also a call that has an
+ * interactive view: the view is what the person reads and uses.
  */
-export function isPinnedCall(block: ToolCallBlockData, repeatRunCalls: ReadonlySet<string>): boolean {
+export function isPinnedCall(
+  block: ToolCallBlockData,
+  repeatRunCalls: ReadonlySet<string>,
+  mcpApps = false,
+): boolean {
+  if (mcpApps && block.mcpApp) return true;
   if (block.tool === 'AskUserQuestion' || block.tool === 'ExitPlanMode') return true;
   const baseName = toolBaseName(block.tool);
   if (isAskFormTool(block.tool) || baseName === 'ask_user' || baseName === 'send_file') return true;
@@ -38,9 +46,13 @@ type BurstBlock = ThinkingBlockData | ToolCallBlockData;
  * The render items of one message with tool bursts: each run of thinking and
  * tool_call blocks becomes one `tool_burst` (consecutive same-tool calls are
  * grouped inside it). Every other block, and every pinned call, stays a
- * separate item and ends the run.
+ * separate item and ends the run. `mcpApps`: see `isPinnedCall`.
  */
-export function groupToolBursts(blocks: MessageBlock[], repeatRunCalls: ReadonlySet<string>): RenderItem[] {
+export function groupToolBursts(
+  blocks: MessageBlock[],
+  repeatRunCalls: ReadonlySet<string>,
+  mcpApps = false,
+): RenderItem[] {
   const result: RenderItem[] = [];
   let run: BurstBlock[] = [];
 
@@ -55,7 +67,7 @@ export function groupToolBursts(blocks: MessageBlock[], repeatRunCalls: Readonly
   }
 
   for (const block of blocks) {
-    if (block.type === 'thinking' || (block.type === 'tool_call' && !isPinnedCall(block, repeatRunCalls))) {
+    if (block.type === 'thinking' || (block.type === 'tool_call' && !isPinnedCall(block, repeatRunCalls, mcpApps))) {
       run.push(block);
     } else {
       flushRun();

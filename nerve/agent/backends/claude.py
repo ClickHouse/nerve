@@ -50,10 +50,12 @@ from claude_agent_sdk.types import (
     ToolPermissionContext,
 )
 
+from nerve import mcp_apps
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.base import (
     AgentClient,
     BackendCapabilities,
+    BackendError,
     SessionSpec,
     TransportDiedError,
     TurnInput,
@@ -244,11 +246,14 @@ def translate_message(message: Any) -> list[ev.AgentEvent]:
             # The structured tool output describes the message's one tool
             # result; with several results it cannot be attributed.
             structured = getattr(message, "tool_use_result", None)
+            # In its place the CLI puts a fixed notice when the person
+            # stopped the call or refused it.
+            rejected = len(results) == 1 and structured == USER_REJECTED_TOOL_USE
             if len(results) != 1 or not isinstance(structured, dict):
                 structured = None
             for block in results:
                 out.append(_translate_tool_result(
-                    block, parent_id, structured=structured,
+                    block, parent_id, structured=structured, rejected=rejected,
                 ))
 
     elif isinstance(message, SystemMessage):
@@ -336,9 +341,15 @@ def context_breakdown(report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# What the CLI reports as ``tool_use_result`` for a tool use that the person
+# stopped while it ran, or refused: the tool gave no result, and the content
+# of the tool result is the CLI's notice to the model.
+USER_REJECTED_TOOL_USE = "User rejected tool use"
+
+
 def _translate_tool_result(
     block: ToolResultBlock, parent_id: str | None,
-    *, structured: dict[str, Any] | None = None,
+    *, structured: dict[str, Any] | None = None, rejected: bool = False,
 ) -> ev.ToolResult:
     return ev.ToolResult(
         tool_use_id=getattr(block, "tool_use_id", None),
@@ -346,6 +357,7 @@ def _translate_tool_result(
         is_error=bool(getattr(block, "is_error", False) or False),
         parent_tool_use_id=parent_id,
         structured=structured,
+        rejected=rejected,
     )
 
 
@@ -754,7 +766,7 @@ class ClaudeBackend:
             # "project" sources. Native skills/plugins are unaffected — they
             # load via ``plugins`` (--plugin-dir), independent of this setting.
             setting_sources=[],
-            mcp_servers=self._build_mcp_servers(spec.session_id),
+            mcp_servers=self._build_mcp_servers(spec.session_id, spec.excluded_tools),
             # External mode: the CLI reads no MCP configuration other than
             # ``mcp_servers``, which holds the MCP gateway's servers.
             strict_mcp_config=self._deps.managed_mcp,
@@ -870,6 +882,14 @@ class ClaudeBackend:
         # is the flag's only route into the CLI. See agent.agent_teams.
         if config.agent.agent_teams:
             env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = "1"
+        # MCP Apps host: the CLI tells MCP servers that this client shows
+        # their ui:// views, and keeps tools that are for a view only out of
+        # the model's tool list. See mcp_apps (docs/mcp-apps.md). Local mode
+        # only: ``managed_mcp`` is external mode, where the feature is off.
+        if getattr(config, "mcp_apps_active", False) and not getattr(
+            self._deps, "managed_mcp", False,
+        ):
+            env[mcp_apps.HOST_ENV] = "1"
         if config.provider.is_bedrock:
             env["CLAUDE_CODE_USE_BEDROCK"] = "1"
             if config.provider.aws_region:
@@ -930,12 +950,17 @@ class ClaudeBackend:
         ))
         return env
 
-    def _build_mcp_servers(self, session_id: str) -> dict[str, Any]:
+    def _build_mcp_servers(
+        self, session_id: str, excluded: frozenset[str] = frozenset(),
+    ) -> dict[str, Any]:
         """Build the mcp_servers dict: in-process nerve + external servers.
 
         Claude Code plugin MCPs are handled separately via the SDK
         ``plugins`` field which lets the CLI manage OAuth and plugin
         lifecycle natively.
+
+        ``excluded`` names the nerve tools this session is not offered on
+        top of the backend's own exclusions (``SessionSpec.excluded_tools``).
         """
         from nerve.agent.tools import build_session_mcp_server
 
@@ -945,7 +970,7 @@ class ClaudeBackend:
             "nerve": build_session_mcp_server(
                 self._deps.registry, tool_ctx,
                 include_hoa=include_hoa,
-                exclude=self.excluded_tools(),
+                exclude=self.excluded_tools() | excluded,
             ),
         }
         for srv in self._deps.external_mcp_servers():
@@ -1251,6 +1276,20 @@ INTERRUPT_TIMEOUT = 10.0
 CONTEXT_USAGE_TIMEOUT = 10.0
 # The CLI command that replaces the conversation with a summary.
 COMPACT_COMMAND = "/compact"
+# MCP Apps (nerve/mcp_apps.py). The mcp_status control request waits at most
+# MCP_STATUS_TIMEOUT. A tool event waits for it only MCP_LOOKUP_WAIT (see
+# ClaudeClient.mcp_app_for_tool), and after a status failed, none is asked
+# for a tool event for MCP_STATUS_RETRY_AFTER.
+MCP_STATUS_TIMEOUT = 5.0
+MCP_LOOKUP_WAIT = 2.0
+MCP_STATUS_RETRY_AFTER = 30.0
+# The mcp_read_resource control request waits at most this long.
+MCP_READ_RESOURCE_TIMEOUT = 30.0
+# A tool that a view calls runs at most this long: the CLI ends it then. The
+# mcp_call control request waits MCP_CALL_GRACE longer, because the CLI first
+# waits up to 30 seconds for a server that is not connected yet.
+MCP_APP_TOOL_TIMEOUT = 60.0
+MCP_CALL_GRACE = 40.0
 
 
 class ClaudeClient(AgentClient):
@@ -1260,6 +1299,12 @@ class ClaudeClient(AgentClient):
     # partially-initialized instance) read None instead of raising.
     _last_entry_uuid: str | None = None
     _transport: Any = None
+    _mcp_apps_host: bool = False
+    _mcp_tools: dict[str, mcp_apps.AppTool] | None = None
+    _mcp_unknown_tools: frozenset[str] = frozenset()
+    _mcp_lookup: asyncio.Task | None = None
+    _mcp_lookup_names: set[str] | None = None
+    _mcp_status_retry_at: float = 0.0
 
     def __init__(
         self, spec: SessionSpec, options: ClaudeAgentOptions, *,
@@ -1284,7 +1329,11 @@ class ClaudeClient(AgentClient):
         # at connect, and a pre-configured copy would set both can_use_tool and
         # permission_prompt_tool_name (a ValueError there).
         self._sdk = ClaudeSDKClient(options=options, transport=self._transport)
-        self._native_session_id: str | None = spec.resume_native_id
+        # A fork gets its own id from the CLI's first message. Until then it
+        # has none: the resume target is the parent's conversation.
+        self._native_session_id: str | None = (
+            None if spec.fork else spec.resume_native_id
+        )
         # The resolved model this client was built with (engine reads it
         # to detect mid-session model switches).
         self.model: str = options.model or ""
@@ -1293,6 +1342,17 @@ class ClaudeClient(AgentClient):
         # entry of the turn you are keeping"). Reset per turn; attached to
         # TurnCompleted as native_turn_id (codex parity).
         self._last_entry_uuid: str | None = None
+        # MCP Apps: whether this CLI was started as a host, and what its MCP
+        # status said last: the third-party tools by the name the model calls
+        # them, and the names a status did not list. ``_mcp_lookup`` is the
+        # status request a tool event started, ``_mcp_lookup_names`` the tool
+        # names that wait for its answer.
+        self._mcp_apps_host = (options.env or {}).get(mcp_apps.HOST_ENV) == "1"
+        self._mcp_tools: dict[str, mcp_apps.AppTool] | None = None
+        self._mcp_unknown_tools: frozenset[str] = frozenset()
+        self._mcp_lookup: asyncio.Task | None = None
+        self._mcp_lookup_names: set[str] | None = None
+        self._mcp_status_retry_at = 0.0
 
     # -- protocol ------------------------------------------------------- #
 
@@ -1553,6 +1613,150 @@ class ClaudeClient(AgentClient):
             return
         await self._sdk.interrupt()
 
+    # -- MCP Apps (nerve/mcp_apps.py) ------------------------------------ #
+
+    async def _control_request(
+        self, request: dict[str, Any], timeout: float,
+    ) -> dict[str, Any]:
+        """Send a control request the Python SDK has no method for, through
+        the private ``_send_control_request`` seam (as :meth:`interrupt`
+        does), and return the CLI's answer.
+
+        Raises ``asyncio.TimeoutError`` when the CLI did not answer within
+        ``timeout`` seconds, :class:`TransportDiedError` when the process is
+        gone, and :class:`BackendError` with the CLI's words when it refused
+        the request, or when the seam is missing.
+        """
+        send = getattr(getattr(self._sdk, "_query", None), "_send_control_request", None)
+        if send is None:
+            raise BackendError(f"{request.get('subtype')} is not available on this runtime")
+        try:
+            return await send(request, timeout=timeout)
+        except CLIConnectionError as e:
+            raise TransportDiedError(str(e)) from e
+        except Exception as e:  # noqa: BLE001 — the SDK raises a bare Exception
+            # Its own timeout is ``Exception("Control request timeout: ...")``
+            # raised from the TimeoutError; it has then forgotten the request.
+            if isinstance(e.__cause__, TimeoutError) or str(e).startswith(
+                "Control request timeout",
+            ):
+                raise asyncio.TimeoutError(str(e)) from e
+            raise BackendError(str(e)) from e
+
+    async def mcp_app_servers(self) -> dict[str, mcp_apps.AppServer]:
+        """The CLI's MCP servers by name with their tools, read now
+        (``mcp_status``). Never Nerve's own server."""
+        status = await self._control_request({"subtype": "mcp_status"}, MCP_STATUS_TIMEOUT)
+        servers = mcp_apps.index_servers(status)
+        self._mcp_tools = mcp_apps.tools_by_full_name(servers)
+        return servers
+
+    async def mcp_app_for_tool(self, tool_name: str) -> dict[str, str] | None:
+        """``{"server", "tool", "resource_uri"}`` when ``tool_name`` is a tool
+        of a third-party MCP server that is linked to a ``ui://`` view, else
+        None. Always None on a CLI that was not started as an MCP Apps host.
+
+        The MCP status is read once and kept. A name it does not list is
+        looked up in a new status once (its server may have connected since)
+        and then remembered as unknown.
+
+        The engine calls this for a tool event, on the task that reads the
+        CLI's stream. While that task waits here, nothing reads the stream,
+        and a stream with a full buffer holds the status answer back. So the
+        status is asked for in a task of its own, and this waits for it only
+        MCP_LOOKUP_WAIT: a call whose status is late goes on without a view,
+        and the answer serves the calls after it. Never raises.
+        """
+        if not self._mcp_apps_host or not mcp_apps.is_third_party_tool(tool_name):
+            return None
+        tool = (self._mcp_tools or {}).get(tool_name)
+        if tool is None and tool_name not in self._mcp_unknown_tools:
+            await self._mcp_look_up(tool_name)
+            tool = (self._mcp_tools or {}).get(tool_name)
+        return tool.app() if tool is not None else None
+
+    async def _mcp_look_up(self, tool_name: str) -> None:
+        """Have the MCP status read for ``tool_name`` and wait for it at most
+        MCP_LOOKUP_WAIT. One status request serves every name that asks while
+        it is under way."""
+        task = self._mcp_lookup
+        if task is None or task.done():
+            if time.monotonic() < self._mcp_status_retry_at:
+                return
+            names: set[str] = set()
+            self._mcp_lookup_names = names
+            task = self._mcp_lookup = asyncio.create_task(self._mcp_read_status(names))
+        if self._mcp_lookup_names is not None:
+            self._mcp_lookup_names.add(tool_name)
+        await asyncio.wait({task}, timeout=MCP_LOOKUP_WAIT)
+
+    async def _mcp_read_status(self, names: set[str]) -> None:
+        """Read the MCP status for the tool names in ``names`` (more may join
+        until it ends). A name the new status does not list is unknown from
+        then on. A failure is logged, and no status is read for a tool event
+        for MCP_STATUS_RETRY_AFTER."""
+        try:
+            await self.mcp_app_servers()
+        except Exception as e:  # noqa: BLE001 — a tool event must not fail on this
+            self._mcp_status_retry_at = time.monotonic() + MCP_STATUS_RETRY_AFTER
+            logger.debug(
+                "MCP status for the tools of session %s failed: %s",
+                self._spec.session_id, e,
+            )
+            return
+        known = self._mcp_tools or {}
+        self._mcp_unknown_tools |= {name for name in names if name not in known}
+
+    async def mcp_read_resource(self, server: str, uri: str) -> dict[str, Any]:
+        """The ``resources/read`` result of a ``ui://`` resource of
+        ``server``, named as configured (``mcp_read_resource``). The CLI
+        refuses any other URI scheme. The content is untrusted third-party
+        HTML."""
+        return await self._control_request(
+            {"subtype": "mcp_read_resource", "serverName": server, "uri": uri},
+            MCP_READ_RESOURCE_TIMEOUT,
+        )
+
+    async def mcp_call_tool(
+        self, tool: mcp_apps.AppTool, arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Call ``tool`` for a view, with no model turn (``mcp_call``), and
+        return the parts of its MCP ``CallToolResult``: ``content``,
+        ``structuredContent``, ``_meta``. A call that failed at the server
+        returns ``{"content": <its message>, "isError": True}``.
+
+        Raises ``asyncio.TimeoutError`` when the tool ran longer than
+        MCP_APP_TOOL_TIMEOUT, and :class:`BackendError` when the CLI could
+        not make the call. Nothing here checks who may call the tool: the
+        route does.
+        """
+        answer = await self._control_request(
+            {
+                "subtype": "mcp_call",
+                "tool": tool.full_name,
+                "arguments": arguments,
+                # For a view, not for a model: the server's own content
+                # blocks, with nothing cut, resized or saved to a file.
+                "result_not_for_model": True,
+                # The CLI ends a call that runs longer, and says in
+                # ``staging`` how the call ended.
+                "timeout_ms": int(MCP_APP_TOOL_TIMEOUT * 1000),
+            },
+            MCP_APP_TOOL_TIMEOUT + MCP_CALL_GRACE,
+        )
+        staging = answer.get("staging")
+        if isinstance(staging, dict) and staging.get("ok") is False:
+            code, detail = staging.get("error_code"), str(staging.get("detail") or "")
+            if code == "timeout":
+                raise asyncio.TimeoutError(detail or "the tool call timed out")
+            if code == "tool_error":
+                return {
+                    "content": detail.removeprefix("tool call failed: "),
+                    "isError": True,
+                }
+            raise BackendError(detail or f"the tool call failed ({code})")
+        return answer
+
     def is_alive(self) -> bool:
         transport = getattr(self._sdk, "_transport", None)
         if not transport:
@@ -1574,6 +1778,11 @@ class ClaudeClient(AgentClient):
         forcibly disarm the task group if needed.
         """
         client = self._sdk
+        # An MCP status request still under way for a tool event has no
+        # process left to answer it.
+        lookup = self._mcp_lookup
+        if lookup is not None and not lookup.done():
+            lookup.cancel()
         # --- 1. Kill subprocess immediately ---
         transport = getattr(getattr(client, "_query", None), "transport", None)
         proc = getattr(transport, "_process", None)

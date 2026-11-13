@@ -54,6 +54,7 @@ def setup_logging(verbose: bool = False) -> None:
     )
     # Quiet noisy loggers
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)
 
@@ -2159,6 +2160,19 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                     f"[WARN] {label} '{model}' uses the '{geo}.' inference profile "
                     f"but region {region} is '{expected}.' — expect 400 errors"
                 )
+        # Nerve's own model calls go through the Anthropic SDK. Its API
+        # version accepts only Claude 4.7 and later models on Bedrock. An ID
+        # that the check cannot read gets no warning.
+        from nerve.config import BEDROCK_SDK_MIN_CLAUDE_VERSION, claude_model_version
+        minimum = ".".join(map(str, BEDROCK_SDK_MIN_CLAUDE_VERSION))
+        for label, model in config.anthropic_sdk_models():
+            version = claude_model_version(model)
+            if version is not None and version < BEDROCK_SDK_MIN_CLAUDE_VERSION:
+                warnings.append(
+                    f"[WARN] {label} '{model}' is older than Claude {minimum}. "
+                    f"On Bedrock, Nerve's own calls with this model fail; "
+                    f"set Claude {minimum} or later"
+                )
     elif config.proxy.enabled:
         if config.anthropic_api_key:
             lines.append("[--] Anthropic API key set (proxy takes precedence)")
@@ -3080,12 +3094,17 @@ def codex_doctor(ctx: click.Context, json_output: bool) -> None:
             click.echo(f"[--] Endpoint: {status['base_url']} (no Codex login)")
         if status.get("available"):
             click.echo(f"[OK] {status.get('version')} ({status.get('auth')})")
-            click.echo(f"[OK] Models: {', '.join(status.get('models') or [])}")
-            hidden = status.get("hidden_models") or []
-            if hidden:
+            offered = status.get("models") or []
+            click.echo(f"[OK] Model menu (codex.models): {', '.join(offered)}")
+            hidden = set(status.get("hidden_models") or [])
+            others = [
+                m for m in status.get("catalog_models") or sorted(hidden)
+                if m not in offered
+            ]
+            if others:
                 click.echo(
-                    "[--] Hidden catalog entries (opt in via codex.models): "
-                    + ", ".join(hidden)
+                    "[--] Other catalog models (add to codex.models to offer them): "
+                    + ", ".join(f"{m} (hidden)" if m in hidden else m for m in others)
                 )
             if status.get("auth_mismatch"):
                 click.echo(
@@ -3361,6 +3380,15 @@ def cron(ctx: click.Context, job_id: str) -> None:
                 for j in system_jobs:
                     if j.id not in seen_ids:
                         all_jobs.append(("system", j))
+
+                # As the daemon loads a built-in job whose system.yaml entry
+                # still holds what an earlier release shipped: the entry that
+                # runs, which is the last one with its id. It logs which job
+                # that is.
+                from nerve.cron.jobs import merge_jobs
+                from nerve.cron.service import bring_up_to_date
+
+                bring_up_to_date([j for j in merge_jobs(system_jobs, []) if j.id not in seen_ids])
 
                 for source, job in all_jobs:
                     # A reserved id is never scheduled by the daemon. Show the

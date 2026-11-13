@@ -1,0 +1,218 @@
+# Nerve — System Cron Jobs
+# Managed by 'nerve init'. Safe to re-generate.
+# To add custom crons, use jobs.yaml instead.
+
+jobs:
+- id: memory-maintenance
+  schedule: 0 5 * * *
+  prompt: "You are running a daily memory maintenance job. Work completely silently\
+    \ \u2014 do not output any text, only think.\n\nDo the following:\n\n## Phase\
+    \ 1: Gather Yesterday's Data\n\n1. Use memory_records_by_date(date=yesterday,\
+    \ updated=true, limit=200) to get ALL records created or updated yesterday.\n\
+    2. Optionally: use conversation_history(date=yesterday) for additional event context.\n\
+    \n## Phase 2: Evaluate Each Record\n\nFor each record from yesterday, evaluate\
+    \ and act:\n- **Exact duplicates**: Same fact already stored elsewhere \u2192\
+    \ delete the worse copy\n- **Category-redundant**: Adds nothing beyond category\
+    \ summary \u2192 delete\n- **Stale/completed**: No longer true \u2192 delete\n\
+    - **Generic knowledge**: Textbook facts not personal to the user \u2192 delete\n\
+    - **Meta-noise**: Observations about the memory system itself \u2192 delete\n\
+    - **Improvable**: Poorly worded or could be more useful \u2192 update via memory_update\n\
+    \n## Phase 3: Category Review\n\nIf yesterday's memories revealed new important\
+    \ context, check whether category summaries need updating.\n\nRules:\n- Never\
+    \ delete entries about people, relationships, or preferences unless exact duplicates\n\
+    - Never delete actionable/pending items\n- Updating is better than deleting\n\
+    - When in doubt, keep the memory\n- Do NOT log or memorize anything about this\
+    \ maintenance run\n"
+  description: "Daily memory cleanup \u2014 dedup, prune stale entries, improve wording"
+  model: ''
+  session_mode: isolated
+  enabled: true
+- id: task-planner
+  schedule: 0 */4 * * *
+  prompt: "You are a proactive planning agent. Your job is to find a task worth working\
+    \ on and produce an implementation plan.\n\n1. Use task_list(status=\"pending\"\
+    ) to browse the tasks that are ready for work\n2. Use plan_list to see which tasks\
+    \ already have plans \u2014 skip those\n3. Pick ONE task and explore the relevant\
+    \ codebase\n4. Call plan_propose(task_id, content, summary) with your plan and\
+    \ a summary of up to 3 short lines for the reviewer\n\nIf all tasks have plans\
+    \ or none are actionable, say so and stop.\n\nplan_propose notifies the user with\
+    \ a link to the plan. Do not send another notification about it.\n"
+  description: "Every 4 hours, reviews your open tasks and proposes implementation\
+    \ plans. Plans go through an approval flow \u2014 nothing is executed without\
+    \ your OK."
+  model: ''
+  session_mode: persistent
+  enabled: false
+  context_rotate_hours: 168
+  run_if:
+  - type: tasks
+    status: pending
+- id: skill-extractor
+  schedule: 0 */12 * * *
+  prompt: 'You are a skill extraction agent. Identify repeated workflows from recent
+    activity and propose new skills.
+
+
+    1. Recall recent behavior patterns and events
+
+    2. Check existing skills to avoid duplicates
+
+    3. Look for repeated tool sequences, domain knowledge clusters, and reusable patterns
+
+    4. For each candidate (max 2): create a task and propose a plan with the full
+    SKILL.md
+
+
+    If no candidates found, say so and stop.
+
+    plan_propose notifies the user with a link to each plan. Do not send another notification
+    about it.
+
+    '
+  description: Every 12 hours, analyzes your recent activity to detect repeated workflows.
+    When it finds a pattern, it proposes a reusable skill for your review.
+  model: ''
+  session_mode: persistent
+  enabled: true
+  context_rotate_hours: 168
+- id: skill-reviser
+  schedule: 0 3 * * 0
+  prompt: 'You are a skill revision agent. Review existing skills and propose improvements.
+
+
+    1. Load all skills and their content
+
+    2. Check accuracy (outdated paths, commands, URLs)
+
+    3. Check completeness (missing steps, known gotchas)
+
+    4. Check quality (clear descriptions, good trigger phrases)
+
+    5. For skills needing changes (max 3): create task + propose plan with updated
+    SKILL.md
+
+
+    If all skills look good, say so and stop.
+
+    plan_propose notifies the user with a link to each plan. Do not send another notification
+    about it.
+
+    '
+  description: "Weekly review of existing skills \u2014 checks if instructions are\
+    \ still accurate, complete, and well-written. Proposes fixes through the approval\
+    \ flow."
+  model: ''
+  session_mode: persistent
+  enabled: true
+  context_rotate_hours: 168
+- id: machine-maintenance
+  schedule: 0 4 * * 0
+  prompt: 'You are running the weekly machine maintenance job. Free disk space and
+    remove clutter on the machine you run on. Remove only items that are old and that
+    nothing uses. Never destroy data without asking first.
+
+
+    ## 1. Learn this machine
+
+
+    Each machine is different, so do not use a fixed list of commands. Find out what
+    this machine has:
+
+    - Disk use: `df -h`, then `du` on the large directories (home, the workspace,
+    repository clones, caches, temporary directories).
+
+    - Where clutter collects: Git repositories and their worktrees, build and compile
+    caches, package manager caches, Docker (images, containers, volumes, build cache),
+    temporary files, old logs, the trash.
+
+    - What runs: processes and containers that listen on a port (for example `ss -ltnp`
+    and `docker ps`), with their start time, command and working directory.
+
+    - What you already know: TOOLS.md, your memory (what earlier runs found, what
+    must be kept), and the answers to the questions earlier runs asked.
+
+
+    If the disk has a lot of free space, nothing is clearly old and no leftover service
+    runs, stop.
+
+
+    ## 2. Sort the candidates
+
+
+    A candidate is old (not used or changed for some weeks) and nothing uses it now.
+    A leftover service is a candidate too: a dev server, preview, test database, tunnel
+    or test container that still listens on a port, that a past task or test run started
+    (often from a worktree or a temporary directory), and that nothing uses now. It
+    uses memory and can expose the machine on an open port. Put each candidate in
+    one of two groups.
+
+
+    **Remove without asking**: items that hold no data, because a tool makes them
+    again when it needs them or because the work is stored somewhere else:
+
+    - build, compile and package download caches;
+
+    - dangling Docker images and unused Docker build cache;
+
+    - a Git worktree whose branch is merged (its pull request is merged), with no
+    uncommitted changes, no untracked files and no unpushed commits;
+
+    - temporary files that no process uses.
+
+
+    **Ask first**: anything that can hold data that is not stored somewhere else:
+
+    - leftover services: a running service can hold state, and the person can still
+    use it;
+
+    - Docker volumes, stopped containers, tagged images;
+
+    - a worktree or branch with uncommitted, untracked or unpushed work, or whose
+    pull request is open or closed without a merge;
+
+    - user files, databases, logs, and anything else you are not sure about.
+
+
+    When you are not sure which group an item is in, it is in "Ask first".
+
+
+    Never stop or remove, and never offer to: Nerve itself, its state directory and
+    workspace; system services and services that a service manager or a deployment
+    keeps running; anything that a session or job of this agent uses now, and the
+    worktrees and files that a running process uses.
+
+
+    ## 3. Act
+
+
+    - Remove the items of the first group with each tool''s own command (for example
+    `git worktree remove`, `docker image prune`, the clean command of the package
+    manager or build cache), not with a raw recursive delete. Where a trash command
+    is installed, use it in place of `rm`.
+
+    - For the second group, send one `ask_user` that lists each item with its size,
+    its age and why you think nothing uses it; for a service, also its port, its command
+    and where it started. Remove or stop only the items that the answer approves.
+    When there is no answer, change nothing in that group.
+
+
+    ## 4. Report
+
+
+    Say what you removed or stopped and how much space it freed (`df -h` before and
+    after). When you also ask a question, put this in the `ask_user`; otherwise send
+    one `notify` (priority low) when you changed something. When you changed nothing
+    and have no question, send nothing.
+
+
+    Save to memory only lasting facts about this machine that make the next run faster
+    or safer, for example a directory that must be kept. Do not save a log of this
+    run.
+
+    '
+  description: 'Weekly cleanup of the machine Nerve runs on: old build caches, Docker
+    leftovers, worktrees of merged pull requests, temporary services left running
+    on open ports. It asks you before it removes or stops anything that can hold data.'
+  model: ''
+  session_mode: isolated
+  enabled: true

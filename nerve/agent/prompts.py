@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from nerve.agent.sessions import INTERACTIVE_SOURCES
 from nerve.agent.tools import build_default_registry
 from nerve.memory import loom_prompts
+from nerve.widget_state import WIDGET_STATE_TOOL
 from nerve.onboarding_catalog import (
     CATALOG,
     FIRST_FORM_OPTIONS,
@@ -1077,11 +1079,87 @@ TEXT_RENDERING_NOTE = (
     "diagrams or charts. Do not emit ```mermaid, ```vega-lite or ```svg "
     "blocks here; give the structure as words or a list."
 )
+# The widget sentences of the "Rendering" line: the web chat also draws a
+# fenced ```widget block, a small piece of HTML, live inside the message
+# (web/src/components/Chat/widgets). It draws it in the sandbox frame of MCP
+# Apps, so the model hears of widgets only on an instance where that sandbox
+# is active; anywhere else the block would be a code block full of HTML.
+WIDGET_RENDERING_NOTE = (
+    " It also runs a fenced ```widget block as a live widget: "
+    "self-contained HTML (a fragment will do) with inline `<style>` and "
+    "`<script>`. Write one when the answer is better explored than read and "
+    "mermaid, vega-lite or svg cannot express it: tabs, a step-by-step "
+    "walkthrough, a table to sort or filter, sliders and what-if calculators, "
+    "a timeline (mermaid's grows wider than the message), a custom drawing "
+    "(inline `<svg>` with its own `<style>` works here, not in ```svg). Do "
+    "not use one for what plain markdown or those say as well. Rules: vanilla "
+    "JS, no network, no external scripts, images or fonts, no clipboard, "
+    "links do not open; as wide as the message, as tall as its content, "
+    "scrolling beyond 800px. `localStorage` works and is kept with the "
+    "chat: save what the person changes there (ticks, entered values, the "
+    "chosen tab) so a reload keeps it. It starts with the chat's font and "
+    "text colour on a transparent background, and plain buttons, inputs and "
+    "tables match the chat, so style little; take every colour from the "
+    "theme variables `--color-{text,background,border}-{primary,secondary,"
+    "info,success,warning,danger}` (they follow light and dark), never a "
+    "fixed colour. Write it directly, like a diagram — no files or tool runs "
+    "to build or test it. Say in the text what it shows."
+)
 
 
-def rendering_note(source: str) -> str:
-    """The "Rendering" line for a session read on ``source``."""
-    return RICH_RENDERING_NOTE if source in RENDERING_SOURCES else TEXT_RENDERING_NOTE
+def surface_excluded_tools(source: str) -> set[str]:
+    """Registry tools that are of no use on the surface a session is read on.
+
+    ``widget_state`` reads what the widgets of a chat saved, and only a
+    rendering source draws widgets. This turns on the session;
+    :func:`~nerve.agent.backends.base.config_excluded_tools` turns on the
+    configuration, and leaves the tool out wherever no widget is drawn at all.
+    """
+    return set() if source in RENDERING_SOURCES else {WIDGET_STATE_TOOL}
+
+
+def rendering_note(source: str, widgets: bool = False) -> str:
+    """The "Rendering" line for a session read on ``source``.
+
+    ``widgets`` says that this instance draws ```widget blocks: the MCP Apps
+    sandbox is active (see :attr:`nerve.config.NerveConfig.mcp_apps_active`).
+    Only a rendering source hears of them; without ``widgets`` the line says
+    nothing of them. Either way it depends on the source and the
+    configuration only, so the prompt stays static.
+    """
+    if source not in RENDERING_SOURCES:
+        return TEXT_RENDERING_NOTE
+    return RICH_RENDERING_NOTE + WIDGET_RENDERING_NOTE if widgets else RICH_RENDERING_NOTE
+
+
+# Tells the agent to offer a cron job for work the person will probably want
+# again. Only sessions that a person chats in get it (INTERACTIVE_SOURCES, by
+# the session's own surface as for the "Rendering" line): a cron, hook or
+# workflow session has no person to answer the offer. Static per source, so
+# the prompt cache keeps working.
+AUTOMATION_OFFER_SECTION = """\
+# Offer to automate
+
+Many people do not know that you can do work on a schedule, or how to set it \
+up. When a person asks for work that they will probably want again, and no \
+cron job does it yet, offer to do it for them on a schedule.
+
+- Signs: a check, a digest, a report, a reminder or a cleanup; words such as \
+"again", "every", "each time" or "as usual"; the same request on earlier days.
+- Do the work first. Then make the offer as the last line of your reply: one \
+yes/no question with a specific schedule and what you will send, for example \
+"Do you want me to do this every Monday at 9:00 and send you the summary?"
+- Make at most one offer in a conversation. Do not offer for one-time work, \
+when a cron job already does the work (check the cron jobs first), or when \
+the person said that they do not want these offers. When they say that, \
+write it in `USER.md` (in `MEMORY.md` if you cannot change `USER.md`), so \
+that later sessions see it.
+- Create the cron job only after a yes (the `nerve-workspace` skill has the \
+steps). The reply of a cron run goes only to the cron log, so the job prompt \
+must tell the job to send the result with `notify`. After a direct edit of \
+the job file, run `nerve reload`: without it the job does not run until a \
+restart. If you proposed the job as a pull request, it starts after the \
+merge. Then tell the person the job id, its schedule and how to stop it."""
 
 
 def build_system_prompt(
@@ -1098,6 +1176,7 @@ def build_system_prompt(
     memory_tools: bool = True,
     config_dir: Path | None = None,
     rendering_source: str | None = None,
+    widgets: bool = False,
 ) -> str:
     """Build the system prompt for the agent.
 
@@ -1106,10 +1185,13 @@ def build_system_prompt(
     ``config_dir`` follows ``TOOLS.md`` (see :func:`_read_platform_notes`).
 
     ``rendering_source`` is the source the session is *read* on, for the
-    context block's "Rendering" line (:func:`rendering_note`); it defaults
-    to ``source``. The two differ when a turn's origin is not the session's
-    surface — a scheduled wakeup (``source="wakeup"``) of a web session is
-    still read in the web chat.
+    context block's "Rendering" line (:func:`rendering_note`) and for the
+    automation offer (:data:`AUTOMATION_OFFER_SECTION`, only where a person
+    chats); it defaults to ``source``. The two differ when a turn's origin
+    is not the session's surface: a scheduled wakeup (``source="wakeup"``)
+    of a web session is still read in the web chat. ``widgets`` adds the
+    ```widget sentences to the "Rendering" line for a source that renders
+    (:func:`rendering_note`).
 
     ``static=True`` (default) renders a prompt that is byte-identical for
     every session of the same workspace, source and tool set: the
@@ -1133,7 +1215,11 @@ def build_system_prompt(
     (:data:`nerve.memory.loom_prompts.NO_TOOLS_SECTION`). Either depends on
     the configuration and the gateway's catalog only, so the prompt stays
     static across sessions.
+
+    The tool list leaves out ``excluded_tools`` and the tools of no use on
+    the surface the session is read on (:func:`surface_excluded_tools`).
     """
+    excluded_tools = set(excluded_tools or ()) | surface_excluded_tools(rendering_source or source)
     parts: list[str] = []
 
     # Load identity/soul files
@@ -1179,7 +1265,7 @@ def build_system_prompt(
         )
         context = f"""# Session Context
 - **Source:** {source}
-{rendering_note(rendering_source or source)}
+{rendering_note(rendering_source or source, widgets)}
 - **Current date:** {today}
 - **Workspace:** {workspace}
 
@@ -1193,7 +1279,7 @@ You have access to the following custom tools:
         context = f"""# Session Context
 - **Session ID:** {session_id}
 - **Source:** {source}
-{rendering_note(rendering_source or source)}
+{rendering_note(rendering_source or source, widgets)}
 - **Current date:** {today}
 - **Workspace:** {workspace}
 
@@ -1205,6 +1291,9 @@ You have access to the following custom tools:
         parts.append(
             loom_prompts.SYSTEM_PROMPT_SECTION if memory_tools else loom_prompts.NO_TOOLS_SECTION,
         )
+
+    if (rendering_source or source) in INTERACTIVE_SOURCES:
+        parts.append(AUTOMATION_OFFER_SECTION)
 
     # Skills summary (progressive disclosure level 1: name + description only)
     skills_section = _format_skills_list(skill_summaries)

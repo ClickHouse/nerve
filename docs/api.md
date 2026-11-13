@@ -31,8 +31,12 @@ Treat the returned token as opaque.
 
 #### Authenticated requests
 
-Send the token as `Authorization: Bearer <jwt>`, as the `nerve_token` cookie,
-or as `?token=` (for `<img src>` and downloads, which cannot set headers).
+Send the token as `Authorization: Bearer <jwt>`, as `?token=` (for `<img src>`
+and downloads, which cannot set headers), or as the `nerve_token` cookie. They
+are read in that order, and the first one found decides: a cookie is read only
+when the request names no token itself. (A cookie belongs to a host name, so
+a page on another port of the host can set one; it must not stand in for the
+token that the request carries.)
 
 Every request resolves its token to an account actor or the system principal.
 Unknown and disabled accounts fail with `401`; unavailable startup identity
@@ -538,30 +542,32 @@ the `reason` names the variable.
 
 ```json
 Response: {
-  "models": [{ "id": "claude-opus-5-5", "label": "Claude Opus 5.5", "family": "opus", "recommended": true },
-             { "id": "claude-fable-5-2", "label": "Claude Fable 5.2", "family": "fable", "recommended": false },
-             { "id": "claude-haiku-5-5", "label": "Claude Haiku 5.5", "family": "haiku", "recommended": false },
+  "models": [{ "id": "claude-fable-5-2", "label": "Claude Fable 5.2", "family": "fable", "recommended": false },
+             { "id": "claude-opus-5-5", "label": "Claude Opus 5.5", "family": "opus", "recommended": true },
              { "id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "family": "sonnet", "recommended": false },
-             { "id": "claude-fable-5-1", "label": "Claude Fable 5.1", "family": "fable", "recommended": false }],
+             { "id": "claude-haiku-5-5", "label": "Claude Haiku 5.5", "family": "haiku", "recommended": false }],
   "current": { "model": "claude-opus-5-5", "effort": "xhigh" },
   "efforts": ["max", "xhigh", "high", "medium", "low"],
-  "discovered": true,
+  "discovered": false,
   "default_model": "claude-opus-5-5"
 }
 ```
 
-The configured model comes first, then the catalogue as the Anthropic Models
-API orders it (newest first), nothing else; without discovery the built-in
-list applies. `family` is `fable`, `opus`, `sonnet`, `haiku` or `other`
-(`fable` is checked first); `recommended` marks the configured model;
+The list is the same as in the composer's model menu: `agent.models`, else
+the catalogue as the Anthropic Models API orders it (newest first) when
+`agent.model_discovery` is on, else the built-in list of the newest model of
+each tier. The configured model is put first when the list does not name it.
+`family` is `fable`, `opus`, `sonnet`, `haiku` or `other` (`fable` is checked
+first); `recommended` marks the configured model;
 `default_model` is Nerve's own default (`nerve.config.DEFAULT_MODEL`), so the
 page can say which entry it is even when this instance was changed to another
 model. On Bedrock the ids carry the geo prefix and `discovered` is `false`.
 
-The catalogue is cached per credential fingerprint (provider, base URL, key
-tail). A successful `POST /api/setup/provider/test` with an API key fetches
-the catalogue for that candidate key in the background, keyed by its
-fingerprint, so the picker is complete the moment the key is saved; a failure
+With discovery on, the catalogue is cached per credential fingerprint
+(provider, base URL, key tail). A successful `POST /api/setup/provider/test`
+with an API key fetches the catalogue for that candidate key in the
+background, keyed by its fingerprint, so the picker is complete the moment the
+key is saved; a failure
 recorded while no key was configured is never served for a configuration
 that now carries one.
 
@@ -1093,6 +1099,14 @@ Rows also carry `is_running` (the orchestrator's turn is in flight),
 `background_count` (how many). The two are independent: agents can run
 between turns. See [Sub-agents and background tasks](agents.md).
 
+The payloads of Codex sessions (`backend` is `codex`) carry `codex_daybreak`
+(boolean): the chat's Daybreak switch, see
+[Daybreak](config.md#daybreak-per-chat-switch). The payloads of other
+sessions do not have the key. `POST /api/sessions` takes
+`codex_daybreak: true` to create a Codex session with the switch on. It
+answers `400` when the session is not a Codex session, and when its model has
+no Daybreak program for the signed-in Codex account.
+
 #### `GET /api/sessions/{id}`
 Get session details.
 
@@ -1112,8 +1126,9 @@ provenance and is never identity. See
 
 #### `DELETE /api/sessions/{id}`
 Delete a session (cannot delete "main"). Disconnects any active SDK client before deletion.
-The delete removes the session's events and its agent records and
-transcripts. Nerve records the delete in
+The delete removes the session's events, its agent records and
+transcripts, and what its widgets saved (see [Widgets](#widgets)). Nerve
+records the delete in
 `session_deletions` with the signed-in person as actor and cause (see
 [Session changes](accounts.md#session-changes)).
 While a turn of the session runs, a message waits in its turn queue, or a
@@ -1123,12 +1138,21 @@ session's pending questions; the notification rows stay. A turn never creates
 a deleted session again: a run in it is refused.
 
 #### `PATCH /api/sessions/{id}`
-Update `title`, `starred`, `model` or `parent_session_id`. A `model` change
-recreates the session's runtime, which would end its live background agents:
-while any run it answers `409` with
+Update `title`, `starred`, `model`, `parent_session_id` or `codex_daybreak`.
+A `model` change recreates the session's runtime, which would end its live
+background agents: while any run it answers `409` with
 `{"detail": {"code": "live_background_agents", "message": "…", "live": 2}}`.
 A `title` sets the session's `title_source` to `manual`, so Nerve no longer
 renames it on its own.
+
+`codex_daybreak` (boolean) sets the chat's Daybreak switch from its next
+message on. It answers `400` for a session that is not a Codex session, and
+for `true` when the session's model (the `model` of the same request, if
+any) has no Daybreak program for the signed-in Codex account; `503` for
+`true` while the Codex model catalog cannot be read. A `model` change to a
+model without a program turns the switch off: the response then has
+`codex_daybreak: false` and a `codex_daybreak_notice` sentence for the
+person.
 
 #### `POST /api/sessions/{id}/regenerate-title`
 Retitle the session with `agent.title_model` from its first request and its
@@ -1166,6 +1190,20 @@ a numeric message row id as a string). The fork branches the source's
 pre-populated with the source's messages up to the fork point, so the new
 chat displays exactly the history the agent remembers.
 
+The fork stores the source's native id and the fork turn when it is created
+(`fork_source_native_id`, `fork_source_turn_id`). A fork of the whole chat
+branches at the source's last completed turn, so a turn that the source
+completes later is neither copied nor known to the fork's agent (history
+from before per-turn recording is forked whole). Each start of the fork's
+runtime branches from the stored source until a turn completes in the fork's
+own conversation. A stop, a crash, a restart, an archive, or a later change to
+the source does not change what the fork branches from. If the source
+conversation no longer exists, the fork's next turn fails with a message
+that says so, and the message after it starts a new conversation.
+
+What the source's widgets saved (see [Widgets](#widgets)) is not copied:
+the widgets of the fork start as the agent wrote them.
+
 Errors: `404` unknown source; `409` not forkable — the source has no native
 conversation yet (no completed turn), or the anchor message has no native
 turn mapping (sessions predating per-turn recording can only be forked
@@ -1177,7 +1215,10 @@ Response: { "id": "fork-a1b2c3d4", "title": "My Fork", "source": "web", "status"
 ```
 
 #### `POST /api/sessions/{id}/resume`
-Resume a stopped or idle session (must have a stored `sdk_session_id`).
+Resume a stopped or idle session (must have a stored `sdk_session_id`). A
+`stopped`, `idle` or `error` session goes to `created`; any other status (for
+example `active`, while a turn runs) stays as it is. The next message resumes
+the stored native conversation.
 
 ```json
 Response: { "id": "a1b2c3d4", "status": "created", "sdk_session_id": "..." }
@@ -1846,6 +1887,209 @@ Re-read MCP server config from YAML files and refresh the in-memory cache. New s
 Response: { "reloaded": 2, "servers": [...] }
 ```
 
+### MCP Apps
+
+What the web UI needs to show the view of an MCP tool (see
+[mcp-apps.md](mcp-apps.md)). A tool call that opens a view carries `mcp_app`
+on its `tool_use` event and its stored block, and `mcp_app_result` once it
+has a result (see [Server → Client](#server--client)).
+
+Errors are `{"detail": "<code or message>"}`. While the feature is off, the
+config route says so and the session routes answer 404 `mcp_apps_disabled`.
+The session routes reach the MCP servers through the session's live Claude
+CLI: without one they answer 409 `session_not_running`.
+
+#### `GET /api/mcp-apps/config`
+Whether this instance shows MCP Apps (and widgets). `enabled` is true only
+when `mcp_apps.enabled` was set when the gateway started, in local mode. The
+frame of a view loads `/mcp-app-sandbox.html?csp=<url-encoded JSON>` from
+the address of this API.
+
+```json
+Response: { "enabled": true }
+Response: { "enabled": false }
+```
+
+#### `GET /mcp-app-sandbox.html?csp=<url-encoded JSON>`
+The sandbox document: the page of every view's and widget's frame (see
+[mcp-apps.md](mcp-apps.md#security-model)). Not under `/api`, and without
+authentication, like the files of the web UI: a frame's load carries no
+token, and the document is static and holds nothing. `csp` is the
+`_meta.ui.csp` of the view's resource, as the web UI passes it on; it is
+optional.
+
+Every answer for this path carries the header that takes the document's
+origin away, also the ones that are not the document:
+
+```
+Content-Security-Policy: sandbox allow-scripts allow-forms; default-src 'none';
+  script-src 'unsafe-inline' 'unsafe-eval' blob: data: <resourceDomains>;
+  style-src 'unsafe-inline' blob: data: <resourceDomains>;
+  img-src data: blob: <resourceDomains>; font-src data: blob: <resourceDomains>;
+  media-src data: blob: <resourceDomains>; connect-src <connectDomains>;
+  worker-src blob: <resourceDomains>; frame-src <frameDomains>; object-src 'none';
+  base-uri <baseUriDomains>; form-action <frameDomains>; frame-ancestors 'self'
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+```
+
+(One line in the response; a directive without sources reads `'none'`.) A
+declared source goes in only when it reads as an http(s) or ws(s) origin
+and is not on Nerve's own host.
+
+| Status | When |
+|--------|------|
+| 200 | `GET` or `HEAD`, the feature on |
+| 404 | The feature is off |
+| 405 | Another method (`Allow: GET, HEAD`) |
+| 503 | The web UI is not built: the document is missing |
+
+#### `GET /api/sessions/{session_id}/mcp-apps/resource?server=<server>&uri=<ui://…>`
+The document of a view. `html` is untrusted third-party HTML, for the sandbox
+frame only. `csp` and `permissions` are the resource's `_meta.ui.csp` and
+`_meta.ui.permissions` as the server sent them, `prefers_border` its
+`_meta.ui.prefersBorder`; each is null when absent. `cached: true` means the
+answer is the copy Nerve kept from an earlier read: the session has no live
+CLI, or its read just failed. A copy is served only for a server that
+`mcp_servers` has now, enabled.
+
+```json
+Response: {
+  "uri": "ui://example/view.html",
+  "mime_type": "text/html;profile=mcp-app",
+  "html": "<!doctype html>…",
+  "csp": { "connectDomains": ["https://api.example.com"], "resourceDomains": ["https://cdn.example.com"] },
+  "permissions": { "clipboardWrite": {} },
+  "prefers_border": true,
+  "cached": false
+}
+```
+
+| Status | `detail` |
+|--------|----------|
+| 400 | `bad_uri` (not a `ui://` URI, or longer than 2048 characters), `bad_server` |
+| 404 | `session_not_found`, `server_not_found` (also for `nerve`), `resource_not_found` |
+| 409 | `session_not_running`: no live CLI and no kept copy |
+| 502 | The reason: the server or the CLI failed or did not answer in 30 seconds, the resource is not one `text/html;profile=mcp-app` document, or it is larger than 5 MiB |
+
+#### `GET /api/sessions/{session_id}/mcp-apps/tools?server=<server>`
+The tools of an MCP server. `read_only` is the tool's `readOnlyHint`
+annotation. `visibility` is `_meta.ui.visibility` (`["model", "app"]` when the
+server does not say). `resource_uri` is the view the tool is linked to.
+
+```json
+Response: {
+  "tools": [
+    { "name": "show_counter", "read_only": true, "visibility": ["model", "app"], "resource_uri": "ui://example/view.html" },
+    { "name": "bump", "read_only": false, "visibility": ["app"], "resource_uri": "ui://example/view.html" },
+    { "name": "plain", "read_only": false, "visibility": ["model", "app"], "resource_uri": null }
+  ]
+}
+```
+
+400 `bad_server`; 404 `session_not_found`, `server_not_found`; 409
+`session_not_running`; 502 when the server is not connected or the CLI
+fails; 504 when the CLI does not answer in 5 seconds.
+
+#### `POST /api/sessions/{session_id}/mcp-apps/tool-call`
+Call a tool for a view, with no model turn. `tool` is the tool's own name,
+not `mcp__<server>__<tool>`. `arguments` may be left out. The answer is the
+MCP `CallToolResult`, also when the tool reports an error (`isError`). A
+result over 2 MiB loses its `structuredContent` and gets
+`"_meta": {"nerve/truncated": true}`.
+
+```json
+Request:  { "server": "example-server", "tool": "bump", "arguments": { "by": 2 } }
+Response: { "content": [{ "type": "text", "text": "counter is 2" }], "structuredContent": { "n": 2 } }
+Response: { "content": [{ "type": "text", "text": "the tool says no" }], "isError": true }
+```
+
+| Status | `detail` |
+|--------|----------|
+| 400 | `bad_json`, `bad_server`, `bad_tool`, `bad_arguments` (not an object), `body_too_large` (over 1 MiB) |
+| 403 | `tool_not_app_visible`: the tool's visibility lacks `app` |
+| 404 | `session_not_found`, `server_not_found` (always for `nerve`), `tool_not_found` |
+| 409 | `session_not_running` |
+| 502 | The reason: the server is not connected, or the CLI could not make the call |
+| 504 | The reason: the tool ran longer than 60 seconds, or the CLI did not answer |
+
+The route checks that the tool is for views. It cannot tell the views apart:
+that a view calls only its own server, and that a tool which changes
+something has the person's consent, is the web UI's part.
+
+### Widgets
+
+What a ```` ```widget ```` block saved in its `localStorage`, kept with the
+chat (see [widgets.md](widgets.md#what-a-widget-keeps)). The web UI reads
+the states of a chat's widgets before it draws the first of them, and writes
+a widget's keys and values when they change. The agent reads them with its
+tool `widget_state`.
+
+A widget is named by its id: the first 32 hex digits of the SHA-256 of its
+source (of the text's UTF-16 code units, low byte first). Its state is
+`items`: a list of `[key, value]` pairs of texts, each key once, in the
+order the widget first set the keys. `size` is the number of characters of
+the keys and values together, in UTF-16 code units, as a script counts
+them. The texts are the widget's own: any character, also half a surrogate
+pair, comes back as it went in.
+
+Errors are `{"detail": "<code>"}`. The routes need authentication like the
+other session routes. They answer 404 `widgets_disabled` while this instance
+draws no widgets (`mcp_apps` is off, or the gateway runs in external mode), and
+404 `session_not_found` for a session that does not exist. No route answers
+with the state of a chat other than the one in its path.
+
+#### `GET /api/sessions/{session_id}/widget-states`
+The saved state of every widget of the chat in one answer, the widget that
+changed last first, and the limits the server holds. A widget that saved
+nothing is not listed.
+
+```json
+Response: {
+  "widgets": [
+    { "id": "fedcba9876543210fedcba9876543210", "items": [["n", "7"]], "size": 2, "updated_at": "2026-01-02T03:05:00+00:00" },
+    { "id": "0123456789abcdef0123456789abcdef", "items": [["ticks", "[\"tent\",\"map\"]"], ["tab", "gear"]], "size": 26, "updated_at": "2026-01-02T03:04:05+00:00" }
+  ],
+  "limits": { "widget_chars": 65536, "widget_keys": 1024, "chat_chars": 1048576, "chat_widgets": 200 }
+}
+Response: { "widgets": [], "limits": { "widget_chars": 65536, "widget_keys": 1024, "chat_chars": 1048576, "chat_widgets": 200 } }
+```
+
+`limits`: one widget keeps at most `widget_chars` characters in at most
+`widget_keys` keys; the widgets of one chat keep at most `chat_chars`
+characters together, and at most `chat_widgets` of them have state.
+
+#### `PUT /api/sessions/{session_id}/widget-states/{widget_id}`
+Replace what one widget saved with `items`. The last write wins. An empty
+list forgets the widget, like the delete below: the answer then has `size`
+0 and `updated_at` null.
+
+```json
+Request:  { "items": [["ticks", "[\"tent\",\"map\"]"], ["tab", "gear"]] }
+Response: { "id": "0123456789abcdef0123456789abcdef", "size": 26, "updated_at": "2026-01-02T03:04:05+00:00" }
+Request:  { "items": [] }
+Response: { "id": "fedcba9876543210fedcba9876543210", "size": 0, "updated_at": null }
+```
+
+| Status | `detail` |
+|--------|----------|
+| 400 | `bad_widget_id` (not 32 lowercase hex digits), `bad_json` (the body is not a JSON object), `bad_items` (not a list of pairs of texts with each key once) |
+| 404 | `session_not_found`, `widgets_disabled` |
+| 413 | `body_too_large` (over 512 KiB), `widget_too_large` (over 65,536 characters), `too_many_keys` (over 1,024 keys), `chat_full` (the widgets of the chat would keep more than 1,048,576 characters together), `too_many_widgets` (200 widgets of the chat have state, and this one has none) |
+
+A write that is refused changes nothing.
+
+#### `DELETE /api/sessions/{session_id}/widget-states/{widget_id}`
+Forget what one widget saved (Reset in the web UI). `deleted` says whether
+there was something. 400 `bad_widget_id`; 404 `session_not_found`,
+`widgets_disabled`.
+
+```json
+Response: { "deleted": true }
+Response: { "deleted": false }
+```
+
 ### Memory Files
 
 #### `GET /api/memory/files`
@@ -2217,6 +2461,13 @@ those for another session. Events marked *global* go to every socket.
 { type: "thinking", session_id: "main", content: "Let me check..." }
 { type: "tool_use", session_id: "main", tool: "Read", input: { file_path: "..." }, tool_use_id: "toolu_..." }
 { type: "tool_result", session_id: "main", tool_use_id: "toolu_...", result: "...", is_error: false }
+// With MCP Apps on, the call of a tool that is linked to a view names it
+// (server as configured, the tool's own name), and its result comes also as
+// an MCP CallToolResult (content is always a list). The stored tool_call
+// block of the message carries the same two keys. A call that the person
+// stopped or refused has no mcp_app_result: the tool gave no result.
+{ type: "tool_use", session_id: "main", tool: "mcp__example-server__show_counter", input: {}, tool_use_id: "toolu_...", mcp_app: { server: "example-server", tool: "show_counter", resource_uri: "ui://example/view.html" } }
+{ type: "tool_result", session_id: "main", tool_use_id: "toolu_...", result: "{\"n\":0}", is_error: false, mcp_app_result: { content: [{ type: "text", text: "{\"n\":0}" }], structuredContent?: { n: 0 }, isError?: true, _meta?: { … } } }
 // Live output of a running command (Codex)
 { type: "tool_output", session_id: "main", tool_use_id: "toolu_...", content: "..." }
 

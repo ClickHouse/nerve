@@ -654,4 +654,21 @@ describe('seen and composer', () => {
     store().reset(SID);
     expect(store().focusNonce).toBe(nonce + 1);
   });
+
+  it('offers text to a composer, and hears nothing went in when no composer answers', async () => {
+    const offered = store().offerToComposer('Plot the last hour.');
+    expect(store().composerInsert).toMatchObject({ text: 'Plot the last hour.', mode: 'offer' });
+
+    // No composer is on the page to take it.
+    await expect(offered).resolves.toBe(false);
+  });
+
+  it('hears from the composer whether the offered text went in, once', async () => {
+    const offered = store().offerToComposer('Plot the last hour.');
+
+    store().composerInsert!.taken!(true);
+    store().composerInsert!.taken!(false);
+
+    await expect(offered).resolves.toBe(true);
+  });
 });

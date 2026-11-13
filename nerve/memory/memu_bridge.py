@@ -31,7 +31,7 @@ import nerve._env  # noqa: F401  isort: skip
 import numpy as np
 
 from nerve import paths
-from nerve.config import NerveConfig
+from nerve.config import ANTHROPIC_CLIENT_OPTIONS, NerveConfig
 from nerve.inference_principal import system_inference_headers
 from nerve.memory.backend import MemoryBackendUnavailable
 from nerve.observability.langfuse import attributes as lf_attrs
@@ -87,19 +87,20 @@ def _is_transient_llm_error(exc: BaseException) -> bool:
 _CLAUDE_GENERATION_RE = re.compile(r"claude-[a-z]+-(\d+)")
 
 # Model ids that rejected ``temperature`` although :func:`_sends_temperature`
-# allowed it, for example a Bedrock application inference profile ARN.
+# allowed it, for example a gateway alias.
 _TEMPERATURE_REJECTED: set[str] = set()
 
 
 def _sends_temperature(model: str) -> bool:
-    """Whether memU calls to ``model`` may carry ``temperature``.
+    """Whether memU's OpenAI client may send ``temperature`` to ``model``.
 
     Claude 5 and later models reject sampling parameters with a 400
     ("`temperature` is deprecated for this model"). Older models accept it.
-    An id with no readable generation (an inference profile ARN, a gateway
-    alias) keeps it until the API rejects it once; the chat wrapper in
+    An id with no readable generation (a gateway alias, for example) keeps
+    it until the API rejects it once; the chat wrapper in
     :meth:`MemUBridge._instrument_llm_timeouts` then records the id in
-    :data:`_TEMPERATURE_REJECTED`.
+    :data:`_TEMPERATURE_REJECTED`. The Bedrock client never sends it (see
+    :class:`_BedrockLLMClient`).
     """
     if model in _TEMPERATURE_REJECTED:
         return False
@@ -481,7 +482,7 @@ class _BedrockLLMClient:
                  default_headers: dict[str, str] | None = None):
         from anthropic import AsyncAnthropicBedrock
 
-        kwargs: dict[str, Any] = {"timeout": timeout}
+        kwargs: dict[str, Any] = {"timeout": timeout, **ANTHROPIC_CLIENT_OPTIONS}
         if default_headers:
             kwargs["default_headers"] = default_headers
         if aws_region:
@@ -502,16 +503,18 @@ class _BedrockLLMClient:
         *,
         max_tokens: int | None = None,
         system_prompt: str | None = None,
-        temperature: float | None = 0.2,
+        temperature: Any = None,
     ) -> tuple[str, Any]:
+        """Send ``prompt`` and return its text and the response.
+
+        memU gives a ``temperature``. It is not sent: the Anthropic SDK has
+        no sampling parameters, and API version 2026-10-21 rejects them.
+        """
         kwargs: dict[str, Any] = {
             "model": self.chat_model,
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_tokens or 4096,
         }
-        # None leaves temperature out, and so does a model that rejects it.
-        if temperature is not None and _sends_temperature(self.chat_model):
-            kwargs["temperature"] = temperature
         if system_prompt:
             kwargs["system"] = system_prompt
         # Tag the OTEL spans emitted by AnthropicInstrumentor so memU calls
@@ -2228,7 +2231,7 @@ class MemUBridge:
         """
         return _BedrockLLMClient(
             chat_model=chat_model,
-            aws_region=self.config.provider.aws_region,
+            aws_region=self.config.bedrock_region(),
             aws_profile=self.config.provider.aws_profile,
             aws_access_key_id=self.config.provider.aws_access_key_id,
             aws_secret_access_key=self.config.provider.aws_secret_access_key,
@@ -2315,11 +2318,9 @@ class MemUBridge:
                 original_chat = client.chat
                 # The temperature value that leaves the field out of the
                 # request. memU's OpenAI client sends None as JSON null, so it
-                # needs the SDK's ``omit`` sentinel.
-                if isinstance(client, _BedrockLLMClient):
-                    no_temperature: Any = None
-                else:
-                    from openai import omit as no_temperature
+                # needs the SDK's ``omit`` sentinel. The Bedrock client sends
+                # no temperature at all.
+                from openai import omit as no_temperature
 
                 async def _timeout_chat(
                     prompt, *, max_tokens=None, system_prompt=None, temperature=0.2,

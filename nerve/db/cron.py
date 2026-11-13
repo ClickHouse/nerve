@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from datetime import UTC, datetime
+
+from nerve.db.usage import _CRON_RUN_STAMP_GLOB
 from nerve.identity import UNATTRIBUTED, Attribution
 from nerve.utils.time import utc_now_iso
 
@@ -14,6 +18,70 @@ EMPTY_RUN = "(records IS 0 AND status IS 'success')"
 #: The finished runs that tell whether a job works. A missed run did not run,
 #: and a run that is still going has no result.
 _COMPLETED = "status IN ('success', 'error')"
+
+
+#: What follows ``cron:<job>:`` in the id of a session of one run or one
+#: generation of the job: the run id that ``new_cron_run_id`` makes, and the
+#: older one without the random tail.
+_RUN_ID_GLOBS = (
+    _CRON_RUN_STAMP_GLOB + "-" + "[0-9a-f]" * 8,
+    _CRON_RUN_STAMP_GLOB,
+)
+
+
+def _cron_session_of(expr: str, job_id: str) -> tuple[str, list]:
+    """SQL, with its parameters, that is true when *expr* is the id of a cron
+    session of *job_id*: ``cron:<job>`` or ``cron:<job>:<run id>``.
+
+    The job id is compared as text, never as a pattern, and what follows it
+    must be a run id: ``cron:a:b`` is the session of the job ``a:b``, not a
+    run of ``a``.
+    """
+    prefix = f"cron:{job_id}:"
+    rest = f"substr({expr}, ?)"
+    return (
+        f"({expr} = ? OR (substr({expr}, 1, ?) = ? "
+        f"AND ({rest} GLOB ? OR {rest} GLOB ?)))",
+        [
+            f"cron:{job_id}", len(prefix), prefix,
+            len(prefix) + 1, _RUN_ID_GLOBS[0], len(prefix) + 1, _RUN_ID_GLOBS[1],
+        ],
+    )
+
+
+def _sessions_of_jobs(column: str, job_ids: list[str]) -> tuple[str, list]:
+    """SQL, with its parameters, that is true when *column* holds the id of a
+    session of one of *job_ids*. *column* names its table, since the SQL
+    refers to it from a subquery.
+
+    A session of a job is a cron session of it, or the session of a workflow
+    run that the job started (``created_by`` is ``cron:<job>``), that one of
+    its cron sessions started (``session:<session id>``), or that is a leg of
+    a review loop which one of its cron sessions started
+    (``review-loop:<loop id>``, the loop's ``session_id``). A workflow run
+    can start neither, so there is nothing further down.
+    """
+    direct, started, params, started_params = [], [], [], []
+    for job_id in job_ids:
+        sql, sql_params = _cron_session_of(column, job_id)
+        direct.append(sql)
+        params += sql_params
+        by_session, by_session_params = _cron_session_of("substr(w.created_by, 9)", job_id)
+        by_loop, by_loop_params = _cron_session_of("l.session_id", job_id)
+        started.append(
+            "w.created_by = ? "
+            f"OR (substr(w.created_by, 1, 8) = 'session:' AND {by_session}) "
+            "OR (substr(w.created_by, 1, 12) = 'review-loop:' AND EXISTS ("
+            "SELECT 1 FROM review_loops l "
+            f"WHERE l.id = substr(w.created_by, 13) AND {by_loop}))"
+        )
+        started_params += [f"cron:{job_id}", *by_session_params, *by_loop_params]
+    return (
+        f"{' OR '.join(direct)} OR EXISTS ("
+        f"SELECT 1 FROM workflow_runs w WHERE w.session_id = {column} "
+        f"AND ({' OR '.join(started)}))",
+        params + started_params,
+    )
 
 
 def _ranked(where: str = "") -> str:
@@ -211,6 +279,100 @@ class CronStore:
         ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    async def has_activity_since_cron_run(
+        self,
+        job_id: str,
+        *,
+        ignore_jobs: Iterable[str] = (),
+        overlap_seconds: int = 0,
+        until: datetime | None = None,
+    ) -> bool:
+        """Whether the agent has worked since the job's last successful run
+        started, not counting the work of the job itself or of a job of
+        ``ignore_jobs``.
+
+        Two records count as work, each in a session that belongs to none of
+        those jobs:
+
+        * a row of ``session_usage``: a turn ended and reported its usage,
+          whatever started it (a chat, a channel message, a wakeup, a hook,
+          another cron job, a workflow run);
+        * a session whose ``updated_at`` moved: a message was stored in it.
+          A turn that somebody asked for stores what it was asked when it
+          starts, so such a turn counts from then on, and also when it is
+          stopped or fails before it reports any usage; so does a
+          conversation taken in from an external agent. A turn that the
+          agent starts for itself (a wakeup, a continuation after background
+          work) stores its messages without moving ``updated_at``: it counts
+          by its usage row, when it ends with one.
+
+        ``overlap_seconds`` moves the start of the window back by that much,
+        so what happened in that time before the last run counts again. A job
+        with no successful run in ``cron_logs`` has no window start: any work
+        counts. The cleanup keeps the latest finished run of each job, so the
+        start outlives the 14 days unless a later run failed.
+
+        ``until`` ends the window: only work recorded before it counts. A
+        catch-up asks about the time the run it stands in for came due. It
+        must be timezone-aware: a naive time raises ``ValueError``. A session
+        has one ``updated_at``, the time of its latest message, so a message
+        stored after ``until`` hides the session's earlier ones from this
+        record; a turn that reported its usage before ``until`` still counts.
+
+        The sessions of a job are its cron sessions, ``cron:<job>`` and
+        ``cron:<job>:<run id>``, and the sessions of the workflow runs that
+        the job or one of those sessions started, a review loop's legs
+        included (:func:`_sessions_of_jobs`).
+        """
+        async with self.db.execute(
+            "SELECT datetime(MAX(datetime(started_at)), ?) FROM cron_logs "
+            "WHERE job_id = ? AND status = 'success'",
+            (f"-{max(0, int(overlap_seconds))} seconds", job_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+        since = row[0] if row else None
+        if until is not None and until.utcoffset() is None:
+            raise ValueError(f"has_activity_since_cron_run() needs a timezone-aware until, not {until!r}")
+        before = until.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S") if until else None
+
+        jobs = list(dict.fromkeys((job_id, *ignore_jobs)))
+        # Both columns hold UTC. session_usage.created_at is SQLite's
+        # CURRENT_TIMESTAMP text, the form datetime() returns, so it compares
+        # as text. sessions.updated_at is ISO 8601 where a message moved it
+        # and CURRENT_TIMESTAMP text where none has: the day picks the rows
+        # through the index, and datetime() compares what either form says.
+        checks = (
+            ("session_usage.session_id", "created_at >= ?", [since], "created_at < ?", ""),
+            (
+                "sessions.id",
+                "updated_at >= ? AND datetime(updated_at) >= ?",
+                [since[:10], since] if since else [],
+                "datetime(updated_at) < ?",
+                "COALESCE(message_count, 0) > 0",
+            ),
+        )
+        for column, window, window_params, end, extra in checks:
+            clauses, params = [], []
+            if since is not None:
+                clauses.append(window)
+                params += window_params
+            if before is not None:
+                clauses.append(end)
+                params.append(before)
+            if extra:
+                clauses.append(extra)
+            mine, mine_params = _sessions_of_jobs(column, jobs)
+            clauses.append(f"NOT ({mine})")
+            params += mine_params
+            table = column.partition(".")[0]
+            async with self.db.execute(
+                f"SELECT 1 FROM {table} WHERE {' AND '.join(clauses)} LIMIT 1",
+                tuple(params),
+            ) as cursor:
+                if await cursor.fetchone() is not None:
+                    return True
+        return False
 
     async def get_latest_cron_session_id(self, job_id: str) -> str | None:
         """Return the most recently active session id for a cron job.

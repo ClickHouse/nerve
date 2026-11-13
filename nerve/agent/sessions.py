@@ -217,6 +217,8 @@ class SessionManager:
         actor: Actor | None,
         cause: CauseArg = CAUSE_FROM_ACTOR,
         origin: Origin | None = None,
+        fork_source_native_id: str | None = None,
+        fork_source_turn_id: str | None = None,
     ) -> dict:
         """Create a new session with status=created and log the event."""
         if backend is None:
@@ -246,6 +248,8 @@ class SessionManager:
             # this insert made the row.
             created_event=attribution_for(actor, cause),
             origin=origin,
+            fork_source_native_id=fork_source_native_id,
+            fork_source_turn_id=fork_source_turn_id,
         )
         logger.info(
             "Created session: %s (parent=%s)", session_id, parent_session_id,
@@ -260,6 +264,7 @@ class SessionManager:
         self, session_id: str, new_status: SessionStatus,
         details: dict | None = None,
         *, attribution: Attribution = UNATTRIBUTED,
+        only_from: tuple[str, ...] | None = None,
     ) -> bool:
         """Atomically transition a session's status and log the event.
 
@@ -267,14 +272,15 @@ class SessionManager:
         resume). A transition that records the state of the runtime keeps it
         unattributed. A session that has ``new_status`` already stays as it
         is and records nothing, so of two callers that make the same
-        transition at the same time only one is recorded. Returns ``True``
-        when the status changed.
+        transition at the same time only one is recorded. With
+        ``only_from``, a session in another status also stays as it is.
+        Returns ``True`` when the status changed.
         """
         async with self._transition_lock:
             return await self.db.change_session_status(
                 session_id, new_status.value,
                 event_type=new_status.value, details=details,
-                attribution=attribution,
+                attribution=attribution, only_from=only_from,
             )
 
     # The ``mark_*`` methods record the state of the runtime. They write
@@ -787,6 +793,11 @@ class SessionManager:
         The source's messages up to that point are copied into the fork so
         the new chat displays exactly the history the agent remembers.
 
+        The fork row stores the source's native id and the fork turn
+        (``fork_source_native_id``, ``fork_source_turn_id``). The engine
+        forks from them, whatever happens to the source or to the fork's
+        status, until the fork's first completed turn.
+
         Raises ``ValueError`` when the source doesn't exist, has no native
         conversation yet, or ``at_message_id`` can't be mapped to a native
         turn (pre-mapping history — see ``get_native_turn_at_message``).
@@ -807,9 +818,11 @@ class SessionManager:
             )
 
         # Resolve the fork point up front so a bad anchor fails the API
-        # call, not the fork's first message. The engine re-resolves the
-        # same mapping when it builds the client (source history is
-        # immutable, so both resolutions agree).
+        # call, not the fork's first message. The same turn bounds the
+        # copied messages and the native fork. A fork of the whole chat
+        # branches at the source's last completed turn, so turns that the
+        # source completes later are in neither. With no turn mapping (history
+        # from before per-turn recording) it takes the whole conversation.
         fork_turn_id: str | None = None
         if at_message_id is not None:
             fork_turn_id = await self.db.get_native_turn_at_message(
@@ -821,6 +834,8 @@ class SessionManager:
                     "mapping (recorded per turn since this feature shipped). "
                     "Fork the whole chat instead."
                 )
+        else:
+            fork_turn_id = await self.db.get_last_native_turn(source_session_id)
 
         fork_id = f"fork-{str(uuid.uuid4())[:8]}"
         fork_title = title or f"Fork of {parent.get('title', source_session_id)}"
@@ -837,6 +852,8 @@ class SessionManager:
             actor=actor,
             # A person forks a chat in the web UI, whatever started the parent.
             origin=Origin(TRIGGER_CHAT, {DETAIL_FORK_OF: source_session_id}),
+            fork_source_native_id=parent["sdk_session_id"],
+            fork_source_turn_id=fork_turn_id,
         )
         session["title_source"] = "manual" if title else "fork"
         await self.db.update_session_fields(
