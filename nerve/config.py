@@ -1035,6 +1035,37 @@ PROXY_CLIENT_MAX_RETRIES = 6
 # second span of the same call, with the same token counts.
 ANTHROPIC_CLIENT_OPTIONS: dict[str, Any] = {"open_telemetry": False}
 
+# The Anthropic SDK sends API version 2026-10-21. On Amazon Bedrock, this
+# version accepts only Claude 4.7 and later models.
+BEDROCK_SDK_MIN_CLAUDE_VERSION = (4, 7)
+
+# ``claude-<family>-<major>[-<minor>]``, for example ``claude-sonnet-4-5``.
+_CLAUDE_VERSION_NEW = re.compile(r"claude-[a-z]+-(\d+)(?:-(\d+))?")
+# ``claude-<major>[-<minor>]-<family>``, for example ``claude-3-5-haiku``.
+_CLAUDE_VERSION_OLD = re.compile(r"claude-(\d+)(?:-(\d+))?-[a-z]+")
+
+
+def claude_model_version(model: str) -> tuple[int, int] | None:
+    """The ``(major, minor)`` version that a Claude model ID names.
+
+    Reads bare and dated IDs (``claude-opus-4-1-20250805``), the ``[1m]``
+    suffix, Bedrock IDs with a region prefix and a version suffix
+    (``us.anthropic.claude-sonnet-4-5-20250929-v1:0``), and an ARN that
+    ends in such an ID. ``None`` for an ID that it cannot read, for example
+    an application inference profile ARN or an alias.
+    """
+    m = model.strip().lower().rsplit("/", 1)[-1]
+    if "anthropic." in m:
+        m = m.rsplit("anthropic.", 1)[1]
+    m = m.split("[", 1)[0]
+    m = re.sub(r"-v\d+(?::\d+)?$", "", m)
+    m = re.sub(r"-latest$", "", m)
+    m = re.sub(r"-20\d{6}$", "", m)
+    match = _CLAUDE_VERSION_NEW.fullmatch(m) or _CLAUDE_VERSION_OLD.fullmatch(m)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
+
 
 # The default model ids live in the constants block at the top of this file
 # (DEFAULT_MODEL and friends, DEFAULT_CLAUDE_MODELS).
@@ -4291,6 +4322,32 @@ class NerveConfig:
         except Exception:  # noqa: BLE001 - a profile that does not load gives no region
             pass
         return "us-east-1"
+
+    def anthropic_sdk_models(self) -> list[tuple[str, str]]:
+        """``(setting, model)`` for each model that Nerve's own calls use.
+
+        These calls go through the Anthropic Python SDK: session titles and
+        plan summaries, memory, source condensing, image description and the
+        prompt rewrite. The agent runs in the Claude CLI, which has its own
+        client, so ``agent.model`` is here only for the prompt rewrite.
+        """
+        models = [("agent.title_model", self.agent.title_model)]
+        if self.memory.backend == "memu":
+            models += [
+                ("memory.recall_model", self.memory.recall_model),
+                ("memory.memorize_model", self.memory.memorize_model),
+            ]
+        models.append(("memory.fast_model", self.memory.fast_model))
+        rewrite = self.agent.prompt_rewrite
+        if rewrite.enabled:
+            models.append(
+                ("agent.prompt_rewrite.model", rewrite.model) if rewrite.model
+                else ("agent.model (prompt rewrite)", self.agent.model)
+            )
+        imap = self.sync.imap
+        if imap.enabled and imap.vision.enabled and imap.vision.model:
+            models.append(("sync.imap.vision.model", imap.vision.model))
+        return models
 
     def _client_retry_kwargs(self, max_retries: int | None) -> dict[str, Any]:
         """The ``max_retries`` argument for an Anthropic client, if any.

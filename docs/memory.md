@@ -115,6 +115,9 @@ gateway alias, gets `temperature` until the model rejects it with a 400. Nerve
 then sends the request again without it, and omits it for that ID until the
 next restart.
 
+On Bedrock, the three model keys must name Claude 4.7 or a later model (see
+[Amazon Bedrock](config.md#amazon-bedrock)).
+
 ### Event Date Resolution
 
 After a conversation is indexed, Nerve resolves temporal context for extracted event items. Event items get their `happened_at` field set via an LLM call (using `fast_model` / Haiku) that parses dates from the content. Non-event items (profiles, knowledge, behavior) stay timeless.

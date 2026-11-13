@@ -2104,6 +2104,19 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                     f"[WARN] {label} '{model}' uses the '{geo}.' inference profile "
                     f"but region {region} is '{expected}.' — expect 400 errors"
                 )
+        # Nerve's own model calls go through the Anthropic SDK. Its API
+        # version accepts only Claude 4.7 and later models on Bedrock. An ID
+        # that the check cannot read gets no warning.
+        from nerve.config import BEDROCK_SDK_MIN_CLAUDE_VERSION, claude_model_version
+        minimum = ".".join(map(str, BEDROCK_SDK_MIN_CLAUDE_VERSION))
+        for label, model in config.anthropic_sdk_models():
+            version = claude_model_version(model)
+            if version is not None and version < BEDROCK_SDK_MIN_CLAUDE_VERSION:
+                warnings.append(
+                    f"[WARN] {label} '{model}' is older than Claude {minimum}. "
+                    f"On Bedrock, Nerve's own calls with this model fail; "
+                    f"set Claude {minimum} or later"
+                )
     elif config.proxy.enabled:
         if config.anthropic_api_key:
             lines.append("[--] Anthropic API key set (proxy takes precedence)")
