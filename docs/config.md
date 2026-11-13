@@ -2725,9 +2725,9 @@ The endpoint must serve `POST /v1/messages`. memU also needs
 IDs in `agent.*` and `memory.*` must be ones the endpoint serves, including the
 CLI aliases in `agent.model_aliases`.
 
-The direct SDK calls and model discovery send the key in an
-`Authorization: Bearer <key>` header, not in `X-Api-Key`. The endpoint must
-read the key from that header.
+The key comes in two headers. The direct SDK calls, memU and model discovery
+send it as `Authorization: Bearer <key>`. The Claude CLI sends it as
+`X-Api-Key: <key>`. The endpoint must read the key from both headers.
 
 It cannot be set together with `proxy.enabled` or `provider.type: bedrock`, and a
 change needs a restart.
