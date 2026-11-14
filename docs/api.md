@@ -1711,7 +1711,11 @@ neighbours itself, so a stale client board can't corrupt the ordering.
 directly below; omit both to append. Omit `status` to reorder in place.
 
 Moving into or out of `done` moves the markdown file between `active/` and
-`done/` as a side effect.
+`done/` as a side effect. Moving into `done` also closes a plan of the task
+that waits for review, and moving out puts it back in review when a
+signed-in person makes the request; a request with a system or API token
+leaves the plan closed (see [plans.md](plans.md#closing-the-task)).
+`PATCH /api/tasks/{id}` with a status does the same.
 
 ```json
 Request:  { "status": "in_progress", "before_id": "2026-03-01-a", "after_id": "2026-03-01-b" }

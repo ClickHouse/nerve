@@ -384,11 +384,12 @@ Only the job's own proposals count:
   other work never stop the job. Neither does a plan that somebody else
   proposes for a task after the job's proposal for it was decided.
 
-Only a decision takes a proposal out of review: its plan approved or declined.
-Time does not, and neither does closing its task: a plan stays in review after
-its task is done, and the Plans page goes on listing it. So the gate counts what
-a person finds there to decide. A job whose proposals nobody decides stops at
-`below` of them, and runs again once enough are decided.
+A proposal leaves review when its plan is approved or declined, or when its task
+is closed: the plan is then closed with the task, undecided, and is in review
+again if a person reopens the task (see [Closing the task](plans.md#closing-the-task)).
+Time does not take it out. So the gate counts what the Plans page shows a person
+to decide. A job whose proposals nobody looks at stops at `below` of them, and
+runs again once enough have left review.
 
 While the job waits, the Cron page shows its next run as "Will skip". The reason
 it gives is the first gate of the job that is not satisfied, so list this gate
@@ -568,8 +569,9 @@ that check.
   Nerve reads the forecast afresh after a turn and after a run. Other work,
   such as a conversation taken in from an external agent, is seen at the
   next read. What `plans_in_review` counts changes when the job proposes a
-  plan, in a run, and when a plan is decided: an approval starts a turn,
-  and a plan declined on the Plans page is seen at the next read.
+  plan, in a run, and when a plan leaves review or comes back: an approval
+  starts a turn, and a plan declined on the Plans page, or a task closed or
+  reopened on the Tasks page, is seen at the next read.
   `messages` reads the consumer's cursors
   without starting one, and takes a cursor that will have expired by `at` as
   expired, since the check will find it so then.
@@ -803,9 +805,9 @@ These ship in `<workspace>/config/cron/system.yaml`, written when the mode is ch
 
 `skill-extractor` also waits for its proposals to be decided, with a [`plans_in_review`](#plans_in_review) gate (`below: 3`):
 
-- While three or more of the skills it proposed wait for review, it does not run: a fourth would only add to a pile that nobody gets to. Once fewer than three wait and the agent has worked, it runs again: at its next scheduled time, or in a catch-up before that. Approve or decline its plans on the Plans page to let it go on. Closing the task of a proposal does not decide its plan.
+- While three or more of the skills it proposed wait for review, it does not run: a fourth would only add to a pile that nobody gets to. Once fewer than three wait and the agent has worked, it runs again: at its next scheduled time, or in a catch-up before that. Approve or decline its plans on the Plans page, or close their tasks, to let it go on.
 - Only its own proposals count. Plans that a chat, `task-planner` or `skill-reviser` proposed do not stop it.
-- Proposals from earlier releases count too. On an install where three or more of them still wait, the job stops from the first load of this release, until enough are decided.
+- Proposals from earlier releases count too. On an install where three or more of them still wait, the job stops from the first load of this release, until enough have left review. A task that an earlier release closed left its plan in review: decline such a plan on the Plans page.
 - On a platform that parks an idle machine, the machine is not woken for the job while it waits (see [What runs next](#what-runs-next)).
 - **Run now** starts the job whatever the gate says.
 

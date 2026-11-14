@@ -6,6 +6,7 @@ import asyncio
 import re
 from datetime import datetime, timezone
 
+from nerve.db.task_statuses import TERMINAL_STATUS
 from nerve.identity import UNATTRIBUTED, Attribution
 from nerve.tasks.similarity import TitleIndex
 
@@ -376,6 +377,21 @@ class TaskStore:
                 datetime.now(timezone.utc).isoformat(),
             ),
         )
+
+    async def get_task_closed_at(self, task_id: str) -> str | None:
+        """When the task was last closed: the time of its latest event that
+        moved it to ``done``, as stored (UTC, ISO 8601); ``None`` for a task
+        that no event closed. The latest event is the one written last,
+        whatever the clock said. For a task that was done already when the
+        status history began, the one event is the start of that history
+        and carries the time the task was created."""
+        async with self.db.execute(
+            "SELECT created_at FROM task_events WHERE task_id = ? AND to_status = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, TERMINAL_STATUS),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return row[0] if row else None
 
     async def list_task_events(self, task_id: str, limit: int = 200) -> list[dict]:
         """A task's transitions, oldest first — the order a timeline reads."""

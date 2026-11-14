@@ -6,6 +6,12 @@ from datetime import datetime, timezone
 
 from nerve.identity import UNATTRIBUTED, Attribution
 
+#: The status of a plan whose task was closed while the plan waited for
+#: review. Nobody decided the plan, so this is not a review decision: the
+#: plan is in review again when a person reopens the task (``task_done``
+#: and ``task_reopen`` in ``nerve.agent.tools.handlers.tasks``).
+CLOSED_WITH_TASK = "closed"
+
 
 class PlanStore:
     """Mixin providing plan CRUD operations."""

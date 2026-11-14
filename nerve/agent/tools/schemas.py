@@ -535,7 +535,7 @@ PLAN_LIST_SCHEMA = {
     "properties": {
         "status": {
             "type": "string",
-            "description": "Filter by status: 'pending', 'approved', 'declined', 'implementing', 'superseded', or empty for pending+implementing",
+            "description": "Filter by status: 'pending', 'approved', 'declined', 'implementing', 'superseded', 'closed' (closed with its task, undecided), or empty for pending+implementing",
             "default": "",
         },
     },
@@ -567,7 +567,8 @@ PLAN_APPROVE_SCHEMA = {
                 "this session does the work. The plan is recorded as approved and "
                 "linked to this session, and no new session starts. A task in "
                 "plan_review goes to in_progress; any other task status does not "
-                "change. Default false: start a new implementation session."
+                "change. It also takes a plan that was closed with its task, when "
+                "the task is done. Default false: start a new implementation session."
             ),
         },
     },

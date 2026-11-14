@@ -612,3 +612,33 @@ class TestTaskBoardRoutes:
         setup.client.post(f"/api/tasks/{second}/move", json={"before_id": first})
         body = setup.client.get("/api/tasks?sort=position").json()
         assert [t["id"] for t in body["tasks"]] == [first, second]
+
+    # ── A plan in review goes with its task ──────────────────────────────
+
+    @pytest.mark.parametrize("route", ["move", "patch"])
+    async def test_closing_a_task_closes_its_plan_in_review_and_reopening_puts_it_back(
+        self, setup, route,
+    ):
+        """The board's drag and the task page both write through
+        ``task_update``, for the person who is signed in. So a card that is
+        dragged into the Done lane and back is as it was: its plan waits for
+        review again."""
+        task_id = await self._create(setup, "Planned task")
+        await setup.db.create_plan(
+            plan_id="plan-routes", task_id=task_id, content="Step one.", session_id="chat-1",
+        )
+
+        def write(status: str):
+            if route == "move":
+                return setup.client.post(f"/api/tasks/{task_id}/move", json={"status": status})
+            return setup.client.patch(f"/api/tasks/{task_id}", json={"status": status})
+
+        closed = write("done")
+        assert closed.status_code == 200, closed.text
+        assert (await setup.db.get_task(task_id))["status"] == "done"
+        assert (await setup.db.get_plan("plan-routes"))["status"] == "closed"
+
+        reopened = write("pending")
+        assert reopened.status_code == 200, reopened.text
+        assert (await setup.db.get_task(task_id))["status"] == "pending"
+        assert (await setup.db.get_plan("plan-routes"))["status"] == "pending"

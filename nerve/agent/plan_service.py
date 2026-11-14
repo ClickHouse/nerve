@@ -333,14 +333,16 @@ async def _revert_plan(
 ) -> None:
     """Best-effort undo of a claimed decision after a later step failed.
 
-    Puts ``plan`` back to ``pending`` with the reviewer it had before the
-    decision, so the failed decision leaves no reviewer behind.
+    Puts ``plan`` back to the status it was read with (``pending``, or
+    ``closed`` for a plan whose approval is recorded after its task was
+    closed), with the reviewer it had before the decision, so the failed
+    decision leaves no reviewer behind.
     """
     plan_id = plan["id"]
     try:
         await db.compare_and_update_plan(
             plan_id, expect_status=from_status,
-            status="pending", reviewed_at=plan.get("reviewed_at"),
+            status=plan.get("status") or "pending", reviewed_at=plan.get("reviewed_at"),
             reviewed_by_actor_id=plan.get("reviewed_by_actor_id"),
             reviewed_caused_by_actor_id=plan.get("reviewed_caused_by_actor_id"),
             **fields,
@@ -560,7 +562,8 @@ async def record_plan_approval(
     For a plan that the user approved in the chat of the session that does
     the work. ``approve_plan`` would start a second session for the same
     work. Without a record, the plan stays ``pending``: it waits on the
-    Plans page and keeps its session in the sidebar's "Needs you" group.
+    Plans page and keeps its session in the sidebar's "Needs you" group,
+    until its task is closed, which closes the plan undecided.
 
     Args:
         db: Database instance.
@@ -580,14 +583,19 @@ async def record_plan_approval(
 
     Raises:
         PlanNotFound: No plan with that ID.
-        PlanNotPending: The plan is not ``pending``, including when a
-            concurrent decision got to it first.
+        PlanNotPending: The plan is neither ``pending`` nor closed with
+            its task, including when a concurrent decision got to it first.
         TaskNotFound: The plan's task no longer exists.
 
     Behavior contract:
         - The plan goes ``pending`` → ``implementing`` in one atomic
           transition, or → ``done`` when the task is already done
           (``task_done`` marks only an ``implementing`` plan done).
+        - A plan that was closed with its task is taken too: the session
+          did the work, closed the task, and records the approval
+          afterwards. It becomes ``done``, or ``implementing`` when an agent
+          has reopened the task since. One that a newer plan of the task
+          replaced is refused.
         - No session starts and no turn runs.
         - A task in ``plan_review`` goes to ``in_progress``, as for
           ``approve_plan``: no plan waits for a decision now. Any other task
@@ -598,26 +606,49 @@ async def record_plan_approval(
     from dataclasses import replace
     from nerve.agent.tools import _legacy_ctx
     from nerve.agent.tools.handlers.tasks import task_update_handler
+    from nerve.db.plans import CLOSED_WITH_TASK
     from nerve.db.task_statuses import PLAN_REVIEW_STATUS, TERMINAL_STATUS
 
     plan = await db.get_plan(plan_id)
     if not plan:
         raise PlanNotFound(f"Plan not found: {plan_id}")
 
-    if plan["status"] != "pending":
+    # In review, or closed with its task and so never decided.
+    was = plan["status"]
+    if was not in ("pending", CLOSED_WITH_TASK):
         await _raise_not_pending(db, plan_id, "approved")
 
     task = await db.get_task(plan["task_id"])
     if not task:
         raise TaskNotFound(f"Task not found for plan {plan_id}: {plan['task_id']}")
 
-    status = "done" if task.get("status") == TERMINAL_STATUS else "implementing"
+    task_done = task.get("status") == TERMINAL_STATUS
+    if was == CLOSED_WITH_TASK and not task_done:
+        # An agent reopened the task, which leaves the plan closed (a person
+        # who reopens it has the plan back in review). The approval can
+        # still be recorded, unless a newer plan has taken the plan's place.
+        versions = [p.get("version") or 0 for p in await db.get_plans_for_task(plan["task_id"])]
+        if (plan.get("version") or 0) != max(versions, default=0):
+            raise PlanNotPending(
+                f"Plan {plan_id} was closed with its task, and a newer plan of the task "
+                "has taken its place since. It cannot be approved."
+            )
+
+    status = "done" if task_done else "implementing"
     if not await db.compare_and_update_plan(
-        plan_id, expect_status="pending",
+        plan_id, expect_status=was,
         status=status, reviewed_at=datetime.now(timezone.utc).isoformat(),
         impl_session_id=session_id,
         attribution=attribution_for(actor, cause),
     ):
+        now = await db.get_plan(plan_id)
+        if now and now["status"] in ("pending", CLOSED_WITH_TASK):
+            # Its task was closed or reopened in between, and the plan went
+            # with it: it can still be recorded, as it is now.
+            raise PlanNotPending(
+                f"Plan {plan_id} changed with its task while the approval was "
+                "recorded; nothing was written. Call again."
+            )
         await _raise_not_pending(db, plan_id, "approved")
 
     task_ctx = replace(

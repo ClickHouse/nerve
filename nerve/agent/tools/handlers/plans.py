@@ -33,6 +33,7 @@ from nerve.agent.tools.schemas import (
 # handlers without going through the registry. This is the chosen pattern
 # for intra-package coupling (see plan-a217db3c "Cross-handler calls").
 from nerve.agent.tools.handlers.tasks import task_update_handler
+from nerve.db.plans import CLOSED_WITH_TASK
 from nerve.db.task_statuses import PLAN_REVIEW_FROM, PLAN_REVIEW_STATUS
 
 logger = logging.getLogger(__name__)
@@ -174,12 +175,30 @@ async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
         "task_id": task_id,
         "note": f"Plan proposed: {plan_link(plan_id)} (v{version})",
     })
+    if await _closed_meanwhile(ctx, plan_id):
+        return ToolResult.text(_CLOSED_MEANWHILE.format(plan_id=plan_id, version=version))
     notified = await _notify_plan_ready(ctx, task, plan_id, version)
 
     return ToolResult.text(
         f"Plan proposed: {plan_id} (v{version}) for task '{task['title']}'. "
         "Awaiting human review.\n" + _review_summary(moved, notified, clipped)
     )
+
+
+# A plan is written before the task's lock is taken for the note, so the task
+# can be closed in between, and the close takes the new plan with it.
+_CLOSED_MEANWHILE = (
+    "Plan {plan_id} (v{version}) was written, but its task was closed at the same "
+    "moment and the plan was closed with it, undecided. No notification was sent. "
+    "The plan is in review again when the user reopens the task; once the task is "
+    "open, it can also be proposed again."
+)
+
+
+async def _closed_meanwhile(ctx: ToolContext, plan_id: str) -> bool:
+    """Whether the plan that this call just wrote was closed with its task."""
+    plan = await ctx.db.get_plan(plan_id)
+    return plan is not None and plan.get("status") == CLOSED_WITH_TASK
 
 
 async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -240,6 +259,10 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         note += f": {feedback}"
     moved = await _move_to_plan_review(ctx, task_id)
     await task_update_handler(ctx, {"task_id": task_id, "note": note})
+    if await _closed_meanwhile(ctx, new_plan_id):
+        return ToolResult.text(
+            _CLOSED_MEANWHILE.format(plan_id=new_plan_id, version=new_version)
+        )
     task = await ctx.db.get_task(task_id)
     notified = bool(task) and await _notify_plan_ready(ctx, task, new_plan_id, new_version)
 
