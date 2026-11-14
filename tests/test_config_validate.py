@@ -812,6 +812,21 @@ class TestGateSpecChecking:
         result = self._run(tmp_path, [{"type": "agent_activity", "ignore_job": ["weekly-cleanup"]}])
         assert any("ignore_job" in line and "ignore_jobs" in line for line in result.warnings)
 
+    def test_the_review_gate_is_checked_in_full(self, tmp_path):
+        for spec in ({"type": "plans_in_review"}, {"type": "plans_in_review", "below": 5}):
+            result = self._run(tmp_path, [spec])
+            assert result.ok, result.errors
+            assert result.warnings == []
+
+        result = self._run(tmp_path, [{"type": "plans_in_review", "below": 0}])
+        assert not result.ok
+        assert any("below" in e for e in result.errors)
+
+        # A misspelled field would take the default, and the job would stop
+        # at three proposals whatever number the entry meant.
+        result = self._run(tmp_path, [{"type": "plans_in_review", "bellow": 5}])
+        assert any("bellow" in line and "below" in line for line in result.warnings)
+
     def test_spec_that_is_not_a_mapping_is_an_error(self, tmp_path):
         result = self._run(tmp_path, ["tasks"])
 

@@ -542,6 +542,78 @@ class AgentActivityGate(CronGate):
         return cls(ignore_jobs=[job.strip() for job in ignore], overlap_hours=float(hours))
 
 
+class PlansInReviewGate(CronGate):
+    """Satisfied while fewer than ``below`` of the job's proposals wait for
+    review.
+
+    The motivating case: a job that proposes a plan on each run, for a person
+    who decides on each one. While that person does not get to them, another
+    proposal only adds to the pile, so the job waits until some are decided.
+
+    Config::
+
+        type: plans_in_review
+        below: 3        # run only while fewer than 3 wait (the default)
+
+    A proposal is a task with a plan in review: one that was proposed, and
+    neither approved nor declined yet. A plan that the reviewer sent back for
+    a revision is still in review. Only the job's own proposals count, the
+    ones that one of its sessions proposed
+    (:meth:`nerve.db.cron.CronStore.count_cron_job_plans_in_review` says
+    exactly which). What a chat or another job proposed does not: it says
+    nothing about what becomes of this job's proposals.
+
+    Nothing takes a proposal out of review but a decision on its plan: not
+    time, and not the end of its task. So the count is what the Plans page
+    shows a person to decide, and a job whose proposals nobody decides stops
+    at ``below`` of them, and starts again when enough are approved or
+    declined.
+
+    Like ``agent_activity``, the gate estimates whether a run is worth it; it
+    does not say whether the job can run. So a run that a person starts by
+    hand is not checked.
+
+    The check reads the database and nothing else, so the default forecast —
+    the check, made now — holds until a plan is proposed or decided. A run of
+    the job, and the turn that implements an approved plan, are followed by a
+    new forecast; a plan declined on the Plans page is seen at the next read
+    of the schedule. The proposals are counted as they are when the gate is
+    asked, for a catch-up too (``GateContext.as_of`` is not used).
+    """
+
+    type = "plans_in_review"
+    spec_keys = frozenset({"below"})
+    checked_on_manual_runs = False
+
+    #: The number of proposals in review at which a job stops, unless its
+    #: spec says another.
+    DEFAULT_BELOW = 3
+
+    def __init__(self, below: int = DEFAULT_BELOW) -> None:
+        # Zero would never let the job run, and that is what `enabled: false`
+        # is for. A bool is an int in Python, and `below: true` is a mistake.
+        if isinstance(below, bool) or not isinstance(below, int) or below < 1:
+            raise GateConfigError(
+                "'plans_in_review' gate 'below' must be a whole number, 1 or "
+                f"more, got {below!r}"
+            )
+        self.below = below
+
+    async def is_satisfied(self, ctx: GateContext) -> bool:
+        return await ctx.db.count_cron_job_plans_in_review(ctx.job_id) < self.below
+
+    def describe(self) -> str:
+        if self.below == 1:
+            return "none of this job's proposals waits for review"
+        return f"fewer than {self.below} of this job's proposals wait for review"
+
+    @classmethod
+    def from_config(cls, spec: dict) -> "PlansInReviewGate":
+        # Only a bare key means "not set", as for the other gates.
+        below = spec.get("below")
+        return cls() if below is None else cls(below=below)
+
+
 class GitHubPrActivityGate(CronGate):
     """Satisfied only when an author's open PRs show *new* activity.
 
@@ -1212,6 +1284,7 @@ GATE_REGISTRY: dict[str, type[CronGate]] = {
     MessagesGate.type: MessagesGate,
     TasksGate.type: TasksGate,
     AgentActivityGate.type: AgentActivityGate,
+    PlansInReviewGate.type: PlansInReviewGate,
     GitHubPrActivityGate.type: GitHubPrActivityGate,
     ClickHouseQueryGate.type: ClickHouseQueryGate,
 }

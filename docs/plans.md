@@ -159,6 +159,8 @@ The user can monitor, stop, or interact with the implementation session from the
 
 A plan is a skill plan when its `plan_type` is `skill-create` or `skill-update`: the `plan_propose` call states the type, or the task's `source` is `skill-extractor` or `skill-reviser`. The `skill-extractor` cron job states it. A skill plan goes through the same approval path as any other plan — an `impl-<id>` session is spawned — with a prompt for the plan type. A session that implements the plan itself (`plan_approve` with `implement_here=true`) gets no such prompt.
 
+`skill-extractor` does not run while three or more of its proposals wait for review (a [`plans_in_review`](cron.md#plans_in_review) gate). Approve or decline some, and it goes on at its next scheduled time, if the agent has worked since its last run. Closing the task of a proposal does not decide its plan.
+
 A `skill-create` plan is a proposal for a person to judge. It says what the skill is for, the evidence that it is needed (where the workflow occurred and what was repeated) and the direction the skill should take. The prompt has the session write the skill:
 
 1. The session looks at the evidence the plan names and at the existing skills

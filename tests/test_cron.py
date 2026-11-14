@@ -1492,8 +1492,8 @@ class TestAnEntryOfAnEarlierRelease:
         assert (job.schedule, job.prompt, job.description) == (
             shipped["schedule"], shipped["prompt"], shipped["description"],
         )
-        # And with the gate that an entry of the job gets when it states none.
-        assert [gate.type for gate in job.gates] == ["agent_activity"]
+        # And with the gates that an entry of the job gets when it states none.
+        assert [gate.type for gate in job.gates] == ["plans_in_review", "agent_activity"]
         assert _said(caplog) == [
             "Cron job skill-extractor: its description, prompt, schedule in system.yaml are "
             "what an earlier release shipped; the job is loaded with this release's (schedule 0 5 * * *)"

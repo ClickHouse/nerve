@@ -30,7 +30,7 @@ Each job plays one role, and each role moves tasks in one direction:
 | Work | Claims one actionable task, moves it to `in_progress`, and ends the run with it in a truthful status | `tasks` on `pending` and the tag it owns | `isolated` |
 | Monitor | Watches a waiting status and returns the task when the external event happens | `tasks` on that status, plus `github_pr_activity` for PRs | `persistent` or `isolated` |
 | Planner (`task-planner`) | Proposes a plan for an open task that has none. Ships disabled for workers; onboarding enables it when the worker plans through the approval loop | `tasks` on `pending`, and the worker's tag once overridden | `persistent` |
-| Skills (`skill-extractor`, `skill-reviser`) | Propose new or revised skills, each as a task with a plan | `agent_activity` | `persistent` |
+| Skills (`skill-extractor`, `skill-reviser`) | Propose new or revised skills, each as a task with a plan | `agent_activity`; `skill-extractor` also `plans_in_review` | `persistent` |
 | Maintenance (`memory-maintenance`, `machine-maintenance`) | Tidies long-term memory, and once a week the machine (old caches, Docker leftovers, worktrees of merged pull requests, leftover services); asks before it removes or stops anything that can hold data; moves no tasks | `agent_activity` | `isolated` |
 
 The last three ship in `system.yaml` ([cron.md](cron.md#built-in-system-crons)); scan, work and monitor jobs are yours, in `config/cron/jobs.yaml`. `task-planner` ships disabled for workers. When the worker should plan through the approval loop (`task-planner` proposes, the operator approves, and an implementation session does the work), onboarding enables it by overriding the job by id in `jobs.yaml`, with a prompt and a `tasks` gate that name the worker's tag; a job in `jobs.yaml` replaces the `system.yaml` job with the same id. Add a work job when `TASK.md` § Approval Required grants autonomy for routine items. When both run, give each its own tasks by tag.
@@ -72,11 +72,12 @@ The same machine as a transition table, in the form `TASK.md` § Actions uses (`
 
 ### Gates keep jobs idle until there is work
 
-A run gate is checked right before a job fires; when it is not satisfied, no session starts ([cron.md](cron.md#run-gates)). Four gate types ship with Nerve:
+A run gate is checked right before a job fires; when it is not satisfied, no session starts ([cron.md](cron.md#run-gates)). Six gate types ship with Nerve:
 
 - `tasks`: enough tasks match a status, or a list of statuses, and an optional tag. A work job gates on the queue it owns, a monitor on the waiting status it watches, the planner on `pending`. No built-in job gates on `backlog`.
 - `messages`: a sync source has unread messages for a consumer. It drives inbox work, if the worker has sources.
 - `agent_activity`: the agent has worked since the job's last run, not counting the job's own runs, the runs of the jobs in `ignore_jobs`, or the runs of other jobs with this gate. The built-in `memory-maintenance`, `skill-extractor`, `skill-reviser` and `machine-maintenance` have it by default, so they stop running when the agent does nothing. A worker with a scan job works at every scan, so they go on running there.
+- `plans_in_review`: fewer than `below` (3 by default) of the job's own proposals wait for review. A proposal is a task with a plan that is neither approved nor declined yet. The built-in `skill-extractor` has it by default, so it stops while three or more of its proposals wait, and goes on once the operator decides some.
 - `github_pr_activity`: something actionable changed on an author's open PRs (a merge or close, a new commit, a review, a CI transition, a human comment); `force_run_after_hours` fires it anyway after a quiet spell.
 - `clickhouse_query`: a ClickHouse query, run through an MCP server such as the ClickHouse Cloud one, gives a true first value; `cooldown_minutes` sets how often it fires while the value stays true, and the run's prompt gets the rows.
 

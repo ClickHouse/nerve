@@ -12,8 +12,13 @@ import pytest
 import pytest_asyncio
 
 import nerve.workflows
+from nerve.agent import tools as tools_mod
+from nerve.agent.plan_service import approve_plan, decline_plan, request_plan_revision
 from nerve.agent.sessions import new_cron_run_id
 from nerve.agent.streaming import broadcaster
+from nerve.agent.tools.handlers.plans import plan_propose_handler, plan_update_handler
+from nerve.agent.tools.handlers.tasks import task_create_handler, task_done_handler
+from nerve.agent.tools.registry import ToolContext
 from nerve.cron.gates import (
     GATE_REGISTRY,
     AgentActivityGate,
@@ -22,6 +27,7 @@ from nerve.cron.gates import (
     GateContext,
     GitHubPrActivityGate,
     MessagesGate,
+    PlansInReviewGate,
     TasksGate,
     build_gate,
     build_gates,
@@ -32,6 +38,7 @@ from nerve.cron.service import CronService
 from nerve.sources.models import SourceRecord
 from nerve.workflows.service import ENGINE_CLAUDE, WorkflowRunService
 from tests.actor_rows import ensure_system_principal
+from tests.test_plan_actions import FakeEngine
 from tests.test_turn_outcomes import _engine, _session, _token_seen
 from tests.test_turn_outcomes import _turn as _real_turn
 from tests.test_workflow_runs import _drain, _make_config
@@ -1346,11 +1353,11 @@ class TestAgentActivityGateConfig:
             "not counting the runs of a, b"
         )
 
-    def test_only_this_gate_lets_a_manual_run_through(self):
-        """It estimates whether a run is worth it. The other gates say whether
-        the job has anything to act on."""
+    def test_only_the_gates_that_estimate_let_a_manual_run_through(self):
+        """They estimate whether a run is worth it. The other gates say
+        whether the job has anything to act on."""
         unchecked = [key for key, cls in GATE_REGISTRY.items() if not cls.checked_on_manual_runs]
-        assert unchecked == ["agent_activity"]
+        assert unchecked == ["agent_activity", "plans_in_review"]
 
 
 # ---------------------------------------------------------------------------
@@ -1571,6 +1578,439 @@ class TestAgentActivityOfRealRuns:
 
 
 # ---------------------------------------------------------------------------
+# PlansInReviewGate
+# ---------------------------------------------------------------------------
+
+async def _plan(
+    db, task_id: str, session_id: str | None, *, status: str = "pending", version: int = 1,
+) -> str:
+    """A plan for ``task_id`` (made on demand) that ``session_id`` proposed."""
+    if await db.get_task(task_id) is None:
+        await db.upsert_task(task_id=task_id, file_path=f"{task_id}.md", title=task_id)
+    plan_id = f"plan-{task_id}-v{version}"
+    await db.create_plan(
+        plan_id=plan_id, task_id=task_id, content="What, evidence, direction.",
+        session_id=session_id, version=version,
+    )
+    if status != "pending":
+        await db.update_plan(plan_id, status=status)
+    return plan_id
+
+
+# What a plan becomes when it is decided: declined, or approved and then
+# under way, finished or failed.
+DECIDED = ["declined", "implementing", "done", "failed"]
+
+
+@pytest.mark.asyncio
+class TestPlansInReviewGate:
+    async def _open(self, db, below: int = 3, job_id: str = "scout") -> bool:
+        return await PlansInReviewGate(below).is_satisfied(GateContext(job_id=job_id, db=db))
+
+    async def test_a_job_that_proposed_nothing_runs(self, db):
+        assert await self._open(db) is True
+
+    async def test_the_job_stops_at_the_number_and_not_before(self, db):
+        for task in ("t1", "t2"):
+            await _plan(db, task, _run_session("scout"))
+        assert await self._open(db) is True
+
+        await _plan(db, "t3", _run_session("scout"))
+        assert await self._open(db) is False
+
+        await _plan(db, "t4", _run_session("scout"))
+        assert await self._open(db) is False
+        assert await self._open(db, below=5) is True
+
+    async def test_below_one_lets_no_proposal_wait(self, db):
+        assert await self._open(db, below=1) is True
+
+        await _plan(db, "t1", "cron:scout")
+        assert await self._open(db, below=1) is False
+
+    @pytest.mark.parametrize("status", [*DECIDED, "superseded"])
+    async def test_only_a_plan_in_review_counts(self, db, status):
+        for task in ("t1", "t2", "t3"):
+            await _plan(db, task, "cron:scout", status=status)
+
+        assert await db.count_cron_job_plans_in_review("scout") == 0
+        assert await self._open(db) is True
+
+    @pytest.mark.parametrize("session_id", [
+        "cron:scout", "cron:scout:20260102-030405-0a1b2c3d", "cron:scout:20260102-030405",
+    ], ids=["the one session of a job", "a run or a generation", "a run of an older release"])
+    async def test_a_plan_from_any_session_of_the_job_counts(self, db, session_id):
+        await _plan(db, "t1", session_id)
+
+        assert await db.count_cron_job_plans_in_review("scout") == 1
+
+    @pytest.mark.parametrize("session_id", [
+        None, "chat-1", "impl-0a1b2c3d", "cron:planner", "cron:planner:20260102-030405-0a1b2c3d",
+        "cron:scout-2", "cron:scout:deep", "cron:scout:deep:20260102-030405-0a1b2c3d", "scout",
+    ])
+    async def test_what_anything_else_proposed_does_not_count(self, db, session_id):
+        """A chat, an implementation session, another job: also one whose id
+        begins with this job's."""
+        for task in ("t1", "t2", "t3"):
+            await _plan(db, task, session_id)
+
+        assert await db.count_cron_job_plans_in_review("scout") == 0
+        assert await self._open(db) is True
+
+    async def test_each_job_counts_its_own_proposals(self, db):
+        for task in ("t1", "t2", "t3"):
+            await _plan(db, task, _run_session("scout"))
+        await _plan(db, "t4", _run_session("planner"))
+
+        assert await self._open(db, job_id="scout") is False
+        assert await self._open(db, job_id="planner") is True
+
+    @pytest.mark.parametrize("job_id", ["50%_off", "a*b[c]?", "it's \"quoted\"", "задача"])
+    async def test_a_job_id_is_text_not_a_pattern(self, db, job_id):
+        await _plan(db, "t1", _run_session("50x_off"))
+        await _plan(db, "t2", _run_session("axb[c]?"))
+        assert await db.count_cron_job_plans_in_review(job_id) == 0
+
+        await _plan(db, "t3", _run_session(job_id))
+        await _plan(db, "t4", f"cron:{job_id}")
+        assert await db.count_cron_job_plans_in_review(job_id) == 2
+
+    @pytest.mark.parametrize("started_by", ["cron:scout", "session:cron:scout", "session:{run}"])
+    async def test_a_workflow_run_the_job_started_proposes_for_the_job(self, db, started_by):
+        """A workflow-run job does its work in ``workflow:<run>``, and a
+        prompt job can start a workflow run from its session."""
+        mine = await _workflow_run(db, "run-1", started_by.format(run=_run_session("scout")))
+        theirs = await _workflow_run(db, "run-2", "session:chat-1")
+        await _plan(db, "t1", mine)
+        await _plan(db, "t2", theirs)
+
+        assert await db.count_cron_job_plans_in_review("scout") == 1
+
+    @pytest.mark.parametrize("reviser", ["cron:scout", "cron:task-planner", "chat-1", None])
+    async def test_a_revision_counts_with_the_plan_it_replaces(self, db, reviser):
+        """Whoever wrote it: the job's own session, the planner session that
+        takes the revision when the job's session was deleted, a person's
+        chat. The proposal is the same one, and still waits."""
+        await _plan(db, "t1", "cron:scout", status="superseded")
+        await _plan(db, "t1", reviser, version=2)
+
+        assert await db.count_cron_job_plans_in_review("scout") == 1
+
+    async def test_a_revision_of_anothers_plan_is_not_the_jobs_proposal(self, db):
+        await _plan(db, "t1", "chat-1", status="superseded")
+        await _plan(db, "t1", "chat-1", version=2)
+
+        assert await db.count_cron_job_plans_in_review("scout") == 0
+
+    async def test_a_revision_of_a_revision_counts(self, db):
+        await _plan(db, "t1", "cron:scout", status="superseded")
+        await _plan(db, "t1", "chat-1", status="superseded", version=2)
+        await _plan(db, "t1", "chat-2", version=3)
+
+        assert await db.count_cron_job_plans_in_review("scout") == 1
+
+    @pytest.mark.parametrize("decided", DECIDED)
+    async def test_a_revised_proposal_that_was_decided_no_longer_waits(self, db, decided):
+        await _plan(db, "t1", "cron:scout", status="superseded")
+        await _plan(db, "t1", "cron:scout", status=decided, version=2)
+
+        assert await db.count_cron_job_plans_in_review("scout") == 0
+
+    @pytest.mark.parametrize("decided", DECIDED)
+    async def test_a_task_with_no_plan_in_review_has_no_proposal(self, db, decided):
+        """Also when a plan of the job was replaced and nothing took its
+        place, as a revision that fails half-way leaves it: the one plan of
+        the task that is not replaced was decided."""
+        await _plan(db, "t1", "chat-1", status=decided)
+        await _plan(db, "t1", "cron:scout", status="superseded", version=2)
+
+        assert await db.count_cron_job_plans_in_review("scout") == 0
+
+    @pytest.mark.parametrize("decided", DECIDED)
+    @pytest.mark.parametrize("revised", [False, True], ids=["as proposed", "after a revision"])
+    async def test_a_plan_for_a_task_whose_earlier_proposal_was_decided_is_not_the_jobs(
+        self, db, decided, revised,
+    ):
+        """The job's proposal for the task was decided, as it was proposed or
+        after a revision. A plan that a chat proposes for the task later
+        replaces nothing of the job's."""
+        if revised:
+            await _plan(db, "t1", "cron:scout", status="superseded", version=0)
+        await _plan(db, "t1", "cron:scout", status=decided)
+        await _plan(db, "t1", "chat-1", version=2)
+
+        assert await db.count_cron_job_plans_in_review("scout") == 0
+
+    async def test_the_jobs_next_proposal_for_a_task_counts_after_a_decision(self, db):
+        await _plan(db, "t1", "cron:scout", status="superseded", version=0)
+        await _plan(db, "t1", "cron:scout", status="declined")
+        await _plan(db, "t1", "cron:scout", version=2)
+
+        assert await db.count_cron_job_plans_in_review("scout") == 1
+
+    @pytest.mark.parametrize("status", [
+        "pending", "plan_review", "in_progress", "backlog", "on_hold", "done",
+    ])
+    async def test_a_proposal_waits_whatever_became_of_its_task(self, db, status):
+        """The plan tools move a task to ``plan_review`` only from some
+        statuses, and a person can move it on, also to ``done``: closing a
+        task decides no plan, and the Plans page goes on listing it."""
+        await _plan(db, "t1", "cron:scout")
+        await db.upsert_task(task_id="t1", file_path="t1.md", title="t1", status=status)
+
+        assert (await db.get_plan("plan-t1-v1"))["status"] == "pending"
+        assert await db.count_cron_job_plans_in_review("scout") == 1
+
+    async def test_a_plan_proposed_for_a_task_that_is_done_waits(self, db):
+        """The job comes back to an idea whose task was closed: the plan
+        tools leave the task done and put the plan in review."""
+        await db.upsert_task(task_id="t1", file_path="t1.md", title="t1", status="done")
+        await _plan(db, "t1", "cron:scout", status="declined")
+        await _plan(db, "t1", "cron:scout", version=2)
+
+        assert (await db.get_task("t1"))["status"] == "done"
+        assert await db.count_cron_job_plans_in_review("scout") == 1
+
+    async def test_a_decided_plan_of_another_task_ends_nothing(self, db):
+        await _plan(db, "t1", "cron:scout")
+        await _plan(db, "t2", "chat-1", status="superseded")
+        await _plan(db, "t2", "chat-1", status="declined", version=2)
+
+        assert await db.count_cron_job_plans_in_review("scout") == 1
+
+    async def test_a_plan_in_review_beside_a_decided_one_of_its_version_waits(self, db):
+        """Two calls that propose for one task at the same moment can leave
+        two plans of one version. Approving one leaves the other in review,
+        where the Plans page lists it."""
+        await _plan(db, "t1", "cron:scout")
+        await db.create_plan(
+            plan_id="plan-twin", task_id="t1", content="x", session_id="cron:scout", version=1,
+        )
+        await db.update_plan("plan-twin", status="implementing")
+
+        assert await db.count_cron_job_plans_in_review("scout") == 1
+
+    async def test_a_plan_without_a_task_does_not_count(self, db):
+        """Nobody could decide it: every decision needs the task."""
+        await db.create_plan(
+            plan_id="plan-adrift", task_id="no-such-task", content="x", session_id="cron:scout",
+        )
+
+        assert await db.count_cron_job_plans_in_review("scout") == 0
+
+    async def test_a_proposal_outlives_the_session_that_proposed_it(self, db):
+        """A plan keeps the id of its session. Deleting the chat of a run, or
+        of a workflow run that the job started, leaves the proposal the
+        job's: the link from a workflow run to its session goes with the
+        session, the run id in the session's id does not."""
+        cron_session = _run_session("scout")
+        await db.create_session(cron_session, source="cron", actor=None)
+        workflow_session = await _workflow_run(db, "run-1", "cron:scout")
+        await _plan(db, "t1", cron_session)
+        await _plan(db, "t2", workflow_session)
+        await _plan(db, "t3", await _workflow_run(db, "run-2", "session:chat-1"))
+        assert await db.count_cron_job_plans_in_review("scout") == 2
+
+        for session_id in (cron_session, workflow_session, "workflow:run-2"):
+            assert await db.delete_session(session_id) is True
+
+        assert await db.count_cron_job_plans_in_review("scout") == 2
+
+    async def test_a_session_named_like_a_workflow_run_is_not_one(self, db):
+        await _workflow_run(db, "run-1", "cron:scout")
+        for task, session_id in (("t1", "workflow:"), ("t2", "workflow:run-9"), ("t3", "run-1"),
+                                 ("t4", "chat:workflow:run-1"), ("t5", "nine-charrun-1"),
+                                 ("t6", "telegram:run-1")):
+            await _plan(db, task, session_id)
+
+        assert await db.count_cron_job_plans_in_review("scout") == 0
+
+    async def test_two_plans_in_review_for_one_task_are_one_proposal(self, db):
+        """The tools keep one plan in review per task. Should two exist, the
+        person still has one proposal to decide."""
+        await _plan(db, "t1", "cron:scout")
+        await _plan(db, "t1", "cron:scout", version=2)
+
+        assert await db.count_cron_job_plans_in_review("scout") == 1
+
+    async def test_the_gate_counts_now_whatever_time_it_is_asked_about(self, db):
+        """A catch-up asks about the time its run came due. A plan has one
+        status, the current one, so the gate cannot answer for then."""
+        for task in ("t1", "t2", "t3"):
+            await _plan(db, task, "cron:scout")
+        gate = PlansInReviewGate()
+        ctx = GateContext(job_id="scout", db=db, as_of=_ago(60 * 24 * 365))
+
+        assert await gate.is_satisfied(ctx) is False
+        assert await gate.forecast(ctx, datetime.now(UTC) + timedelta(days=30)) is False
+
+
+class TestPlansInReviewGateConfig:
+    def test_from_config(self):
+        gate = build_gate({"type": "plans_in_review"})
+        assert isinstance(gate, PlansInReviewGate)
+        assert gate.below == 3
+
+        assert build_gate({"type": "plans_in_review", "below": 5}).below == 5
+        assert build_gate({"type": "plans_in_review", "below": 1}).below == 1
+        # A bare key is the one way to say "not set".
+        assert build_gate({"type": "plans_in_review", "below": None}).below == 3
+
+    @pytest.mark.parametrize("bad", [
+        0, -1, True, False, "3", 3.0, 2.5, float("nan"), float("inf"), [3], {}, "",
+    ])
+    def test_a_malformed_number_is_refused(self, bad):
+        """Zero would never let the job run, which is what ``enabled: false``
+        says. Refused as a gate that does not build, which costs the one job."""
+        with pytest.raises(GateConfigError, match="below"):
+            build_gate({"type": "plans_in_review", "below": bad})
+        with pytest.raises(GateConfigError, match="below"):
+            PlansInReviewGate(bad)
+
+    def test_a_number_of_any_size_builds(self):
+        """It is compared with a count and never handed to the database."""
+        assert build_gate({"type": "plans_in_review", "below": 10 ** 400}).below == 10 ** 400
+
+    def test_describe(self):
+        assert PlansInReviewGate().describe() == (
+            "fewer than 3 of this job's proposals wait for review"
+        )
+        assert PlansInReviewGate(1).describe() == "none of this job's proposals waits for review"
+
+    def test_its_one_field_is_known_to_validation(self):
+        assert PlansInReviewGate.spec_keys == frozenset({"below"})
+
+
+@pytest.mark.asyncio
+class TestPlansInReviewOfRealProposals:
+    """Proposals that the plan tools make, in a session with an id the code
+    itself makes, and decisions that the plan service takes."""
+
+    @staticmethod
+    def _tools(db, tmp_path, session_id: str) -> ToolContext:
+        return ToolContext(
+            session_id=session_id, workspace=tmp_path, db=db,
+            notification_service=None, actor=db.system_actor,
+        )
+
+    @staticmethod
+    async def _proposed(ctx: ToolContext, title: str) -> tuple[str, str]:
+        import re
+
+        created = await task_create_handler(ctx, {"title": title, "content": "What it is for."})
+        task_id = re.match(r"Task created: (\S+)", created.content[0]["text"]).group(1)
+        await plan_propose_handler(ctx, {"task_id": task_id, "content": "What, evidence, direction."})
+        (plan,) = [p for p in await ctx.db.get_plans_for_task(task_id) if p["status"] == "pending"]
+        return task_id, plan["id"]
+
+    async def test_a_job_waits_at_three_proposals_and_goes_on_after_a_decision(self, agent_db, tmp_path):
+        db = agent_db
+        engine = FakeEngine(db)
+        tools_mod.init_tools(workspace=tmp_path, db=db, engine=engine)
+        scout = self._tools(db, tmp_path, _run_session("scout"))
+        gate, ctx = PlansInReviewGate(3), GateContext(job_id="scout", db=db)
+
+        first = await self._proposed(scout, "Release notes from merged pull requests")
+        second = await self._proposed(scout, "Weekly audit of dependencies")
+        assert await gate.is_satisfied(ctx) is True
+        third = await self._proposed(scout, "Triage of flaky tests")
+        assert await gate.is_satisfied(ctx) is False
+
+        # What a chat proposes is not the job's.
+        await self._proposed(self._tools(db, tmp_path, "chat-1"), "Fix the encoder")
+        assert await db.count_cron_job_plans_in_review("scout") == 3
+
+        # Sent back for a revision, the proposal still waits; so does the
+        # revision, here written in another session.
+        await request_plan_revision(db, engine, first[1], "Narrower, please.", actor=None, cause=None)
+        assert await gate.is_satisfied(ctx) is False
+        await plan_update_handler(
+            self._tools(db, tmp_path, "cron:task-planner"),
+            {"plan_id": first[1], "content": "Narrower."},
+        )
+        assert (await db.get_plan(first[1]))["status"] == "superseded"
+        assert await db.count_cron_job_plans_in_review("scout") == 3
+
+        # A task that somebody closes by hand leaves its plan in review, where
+        # the Plans page lists it: the proposal still waits for a decision.
+        await task_done_handler(scout, {"task_id": third[0]})
+        assert (await db.get_plan(third[1]))["status"] == "pending"
+        assert await gate.is_satisfied(ctx) is False
+
+        await decline_plan(db=db, engine=engine, plan_id=third[1], actor=None, cause=None)
+        assert await gate.is_satisfied(ctx) is True
+
+        await self._proposed(scout, "Rotation of the on-call notes")
+        assert await gate.is_satisfied(ctx) is False
+
+        engine.run_event.clear()  # the revision request above ran a turn too
+        await approve_plan(db=db, engine=engine, plan_id=second[1], actor=None, cause=None)
+        await asyncio.wait_for(engine.run_event.wait(), timeout=5.0)
+        assert (await db.get_plan(second[1]))["status"] == "implementing"
+        assert await gate.is_satisfied(ctx) is True
+
+
+@pytest.mark.asyncio
+class TestPlansInReviewOfRealRuns:
+    """The gate on runs of the real scheduler. Each run that happens proposes
+    one plan in its own session, whose id the scheduler made."""
+
+    GATED = [{"type": "plans_in_review", "below": 3}]
+
+    @staticmethod
+    async def _scheduled_time(svc: CronService, job: CronJob, **how) -> int:
+        """One scheduled time of *job*. Returns the runs it has had so far."""
+        before = len(await svc.db.get_cron_logs(job.id))
+        await svc._run_job_wrapper(job, **how)
+        logs = await svc.db.get_cron_logs(job.id)
+        if len(logs) > before:
+            await _plan(svc.db, f"proposal-{len(logs)}", logs[0]["session_id"])
+        return len(logs)
+
+    @pytest.mark.parametrize("mode", ["isolated", "persistent"])
+    async def test_a_job_stops_after_three_proposals_until_one_is_decided(self, agent_db, tmp_path, mode):
+        engine, _ = await _engine(agent_db, tmp_path, [OK])
+        svc = CronService(engine.config, engine, agent_db)
+        job = CronJob(id="scout", schedule="1h", prompt="p", session_mode=mode,
+                      context_rotate_hours=0, run_if=self.GATED)
+        svc._jobs = [job]
+
+        runs = [await self._scheduled_time(svc, job) for _ in range(5)]
+        assert runs == [1, 2, 3, 3, 3]
+
+        await agent_db.update_plan("plan-proposal-2-v1", status="declined")
+        runs = [await self._scheduled_time(svc, job) for _ in range(3)]
+        assert runs == [4, 4, 4]
+
+    @pytest.mark.parametrize("origin", ["schedule", "catchup", "delivery"])
+    async def test_a_run_that_nobody_started_is_checked(self, agent_db, tmp_path, origin):
+        engine, _ = await _engine(agent_db, tmp_path, [OK])
+        svc = CronService(engine.config, engine, agent_db)
+        job = CronJob(id="scout", schedule="1h", prompt="p", run_if=self.GATED)
+        svc._jobs = [job]
+        for task in ("t1", "t2", "t3"):
+            await _plan(agent_db, task, "cron:scout")
+
+        assert await self._scheduled_time(svc, job, origin=origin) == 0
+
+    async def test_a_run_that_a_person_starts_is_not_checked(self, agent_db, tmp_path):
+        """The gate estimates whether another proposal is worth making. A
+        person who starts the job wants one."""
+        engine, _ = await _engine(agent_db, tmp_path, [OK])
+        svc = CronService(engine.config, engine, agent_db)
+        job = CronJob(id="scout", schedule="1h", prompt="p", run_if=self.GATED)
+        svc._jobs = [job]
+        for task in ("t1", "t2", "t3"):
+            await _plan(agent_db, task, "cron:scout")
+
+        await svc._run_job_wrapper(job)  # as the scheduler starts it
+        assert await agent_db.get_cron_logs("scout") == []
+
+        await svc.run_job("scout")
+        assert [log["status"] for log in await agent_db.get_cron_logs("scout")] == ["success"]
+
+
+# ---------------------------------------------------------------------------
 # The default gates of built-in jobs
 # ---------------------------------------------------------------------------
 
@@ -1604,7 +2044,11 @@ def _system_yaml(backend: str = "memu", mode: str = "worker") -> list[dict]:
 
 
 def _gates(job: CronJob) -> list[tuple]:
-    return [(type(g), g.ignore_jobs, g.overlap_hours) for g in job.gates]
+    return [
+        (type(g), g.below) if isinstance(g, PlansInReviewGate)
+        else (type(g), g.ignore_jobs, g.overlap_hours)
+        for g in job.gates
+    ]
 
 
 def _said_about_defaults(caplog) -> list[str]:
@@ -1613,8 +2057,9 @@ def _said_about_defaults(caplog) -> list[str]:
 
 class TestDefaultGatesOfBuiltInJobs:
     """The four maintenance jobs (memory-maintenance, skill-extractor,
-    skill-reviser, machine-maintenance) wait for the agent to work. The gates
-    are not in system.yaml, which nothing writes again when Nerve is updated:
+    skill-reviser, machine-maintenance) wait for the agent to work, and
+    skill-extractor also for its proposals to be decided. The gates are
+    not in system.yaml, which nothing writes again when Nerve is updated:
     the scheduler gives them to an entry that states none, so an install from
     before them has them too, and a later change reaches all."""
 
@@ -1623,6 +2068,9 @@ class TestDefaultGatesOfBuiltInJobs:
     REVISER = ["memory-maintenance", "skill-extractor", "machine-maintenance"]
     MACHINE = ["memory-maintenance", "skill-extractor", "skill-reviser"]
     GATED = {"memory-maintenance", "skill-extractor", "skill-reviser", "machine-maintenance"}
+    #: skill-extractor's: the review of its proposals first, so that a job
+    #: that waits for both names the one a person can do something about.
+    EXTRACTOR = [(PlansInReviewGate, 3), (AgentActivityGate, SKILLS, 0.0)]
 
     @pytest.mark.parametrize("strict", [False, True], ids=["at startup", "on a reload"])
     def test_the_jobs_have_their_gates_without_the_file_stating_them(self, tmp_path, strict):
@@ -1633,7 +2081,7 @@ class TestDefaultGatesOfBuiltInJobs:
         loaded = _load(tmp_path, list(written.values()), strict=strict)
 
         assert _gates(loaded["memory-maintenance"]) == [(AgentActivityGate, self.MEMORY, 24.0)]
-        assert _gates(loaded["skill-extractor"]) == [(AgentActivityGate, self.SKILLS, 0.0)]
+        assert _gates(loaded["skill-extractor"]) == self.EXTRACTOR
         assert _gates(loaded["skill-reviser"]) == [(AgentActivityGate, self.REVISER, 0.0)]
         assert _gates(loaded["machine-maintenance"]) == [(AgentActivityGate, self.MACHINE, 0.0)]
 
@@ -1644,7 +2092,7 @@ class TestDefaultGatesOfBuiltInJobs:
         loaded = _load(tmp_path, _system_yaml("memu"), backend="loom")
 
         assert _gates(loaded["memory-maintenance"]) == [(AgentActivityGate, self.MEMORY, 0.0)]
-        assert _gates(loaded["skill-extractor"]) == [(AgentActivityGate, self.SKILLS, 0.0)]
+        assert _gates(loaded["skill-extractor"]) == self.EXTRACTOR
         # The weekly jobs look at what there is, under either backend.
         assert _gates(loaded["skill-reviser"]) == [(AgentActivityGate, self.REVISER, 0.0)]
         assert _gates(loaded["machine-maintenance"]) == [(AgentActivityGate, self.MACHINE, 0.0)]
@@ -1679,7 +2127,7 @@ class TestDefaultGatesOfBuiltInJobs:
         loaded = _load(tmp_path, jobs)["skill-extractor"]
 
         assert loaded.prompt == "Look for what I do twice."
-        assert _gates(loaded) == [(AgentActivityGate, self.SKILLS, 0.0)]
+        assert _gates(loaded) == self.EXTRACTOR
 
     def test_no_other_built_in_job_gets_a_gate_it_does_not_state(self, tmp_path):
         """inbox-processor and task-planner have their gates in the file. An
@@ -1724,6 +2172,8 @@ class TestDefaultGatesOfBuiltInJobs:
             "system.yaml" in line and "agent activity since" in line and "run_if: []" in line
             for line in said
         )
+        (extractor,) = [line for line in said if line.startswith("Cron job skill-extractor:")]
+        assert "fewer than 3 of this job's proposals wait for review; agent activity since" in extractor
 
     def test_only_the_scheduler_gives_them(self, tmp_path):
         """A plain load of the file returns what the file says: the default

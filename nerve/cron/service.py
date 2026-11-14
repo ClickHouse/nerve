@@ -2759,7 +2759,9 @@ class CronService:
         this service; tasks created, moved or edited from a chat turn, the
         web UI or the API change what a ``tasks`` gate forecasts without any
         call here; a turn, or a message stored in a session, changes what an
-        ``agent_activity`` gate forecasts without one; and a message a channel
+        ``agent_activity`` gate forecasts without one; a plan that is proposed
+        or decided changes what a ``plans_in_review`` gate forecasts without
+        one; and a message a channel
         buffers for its
         ``<channel>:observed`` drain makes that drain count (see
         :meth:`_undrained`) without one. Those count from the next

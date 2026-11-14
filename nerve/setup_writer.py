@@ -1384,11 +1384,18 @@ _DEFAULT_RUN_IF: dict[str, list[dict[str, Any]]] = {
         "ignore_jobs": _other_maintenance_crons("memory-maintenance"),
         "overlap_hours": 24,
     }],
+    # The job proposes a skill a run, for a person to decide on. While three
+    # of its proposals wait for that decision it does not add a fourth. That
+    # gate comes first, so that it is the reason a paused job shows: the one
+    # the person can do something about.
     # Recent activity is all the job looks at: no run while there was none.
-    "skill-extractor": [{
-        "type": "agent_activity",
-        "ignore_jobs": _other_maintenance_crons("skill-extractor"),
-    }],
+    "skill-extractor": [
+        {"type": "plans_in_review", "below": 3},
+        {
+            "type": "agent_activity",
+            "ignore_jobs": _other_maintenance_crons("skill-extractor"),
+        },
+    ],
     # The skills serve the agent's work, and what is out of date in them
     # shows there: no review while the agent has done nothing since the last
     # one.

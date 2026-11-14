@@ -49,7 +49,9 @@ def _cron_session_of(expr: str, job_id: str) -> tuple[str, list]:
     )
 
 
-def _sessions_of_jobs(column: str, job_ids: list[str]) -> tuple[str, list]:
+def _sessions_of_jobs(
+    column: str, job_ids: list[str], *, runs_by_id: bool = False,
+) -> tuple[str, list]:
     """SQL, with its parameters, that is true when *column* holds the id of a
     session of one of *job_ids*. *column* names its table, since the SQL
     refers to it from a subquery.
@@ -60,7 +62,17 @@ def _sessions_of_jobs(column: str, job_ids: list[str]) -> tuple[str, list]:
     a review loop which one of its cron sessions started
     (``review-loop:<loop id>``, the loop's ``session_id``). A workflow run
     can start neither, so there is nothing further down.
+
+    The run of a session is the one whose ``session_id`` is that session.
+    The column is emptied when the session is deleted, so a record that
+    keeps a session id for longer than the session lives passes
+    ``runs_by_id``: the run is then the one named in the id itself,
+    ``workflow:<run id>``.
     """
+    run_of_session = (
+        f"w.id = substr({column}, 10) AND {column} GLOB 'workflow:?*'"
+        if runs_by_id else f"w.session_id = {column}"
+    )
     direct, started, params, started_params = [], [], [], []
     for job_id in job_ids:
         sql, sql_params = _cron_session_of(column, job_id)
@@ -78,7 +90,7 @@ def _sessions_of_jobs(column: str, job_ids: list[str]) -> tuple[str, list]:
         started_params += [f"cron:{job_id}", *by_session_params, *by_loop_params]
     return (
         f"{' OR '.join(direct)} OR EXISTS ("
-        f"SELECT 1 FROM workflow_runs w WHERE w.session_id = {column} "
+        f"SELECT 1 FROM workflow_runs w WHERE {run_of_session} "
         f"AND ({' OR '.join(started)}))",
         params + started_params,
     )
@@ -373,6 +385,45 @@ class CronStore:
                 if await cursor.fetchone() is not None:
                     return True
         return False
+
+    async def count_cron_job_plans_in_review(self, job_id: str) -> int:
+        """How many of the job's proposals wait for review.
+
+        A proposal is a task with a plan in review (``pending``: proposed,
+        and neither approved nor declined). A plan is in review until
+        somebody decides it, however old it is and whatever became of its
+        task: closing a task decides no plan, and the Plans page goes on
+        listing it. So the count is what a person finds there to decide. A
+        plan whose task has no row is left out: no decision could be made
+        on it.
+
+        The proposal is the job's when one of the job's sessions
+        (:func:`_sessions_of_jobs`) proposed the plan in review, or a plan
+        that it replaces: a ``superseded`` plan of the task with no decided
+        plan after it. So a revision counts whichever session wrote it: a
+        person's chat, or the planner session that takes the revision of a
+        plan whose own session was deleted. A plan of the job that was
+        decided does not make a later plan for the same task the job's.
+
+        A plan keeps the id of the session that proposed it after that
+        session is deleted, so a workflow run is found by the run id in the
+        session id. A leg of a review loop is still known by the loop's link
+        to the session that started it, which goes with that session.
+        """
+        mine, params = _sessions_of_jobs("q.session_id", [job_id], runs_by_id=True)
+        async with self.db.execute(
+            "SELECT COUNT(DISTINCT p.task_id) FROM plans p "
+            "JOIN tasks t ON t.id = p.task_id "
+            "WHERE p.status = 'pending' AND EXISTS ("
+            "SELECT 1 FROM plans q WHERE q.task_id = p.task_id "
+            f"AND q.status IN ('pending', 'superseded') AND ({mine}) "
+            "AND NOT EXISTS (SELECT 1 FROM plans d WHERE d.task_id = q.task_id "
+            "AND d.version > q.version "
+            "AND d.status NOT IN ('pending', 'superseded')))",
+            tuple(params),
+        ) as cursor:
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
 
     async def get_latest_cron_session_id(self, job_id: str) -> str | None:
         """Return the most recently active session id for a cron job.
