@@ -242,7 +242,7 @@ A reload is always explicit. Two things cause one:
 | Cron jobs (`config/cron/*.yaml`) | ✅ |
 | Custom cron gate plugins (new, edited *and* deleted `.py` files) | ✅ the registry is rebuilt from the directory |
 | Cron file locations (`cron.jobs_file`, `system_file`, `gate_plugins_dir`) | ✅ re-read from the new config |
-| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. In hosted mode the GitHub filters, `pr_watch`, `inbox` and the repository watch (`sync.github_repos`) are published to the gateway again. **`sync.codex` and `sync.github.mode` are not among these**; see the restart table |
+| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.linear`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. In hosted mode the GitHub filters, `pr_watch`, `inbox` and the repository watch (`sync.github_repos`) are published to the gateway again, and so are the Linear settings and rules. **`sync.codex` and `sync.github.mode` are not among these**; see the restart table |
 | `cron.delivery_debounce_seconds` | ✅ read for each delivery |
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
 | Skills (`skills/`, and the platform skills in `skills/` in the config directory) | ✅ re-scanned |
@@ -300,6 +300,7 @@ reload cannot inspect, and are documented here only.
 | `mcp_gateway_url` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
 | `slack.mode`, `channels.hosted.*` | the hosted channels, the email channel included, their stream endpoint, and their token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
 | `sync.github.mode` | the GitHub sources (`github` and the repository watch, `github_repos`), and in hosted mode the stream endpoint and the consumers of the gateway's records, are chosen at startup. Until a restart the sources keep the mode they started with, and so does the `github_pr_activity` gate. The filters, `pr_watch`, `inbox` and `sync.github_repos` do follow a reload: in hosted mode the reload publishes them to the gateway again. To go back to `poll`, set `enabled: false` (and `sync.github_repos.enabled: false`) and reload first (see [sources.md](sources.md#hosted-github-source)) |
+| Turning `sync.linear.enabled` **on** | the consumer of the gateway's Linear records is built at startup, only while the source is on. Turning it **off** is hot: the reload tells the gateway that Nerve takes no Linear records. The events, the other settings and the rules follow a reload |
 | `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
 | `workflows.poll_interval_seconds`, `workflows.review_loop.reconcile_interval_seconds` | both loops were handed their interval when they started. Everything else under `workflows.*` is read per use (see the table above) |
@@ -1629,13 +1630,15 @@ notifications, and with `sync.github_repos` the repositories it watches; the
 `channels.hosted` settings above apply unchanged, and they are enough on their
 own: Slack need not be hosted too. See
 [Hosted GitHub source](sources.md#hosted-github-source) and
-[Hosted repository watch](sources.md#hosted-repository-watch). They also
+[Hosted repository watch](sources.md#hosted-repository-watch). With
+`sync.linear.enabled` the gateway also polls Linear with the agent's Linear
+connector (see [Linear](sources.md#linear-hosted)). They also
 carry the mail that members send to the agent: the usable `channels.hosted`
 settings give the email channel, which `email.enabled` switches on (see
 [Email](#email)).
 
-When Slack is hosted as well, its switch also holds GitHub and member mail
-back. Nerve reads the events of every hosted provider from one ordered
+When Slack is hosted as well, its switch also holds GitHub, Linear and member
+mail back. Nerve reads the events of every hosted provider from one ordered
 inbox, and it reads nothing while hosted Slack is switched off
 (`slack.enabled: false`): the GitHub records wait at the gateway until Slack
 is switched on again, and past the gateway's limit of stored records the
@@ -2193,6 +2196,28 @@ reload:
 | `sync.github_repos.include_drafts` | bool | `true` | `false`: a draft pull request is reported when it is marked ready for review (event `ready`), not when it is opened |
 | `sync.github_repos.updates` | bool | `false` | Also report a new head commit, ready for review, and the merge or close of each pull request the watch reported |
 | `sync.github_repos.deny_authors` | list | `[]` | Case-insensitive globs on the author's login, with the guardrail rules; what they match is never reported, releases included |
+
+**Linear-specific** (issue events of the agent's Linear connector in the MCP
+catalog; see [sources.md](sources.md#linear-hosted)). The channel gateway
+polls Linear with the connector's credential and scope and streams the
+records, so the source needs the `channels.hosted` settings (see
+[Hosted mode](#hosted-mode)) and a gateway that knows generic sources. The
+settings and the rules go to the gateway in the subscription, and the rules
+are applied here again. Everything follows a reload, except that switching
+the source on needs a restart:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `sync.linear.enabled` | bool | `false` | Take the Linear records from the channel gateway. Switching it on takes effect at the next restart; switching it off follows a reload |
+| `sync.linear.mode` | string | `hosted` | `hosted`, the only mode. `poll` and any other value refuse to load |
+| `sync.linear.events` | list | every event | What is reported: `issue_created`, `assigned`, `unassigned`, `delegated`, `state_changed`, `priority_changed`, `moved_in`, `commented`, `mentioned`. Case does not matter; an unknown event or an empty list refuses to load. With the default, an event that a later gateway adds is reported too |
+| `sync.linear.inbox` | bool | `true` | Also report the mentions of the credential's Linear user, which the gateway reads from its Linear inbox (`mentioned`, `via: inbox`). Only a credential that belongs to the agent (an agent API key, the agent's sign-in) has one; assignments, comments and the other changes come from the issues of the scope either way |
+| `sync.linear.include_bots` | bool | `false` | Also report the events of bots and integrations |
+| `sync.linear.drop_own_actions` | bool | `true` | Drop the events of the credential's Linear user. With a tenant API key they are kept and marked with `actor.credential_user: true` |
+| `sync.linear.rules` | list | `[]` | At most 16 rules, each a `path` (a JSON Pointer into the record data, such as `/issue/team/key`) and exactly one non-empty `allow` or `deny` list of globs. A rule the gateway would refuse refuses to load. The subscription is never sent without its rules: rules too large for the gateway's frame leave Linear out (`nerve doctor` reports it). See [sources.md](sources.md#rules-of-generic-hosted-sources) |
+| `sync.linear.schedule` | cron | `*/15 * * * *` | Fallback cadence of the drain, which also runs on every delivery |
+| `sync.linear.batch_size` | int | `50` | Max records per drain |
+| `sync.linear.condense` | bool | `false` | LLM-condense long records via `memory.fast_model` |
 
 `cron.delivery_debounce_seconds` (int, default `60`) spaces the job runs that a
 hosted delivery starts; a negative value reads as `0`, and a value above `600`

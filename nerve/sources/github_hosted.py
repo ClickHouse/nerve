@@ -31,16 +31,13 @@ Metadata values arrive as strings. ``actors`` and ``changes`` are lists, and
 
 from __future__ import annotations
 
-import logging
 from typing import TYPE_CHECKING, Any
 
-from nerve.sources.base import Source
-from nerve.sources.models import FetchResult, SourceRecord
+from nerve.sources.hosted import HostedSource, record_fields
+from nerve.sources.models import SourceRecord
 
 if TYPE_CHECKING:
     from nerve.db import Database
-
-logger = logging.getLogger(__name__)
 
 SOURCE_NAME = "github"
 # The buffer channel that the hosted source consumer writes for this source.
@@ -53,7 +50,7 @@ _LIST_KEYS = frozenset({"actors", "changes"})
 _FLAG_KEYS = frozenset({"unread"})
 
 
-class HostedGitHubSource(Source):
+class HostedGitHubSource(HostedSource):
     """A GitHub source over the hosted records buffer of its provider.
 
     *provider* is ``github`` (the default) or ``github_repos``: the buffer
@@ -61,77 +58,14 @@ class HostedGitHubSource(Source):
     """
 
     source_name = SOURCE_NAME
-    push_fed = True
 
     def __init__(self, db: Database, provider: str = SOURCE_NAME):
         if provider not in PROVIDERS:
             raise ValueError(f"no hosted GitHub source for provider {provider!r}")
-        self._db = db
-        self.source_name = provider
-        self._buffer = provider
+        super().__init__(db, provider)
 
-    async def fetch(self, cursor: str | None, limit: int = 100) -> FetchResult:
-        """Read buffered records past *cursor*, oldest first.
-
-        A failed read raises, so the runner reports it and its health checks
-        count it.
-        """
-        rows = await self._db.read_channel_observations(
-            self._buffer, after_id=self._position(cursor), limit=limit,
-        )
-        if not rows:
-            return FetchResult(records=[], next_cursor=cursor, has_more=False)
-
-        records: list[SourceRecord] = []
-        for row_id, payload in rows:
-            record = (
-                record_from_buffer(payload, source=self.source_name)
-                if isinstance(payload, dict) else None
-            )
-            if record is None:
-                logger.warning(
-                    "Hosted %s source: skipping unreadable buffer row %s", self.source_name, row_id,
-                )
-                continue
-            records.append(record)
-        # The cursor tracks what was scanned, so an unreadable row is passed
-        # and does not stop the drain.
-        return FetchResult(
-            records=records,
-            next_cursor=str(rows[-1][0]),
-            has_more=len(rows) >= limit,
-        )
-
-    async def has_undrained(self, cursor: str | None) -> bool:
-        """Whether a record waits in the buffer past *cursor*.
-
-        Normally none does: the cron service drains the buffer as records are
-        delivered. One row is enough to know; a failed read answers no, so a
-        forecast never fails for it.
-        """
-        try:
-            rows = await self._db.read_channel_observations(
-                self._buffer, after_id=self._position(cursor, quiet=True), limit=1,
-            )
-        except Exception:
-            logger.debug("Hosted %s source: checking the buffer failed", self.source_name, exc_info=True)
-            return False
-        return bool(rows)
-
-    def _position(self, cursor: str | None, *, quiet: bool = False) -> int:
-        """The buffer row ID that *cursor* names, or 0."""
-        if not cursor:
-            return 0
-        try:
-            return int(cursor)
-        except ValueError:
-            if not quiet:
-                logger.info(
-                    "Hosted %s source: cursor %.80r is not a buffer position (a cursor of "
-                    "the polling source); draining from the start of the buffer",
-                    self.source_name, cursor,
-                )
-            return 0
+    def record(self, payload: dict[str, Any]) -> SourceRecord | None:
+        return record_from_buffer(payload, source=self.source_name)
 
 
 def record_from_buffer(payload: dict[str, Any], source: str = SOURCE_NAME) -> SourceRecord | None:
@@ -139,21 +73,16 @@ def record_from_buffer(payload: dict[str, Any], source: str = SOURCE_NAME) -> So
 
     *source* is the provider whose buffer held it, and the record's source.
     """
-    record = payload.get("record")
-    if not isinstance(record, dict):
-        return None
-    record_id = record.get("id")
-    record_type = record.get("record_type")
-    summary = record.get("summary")
-    if not all(isinstance(value, str) and value for value in (record_id, record_type, summary)):
+    record = record_fields(payload)
+    if record is None:
         return None
     content = record.get("content")
     timestamp = record.get("timestamp")
     return SourceRecord(
-        id=record_id,
+        id=record["id"],
         source=source,
-        record_type=record_type,
-        summary=summary,
+        record_type=record["record_type"],
+        summary=record["summary"],
         content=content if isinstance(content, str) else "",
         timestamp=timestamp if isinstance(timestamp, str) else "",
         metadata=_metadata(record.get("metadata")),

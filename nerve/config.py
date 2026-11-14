@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+import unicodedata
 import uuid
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -23,6 +24,7 @@ from nerve.coerce import as_bool as _as_bool
 from nerve.coerce import coerced as _coerced
 from nerve.coerce import lenient_int as _lenient_int
 from nerve.inference_principal import direct_client_headers, has_custom_header_line
+from nerve.sources.source_json import pointer_tokens
 
 import yaml
 
@@ -2412,6 +2414,194 @@ class GitHubReposSyncConfig:
         )
 
 
+# How Linear issue events reach the inbox: the channel gateway polls Linear
+# with the agent's Linear connector and streams the records here. "poll", a
+# Linear source that this process runs, does not exist.
+LINEAR_SYNC_MODES: tuple[str, ...] = ("hosted",)
+LINEAR_POLL_MODE = "poll"
+# The Linear issue events that the channel gateway reports
+# (LinearSyncConfig.events): the names of the records' data.event.
+LINEAR_EVENTS: tuple[str, ...] = (
+    "issue_created", "assigned", "unassigned", "delegated", "state_changed",
+    "priority_changed", "moved_in", "commented", "mentioned",
+)
+# The rules of a generic hosted source (LinearSyncConfig.rules): at most this
+# many rules, each with at most this many patterns of at most this many
+# UTF-8 bytes. The channel gateway's bounds too.
+SOURCE_RULES_MAX = 16
+SOURCE_RULE_PATTERNS_MAX = 64
+SOURCE_RULE_PATTERN_MAX_BYTES = 256
+_SOURCE_RULE_KEYS = frozenset({"path", "allow", "deny"})
+
+
+@dataclass
+class SourceRuleConfig:
+    """One rule of a generic hosted source (``sync.linear.rules``).
+
+    ``path`` is a JSON Pointer into the record's data, such as
+    ``/actor/kind``, and exactly one of ``allow`` and ``deny`` holds glob
+    patterns; the other is empty. :func:`_source_rules` builds them from the
+    config and refuses a rule that the channel gateway would refuse, so this
+    has no ``from_dict`` of its own.
+    """
+    path: str = ""
+    allow: list[str] = field(default_factory=list)
+    deny: list[str] = field(default_factory=list)
+
+
+def _linear_mode(value: object) -> str:
+    """``sync.linear.mode``: ``hosted``, also when unset; anything else refuses to load."""
+    mode = _setting_str(value, "hosted").lower()
+    if mode == LINEAR_POLL_MODE:
+        raise ValueError(
+            "sync.linear.mode 'poll' is not available: Linear records come only from the "
+            "hosted channel gateway, so the mode is 'hosted'"
+        )
+    if mode not in LINEAR_SYNC_MODES:
+        raise ValueError(f"sync.linear.mode must be one of {LINEAR_SYNC_MODES}, got {mode!r}")
+    return mode
+
+
+def _linear_events(value: object) -> list[str]:
+    """``sync.linear.events``, checked against :data:`LINEAR_EVENTS`.
+
+    Unset (missing, null or blank) is every event. Case does not matter, an
+    event named twice counts once, and they are kept in the order of
+    :data:`LINEAR_EVENTS`. An unknown event, or an empty list, refuses to
+    load: switch the source off with ``enabled: false`` instead.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return list(LINEAR_EVENTS)
+    chosen: set[str] = set()
+    for entry in value if isinstance(value, (list, tuple)) else [value]:
+        name = str(entry or "").strip().lower()
+        if name not in LINEAR_EVENTS:
+            raise ValueError(f"sync.linear.events must be one or more of {LINEAR_EVENTS}, got {name!r}")
+        chosen.add(name)
+    if not chosen:
+        raise ValueError(f"sync.linear.events must be one or more of {LINEAR_EVENTS}, got none")
+    return [event for event in LINEAR_EVENTS if event in chosen]
+
+
+def _source_rules(value: object, setting: str) -> list[SourceRuleConfig]:
+    """The rules of a generic hosted source, such as ``sync.linear.rules``.
+
+    Each rule is a mapping with a ``path``, a JSON Pointer into the record's
+    data such as ``/actor/kind``, and exactly one non-empty ``allow`` or
+    ``deny`` list of glob patterns. Patterns are stripped and blank ones
+    dropped; a single value is a list of one. A rule that the channel gateway
+    would refuse refuses to load, so the gateway never closes the stream over
+    one.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{setting} must be a list of rules, each with a path and an allow or deny list")
+    if len(value) > SOURCE_RULES_MAX:
+        raise ValueError(f"{setting} must have at most {SOURCE_RULES_MAX} rules, got {len(value)}")
+    rules: list[SourceRuleConfig] = []
+    for index, entry in enumerate(value):
+        where = f"{setting}[{index}]"
+        if not isinstance(entry, dict):
+            raise ValueError(f"{where} must be a mapping with a path and an allow or deny list")
+        unknown = sorted(str(key) for key in set(entry) - _SOURCE_RULE_KEYS)
+        if unknown:
+            raise ValueError(f"{where} has unknown keys {unknown}; a rule has path, and allow or deny")
+        path = entry.get("path")
+        if not isinstance(path, str) or pointer_tokens(path) is None:
+            raise ValueError(
+                f"{where}.path must be a JSON Pointer into the record data, such as /actor/kind "
+                "(it starts with '/', has 1 to 8 parts and at most 256 bytes without control "
+                f"characters, and writes '~' as '~0' and '/' as '~1'), got {path!r}"
+            )
+        lists: dict[str, list[str]] = {}
+        for key in ("allow", "deny"):
+            patterns = _source_rule_patterns(entry.get(key), f"{where}.{key}")
+            if patterns:
+                lists[key] = patterns
+        if len(lists) != 1:
+            raise ValueError(f"{where} needs exactly one non-empty list: allow or deny")
+        rules.append(SourceRuleConfig(path=path, **lists))
+    return rules
+
+
+def _source_rule_patterns(value: object, where: str) -> list[str]:
+    """The patterns of one rule list, stripped, without the blank ones (none when unset)."""
+    if value is None:
+        return []
+    entries = value if isinstance(value, (list, tuple)) else [value]
+    patterns = [text for text in (str(entry).strip() for entry in entries if entry is not None) if text]
+    if len(patterns) > SOURCE_RULE_PATTERNS_MAX:
+        raise ValueError(f"{where} must have at most {SOURCE_RULE_PATTERNS_MAX} patterns, got {len(patterns)}")
+    for pattern in patterns:
+        if (
+            len(pattern.encode("utf-8", "replace")) > SOURCE_RULE_PATTERN_MAX_BYTES
+            or any(unicodedata.category(character) in ("Cc", "Cs") for character in pattern)
+        ):
+            raise ValueError(
+                f"{where} patterns must have at most {SOURCE_RULE_PATTERN_MAX_BYTES} bytes and no "
+                f"control characters, got {pattern[:40]!r}"
+            )
+    return patterns
+
+
+@dataclass
+class LinearSyncConfig:
+    """Config for the Linear source: issue events of the agent's Linear connector.
+
+    The channel gateway polls Linear for the agent with the credential of the
+    agent's Linear connector in the MCP catalog, and only within the
+    connector's project scope, then streams the records to Nerve (``mode:
+    hosted``, the only mode). Each record names the catalog server, whose
+    Linear tools act on it. The settings below go to the gateway as the
+    provider settings of the subscription; the rules go too, and the inbox
+    guardrail applies them again. All of it follows a reload, but switching
+    the source on needs a restart. See docs/sources.md "Linear".
+    """
+    enabled: bool = False
+    # "hosted" only, also when unset. "poll" and any other value refuse to
+    # load. Restart-only.
+    mode: str = "hosted"
+    # The events to report (LINEAR_EVENTS); every one by default. An unknown
+    # event or an empty list refuses to load.
+    events: list[str] = field(default_factory=lambda: list(LINEAR_EVENTS))
+    # Also report the mentions of the credential's Linear user, which the
+    # gateway reads from its Linear inbox (event mentioned, via inbox). Only a
+    # credential of the agent's own (an agent API key, the agent's sign-in)
+    # has an inbox; a credential of the tenant ignores it. Assignments,
+    # comments and the other changes come from the issues of the scope.
+    inbox: bool = True
+    # Also report the events of bots and integrations.
+    include_bots: bool = False
+    # Drop the events of the credential's own Linear user. A tenant API key
+    # belongs to a person, so its events are kept and marked
+    # (actor.credential_user) whatever this says.
+    drop_own_actions: bool = True
+    # Allow/deny glob lists on JSON Pointer paths into the record data, such
+    # as {"path": "/issue/team/key", "allow": ["ENG*"]}. At most
+    # SOURCE_RULES_MAX rules; a rule the gateway would refuse refuses to load.
+    rules: list[SourceRuleConfig] = field(default_factory=list)
+    schedule: str = "*/15 * * * *"
+    condense: bool = False
+    batch_size: int = 50
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> LinearSyncConfig:
+        return cls(
+            enabled=d.get("enabled", False),
+            mode=_linear_mode(d.get("mode")),
+            events=_linear_events(d.get("events")),
+            inbox=d.get("inbox", True),
+            include_bots=d.get("include_bots", False),
+            drop_own_actions=d.get("drop_own_actions", True),
+            rules=_source_rules(d.get("rules"), "sync.linear.rules"),
+            schedule=d.get("schedule", "*/15 * * * *"),
+            condense=d.get("condense", False),
+            batch_size=d.get("batch_size", 50),
+        )
+
+
 @dataclass
 class CodexOriginConfig:
     """A single Codex thread sync origin.
@@ -2514,6 +2704,7 @@ class SyncConfig:
     github: GitHubSyncConfig = field(default_factory=GitHubSyncConfig)
     github_events: GitHubEventsSyncConfig = field(default_factory=GitHubEventsSyncConfig)
     github_repos: GitHubReposSyncConfig = field(default_factory=GitHubReposSyncConfig)
+    linear: LinearSyncConfig = field(default_factory=LinearSyncConfig)
     codex: CodexSyncConfig = field(default_factory=CodexSyncConfig)
     message_ttl_days: int = 7           # How long to keep source messages in the inbox
     consumer_cursor_ttl_days: int = 2   # Consumer cursors expire after N days of inactivity
@@ -2528,6 +2719,7 @@ class SyncConfig:
             github=GitHubSyncConfig.from_dict(d.get("github", {})),
             github_events=GitHubEventsSyncConfig.from_dict(d.get("github_events", {})),
             github_repos=GitHubReposSyncConfig.from_dict(d.get("github_repos", {})),
+            linear=LinearSyncConfig.from_dict(d.get("linear", {})),
             codex=CodexSyncConfig.from_dict(d.get("codex", {})),
             message_ttl_days=d.get("message_ttl_days", 7),
             consumer_cursor_ttl_days=d.get("consumer_cursor_ttl_days", 2),

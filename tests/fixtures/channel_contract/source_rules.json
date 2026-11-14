@@ -1,0 +1,548 @@
+{
+  "data": {
+    "event": "assigned",
+    "actor": {
+      "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+      "name": "Alice Example",
+      "kind": "user",
+      "credential_user": false
+    },
+    "issue": {
+      "identifier": "ENG-12",
+      "team": {
+        "key": "ENG"
+      },
+      "priority": 2,
+      "estimate": 1.5,
+      "size": 2.0,
+      "labels": [
+        "bug",
+        "Frontend",
+        7,
+        true,
+        null,
+        [
+          "nested"
+        ],
+        {
+          "name": "object"
+        }
+      ],
+      "watchers": [],
+      "assignee": null
+    },
+    "changes": [
+      {
+        "field": "assignee",
+        "from": null,
+        "to": "8d1e3f5a-7b9c-4d2e-a6f8-1c3e5a7b9d20"
+      }
+    ],
+    "a/b": "slash",
+    "m~n": "tilde",
+    "": "empty name"
+  },
+  "cases": [
+    {
+      "name": "no rules keep every record",
+      "rules": [],
+      "keep": true
+    },
+    {
+      "name": "a deny pattern that matches drops",
+      "rules": [
+        {
+          "path": "/actor/kind",
+          "deny": [
+            "bot",
+            "user"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "a deny list without a match keeps",
+      "rules": [
+        {
+          "path": "/actor/kind",
+          "deny": [
+            "bot",
+            "integration"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "an allow pattern matches without case",
+      "rules": [
+        {
+          "path": "/issue/team/key",
+          "allow": [
+            "eng*"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "an upper-case allow pattern matches",
+      "rules": [
+        {
+          "path": "/issue/team/key",
+          "allow": [
+            "ENG*"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "an allow list without a match drops",
+      "rules": [
+        {
+          "path": "/issue/team/key",
+          "allow": [
+            "OPS*"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "a question mark matches one character",
+      "rules": [
+        {
+          "path": "/issue/identifier",
+          "allow": [
+            "eng-1?"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "a deny rule on a missing path keeps",
+      "rules": [
+        {
+          "path": "/issue/project/name",
+          "deny": [
+            "*"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "an allow rule on a missing path drops",
+      "rules": [
+        {
+          "path": "/issue/project/name",
+          "allow": [
+            "*"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "an integer matches its canonical text",
+      "rules": [
+        {
+          "path": "/issue/priority",
+          "allow": [
+            "1",
+            "2"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "a fraction matches its canonical text",
+      "rules": [
+        {
+          "path": "/issue/estimate",
+          "allow": [
+            "1.5"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "a number written as 2.0 matches 2",
+      "rules": [
+        {
+          "path": "/issue/size",
+          "allow": [
+            "2"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "a number written as 2.0 does not match 2.0",
+      "rules": [
+        {
+          "path": "/issue/size",
+          "allow": [
+            "2.0"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "false matches false",
+      "rules": [
+        {
+          "path": "/actor/credential_user",
+          "allow": [
+            "false"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "a deny of true keeps false",
+      "rules": [
+        {
+          "path": "/actor/credential_user",
+          "deny": [
+            "true"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "null matches null",
+      "rules": [
+        {
+          "path": "/issue/assignee",
+          "deny": [
+            "null"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "any element of an array matches",
+      "rules": [
+        {
+          "path": "/issue/labels",
+          "deny": [
+            "frontend"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "a scalar element of an array matches its canonical text",
+      "rules": [
+        {
+          "path": "/issue/labels",
+          "allow": [
+            "7"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "true as an element of an array matches",
+      "rules": [
+        {
+          "path": "/issue/labels",
+          "allow": [
+            "true"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "null as an element of an array matches",
+      "rules": [
+        {
+          "path": "/issue/labels",
+          "allow": [
+            "null"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "an array in an array gives no value",
+      "rules": [
+        {
+          "path": "/issue/labels",
+          "allow": [
+            "nested"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "an object in an array gives no value",
+      "rules": [
+        {
+          "path": "/issue/labels",
+          "allow": [
+            "object"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "an array index selects one element",
+      "rules": [
+        {
+          "path": "/issue/labels/0",
+          "allow": [
+            "bug"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "an index with a leading zero names nothing",
+      "rules": [
+        {
+          "path": "/issue/labels/01",
+          "allow": [
+            "bug"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "an index past the end names nothing",
+      "rules": [
+        {
+          "path": "/issue/labels/7",
+          "allow": [
+            "*"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "the index - names nothing",
+      "rules": [
+        {
+          "path": "/issue/labels/-",
+          "allow": [
+            "*"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "an object gives no value to an allow rule",
+      "rules": [
+        {
+          "path": "/issue/team",
+          "allow": [
+            "*"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "an object gives no value to a deny rule",
+      "rules": [
+        {
+          "path": "/issue/team",
+          "deny": [
+            "*"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "an empty array gives no value to an allow rule",
+      "rules": [
+        {
+          "path": "/issue/watchers",
+          "allow": [
+            "*"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "an empty array gives no value to a deny rule",
+      "rules": [
+        {
+          "path": "/issue/watchers",
+          "deny": [
+            "*"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "an array of objects gives no value",
+      "rules": [
+        {
+          "path": "/changes",
+          "allow": [
+            "*"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "a path through an array of objects",
+      "rules": [
+        {
+          "path": "/changes/0/field",
+          "allow": [
+            "assignee"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "a path through a string names nothing",
+      "rules": [
+        {
+          "path": "/event/name",
+          "allow": [
+            "*"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "~1 names a slash",
+      "rules": [
+        {
+          "path": "/a~1b",
+          "allow": [
+            "slash"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "~0 names a tilde",
+      "rules": [
+        {
+          "path": "/m~0n",
+          "allow": [
+            "tilde"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "the path / names the empty member name",
+      "rules": [
+        {
+          "path": "/",
+          "allow": [
+            "empty name"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "a star matches every string",
+      "rules": [
+        {
+          "path": "/event",
+          "allow": [
+            "*"
+          ]
+        }
+      ],
+      "keep": true
+    },
+    {
+      "name": "every rule must keep the record",
+      "rules": [
+        {
+          "path": "/issue/team/key",
+          "allow": [
+            "ENG"
+          ]
+        },
+        {
+          "path": "/actor/kind",
+          "deny": [
+            "user"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "two allow rules on one path both apply",
+      "rules": [
+        {
+          "path": "/issue/team/key",
+          "allow": [
+            "ENG"
+          ]
+        },
+        {
+          "path": "/issue/team/key",
+          "allow": [
+            "OPS"
+          ]
+        }
+      ],
+      "keep": false
+    },
+    {
+      "name": "every rule keeps the record",
+      "rules": [
+        {
+          "path": "/issue/team/key",
+          "allow": [
+            "ENG"
+          ]
+        },
+        {
+          "path": "/actor/kind",
+          "deny": [
+            "bot"
+          ]
+        },
+        {
+          "path": "/event",
+          "allow": [
+            "assigned",
+            "unassigned"
+          ]
+        }
+      ],
+      "keep": true
+    }
+  ]
+}

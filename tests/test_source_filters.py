@@ -2,19 +2,24 @@
 
 Covers the pure matching logic of :class:`FieldRule` / :class:`InboxFilter`
 plus an end-to-end runner test proving dropped records never reach the inbox
-while the source cursor still advances.
+while the source cursor still advances, and :class:`DataRule`, the rules of a
+generic hosted source, against the channel contract's rule vectors.
 """
 
 from __future__ import annotations
+
+import json
+from pathlib import Path
 
 import pytest
 
 from nerve.config import GitHubSyncConfig
 from nerve.sources.base import Source
-from nerve.sources.filters import FieldRule, InboxFilter
+from nerve.sources.filters import DataRule, FieldRule, InboxFilter
 from nerve.sources.github import github_inbox_filter
 from nerve.sources.models import FetchResult, SourceRecord
 from nerve.sources.runner import SourceRunner
+from nerve.sources.source_json import record_metadata
 
 
 def _rec(repo: str = "owner/repo", **meta) -> SourceRecord:
@@ -358,3 +363,128 @@ def test_the_repo_rule_still_applies_to_a_pull_request_record(settings):
     rejected_by = flt.rejects(_github("github_pr_activity"))
 
     assert rejected_by is not None and rejected_by.field == "repo_name"
+
+
+# ---------------------------------------------------------------------------
+# DataRule: the rules of a generic hosted source, on JSON Pointers into the
+# record's data (its metadata), with the semantics of the channel contract
+# ---------------------------------------------------------------------------
+
+# A byte-exact copy of the contract's rule vectors (testdata/source_rules.json);
+# test_channel_contract_generic pins its bytes.
+RULE_VECTORS = json.loads(
+    (Path(__file__).parent / "fixtures" / "channel_contract" / "source_rules.json").read_text(encoding="utf-8")
+)
+
+
+def _data_rules(rules: list[dict]) -> list[DataRule]:
+    """The guardrail rules of subscription rules in the contract's shape."""
+    return [DataRule(rule["path"], tuple(rule.get("allow", ())), tuple(rule.get("deny", ()))) for rule in rules]
+
+
+def _data_record(data: dict) -> SourceRecord:
+    """A stored generic record: its metadata holds its schema and *data*."""
+    return SourceRecord(
+        id="note:1", source="example", record_type="example_note", summary="[NOTE-7] Plan",
+        content="", timestamp="2026-11-10T08:00:00Z", metadata=record_metadata("example.note/1", data),
+    )
+
+
+@pytest.mark.parametrize("case", RULE_VECTORS["cases"], ids=lambda case: case["name"])
+def test_the_rule_vectors_shared_with_the_gateway(case):
+    record = _data_record(RULE_VECTORS["data"])
+
+    assert InboxFilter(rules=_data_rules(case["rules"])).passes(record) is case["keep"]
+
+
+def test_the_values_at_a_path():
+    record = _data_record(RULE_VECTORS["data"])
+
+    assert DataRule("/issue/labels", deny=("x",)).values(record) == ["bug", "Frontend", "7", "true", "null"]
+    assert DataRule("/issue/size", deny=("x",)).values(record) == ["2"]
+    assert DataRule("/issue/team", deny=("x",)).values(record) == []
+    assert DataRule("/issue/missing", deny=("x",)).values(record) == []
+    # An index names an element only in decimal without a leading zero.
+    assert DataRule("/issue/labels/1", deny=("x",)).values(record) == ["Frontend"]
+    assert DataRule("/issue/labels/01", deny=("x",)).values(record) == []
+    assert DataRule("/issue/labels/-", deny=("x",)).values(record) == []
+    assert DataRule("not a pointer", deny=("x",)).values(record) == []
+
+
+def test_a_data_rule_reads_the_data_of_a_generic_record_only():
+    """The schema next to the data is not data, and other metadata has no data."""
+    record = _data_record({"event": "created"})
+    flat = SourceRecord(**{**record.__dict__, "metadata": {"event": "created"}})
+
+    assert DataRule("/event", allow=("created",)).passes(record) is True
+    assert DataRule("/schema", deny=("*",)).passes(record) is True
+    assert DataRule("/event", allow=("created",)).passes(flat) is False
+    assert DataRule("/event", deny=("created",)).passes(flat) is True
+
+
+def test_a_data_rule_without_patterns_is_inactive_and_an_invalid_path_names_nothing():
+    record = _data_record(RULE_VECTORS["data"])
+
+    assert DataRule("/actor/kind").active is False
+    assert InboxFilter(rules=[DataRule("/actor/kind")]).active is False
+    assert DataRule("actor/kind", deny=("user",)).passes(record) is True
+    assert DataRule("actor/kind", allow=("user",)).passes(record) is False
+
+
+def test_rejects_names_the_path_and_the_list_of_the_data_rule():
+    record = _data_record(RULE_VECTORS["data"])
+    flt = InboxFilter(rules=_data_rules([
+        {"path": "/issue/team/key", "allow": ["ENG*"]},
+        {"path": "/actor/kind", "deny": ["user"]},
+    ]))
+
+    rule = flt.rejects(record)
+
+    assert (rule.field, rule.fired_list(record)) == ("/actor/kind", "deny")
+    assert InboxFilter(rules=_data_rules([{"path": "/issue/team/key", "allow": ["OPS"]}])).rejects(
+        record,
+    ).fired_list(record) == "allow"
+
+
+def test_a_field_rule_names_the_list_that_fired():
+    rule = FieldRule(field="repo_name", allow=["trusted/*"], deny=["evil/*"])
+
+    assert rule.fired_list(_rec("evil/repo")) == "deny"
+    assert rule.fired_list(_rec("other/repo")) == "allow"
+
+
+class _DataSource(_FakeSource):
+    source_name = "example"
+
+
+@pytest.mark.asyncio
+async def test_runner_logs_the_rule_of_a_drop_and_nothing_of_the_record(db, caplog):
+    kept = _data_record({"actor": {"kind": "user"}})
+    bot = SourceRecord(**{
+        **kept.__dict__, "id": "note:2", "summary": "[NOTE-8] Secret plan",
+        "metadata": record_metadata("example.note/1", {"actor": {"kind": "bot", "name": "Hidden Bot"}}),
+    })
+    flt = InboxFilter(rules=_data_rules([{"path": "/actor/kind", "deny": ["bot"]}]))
+    runner = SourceRunner(source=_DataSource([kept, bot]), db=db, inbox_filter=flt)
+
+    with caplog.at_level("INFO", logger="nerve.sources.runner"):
+        result = await runner.run()
+
+    assert (result.records_ingested, result.records_dropped) == (1, 1)
+    assert await db.get_source_message("example", "note:2") is None
+    assert "dropped note:2 by the deny list of the rule on /actor/kind" in caplog.text
+    assert "guardrail dropped 1/2 records" in caplog.text
+    assert not any(text in caplog.text for text in ("Secret plan", "Hidden Bot", "'bot'"))
+
+
+@pytest.mark.asyncio
+async def test_runner_logs_no_summary_or_value_of_a_github_drop(db, caplog):
+    records = [_rec("evil/repo", reason="a private title")]
+    flt = InboxFilter.from_field("repo_name", allow=["trusted/*"], deny=[])
+    runner = SourceRunner(source=_FakeSource(records), db=db, inbox_filter=flt)
+
+    with caplog.at_level("INFO", logger="nerve.sources.runner"):
+        await runner.run()
+
+    assert "by the allow list of the rule on repo_name" in caplog.text
+    assert "evil/repo" not in caplog.text.replace("id-evil/repo", "")

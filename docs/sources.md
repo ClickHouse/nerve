@@ -437,6 +437,110 @@ machine for them.
   platform that parks the machine does not wake it for that run. The mode
   follows `sync.github.mode`, which is restart-only.
 
+### Linear (hosted)
+- **Adapter:** `nerve/sources/hosted.py` (`HostedSource`). It drains the records that the channel gateway delivered. This process makes no Linear calls and needs no Linear key.
+
+With `sync.linear.enabled: true`, the shared channel gateway (the one of
+[hosted Slack](config.md#hosted-mode) and the
+[hosted GitHub source](#hosted-github-source), set up with the same
+`channels.hosted` settings) polls Linear for the agent and streams the records
+to Nerve. It uses the agent's Linear connector in the MCP catalog: its
+credential, its project scope, and its GitHub filter. A record holds only what
+the connector would show the agent. The gateway keeps the records until Nerve
+reads them, also while Nerve is not running.
+
+- **The connector is the switch.** The gateway polls Linear for an agent only
+  while the agent has a Linear connector in the MCP catalog and Nerve
+  subscribes, which it does while `enabled` is true. An agent with more than
+  one Linear connector gets the records of each one.
+- **What arrives:** `linear_issue_event` records, one for each event:
+  `issue_created`, `assigned`, `unassigned`, `delegated`, `state_changed`,
+  `priority_changed`, `moved_in` (moved into a project of the scope),
+  `commented` and `mentioned`. The summary is one line, such as
+  `[ENG-12] Alice assigned you: Fix the login page`, and the content is
+  Markdown for the agent. Assignments, comments and the other changes come
+  from the issues of the scope. `mentioned` comes from the Linear inbox of
+  the credential's Linear user: only a credential that belongs to the agent
+  (an agent API key, or the agent's sign-in) has one, and the gateway reads
+  only the mentions from it. An item that is too large for the gateway to
+  read is left out, with no record.
+- **The record keeps its schema and its data.** The gateway sends the data of
+  a record as a JSON object of the record schema `linear.issue_event/1`, and
+  Nerve stores both as the record's metadata, `{"schema": ..., "data": ...}`,
+  with every member of the data, also the members that this release does not
+  know. The poll tools show them to the agent as a `Schema:` line and a
+  `Data:` line of JSON. The members of the data (optional members are left
+  out, never `null`):
+  - `event`, and `via`: `watch` for an issue of the scope, `inbox` for a
+    mention from the Linear inbox (only with `mentioned`);
+  - `server`: the `id` of the Linear server in the MCP catalog (its catalog
+    server ID, such as `linear`) and its `name`;
+  - `issue`: `id`, `identifier`, `title`, `url`, `team` (`key`), `project`
+    (`id`, `name`), `state` (`name`, `type`), `priority` (0 to 4),
+    `assignee` and `delegate` (`id`, `name`);
+  - `comment`: `id`, `url`, `body` (at most 4,000 characters; `truncated` is
+    true when it was cut), `parent_id`;
+  - `actor`: `id`, `name`, `kind` (`user`, `app`, `bot`, `integration`,
+    `external`, or `system` for a change without an actor), and
+    `credential_user`;
+  - `changes`: a list of `{field, from, to}`, where `from` and `to` are a
+    name or a priority.
+- **One record for each event.** The record ID is
+  `<server>:<event>:<entity>`. A changed event, such as a comment that was
+  edited, keeps it, so the new version replaces the stored one and is unread
+  again.
+- **Act on a record with the Linear tools of the server that it names**
+  (`server.id`). That MCP catalog server reaches the same issues, with the
+  same scope.
+- **The settings go to the gateway.** `events`, `inbox`, `include_bots` and
+  `drop_own_actions` go in the subscription as the provider settings. Only the
+  values that differ from the defaults are sent, so with the default `events`
+  an event that a later gateway adds arrives too. `inbox` switches the
+  mentions of the credential's Linear user on or off; it has an effect only
+  with a credential that belongs to the agent. `drop_own_actions` drops the
+  events of the credential's Linear user. A tenant API key belongs to a
+  person, so the events of that person are kept and marked with
+  `actor.credential_user: true`, whatever the setting is. To drop them, add the
+  rule `{path: /actor/credential_user, deny: ["true"]}`.
+- **The rules go to the gateway too.** The gateway applies `rules` before it
+  stores a record, and the guardrail here applies them again; see
+  [Rules of generic hosted sources](#rules-of-generic-hosted-sources). A rule
+  that the gateway would refuse refuses to load. The subscription is never
+  sent without its rules: if the subscriptions frame with the rules is larger
+  than the gateway takes, Nerve leaves the Linear subscription out, logs an
+  error, and the gateway stores no Linear records until the rules are shorter.
+  `nerve doctor` reports this as an error.
+- **The gateway must know generic sources.** A gateway that predates them
+  closes a stream whose subscriptions carry `settings`, `schemas` or `rules`,
+  hosted Slack traffic included. Update the gateway before you switch Linear on.
+- **Same runner model as hosted GitHub.** The records go to a local buffer,
+  and the `source:linear` runner drains it as soon as records are delivered.
+  Its scheduled run is a fallback that is not the instance's next scheduled
+  task while nothing waits. Consumer cursors, `messages` gates, `condense` and
+  the Sources page work as for the other sources; the Sources page shows each
+  record with a Linear card.
+- **A switched-off hosted Slack holds Linear back**, as it holds hosted GitHub
+  back (see [Hosted GitHub source](#hosted-github-source)).
+- **Hosted only.** `mode` is `hosted`, also when it is not set. `mode: poll`
+  refuses to load: this release has no Linear source that polls from this
+  process.
+- **Switching it on needs a restart.** The consumer of the gateway's Linear
+  records is built at startup, so `enabled: true` takes effect at the next
+  restart. Switching it off follows a reload: Nerve tells the gateway that it
+  takes no Linear records. The other settings follow a reload.
+
+```yaml
+sync:
+  linear:
+    enabled: true
+    events: [assigned, commented, mentioned]   # default: every event
+    rules:
+      - path: /issue/team/key
+        allow: ["ENG*"]                         # applied by the gateway and again here
+```
+
+`nerve doctor` reports the source and checks the hosted settings.
+
 ### Telegram account sync
 - **Adapter:** `nerve/sources/telegram.py` — uses Telethon (user account API).
   This is the pull sync for your own Telegram account, and is separate from the
@@ -677,6 +781,18 @@ sync:
     deny_authors: []              # Globs on the author's login; never reported
     batch_size: 50
     condense: false
+
+  linear:
+    enabled: false                # The channel gateway polls Linear with the agent's Linear connector
+    mode: hosted                  # The only mode; poll refuses to load
+    events: [issue_created, assigned, unassigned, delegated, state_changed, priority_changed, moved_in, commented, mentioned]
+    inbox: true                   # Also the mentions of the credential's Linear user (agent credentials only)
+    include_bots: false           # Also the events of bots and integrations
+    drop_own_actions: true        # Drop the events of the credential's Linear user (not with a tenant API key)
+    rules: []                     # Allow/deny globs on JSON Pointers into the data. See "Rules of generic hosted sources"
+    schedule: "*/15 * * * *"      # Fallback cadence of the drain
+    batch_size: 50
+    condense: false
 ```
 
 ### Config Fields
@@ -890,11 +1006,13 @@ drop them; `deny_repos` and an `allow_repos` list that the repo does not match d
 ### Debugging drops
 
 Dropped records are never persisted, so the run summary count is backed by per-record log
-lines naming the rule that fired:
+lines naming the rule that fired. They name the record ID, the rule's field and the list
+that dropped it, and never a value or the summary of the dropped record, so what the
+guardrail keeps from the inbox does not reach the log either:
 
 ```
-Source github: guardrail dropped 3/5 records (e.g. '[owner/repo] CI workflow run failed …')
-Source github: dropped 19542… on ci_branch='main' — [owner/repo] CI workflow run failed …
+Source github: guardrail dropped 3/5 records
+Source github: dropped 19542… by the deny list of the rule on ci_branch
 ```
 
 ### Drop hook
@@ -975,6 +1093,49 @@ Rules a hook can rely on:
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `github.drop_hook` | list | `[]` | argv of a command that gets each dropped record as a JSON line on stdin. Passed as is: no shell, nothing stripped. Empty = off |
+
+### Rules of generic hosted sources
+
+A generic hosted source, such as [Linear](#linear-hosted), stores the data of
+each record (a JSON object) as the record's metadata. Its rules
+(`sync.linear.rules`) name a value in that data with a JSON Pointer (RFC 6901)
+and match it with an `allow` or a `deny` list of glob patterns. The channel
+gateway applies the same rules before it stores a record, so the two sides
+drop the same records, and the guardrail here (`DataRule` in
+`nerve/sources/filters.py`) applies them again.
+
+```yaml
+sync:
+  linear:
+    rules:
+      - path: /issue/team/key
+        allow: ["ENG*", "OPS"]
+      - path: /actor/kind
+        deny: [bot, integration]
+```
+
+- **The path** starts with `/`, has 1 to 8 parts and at most 256 bytes, and
+  writes `~` as `~0` and `/` as `~1`. A part names the member of an object, or
+  the element of an array at its index (`/changes/0/field`).
+- **The values at the path:** a string as it is; a number as its shortest
+  JSON text (`2` for `2.0`, `1.5`); `true`, `false` and `null` as those words;
+  and each such element of an array. An object, an array or an object in an
+  array, an empty array, and a path that names nothing give no value.
+- **Each rule has exactly one non-empty list**, `allow` or `deny`, of at most
+  64 patterns of at most 256 bytes without control characters. Patterns match
+  as the other guardrail patterns do: case-insensitive shell globs on the
+  stripped value. A `deny` rule drops a record when one of its values matches.
+  An `allow` rule drops a record when none of its values matches, also a record
+  without a value at its path. A record stays only when every rule keeps it.
+- **At most 16 rules.** A rule outside these bounds, or with unknown keys,
+  refuses to load, so the gateway never closes the stream over one. A
+  subscription is never sent without its rules (see [Linear](#linear-hosted)).
+- **The paths are into the data.** The record's schema, which Nerve keeps next
+  to the data, is not part of it.
+
+The runner's drop log names the record ID, the path of the rule that dropped
+it, and whether its `allow` or its `deny` list did, and nothing of the record's
+data.
 
 ### Extending to other sources
 
@@ -1188,7 +1349,11 @@ web/src/components/Sources/
     ├── index.ts                    ← Registry: source name → renderer type mapping
     ├── MarkdownRenderer.tsx        ← Default: ReactMarkdown with prose styles
     ├── EmailRenderer.tsx           ← Gmail: sandboxed iframe for HTML + text toggle
-    └── GitHubRenderer.tsx          ← GitHub: repo/PR header card + markdown body
+    ├── GitHubRenderer.tsx          ← GitHub: repo/PR header card + markdown body
+    ├── LinearRenderer.tsx          ← Records of schema linear.issue_event/1: issue card + markdown body + the record data
+    ├── DataRenderer.tsx            ← A record of another schema: markdown body + the record data
+    ├── RecordData.tsx              ← The record data as an expandable JSON view, with its schema
+    └── storedRecord.ts             ← The schema and the data of a stored generic record (metadata {schema, data})
 ```
 
 ### Steps
@@ -1227,7 +1392,9 @@ export function MyRenderer({ content, metadata, summary }: Props) {
 | `nerve/sources/models.py` | `SourceRecord`, `FetchResult`, `IngestResult` dataclasses |
 | `nerve/sources/base.py` | `Source` abstract base class |
 | `nerve/sources/runner.py` | `SourceRunner` — pure ingestion pipeline (fetch → preprocess → guardrail → persist → condense → drop hook → advance) |
-| `nerve/sources/filters.py` | `InboxFilter` / `FieldRule` — declarative allow/deny guardrails applied before persist |
+| `nerve/sources/filters.py` | `InboxFilter` / `FieldRule` / `DataRule`: declarative allow/deny guardrails applied before persist |
+| `nerve/sources/source_json.py` | The JSON data of generic hosted sources: checks, canonical form (RFC 8785), JSON Pointers |
+| `nerve/sources/hosted.py` | `HostedSource`: drain the records of a generic hosted source (Linear) that the channel gateway delivered |
 | `nerve/sources/processor.py` | Legacy agent prompt building (unused by runner, may be used by tools) |
 | `nerve/sources/registry.py` | Config → `list[SourceRunner]` factory |
 | `nerve/sources/telegram.py` | Telegram adapter (Telethon) |
@@ -1237,7 +1404,7 @@ export function MyRenderer({ content, metadata, summary }: Props) {
 | `nerve/sources/github_events.py` | GitHub user events adapter (gh CLI) |
 | `nerve/sources/github_repos.py` | GitHub repository watch adapter (gh CLI), record builder, its guardrail |
 | `nerve/agent/tools.py` | Consumer tools: `list_sources`, `poll_source`, `read_source` |
-| `web/src/components/Sources/` | Source message renderers (email, GitHub, default markdown) |
+| `web/src/components/Sources/` | Source message renderers (email, GitHub, Linear, record data, default markdown) |
 
 ### Cursor Design
 

@@ -946,8 +946,9 @@ See [sources.md](sources.md) for full documentation.
 
 ### Runs on delivery
 
-A hosted source — GitHub with `sync.github.mode: hosted`, see
-[Hosted GitHub source](sources.md#hosted-github-source) — does not wait for its
+A hosted source (GitHub with `sync.github.mode: hosted`, see
+[Hosted GitHub source](sources.md#hosted-github-source), or Linear, see
+[Linear (hosted)](sources.md#linear-hosted)) does not wait for its
 schedule. When the channel gateway delivers records, the source's runner runs
 at once, after any run of it already in progress (which may have fetched
 before the records arrived); deliveries during that drain make it run once
