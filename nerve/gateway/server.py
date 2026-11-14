@@ -460,8 +460,16 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001 — the wizard's scratch file must never stop a boot
         logger.warning("Setup state could not be retired at boot: %s", e)
 
-    # Clear CLAUDECODE env var to prevent nested session detection by claude-agent-sdk
-    os.environ.pop("CLAUDECODE", None)
+    # A server started from a session's shell must not pass that session's
+    # identity (CLAUDECODE, NERVE_SESSION_ID, MCP token, ...) to its CLIs.
+    from nerve._env import strip_inherited_session_env
+
+    _dropped_env = strip_inherited_session_env()
+    if _dropped_env:
+        logger.info(
+            "Removed inherited session variables from the environment: %s",
+            ", ".join(_dropped_env),
+        )
 
     # If startup fails before the ``yield``, the shutdown code below it does
     # not run. So each resource registers its stop function as soon as it

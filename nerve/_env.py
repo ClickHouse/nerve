@@ -64,4 +64,58 @@ def apply_env_defaults() -> None:
     os.environ.setdefault("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", "1")
 
 
+# Variables that describe one CLI session or process, not the machine. A
+# server started from a session's shell (``nerve restart`` in a Bash tool)
+# inherits them, and every CLI it spawns would then see that session's
+# identity, MCP token and messaging socket. Configuration such as
+# CLAUDE_CODE_OAUTH_TOKEN or CLAUDE_CODE_USE_BEDROCK is not listed.
+_SESSION_ENV_NAMES = frozenset({
+    # Claude Code, for the commands one CLI runs.
+    "CLAUDECODE",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+    "CLAUDE_AGENT_SDK_VERSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_EXECPATH",
+    # Codex, for the commands one thread runs.
+    "CODEX_THREAD_ID",
+    "CODEX_CI",
+    # Set by the Codex backend for one process when Ultracode is on. Left
+    # over with Ultracode off, CODEX_CLI_PATH still points at the wrapper.
+    "CODEX_CLI_PATH",
+    "ULTRACODE_NO_AUTO_UPDATE",
+    "ULTRACODE_UI",
+    "ULTRACODE_TRANSPORT",
+    "ULTRACODE_MAX_CONCURRENCY",
+    "ULTRACODE_DEFAULT_TOKEN_BUDGET",
+    "ULTRACODE_MAX_AGENTS",
+    "NERVE_SESSION_ID",
+})
+_SESSION_ENV_PREFIXES = (
+    "CLAUDE_CODE_MESSAGING_",
+    "NERVE_MCP_",
+    "NERVE_CODEX_",
+)
+
+
+def is_session_env_name(name: str) -> bool:
+    """Whether ``name`` belongs to a single CLI session (see above)."""
+    return name in _SESSION_ENV_NAMES or name.startswith(_SESSION_ENV_PREFIXES)
+
+
+def strip_inherited_session_env() -> list[str]:
+    """Remove the per-session variables from ``os.environ``.
+
+    Called when the server starts, before it spawns any CLI. Returns the
+    removed names, sorted, for the caller to log.
+    """
+    dropped = sorted(name for name in os.environ if is_session_env_name(name))
+    for name in dropped:
+        os.environ.pop(name, None)
+    return dropped
+
+
 apply_env_defaults()
