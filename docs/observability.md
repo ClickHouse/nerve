@@ -40,7 +40,8 @@ Two options:
   `https://jp.cloud.langfuse.com` (JP).
 - **Self-hosted** — follow the upstream deployment guide at
   <https://langfuse.com/self-hosting/deployment/docker-compose>, then
-  point Nerve at the resulting host URL.
+  point Nerve at the resulting host URL. The server must be Langfuse
+  v4.59.0 or later (see [Server version](#server-version)).
 
 ### 2. Get API keys
 
@@ -93,17 +94,67 @@ secret formats you don't want to leave the host. An explicit empty list
 
 Nerve applies the patterns to text in the attributes of every exported
 span: prompts, completions, tool inputs and outputs, tags and metadata.
-This includes UTF-8 bytes and nested mappings and sequences. JSON is
-decoded before matching patterns against its text. Bytes that are not
+This includes UTF-8 bytes and nested mappings and sequences. The
+patterns match each value as text. If the text is JSON, Nerve also decodes
+it and matches each string, key, number and boolean in it, so a secret
+that the JSON text shows with an escaped character is redacted too. A
+pattern that matches JSON syntax, for example a quote, can leave text
+that is not valid JSON in the attribute. If such a match makes the JSON
+text invalid and the decoded value also has a match, the whole value
+becomes `[REDACTED]` (a metadata value becomes the JSON string
+`"[REDACTED]"`). The default patterns do not match JSON syntax, so
+prompts and completions stay valid JSON with them. Bytes that are not
 valid UTF-8 are replaced with `[REDACTED]`.
+
+The metadata attributes (`langfuse.trace.metadata.*` and
+`langfuse.observation.metadata.*`) hold JSON text, and they stay valid
+JSON after redaction:
+
+- For a string value, the SDK adds quotes. Nerve decodes the string and
+  redacts it with the rules above, so the patterns do not match the
+  quotes that the SDK adds.
+- For an object, array, number or boolean, the patterns match the
+  attribute text with the rules above, as for other attributes. If the
+  result is not valid JSON, Nerve sends it as a JSON string. If a
+  pattern matches that JSON string form, the value becomes
+  `"[REDACTED]"`.
+- A pattern match on a number or boolean in the text makes the JSON
+  text invalid, so the whole value becomes `"[REDACTED]"`.
+- A metadata value that is not JSON text is redacted as plain text.
 
 Masking runs before the Langfuse SDK extracts media for upload. A matching
 data URI is redacted before it can enter the upload queue. This uses the
-exporter layout of Langfuse 4.17 and OpenTelemetry 1.45; if masking cannot
-be installed, tracing stays off. If masking raises, the batch is dropped
-before media processing or export. Span names and span events (for
-example exception messages) are not redacted. Patterns do not inspect the
-contents of encoded images or other media.
+exporter layout of Langfuse Python SDK 5 and OpenTelemetry 1.45; if
+masking cannot be installed, tracing stays off. If masking raises, the
+batch is dropped before media processing or export. Span names and span
+events (for example exception messages) are not redacted. Patterns do not
+inspect the contents of encoded images or other media.
+
+## Langfuse SDK 5: server version, compression and metadata
+
+Nerve uses the Langfuse Python SDK 5.
+
+### Server version
+
+Langfuse Cloud works. A self-hosted Langfuse server must be v4.59.0 or
+later. SDK 5 does not support Langfuse v3 or a v4 server older than
+v4.59.0. Upgrade the server before you upgrade Nerve.
+
+### Compression
+
+The SDK sends each span batch gzip-compressed. If a proxy between Nerve
+and `host` rejects compressed requests, set `LANGFUSE_OTEL_COMPRESSION=none`
+in the environment of the Nerve process (for example `Environment=` in a
+systemd unit, or `docker run -e`) and restart Nerve. The SDK also reads
+`OTEL_EXPORTER_OTLP_TRACES_COMPRESSION` and `OTEL_EXPORTER_OTLP_COMPRESSION`
+when `LANGFUSE_OTEL_COMPRESSION` is not set.
+
+### Metadata values
+
+The SDK sends each metadata value as JSON text, strings included. For
+example, `metadata.parent_session_id` goes out as `"<id>"`, with the
+quotes. Langfuse decodes these values for spans from SDK 5. A saved
+metadata filter that you wrote for data from SDK 4 may not match new data.
 
 ## Privacy note
 
@@ -172,6 +223,9 @@ key).
   - `enabled: true` with `auth_ok: false`: the host did not answer the
     startup check. Spans are sent when it answers; check the network path
     to `host`.
+  - `enabled: true` with `auth_ok: true` on a self-hosted server: check
+    that the server is v4.59.0 or later, and that no proxy rejects
+    gzip-compressed requests (see [Compression](#compression)).
 - **No Langfuse link in the chat header.** The link needs `project_id`
   from a successful startup check. Restart Nerve once the host answers.
 - **The host runs out of memory under heavy load.** The Langfuse SDK
