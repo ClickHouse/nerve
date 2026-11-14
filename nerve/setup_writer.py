@@ -1352,8 +1352,9 @@ def _cron_description(cron: dict[str, Any], memory_backend: str) -> str:
     return cron["description"]
 
 
-# The built-in jobs that look after the agent's own work. A run of one is no
-# reason for another to run, so the default gates below leave them all out.
+# The built-in jobs that look after the agent's own work. Each waits for the
+# agent to work (the default gates below). A run of one is no reason for
+# another to run, so each gate leaves the other three out.
 MAINTENANCE_CRON_IDS = (
     "memory-maintenance", "skill-extractor", "skill-reviser", "machine-maintenance",
 )
@@ -1395,6 +1396,22 @@ _DEFAULT_RUN_IF: dict[str, list[dict[str, Any]]] = {
             "ignore_jobs": _other_maintenance_crons("skill-extractor"),
         },
     ],
+    # The skills serve the agent's work, and what is out of date in them
+    # shows there: no review while the agent has done nothing since the last
+    # one.
+    "skill-reviser": [{
+        "type": "agent_activity",
+        "ignore_jobs": _other_maintenance_crons("skill-reviser"),
+    }],
+    # What the job removes is what work leaves on the machine, and an agent
+    # that has done nothing since the last run has left nothing more. The job
+    # removes only what is old, and the gate has no overlap: an item that was
+    # too new for the last run waits for the first run after the agent works
+    # again.
+    "machine-maintenance": [{
+        "type": "agent_activity",
+        "ignore_jobs": _other_maintenance_crons("machine-maintenance"),
+    }],
 }
 
 

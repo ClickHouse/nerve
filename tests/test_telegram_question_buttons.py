@@ -283,6 +283,50 @@ async def test_status_line_is_cut_to_keep_the_card_within_the_limit(
 
 
 @pytest.mark.asyncio
+async def test_the_answered_card_keeps_its_formatting_and_links(
+    service, channel, db, bot,
+):
+    """The card's text comes back from Telegram without its markup: the
+    places of its bold spans and links go into the edit with it."""
+    nid = await _ask(service, ["Yes", "No"])
+    entities = [SimpleNamespace(type="text_link", offset=21, length=14, url="https://nerve.example.com/chat/s1")]
+    preview = SimpleNamespace(is_disabled=True)
+
+    update, query = _tap(_buttons(bot)[0].callback_data, card_text="Which one?\n\nSession: Nightly report")
+    query.message.entities = entities
+    query.message.link_preview_options = preview
+    await channel._handle_callback_query(update, None)
+
+    assert (await db.get_notification(nid))["answer"] == "Yes"
+    kwargs = query.edit_message_text.await_args.kwargs
+    assert kwargs["text"] == "Which one?\n\nSession: Nightly report\n\n✅ Answered: Yes"
+    assert kwargs["entities"] is entities
+    assert kwargs["link_preview_options"] is preview
+    assert kwargs["reply_markup"] is None
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_a_card_that_had_to_be_cut_goes_out_plain(
+    service, channel, db, bot,
+):
+    """A place of the card's markup can lie past the cut."""
+    nid = await _ask(service, ["Yes", "No"])
+    card_text = "q" * MAX_MSG_LEN
+
+    update, query = _tap(_buttons(bot)[0].callback_data, card_text=card_text)
+    query.message.entities = [SimpleNamespace(type="bold", offset=MAX_MSG_LEN - 4, length=4)]
+    query.message.link_preview_options = None
+    await channel._handle_callback_query(update, None)
+
+    assert (await db.get_notification(nid))["answer"] == "Yes"
+    kwargs = query.edit_message_text.await_args.kwargs
+    assert len(kwargs["text"]) == MAX_MSG_LEN and kwargs["text"].endswith("…")
+    assert "entities" not in kwargs and "link_preview_options" not in kwargs
+    await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
 async def test_failed_card_edit_still_removes_the_buttons(
     service, channel, db, bot,
 ):

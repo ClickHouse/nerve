@@ -23,7 +23,7 @@ and migration splits a legacy `config.yaml` on the same table:
 
 | Layer | Gets |
 |-------|------|
-| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `proxy`, `docker`, `telegram.enabled`, `slack.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `mcp_apps`, `workflows.runs_dir` |
+| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `gateway.public_url`, `proxy`, `docker`, `telegram.enabled`, `slack.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `mcp_apps`, `workflows.runs_dir` |
 | `settings.yaml` | `timezone`, `gateway.host`/`port`/`loop`, `provider.type`/`aws_region` (incl. the region-scoped Bedrock model IDs), `agent.*`, `memory.*`, `sessions.*`, `sync.*`, the rest of `workflows.*` (the budget caps and cadence), `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode` |
 
 The test is whether the value would be wrong on another machine: filesystem
@@ -250,6 +250,7 @@ A reload is always explicit. Two things cause one:
 | `setup.local_secrets` | ✅ read on every request of the setup page |
 | Web gateway auth (`auth.*`) | partly. `auth.jwt_expiry_hours` follows a reload for newly issued or refreshed tokens. The deprecated `auth.password_hash` follows a reload only for accounts without a local password. `auth.external.*` follows a reload, which also reads the file that `gateway_jwks_file` names again. `auth.jwt_secret` requires a restart (see the restart table) |
 | `gateway.drain_timeout_seconds` | ✅ read when the shutdown signal arrives (see [Shutdown Sequence](architecture.md#shutdown-sequence)) |
+| `gateway.public_url` | ✅ read for each message that links to the web UI (see [Links to the web UI](#links-to-the-web-ui)) |
 | `notifications.*` | ✅ read per notification |
 | `workspace_sync.*` | ✅ from the next sync cycle |
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
@@ -1237,6 +1238,76 @@ Known limits:
 | `gateway.port` | int | `8900` | Port number |
 | `gateway.ssl.cert` | path | - | SSL certificate path |
 | `gateway.ssl.key` | path | - | SSL private key path |
+| `gateway.public_url` | string | `$NERVE_PUBLIC_ORIGIN`, else `""` | The address at which people open the web UI, for example `https://nerve.example.com`. Messages that leave the web UI link to it (see [Links to the web UI](#links-to-the-web-ui)) |
+
+### Links to the web UI
+
+A message in Telegram or Slack can point back at the web UI only with a full
+address. Nerve cannot tell its own: it knows the address it binds, and a
+reverse proxy, a tunnel or a host name can stand in front of that. Set the
+address that people type into the browser:
+
+```yaml
+# config.yaml
+gateway:
+  public_url: https://nerve.example.com
+```
+
+With it, the last line of a notification in Telegram and Slack links to the
+session that raised the notification, and the link text is the session's
+title (its ID while the session has no title):
+
+```text
+Session: Cron: nightly-report
+```
+
+Without it the line names the session by its ID, for example
+`Session: cron:nightly-report:20260101-050000-0a1b2c3d`. Some lines name the
+ID in both cases:
+
+- A notification that no session raised, such as a backup report, keeps
+  `Session: system`.
+- A notification whose title or body holds an open `[` or an unfinished
+  Markdown link outside code, as a cut text or a log line can. The Markdown
+  conversion of a channel would join it with the link and spoil both.
+
+A cron job with `show_session_label: false` has no such line.
+
+The value is `http://` or `https://`, a host and an optional port, for
+example `https://nerve.example.com` or `http://192.0.2.10:8900`. The host is
+a name of letters, digits, `-`, `.` and `_`, an IPv4 address, or an IPv6
+address in brackets; a name with other characters is written in its ASCII
+form (`xn--...`). A `/` at its end is dropped. The web UI is served at the
+root of its address, so a value with a path is refused, as is one with
+credentials, a query or a fragment. The address only has to be one that the
+people who read the messages can open: a public host name, a LAN address, a
+VPN name. A refused value is ignored with one warning in the log, and the
+messages carry no links; `nerve config validate` reports a refused
+`gateway.public_url`.
+
+The address belongs to one machine, so it goes into `config.yaml`. When no
+layer names `gateway.public_url`, or its value is blank, the environment
+variable `NERVE_PUBLIC_ORIGIN` gives the address; a hosting platform can set
+it for each agent. A reload applies a change to the next message.
+
+The link opens the session's page (`/chat/<session ID>`). A person who is not
+signed in signs in first and then arrives at the session.
+
+In Telegram:
+
+- Telegram makes a link only when the host is an IP address or has a dot in
+  its name. With `http://localhost:8900` the line shows the title as plain
+  text.
+- Telegram shows a preview of the first address in a message. A notification
+  keeps Telegram's default when the first `http://` or `https://` address in
+  its title or body, outside code, leads somewhere else than the web UI. The
+  address counts when Telegram makes a link of it: its host has a dot or is
+  an IP address. Every other notification with the session link is sent with
+  the preview off, so no card of the web UI's own page appears under it. An
+  address without `http://` or `https://` does not count, so the preview of
+  such a notification is off too.
+- The card of an answered question keeps its formatting and its links when
+  the answer is added to it.
 
 ### Favicon
 
@@ -1987,6 +2058,10 @@ notifications:
     slack: all
     telegram: important
 ```
+
+In Telegram and Slack the last line of an item names the session that raised
+it. With [`gateway.public_url`](#links-to-the-web-ui) set, that line is a link
+to the session in the web UI.
 
 ### Web Push
 

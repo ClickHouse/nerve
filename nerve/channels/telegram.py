@@ -3012,10 +3012,19 @@ class TelegramChannel(BaseChannel):
             await query.answer(_fit_text(toast, _TOAST_MAX_LEN))
             try:
                 original = query.message.text or ""
-                await query.edit_message_text(
-                    text=_fit_text(f"{original}\n\n{status_line}", MAX_MSG_LEN),
-                    reply_markup=None,
-                )
+                text = _fit_text(f"{original}\n\n{status_line}", MAX_MSG_LEN)
+                # The status line goes after the card's text, so the card's
+                # formatting and links keep their places. A text that had to
+                # be cut goes out plain, since a place can lie past the cut.
+                # The card's link preview choice stays too.
+                kept: dict[str, Any] = {}
+                entities = getattr(query.message, "entities", None)
+                if entities and text.startswith(original):
+                    kept["entities"] = entities
+                link_preview = getattr(query.message, "link_preview_options", None)
+                if link_preview is not None:
+                    kept["link_preview_options"] = link_preview
+                await query.edit_message_text(text=text, reply_markup=None, **kept)
             except Exception:
                 # Remove the buttons anyway: the tap has been handled.
                 try:

@@ -32,6 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from nerve import paths
 from nerve.agent.agents.emitter import agent_channel
 from nerve.agent.engine import AgentEngine, NotAcceptingTurnsError, SessionClosedError
+from nerve.agent.sessions import SessionNotFoundError
 from nerve.agent.streaming import broadcaster
 from nerve.config import EXTERNAL_VERIFICATION_LOG, NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
@@ -225,6 +226,25 @@ def _client_msg_id(raw: Any) -> str | None:
 
 WS_ACCOUNT_DISABLED_CODE = 1008
 WS_ACCOUNT_DISABLED_REASON = "Account disabled"
+# What a message for a session that does not exist gets back.
+SESSION_NOT_FOUND_ERROR = "This session does not exist. It may have been deleted."
+
+
+async def _switch_web_session(router: Any, session_id: Any) -> bool:
+    """Make ``session_id`` the web channel's session. ``False`` when it names no session.
+
+    The switch looks the session up itself, so no check of the caller's
+    stands before it, and the caller binds the socket only after it. Nothing
+    of the socket has changed when this returns ``False``. A value that is
+    not a session ID (a frame can hold any JSON) names no session.
+    """
+    if not isinstance(session_id, str) or not session_id:
+        return False
+    try:
+        await router.switch_session("web:default", session_id)
+    except SessionNotFoundError:
+        return False
+    return True
 
 
 async def _account_enabled(actor: Actor) -> bool:
@@ -1402,12 +1422,23 @@ def create_app() -> FastAPI:
                     client_msg_id = _client_msg_id(data.get("client_msg_id"))
 
                     if session_id != active_session:
-                        # Switch sessions
+                        # Switch sessions. The web UI creates a session before
+                        # it sends the first message, so a session that does
+                        # not exist was deleted. Refuse the message and keep
+                        # the socket: a closed one reconnects and sends it
+                        # again.
+                        if not await _switch_web_session(router, session_id):
+                            await websocket.send_json({
+                                "type": "error",
+                                "session_id": session_id,
+                                "error": SESSION_NOT_FOUND_ERROR,
+                                "client_msg_id": client_msg_id,
+                            })
+                            continue
                         await _drop_agent_subs()
                         await broadcaster.unregister(active_session, client_id)
                         active_session = session_id
                         await broadcaster.register(active_session, client_id, ws_broadcast)
-                        await router.switch_session("web:default", session_id)
 
                     # During a drain, tell this client only. Other tabs get
                     # no echo of a message that will not run. With the
@@ -1524,12 +1555,22 @@ def create_app() -> FastAPI:
 
                 elif msg_type == "switch_session":
                     new_session = data.get("session_id", active_session)
+                    # Persist channel mapping so next page load resumes this
+                    # session. A session that does not exist is a link to one
+                    # that was deleted since, or a tab left open on one. Say
+                    # so and keep the binding and the socket: the client
+                    # sends the switch again on every connect, so a closed
+                    # socket would reconnect without end.
+                    if not await _switch_web_session(router, new_session):
+                        await websocket.send_json({
+                            "type": "session_not_found",
+                            "session_id": new_session,
+                        })
+                        continue
                     await _drop_agent_subs()
                     await broadcaster.unregister(active_session, client_id)
                     active_session = new_session
                     await broadcaster.register(active_session, client_id, ws_broadcast)
-                    # Persist channel mapping so next page load resumes this session
-                    await router.switch_session("web:default", new_session)
 
                     # Send session status (running/idle + buffered events for
                     # reconnect). Unlike the initial-bind branch, we always
