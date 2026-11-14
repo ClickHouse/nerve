@@ -121,6 +121,14 @@ def test_the_loom_section_covers_levels_proposals_and_verdicts() -> None:
         assert words in section, words
 
 
+def test_the_loom_section_says_to_leave_the_memory_type_unset() -> None:
+    """Loom searches neither an `episodic` nor a `profile` memory, so a fact
+    saved as one could not be recalled."""
+    section = loom_prompts.SYSTEM_PROMPT_SECTION
+    assert "Leave `memory_type` unset" in section
+    assert "typed `episodic` or `profile` out of search" in section
+
+
 def test_without_loom_tools_the_prompt_says_memory_cannot_be_used(tmp_path: Path) -> None:
     """Loom is the backend but the session gets no `loom` server (local
     mode, or not provisioned yet): no tool guidance for tools it lacks."""
