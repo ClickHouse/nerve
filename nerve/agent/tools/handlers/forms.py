@@ -33,6 +33,7 @@ import re
 from typing import Any, Iterable
 
 from nerve.agent import interactive
+from nerve.agent.tools.handlers.notifications import unescape_newlines
 from nerve.agent.tools.registry import ToolContext, ToolResult, ToolSpec
 from nerve.agent.tools.schemas import (
     ASK_FORM_SCHEMA,
@@ -428,6 +429,8 @@ async def ask_form_handler(ctx: ToolContext, args: dict) -> ToolResult:
     hub = interactive.get_handler(ctx.session_id)
     if hub is None or not hub.interactive_capable:
         return ToolResult.text(NOT_INTERACTIVE, is_error=True)
+    if "intro" in args:
+        args = {**args, "intro": unescape_newlines(args["intro"])}
     form, problems = validate_form(args)
     if problems:
         return ToolResult.text(_invalid(problems), is_error=True)

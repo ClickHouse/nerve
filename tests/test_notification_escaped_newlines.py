@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from nerve.agent.tools.handlers.notifications import (
-    _unescape_newlines,
+    unescape_newlines,
     ask_user_handler,
     notify_handler,
     propose_action_handler,
@@ -25,12 +25,13 @@ from nerve.agent.tools.registry import ToolContext
         ("rejects `\\r` and `\\n` in headers", "rejects `\\r` and `\\n` in headers"),
         ("before\\n`code \\n`\\nafter", "before\n`code \\n`\nafter"),
         ("x\\n```\nprint('a\\n')\n```\\ny", "x\n```\nprint('a\\n')\n```\ny"),
+        ("x\\n```\\nls -l\\n```\\ny", "x\n```\nls -l\n```\ny"),
         ("", ""),
         (None, None),
     ],
 )
 def test_unescape_newlines(raw, expected):
-    assert _unescape_newlines(raw) == expected
+    assert unescape_newlines(raw) == expected
 
 
 def _ctx() -> tuple[ToolContext, MagicMock]:
@@ -65,3 +66,32 @@ async def test_propose_action_unescapes_body():
         ctx, {"target_kind": "k", "target_id": "1", "title": "T", "body": "a\\nb"},
     )
     assert svc.propose_action.await_args.kwargs["body"] == "a\nb"
+
+
+@pytest.mark.asyncio
+async def test_send_channel_message_unescapes_text():
+    from nerve.agent.tools.handlers.notifications import send_channel_message_handler
+
+    engine = MagicMock()
+    engine.router.deliver_addressed = AsyncMock(return_value=MagicMock(allowed=True))
+    ctx = ToolContext(session_id="s1", engine=engine)
+    await send_channel_message_handler(
+        ctx, {"channel": "slack", "target": "C1", "text": "a\\n\\nb"},
+    )
+    assert engine.router.deliver_addressed.await_args.args[2] == "a\n\nb"
+
+
+@pytest.mark.asyncio
+async def test_ask_form_unescapes_intro(monkeypatch):
+    from nerve.agent.tools.handlers import forms
+
+    seen: dict = {}
+
+    def fake_validate(args):
+        seen.update(args)
+        return {}, ["stop here"]
+
+    monkeypatch.setattr(forms.interactive, "get_handler", lambda sid: MagicMock(interactive_capable=True))
+    monkeypatch.setattr(forms, "validate_form", fake_validate)
+    await forms.ask_form_handler(ToolContext(session_id="s1"), {"intro": "a\\n\\nb", "questions": []})
+    assert seen["intro"] == "a\n\nb"
