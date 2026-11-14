@@ -391,11 +391,13 @@ class CronStore:
 
         A proposal is a task with a plan in review (``pending``: proposed,
         and neither approved nor declined). A plan is in review until
-        somebody decides it, however old it is and whatever became of its
-        task: closing a task decides no plan, and the Plans page goes on
-        listing it. So the count is what a person finds there to decide. A
-        plan whose task has no row is left out: no decision could be made
-        on it.
+        somebody decides it, however old it is, or until its task is
+        closed: ``task_done`` closes the plan that waits for review with
+        the task. A plan can still be in review for a task that is done,
+        when it was proposed after the close or the task was closed by a
+        release from before that rule, and it counts like any other. So the
+        count is what the Plans page shows a person to decide. A plan whose
+        task has no row is left out: no decision could be made on it.
 
         The proposal is the job's when one of the job's sessions
         (:func:`_sessions_of_jobs`) proposed the plan in review, or a plan

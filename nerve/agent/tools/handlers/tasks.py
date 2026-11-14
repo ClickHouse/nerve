@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from nerve.agent.plan_service import plan_link
 from nerve.agent.tools.registry import ToolContext, ToolResult, ToolSpec
 from nerve.agent.tools.schemas import (
     TASK_COMMENT_SCHEMA,
@@ -33,6 +34,7 @@ from nerve.agent.tools.schemas import (
     TASK_WRITE_SCHEMA,
 )
 from nerve.config import ensure_path_not_tracked_config
+from nerve.db.plans import CLOSED_WITH_TASK
 from nerve.db.tasks import KEEP
 from nerve.db.task_statuses import (
     DEFAULT_STATUS,
@@ -109,11 +111,13 @@ def _expect_revision(args: dict) -> int | None:
         raise ValueError(f"expect_revision must be an integer, got {raw!r}.") from None
 
 
-def _revision_conflict(task_id: str, expected: int, *, reopened: bool = False) -> ToolResult:
-    if reopened:
+def _revision_conflict(
+    task_id: str, expected: int, *, reopened: ToolResult | None = None,
+) -> ToolResult:
+    if reopened is not None:
         return ToolResult.text(
             f"Task {task_id} was reopened, but it changed again before the other edits were "
-            "written, so they were not applied. Re-read it and retry them.",
+            f"written, so they were not applied. Re-read it and retry them.{_about_the_plans(reopened)}",
             is_error=True,
         )
     return ToolResult.text(
@@ -608,8 +612,12 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         if not task:
             return ToolResult.text(f"Task not found: {task_id}", is_error=True)
         if reopened and expect_revision is not None:
-            # The reopen's single guarded write advanced the row by exactly one revision.
-            expect_revision += 1
+            # The caller's token guarded the reopen, which has written since:
+            # the status, and a note when a plan came back with the task. The
+            # other edits are fenced on the revision that those writes of the
+            # reopen left, so a write of anybody else, during the reopen or
+            # after it, still refuses them.
+            expect_revision = reopened.structured["revision"]
 
         new_tags_str = ""
         if raw_tags is not None:
@@ -690,12 +698,10 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                     await ctx.db.upsert_task(**kw)
                 else:
                     if not await ctx.db.upsert_task(**kw, expect_revision=expect_revision):
-                        return _revision_conflict(
-                            task_id, expect_revision, reopened=reopened is not None,
-                        )
+                        return _revision_conflict(task_id, expect_revision, reopened=reopened)
                     await asyncio.to_thread(write)
                 await _emit_task_event(ctx, task_id, "updated")
-                return ToolResult.text(f"Task {task_id} updated.")
+                return ToolResult.text(f"Task {task_id} updated.{_about_the_plans(reopened)}")
 
         # Fall back to metadata updates when no task file was changed.
         if expect_revision is not None and (note or deadline is not None or new_title):
@@ -722,7 +728,7 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 task_id, new_tags_str, expect_revision=expect_revision,
             )
         if not applied and expect_revision is not None:
-            return _revision_conflict(task_id, expect_revision, reopened=reopened is not None)
+            return _revision_conflict(task_id, expect_revision, reopened=reopened)
         await _emit_task_event(ctx, task_id, "updated")
 
     return ToolResult.text(f"Task {task_id} updated.")
@@ -910,10 +916,12 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
     except ValueError as e:
         return ToolResult.text(str(e), is_error=True)
 
+    closed: list[str] = []
     if ctx.db:
         task = await ctx.db.get_task(task_id)
         if not task:
             return ToolResult.text(f"Task not found: {task_id}", is_error=True)
+        was_open = task.get("status") != TERMINAL_STATUS
 
         # Done is a write like any other — it appends to the file and moves it
         # into done/, so a stored ``file_path`` inside the tracked config
@@ -960,14 +968,110 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
         # Mark any implementing plans for this task as done. A failed plan
         # is done too when its own implementation session closes the task:
         # a later turn there finished the work.
+        #
+        # A plan that still waits for review is closed with the task. Nobody
+        # decided it, so it gets a status of its own and no reviewer, and a
+        # person who reopens the task gets it back. The plan is written only
+        # while it is still pending, so one that is approved at that moment
+        # stays approved.
+        #
+        # A call that finds the task done already closed nothing new: a plan
+        # that was proposed for a done task waits for a decision of its own.
+        # What it does close is a plan that is older than the task's last
+        # close, which that close left in review: its write failed, or it
+        # was made by a release from before this rule.
+        closed_at = None if was_open else _stored_time(await ctx.db.get_task_closed_at(task_id))
         for p in await ctx.db.get_plans_for_task(task_id):
             retried = p.get("status") == "failed" and p.get("impl_session_id") == ctx.session_id
             if p.get("status") == "implementing" or retried:
                 await ctx.db.update_plan(p["id"], status="done")
+            elif p.get("status") == "pending" and (was_open or _proposed_by(p, closed_at)):
+                if await ctx.db.compare_and_update_plan(
+                    p["id"], expect_status="pending", status=CLOSED_WITH_TASK,
+                ):
+                    closed.append(p["id"])
+        if closed:
+            await ctx.db.dismiss_plan_notifications(task_id, attribution=ctx.attribution)
+            await _note_about_plans(
+                ctx, task_id, closed, "waited for review and was closed with the task",
+            )
 
         await _emit_task_event(ctx, task_id, "done")
 
-    return ToolResult.text(f"Task {task_id} marked as done.")
+    result = f"Task {task_id} marked as done."
+    if closed:
+        result += (
+            f" Its plan in review ({', '.join(closed)}) was closed with it, undecided. "
+            "If the user had approved the plan and this session did the work, record that "
+            "with plan_approve (implement_here=true). The plan is in review again when the "
+            "user reopens the task on the board or the task page."
+        )
+    return ToolResult.text(result, structured={"plans_closed": closed})
+
+
+def _stored_time(value: object) -> datetime | None:
+    """A stored timestamp as an aware time, UTC when it names no zone;
+    ``None`` for one that is missing or does not parse."""
+    if not value:
+        return None
+    try:
+        when = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def _proposed_by(plan: dict, closed_at: datetime | None) -> bool:
+    """Whether *plan* was proposed by the time its task was closed. A time
+    that is not known, on either side, answers no: the plan stays in review."""
+    proposed_at = _stored_time(plan.get("created_at"))
+    return closed_at is not None and proposed_at is not None and proposed_at <= closed_at
+
+
+async def _note_about_plans(
+    ctx: ToolContext, task_id: str, plan_ids: list[str], what: str,
+    *, expect_revision: int | None = None,
+) -> bool:
+    """Add a line about *plan_ids* to the task's notes, as every other change
+    of a plan does. The plans are written already, so a note that fails is
+    logged and nothing else.
+
+    With *expect_revision* the note is first tried as a write from exactly
+    that revision, and the answer is whether it landed as one. When the row
+    has moved on, the note is written all the same, and the answer is no: the
+    caller then knows that somebody else wrote in between.
+    """
+    links = ", ".join(plan_link(plan_id) for plan_id in plan_ids)
+    args = {"task_id": task_id, "note": f"Plan {links} {what}."}
+    try:
+        if expect_revision is not None:
+            fenced = await task_update_handler(ctx, {**args, "expect_revision": expect_revision})
+            if not fenced.is_error:
+                return True
+        await task_update_handler(ctx, args)
+    except Exception:  # noqa: BLE001 (the note is the least of the change)
+        logger.warning("Could not note the plans %s on task %s", plan_ids, task_id, exc_info=True)
+    return False
+
+
+async def _plans_closed_with(ctx: ToolContext, task_id: str) -> list[str]:
+    """The plans that were closed with the task and that no newer plan has
+    replaced: more than one only if more than one was in review at the
+    close. A plan that was proposed for the task since has taken the place
+    of a closed one, whatever became of it."""
+    plans = await ctx.db.get_plans_for_task(task_id)
+    newest = max((p.get("version") or 0 for p in plans), default=0)
+    return [
+        p["id"] for p in plans
+        if p.get("status") == CLOSED_WITH_TASK and (p.get("version") or 0) == newest
+    ]
+
+
+def _about_the_plans(reopened: ToolResult | None) -> str:
+    """What a reopen said about the task's plan, for the result of a call
+    that went on to other edits; empty when it said nothing."""
+    said = (reopened.structured or {}) if reopened is not None else {}
+    return said.get("about_plans", "")
 
 
 @_one_change_per_task
@@ -1057,8 +1161,49 @@ async def task_reopen_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if src is not None:
         await asyncio.to_thread(move_task_file, src, dst, content)
 
+    # The close decided nothing about a plan that was in review, so a person
+    # who reopens the task has it back as it was: a card that is dragged into
+    # the Done lane and back is the same card. An agent that reopens a task,
+    # perhaps long after, does not put a plan in front of the person again
+    # without a word: the plan stays closed, and the agent is told.
+    about_plans = ""
+    noted = False
+    waiting = await _plans_closed_with(ctx, task_id)
+    if waiting and ctx.actor is not None and ctx.actor.is_human:
+        restored = [
+            plan_id for plan_id in waiting
+            if await ctx.db.compare_and_update_plan(
+                plan_id, expect_status=CLOSED_WITH_TASK, status="pending",
+            )
+        ]
+        if restored:
+            noted = await _note_about_plans(
+                ctx, task_id, restored, "is in review again: it was closed with the task",
+                expect_revision=None if expect_revision is None else expect_revision + 1,
+            )
+            about_plans = (
+                f" Its plan ({', '.join(restored)}), which was closed with the task, "
+                "waits for review again."
+            )
+    elif waiting:
+        about_plans = (
+            f" Its plan ({', '.join(waiting)}) stays closed: it was closed with the task, "
+            "undecided. If it is still wanted, propose it again with plan_propose; if the "
+            "user had approved it and this session did the work, record that with "
+            "plan_approve (implement_here=true)."
+        )
+
     await _emit_task_event(ctx, task_id, "updated")
-    return ToolResult.text(f"Task {task_id} reopened (status: {status}).")
+    # The revision that the writes of this reopen left, for a caller that
+    # sent a token and goes on to other edits (see task_update): the status
+    # write moved the row on by one, and the note, when it landed as the
+    # next write, by one more. It is worked out, not read: read, it would
+    # take a write of somebody else during the reopen for one of its own.
+    left = None if expect_revision is None else expect_revision + 1 + (1 if noted else 0)
+    return ToolResult.text(
+        f"Task {task_id} reopened (status: {status}).{about_plans}",
+        structured={"about_plans": about_plans, "revision": left},
+    )
 
 
 async def task_status_list_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -1137,6 +1282,7 @@ TASK_UPDATE_SPEC = ToolSpec(
     name="task_update",
     description=(
         "Update a task's status, deadline, tags, title, or add an update note. "
+        "The status done closes the task as task_done does. "
         "Pass expect_revision (from task_read) to refuse the update, writing "
         "nothing, if the task has changed since."
     ),
@@ -1165,6 +1311,9 @@ TASK_DONE_SPEC = ToolSpec(
     name="task_done",
     description=(
         "Mark a task as done and move its file to the done/ directory. "
+        "A plan of the task that still waits for review is closed with it, "
+        "undecided; if the user approved the plan and this session did the "
+        "work, call plan_approve with implement_here=true before or after. "
         "Pass expect_revision (from task_read) to refuse the completion, "
         "writing nothing, if the task has changed since."
     ),

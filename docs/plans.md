@@ -48,7 +48,7 @@ User reviews (via /plans UI or chat tools)
 ### `plan_list(status?)`
 
 - Default: returns pending + implementing plans
-- Supports filtering: `pending`, `approved`, `declined`, `implementing`, `superseded`
+- Supports filtering: `pending`, `approved`, `declined`, `implementing`, `superseded`, `closed`
 
 ### `plan_read(plan_id)`
 
@@ -68,9 +68,9 @@ User reviews (via /plans UI or chat tools)
 
 ### `plan_approve(plan_id, implement_here=true)`
 
-For a plan that the user approved in the chat of the session that does the work. Without it, such a plan stays `pending`: it waits on the Plans page, and its session stays in the sidebar's "Needs you" group.
+For a plan that the user approved in the chat of the session that does the work. Without it, such a plan stays `pending`: it waits on the Plans page, and its session stays in the sidebar's "Needs you" group, until its task is closed, which closes the plan undecided (see [Closing the task](#closing-the-task)).
 
-- Guards: only pending plans; needs a calling session
+- Guards: only a pending plan, or one that was closed with its task while the task is done; needs a calling session
 - Marks the plan `implementing` with `impl_session_id` = the calling session, or `done` when the task is already done
 - Starts no session and runs no turn
 - Moves a task in `plan_review` to `in_progress`; any other task status does not change. Writes a task note with links to the plan and the session, and dismisses the task's pending plan notifications
@@ -115,10 +115,27 @@ For a plan that the user approved in the chat of the session that does the work.
 | `pending` | Awaiting human review |
 | `approved` | Approved (briefly, before implementation starts) |
 | `implementing` | Implementation session is running |
-| `done` | The task of the plan was marked done. A `failed` plan becomes `done` too when its own implementation session marks the task done |
+| `done` | The task of the plan was marked done while the plan was `implementing`, or the approval was recorded with `implement_here=true` for a task that is done. A `failed` plan becomes `done` too when its own implementation session marks the task done |
 | `failed` | The first implementation turn failed: it raised, or it ended with a failed outcome. A task event (`updated`) follows the write |
 | `declined` | Rejected by user |
 | `superseded` | Replaced by a newer version |
+| `closed` | Its task was closed while the plan waited for review. Nobody decided it, and it is in review again when a person reopens the task (see below) |
+
+### Closing the task
+
+Closing a task takes the plan of the task that waits for review out of review. However the task is closed (`task_done`, `task_update` with the status `done`, the board, the task page), a `pending` plan becomes `closed`: whoever closes the task wants no plan for it now, or did the work without one.
+
+- **Nobody decided the plan.** `closed` is not a review decision: the plan gets no reviewer and no reason, and a revision request that nobody answered stays as it was.
+- **A person who reopens the task has the plan back in review**, as it was: on the board, a card that is dragged into the Done lane and back keeps its plan. Only while the plan is still the newest plan of the task: one that was proposed for the task since has taken its place, whatever became of it. The plan's notification is not sent again, and a revision that was under way at the close is not started again: ask for it once more.
+- **An agent that reopens the task leaves the plan closed.** It would put a plan in front of the person again without a word. An agent here is every caller that is not a signed-in person: a tool call in any session, and a request with a system or API token. `task_update` tells the agent so. The plan then stays closed on an open task until the agent proposes it again with `plan_propose`, which notifies, or a person closes and reopens the task.
+- **An approval can still be recorded.** When the user approved the plan in a chat, the session that does the work calls `plan_approve` with `implement_here=true`: before it closes the task, for the plan in review, or after, for the closed plan. That one becomes `done`, or `implementing` when an agent has reopened the task since. Any session can record it; a closed plan that a newer plan of the task replaced is refused.
+- **What the person and the agent are told.** The task's pending plan notifications are dismissed. The task gets a note that names the plan, at the close and when the plan comes back, and `task_done` and `task_update` say in their results what became of the plan.
+- **A plan that is approved at the same moment is not closed.** The plan is written only while it is still `pending`.
+- **A plan that is proposed for a task that is already done stays in review.** Closing that task once more leaves it for a decision of its own.
+- **Closing a task once more closes a plan that an earlier close left in review**, when the plan is older than that close: a close whose plan write failed, or one made by an earlier release, which did not close plans. This does not help for a task that was done before Nerve kept the status history of tasks: its one record is as old as the task. Decline such a plan on the Plans page, or reopen the task and close it.
+- An `implementing` plan becomes `done` when its task is closed, as the table says.
+
+`plan_approve` without `implement_here`, `plan_decline`, `plan_revise` and `plan_update` refuse a `closed` plan, in the tools and in the web UI: only pending plans can be changed. The web UI shows the status with the neutral badge, and the Plans page lists such a plan under **All**.
 
 ## Cron Job
 
@@ -159,7 +176,7 @@ The user can monitor, stop, or interact with the implementation session from the
 
 A plan is a skill plan when its `plan_type` is `skill-create` or `skill-update`: the `plan_propose` call states the type, or the task's `source` is `skill-extractor` or `skill-reviser`. The `skill-extractor` cron job states it. A skill plan goes through the same approval path as any other plan — an `impl-<id>` session is spawned — with a prompt for the plan type. A session that implements the plan itself (`plan_approve` with `implement_here=true`) gets no such prompt.
 
-`skill-extractor` does not run while three or more of its proposals wait for review (a [`plans_in_review`](cron.md#plans_in_review) gate). Approve or decline some, and it goes on at its next scheduled time, if the agent has worked since its last run. Closing the task of a proposal does not decide its plan.
+`skill-extractor` does not run while three or more of its proposals wait for review (a [`plans_in_review`](cron.md#plans_in_review) gate). Approve or decline some, or close their tasks, and it goes on at its next scheduled time, if the agent has worked since its last run.
 
 A `skill-create` plan is a proposal for a person to judge. It says what the skill is for, the evidence that it is needed (where the workflow occurred and what was repeated) and the direction the skill should take. The prompt has the session write the skill:
 
@@ -183,7 +200,7 @@ Plans are stored in the `plans` SQLite table (schema v12):
 | `task_id` | TEXT | Linked task |
 | `session_id` | TEXT | Planner session that created it |
 | `impl_session_id` | TEXT | Implementation session (after approval) |
-| `status` | TEXT | pending/approved/declined/superseded/implementing |
+| `status` | TEXT | pending/approved/declined/superseded/implementing/done/failed/closed (see [Plan Statuses](#plan-statuses)) |
 | `content` | TEXT | Plan markdown |
 | `summary` | TEXT | Short summary from `plan_propose` or `plan_update`; NULL when the agent gave none |
 | `feedback` | TEXT | User revision feedback |

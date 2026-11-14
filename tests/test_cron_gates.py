@@ -1628,7 +1628,7 @@ class TestPlansInReviewGate:
         await _plan(db, "t1", "cron:scout")
         assert await self._open(db, below=1) is False
 
-    @pytest.mark.parametrize("status", [*DECIDED, "superseded"])
+    @pytest.mark.parametrize("status", [*DECIDED, "superseded", "closed"])
     async def test_only_a_plan_in_review_counts(self, db, status):
         for task in ("t1", "t2", "t3"):
             await _plan(db, task, "cron:scout", status=status)
@@ -1753,8 +1753,10 @@ class TestPlansInReviewGate:
     ])
     async def test_a_proposal_waits_whatever_became_of_its_task(self, db, status):
         """The plan tools move a task to ``plan_review`` only from some
-        statuses, and a person can move it on, also to ``done``: closing a
-        task decides no plan, and the Plans page goes on listing it."""
+        statuses, and a person can move it on. The count goes by the plan:
+        one that is in review counts, whatever the status of its task. A
+        plan is in review on a task that is done when it was proposed after
+        the close, since closing a task closes the plan that waits then."""
         await _plan(db, "t1", "cron:scout")
         await db.upsert_task(task_id="t1", file_path="t1.md", title="t1", status=status)
 
@@ -1931,16 +1933,19 @@ class TestPlansInReviewOfRealProposals:
         assert (await db.get_plan(first[1]))["status"] == "superseded"
         assert await db.count_cron_job_plans_in_review("scout") == 3
 
-        # A task that somebody closes by hand leaves its plan in review, where
-        # the Plans page lists it: the proposal still waits for a decision.
+        # Closing the task of a proposal closes its plan with it: the
+        # proposal no longer waits.
         await task_done_handler(scout, {"task_id": third[0]})
-        assert (await db.get_plan(third[1]))["status"] == "pending"
-        assert await gate.is_satisfied(ctx) is False
-
-        await decline_plan(db=db, engine=engine, plan_id=third[1], actor=None, cause=None)
+        assert (await db.get_plan(third[1]))["status"] == "closed"
         assert await gate.is_satisfied(ctx) is True
 
-        await self._proposed(scout, "Rotation of the on-call notes")
+        fourth = await self._proposed(scout, "Rotation of the on-call notes")
+        assert await gate.is_satisfied(ctx) is False
+
+        await decline_plan(db=db, engine=engine, plan_id=fourth[1], actor=None, cause=None)
+        assert await gate.is_satisfied(ctx) is True
+
+        await self._proposed(scout, "Checklist for a release branch")
         assert await gate.is_satisfied(ctx) is False
 
         engine.run_event.clear()  # the revision request above ran a turn too

@@ -87,6 +87,7 @@ Setting a task's status to `done` via `task_update` automatically delegates to `
 - Moves the markdown file from `active/` to `done/`
 - Syncs the FTS index
 - Appends a completion note
+- Settles the plans of the task: one that waits for review is closed with the task, undecided, and one that is being implemented becomes `done` (see [Closing the task](plans.md#closing-the-task))
 
 This prevents orphan tasks (status=done in DB but file still in active/).
 
@@ -94,7 +95,9 @@ Leaving `done` delegates the same way, to the inverse path: `task_update`
 routes a task whose stored status is `done` through the reopen handler, which
 moves the file back to `active/` and appends a `REOPENED` line. Both
 directions check the tracked-config guard *before* the status flip, so a
-refused move never leaves a task whose status and file disagree.
+refused move never leaves a task whose status and file disagree. When a
+person reopens the task, on the board or the task page, a plan that was
+closed with it is in review again; an agent's reopen leaves the plan closed.
 
 The inverse matters because the disagreement is silent rather than loud.
 `reindex()` treats a file under `done/` as terminal by definition, so a row

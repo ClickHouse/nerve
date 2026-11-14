@@ -19,16 +19,16 @@ Call tools as `mcp__nerve__<name>`. The system prompt lists what is live; this i
 - `task_list`: filter by status or tag; a `backlog` task is not ready for work yet
 - `task_update`: status, deadline, tags, title, or a dated note
 - `task_read`/`task_write`: read or overwrite the markdown; `task_write` needs a prior `task_read`
-- `task_done`: moves the file to `done/` and the task's implementing plans to done
+- `task_done`: moves the file to `done/` and the task's implementing plans to done; a plan that still waits for review is closed with the task, undecided
 - `task_comment`: a comment on a task, signed as you; `task_read` shows the newest 50
 - `task_status_list`/`task_status_create`: configured statuses; create only on request
 
-**Plans** (`pending` → `implementing` → `done`/`failed`, or `declined`/`superseded`; in the web UI, link a plan as `[plan-<id>](/plans/plan-<id>)`)
+**Plans** (`pending` → `implementing` → `done`/`failed`, or `declined`/`superseded`, or `closed` with its task; in the web UI, link a plan as `[plan-<id>](/plans/plan-<id>)`)
 - `plan_propose`: a plan for a task; one pending plan per task; moves a `pending`, `backlog` or `in_progress` task to `plan_review` and notifies the user with a link, so send no `notify` about it
 - `plan_update`: version n+1 of your own pending plan (instead of decline and propose); moves and notifies like `plan_propose`
 - `plan_list`/`plan_read`: browse; the full plan with version and feedback
 - `plan_approve`: pending → implementing; spawns an `impl-<id>` session, task → `in_progress`
-- `plan_approve(implement_here=true)`: the user approved in this chat and this session does the work; pending → implementing (or done for a done task), linked to this session, no new session; task `plan_review` → `in_progress`, other statuses unchanged
+- `plan_approve(implement_here=true)`: the user approved in this chat and this session does the work; pending → implementing (or done for a done task, whose plan may have been closed with it), linked to this session, no new session; task `plan_review` → `in_progress`, other statuses unchanged
 - `plan_decline`: pending → declined; **moves the task to done**
 - `plan_revise`: feedback to the planner session, which answers with `plan_update`
 
