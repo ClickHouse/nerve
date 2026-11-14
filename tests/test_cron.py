@@ -1494,18 +1494,40 @@ class TestAnEntryOfAnEarlierRelease:
         )
         # And with the gates that an entry of the job gets when it states none.
         assert [gate.type for gate in job.gates] == ["plans_in_review", "agent_activity"]
-        assert _said(caplog) == [
+        said = _said(caplog)
+        assert (
             "Cron job skill-extractor: its description, prompt, schedule in system.yaml are "
             "what an earlier release shipped; the job is loaded with this release's (schedule 0 5 * * *)"
-        ]
+        ) in said
+        # The file with the first prompt is from before the planner's and the
+        # reviser's prompts changed too: the three are brought up to date.
+        earlier = {line.split(":")[0].removeprefix("Cron job ") for line in said}
+        assert earlier == (
+            {"skill-extractor"} if file is _BEFORE_DAILY
+            else {"skill-extractor", "skill-reviser", "task-planner"}
+        )
         # The file's other keys, and every other job, are as the file has them.
         assert job.enabled is before["skill-extractor"]["enabled"]
         assert job.session_mode == "persistent" and job.context_rotate_hours == 168
         for job_id, entry in before.items():
-            if job_id != "skill-extractor":
+            if job_id not in earlier:
                 assert (loaded[job_id].schedule, loaded[job_id].prompt) == (
                     entry["schedule"], entry["prompt"],
                 )
+
+    @pytest.mark.parametrize("job_id", ["skill-reviser", "task-planner"])
+    def test_the_reviser_and_the_planner_are_loaded_with_their_current_prompts(self, tmp_path, job_id):
+        """An install from before ``plan_propose`` began to notify has the
+        prompts that told the agent to send a notification of its own."""
+        from nerve.setup_writer import PRODUCTIVITY_CRONS
+
+        shipped = next(c for c in PRODUCTIVITY_CRONS if c["id"] == job_id)
+        before = {job["id"]: job for job in yaml.safe_load(_FIRST_PROMPT.read_text(encoding="utf-8"))["jobs"]}
+        assert "use `notify`" in before[job_id]["prompt"]
+
+        job = _loaded(tmp_path, _FIRST_PROMPT)[job_id]
+        assert job.prompt == shipped["prompt"]
+        assert job.schedule == before[job_id]["schedule"]
 
     def test_what_was_edited_stays(self, tmp_path, caplog):
         """Each of the three is judged on its own."""
@@ -1686,3 +1708,60 @@ class TestAnEntryOfAnEarlierRelease:
 
         assert not _said(caplog)
         assert loaded["skill-extractor"].schedule == "0 5 * * *"
+
+
+class TestTheSchedulerWritesTheSystemFile:
+    """At its start and once a reload is applied, the scheduler writes this
+    release's values into a system.yaml that holds an earlier release's, so
+    that the file shows what runs. The start and the reload themselves are in
+    tests/test_cron_reload.py."""
+
+    @staticmethod
+    def _service(workspace: Path, lockdown: bool = False):
+        system = workspace / "config" / "cron" / "system.yaml"
+        system.parent.mkdir(parents=True)
+        system.write_bytes(_FIRST_PROMPT.read_bytes())
+        service = SimpleNamespace(config=SimpleNamespace(
+            cron=SimpleNamespace(system_file=system), lockdown=lockdown, workspace=workspace,
+        ))
+        service._in_git_workspace = lambda path: CronService._in_git_workspace(service, path)
+        return service, system
+
+    def test_the_file_gets_this_releases_values(self, tmp_path, caplog):
+        service, system = self._service(tmp_path)
+        with caplog.at_level("INFO", logger="nerve.cron.service"):
+            CronService._rewrite_system_file(service)
+
+        jobs = {job["id"]: job for job in yaml.safe_load(system.read_text(encoding="utf-8"))["jobs"]}
+        assert jobs["skill-extractor"]["schedule"] == "0 5 * * *"
+        assert sorted(_said(caplog)) == [
+            "Cron job skill-extractor: its description, prompt, schedule in system.yaml were "
+            "what an earlier release shipped; the file now has this release's",
+            "Cron job skill-reviser: its prompt in system.yaml was "
+            "what an earlier release shipped; the file now has this release's",
+            "Cron job task-planner: its prompt in system.yaml was "
+            "what an earlier release shipped; the file now has this release's",
+        ]
+
+    @pytest.mark.parametrize("kept", ["lockdown", "a git workspace"])
+    def test_a_file_that_changes_through_a_repository_is_left_as_it_is(self, tmp_path, kept):
+        """Under lockdown, and in a workspace that is a git repository, where
+        a local change stops the sync."""
+        service, system = self._service(tmp_path, lockdown=kept == "lockdown")
+        if kept == "a git workspace":
+            (tmp_path / ".git").mkdir()
+        before = system.read_bytes()
+
+        CronService._rewrite_system_file(service)
+        assert system.read_bytes() == before
+
+    def test_a_failure_to_write_does_not_stop_the_scheduler(self, tmp_path, monkeypatch, caplog):
+        service, _system = self._service(tmp_path)
+
+        def refuse(path):
+            raise OSError("read-only file system")
+
+        monkeypatch.setattr("nerve.cron.service.rewrite_superseded_cron_values", refuse)
+        with caplog.at_level("WARNING", logger="nerve.cron.service"):
+            CronService._rewrite_system_file(service)
+        assert any("could not write this release's values" in r.getMessage() for r in caplog.records)

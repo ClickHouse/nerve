@@ -581,7 +581,11 @@ meant to run only reviewed config would be running local code. Commit, discard o
 push local edits; the failure message names the paths. So a skill the agent created
 at runtime, or a locally edited `SOUL.md`, blocks the merge until it is committed or
 dropped. Files matched by `.gitignore` in there are warnings rather than refusals,
-since the shared repo can never carry them.
+since the shared repo can never carry them. Nerve does not edit a reviewed file
+itself after an update: in a workspace that is a git repository, with the
+periodic sync on or off, the scheduler leaves `config/cron/system.yaml` as the
+repository has it, where it otherwise writes the new prompt of a built-in job
+into it ([cron.md](cron.md#after-a-nerve-update)).
 
 **A blocked sync says so.** Left to a log line it is invisible: the instance keeps
 answering normally while every later config change stops arriving, indefinitely.

@@ -1192,3 +1192,62 @@ class TestSourceScheduleReporting:
         rows = await service.list_jobs()
         row = next(r for r in rows if r["id"] == "source:github")
         assert row["schedule"] == "*/15 * * * *"
+
+
+class TestTheSystemFileOfAnEarlierRelease:
+    """The scheduler writes this release's values into a system.yaml that
+    holds an earlier release's: before it loads the jobs at its start, and
+    once a reload is applied. A reload that is refused changes no file."""
+
+    EARLIER = Path(__file__).parent / "fixtures" / "cron" / "system-before-daily-skill-extractor.yaml"
+
+    def _earlier_system_file(self, service, tmp_path) -> Path:
+        service.config.lockdown = False
+        service.config.workspace = tmp_path
+        service.config.memory.backend = "memu"
+        system = Path(service.config.cron.system_file)
+        system.write_bytes(self.EARLIER.read_bytes())
+        return system
+
+    @staticmethod
+    def _extractor_schedule(system: Path) -> str:
+        jobs = yaml.safe_load(system.read_text(encoding="utf-8"))["jobs"]
+        return next(job["schedule"] for job in jobs if job["id"] == "skill-extractor")
+
+    @pytest.mark.asyncio
+    async def test_an_applied_reload_writes_it(self, svc, tmp_path):
+        service, _jobs_file = svc
+        system = self._earlier_system_file(service, tmp_path)
+        assert self._extractor_schedule(system) == "0 */12 * * *"
+
+        await service.reload()
+        assert self._extractor_schedule(system) == "0 5 * * *"
+        assert next(j for j in service._jobs if j.id == "skill-extractor").schedule == "0 5 * * *"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_reload_leaves_it(self, svc, tmp_path):
+        from nerve.config import ConfigError
+
+        service, jobs_file = svc
+        system = self._earlier_system_file(service, tmp_path)
+        before = system.read_bytes()
+        jobs_file.write_text("jobs: [ this is: not valid: yaml\n", encoding="utf-8")
+
+        with pytest.raises(ConfigError):
+            await service.reload()
+        assert system.read_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_the_start_writes_it_before_it_loads_the_jobs(self, svc, monkeypatch):
+        service, _jobs_file = svc
+        calls = []
+        monkeypatch.setattr(service, "_rewrite_system_file", lambda: calls.append("write"))
+
+        def load(*args, **kwargs):
+            calls.append("load")
+            raise RuntimeError("far enough")
+
+        monkeypatch.setattr(service, "_load_merged_jobs", load)
+        with pytest.raises(RuntimeError):
+            await service.start()
+        assert calls == ["write", "load"]

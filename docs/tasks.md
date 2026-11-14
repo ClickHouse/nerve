@@ -50,7 +50,7 @@ Statuses are configurable (`task_status_list`, `task_status_create`, and the boa
 
 `pending`, `plan_review` and `done` are protected and cannot be deleted. Migration v059 adds `backlog` and `plan_review` to an existing install, before and after `pending`; a status that already has one of these names stays as it is.
 
-An install that existed before keeps the `task-planner` prompt in its `config/cron/system.yaml`, which lists all open tasks, until the Automation step writes that file again. On such an install the planner can propose a plan for a `backlog` task.
+An install that existed before has the earlier `task-planner` prompt in its `config/cron/system.yaml`, which lists all open tasks. When the scheduler starts, Nerve replaces that prompt with the current one, which lists the `pending` tasks only ([cron.md](cron.md#after-a-nerve-update)). A prompt that was edited stays, and so does a `task-planner` entry in `config/cron/jobs.yaml`: with a prompt that lists all open tasks, the planner can propose a plan for a `backlog` task.
 
 ## Agent Tools
 

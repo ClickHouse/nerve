@@ -568,8 +568,9 @@ that regenerates files. On an existing install it asks first:
 **What gets overwritten:**
 - `config.yaml` and `config.local.yaml` — regenerated from your choices (each
   is copied to `*.bak` first unless it holds nothing)
-- `<workspace>/config/cron/system.yaml` — regenerated (picks up new built-in
-  cron prompts from Nerve updates)
+- `<workspace>/config/cron/system.yaml` — regenerated. The new built-in cron
+  prompts of a Nerve update do not need this: the scheduler writes them into
+  the file itself ([cron.md](cron.md#after-a-nerve-update))
 
 **What's preserved:**
 - All workspace files (`SOUL.md`, `IDENTITY.md`, `USER.md`, `MEMORY.md`, skills, tasks, etc.)
