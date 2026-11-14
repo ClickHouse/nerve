@@ -71,6 +71,15 @@ export function FilesPage() {
 
   const currentFile = openFiles.find(f => f.path === activeFile);
 
+  const closeWithUnsavedWarning = (path: string) => {
+    if (saving) return;
+    const tab = openFiles.find(f => f.path === path);
+    if (tab?.modified && !window.confirm(
+      `Close ${tab.name}? Unsaved changes will be lost.`,
+    )) return;
+    closeFile(path);
+  };
+
   return (
     <div className="h-full flex flex-col">
       {isMobile && (
@@ -99,7 +108,7 @@ export function FilesPage() {
             files={openFiles}
             activePath={activeFile}
             onSelect={setActiveFile}
-            onClose={closeFile}
+            onClose={closeWithUnsavedWarning}
           />
 
           {currentFile ? (
@@ -109,6 +118,7 @@ export function FilesPage() {
               modified={currentFile.modified}
               readOnly={currentFile.readOnly}
               saving={saving}
+              saveError={currentFile.saveError}
               onContentChange={(c) => updateContent(currentFile.path, c)}
               onSave={() => saveFile(currentFile.path)}
             />

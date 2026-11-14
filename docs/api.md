@@ -2096,14 +2096,28 @@ Response: { "deleted": false }
 List the memory files: markdown files at the workspace root and under `memory/`.
 
 #### `GET /api/memory/file/{path}`
-Read a memory file. Any other path gets 403.
-
-#### `PUT /api/memory/file/{path}`
-Write a memory file. Any other path gets 403. On a locked instance, the
-reviewed root files (`SOUL.md`, `AGENTS.md` and the others) also get 403.
+Read a memory file and its SHA-256 content revision. Returns 404 if the
+file does not exist, 403 for any path outside the allowed memory files.
 
 ```json
-Request: { "content": "# Updated content..." }
+{ "path": "memory/notes.md", "content": "# Notes", "revision": "<sha256-of-file-bytes>", "read_only": false }
+```
+
+#### `PUT /api/memory/file/{path}`
+Write a memory file. Editors should send the `revision` returned by GET
+as `expected_revision` to avoid overwriting external changes. If the
+file changed or was deleted after GET, the server returns **409 Conflict**
+without writing; reload or reconcile the changes before retrying. A
+successful save returns `{ "path": "...", "saved": true, "revision": "..." }`
+with the new SHA-256 revision.
+
+`expected_revision` is optional for backwards-compatible API callers:
+omitting it retains unconditional overwrite semantics. Paths outside the
+allowed memory files return 403, as do reviewed root files (such as
+`SOUL.md` and `AGENTS.md`) on locked instances.
+
+```json
+{ "content": "# Updated content...", "expected_revision": "<revision-from-GET>" }
 ```
 
 ### memU Semantic Memory

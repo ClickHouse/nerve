@@ -1694,11 +1694,11 @@ export const api = {
   // Memory
   listMemoryFiles: () => request<{ files: any[] }>('/memory/files'),
   readMemoryFile: (path: string) =>
-    request<{ path: string; content: string; read_only?: boolean }>(`/memory/file/${path}`),
-  writeMemoryFile: (path: string, content: string) =>
-    request<any>(`/memory/file/${path}`, {
+    request<{ path: string; content: string; revision: string; read_only?: boolean }>(`/memory/file/${path}`),
+  writeMemoryFile: (path: string, content: string, expectedRevision: string) =>
+    request<{ path: string; saved: boolean; revision: string }>(`/memory/file/${path}`, {
       method: 'PUT',
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({ content, expected_revision: expectedRevision }),
     }),
 
   // memU

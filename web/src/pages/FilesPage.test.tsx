@@ -29,7 +29,7 @@ beforeEach(() => {
       { path: 'README.md', name: 'README.md', size: 10 },
     ],
   });
-  readMemoryFile.mockImplementation(async (path: string) => ({ path, content: `# ${path}` }));
+  readMemoryFile.mockImplementation(async (path: string) => ({ path, content: `# ${path}`, revision: 'test-revision' }));
 });
 
 /** Render the page and wait for the tree to load. */
@@ -76,6 +76,7 @@ describe('FilesPage on a phone', () => {
       openFiles: [{
         path: 'README.md', name: 'README.md', content: '# README.md',
         originalContent: '# README.md', modified: false, readOnly: false,
+        revision: 'test-revision', saveError: null,
       }],
       activeFile: 'README.md',
     });
@@ -91,6 +92,25 @@ describe('FilesPage on a phone', () => {
 });
 
 describe('FilesPage on a desktop', () => {
+
+  it('keeps unsaved edits when closing a modified tab is cancelled', async () => {
+    await renderPage();
+    await userEvent.click(screen.getByRole('button', { name: 'README.md' }));
+    const editor = await screen.findByDisplayValue('# README.md');
+    await userEvent.type(editor, ' updated');
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    try {
+      await userEvent.click(screen.getByRole('button', { name: 'Close README.md' }));
+      expect(confirm).toHaveBeenCalled();
+      expect(screen.getByDisplayValue('# README.md updated')).toBeInTheDocument();
+      confirm.mockReturnValue(true);
+      await userEvent.click(screen.getByRole('button', { name: 'Close README.md' }));
+      expect(screen.queryByDisplayValue('# README.md updated')).not.toBeInTheDocument();
+    } finally {
+      confirm.mockRestore();
+    }
+  });
+
   it('shows the tree beside the editor, with no toggle', async () => {
     await renderPage();
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
