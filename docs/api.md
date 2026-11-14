@@ -2409,7 +2409,10 @@ fresh.
 // stops over REST (POST /api/sessions/{id}/stop) to get the structured result.
 { type: "stop", session_id: "main" }
 
-// Switch active session (drops this socket's agent subscriptions)
+// Switch active session (drops this socket's agent subscriptions). A session
+// that does not exist, or a session_id that is no string, answers
+// { type: "session_not_found", session_id } and changes nothing: the socket
+// stays open and follows the session it followed.
 { type: "switch_session", session_id: "abc123" }
 
 // Follow one agent's live transcript (agent_event frames) / stop following.
@@ -2482,6 +2485,8 @@ those for another session. Events marked *global* go to every socket.
 // With client_msg_id, a tab that queued the message behind a running turn
 // puts the text back in the composer and keeps streaming that turn.
 { type: "error", session_id: "main", error: "...", client_msg_id: "4b6f…" | null }
+// A message for a session that does not exist is refused the same way, with
+// the session_id of the message, and the socket stays open.
 
 // An autonomous turn starts (the runtime resumed after background work
 // settled). triggers names the agents that settled since the last turn
@@ -2499,6 +2504,12 @@ those for another session. Events marked *global* go to every socket.
 // status, the agent snapshot, and the turn's buffered events when a turn runs
 { type: "session_status", session_id: "abc123", is_running: true, status: "active", buffered_events?: [...], agents: AgentSnapshot }
 { type: "session_switched", session_id: "abc123" }
+// The answer to a switch_session that names a session that does not exist: a
+// link that outlived its session, or a session deleted in another tab. The
+// web UI shows a notice in place of the chat. It names the session again at
+// every connect, as it does for any session on screen, and a session_status
+// for it ends the notice.
+{ type: "session_not_found", session_id: "abc123" }
 
 // Turn boundary (global): is_running is the orchestrator's turn only;
 // has_background_tasks / background_count are live agents

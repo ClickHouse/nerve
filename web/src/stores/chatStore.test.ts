@@ -955,3 +955,212 @@ describe('agent tabs', () => {
     expect(ids.filter(id => id.startsWith('t'))).toEqual(['t3', 't4', 't5', 't6', 't7']);
   });
 });
+
+describe('a session that the server does not have', () => {
+  beforeEach(() => onSession({ activeSession: 'gone1234', missingSession: null, loading: true }));
+
+  it('is marked when the server answers the switch, and loading ends', () => {
+    dispatch({ type: 'session_not_found', session_id: 'gone1234' });
+
+    expect(useChatStore.getState().missingSession).toBe('gone1234');
+    expect(useChatStore.getState().loading).toBe(false);
+  });
+
+  it('is not marked by the answer for a session that is no longer on screen', () => {
+    useChatStore.setState({ activeSession: SID });
+
+    dispatch({ type: 'session_not_found', session_id: 'gone1234' });
+
+    expect(useChatStore.getState().missingSession).toBeNull();
+    expect(useChatStore.getState().loading).toBe(true);
+  });
+
+  it('leaves nothing of the session in the view', () => {
+    // A tab that was open on the session learns at a reconnect that it is gone.
+    useChatStore.setState({
+      messages: [{ role: 'user', blocks: [{ type: 'text', content: 'Sort the inbox.' }] }] as never,
+      isStreaming: true, agentStatus: { state: 'thinking' },
+      streamingBlocks: [{ type: 'text', content: 'On it' }] as never,
+      currentTodos: [{ content: 'Sort', status: 'pending' }] as never,
+      contextUsage: { used: 1, max: 2 } as never,
+      pendingInteraction: { interactionId: 'i-1' } as never,
+      modifiedFiles: [{ path: 'a.txt' }] as never, modifiedFilesCount: 1,
+      sessionTasks: [{ id: 't-1' }] as never,
+    });
+    useChatStore.getState().openAgentsPanel();
+    useAgentStore.getState().hydrate(fx.makeSnapshot([fx.FX_RUNNING]));
+
+    dispatch({ type: 'session_not_found', session_id: 'gone1234' });
+
+    const state = useChatStore.getState();
+    expect(state.messages).toEqual([]);
+    expect(state.isStreaming).toBe(false);
+    expect(state.agentStatus).toEqual({ state: 'idle' });
+    expect(state.streamingBlocks).toEqual([]);
+    expect(state.currentTodos).toEqual([]);
+    expect(state.contextUsage).toBeNull();
+    expect(state.pendingInteraction).toBeNull();
+    expect(state.modifiedFilesCount).toBe(0);
+    expect(state.sessionTasks).toBeNull();
+    expect(state.panels).toEqual([]);
+    expect(state.panelVisible).toBe(false);
+    expect(useAgentStore.getState().agents).toEqual({});
+  });
+
+  it('writes what the composer holds to the draft before the composer goes out of sight', () => {
+    const flush = vi.fn(() => useChatStore.getState().setDraft('gone1234', 'half a thought'));
+    const unregister = registerComposerFlush(flush);
+    try {
+      dispatch({ type: 'session_not_found', session_id: 'gone1234' });
+    } finally {
+      unregister();
+    }
+
+    expect(flush).toHaveBeenCalledOnce();
+    expect(useChatStore.getState().drafts.gone1234).toBe('half a thought');
+  });
+
+  it('is not marked, and the view is not emptied, by an answer that names no session', () => {
+    // The server answers a frame whose session_id is no session ID.
+    useChatStore.setState({
+      messages: [{ role: 'user', blocks: [{ type: 'text', content: 'Sort the inbox.' }] }] as never,
+    });
+
+    for (const id of [null, '', 0, false]) dispatch({ type: 'session_not_found', session_id: id as never });
+
+    expect(useChatStore.getState().missingSession).toBeNull();
+    expect(useChatStore.getState().messages).toHaveLength(1);
+    expect(useChatStore.getState().loading).toBe(true);
+  });
+
+  it('is opened again when it runs, since it exists then', async () => {
+    dispatch({ type: 'session_not_found', session_id: 'gone1234' });
+    vi.mocked(ws.switchSession).mockClear();
+    vi.mocked(api.getMessages).mockResolvedValueOnce({
+      messages: [{ id: 1, role: 'user', content: 'Run the nightly report.', created_at: '2026-08-05T02:00:00Z' }],
+    } as never);
+
+    dispatch({ type: 'session_running', session_id: 'gone1234', is_running: true } as never);
+
+    expect(useChatStore.getState().missingSession).toBeNull();
+    expect(ws.switchSession).toHaveBeenCalledWith('gone1234');
+    await vi.waitFor(() => expect(useChatStore.getState().messages).toHaveLength(1));
+    // The switch, not the event, decides what the view shows.
+    expect(useChatStore.getState().isStreaming).toBe(false);
+    // The same event for a session that is not missing opens nothing.
+    vi.mocked(ws.switchSession).mockClear();
+    dispatch({ type: 'session_running', session_id: 'gone1234', is_running: false } as never);
+    expect(ws.switchSession).not.toHaveBeenCalled();
+  });
+
+  it('gives its row the running state of the event that opens it again', () => {
+    useChatStore.setState({ sessions: [row('gone1234'), row('s-other')] as never });
+    dispatch({ type: 'session_not_found', session_id: 'gone1234' });
+
+    dispatch({
+      type: 'session_running', session_id: 'gone1234', is_running: true,
+      has_background_tasks: true, background_count: 2,
+    } as never);
+
+    const listed = useChatStore.getState().sessions.find(sess => sess.id === 'gone1234')!;
+    expect(listed.is_running).toBe(true);
+    expect(listed.background_count).toBe(2);
+  });
+
+  it('is forgotten when another session opens', async () => {
+    dispatch({ type: 'session_not_found', session_id: 'gone1234' });
+
+    await useChatStore.getState().switchSession('s-other');
+
+    expect(useChatStore.getState().missingSession).toBeNull();
+    expect(ws.switchSession).toHaveBeenCalledWith('s-other');
+  });
+
+  it('is named again when the socket opens, since it can exist by now', () => {
+    dispatch({ type: 'session_not_found', session_id: 'gone1234' });
+    vi.mocked(ws.switchSession).mockClear();
+
+    onSocketOpen?.();
+
+    expect(ws.switchSession).toHaveBeenCalledWith('gone1234');
+    // The same answer keeps the mark; the status of the session clears it.
+    dispatch({ type: 'session_not_found', session_id: 'gone1234' });
+    expect(useChatStore.getState().missingSession).toBe('gone1234');
+    dispatch({ type: 'session_status', session_id: 'gone1234', is_running: false });
+    expect(useChatStore.getState().missingSession).toBeNull();
+    expect(onSocketOpen).toBeTypeOf('function');
+  });
+
+  it('is named again when its address is opened again', async () => {
+    dispatch({ type: 'session_not_found', session_id: 'gone1234' });
+    vi.mocked(ws.switchSession).mockClear();
+
+    await useChatStore.getState().switchSession('gone1234');
+
+    expect(useChatStore.getState().missingSession).toBeNull();
+    expect(ws.switchSession).toHaveBeenCalledWith('gone1234');
+  });
+});
+
+describe('a new chat from a session that does not exist', () => {
+  beforeEach(() => {
+    onSession({ activeSession: 'gone1234', missingSession: 'gone1234', drafts: { gone1234: 'half a thought' } });
+    vi.mocked(api.getMessages).mockResolvedValue({ messages: [] } as never);
+  });
+
+  it('takes what was typed for the session', async () => {
+    await useChatStore.getState().createSession();
+
+    const { virtualSession, activeSession, drafts } = useChatStore.getState();
+    expect(virtualSession).not.toBeNull();
+    expect(activeSession).toBe(virtualSession!.id);
+    expect(drafts[virtualSession!.id]).toBe('half a thought');
+    expect(drafts.gone1234).toBe('');
+  });
+
+  it('puts it after the text that an unsent chat holds already', async () => {
+    useChatStore.setState({
+      virtualSession: { id: 'v-1', title: '', source: 'web', updated_at: '' },
+      drafts: { 'v-1': 'older unsent prompt', gone1234: 'important reply' },
+    });
+
+    await useChatStore.getState().createSession();
+
+    const { activeSession, drafts } = useChatStore.getState();
+    expect(activeSession).toBe('v-1');
+    expect(drafts['v-1']).toBe('older unsent prompt\n\nimportant reply');
+    expect(drafts.gone1234).toBe('');
+  });
+
+  it('leaves the text alone when the unsent chat is the one marked missing', async () => {
+    // No flow marks an unsent chat missing; the move must not eat the text if one did.
+    useChatStore.setState({
+      activeSession: 'v-1', missingSession: 'v-1',
+      virtualSession: { id: 'v-1', title: '', source: 'web', updated_at: '' },
+      drafts: { 'v-1': 'half a thought' },
+    });
+
+    await useChatStore.getState().createSession();
+
+    expect(useChatStore.getState().drafts['v-1']).toBe('half a thought');
+  });
+
+  it('moves nothing when nothing was typed', async () => {
+    useChatStore.setState({ drafts: { gone1234: '   ' } });
+
+    await useChatStore.getState().createSession();
+
+    const { virtualSession, drafts } = useChatStore.getState();
+    expect(drafts[virtualSession!.id] ?? '').toBe('');
+  });
+
+  it('leaves the draft of a session that exists where it is', async () => {
+    onSession({ drafts: { [SID]: 'kept here' } });
+
+    await useChatStore.getState().createSession();
+
+    const { virtualSession, drafts } = useChatStore.getState();
+    expect(drafts[SID]).toBe('kept here');
+    expect(drafts[virtualSession!.id] ?? '').toBe('');
+  });
+});
