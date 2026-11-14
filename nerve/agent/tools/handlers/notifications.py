@@ -42,13 +42,40 @@ from nerve.agent.tools.schemas import (
 
 logger = logging.getLogger(__name__)
 
+# Fenced blocks, then inline code spans: text the model means literally.
+_CODE_RE = re.compile(r"```.*?```|`[^`\n]*`", re.DOTALL)
+_ESCAPED_NEWLINE_RE = re.compile(r"\\r\\n|\\n")
+
+
+def unescape_newlines(text):
+    """Turn a literal ``\\n`` the model wrote into a real line break.
+
+    Models sometimes escape a string twice, so the user reads
+    ``…card X\\n\\nIs Y a colleague…`` instead of two paragraphs. Code spans
+    and fenced blocks are kept as written: ``\\n`` there is usually meant.
+    A fenced block with no real line break is escaped too, so it is fixed.
+    """
+    if not isinstance(text, str) or "\\n" not in text:
+        return text
+    out: list[str] = []
+    pos = 0
+    for m in _CODE_RE.finditer(text):
+        out.append(_ESCAPED_NEWLINE_RE.sub("\n", text[pos:m.start()]))
+        code = m.group(0)
+        if code.startswith("```") and "\n" not in code:
+            code = _ESCAPED_NEWLINE_RE.sub("\n", code)
+        out.append(code)
+        pos = m.end()
+    out.append(_ESCAPED_NEWLINE_RE.sub("\n", text[pos:]))
+    return "".join(out)
+
 
 async def notify_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if not ctx.notification_service:
         return ToolResult.text("Notification service not available.")
 
-    title = args.get("title", "")
-    body = args.get("body", "")
+    title = unescape_newlines(args.get("title", ""))
+    body = unescape_newlines(args.get("body", ""))
     priority = args.get("priority", "normal")
     force = bool(args.get("force", False))
 
@@ -130,8 +157,8 @@ async def ask_user_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if not ctx.notification_service:
         return ToolResult.text("Notification service not available.")
 
-    title = args["title"]
-    body = args.get("body", "")
+    title = unescape_newlines(args["title"])
+    body = unescape_newlines(args.get("body", ""))
     options_raw = args.get("options", "")
     # Parse options: accept JSON array, comma-separated string, or already-parsed list
     options: list[str] = []
@@ -219,7 +246,8 @@ async def propose_action_handler(ctx: ToolContext, args: dict) -> ToolResult:
             "propose_action: target_kind, target_id, and title are required."
         )
 
-    body = args.get("body", "")
+    title = unescape_newlines(title)
+    body = unescape_newlines(args.get("body", ""))
     options = _parse_action_options(args.get("options"))
     priority = args.get("priority", "high")
     expires_at = args.get("expires_at") or None
@@ -471,7 +499,7 @@ async def send_channel_message_handler(ctx: ToolContext, args: dict) -> ToolResu
 
     channel = args.get("channel", "").strip()
     target = args.get("target", "").strip()
-    text = args.get("text", "")
+    text = unescape_newlines(args.get("text", ""))
 
     if not channel:
         return ToolResult.text("Error: channel is required.", is_error=True)
