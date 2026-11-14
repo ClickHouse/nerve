@@ -13,7 +13,7 @@ git-syncable workspace subtree):
 
 | File | Purpose | Managed by |
 |------|---------|------------|
-| `system.yaml` | Built-in crons (core + productivity) | The Mode step of setup writes it (or `nerve init --terminal`); the Automation step flips its `enabled` flags — safe to regenerate with `nerve init --terminal` |
+| `system.yaml` | Built-in crons (core + productivity) | The Mode step of setup writes it (or `nerve init --terminal`); the Automation step flips its `enabled` flags; after a Nerve update the scheduler writes the new schedule, description or prompt of a built-in job into it (see [After a Nerve update](#after-a-nerve-update)) — safe to regenerate with `nerve init --terminal` |
 | `jobs.yaml` | Your custom crons | You. Nerve changes only the `enabled` flag of a job, when you switch it on the Cron page (see [Switching a job on and off](#switching-a-job-on-and-off)) |
 
 > **Location & migration.** New installs write cron config to
@@ -30,7 +30,7 @@ Both files use the same format. On startup, CronService loads and merges both:
 - If a job ID appears in both files, the **user version wins** (with a warning in the log).
 - Old installs with everything in `jobs.yaml` still work — if `system.yaml` doesn't exist, all jobs load from `jobs.yaml`.
 
-Running `nerve init --terminal` on an existing install regenerates `system.yaml` (e.g., to pick up updated prompts from a Nerve update) without touching `jobs.yaml`. The default `nerve init` leaves it alone, and the setup page's Automation step only changes which optional jobs are enabled.
+Running `nerve init --terminal` on an existing install regenerates `system.yaml` without touching `jobs.yaml`. The default `nerve init` leaves it alone, and the setup page's Automation step only changes which optional jobs are enabled. A Nerve update that changes the schedule, the description or the prompt of a built-in job needs none of them: the scheduler writes the new value into `system.yaml` when it starts and when it reloads, and never changes `jobs.yaml` (see [After a Nerve update](#after-a-nerve-update)).
 
 ### Hot-reload (no restart)
 
@@ -70,6 +70,10 @@ Notes:
   typo. `GET /api/cron/jobs` still lists the job, with a null `next_run`.
 - `show_session_label` is **restart-only**: changing it and reloading has no
   effect until the daemon restarts.
+- Once a reload is applied, Nerve writes this release's values into a
+  `system.yaml` that still holds what an earlier release wrote for a built-in
+  job (see [After a Nerve update](#after-a-nerve-update)). A reload that is
+  refused changes no file.
 
 ## Job Definition
 
@@ -779,7 +783,7 @@ nerve doctor
 
 ## Built-in System Crons
 
-These ship in `<workspace>/config/cron/system.yaml`, written when the mode is chosen (the setup page's Mode step, or `nerve init --terminal`). Running `nerve init --terminal` regenerates this file (e.g., to pick up updated prompts from a Nerve update) without touching your custom `jobs.yaml`.
+These ship in `<workspace>/config/cron/system.yaml`, written when the mode is chosen (the setup page's Mode step, or `nerve init --terminal`). Running `nerve init --terminal` regenerates this file without touching your custom `jobs.yaml`. What a Nerve update changes in a built-in job reaches the file without that (see [After a Nerve update](#after-a-nerve-update)).
 
 | Job | Schedule | Session Mode | Description | Personal | Worker |
 |-----|----------|-------------|-------------|:--------:|:------:|
@@ -811,7 +815,7 @@ These ship in `<workspace>/config/cron/system.yaml`, written when the mode is ch
 - On a platform that parks an idle machine, the machine is not woken for the job while it waits (see [What runs next](#what-runs-next)).
 - **Run now** starts the job whatever the gate says.
 
-`system.yaml` states none of these gates. The scheduler gives them to an entry of the four jobs that has neither `run_if` nor `skip_when_idle`, the gate on activity in the form for the configured memory backend, and logs one line for each job when it loads the file. Nothing writes `system.yaml` again when Nerve is updated, so this is how an install from before the gates has them, and how a later change to them reaches every install.
+`system.yaml` states none of these gates. The scheduler gives them to an entry of the four jobs that has neither `run_if` nor `skip_when_idle`, the gate on activity in the form for the configured memory backend, and logs one line for each job when it loads the file. This is how an install from before the gates has them, and how a later change to them reaches every install. Nerve never writes them into the file, also not when it writes what a Nerve update changed in a job (see [After a Nerve update](#after-a-nerve-update)): a Nerve from before a gate type refuses a job that names it, so a file with the gates could not go back a release.
 
 | The entry in `system.yaml` | What runs |
 |---|---|
@@ -836,13 +840,40 @@ A `run_if` of its own replaces every default gate of the job. So to have `skill-
 
 An old install that keeps every job in `jobs.yaml`, with no `system.yaml`, is not changed; an entry there can state the gates in the same way. `inbox-processor` and `task-planner` have their gates in the file, and an entry of theirs without one runs on every schedule. Only the scheduler gives the default: `nerve config validate` and `nerve doctor` read the file as it is.
 
-`machine-maintenance` is on by default and optional in both modes: switch it off on the Automation step of the setup page, or with a job of the same id in `jobs.yaml`. Its prompt is general on purpose: the agent learns what each machine has on each run. To keep an item out of its reach, write it in `TOOLS.md` or ask the agent to remember it; the job reads both before it acts. Its gate waits for the agent's work, not for what else fills the machine. Where people or other programs fill it too, write `run_if: []` in the job's entry in `system.yaml` and run `nerve reload`: the job then runs every week. Whatever writes `system.yaml` again, as `nerve init --terminal` does, writes it without that key. A job with the same id in `jobs.yaml` is not written again, and runs without the default gate.
+`machine-maintenance` is on by default and optional in both modes: switch it off on the Automation step of the setup page, or with a job of the same id in `jobs.yaml`. Its prompt is general on purpose: the agent learns what each machine has on each run. To keep an item out of its reach, write it in `TOOLS.md` or ask the agent to remember it; the job reads both before it acts. Its gate waits for the agent's work, not for what else fills the machine. Where people or other programs fill it too, write `run_if: []` in the job's entry in `system.yaml` and run `nerve reload`: the job then runs every week. `nerve init --terminal`, which writes the whole file again, writes it without that key; what the scheduler writes into the file after a Nerve update keeps it (see [After a Nerve update](#after-a-nerve-update)). A job with the same id in `jobs.yaml` is not written again, and runs without the default gate.
 
 `skill-extractor` creates its task with `source="skill-extractor"` and the tag `skill-proposal`, and proposes its plan with `plan_type="skill-create"`. Its prompt has it check the existing skills and what was proposed before, and propose nothing that a skill covers or that was proposed before, whether that proposal waits for review, was declined or ended with no skill. The tag is how it finds earlier proposals: `task_list` with the status `all`, the tag and a limit of 1000 lists their tasks whatever became of the plans; `plan_list` adds the plans in review and the declined ones, up to 100 of each. When a skill plan is approved, an `impl-<id>` session is spawned like for any plan, with a prompt for its plan type (see [Skill Proposals](plans.md#skill-proposals)). For a `skill-create` plan the prompt has the session write the skill itself, within the plan's direction: look at the evidence the plan names and at the existing skills, decide the name, the description and the content, and call `skill_create`. When the evidence does not support a skill, the session is to create none and tell the user why with `notify`. A `skill-update` plan holds the full revised SKILL.md, and the session applies it with `skill_update`. Both close the task with `task_done`.
 
-`skill-extractor` runs at the same time as `memory-maintenance`, so a machine that is parked while idle is woken once for both. Earlier releases ran it every 12 hours, let it propose up to two skills a run, and had it put the full SKILL.md into the plan. Nothing writes `system.yaml` again when Nerve is updated, so the scheduler loads an entry of the job in that file that still holds what an earlier release shipped with the current schedule, description and prompt. It logs one line for the job, and `nerve cron` lists the job with its current description. Each of the three is replaced on its own, and only when it is what a release shipped, the whitespace around it aside: an edited schedule or prompt stays, and a `prompt_file` is still the prompt that is sent. The file itself is not changed, so it still shows the earlier values.
+`skill-extractor` runs at the same time as `memory-maintenance`, so a machine that is parked while idle is woken once for both.
 
-An entry in `jobs.yaml` is yours, and this never changes it. To run `skill-extractor` on another schedule, the earlier one included, put a job with the same id there. Such an entry has none of the default gates: state them in its `run_if`, as shown above, to keep them. An install from before `system.yaml` has its built-in jobs in `jobs.yaml`, as that release wrote them; they replace the ones in `system.yaml` and are loaded as written. The scheduler logs a line for such an entry while it holds the earlier prompt. The Automation step of the setup page marks a job that `jobs.yaml` replaces as set there, and shows the built-in job's schedule and description beside it, not the entry's. To get the job as this release ships it, remove the entry from `jobs.yaml` once the install has a `system.yaml`: the job then runs from `system.yaml`, which also says whether it is enabled.
+### After a Nerve update
+
+A Nerve update can change the schedule, the description or the prompt of a built-in job. `system.yaml` is written when the mode is chosen, so the file of an install from before such a change has the earlier value. The jobs that have changed so far:
+
+- `skill-extractor`: earlier releases ran it every 12 hours, let it propose up to two skills a run, and had it put the full SKILL.md into the plan. The earliest also had it send a notification of its own after it proposed.
+- `skill-reviser`: earlier releases had it send a notification of its own after it proposed. `plan_propose` sends one now.
+- `task-planner`: the earliest releases had it look at every open task and send a notification of its own. Later ones had it look at the `pending` tasks only, as now, and did not ask for a summary of the plan yet.
+
+When the scheduler starts, and after every reload that it applies, Nerve writes this release's values into `system.yaml`, so that the file shows what runs:
+
+- In each entry of a built-in job, the schedule, the description and the inline prompt are replaced. Each of the three is replaced on its own, and only when it is what an earlier release shipped, the whitespace around it aside: a schedule or prompt that you edited stays. A `prompt_file` is still the prompt that is sent. The inline prompt of an entry with a `workflow` is never sent, and stays.
+- Everything else in the file stays as it is: the comment at its top, the other keys of an entry (`enabled`, `model`, a `run_if` of its own) and the other jobs.
+- The log has one line for each job whose entry was written. A file that has the current values is not written again, and a reload that is refused writes nothing.
+
+Nerve writes a YAML file as a whole and does not keep the comments and the layout of the file it read. So it writes `system.yaml` only when that loses nothing: the text after the comment at the top must be exactly what Nerve writes for its content. A `system.yaml` from the installer is in that form, also after the Automation step or the **Active** switch of the Cron page changed an `enabled` flag in it. A file with a comment between the jobs, a prompt as a block scalar, other quotes or Windows line endings was edited, and is left as written. So is a file that is read-only.
+
+Nerve also writes nothing under [lockdown](config.md#lockdown-remote-only-read-only), and nothing into the `config/` of a workspace that is a git repository: there the file changes through the repository, and [workspace sync](config.md#git-backed-workspace-sync) and `nerve config sync` refuse to merge while a file under `config/` has a local change.
+
+In all of these cases the job still runs as this release ships it: the scheduler loads the entry with the current schedule, description and prompt, and the log has one line for each such job. Only the file still shows the earlier values. `nerve cron` lists a job with the description it runs with, and never writes the file.
+
+Two things that the scheduler gives a built-in job when it loads the file are not written into it, on purpose:
+
+- The default gates (see above). A Nerve from before a gate type refuses a job that names it, so a file with the gates could not go back a release.
+- The Loom wording of `memory-maintenance` and `inbox-processor`. It depends on `memory.backend`, which can be switched back: a file that was written for memU keeps memU's prompts, and they run in their Loom wording while the backend is Loom.
+
+What is written stays when you go back to an older Nerve: to that release the newer schedule and prompt are values that you edited, and it runs them as the file has them.
+
+An entry in `jobs.yaml` is yours: none of this changes that file, and the entry is loaded as written. To run `skill-extractor` on another schedule, the earlier one included, put a job with the same id there. Such an entry has none of the default gates: state them in its `run_if`, as shown above, to keep them. An install from before `system.yaml` has its built-in jobs in `jobs.yaml`, as that release wrote them; they replace the ones in `system.yaml` and are loaded as written. The scheduler logs a line for such an entry while it holds the earlier prompt. The Automation step of the setup page marks a job that `jobs.yaml` replaces as set there, and shows the built-in job's schedule and description beside it, not the entry's. To get the job as this release ships it, remove the entry from `jobs.yaml` once the install has a `system.yaml`: the job then runs from `system.yaml`, which also says whether it is enabled.
 
 ## Persistent Timers
 

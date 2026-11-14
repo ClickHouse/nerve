@@ -1368,12 +1368,15 @@ def _other_maintenance_crons(job_id: str) -> list[str]:
 # Run gates that a built-in job has without ``system.yaml`` stating them: the
 # scheduler gives them to an entry of the job that has no ``run_if``
 # (:func:`default_run_if`). Unlike the gates of inbox-processor and
-# task-planner, they are not written into the file:
+# task-planner, they are not written into the file: not by setup, and not
+# when the scheduler writes this release's values over what an earlier
+# release wrote (:func:`rewrite_superseded_cron_values`).
 #
-# * nothing writes ``system.yaml`` again when Nerve is updated, so a gate
-#   written there never changes, and an install from before it never has it;
-# * a Nerve that predates a gate type refuses a job that names it, so a file
+# * A Nerve that predates a gate type refuses a job that names it, so a file
 #   with the gate could not go back to the release before.
+# * Given at the load, a gate reaches every install, and a later change to it
+#   too: also an entry that was edited, and a file that is never written
+#   again (lockdown, a workspace that is a git repository).
 _DEFAULT_RUN_IF: dict[str, list[dict[str, Any]]] = {
     # Nothing to clean up while the agent has done nothing since the last
     # run. The prompt reviews the records of the day before the run, so what
@@ -1450,12 +1453,20 @@ def loom_wording_of_shipped_job(
 
 
 # What earlier releases shipped for a built-in job where this release ships
-# something else, by job id and key. Nothing writes ``system.yaml`` again when
-# Nerve is updated, so the scheduler loads an entry of that file that still
-# has one of these values with the current one
-# (:func:`current_values_of_shipped_job`). A value that is not listed here
-# was edited, and is left alone; so is every entry in ``jobs.yaml``, which is
-# the operator's file. Texts are compared without the whitespace around them.
+# something else, by job id and key. An entry of ``system.yaml`` that still
+# has one of these values gets the current one
+# (:func:`current_values_of_shipped_job`): the scheduler writes it into the
+# file when it starts and when it reloads
+# (:func:`rewrite_superseded_cron_values`), and loads the entry with it where
+# the file is left as written. A value that is not listed here was edited,
+# and is left alone; so is every entry in ``jobs.yaml``, which is the
+# operator's file. Texts are compared without the whitespace around them.
+#
+# A change to the schedule, the description or the prompt of a built-in job
+# needs the value it replaces here: without it, the installs that have that
+# value keep it. tests/test_setup_writer.py records a digest of each current
+# value and fails when one changes. The earlier texts are written out here,
+# never taken from the catalogue: they stay what they were when it changes.
 _SKILL_EXTRACTOR_STEPS_BEFORE_DAILY = (
     "You are a skill extraction agent. Identify repeated workflows from recent activity and propose new skills.\n\n"
     "1. Recall recent behavior patterns and events\n"
@@ -1463,6 +1474,28 @@ _SKILL_EXTRACTOR_STEPS_BEFORE_DAILY = (
     "3. Look for repeated tool sequences, domain knowledge clusters, and reusable patterns\n"
     "4. For each candidate (max 2): create a task and propose a plan with the full SKILL.md\n\n"
     "If no candidates found, say so and stop.\n"
+)
+# The reviser's earlier prompt up to its last sentence.
+_EARLIER_SKILL_REVISER_STEPS = (
+    "You are a skill revision agent. Review existing skills and propose improvements.\n\n"
+    "1. Load all skills and their content\n"
+    "2. Check accuracy (outdated paths, commands, URLs)\n"
+    "3. Check completeness (missing steps, known gotchas)\n"
+    "4. Check quality (clear descriptions, good trigger phrases)\n"
+    "5. For skills needing changes (max 3): create task + propose plan with updated SKILL.md\n\n"
+    "If all skills look good, say so and stop.\n"
+)
+# What the planner's two earlier prompts share: what came before the first
+# step, and what came between it and the last sentence.
+_EARLIER_TASK_PLANNER_OPENING = (
+    "You are a proactive planning agent. Your job is to find a task worth working on "
+    "and produce an implementation plan.\n\n"
+)
+_EARLIER_TASK_PLANNER_STEPS = (
+    "2. Use plan_list to see which tasks already have plans — skip those\n"
+    "3. Pick ONE task and explore the relevant codebase\n"
+    "4. Call plan_propose(task_id, content) with your plan\n\n"
+    "If all tasks have plans or none are actionable, say so and stop.\n\n"
 )
 _SUPERSEDED_CRON_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
     "skill-extractor": {
@@ -1478,6 +1511,31 @@ _SUPERSEDED_CRON_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
             # The second: plan_propose had begun to notify.
             _SKILL_EXTRACTOR_STEPS_BEFORE_DAILY
             + "plan_propose notifies the user with a link to each plan. "
+            "Do not send another notification about it.\n",
+        ),
+    },
+    # The schedule and the description of the two jobs below never changed.
+    "skill-reviser": {
+        "prompt": (
+            # Until plan_propose began to notify.
+            _EARLIER_SKILL_REVISER_STEPS
+            + "After proposing, use `notify` to alert the user.\n",
+        ),
+    },
+    "task-planner": {
+        "prompt": (
+            # The first form: every open task, and a notification of its own.
+            _EARLIER_TASK_PLANNER_OPENING
+            + "1. Use task_list to browse open tasks\n"
+            + _EARLIER_TASK_PLANNER_STEPS
+            + "After proposing a plan, use `notify` to alert the user.\n",
+            # The second: only the tasks that are ready for work, and
+            # plan_propose had begun to notify. It did not ask for a plan
+            # summary yet.
+            _EARLIER_TASK_PLANNER_OPENING
+            + "1. Use task_list(status=\"pending\") to browse the tasks that are ready for work\n"
+            + _EARLIER_TASK_PLANNER_STEPS
+            + "plan_propose notifies the user with a link to the plan. "
             "Do not send another notification about it.\n",
         ),
     },
@@ -1934,6 +1992,68 @@ def plan_cron_job_enabled(path: Path, job_id: str, enabled: bool) -> CronToggleP
         except yaml.YAMLError:
             continue
     return CronTogglePlan(path=path, text=None, problem=CRON_FILE_HAND_EDITED)
+
+
+# --- Writing this release's values over an earlier release's -------------------
+
+
+def rewrite_superseded_cron_values(system_file: Path) -> dict[str, tuple[str, ...]]:
+    """Write this release's values into a ``system.yaml`` that holds what
+    earlier releases wrote for built-in jobs, so that the file shows what
+    runs. Returns the keys that were written, by job id; empty when the file
+    was left as it is.
+
+    In every entry with an id, each of the schedule, the description and the
+    inline prompt is replaced when it is what an earlier release wrote
+    (:func:`current_values_of_shipped_job`). A value that was edited stays,
+    and so does the inline prompt of a job that launches a workflow, which is
+    never sent.
+
+    The file is dumped again for this, which would lose comments and layout.
+    So it is written only when it has none to lose: the text after the
+    comment it opens with is exactly what Nerve writes for its content. A
+    file that was edited by hand, and one that is read-only, are left as they
+    are; the scheduler loads their jobs with this release's values all the
+    same (``bring_up_to_date`` in ``nerve.cron.service``).
+
+    The default gates and the Loom wording, which the scheduler also gives a
+    built-in job, are not written: see ``_DEFAULT_RUN_IF`` and
+    :func:`loom_wording_of_shipped_job`.
+    """
+    path = Path(system_file)
+    try:
+        # Not read_text: that would read other line endings as ``\n``.
+        text = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return {}
+    opening = leading_comment(text)
+    body = text[len(opening):]
+    try:
+        document = yaml.safe_load(body)
+    except yaml.YAMLError:
+        return {}
+    if not isinstance(document, dict) or not isinstance(document.get("jobs"), list):
+        return {}
+    if yaml.safe_dump(document, default_flow_style=False, sort_keys=False) != body:
+        return {}
+    if not os.access(path, os.W_OK):
+        return {}
+
+    written: dict[str, set[str]] = {}
+    for entry in document["jobs"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+            continue
+        values = {"schedule": entry.get("schedule"), "description": entry.get("description")}
+        if entry.get("workflow") is None:
+            values["prompt"] = entry.get("prompt")
+        current = current_values_of_shipped_job(entry["id"], **values)
+        if current:
+            entry.update(current)
+            written.setdefault(entry["id"], set()).update(current)
+    if not written:
+        return {}
+    publish_text(path, opening + yaml.safe_dump(document, default_flow_style=False, sort_keys=False))
+    return {job_id: tuple(sorted(keys)) for job_id, keys in written.items()}
 
 
 _WEEKDAYS = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")

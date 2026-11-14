@@ -1542,3 +1542,159 @@ class TestHostedGitHubKeepsTheEventsSourceOff:
         assert portable["sync"]["github_events"] == {"enabled": False}
         polled = choices_from_config(NerveConfig.from_dict({"workspace": str(tmp_path / "ws")}))
         assert polled.github_mode == "poll"
+
+
+# ---------------------------------------------------------------------------
+# What earlier releases shipped, and the file that still holds it
+# ---------------------------------------------------------------------------
+
+# A worker's system.yaml from before plan_propose began to notify: the first
+# prompts of the skill extractor, the skill reviser and the task planner.
+_FIRST_PROMPTS = Path(__file__).parent / "fixtures" / "cron" / "system-with-the-first-skill-extractor-prompt.yaml"
+# The planner's second prompt: it listed the pending tasks only, and did not
+# ask for a summary of the plan yet.
+_PLANNER_SECOND_PROMPT = (
+    "You are a proactive planning agent. Your job is to find a task worth working on "
+    "and produce an implementation plan.\n\n"
+    "1. Use task_list(status=\"pending\") to browse the tasks that are ready for work\n"
+    "2. Use plan_list to see which tasks already have plans — skip those\n"
+    "3. Pick ONE task and explore the relevant codebase\n"
+    "4. Call plan_propose(task_id, content) with your plan\n\n"
+    "If all tasks have plans or none are actionable, say so and stop.\n\n"
+    "plan_propose notifies the user with a link to the plan. "
+    "Do not send another notification about it.\n"
+)
+
+
+def _shipped_job(job_id: str) -> dict:
+    return next(
+        c for c in (*setup_writer.CORE_CRONS, *setup_writer.PRODUCTIVITY_CRONS) if c["id"] == job_id
+    )
+
+
+def _jobs_of(path: Path) -> dict[str, dict]:
+    return {job["id"]: job for job in yaml.safe_load(path.read_text(encoding="utf-8"))["jobs"]}
+
+
+class TestEarlierPromptsOfTheReviserAndThePlanner:
+    """Both told the agent to send a notification of its own after a
+    proposal; the planner also listed every open task, and later proposed
+    without a summary."""
+
+    @pytest.mark.parametrize("job_id", ["skill-reviser", "task-planner"])
+    def test_the_first_prompt_becomes_the_current_one(self, job_id: str) -> None:
+        earlier, current = _jobs_of(_FIRST_PROMPTS)[job_id]["prompt"], _shipped_job(job_id)["prompt"]
+        assert earlier != current and "use `notify`" in earlier
+        assert setup_writer.current_values_of_shipped_job(job_id, prompt=earlier) == {"prompt": current}
+
+    def test_the_planners_second_prompt_becomes_the_current_one(self) -> None:
+        assert setup_writer.current_values_of_shipped_job(
+            "task-planner", prompt=_PLANNER_SECOND_PROMPT,
+        ) == {"prompt": _shipped_job("task-planner")["prompt"]}
+
+    @pytest.mark.parametrize("job_id", ["skill-reviser", "task-planner"])
+    def test_an_edited_prompt_stays(self, job_id: str) -> None:
+        assert setup_writer.current_values_of_shipped_job(job_id, prompt="Mine.") == {}
+
+
+class TestAChangedBuiltInJobNeedsItsEarlierValue:
+    """An install keeps the schedule, the description and the prompt that its
+    system.yaml was written with, unless the earlier value is in the table of
+    what earlier releases shipped. This fails when one of them changes."""
+
+    # sha256 of the stripped value, 16 hex digits: schedule, description, prompt.
+    DIGESTS = {
+        "memory-maintenance": ("d9fdb8516ce96c9a", "fce1b81d52afe073", "6479ac370490bf6f"),
+        "inbox-processor": ("03cec5ca8e0d93cd", "07583577c07d5d08", "234047458c87472d"),
+        "task-planner": ("641898abf01533c3", "f22747568bf437d6", "13ca985f3570e5c6"),
+        "skill-extractor": ("d9fdb8516ce96c9a", "c152e537f9adad0a", "510639628dc38b0e"),
+        "skill-reviser": ("5077355b926bf223", "c1d65b8f9fdfbedb", "128074108934930e"),
+        "machine-maintenance": ("f8db192e9cd0c5b1", "622965a85b99afd0", "319624dd7797863e"),
+    }
+
+    def test_the_catalogue_is_what_the_digests_record(self) -> None:
+        import hashlib
+
+        current = {
+            cron["id"]: tuple(
+                hashlib.sha256(str(cron[key]).strip().encode()).hexdigest()[:16]
+                for key in ("schedule", "description", "prompt")
+            )
+            for cron in (*setup_writer.CORE_CRONS, *setup_writer.PRODUCTIVITY_CRONS)
+        }
+        assert current == self.DIGESTS, (
+            "The schedule, the description or the prompt of a built-in job changed. "
+            "Add the value it replaces to setup_writer._SUPERSEDED_CRON_VALUES first, "
+            "so that installs that have it get the new one; then update the digest here."
+        )
+
+
+class TestRewritingAnEarlierSystemFile:
+    """The file gets this release's values where it holds what an earlier
+    release wrote, when writing it again loses nothing."""
+
+    WRITTEN = {
+        "skill-extractor": ("description", "prompt", "schedule"),
+        "skill-reviser": ("prompt",),
+        "task-planner": ("prompt",),
+    }
+
+    @staticmethod
+    def _file(tmp_path: Path) -> Path:
+        path = tmp_path / "system.yaml"
+        path.write_bytes(_FIRST_PROMPTS.read_bytes())
+        return path
+
+    def test_the_file_gets_this_releases_values(self, tmp_path: Path) -> None:
+        path = self._file(tmp_path)
+        before = _jobs_of(path)
+        opening = setup_writer.leading_comment(path.read_text(encoding="utf-8"))
+
+        assert setup_writer.rewrite_superseded_cron_values(path) == self.WRITTEN
+
+        after = _jobs_of(path)
+        assert opening and path.read_text(encoding="utf-8").startswith(opening)
+        assert list(after) == list(before)
+        for job_id, entry in before.items():
+            assert list(after[job_id]) == list(entry)
+            for key, value in entry.items():
+                if key in self.WRITTEN.get(job_id, ()):
+                    assert after[job_id][key] == _shipped_job(job_id)[key] != value
+                else:
+                    assert after[job_id][key] == value
+        # Nothing is left to replace.
+        written = path.read_bytes()
+        assert setup_writer.rewrite_superseded_cron_values(path) == {}
+        assert path.read_bytes() == written
+
+    def test_an_edited_value_stays(self, tmp_path: Path) -> None:
+        path = self._file(tmp_path)
+        text = path.read_text(encoding="utf-8")
+        assert "  schedule: 0 */12 * * *\n" in text
+        path.write_text(text.replace("  schedule: 0 */12 * * *\n", "  schedule: 0 9 * * 1\n"), encoding="utf-8")
+
+        assert setup_writer.rewrite_superseded_cron_values(path)["skill-extractor"] == ("description", "prompt")
+        assert _jobs_of(path)["skill-extractor"]["schedule"] == "0 9 * * 1"
+
+    def test_a_file_that_was_edited_by_hand_is_left_as_it_is(self, tmp_path: Path) -> None:
+        """Dumped again, it would lose the comment."""
+        path = self._file(tmp_path)
+        text = path.read_text(encoding="utf-8")
+        assert "- id: skill-extractor\n" in text
+        path.write_text(text.replace("- id: skill-extractor\n", "# Mine.\n- id: skill-extractor\n"), encoding="utf-8")
+        before = path.read_bytes()
+
+        assert setup_writer.rewrite_superseded_cron_values(path) == {}
+        assert path.read_bytes() == before
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root may write a read-only file")
+    def test_a_read_only_file_is_left_as_it_is(self, tmp_path: Path) -> None:
+        path = self._file(tmp_path)
+        path.chmod(0o444)
+        before = path.read_bytes()
+
+        assert setup_writer.rewrite_superseded_cron_values(path) == {}
+        assert path.read_bytes() == before
+
+    def test_a_missing_file_has_nothing_to_write(self, tmp_path: Path) -> None:
+        assert setup_writer.rewrite_superseded_cron_values(tmp_path / "system.yaml") == {}

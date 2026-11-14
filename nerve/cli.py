@@ -3328,7 +3328,9 @@ def cron(ctx: click.Context, job_id: str) -> None:
                 # As the daemon loads a built-in job whose system.yaml entry
                 # still holds what an earlier release shipped: the entry that
                 # runs, which is the last one with its id. It logs which job
-                # that is.
+                # that is. The daemon also writes this release's values into
+                # the file, when it starts and when it reloads; the listing
+                # writes nothing.
                 from nerve.cron.jobs import merge_jobs
                 from nerve.cron.service import bring_up_to_date
 

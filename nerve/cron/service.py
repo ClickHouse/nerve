@@ -49,6 +49,7 @@ from nerve.setup_writer import (
     default_run_if,
     plan_cron_job_enabled,
     publish_text,
+    rewrite_superseded_cron_values,
 )
 from nerve.utils.aio import GRACEFUL_STOP_SECONDS
 
@@ -517,12 +518,17 @@ def _keys_said(current: dict[str, str]) -> tuple[str, str]:
 
 def bring_up_to_date(jobs: list[CronJob]) -> None:
     """A built-in job whose entry in ``system.yaml`` still holds what an
-    earlier release shipped is loaded as this release ships it: nothing
-    writes that file again when Nerve is updated, so without this a change to
-    a built-in job's schedule or prompt reaches new installs only. Each of
-    the schedule, the description and the inline prompt is replaced when it
-    is one that an earlier release shipped; an edited one is left alone. The
-    file is not changed.
+    earlier release shipped is loaded as this release ships it. Each of the
+    schedule, the description and the inline prompt is replaced when it is
+    one that an earlier release shipped; an edited one is left alone. The
+    file is not changed here.
+
+    The scheduler also writes this release's values into the file, at its
+    start and once a reload is applied (:meth:`CronService._rewrite_system_file`).
+    This is what gives the jobs their values where the file stays as it is:
+    one that was edited, one under lockdown or in a workspace that is a git
+    repository, and a load that writes nothing (a manual run, the listing of
+    ``nerve cron``).
 
     ``jobs`` are the ``system.yaml`` entries that run. An entry in
     ``jobs.yaml`` is the operator's and is never brought up to date
@@ -656,6 +662,10 @@ class CronService:
         from nerve.cron.gate_plugins import load_gate_plugins
 
         load_gate_plugins(self.config.cron.gate_plugins_dir)
+
+        # Before the load, so that the jobs come from a file that shows what
+        # runs.
+        self._rewrite_system_file()
 
         # Load job definitions from both files
         self._jobs = self._load_merged_jobs()
@@ -812,10 +822,17 @@ class CronService:
         carry out raises with the running schedule exactly as it was. That
         covers the gate registry too; see :meth:`_reload_locked`.
 
+        Once the reload is applied, ``system.yaml`` gets this release's values
+        where it holds what an earlier release shipped for a built-in job
+        (:meth:`_rewrite_system_file`): the load has given the jobs those
+        values already. A reload that is refused changes no file.
+
         Serialized via a lock so concurrent callers (sync loop, HTTP routes)
         can't interleave scheduler mutations. The two properties are
         separate: the lock keeps two reloads from overlapping, and the planning
-        pass keeps a single failing one from applying half of itself.
+        pass keeps a single failing one from applying half of itself. The
+        write to ``system.yaml`` is under the lock too, which keeps it apart
+        from the one of :meth:`set_job_enabled`.
 
         Returns a summary dict: ``{"added", "removed", "updated", "enabled",
         "rejected"}``. ``updated`` is every enabled job that already had a
@@ -827,6 +844,9 @@ class CronService:
         """
         async with self._reload_lock:
             summary = await self._reload_locked()
+            # After the load, which raises when the reload is refused: such
+            # a reload must leave the files as they are.
+            self._rewrite_system_file()
         self._schedule_changed()
         return summary
 
@@ -1781,6 +1801,38 @@ class CronService:
 
     # -- End persistent session generations ----------------------------------
 
+    def _rewrite_system_file(self) -> None:
+        """``system.yaml`` gets this release's values where it holds what an
+        earlier release shipped for a built-in job, so that the file shows
+        what runs (:func:`nerve.setup_writer.rewrite_superseded_cron_values`):
+        at the start before the jobs are loaded, at a reload once it is
+        applied.
+
+        Not under lockdown, and not in a workspace that is a git repository:
+        there the file changes through the repository
+        (:meth:`_in_git_workspace`). The jobs of a file that is left as it is
+        have this release's values all the same (:func:`bring_up_to_date`).
+        Whatever goes wrong here, the scheduler goes on: a failure to write a
+        file must not cost the schedule.
+        """
+        system_file = self.config.cron.system_file
+        try:
+            path = Path(system_file)
+            if self.config.lockdown or self._in_git_workspace(path):
+                return
+            written = rewrite_superseded_cron_values(path)
+        except Exception as e:  # noqa: BLE001 — never at the cost of the schedule
+            logger.warning(
+                "Cron: could not write this release's values into %s: %s", system_file, e,
+            )
+            return
+        for job_id, keys in written.items():
+            logger.info(
+                "Cron job %s: its %s in system.yaml %s what an earlier release shipped; "
+                "the file now has this release's",
+                job_id, ", ".join(keys), "was" if len(keys) == 1 else "were",
+            )
+
     def _load_merged_jobs(self, strict: bool = False) -> list[CronJob]:
         """Load and merge jobs from system.yaml and jobs.yaml.
 
@@ -2703,6 +2755,18 @@ class CronService:
         return any(
             _is_within(path, reviewed)
             for reviewed in workspace_reviewed_paths(self.config.workspace)
+        )
+
+    def _in_git_workspace(self, path: Path) -> bool:
+        """Whether ``path`` is in the reviewed surface of a workspace that is
+        a git repository. A file there changes through the repository:
+        workspace sync and ``nerve config sync`` refuse to merge while it has
+        a local change."""
+        from nerve.sync_service import is_git_repo
+
+        workspace = self.config.workspace
+        return is_git_repo(workspace) and any(
+            _is_within(path, reviewed) for reviewed in workspace_reviewed_paths(workspace)
         )
 
     async def set_job_enabled(self, job_id: str, enabled: bool) -> dict:
