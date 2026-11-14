@@ -751,6 +751,7 @@ class ClaudeBackend:
                 inference_principal=spec.inference_principal,
                 inference_trigger=spec.inference_trigger,
                 inference_origin=spec.inference_origin,
+                session_id=spec.session_id,
             ),
             cwd=spec.cwd,
             # Load no filesystem settings/memory: Nerve owns the entire
@@ -856,6 +857,7 @@ class ClaudeBackend:
     def _build_env(
         self, cache_ttl: str = "5m", inference_principal: str | None = None,
         inference_trigger: str | None = None, inference_origin: str | None = None,
+        session_id: str | None = None,
     ) -> dict[str, str]:
         """Build environment variables for the SDK subprocess.
 
@@ -866,6 +868,9 @@ class ClaudeBackend:
         """
         config = self.config
         env: dict[str, str] = {}
+        # The Nerve session this CLI serves, for commands it runs.
+        if session_id:
+            env["NERVE_SESSION_ID"] = session_id
         # Prompt-cache TTL: the CLI natively supports the 1-hour TTL via
         # this env var. Resolved per client build by
         # nerve.agent.cache_policy — see that module for the policy.
