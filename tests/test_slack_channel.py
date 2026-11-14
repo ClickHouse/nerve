@@ -289,6 +289,21 @@ class TestNotificationDelivery:
         )
 
     @pytest.mark.asyncio
+    async def test_the_text_beside_the_blocks_is_mrkdwn(self):
+        """Slack shows it in a toast and a push notification, where a
+        Markdown link would show with its brackets and its address."""
+        channel = _channel(allow_channels=["C0456DEF"])
+        text = "**Done**\n\nSession: [Nightly report](https://nerve.example.com/chat/s1)"
+
+        await channel.post_notification("n1", text)
+
+        posted = channel._web.chat_postMessage.await_args.kwargs
+        assert posted["text"] == "*Done*\n\nSession: <https://nerve.example.com/chat/s1|Nightly report>"
+        assert posted["blocks"][0]["text"]["text"] == posted["text"]
+        # What a reaction quotes back to the agent stays the text as written.
+        assert [entry[1] for entry in channel._message_cache.values()] == [text]
+
+    @pytest.mark.asyncio
     async def test_an_explicit_dm_is_a_notification_target(self):
         channel = _channel()
         channel.config.notifications.slack_channel_id = "D0123ABC"
