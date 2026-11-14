@@ -1742,6 +1742,12 @@ class TestTheSchedulerWritesTheSystemFile:
             "Cron job task-planner: its prompt in system.yaml was "
             "what an earlier release shipped; the file now has this release's",
         ]
+        # The file is from before machine-maintenance existed.
+        assert "machine-maintenance" in jobs
+        assert (
+            "Cron job machine-maintenance: system.yaml had no entry for it; "
+            "added as this release ships it"
+        ) in [r.getMessage() for r in caplog.records]
 
     @pytest.mark.parametrize("kept", ["lockdown", "a git workspace"])
     def test_a_file_that_changes_through_a_repository_is_left_as_it_is(self, tmp_path, kept):
