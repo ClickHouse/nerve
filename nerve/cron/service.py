@@ -1808,10 +1808,6 @@ class CronService:
         at the start before the jobs are loaded, at a reload once it is
         applied.
 
-        A built-in job that every mode switches on by default is added to a
-        file that has no entry for it; one added at a reload is loaded at the
-        next start or reload.
-
         Not under lockdown, and not in a workspace that is a git repository:
         there the file changes through the repository
         (:meth:`_in_git_workspace`). The jobs of a file that is left as it is
@@ -1831,12 +1827,6 @@ class CronService:
             )
             return
         for job_id, keys in written.items():
-            if keys == ("added",):
-                logger.info(
-                    "Cron job %s: system.yaml had no entry for it; added as this release ships it",
-                    job_id,
-                )
-                continue
             logger.info(
                 "Cron job %s: its %s in system.yaml %s what an earlier release shipped; "
                 "the file now has this release's",

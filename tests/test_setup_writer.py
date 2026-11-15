@@ -1637,8 +1637,6 @@ class TestRewritingAnEarlierSystemFile:
         "skill-extractor": ("description", "prompt", "schedule"),
         "skill-reviser": ("prompt",),
         "task-planner": ("prompt",),
-        # The file is from before the job existed.
-        "machine-maintenance": ("added",),
     }
 
     @staticmethod
@@ -1656,15 +1654,7 @@ class TestRewritingAnEarlierSystemFile:
 
         after = _jobs_of(path)
         assert opening and path.read_text(encoding="utf-8").startswith(opening)
-        # The job that every mode switches on by default, and that the file
-        # had no entry for, is added as the installer writes it.
-        assert list(after) == [*before, "machine-maintenance"]
-        assert after["machine-maintenance"] == next(
-            job for job in setup_writer.build_cron_jobs(
-                setup_writer.SetupChoices(mode="worker", enabled_crons=["machine-maintenance"]),
-            ) if job["id"] == "machine-maintenance"
-        )
-        assert after["machine-maintenance"]["enabled"] is True
+        assert list(after) == list(before)
         for job_id, entry in before.items():
             assert list(after[job_id]) == list(entry)
             for key, value in entry.items():
@@ -1685,17 +1675,6 @@ class TestRewritingAnEarlierSystemFile:
 
         assert setup_writer.rewrite_superseded_cron_values(path)["skill-extractor"] == ("description", "prompt")
         assert _jobs_of(path)["skill-extractor"]["schedule"] == "0 9 * * 1"
-
-    def test_a_job_that_was_switched_off_stays_off(self, tmp_path: Path) -> None:
-        """Its entry is there, with ``enabled: false``: nothing is added."""
-        path = tmp_path / "system.yaml"
-        text = (_FIRST_PROMPTS.parent / "system-before-daily-skill-extractor.yaml").read_text(encoding="utf-8")
-        assert text.endswith("  enabled: true\n") and "- id: machine-maintenance\n" in text
-        path.write_text(text.removesuffix("  enabled: true\n") + "  enabled: false\n", encoding="utf-8")
-
-        assert "machine-maintenance" not in setup_writer.rewrite_superseded_cron_values(path)
-        after = yaml.safe_load(path.read_text(encoding="utf-8"))["jobs"]
-        assert [job["enabled"] for job in after if job["id"] == "machine-maintenance"] == [False]
 
     def test_a_file_that_was_edited_by_hand_is_left_as_it_is(self, tmp_path: Path) -> None:
         """Dumped again, it would lose the comment."""
