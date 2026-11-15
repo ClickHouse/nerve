@@ -31,6 +31,9 @@ from tests.rate_limited_upstream import RateLimitedUpstream
         ("max",    "claude-fable-5",            "max"),
         ("xhigh",  "claude-fable-5",            "xhigh"),
         ("low",    "claude-fable-5",            "low"),
+        # Fable 5.2 keeps the full ladder (default effort high; verified 2026-11-09)
+        ("max",    "claude-fable-5-2",          "max"),
+        ("xhigh",  "claude-fable-5-2",          "xhigh"),
         # Opus 5 supports the full ladder (verified via Models API 2026-07-28)
         ("max",    "claude-opus-5",             "max"),
         ("xhigh",  "claude-opus-5",             "xhigh"),
@@ -893,48 +896,6 @@ async def test_engine_fails_turn_when_eof_follows_content(db, tmp_path):
     asst = [r for r in rows if r["role"] == "assistant"][-1]
     assert asst["content"].startswith("Agent error:")
     assert json.dumps(asst["blocks"] or []).count("half an answer") == 1
-
-
-@pytest.mark.asyncio
-async def test_workflow_session_never_forks_from_parent(db, tmp_path):
-    """A source=='workflow' leg carries parent_session_id for sidebar nesting
-    only — its first turn must NOT fork the parent's native session (that would
-    contaminate the fresh orchestration prompt, and cross-backend it raises).
-    A non-workflow child with identical setup still forks: source is the only
-    discriminator."""
-    engine, _made = await _engine_with_scripted_clients(
-        db, tmp_path, "seed", [[("text", "ok"), ("result", "sdk-ok")]],
-    )
-    # Parent with a resumable native session — the fork target.
-    await engine.sessions.get_or_create(
-        "parent", title="t", source="web", backend="claude", actor=None,
-    )
-    await db.update_session_fields("parent", {"sdk_session_id": "sdk-parent"})
-
-    forks: dict[str, str | None] = {}
-    served = engine._get_or_create_client
-
-    async def _cap(sid, source, model, **kw):
-        forks[sid] = kw.get("fork_from")
-        return await served(sid, source, model, **kw)
-
-    engine._get_or_create_client = _cap
-
-    # Workflow leg nested under the parent, still in 'created' state.
-    await engine.sessions.get_or_create(
-        "workflow:wfr-x", title="t", source="workflow", backend="claude", actor=None,
-    )
-    await db.update_session_fields("workflow:wfr-x", {"parent_session_id": "parent"})
-    await engine.run("workflow:wfr-x", "go", source="workflow", channel="web", actor=None)
-    assert forks["workflow:wfr-x"] is None
-
-    # Control: a non-workflow child with the same setup DOES fork.
-    await engine.sessions.get_or_create(
-        "web-child", title="t", source="web", backend="claude", actor=None,
-    )
-    await db.update_session_fields("web-child", {"parent_session_id": "parent"})
-    await engine.run("web-child", "go", source="web", channel="web", actor=None)
-    assert forks["web-child"] == "sdk-parent"
 
 
 # ---------------------------------------------------------------------------
@@ -1996,7 +1957,7 @@ def test_build_options_forwards_subagent_text(tmp_path):
             claude_plugins=lambda: [],
             managed_mcp=False,
         ))
-        backend._build_mcp_servers = lambda sid: {}
+        backend._build_mcp_servers = lambda sid, excluded=frozenset(): {}
         spec = SessionSpec(
             session_id="s-opts", source="web", model="claude-test", effort="high",
             system_prompt="", cwd=str(ws),

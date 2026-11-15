@@ -21,6 +21,8 @@ from nerve.agent.backends.base import config_excluded_tools
 from nerve.agent.backends.codex.backend import _BACKEND_NOTES, _backend_notes
 from nerve.agent.prompts import (
     _ONBOARDING_STEPS,
+    AUTOMATION_OFFER_SECTION,
+    RICH_RENDERING_NOTE,
     build_system_prompt,
     onboarding_prompt,
     worker_onboarding_prompt,
@@ -54,19 +56,23 @@ def _loom_config() -> NerveConfig:
 
 # main's memU system prompt for a workspace holding only `SOUL.md` ("Be kind.")
 # and one tool offered, frozen before the Loom backend: the date, the
-# workspace path and the tool's description are normalized away.
+# workspace path and the tool's description are normalized away. The
+# "Rendering" line and the automation offer of web sessions came later and
+# are the same for both backends.
 MAIN_STATIC_PROMPT = (
-    "Be kind.\n\n---\n\n# Session Context\n- **Source:** web\n- **Current date:** <date>\n"
+    "Be kind.\n\n---\n\n# Session Context\n- **Source:** web\n"
+    f"{RICH_RENDERING_NOTE}\n- **Current date:** <date>\n"
     "- **Workspace:** <workspace>\n\nPer-session details — this session's id and the memories "
     "recalled at session start — are in the `<session-context>` block at the top of this "
     "conversation's first user message. `mcp__nerve__session_context` returns them live if "
     "that message is no longer in context.\n\nYou have access to the following custom tools:\n"
-    "- <tool>"
+    f"- <tool>\n\n---\n\n{AUTOMATION_OFFER_SECTION}"
 )
 MAIN_LEGACY_PROMPT = (
     "Be kind.\n\n---\n\n# Session Context\n- **Session ID:** s1\n- **Source:** web\n"
-    "- **Current date:** <date>\n- **Workspace:** <workspace>\n\nYou have access to the "
-    "following custom tools:\n- <tool>\n\n---\n\n# Recalled Memories\n\n- a fact"
+    f"{RICH_RENDERING_NOTE}\n- **Current date:** <date>\n- **Workspace:** <workspace>\n\n"
+    f"You have access to the following custom tools:\n- <tool>\n\n---\n\n{AUTOMATION_OFFER_SECTION}"
+    "\n\n---\n\n# Recalled Memories\n\n- a fact"
 )
 
 
@@ -113,6 +119,14 @@ def test_the_loom_section_covers_levels_proposals_and_verdicts() -> None:
         "mcp__loom__<tool>", "session id: find them with `loom_search`",
     ):
         assert words in section, words
+
+
+def test_the_loom_section_says_to_leave_the_memory_type_unset() -> None:
+    """Loom searches neither an `episodic` nor a `profile` memory, so a fact
+    saved as one could not be recalled."""
+    section = loom_prompts.SYSTEM_PROMPT_SECTION
+    assert "Leave `memory_type` unset" in section
+    assert "typed `episodic` or `profile` out of search" in section
 
 
 def test_without_loom_tools_the_prompt_says_memory_cannot_be_used(tmp_path: Path) -> None:

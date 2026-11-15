@@ -459,6 +459,10 @@ class TestHandleAnswerApproval:
         assert approval_broadcasts
         assert approval_broadcasts[0]["approval_status"] == "answered"
         assert approval_broadcasts[0]["dispatch_ok"] is True
+        # The card shows the channel and the stored answer time.
+        assert approval_broadcasts[0]["answered_by"] == "web"
+        assert notif["answered_at"]
+        assert approval_broadcasts[0]["answered_at"] == notif["answered_at"]
         # Importantly, no ``answer_injected`` should fire. The answer
         # routes through the dispatcher, not back into the session.
         injected = [
@@ -599,6 +603,15 @@ class TestHandleAnswerApproval:
             and m.get("notification_id") == nid
         ]
         assert injected
+        # The UI event carries the channel and the stored answer time.
+        answered = [
+            m for _, m in patch_broadcaster
+            if m.get("type") == "notification_answered"
+            and m.get("notification_id") == nid
+        ]
+        assert answered[0]["answered_by"] == "web"
+        assert notif["answered_at"]
+        assert answered[0]["answered_at"] == notif["answered_at"]
         # Wait for any fire-and-forget answer task to settle.
         await asyncio.sleep(0)
         fake_engine.run.assert_called()

@@ -41,9 +41,17 @@ class GitHubEventsSource(Source):
         # Lowercase for case-insensitive matching
         self._repos_lower = [r.lower() for r in self._repos]
         self._username: str = self._config.get("username", "")
+        # The login gh reported last; used only when a later lookup fails.
+        self._detected_username = ""
 
     async def _resolve_username(self) -> str:
-        """Resolve GitHub username, auto-detecting from gh auth if not configured."""
+        """The configured GitHub username, or else the account gh acts as now.
+
+        The account is looked up in every run and not kept as the answer: once
+        gh is signed in as another account, or the account is renamed, the
+        next run reads the events of the current one. A failed lookup falls
+        back to the login the last one returned.
+        """
         if self._username:
             return self._username
 
@@ -55,12 +63,16 @@ class GitHubEventsSource(Source):
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
             if proc.returncode == 0 and stdout.strip():
-                self._username = stdout.decode().strip()
-                logger.info("Auto-detected GitHub username: %s", self._username)
-                return self._username
+                detected = stdout.decode().strip()
+                if detected != self._detected_username:
+                    logger.info("Auto-detected GitHub username: %s", detected)
+                    self._detected_username = detected
+                return detected
         except Exception as e:
             logger.error("Failed to detect GitHub username: %s", e)
 
+        if self._detected_username:
+            return self._detected_username
         raise RuntimeError("GitHub username not configured and auto-detection failed")
 
     async def fetch(self, cursor: str | None, limit: int = 100) -> FetchResult:

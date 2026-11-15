@@ -38,6 +38,11 @@ CUSTOM_REACTION_PREFIX = "custom:"
 # Longer emoji names do not fit the gateway's reaction name limit.
 _MAX_EMOJI_BYTES = 128
 _CONTROL_RE = re.compile("[\x00-\x1f\x7f-\x9f]")
+# A Markdown link with its label, and how far from a cut a link that crosses
+# it can begin or end. The label holds no bracket: from an open bracket
+# further back, the text up to a later link is not the label of a link.
+_LINK_RE = re.compile(r"\[([^\[\]]+)\]\([^)]+\)")
+_LINK_WINDOW = 1024
 
 
 def file_name(name: str) -> str:
@@ -99,14 +104,43 @@ def split_text(text: str, limit: int) -> list[str]:
 
 
 def truncate_text(text: str, limit: int) -> str:
-    """Shorten *text* to at most *limit* code points, with a closing ellipsis."""
+    """Shorten *text* to at most *limit* code points, with a closing ellipsis.
+
+    The cut does not divide a Markdown link. Half of a link reaches the
+    reader as its markup, brackets and address, so a link that the limit
+    divides gives way to the part of its label before the cut. A
+    notification ends with the link to its session, which is where a cut
+    falls first.
+    """
     # The ellipsis takes three bytes.
     limit = min(limit, MAX_TEXT_BYTES - 2)
     if any(ord(character) > 0x7F for character in text):
         limit = min(limit, _SAFE_CODE_POINTS)
     if len(text) <= limit:
         return text
-    return text[:max(0, limit - 1)] + "…"
+    return _before_divided_link(text, max(0, limit - 1)) + "…"
+
+
+def _before_divided_link(text: str, cut: int) -> str:
+    """``text[:cut]``, with a Markdown link that the cut divides replaced by
+    the part of its label before the cut.
+
+    The link is looked for from the cut backwards: the nearest ``[`` from
+    which a link runs across the cut begins it. An open bracket before the
+    cut, in code or not, begins no link, whatever follows the cut, and
+    stays as it is. The window bounds the search in a text with many
+    brackets.
+    """
+    low = max(0, cut - _LINK_WINDOW)
+    high = min(len(text), cut + _LINK_WINDOW)
+    position = text.rfind("[", low, cut)
+    while position != -1:
+        link = _LINK_RE.match(text, position, high)
+        if link and link.end() > cut:
+            label = link.group(1)[:max(0, cut - position - 1)]
+            return (text[:position] + label).rstrip()
+        position = text.rfind("[", low, position)
+    return text[:cut]
 
 
 def reaction_name(emoji: str, short_names: Mapping[str, str]) -> str | None:

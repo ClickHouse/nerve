@@ -1,14 +1,12 @@
-"""Anthropic model-catalog discovery for the composer's model picker.
+"""Anthropic model-catalog discovery for the composer's model menu.
 
-The Claude side of ``GET /api/models`` used to be a hardcoded list
-(:data:`nerve.config.DEFAULT_CLAUDE_MODELS`) plus whatever ``agent.model`` /
-``agent.models`` named, so every model Anthropic released after that constant
-was written stayed invisible in the UI even when the configured credentials
-could use it. This module asks the Anthropic Models API (``GET /v1/models``)
-which models the configured credentials' catalog endpoint advertises, so new
-releases show up without a code change or a config edit. Catalog membership is
-not a serving guarantee — an advertised ID can still fail on send, and
-discovery performs no serving probe.
+By default the Claude side of ``GET /api/models`` is ``agent.models`` or the
+built-in list of the newest model of each tier
+(:data:`nerve.config.DEFAULT_CLAUDE_MODELS`). With ``agent.model_discovery``
+on, this module asks the Anthropic Models API (``GET /v1/models``) which
+models the configured credentials' catalog endpoint advertises, and the menu
+offers all of them. Catalog membership is not a serving guarantee: an
+advertised ID can still fail on send, and discovery performs no serving probe.
 
 Discovery is best-effort and never raises. It returns an empty list — and the
 caller falls back to the built-in list — when:

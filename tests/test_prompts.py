@@ -6,6 +6,7 @@ from pathlib import Path
 
 from nerve.agent import prompts
 from nerve.agent.prompts import (
+    AUTOMATION_OFFER_SECTION,
     SESSION_CONTEXT_TAG,
     _format_skills_list,
     _format_tool_list,
@@ -179,3 +180,92 @@ def test_platform_md_over_16_kib_is_cut_with_a_marker(tmp_path: Path):
     prompt = build_system_prompt(workspace=ws, config_dir=config_dir)
     assert f"\n\n---\n\n{kept}\n[platform notes truncated at 16 KiB]\n\n---\n\n# MEMORY" in prompt
     assert "dropped" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# The "Rendering" line: what the surface a session is read on draws.
+# ---------------------------------------------------------------------------
+
+
+def _rendering_line(prompt: str) -> str:
+    return next(ln for ln in prompt.splitlines() if ln.startswith("- **Rendering:**"))
+
+
+def test_web_prompt_names_the_fence_languages_the_chat_renders(tmp_path: Path):
+    """``web`` sessions, and the ``api`` sessions the web UI shows as well."""
+    prompts._PROMPT_TOOL_REGISTRY = None
+    for source in ("web", "api"):
+        line = _rendering_line(build_system_prompt(workspace=tmp_path, source=source))
+        assert "renders" in line, source
+        for fence in ("```mermaid", "```vega-lite", "```svg"):
+            assert fence in line, source
+
+
+def test_text_channels_are_told_not_to_draw(tmp_path: Path):
+    prompts._PROMPT_TOOL_REGISTRY = None
+    for source in ("telegram", "slack", "cron"):
+        prompt = build_system_prompt(workspace=tmp_path, source=source)
+        assert f"- **Source:** {source}" in prompt
+        assert "Do not emit ```mermaid" in _rendering_line(prompt), source
+
+
+def test_rendering_follows_the_session_surface_not_the_turn(tmp_path: Path):
+    """A wakeup turn of a web session is still read in the web chat."""
+    prompts._PROMPT_TOOL_REGISTRY = None
+    prompt = build_system_prompt(workspace=tmp_path, source="wakeup", rendering_source="web")
+    assert "- **Source:** wakeup" in prompt
+    assert "renders fenced ```mermaid" in _rendering_line(prompt)
+    legacy = build_system_prompt(
+        workspace=tmp_path, source="wakeup", rendering_source="web", static=False,
+    )
+    assert "renders fenced ```mermaid" in _rendering_line(legacy)
+    assert "Do not emit" in _rendering_line(build_system_prompt(workspace=tmp_path, source="wakeup"))
+
+
+# ---------------------------------------------------------------------------
+# The automation offer: only sessions that a person chats in.
+# ---------------------------------------------------------------------------
+
+
+def test_chat_sessions_are_told_to_offer_automation(tmp_path: Path):
+    prompts._PROMPT_TOOL_REGISTRY = None
+    for source in ("web", "telegram", "slack"):
+        for static in (True, False):
+            prompt = build_system_prompt(workspace=tmp_path, source=source, static=static)
+            assert prompt.count(AUTOMATION_OFFER_SECTION) == 1, (source, static)
+
+
+def test_sessions_without_a_person_get_no_automation_offer(tmp_path: Path):
+    """A cron, hook or workflow session has no person to answer the offer."""
+    prompts._PROMPT_TOOL_REGISTRY = None
+    for source in ("cron", "hook", "wakeup", "workflow", "api"):
+        prompt = build_system_prompt(workspace=tmp_path, source=source)
+        assert "# Offer to automate" not in prompt, source
+
+
+def test_automation_offer_follows_the_session_surface_not_the_turn(tmp_path: Path):
+    """A wakeup turn of a web session gets the offer; one of a cron session does not."""
+    prompts._PROMPT_TOOL_REGISTRY = None
+    web = build_system_prompt(workspace=tmp_path, source="wakeup", rendering_source="web")
+    assert AUTOMATION_OFFER_SECTION in web
+    cron = build_system_prompt(workspace=tmp_path, source="wakeup", rendering_source="cron")
+    assert "# Offer to automate" not in cron
+
+
+def test_automation_offer_comes_before_the_skills(tmp_path: Path):
+    prompts._PROMPT_TOOL_REGISTRY = None
+    prompt = build_system_prompt(
+        workspace=tmp_path, source="web",
+        skill_summaries=[{"id": "s1", "name": "S1", "description": "Does a thing."}],
+    )
+    assert prompt.index("# Offer to automate") < prompt.index("# Available Skills")
+
+
+def test_automation_offer_covers_delivery_reload_and_refusal():
+    """The job must send its result itself, a direct edit needs a reload, and
+    a "no" goes to a file that every later session reads."""
+    for words in (
+        "`notify`", "only to the cron log", "`nerve reload`", "after the merge",
+        "`USER.md`", "`MEMORY.md`", "`nerve-workspace` skill", "only after a yes",
+    ):
+        assert words in AUTOMATION_OFFER_SECTION, words

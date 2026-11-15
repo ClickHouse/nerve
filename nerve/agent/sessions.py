@@ -12,12 +12,14 @@ Session lifecycle:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import secrets
 import uuid
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
-from typing import Any, Callable, Literal
+from typing import Any, Awaitable, Callable, Literal
 
 from nerve.db import Database
 from nerve.identity import (
@@ -27,6 +29,15 @@ from nerve.identity import (
     Attribution,
     CauseArg,
     attribution_for,
+)
+from nerve.session_origin import (
+    DETAIL_FORK_OF,
+    DETAIL_HOOK,
+    TRIGGER_API,
+    TRIGGER_CHAT,
+    Origin,
+    channel_origin,
+    cron_origin,
 )
 
 logger = logging.getLogger(__name__)
@@ -72,11 +83,19 @@ InterruptOutcome = Literal["stopped", "not_running", "not_stopped", "killed"]
 
 # The reason an archive refuses a session whose agents still run.
 BUSY_AGENTS_REASON = "background agents running"
+BUSY_RUNNING_REASON = "session is running"
 
 
 class SessionBusyError(RuntimeError):
-    """The session cannot be archived now: background agents still run in
-    it (archiving would stop them). Pass ``force=True`` to archive anyway."""
+    """The session cannot be archived now: a turn of it runs or waits for a
+    concurrency slot (``BUSY_RUNNING_REASON``), or background agents still
+    run in it (``BUSY_AGENTS_REASON``, archiving would stop them; pass
+    ``force=True`` to archive anyway)."""
+
+
+class SessionNotFoundError(ValueError):
+    """A switch names a session that does not exist. A ``ValueError``, which
+    is what the switch raised before the error had a name."""
 
 
 class SessionManager:
@@ -100,6 +119,13 @@ class SessionManager:
     # ``has_live_agents(session_id)``: background agents still run in the
     # session (the archive guard). Wired to the agent registry.
     has_live_agents: Callable[[str], bool] | None = None
+    # Awaited as ``on_archived(session_id)`` after an archive changed the
+    # status (the engine wires the expiry of the session's questions).
+    # Never raises into the caller.
+    on_archived: Callable[[str], Awaitable[None]] | None = None
+    # ``run_lock_held(session_id)``: something holds the session's run lock
+    # (see :meth:`has_turn_work`). Wired to the engine's run locks.
+    run_lock_held: Callable[[str], bool] | None = None
     # Called as ``listener(session_id, running)`` right after a session
     # starts or stops running a turn (see ``add_running_listener``).
     _running_listeners: tuple[Callable[[str, bool], None], ...] = ()
@@ -140,6 +166,9 @@ class SessionManager:
         # Callback for memorizing session before close/archive/delete.
         # Set by AgentEngine after init to wire up memU bridge.
         self._on_memorize: Any | None = None
+        # session_id -> one reason per archive or delete in progress
+        # (see :meth:`closing`).
+        self._closing: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------------ #
     #  Lifecycle: Create / Get                                             #
@@ -157,10 +186,13 @@ class SessionManager:
         *,
         actor: Actor | None,
         cause: CauseArg = CAUSE_FROM_ACTOR,
+        origin: Origin | None = None,
     ) -> dict:
         """Get an existing session or create a new one.
 
-        ``actor`` and ``cause`` are only used when a row is actually created.
+        ``actor``, ``cause`` and ``origin`` (the trigger and origin details,
+        see :mod:`nerve.session_origin`) are only used when a row is actually
+        created.
         An existing session keeps the creator and the cause it was stamped
         with, so re-resolving a session someone else started never
         re-attributes it. ``actor`` is required keyword-only, like the store
@@ -171,6 +203,7 @@ class SessionManager:
             session = await self._create_session(
                 session_id, title=title, source=source, metadata=metadata,
                 backend=backend, model=model, cwd=cwd, actor=actor, cause=cause,
+                origin=origin,
             )
         return session
 
@@ -188,6 +221,9 @@ class SessionManager:
         *,
         actor: Actor | None,
         cause: CauseArg = CAUSE_FROM_ACTOR,
+        origin: Origin | None = None,
+        fork_source_native_id: str | None = None,
+        fork_source_turn_id: str | None = None,
     ) -> dict:
         """Create a new session with status=created and log the event."""
         if backend is None:
@@ -216,6 +252,9 @@ class SessionManager:
             # The event names the creator and the session's cause only when
             # this insert made the row.
             created_event=attribution_for(actor, cause),
+            origin=origin,
+            fork_source_native_id=fork_source_native_id,
+            fork_source_turn_id=fork_source_turn_id,
         )
         logger.info(
             "Created session: %s (parent=%s)", session_id, parent_session_id,
@@ -230,6 +269,7 @@ class SessionManager:
         self, session_id: str, new_status: SessionStatus,
         details: dict | None = None,
         *, attribution: Attribution = UNATTRIBUTED,
+        only_from: tuple[str, ...] | None = None,
     ) -> bool:
         """Atomically transition a session's status and log the event.
 
@@ -237,22 +277,27 @@ class SessionManager:
         resume). A transition that records the state of the runtime keeps it
         unattributed. A session that has ``new_status`` already stays as it
         is and records nothing, so of two callers that make the same
-        transition at the same time only one is recorded. Returns ``True``
-        when the status changed.
+        transition at the same time only one is recorded. With
+        ``only_from``, a session in another status also stays as it is.
+        Returns ``True`` when the status changed.
         """
         async with self._transition_lock:
             return await self.db.change_session_status(
                 session_id, new_status.value,
                 event_type=new_status.value, details=details,
-                attribution=attribution,
+                attribution=attribution, only_from=only_from,
             )
+
+    # The ``mark_*`` methods record the state of the runtime. They write
+    # nothing to an archived or missing session: only unarchive takes a
+    # session out of ``archived``. Each returns ``True`` when it wrote.
 
     async def mark_active(
         self,
         session_id: str,
         sdk_session_id: str | None = None,
         connected_at: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Mark session as active with an SDK client.
 
         ``connected_at`` is the (stable) time the SDK client connected; callers
@@ -272,41 +317,49 @@ class SessionManager:
         }
         if sdk_session_id is not None:
             fields["sdk_session_id"] = sdk_session_id
-        await self.db.update_session_fields(session_id, fields)
+        if not await self.db.update_unarchived_session_fields(session_id, fields):
+            return False
         await self.db.log_session_event(session_id, "started", {
             "sdk_session_id": sdk_session_id,
         })
+        return True
 
     async def mark_idle(
         self, session_id: str, preserve_sdk_id: bool = True,
-    ) -> None:
+    ) -> bool:
         """Mark session as idle (client disconnected but potentially resumable)."""
         fields: dict[str, Any] = {"status": SessionStatus.IDLE.value}
         if not preserve_sdk_id:
             fields["sdk_session_id"] = None
             fields["connected_at"] = None
-        await self.db.update_session_fields(session_id, fields)
+        if not await self.db.update_unarchived_session_fields(session_id, fields):
+            return False
         await self.db.log_session_event(session_id, "idle", {
             "resumable": preserve_sdk_id,
         })
+        return True
 
-    async def mark_stopped(self, session_id: str) -> None:
+    async def mark_stopped(self, session_id: str) -> bool:
         """Mark session as user-stopped."""
-        await self.db.update_session_fields(
+        if not await self.db.update_unarchived_session_fields(
             session_id, {"status": SessionStatus.STOPPED.value},
-        )
+        ):
+            return False
         await self.db.log_session_event(session_id, "stopped", {})
+        return True
 
-    async def mark_error(self, session_id: str, error_msg: str) -> None:
+    async def mark_error(self, session_id: str, error_msg: str) -> bool:
         """Mark session as errored (SDK crashed)."""
-        await self.db.update_session_fields(session_id, {
+        if not await self.db.update_unarchived_session_fields(session_id, {
             "status": SessionStatus.ERROR.value,
             "sdk_session_id": None,
             "connected_at": None,
-        })
+        }):
+            return False
         await self.db.log_session_event(session_id, "error", {
             "error": error_msg[:500],
         })
+        return True
 
     # ------------------------------------------------------------------ #
     #  Channel mapping (DB-persisted)                                      #
@@ -329,6 +382,7 @@ class SessionManager:
 
     async def get_active_session(
         self, channel_key: str, source: str = "web", *, actor: Actor | None,
+        conversation_title: str = "",
     ) -> str:
         """Get or create the active session for a channel.
 
@@ -339,6 +393,10 @@ class SessionManager:
         ``actor`` is stamped on the fresh session only — the person whose
         message rolled the channel over to a new conversation. A reused
         session keeps whoever started it.
+
+        The fresh session's origin comes from ``source`` and ``channel_key``,
+        with ``conversation_title`` as the conversation's display name (see
+        :func:`nerve.session_origin.channel_origin`).
         """
         row = await self.db.get_channel_session(channel_key)
         if row:
@@ -348,7 +406,10 @@ class SessionManager:
 
         # Create a fresh session
         session_id = self._generate_session_id()
-        await self._create_session(session_id, source=source, actor=actor)
+        await self._create_session(
+            session_id, source=source, actor=actor,
+            origin=channel_origin(source, channel_key, conversation_title),
+        )
         await self.db.set_channel_session(channel_key, session_id)
         return session_id
 
@@ -369,8 +430,14 @@ class SessionManager:
         Idle sessions fall back to the time-based check so channels
         that have been quiet for longer than sticky_period_minutes
         roll over to a new session as before.
+
+        An archived session is never sticky: the next message of the
+        channel starts a new session.
         """
-        if session.get("status") == SessionStatus.ACTIVE.value:
+        status = session.get("status")
+        if status == SessionStatus.ARCHIVED.value:
+            return False
+        if status == SessionStatus.ACTIVE.value:
             return True
         ts = session.get("last_activity_at") or session.get("updated_at")
         if not ts:
@@ -398,7 +465,7 @@ class SessionManager:
         """Switch the active session for a channel (persisted to DB)."""
         session = await self.db.get_session(session_id)
         if not session:
-            raise ValueError(f"Session not found: {session_id}")
+            raise SessionNotFoundError(f"Session not found: {session_id}")
         await self.db.set_channel_session(channel_key, session_id)
         # An explicit switch is a deliberate choice: the next inbound message must
         # route to this session regardless of how long it has been idle. Mark it
@@ -596,13 +663,6 @@ class SessionManager:
             return None
         return task
 
-    def registered_task(self, session_id: str) -> asyncio.Task | None:
-        """The live task registered with :meth:`register_task`, or ``None``."""
-        task = self._running_tasks.get(session_id)
-        if task is None or task.done():
-            return None
-        return task
-
     def has_running_work(self, session_id: str) -> bool:
         """True while a turn of the session runs or its registered task lives."""
         task = self._running_tasks.get(session_id)
@@ -610,6 +670,14 @@ class SessionManager:
             self.is_running(session_id)
             or self.turn_task(session_id) is not None
             or (task is not None and not task.done())
+        )
+
+    def has_turn_work(self, session_id: str) -> bool:
+        """:meth:`has_running_work`, or something holds the session's run
+        lock (a queued message, an autonomous turn, an idle drain). Archive
+        and delete refuse a session with turn work."""
+        return self.has_running_work(session_id) or bool(
+            self.run_lock_held and self.run_lock_held(session_id)
         )
 
     def get_running_ids(self) -> set[str]:
@@ -730,6 +798,11 @@ class SessionManager:
         The source's messages up to that point are copied into the fork so
         the new chat displays exactly the history the agent remembers.
 
+        The fork row stores the source's native id and the fork turn
+        (``fork_source_native_id``, ``fork_source_turn_id``). The engine
+        forks from them, whatever happens to the source or to the fork's
+        status, until the fork's first completed turn.
+
         Raises ``ValueError`` when the source doesn't exist, has no native
         conversation yet, or ``at_message_id`` can't be mapped to a native
         turn (pre-mapping history — see ``get_native_turn_at_message``).
@@ -750,9 +823,11 @@ class SessionManager:
             )
 
         # Resolve the fork point up front so a bad anchor fails the API
-        # call, not the fork's first message. The engine re-resolves the
-        # same mapping when it builds the client (source history is
-        # immutable, so both resolutions agree).
+        # call, not the fork's first message. The same turn bounds the
+        # copied messages and the native fork. A fork of the whole chat
+        # branches at the source's last completed turn, so turns that the
+        # source completes later are in neither. With no turn mapping (history
+        # from before per-turn recording) it takes the whole conversation.
         fork_turn_id: str | None = None
         if at_message_id is not None:
             fork_turn_id = await self.db.get_native_turn_at_message(
@@ -764,6 +839,8 @@ class SessionManager:
                     "mapping (recorded per turn since this feature shipped). "
                     "Fork the whole chat instead."
                 )
+        else:
+            fork_turn_id = await self.db.get_last_native_turn(source_session_id)
 
         fork_id = f"fork-{str(uuid.uuid4())[:8]}"
         fork_title = title or f"Fork of {parent.get('title', source_session_id)}"
@@ -778,6 +855,14 @@ class SessionManager:
             model=parent.get("model"),
             cwd=parent.get("cwd"),
             actor=actor,
+            # A person forks a chat in the web UI, whatever started the parent.
+            origin=Origin(TRIGGER_CHAT, {DETAIL_FORK_OF: source_session_id}),
+            fork_source_native_id=parent["sdk_session_id"],
+            fork_source_turn_id=fork_turn_id,
+        )
+        session["title_source"] = "manual" if title else "fork"
+        await self.db.update_session_fields(
+            fork_id, {"title_source": session["title_source"]},
         )
         copied = await self.db.copy_messages_to_session(
             source_session_id, fork_id, up_to_native_turn_id=fork_turn_id,
@@ -826,7 +911,7 @@ class SessionManager:
             session_id = f"cron:{job_id}"
         return await self.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron", actor=actor,
-            cause=cause,
+            cause=cause, origin=cron_origin(job_id),
         )
 
     async def create_hook_session(
@@ -836,6 +921,7 @@ class SessionManager:
         session_id = f"hook:{hook_name}:{hook_id}"
         return await self.get_or_create(
             session_id, title=f"Hook: {hook_name}", source="hook", actor=actor,
+            origin=Origin(TRIGGER_API, {DETAIL_HOOK: hook_name}),
         )
 
     # ------------------------------------------------------------------ #
@@ -972,14 +1058,39 @@ class SessionManager:
         agent still running in it. Unless ``force``, a session with live
         agents is refused with :class:`SessionBusyError`; with ``force`` its
         agents end as interrupted (``archived``).
+
+        A session with turn work is refused with :class:`SessionBusyError`,
+        also with ``force``: a turn that runs or waits for a concurrency
+        slot, or any holder of the session's run lock (a queued message, an
+        autonomous turn, an idle drain). The session is then marked as
+        closing until its status is written (:meth:`closing`).
+
+        After the archive, the session's pending wakeups are deleted and
+        ``on_archived`` runs (it expires the session's pending questions).
         """
         session = await self.db.get_session(session_id)
         if not session:
             raise ValueError(f"Session {session_id} not found")
         if session.get("status") == SessionStatus.ARCHIVED.value:
             return False
+        if self.has_turn_work(session_id):
+            raise SessionBusyError(BUSY_RUNNING_REASON)
         if not force and self._agents_live(session_id):
             raise SessionBusyError(BUSY_AGENTS_REASON)
+        with self.closing(session_id, "archived"):
+            archived = await self._archive_marked(
+                session_id, attribution=attribution, details=details,
+            )
+        if archived:
+            logger.info("Archived session %s", session_id)
+            await self._close_archived_work(session_id)
+        return archived
+
+    async def _archive_marked(
+        self, session_id: str, *, attribution: Attribution, details: dict | None,
+    ) -> bool:
+        """The work of :meth:`archive_session` while the session is marked:
+        memorize, disconnect the client, write the status."""
         # Memorize in the background: memU indexing can take ~90s; awaiting it
         # here would hang the archive (and, in a cascade, the whole request on the root).
         if self._on_memorize:
@@ -1001,7 +1112,7 @@ class SessionManager:
             except Exception:
                 pass
         now = datetime.now(timezone.utc).isoformat()
-        archived = await self.db.change_session_status(
+        return await self.db.change_session_status(
             session_id, SessionStatus.ARCHIVED.value,
             fields={
                 "archived_at": now,
@@ -1010,9 +1121,52 @@ class SessionManager:
             },
             event_type="archived", details=details, attribution=attribution,
         )
-        if archived:
-            logger.info("Archived session %s", session_id)
-        return archived
+
+    @contextlib.contextmanager
+    def closing(self, session_id: str, reason: str) -> Iterator[None]:
+        """Mark the session as closing (``archived`` or ``deleted``) for the
+        duration of the block (see :meth:`closing_reason`).
+
+        The caller checks :meth:`has_turn_work` and enters the block with no
+        await in between. A run checks the mark right after it holds the run
+        lock, also with no await in between. So a run either makes the
+        caller's check fail, or is refused.
+        """
+        self._closing.setdefault(session_id, []).append(reason)
+        try:
+            yield
+        finally:
+            marks = self._closing[session_id]
+            marks.remove(reason)
+            if not marks:
+                del self._closing[session_id]
+
+    def closing_reason(self, session_id: str) -> str | None:
+        """``deleted`` or ``archived`` while :meth:`closing` marks the
+        session (``deleted`` wins), else ``None``."""
+        marks = self._closing.get(session_id)
+        if not marks:
+            return None
+        return "deleted" if "deleted" in marks else "archived"
+
+    async def _close_archived_work(self, session_id: str) -> None:
+        """End the work that targets a session that was just archived: its
+        pending wakeups (deleted) and, through ``on_archived``, its pending
+        questions. Best effort: a failure is logged, the archive stands."""
+        try:
+            cancelled = await self.db.cancel_wakeups_for_session(session_id)
+            if cancelled:
+                logger.info(
+                    "Archive of %s: deleted %d pending wakeup(s)",
+                    session_id, cancelled,
+                )
+        except Exception as e:
+            logger.warning("Archive of %s: wakeup cancel failed: %s", session_id, e)
+        if self.on_archived is not None:
+            try:
+                await self.on_archived(session_id)
+            except Exception as e:
+                logger.warning("Archive of %s: on_archived failed: %s", session_id, e)
 
     async def _resolve_descendants(self, root_id: str) -> list[str]:
         """Every session in ``root_id``'s subtree, discovery order (root first).
@@ -1093,8 +1247,8 @@ class SessionManager:
                     force=force,
                 )
                 archived.append(sid)
-            except SessionBusyError:  # agents started meanwhile
-                skipped[sid] = BUSY_AGENTS_REASON
+            except SessionBusyError as e:  # a turn or agents started meanwhile
+                skipped[sid] = str(e)
             except Exception as e:  # keep going; sibling subtrees still complete
                 logger.warning("Cascade archive failed for %s: %s", sid, e)
                 skipped[sid] = str(e)
@@ -1173,8 +1327,8 @@ class SessionManager:
         When ``interactive_archive_after_hours`` > 0 (opt-in; 0 disables and leaves the
         default behavior unchanged), interactive sessions (web/telegram/…)
         idle longer than that are archived and memorized promptly — including
-        ones parked on an unanswered ``ask_user`` question, whose pending
-        notification is expired so it doesn't dangle on a closed session.
+        ones parked on an unanswered ``ask_user`` question. Every archive
+        expires the session's pending questions (see :meth:`archive_session`).
         Cron/persistent sessions are excluded from the short cutoff and only
         hit the ``archive_after_days`` backstop. Starred sessions are exempt
         from every auto-archival path (short cutoff, backstop, and the
@@ -1189,17 +1343,16 @@ class SessionManager:
         system = attribution_for(self.db.system_actor)
 
         async def _archive(sid: str, reason: str) -> bool:
-            """Archive one session; a session whose background agents still
-            run is skipped (an automatic archive never ends them)."""
+            """Archive one session; a session with a running turn or with
+            background agents is skipped (an automatic archive never ends
+            them)."""
             try:
                 await self.archive_session(
                     sid, attribution=system, details={"reason": reason},
                 )
                 return True
-            except SessionBusyError:
-                logger.info(
-                    "Session cleanup: skipping %s (%s)", sid, BUSY_AGENTS_REASON,
-                )
+            except SessionBusyError as e:
+                logger.info("Session cleanup: skipping %s (%s)", sid, e)
                 return False
 
         # Opt-in short idle cutoff for interactive sessions. Skipped entirely
@@ -1216,12 +1369,6 @@ class SessionManager:
                         "Session cleanup: skipping %s (%s)", s["id"], BUSY_AGENTS_REASON,
                     )
                     continue
-                try:
-                    await self.db.expire_pending_questions_for_session(s["id"])
-                except Exception as e:
-                    logger.warning(
-                        "Expire pending questions failed for %s: %s", s["id"], e,
-                    )
                 if await _archive(s["id"], "idle_interactive"):
                     archived_interactive += 1
 

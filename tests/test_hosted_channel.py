@@ -14,6 +14,7 @@ outstanding page, and the separation from the web UI's own authentication.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import uuid
 from dataclasses import dataclass
@@ -461,6 +462,9 @@ class TestInvoke:
         assert (run["session_id"], run["user_message"], run["channel"]) == (
             mapping["session_id"], "what is on today?", "slack",
         )
+        # A direct conversation has no channel name.
+        session = await hosted.db.get_session(mapping["session_id"])
+        assert (session["trigger"], session["origin_detail"]) == ("slack", '{"channel": "D0DIRECT"}')
 
     async def test_a_mention_in_a_channel_roots_a_thread_session(self, hosted):
         stream = await hosted.stream()
@@ -472,8 +476,16 @@ class TestInvoke:
 
         await hosted.acknowledged(inbox_id)
         await hosted.turns.wait_for(1)
-        assert await hosted.db.get_channel_session("slack:C_FIXTURE_CHANNEL:1700000300.000100")
+        mapping = await hosted.db.get_channel_session("slack:C_FIXTURE_CHANNEL:1700000300.000100")
+        assert mapping
         assert hosted.turns.runs[0]["user_message"] == "summarize the deploys"
+        # The session's origin names the channel with its display name.
+        session = await hosted.db.get_session(mapping["session_id"])
+        assert session["trigger"] == "slack"
+        assert json.loads(session["origin_detail"]) == {
+            "channel": "C_FIXTURE_CHANNEL", "thread": "1700000300.000100",
+            "channel_name": "deployments",
+        }
 
     async def test_acceptance_does_not_wait_for_the_turn(self, hosted):
         hosted.turns.release.clear()

@@ -298,6 +298,14 @@ export const useTaskStore = create<TaskState>((set, get) => ({
     if (selectedTask?.id === task.id) {
       // Keep any locally-loaded markdown; the broadcast carries the row only.
       set({ selectedTask: { ...selectedTask, ...task } });
+      // The sessions of the task are in the detail only, so read it again
+      // and take its `sessions`. The content stays as it is on screen.
+      api.getTask(task.id)
+        .then(({ sessions }) => {
+          const current = get().selectedTask;
+          if (current?.id === task.id) set({ selectedTask: { ...current, sessions } });
+        })
+        .catch(() => {});
     }
 
     if (lanes.length === 0) return;

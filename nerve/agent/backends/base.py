@@ -21,6 +21,7 @@ from typing import (
 )
 
 from nerve.agent.backends.events import AgentEvent
+from nerve.widget_state import WIDGET_STATE_TOOL, widgets_drawn
 
 # async (session_id, file_path, content_or_none) -> None
 SnapshotFn = Callable[[str, str, "str | None"], Awaitable[None]]
@@ -34,6 +35,18 @@ class BackendError(Exception):
 
 class TransportDiedError(BackendError):
     """The backend subprocess/stream died mid-operation."""
+
+
+class ForkSourceMissingError(BackendError):
+    """The native conversation that a fork branches from no longer exists."""
+
+
+class TurnRefusedError(BackendError):
+    """The runtime will not start the turn; the message says why.
+
+    Nothing of the turn was sent and the runtime is as healthy as before, so
+    the engine ends the turn as failed and keeps the client.
+    """
 
 
 @dataclass
@@ -87,6 +100,18 @@ class SessionSpec:
     # cause in external mode. None: no principal. A backend that cannot send
     # it ignores it.
     inference_principal: str | None = None
+    # The session's trigger for the same proxy (nerve.session_origin), in
+    # external mode. None: no trigger. A backend that cannot send it ignores it.
+    inference_trigger: str | None = None
+    # The tag of the session's origin for the same proxy, for example the
+    # cron job (nerve.session_origin.origin_tag), in external mode. None: no
+    # origin. A backend that cannot send it ignores it.
+    inference_origin: str | None = None
+    # Registry tools this session is not offered, beyond the backend's own
+    # exclusions: the ones of no use on the surface the session is read on
+    # (nerve.agent.prompts.surface_excluded_tools), which the system prompt
+    # leaves out of its list as well.
+    excluded_tools: frozenset[str] = frozenset()
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -104,6 +129,10 @@ class BackendCapabilities:
     supports_task_stop: bool = False
     # Sub-agents stream their own transcript (sidechain events) to the host.
     supports_agent_transcripts: bool = False
+    # The live client tells its context use by category
+    # (AgentClient.context_usage) and can compact the conversation
+    # (AgentClient.start_compact).
+    supports_compact: bool = False
 
 
 @runtime_checkable
@@ -160,6 +189,26 @@ class AgentClient(Protocol):
         it would end background agents when this is ``False``.
         """
         return False
+
+    async def context_usage(self) -> dict[str, Any]:
+        """The context window now: ``total_tokens``, ``max_tokens``,
+        ``auto_compact_threshold`` (``None`` when auto-compact is off) and
+        ``categories`` (``{"name", "tokens"}`` of each category that is part
+        of ``total_tokens``). The default: unsupported."""
+        raise BackendError("context_usage unsupported")
+
+    async def start_compact(self) -> None:
+        """Send the runtime's compact command as a turn: the runtime replaces
+        the conversation so far with a summary. Read the turn with
+        :meth:`receive_turn`. The default: unsupported."""
+        raise BackendError("compact unsupported")
+
+    async def mcp_app_for_tool(self, tool_name: str) -> "dict[str, str] | None":
+        """The MCP App that a call of ``tool_name`` opens:
+        ``{"server", "tool", "resource_uri"}`` when the tool belongs to a
+        third-party MCP server and is linked to a ``ui://`` view (see
+        nerve/mcp_apps.py). The default: none."""
+        return None
 
     async def disconnect(self) -> None:
         """Full teardown, owning every process/transport internal."""
@@ -245,10 +294,14 @@ def config_excluded_tools(config: Any) -> set[str]:
     and with it off no destination is reachable. The memory tools are the
     other: they serve memU, and with ``memory.backend: loom`` the agent
     uses Loom's own tools from the MCP gateway's catalog instead.
+    ``widget_state`` reads what the web chat's widgets saved, and without
+    the sandbox that draws widgets there is no widget.
     """
     excluded: set[str] = set()
     if not config.outbound_channels:
         excluded.add("send_channel_message")
+    if not widgets_drawn(config):
+        excluded.add(WIDGET_STATE_TOOL)
     if config.memory.backend == "loom":
         from nerve.agent.tools.handlers.memory import MEMORY_SPECS
 

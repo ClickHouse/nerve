@@ -50,7 +50,7 @@ Statuses are configurable (`task_status_list`, `task_status_create`, and the boa
 
 `pending`, `plan_review` and `done` are protected and cannot be deleted. Migration v059 adds `backlog` and `plan_review` to an existing install, before and after `pending`; a status that already has one of these names stays as it is.
 
-An install that existed before keeps the `task-planner` prompt in its `config/cron/system.yaml`, which lists all open tasks, until the Automation step writes that file again. On such an install the planner can propose a plan for a `backlog` task.
+An install that existed before has the earlier `task-planner` prompt in its `config/cron/system.yaml`, which lists all open tasks. When the scheduler starts, Nerve replaces that prompt with the current one, which lists the `pending` tasks only ([cron.md](cron.md#after-a-nerve-update)). A prompt that was edited stays, and so does a `task-planner` entry in `config/cron/jobs.yaml`: with a prompt that lists all open tasks, the planner can propose a plan for a `backlog` task.
 
 ## Agent Tools
 
@@ -66,18 +66,20 @@ An install that existed before keeps the `task-planner` prompt in its `config/cr
 
 ### Duplicate Detection
 
-`task_create` automatically checks for potential duplicates before creating a task:
+`task_create` checks what a new task would double before it writes anything, and refuses in two cases:
 
-1. **Primary: `source_url` exact match** — If the task has a `source_url` (e.g., a GitHub issue URL), checks for any existing task with the same URL. This is the most reliable dedup for source-generated tasks, since the agent may paraphrase titles differently each time.
-2. **Fallback: Fuzzy FTS5 search** — Uses OR semantics (any word can match) ranked by BM25 relevance. This catches similar tasks even with different wording — e.g., "database backup failed" matches "Fix database backup failure". Stop words and short tokens (≤1 char) are stripped to reduce noise.
+1. **Same `source_url`** — a task already tracks that URL. The URL is the identity of a source-generated item (an issue, a PR, an email), whose title the agent may word differently each time. Pass the most specific URL you have — a comment permalink for a directive, the issue URL for the issue itself — or several deliberate tasks under one issue will each need `confirm_duplicate`.
+2. **Nearly the same title** — the title scores ≥ 0.85 against an existing task (done ones included). The score is IDF-weighted token overlap over all task titles: words every title of the install shares weigh nothing, the words that identify the work (a test name, an issue number, a function) weigh the most, and dates, small numbers and time stamps are ignored (a `#41`-style ticket reference is kept at any length). It is 0..1 and does not depend on the size of the corpus or the length of the title, so the threshold holds on a ten-task install and a ten-thousand-task one. Two exceptions never refuse, however alike the words: a match whose title names a *different* ticket, and a match that tracks a different `source_url` — both are reported as related with the reason.
 
-If matches are found, the tool returns them and refuses to create — the caller must re-invoke with `confirm_duplicate=true` to override. Confirming means "create a second task": the new task gets its own ID and file, and never replaces the one it resembles.
+The refusal lists each match with its status, its similarity and the words the titles share. Tasks that merely look alike never block: those scoring ≥ 0.5, and those that share a **rare identifier** with the new title (a test name, an issue number, a symbol — a token with a digit or underscore that appears in at most five titles) whatever their score, are listed as **related** — under the duplicates on a refusal, after the new ID on a success — so the caller can link or merge them. `confirm_duplicate=true` means "create a second task": the new task gets its own ID and file, and never replaces the one it resembles; the look-alikes are still reported with it.
+
+Earlier versions matched the new title against every task's title *and body* with an FTS5 OR query and a fixed BM25 cut-off. BM25 grows with query length and corpus size, so on a large install the cut-off fell below the score of one shared rare word and every create was refused; the title index replaced it.
 
 ### Search
 
 `task_search` performs an FTS5 full-text search on task titles and content using AND semantics (all words must match). Supports an optional status filter (`all` to include done tasks, specific status, or empty for open tasks only).
 
-Note: `task_search` (user-facing) uses strict AND matching for precision. Duplicate detection (internal) uses fuzzy OR matching for recall — these are intentionally different trade-offs.
+Note: `task_search` (user-facing) uses strict AND matching for precision. Duplicate detection does not use the FTS index at all — it scores titles against titles (see above), so it keeps working when the index is being rebuilt.
 
 ### Status Transitions
 
@@ -85,6 +87,7 @@ Setting a task's status to `done` via `task_update` automatically delegates to `
 - Moves the markdown file from `active/` to `done/`
 - Syncs the FTS index
 - Appends a completion note
+- Settles the plans of the task: one that waits for review is closed with the task, undecided, and one that is being implemented becomes `done` (see [Closing the task](plans.md#closing-the-task))
 
 This prevents orphan tasks (status=done in DB but file still in active/).
 
@@ -92,7 +95,9 @@ Leaving `done` delegates the same way, to the inverse path: `task_update`
 routes a task whose stored status is `done` through the reopen handler, which
 moves the file back to `active/` and appends a `REOPENED` line. Both
 directions check the tracked-config guard *before* the status flip, so a
-refused move never leaves a task whose status and file disagree.
+refused move never leaves a task whose status and file disagree. When a
+person reopens the task, on the board or the task page, a plan that was
+closed with it is in review again; an agent's reopen leaves the plan closed.
 
 The inverse matters because the disagreement is silent rather than loud.
 `reindex()` treats a file under `done/` as terminal by definition, so a row
@@ -234,6 +239,34 @@ Only the author of a comment can delete it, through
 `DELETE /api/tasks/{id}/comments/{comment_id}`. Accounts have no roles, so
 no person can delete the words of another. Comments cannot be edited.
 
+### Sessions (`created_session_id`)
+
+`tasks.created_session_id` (migration v066) is the session that created the
+task. `task_create` in an agent session sets it. It is NULL for a task created
+through the HTTP API or by a reindex, because their actor (`web`, `system`) is
+not a session ID. For tasks that existed before v066, the migration copies the
+actor of the creation event in `task_events`, but only when a session with that
+ID exists.
+
+Task rows from the list, search, board and detail routes, and the
+`task_updated` broadcast, have `created_session_title`: the title of that
+session, or its ID when it has no title. It is `null` when the session does not
+exist, for example after a delete.
+
+A session relates to a task in one of three ways, in this order:
+
+| Relation | Source |
+|---|---|
+| `created` | `tasks.created_session_id` |
+| `implemented` | `plans.impl_session_id` of a plan of the task |
+| `updated` | `task_events.actor`: the session changed the status |
+
+A session that relates in more than one way gets the first relation. The task
+detail (`GET /api/tasks/{id}`) lists the sessions of the task in `sessions`,
+and `GET /api/sessions/{id}/tasks` lists the tasks of a session. Both include
+only sessions that exist. A change that keeps the status (a note, a content
+edit) records no event, so it does not make a session `updated`.
+
 ### Live Updates
 
 Every task mutation broadcasts a `task_updated` WebSocket event on the
@@ -276,9 +309,11 @@ Full-page markdown editor for task content:
 
 - **Edit / Preview toggle** — raw markdown editing or rendered preview
 - **Ctrl+S / Cmd+S** to save; Save button appears when content is modified
-- **Status dropdown** — change status inline in the header
-- **Metadata** — deadline, source, external link displayed in header
-- **Plan**: the latest plan of the task (`GET /api/tasks/{id}/plans`), with its version, its status and **Open plan**. A pending plan with no revision request shows "A plan waits for your review". The section reads the plans again when the task changes, for example when `plan_propose` writes its note
+- **Status dropdown** — change status inline in the header. It is the only display of the status, with the status colour on its background and border
+- **Metadata** — deadline, source, external link displayed in header. On a phone, they go in a second row under the status and the buttons
+- **Created in**: when the session that created the task exists, "from <session title>" links to its chat in place of the source. Task cards on the board and in the list show the same link
+- **Sessions**: below the content in preview mode, the sessions that created, implemented or updated the task, each with a link to its chat
+- **Plan**: the latest plan of the task (`GET /api/tasks/{id}/plans`), with its version, its status and **Open plan**. A pending plan with no revision request shows one row, "Plan vN waits for your review", with **Review**; the full row opens the plan. The section reads the plans again when the task changes, for example when `plan_propose` writes its note
 - **Comments**: below the content in preview mode. Each comment shows its author ("Nerve for <person>" for an agent comment), its age and its markdown text. **Comment** (or Ctrl+Enter / Cmd+Enter) adds one; the delete button shows on your own comments only. The list reads the comments again when the task changes, so a comment by another person or by the agent shows without a reload. Board cards show the comment count
 - **Back button** — returns to the task list
 

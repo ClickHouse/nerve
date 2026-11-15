@@ -223,13 +223,19 @@ class StreamManager:
                 return stream
         return None
 
-    def connections(self, operation: str) -> set[uuid.UUID]:
-        """The connections that some ready stream advertised *operation* for."""
+    def connections(self, operation: str, provider: str | None = None) -> set[uuid.UUID]:
+        """The connections that some ready stream advertised *operation* for.
+
+        With *provider*, only the connections that serve that provider's
+        hosted chat channel: those whose capabilities name it, and those
+        whose capabilities name no provider.
+        """
         return {
             connection_id
             for stream in self.streams if stream.ready
-            for connection_id in stream.capabilities
+            for connection_id, capabilities in stream.capabilities.items()
             if stream.supports(connection_id, operation)
+            and (provider is None or capabilities.serves(provider))
         }
 
     async def wait_for_change(self, timeout: float) -> None:

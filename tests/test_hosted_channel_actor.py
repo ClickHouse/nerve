@@ -55,7 +55,7 @@ from tests.test_hosted_channel import (
     start_hosted,
     stop_hosted,
 )
-from tests.test_hosted_channel_outbound import TOOL_TARGET, interaction_event, question_card
+from tests.test_hosted_channel_outbound import TOOL_TARGET, interaction_event, notify_stream, question_card
 from tests.test_inference_principal import _FakeCli, _principals
 
 pytestmark = pytest.mark.asyncio
@@ -466,7 +466,8 @@ class TestHostedTurns:
 @pytest_asyncio.fixture
 async def noticed_external(tmp_path, db, monkeypatch, external):
     harness = await start_hosted(tmp_path, db, monkeypatch, notifications=True)
-    harness.config.notifications.slack_channel_id = TOOL_TARGET
+    # The agent's notification channel, as the control plane sets it.
+    harness.gateway.notification_conversation = TOOL_TARGET
     await db.create_session("s1", actor=None)
     try:
         yield harness
@@ -477,7 +478,7 @@ async def noticed_external(tmp_path, db, monkeypatch, external):
 class TestHostedAnswers:
     async def test_a_press_answers_as_the_resolved_person(self, noticed_external):
         hosted = noticed_external
-        stream = await hosted.stream()
+        stream = await notify_stream(hosted)
         notification_id, message_id = await question_card(hosted)
         press = invoked_by(interaction_event(f"notif:{notification_id}:yes", message_id=message_id), ADA)
         inbox_id = hosted.gateway.store(press)
@@ -492,10 +493,10 @@ class TestHostedAnswers:
 
     async def test_a_press_in_local_mode_answers_without_an_actor(self, tmp_path, db, monkeypatch):
         hosted = await start_hosted(tmp_path, db, monkeypatch, notifications=True)
-        hosted.config.notifications.slack_channel_id = TOOL_TARGET
+        hosted.gateway.notification_conversation = TOOL_TARGET
         await db.create_session("s1", actor=None)
         try:
-            stream = await hosted.stream()
+            stream = await notify_stream(hosted)
             notification_id, message_id = await question_card(hosted)
             press = invoked_by(interaction_event(f"notif:{notification_id}:yes", message_id=message_id), ADA)
             inbox_id = hosted.gateway.store(press)
@@ -676,7 +677,7 @@ class TestInvokeName:
 
     async def test_a_press_fills_a_missing_name(self, noticed_external):
         hosted = noticed_external
-        stream = await hosted.stream()
+        stream = await notify_stream(hosted)
         notification_id, message_id = await question_card(hosted)
         press = invoked_by(interaction_event(f"notif:{notification_id}:yes", message_id=message_id), ADA)
         inbox_id = hosted.gateway.store(linked_to(press, ADA, "Ada Lovelace"))

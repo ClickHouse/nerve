@@ -6,7 +6,7 @@ import { ws } from '../../api/websocket';
 import { api } from '../../api/client';
 import { useHostedStore } from '../../api/hosted';
 import { Drawer, IconButton } from '../ui';
-import { MoreHorizontal, LogOut, X } from '../ui/icons';
+import { MoreHorizontal, LogOut, Settings, X } from '../ui/icons';
 import { useSetupStore } from '../../stores/setupStore';
 import { ThemeToggle } from './ThemeToggle';
 import { NAV_ITEMS, PRIMARY_PATHS, visibleNavItems, type NavItem } from './navItems';
@@ -44,7 +44,7 @@ export function BottomNav() {
 
   // Setup stays in the drawer also when it is finished: the drawer is
   // already the place for rarely used destinations.
-  const available = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown, setupFinished: false });
+  const available = visibleNavItems(NAV_ITEMS, { hosted, ultracodeEnabled, setupKnown, setupFinished: false, phone: true });
   const primary = PRIMARY_PATHS
     .map(p => available.find(i => i.path === p))
     .filter((i): i is NavItem => Boolean(i));
@@ -52,7 +52,8 @@ export function BottomNav() {
 
   // "More" counts as selected whenever the current route is one of the
   // destinations it hides, so the bar always shows where you are.
-  const inOverflow = overflow.some(i => location.pathname.startsWith(i.path));
+  const inSettings = location.pathname.startsWith('/settings');
+  const inOverflow = inSettings || overflow.some(i => location.pathname.startsWith(i.path));
 
   const go = (path: string) => {
     navigate(path);
@@ -163,6 +164,17 @@ export function BottomNav() {
           })}
         </div>
 
+        {/* The rail's footer gear, here as the drawer's footer row. */}
+        <button
+          onClick={() => go('/settings')}
+          aria-current={inSettings ? 'page' : undefined}
+          className={`flex w-full cursor-pointer items-center gap-3 border-t border-border-subtle px-4 py-3 text-left text-sm transition-colors ${
+            inSettings ? 'bg-accent/10 text-accent' : 'text-text-muted hover:bg-surface-hover'
+          }`}
+        >
+          <Settings size={18} />
+          Settings
+        </button>
         {!hosted && (
           <button
             onClick={logout}

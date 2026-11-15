@@ -119,7 +119,10 @@ installation's system actor.
 | Backend and external MCP token | The system actor |
 
 Disabling an account blocks its next HTTP or MCP request and any new WebSocket
-connection, and closes its open WebSocket connections. Autonomous work, including cron jobs and background agents, uses the
+connection, and closes its open WebSocket connections. It also stops the
+[push notifications](web-ui.md#push-notifications) to the browsers of the
+account. Nerve keeps their subscriptions, so push starts again when the
+account is enabled again. Autonomous work, including cron jobs and background agents, uses the
 system actor rather than a human account.
 
 ### External mode
@@ -184,6 +187,13 @@ In external mode:
 - Startup can give the system actor the ID of the agent's system principal.
   See [The system actor in external mode](#the-system-actor-in-external-mode).
 - Accounts and history from an earlier local mode stay in `nerve.db`.
+- Nerve does not know when the gateway removes the access of a person. The
+  browsers where that person turned on
+  [push notifications](web-ui.md#push-notifications) continue to show them.
+  This stops when the person blocks the notifications of the panel in each
+  browser, or when somebody with access to `nerve.db` deletes the rows of
+  that person from `push_subscriptions` (`actor_id` is the principal ID). No
+  route removes the browsers of a different person.
 - Each model request names the principal that caused the work, in the
   `X-Nerve-Inference-Principal` header: the session's cause, or the system
   actor for Nerve's own model calls. See
@@ -350,10 +360,11 @@ work uses the system actor.
 | Event | Change | Details |
 |---|---|---|
 | `created` | The session is created (actor: the creator; cause: the session's cause); also a resume (`reason: "resume"`) | `source`, `parent`, or `reason` |
-| `title_changed` | The title changes | `title`, `previous`; `reason` is `placeholder` or `generated` for a title that Nerve makes from the first message, `cron_rotation` for a rotated cron session |
+| `title_changed` | The title changes | `title`, `previous`; `reason` is `placeholder` or `generated` for a title that Nerve makes from the first message, `outcome` for one it makes when a turn ends (`agent.outcome_titles`), `regenerated` for Regenerate name (actor: the person), `cron_rotation` for a rotated cron session |
 | `starred`, `unstarred` | The session is starred or unstarred | |
 | `model_changed` | The model changes | `model`, `previous` |
 | `parent_changed` | The session moves under another session, or back to the top level | `parent_session_id`, `previous` |
+| `compacted` | A Compact compacts the conversation. A Compact that stops, fails or has nothing to compact records no event | |
 | `archived`, `unarchived` | The session is archived or restored | `cascade_root` for a session that an archive of an ancestor archives; `reason` for an automatic archive (`idle_interactive`, `stale`, `overflow`, `codex_thread_archived`) |
 | `stop_requested` | A stop request reaches a running turn; each request is one event | `scope` (`turn`), `outcome` (`stopped`, `killed`, `not_stopped`, …), `live_agents` |
 | `agent_stop_requested` | One agent is stopped (with the agents it started) | `agent_ids`, `task_ids`, `cascade` |

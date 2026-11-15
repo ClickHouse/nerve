@@ -32,8 +32,10 @@ from nerve.channels.hosted.contract import (
     SourceSubscription,
     Subscriptions,
 )
+from nerve.channels.hosted import providers as providers_module
 from nerve.channels.hosted.contract.model import MAX_SUBSCRIPTION_PATTERNS
 from nerve.channels.hosted.contract.wire import dumps
+from nerve.channels.hosted.providers import SLACK
 from nerve.channels.hosted.runtime import (
     HostedChannelRuntime,
     hosted_channel_providers,
@@ -57,12 +59,13 @@ from nerve.config import (
     SlackConfig,
     validate_config_keys,
 )
-from nerve.cron.gates import GateContext, GitHubPrActivityGate
+from nerve.cron.gates import GateContext, GitHubPrActivityGate, MessagesGate
 from nerve.cron.service import CronService
 from nerve.gateway import server as gateway_server
 from nerve.sources.github import GitHubSource, notification_record
 from nerve.sources.github_hosted import HostedGitHubSource, record_from_buffer
 from nerve.sources.registry import build_source_runners
+from nerve.sources.runner import SourceRunner
 from tests.fake_channel_gateway import (
     EVENT_TIMEOUT,
     FakeChannelGateway,
@@ -650,6 +653,20 @@ class TestBufferedRecords:
         again = await HostedGitHubSource(db).fetch(result.next_cursor, limit=10)
         assert (again.records, again.next_cursor) == ([], "2")
 
+    @pytest.mark.asyncio
+    async def test_the_first_drain_of_a_provider_wakes_the_consumers_of_other_sources(self, db):
+        """The first records of a provider that starts later, here the
+        repository watch, are unread for a consumer that reads another source."""
+        await db.set_consumer_cursor("inbox", "github", 0)
+        await db.insert_channel_observation("github_repos", "github_repos:owner/repo", self.payload())
+        gate, ctx = MessagesGate(), GateContext(job_id="inbox-processor", db=db)
+        assert not await gate.is_satisfied(ctx)
+
+        await SourceRunner(HostedGitHubSource(db, provider="github_repos"), db).run()
+
+        assert await gate.is_satisfied(ctx)
+        assert await db.peek_consumer_cursor("inbox", "github_repos") == 0
+
 
 @pytest.mark.asyncio
 class TestRegistry:
@@ -1096,7 +1113,7 @@ class TestStreams:
         async with stalled_through_negotiation(hosted) as stream:
             hosted.config.sync.github.deny_reasons = ["subscribed", "comment"]
             outcome = await asyncio.wait_for(hosted.runtime.republish_subscriptions(), timeout=3)
-            assert outcome == "published on 0 stream(s)"
+            assert outcome.startswith("not sent yet: none of the 1 open stream(s) sent them in time")
 
         await hosted.gateway.wait_for(lambda: bool(stream.sent("inbox_read")))
         [frame] = stream.sent("subscriptions")
@@ -1287,7 +1304,8 @@ class TestSharedStreams:
     async def test_slack_and_github_share_the_streams_and_the_reader(self, tmp_path, db, monkeypatch):
         harness = await start(tmp_path, db, monkeypatch, slack=True)
         try:
-            assert set(harness.runtime.channels) == {"slack"}
+            # The usable hosted settings give the email channel too.
+            assert set(harness.runtime.channels) == {"slack", "email"}
             assert set(harness.runtime.sources) == {"github", "github_repos"}
             assert harness.router.get_channel("github") is None
             stream = await harness.stream()
@@ -1327,6 +1345,9 @@ class TestSharedStreams:
             await stop(harness)
 
     async def test_without_hosted_sources_no_subscriptions_are_sent(self, tmp_path, db, monkeypatch):
+        """A runtime without an email channel, which the frame would name
+        (see test_hosted_email_channel)."""
+        monkeypatch.setattr(providers_module, "HOSTED_CHAT_PROVIDERS", (SLACK,))
         harness = await start(tmp_path, db, monkeypatch, slack=True, github=False)
         try:
             stream = await harness.stream()
@@ -1338,7 +1359,10 @@ class TestSharedStreams:
         finally:
             await stop(harness)
 
-    async def test_a_runtime_without_any_hosted_provider_is_refused(self, tmp_path, db):
+    async def test_a_runtime_without_any_hosted_provider_is_refused(self, tmp_path, db, monkeypatch):
+        """Usable hosted settings give the email channel, so only a table
+        without email leaves no provider."""
+        monkeypatch.setattr(providers_module, "HOSTED_CHAT_PROVIDERS", (SLACK,))
         config = slack_hosted_config(tmp_path)
         config.slack = SlackConfig()
 

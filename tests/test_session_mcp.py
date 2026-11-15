@@ -8,6 +8,7 @@ concurrent sessions could overwrite a shared global.
 import asyncio
 from unittest.mock import AsyncMock, patch
 
+import jsonschema
 import pytest
 
 from nerve.agent.tools import (
@@ -15,6 +16,7 @@ from nerve.agent.tools import (
     _ask_user_impl,
     create_session_mcp_server,
 )
+from nerve.agent.tools.schemas import ASK_USER_SCHEMA
 
 
 @pytest.mark.asyncio
@@ -156,6 +158,40 @@ class TestSessionMCPIsolation:
 
         call_kwargs = mock_service.ask_question.call_args[1]
         assert call_kwargs["options"] == ["Yes", "No", "Maybe"]
+
+    async def test_ask_user_keeps_a_comma_inside_an_array_option(self):
+        """An array option that holds a comma stays one option."""
+        mock_service = AsyncMock()
+        mock_service.ask_question = AsyncMock(
+            return_value={"notification_id": "ask-list"}
+        )
+
+        with patch("nerve.agent.tools._notification_service", mock_service):
+            await _ask_user_impl(
+                {
+                    "title": "Pick one",
+                    "options": ["Yes, all of these", " No ", ""],
+                },
+                "session-list",
+            )
+
+        call_kwargs = mock_service.ask_question.call_args[1]
+        assert call_kwargs["options"] == ["Yes, all of these", "No"]
+
+    @pytest.mark.parametrize("options", [
+        ["Yes, all of these", "No"],
+        '["Yes, all of these", "No"]',
+        "Yes, No",
+    ])
+    async def test_ask_user_schema_accepts_an_array_or_a_string(self, options):
+        """The schema takes the array form and the string form of options."""
+        jsonschema.validate({"title": "Pick one", "options": options}, ASK_USER_SCHEMA)
+
+    async def test_ask_user_schema_refuses_other_option_types(self):
+        """Options that are neither strings nor a list of strings are refused."""
+        for options in (3, [1, 2], {"a": "b"}):
+            with pytest.raises(jsonschema.ValidationError):
+                jsonschema.validate({"title": "Pick one", "options": options}, ASK_USER_SCHEMA)
 
     async def test_notify_without_service_returns_error(self):
         """notify gracefully fails when notification service is not initialized."""

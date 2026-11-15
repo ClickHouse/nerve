@@ -111,11 +111,12 @@ Run the commands below from the repository root (wherever you cloned it).
 │   ├── src/stores/         # Zustand stores; chatStore + handlers/ (WS dispatch) + helpers/
 │   ├── src/hooks/ src/utils/ src/types/
 │   ├── src/test/setup.ts   # vitest setup (jsdom + Testing Library)
-│   └── eslint.config.js, vite.config.ts, package.json, package-lock.json
+│   ├── e2e/                # Playwright UI snapshots: spec, baseline PNGs, snapshots.sh (Docker runner)
+│   └── eslint.config.js, vite.config.ts, playwright.config.ts, package.json, package-lock.json
 ├── tests/                  # pytest suite; conftest.py isolates NERVE_HOME per test
-├── scripts/                # check_migration_numbers.py, check_codex_schema.py, codex_smoke.py, backtest_cache_ttl.py
+├── scripts/                # check_migration_numbers.py, check_codex_schema.py, codex_smoke.py, backtest_cache_ttl.py, ui_snapshot_server.py
 ├── docs/                   # architecture, config, api, cron, memory, ... — update alongside code
-├── .github/workflows/      # ci.yml (backend tests, migration check, frontend build + vitest, Node floor), slack-live.yml
+├── .github/workflows/      # ci.yml (backend tests, migration check, frontend build + vitest, Node floor, UI snapshots), slack-live.yml
 ├── config.example.yaml     # committed example; config.yaml and config.local.yaml are gitignored
 ├── install.sh
 ├── pyproject.toml, uv.lock # commit uv.lock together with pyproject.toml
@@ -188,7 +189,7 @@ in the `TOOLS.md` templates under `nerve/templates/`.
 3. **Backend first** — Python under `nerve/`; add or renumber a migration if the schema changes
 4. **Frontend second** — TypeScript/React under `web/src/`
 5. **Tests** — `.venv/bin/pytest tests/ -v`; `cd web && npm test && npm run lint`
-6. **Build UI** — `cd web && npm run build` (the server serves `web/dist/`)
+6. **Build UI** — `cd web && npm run build` (the server serves `web/dist/`); after a visible UI change, `web/e2e/snapshots.sh --update-snapshots` and commit the changed PNGs
 7. **Docs** — update the matching `docs/*.md` (and README tables) in the same change
 8. **Commit** — focused, scoped commits on the feature branch
 9. **Review** — launch a review subagent, act on its feedback, run the leak check below
@@ -222,9 +223,9 @@ gh pr create --repo https://github.com/ClickHouse/nerve \
 - Include test coverage for new functionality
 - Run the full backend suite, the frontend build and `npm test` before opening
 - CI runs: backend tests on Python 3.13 with `uv sync --locked`, the migration
-  number check, `npm ci --strict-peer-deps && npm run build && npm test`, and an
-  install + build on the Node floor (22.12.0). `npm run lint` is not in CI — run
-  it yourself.
+  number check, `npm ci --strict-peer-deps && npm run build && npm test`, an
+  install + build on the Node floor (22.12.0), and the UI snapshot comparison
+  (`web/e2e/snapshots.sh`). `npm run lint` is not in CI — run it yourself.
 
 ## Build Commands
 
@@ -271,6 +272,9 @@ npm test                    # vitest run — jsdom, specs are src/**/*.test.{ts,
 npm run test:watch          # vitest in watch mode
 npm run lint                # eslint .
 npm run dev                 # Vite dev server; proxies /api and /ws to localhost:8900
+
+e2e/snapshots.sh                      # UI snapshots in the Playwright image (needs Docker), as CI runs them
+e2e/snapshots.sh --update-snapshots   # rewrite the baseline PNGs; see docs/web-ui.md#snapshot-tests
 ```
 
 ## Critical Rules

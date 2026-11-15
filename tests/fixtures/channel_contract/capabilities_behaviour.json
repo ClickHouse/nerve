@@ -1,0 +1,23 @@
+{
+  "version": "1",
+  "kind": "capabilities",
+  "request_id": "g-2",
+  "connection_id": "8c82bd61-913c-40f2-b7cb-c50ba5c56a07",
+  "payload": {
+    "capabilities": {
+      "limits": {
+        "in_flight_operations": 16,
+        "operation_deadline_millis": 30000,
+        "text_characters": 4000,
+        "edit_interval_millis": 1200,
+        "file_bytes": 16777216
+      },
+      "provider": "email",
+      "behaviour": {
+        "answer": "tool",
+        "reply_tool": "mcp__email__send",
+        "session": "keep"
+      }
+    }
+  }
+}

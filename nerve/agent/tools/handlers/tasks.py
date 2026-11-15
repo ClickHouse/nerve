@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from nerve.agent.plan_service import plan_link
 from nerve.agent.tools.registry import ToolContext, ToolResult, ToolSpec
 from nerve.agent.tools.schemas import (
     TASK_COMMENT_SCHEMA,
@@ -33,6 +34,7 @@ from nerve.agent.tools.schemas import (
     TASK_WRITE_SCHEMA,
 )
 from nerve.config import ensure_path_not_tracked_config
+from nerve.db.plans import CLOSED_WITH_TASK
 from nerve.db.tasks import KEEP
 from nerve.db.task_statuses import (
     DEFAULT_STATUS,
@@ -43,6 +45,7 @@ from nerve.db.task_statuses import (
 )
 from nerve.tasks.files import move_task_file, write_task_file
 from nerve.tasks.locks import task_mutation
+from nerve.tasks.similarity import SimilarTask
 
 logger = logging.getLogger(__name__)
 
@@ -108,11 +111,13 @@ def _expect_revision(args: dict) -> int | None:
         raise ValueError(f"expect_revision must be an integer, got {raw!r}.") from None
 
 
-def _revision_conflict(task_id: str, expected: int, *, reopened: bool = False) -> ToolResult:
-    if reopened:
+def _revision_conflict(
+    task_id: str, expected: int, *, reopened: ToolResult | None = None,
+) -> ToolResult:
+    if reopened is not None:
         return ToolResult.text(
             f"Task {task_id} was reopened, but it changed again before the other edits were "
-            "written, so they were not applied. Re-read it and retry them.",
+            f"written, so they were not applied. Re-read it and retry them.{_about_the_plans(reopened)}",
             is_error=True,
         )
     return ToolResult.text(
@@ -300,22 +305,108 @@ async def task_search_handler(ctx: ToolContext, args: dict) -> ToolResult:
     )
 
 
-async def _find_duplicate_tasks(ctx: ToolContext, title: str, source_url: str = "") -> list[dict]:
-    """Check for existing tasks — source_url exact match first, fuzzy FTS fallback.
+# Title-similarity bands for the duplicate guard. The index scores the new
+# title against every existing title by IDF-weighted token overlap (see
+# nerve.tasks.similarity): 1.0 is the same words, 0 is nothing in common
+# beyond the words every title has. Measured on a 12.6K-task worker corpus
+# and a 900-task personal one: a re-filed or reworded copy of a task scores
+# 0.85 and above; same-area tasks that share a template or a few rare words
+# score 0.2–0.8 — worth a mention, not a refusal. A task that shares a rare
+# identifier (a test name, an issue number) is mentioned whatever its score.
+# A match that names a different ticket in its title, or tracks a different
+# source_url, is a different item however alike the words: mentioned, never
+# refused.
+DUPLICATE_SIMILARITY = 0.85
+RELATED_SIMILARITY = 0.5
+MAX_DUPLICATES_LISTED = 10
+MAX_RELATED_LISTED = 5
 
-    Mirror of the legacy helper: prefer an exact ``source_url`` match
-    (most reliable for source-generated tasks), then fall back to OR-based
-    FTS with a relevance threshold that filters out weak shared-word hits.
+
+def _similar_entry(match: SimilarTask, *, same_source: bool = False) -> dict:
+    return {
+        "id": match.id,
+        "title": match.title,
+        "status": match.status,
+        "deadline": match.row.get("deadline") or "",
+        "similarity": match.score,
+        "shared": list(match.shared[:6]),
+        "shared_identifiers": list(match.shared_identifiers),
+        "same_source": same_source,
+        "distinct_by": "",
+    }
+
+
+def _format_similar(entry: dict) -> str:
+    deadline = f" (due: {entry['deadline']})" if entry.get("deadline") else ""
+    notes = []
+    if entry.get("same_source"):
+        notes.append("same source_url")
+    notes.append(f"title similarity {entry['similarity']:.2f}")
+    if entry.get("distinct_by"):
+        notes.append(entry["distinct_by"])
+    if entry.get("shared_identifiers"):
+        notes.append("shares the identifier " + ", ".join(entry["shared_identifiers"]))
+    elif entry.get("shared"):
+        notes.append("shares: " + ", ".join(entry["shared"]))
+    return f"  - [{entry['status']}] {entry['title']}{deadline} — {entry['id']}  ({'; '.join(notes)})"
+
+
+async def _assess_duplicates(
+    ctx: ToolContext, title: str, source_url: str = "",
+) -> tuple[list[dict], list[dict]]:
+    """What a new task with this title and source would double.
+
+    Returns ``(duplicates, related)``. ``duplicates`` refuse the create:
+    every task with the same ``source_url`` — the identity of a
+    source-generated item, whose title the agent may word differently each
+    time — and every task whose title is nearly the same. ``related`` are
+    the remaining look-alikes above RELATED_SIMILARITY and the tasks that
+    share a rare identifier with the title: reported with the outcome so
+    the caller can link or merge, never a reason to refuse.
     """
     if not ctx.db:
-        return []
+        return [], []
+    index = await ctx.db.title_index()
+    duplicates: list[dict] = []
+    seen: set[str] = set()
     if source_url:
-        url_matches = await ctx.db.find_tasks_by_source_url(source_url, limit=10)
-        if url_matches:
-            return url_matches
-    return await ctx.db.search_tasks_similar(
-        query=title, limit=10, rank_threshold=getattr(ctx.db, "task_search_rank_threshold", -5.0),
-    )
+        for row in await ctx.db.find_tasks_by_source_url(
+            source_url, limit=MAX_DUPLICATES_LISTED,
+        ):
+            match = index.compare(title, row["id"])
+            if match is None:
+                # Created after the index was built; still the same source.
+                entry = {
+                    "id": row["id"], "title": row["title"], "status": row["status"],
+                    "deadline": row.get("deadline") or "", "similarity": 0.0,
+                    "shared": [], "shared_identifiers": [], "same_source": True,
+                    "distinct_by": "",
+                }
+            else:
+                entry = _similar_entry(match, same_source=True)
+            duplicates.append(entry)
+            seen.add(row["id"])
+    related: list[dict] = []
+    for match in index.similar(
+        title, min_score=RELATED_SIMILARITY,
+        limit=MAX_DUPLICATES_LISTED + MAX_RELATED_LISTED + len(seen),
+    ):
+        if match.id in seen:
+            continue
+        entry = _similar_entry(match)
+        other_source = match.row.get("source_url") or ""
+        if match.conflicting_refs:
+            entry["distinct_by"] = "names a different ticket"
+        elif source_url and other_source and other_source != source_url:
+            entry["distinct_by"] = "different source_url"
+        if match.score >= DUPLICATE_SIMILARITY and not entry["distinct_by"]:
+            duplicates.append(entry)
+        else:
+            related.append(entry)
+    duplicates.sort(key=lambda e: (not e["same_source"], -e["similarity"]))
+    # A shared identifier is the stronger clue; keep those within the cap.
+    related.sort(key=lambda e: (not e["shared_identifiers"], -e["similarity"]))
+    return duplicates[:MAX_DUPLICATES_LISTED], related[:MAX_RELATED_LISTED]
 
 
 async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -338,27 +429,30 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
             err, structured={"created": False, "reason": "invalid_status"},
         )
 
-    # Duplicate check (skip if explicitly confirmed)
-    if not confirm:
-        dupes = await _find_duplicate_tasks(ctx, title, source_url=source_url)
-        if dupes:
-            lines = [f"⚠️ Found {len(dupes)} potentially similar task(s):"]
-            for t in dupes:
-                deadline_str = f" (due: {t['deadline']})" if t.get("deadline") else ""
-                lines.append(f"  - [{t['status']}] {t['title']}{deadline_str} — {t['id']}")
-            lines.append("")
-            lines.append("Task NOT created. To create anyway, call task_create again with confirm_duplicate=true.")
-            return ToolResult.text(
-                "\n".join(lines),
-                structured={
-                    "created": False,
-                    "reason": "duplicate",
-                    "duplicates": [
-                        {"id": t["id"], "title": t["title"], "status": t["status"]}
-                        for t in dupes
-                    ],
-                },
-            )
+    # The duplicate guard. A confirmed create skips the refusal, not the
+    # look-up: the matches still travel with the result as related tasks.
+    duplicates, related = await _assess_duplicates(ctx, title, source_url=source_url)
+    if duplicates and not confirm:
+        lines = [f"⚠️ Found {len(duplicates)} likely duplicate task(s):"]
+        lines.extend(_format_similar(e) for e in duplicates)
+        if related:
+            lines.append("Related, not blocking:")
+            lines.extend(_format_similar(e) for e in related)
+        lines.append("")
+        lines.append(
+            "Task NOT created. If none of these is the same work item, call "
+            "task_create again with confirm_duplicate=true."
+        )
+        return ToolResult.text(
+            "\n".join(lines),
+            structured={
+                "created": False,
+                "reason": "duplicate",
+                "duplicates": duplicates,
+                "related": related,
+            },
+        )
+    mentions = (duplicates + related if confirm else related)[:MAX_RELATED_LISTED]
 
     md_parts = [f"# {title}\n"]
     if source_url:
@@ -421,10 +515,16 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if status == TERMINAL_STATUS and ctx.db:
         await task_done_handler(ctx, {"task_id": task_id, "note": ""})
 
-    return ToolResult.text(
-        f"Task created: {task_id} (status: {status})\nFile: {file_path}",
-        structured={"created": True, "task_id": task_id, "status": status},
-    )
+    text = f"Task created: {task_id} (status: {status})\nFile: {file_path}"
+    structured: dict = {"created": True, "task_id": task_id, "status": status}
+    if mentions:
+        text += (
+            "\nPossibly related tasks (created anyway — if one of them is the "
+            "same work item, close this task as its duplicate):\n"
+            + "\n".join(_format_similar(e) for e in mentions)
+        )
+        structured["related"] = mentions
+    return ToolResult.text(text, structured=structured)
 
 
 async def task_list_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -520,8 +620,12 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         if not task:
             return ToolResult.text(f"Task not found: {task_id}", is_error=True)
         if reopened and expect_revision is not None:
-            # The reopen's single guarded write advanced the row by exactly one revision.
-            expect_revision += 1
+            # The caller's token guarded the reopen, which has written since:
+            # the status, and a note when a plan came back with the task. The
+            # other edits are fenced on the revision that those writes of the
+            # reopen left, so a write of anybody else, during the reopen or
+            # after it, still refuses them.
+            expect_revision = reopened.structured["revision"]
 
         new_tags_str = ""
         if raw_tags is not None:
@@ -602,12 +706,10 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                     await ctx.db.upsert_task(**kw)
                 else:
                     if not await ctx.db.upsert_task(**kw, expect_revision=expect_revision):
-                        return _revision_conflict(
-                            task_id, expect_revision, reopened=reopened is not None,
-                        )
+                        return _revision_conflict(task_id, expect_revision, reopened=reopened)
                     await asyncio.to_thread(write)
                 await _emit_task_event(ctx, task_id, "updated")
-                return ToolResult.text(f"Task {task_id} updated.")
+                return ToolResult.text(f"Task {task_id} updated.{_about_the_plans(reopened)}")
 
         # Fall back to metadata updates when no task file was changed.
         if expect_revision is not None and (note or deadline is not None or new_title):
@@ -634,7 +736,7 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 task_id, new_tags_str, expect_revision=expect_revision,
             )
         if not applied and expect_revision is not None:
-            return _revision_conflict(task_id, expect_revision, reopened=reopened is not None)
+            return _revision_conflict(task_id, expect_revision, reopened=reopened)
         await _emit_task_event(ctx, task_id, "updated")
 
     return ToolResult.text(f"Task {task_id} updated.")
@@ -822,10 +924,12 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
     except ValueError as e:
         return ToolResult.text(str(e), is_error=True)
 
+    closed: list[str] = []
     if ctx.db:
         task = await ctx.db.get_task(task_id)
         if not task:
             return ToolResult.text(f"Task not found: {task_id}", is_error=True)
+        was_open = task.get("status") != TERMINAL_STATUS
 
         # Done is a write like any other — it appends to the file and moves it
         # into done/, so a stored ``file_path`` inside the tracked config
@@ -869,15 +973,113 @@ async def task_done_handler(ctx: ToolContext, args: dict) -> ToolResult:
             if not done and expect_revision is not None:
                 return _revision_conflict(task_id, expect_revision)
 
-        # Mark any implementing plans for this task as done
-        implementing_plans = await ctx.db.get_plans_for_task(task_id)
-        for p in implementing_plans:
-            if p.get("status") == "implementing":
+        # Mark any implementing plans for this task as done. A failed plan
+        # is done too when its own implementation session closes the task:
+        # a later turn there finished the work.
+        #
+        # A plan that still waits for review is closed with the task. Nobody
+        # decided it, so it gets a status of its own and no reviewer, and a
+        # person who reopens the task gets it back. The plan is written only
+        # while it is still pending, so one that is approved at that moment
+        # stays approved.
+        #
+        # A call that finds the task done already closed nothing new: a plan
+        # that was proposed for a done task waits for a decision of its own.
+        # What it does close is a plan that is older than the task's last
+        # close, which that close left in review: its write failed, or it
+        # was made by a release from before this rule.
+        closed_at = None if was_open else _stored_time(await ctx.db.get_task_closed_at(task_id))
+        for p in await ctx.db.get_plans_for_task(task_id):
+            retried = p.get("status") == "failed" and p.get("impl_session_id") == ctx.session_id
+            if p.get("status") == "implementing" or retried:
                 await ctx.db.update_plan(p["id"], status="done")
+            elif p.get("status") == "pending" and (was_open or _proposed_by(p, closed_at)):
+                if await ctx.db.compare_and_update_plan(
+                    p["id"], expect_status="pending", status=CLOSED_WITH_TASK,
+                ):
+                    closed.append(p["id"])
+        if closed:
+            await ctx.db.dismiss_plan_notifications(task_id, attribution=ctx.attribution)
+            await _note_about_plans(
+                ctx, task_id, closed, "waited for review and was closed with the task",
+            )
 
         await _emit_task_event(ctx, task_id, "done")
 
-    return ToolResult.text(f"Task {task_id} marked as done.")
+    result = f"Task {task_id} marked as done."
+    if closed:
+        result += (
+            f" Its plan in review ({', '.join(closed)}) was closed with it, undecided. "
+            "If the user had approved the plan and this session did the work, record that "
+            "with plan_approve (implement_here=true). The plan is in review again when the "
+            "user reopens the task on the board or the task page."
+        )
+    return ToolResult.text(result, structured={"plans_closed": closed})
+
+
+def _stored_time(value: object) -> datetime | None:
+    """A stored timestamp as an aware time, UTC when it names no zone;
+    ``None`` for one that is missing or does not parse."""
+    if not value:
+        return None
+    try:
+        when = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    return when if when.tzinfo else when.replace(tzinfo=timezone.utc)
+
+
+def _proposed_by(plan: dict, closed_at: datetime | None) -> bool:
+    """Whether *plan* was proposed by the time its task was closed. A time
+    that is not known, on either side, answers no: the plan stays in review."""
+    proposed_at = _stored_time(plan.get("created_at"))
+    return closed_at is not None and proposed_at is not None and proposed_at <= closed_at
+
+
+async def _note_about_plans(
+    ctx: ToolContext, task_id: str, plan_ids: list[str], what: str,
+    *, expect_revision: int | None = None,
+) -> bool:
+    """Add a line about *plan_ids* to the task's notes, as every other change
+    of a plan does. The plans are written already, so a note that fails is
+    logged and nothing else.
+
+    With *expect_revision* the note is first tried as a write from exactly
+    that revision, and the answer is whether it landed as one. When the row
+    has moved on, the note is written all the same, and the answer is no: the
+    caller then knows that somebody else wrote in between.
+    """
+    links = ", ".join(plan_link(plan_id) for plan_id in plan_ids)
+    args = {"task_id": task_id, "note": f"Plan {links} {what}."}
+    try:
+        if expect_revision is not None:
+            fenced = await task_update_handler(ctx, {**args, "expect_revision": expect_revision})
+            if not fenced.is_error:
+                return True
+        await task_update_handler(ctx, args)
+    except Exception:  # noqa: BLE001 (the note is the least of the change)
+        logger.warning("Could not note the plans %s on task %s", plan_ids, task_id, exc_info=True)
+    return False
+
+
+async def _plans_closed_with(ctx: ToolContext, task_id: str) -> list[str]:
+    """The plans that were closed with the task and that no newer plan has
+    replaced: more than one only if more than one was in review at the
+    close. A plan that was proposed for the task since has taken the place
+    of a closed one, whatever became of it."""
+    plans = await ctx.db.get_plans_for_task(task_id)
+    newest = max((p.get("version") or 0 for p in plans), default=0)
+    return [
+        p["id"] for p in plans
+        if p.get("status") == CLOSED_WITH_TASK and (p.get("version") or 0) == newest
+    ]
+
+
+def _about_the_plans(reopened: ToolResult | None) -> str:
+    """What a reopen said about the task's plan, for the result of a call
+    that went on to other edits; empty when it said nothing."""
+    said = (reopened.structured or {}) if reopened is not None else {}
+    return said.get("about_plans", "")
 
 
 @_one_change_per_task
@@ -967,8 +1169,49 @@ async def task_reopen_handler(ctx: ToolContext, args: dict) -> ToolResult:
     if src is not None:
         await asyncio.to_thread(move_task_file, src, dst, content)
 
+    # The close decided nothing about a plan that was in review, so a person
+    # who reopens the task has it back as it was: a card that is dragged into
+    # the Done lane and back is the same card. An agent that reopens a task,
+    # perhaps long after, does not put a plan in front of the person again
+    # without a word: the plan stays closed, and the agent is told.
+    about_plans = ""
+    noted = False
+    waiting = await _plans_closed_with(ctx, task_id)
+    if waiting and ctx.actor is not None and ctx.actor.is_human:
+        restored = [
+            plan_id for plan_id in waiting
+            if await ctx.db.compare_and_update_plan(
+                plan_id, expect_status=CLOSED_WITH_TASK, status="pending",
+            )
+        ]
+        if restored:
+            noted = await _note_about_plans(
+                ctx, task_id, restored, "is in review again: it was closed with the task",
+                expect_revision=None if expect_revision is None else expect_revision + 1,
+            )
+            about_plans = (
+                f" Its plan ({', '.join(restored)}), which was closed with the task, "
+                "waits for review again."
+            )
+    elif waiting:
+        about_plans = (
+            f" Its plan ({', '.join(waiting)}) stays closed: it was closed with the task, "
+            "undecided. If it is still wanted, propose it again with plan_propose; if the "
+            "user had approved it and this session did the work, record that with "
+            "plan_approve (implement_here=true)."
+        )
+
     await _emit_task_event(ctx, task_id, "updated")
-    return ToolResult.text(f"Task {task_id} reopened (status: {status}).")
+    # The revision that the writes of this reopen left, for a caller that
+    # sent a token and goes on to other edits (see task_update): the status
+    # write moved the row on by one, and the note, when it landed as the
+    # next write, by one more. It is worked out, not read: read, it would
+    # take a write of somebody else during the reopen for one of its own.
+    left = None if expect_revision is None else expect_revision + 1 + (1 if noted else 0)
+    return ToolResult.text(
+        f"Task {task_id} reopened (status: {status}).{about_plans}",
+        structured={"about_plans": about_plans, "revision": left},
+    )
 
 
 async def task_status_list_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -1026,7 +1269,12 @@ TASK_SEARCH_SPEC = ToolSpec(
 
 TASK_CREATE_SPEC = ToolSpec(
     name="task_create",
-    description="Create a new task. Checks for duplicates first — if similar tasks exist, returns them and refuses unless confirm_duplicate=true.",
+    description=(
+        "Create a new task. Refuses when a task with the same source_url exists "
+        "or an existing title is nearly the same, and lists them; pass "
+        "confirm_duplicate=true to create anyway. Look-alike tasks that do not "
+        "block are listed in the result as related — check them before starting."
+    ),
     input_schema=TASK_CREATE_SCHEMA,
     handler=task_create_handler,
 )
@@ -1042,6 +1290,7 @@ TASK_UPDATE_SPEC = ToolSpec(
     name="task_update",
     description=(
         "Update a task's status, deadline, tags, title, or add an update note. "
+        "The status done closes the task as task_done does. "
         "Pass expect_revision (from task_read) to refuse the update, writing "
         "nothing, if the task has changed since."
     ),
@@ -1070,6 +1319,9 @@ TASK_DONE_SPEC = ToolSpec(
     name="task_done",
     description=(
         "Mark a task as done and move its file to the done/ directory. "
+        "A plan of the task that still waits for review is closed with it, "
+        "undecided; if the user approved the plan and this session did the "
+        "work, call plan_approve with implement_here=true before or after. "
         "Pass expect_revision (from task_read) to refuse the completion, "
         "writing nothing, if the task has changed since."
     ),

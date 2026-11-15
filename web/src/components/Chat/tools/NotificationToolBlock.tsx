@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Bell, HelpCircle, Loader2, ChevronRight, ChevronDown } from '../../ui/icons';
+import { Bell, Loader2, ChevronRight, ChevronDown } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { Badge, type BadgeTone } from '../../ui';
 
@@ -23,22 +23,15 @@ const PRIORITY_TONES: Record<string, BadgeTone> = {
   high: 'warning',
 };
 
+/** Nerve's `notify` call in the chat. `ask_user` has its own card, `AskUserBlock`. */
 export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
   const [expanded, setExpanded] = useState(false);
   const isRunning = block.status === 'running';
-  const isNotify = block.tool === 'notify';
-  const isAsk = block.tool === 'ask_user';
 
   const title = String(block.input.title || '');
   const priority = String(block.input.priority || 'normal');
-  const optionsRaw = String(block.input.options || '');
-  const options = optionsRaw ? optionsRaw.split(',').map(o => o.trim()).filter(Boolean) : [];
-  const wait = String(block.input.wait || 'false').toLowerCase() === 'true';
   const body = String(block.input.body || '');
-
-  const Icon = isAsk ? HelpCircle : Bell;
-  const iconColor = block.isError ? 'text-error' : isAsk ? 'text-hue-blue' : 'text-hue-amber';
-  const label = isNotify ? 'Notify' : 'Ask User';
+  const iconColor = block.isError ? 'text-error' : 'text-hue-amber';
 
   const resultText = block.result ? extractText(block.result) : '';
   const isSent = resultText.includes('sent') || resultText.includes('Sent');
@@ -51,17 +44,14 @@ export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
       >
         {isRunning
           ? <Loader2 size={14} className="text-accent animate-spin shrink-0" />
-          : <Icon size={14} className={`shrink-0 ${iconColor}`} />
+          : <Bell size={14} className={`shrink-0 ${iconColor}`} />
         }
-        <span className="text-sm leading-tight font-medium text-text-secondary">{label}</span>
+        <span className="text-sm leading-tight font-medium text-text-secondary">Notify</span>
         {title && <span className="text-xs text-text-muted truncate">{title}</span>}
         {priority !== 'normal' && (
           <Badge tone={PRIORITY_TONES[priority] || 'neutral'} className="shrink-0">
             {priority}
           </Badge>
-        )}
-        {wait && isAsk && (
-          <Badge tone="info" className="shrink-0">blocking</Badge>
         )}
         {isSent && !isRunning && (
           <span className="text-2xs text-success shrink-0">sent</span>
@@ -76,15 +66,6 @@ export function NotificationToolBlock({ block }: { block: ToolCallBlockData }) {
           <div className="px-3 py-2">
             {title && <p className="text-sm text-text font-medium">{title}</p>}
             {body && <p className="text-xs text-text-muted mt-0.5">{body}</p>}
-
-            {/* Options for questions */}
-            {isAsk && options.length > 0 && (
-              <div className="flex flex-wrap gap-1.5 mt-2">
-                {options.map(opt => (
-                  <Badge key={opt} tone="info" size="sm" outline>{opt}</Badge>
-                ))}
-              </div>
-            )}
           </div>
 
           {/* Result */}

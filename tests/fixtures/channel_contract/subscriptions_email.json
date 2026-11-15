@@ -1,0 +1,16 @@
+{
+  "version": "1",
+  "kind": "subscriptions",
+  "request_id": "n-26",
+  "payload": {
+    "subscriptions": {
+      "version": "1",
+      "sources": [
+        {
+          "provider": "email",
+          "filters": {}
+        }
+      ]
+    }
+  }
+}

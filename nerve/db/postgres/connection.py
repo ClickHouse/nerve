@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections.abc import Mapping
 
 _SERIAL_TABLES = {
     "cron_logs",
+    "push_subscriptions",
     "channel_observations",
     "task_status_events",
     "review_loop_decisions",
@@ -62,13 +62,23 @@ def translate(sql):
         "CAST(strftime('%s', u.created_at) AS REAL)",
         "EXTRACT(EPOCH FROM u.created_at::timestamptz)",
     )
-    sql = re.sub(r"\bLIKE\b", "ILIKE", sql)
+    # Keep SQL operators out of quoted strings and comments.
+    parts = re.split(
+        r"('(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|--[^\n]*|/\*.*?\*/)", sql, flags=re.S
+    )
+    for index in range(0, len(parts), 2):
+        part = re.sub(r"\bNOT\s+GLOB\b", "!~~~", parts[index], flags=re.I)
+        part = re.sub(r"\bGLOB\b", "~~~", part, flags=re.I)
+        part = re.sub(r"\bDATE\s*\(", "nerve_pg.sqlite_date(", part, flags=re.I)
+        parts[index] = re.sub(r"\bLIKE\b", "ILIKE", part, flags=re.I)
+    sql = "".join(parts)
     sql = sql.replace("MAX(rev + 1, ?)", "GREATEST(rev + 1, ?)")
     sql = sql.replace("IS NOT excluded.", "IS DISTINCT FROM excluded.")
     replace = re.match(r"INSERT OR REPLACE INTO (\w+)\s*\(([^)]+)\)", sql, re.I)
     if replace:
         keys = {
             "sync_cursors": "source",
+            "channel_reply_routes": "channel, target, message_id",
             "session_deletions": "session_id",
             "channel_sessions": "channel_key",
             "consumer_cursors": "consumer, source",
@@ -100,7 +110,7 @@ def translate(sql):
     return sql, returning
 
 
-class Row(Mapping):
+class Row:
     def __init__(self, columns, values):
         self._data = {
             key: value for key, value in zip(columns, values) if key != "_scope"
@@ -112,11 +122,14 @@ class Row(Mapping):
     def __getitem__(self, key):
         return self._values[key] if isinstance(key, (int, slice)) else self._data[key]
 
+    def keys(self):
+        return self._data.keys()
+
     def __iter__(self):
-        return iter(self._data)
+        return iter(self._values)
 
     def __len__(self):
-        return len(self._data)
+        return len(self._values)
 
 
 class Cursor:

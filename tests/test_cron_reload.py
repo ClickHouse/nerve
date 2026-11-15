@@ -35,6 +35,8 @@ async def svc(tmp_path):
 
     db = AsyncMock()
     db.get_last_successful_cron_run = AsyncMock(return_value=None)
+    db.get_last_cron_runs = AsyncMock(return_value={})
+    db.get_cron_job_stats = AsyncMock(return_value={})
 
     service = CronService(config, AsyncMock(), db)
     # Start the scheduler paused so add/remove/replace_existing hit the real
@@ -1067,6 +1069,88 @@ class TestReservedIdsInCli:
         assert "reserved" in result.output
 
 
+_BEFORE_DAILY = Path(__file__).parent / "fixtures" / "cron" / "system-before-daily-skill-extractor.yaml"
+
+
+def _shipped_skill_extractor() -> dict:
+    from nerve.setup_writer import PRODUCTIVITY_CRONS
+
+    return next(c for c in PRODUCTIVITY_CRONS if c["id"] == "skill-extractor")
+
+
+class TestAnEarlierSystemFile:
+    """A built-in job whose system.yaml entry still holds what an earlier
+    release shipped is loaded as this release ships it (tests/test_cron.py).
+    Here: what the scheduler and the CLI make of the file such a release
+    wrote."""
+
+    @staticmethod
+    def _trigger(service, job_id: str) -> dict[str, str]:
+        trigger = service.scheduler.get_job(job_id).trigger
+        return {field.name: str(field) for field in trigger.fields}
+
+    @pytest.mark.asyncio
+    async def test_the_trigger_is_built_from_the_schedule_this_release_ships(self, svc):
+        service, jobs_file = svc
+        service.config.cron.system_file.write_bytes(_BEFORE_DAILY.read_bytes())
+        shipped = _shipped_skill_extractor()
+
+        result = await service.reload()
+
+        assert "skill-extractor" in result["added"]
+        trigger = self._trigger(service, "skill-extractor")
+        assert (trigger["hour"], trigger["minute"]) == ("5", "0")
+        row = next(r for r in await service.list_jobs() if r["id"] == "skill-extractor")
+        assert (row["schedule"], row["description"]) == (shipped["schedule"], shipped["description"])
+        job = next(j for j in service._jobs if j.id == "skill-extractor")
+        assert job.resolve_prompt() == shipped["prompt"]
+
+        # The earlier schedule, chosen in jobs.yaml, is the one that runs.
+        _write_jobs(jobs_file, [_job_dict("skill-extractor", schedule="0 */12 * * *")])
+        result = await service.reload()
+
+        assert "skill-extractor" in result["updated"]
+        trigger = self._trigger(service, "skill-extractor")
+        assert (trigger["hour"], trigger["minute"]) == ("*/12", "0")
+
+    def test_the_cli_lists_the_job_with_the_description_it_is_loaded_with(self, tmp_path, monkeypatch):
+        from click.testing import CliRunner
+
+        import nerve.agent.engine as engine_mod
+        import nerve.db as db_mod
+        from nerve.cli import main
+
+        monkeypatch.setattr(db_mod, "init_db", AsyncMock(return_value=AsyncMock()))
+        monkeypatch.setattr(db_mod, "close_db", AsyncMock())
+        monkeypatch.setattr(
+            engine_mod, "AgentEngine", MagicMock(return_value=AsyncMock()),
+        )
+        before = yaml.safe_load(_BEFORE_DAILY.read_text(encoding="utf-8"))["jobs"]
+        mine = next(job for job in before if job["id"] == "skill-extractor")
+        now, earlier = _shipped_skill_extractor()["description"], mine["description"]
+        assert now != earlier
+
+        def listed(system: list[dict], user: list[dict]) -> str:
+            cfg = TestReservedIdsInCli._config_dir(tmp_path, system, user)
+            result = CliRunner().invoke(main, ["-c", str(cfg), "cron"])
+            assert result.exit_code == 0, result.output
+            return result.output
+
+        # In system.yaml: as this release ships it.
+        output = listed(before, [])
+        assert f"[system] skill-extractor: {now} (" in output and earlier not in output
+        # In jobs.yaml, which replaces it, and in jobs.yaml alone: as written.
+        for system in (before, []):
+            output = listed(system, [mine])
+            assert f"[user  ] skill-extractor: {earlier} (" in output and now not in output
+        # Of two entries with the id in system.yaml the last one runs: the
+        # list brings that one up to date and leaves the other as written.
+        output = listed([{**mine, "description": "Mine."}, mine], [])
+        assert f"[system] skill-extractor: {now} (" in output and "skill-extractor: Mine. (" in output
+        output = listed([mine, {**mine, "description": "Mine."}], [])
+        assert f"[system] skill-extractor: {earlier} (" in output and "skill-extractor: Mine. (" in output
+
+
 class TestSourceScheduleReporting:
     """``list_jobs`` must report the trigger the scheduler actually used.
 
@@ -1108,3 +1192,62 @@ class TestSourceScheduleReporting:
         rows = await service.list_jobs()
         row = next(r for r in rows if r["id"] == "source:github")
         assert row["schedule"] == "*/15 * * * *"
+
+
+class TestTheSystemFileOfAnEarlierRelease:
+    """The scheduler writes this release's values into a system.yaml that
+    holds an earlier release's: before it loads the jobs at its start, and
+    once a reload is applied. A reload that is refused changes no file."""
+
+    EARLIER = Path(__file__).parent / "fixtures" / "cron" / "system-before-daily-skill-extractor.yaml"
+
+    def _earlier_system_file(self, service, tmp_path) -> Path:
+        service.config.lockdown = False
+        service.config.workspace = tmp_path
+        service.config.memory.backend = "memu"
+        system = Path(service.config.cron.system_file)
+        system.write_bytes(self.EARLIER.read_bytes())
+        return system
+
+    @staticmethod
+    def _extractor_schedule(system: Path) -> str:
+        jobs = yaml.safe_load(system.read_text(encoding="utf-8"))["jobs"]
+        return next(job["schedule"] for job in jobs if job["id"] == "skill-extractor")
+
+    @pytest.mark.asyncio
+    async def test_an_applied_reload_writes_it(self, svc, tmp_path):
+        service, _jobs_file = svc
+        system = self._earlier_system_file(service, tmp_path)
+        assert self._extractor_schedule(system) == "0 */12 * * *"
+
+        await service.reload()
+        assert self._extractor_schedule(system) == "0 5 * * *"
+        assert next(j for j in service._jobs if j.id == "skill-extractor").schedule == "0 5 * * *"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_reload_leaves_it(self, svc, tmp_path):
+        from nerve.config import ConfigError
+
+        service, jobs_file = svc
+        system = self._earlier_system_file(service, tmp_path)
+        before = system.read_bytes()
+        jobs_file.write_text("jobs: [ this is: not valid: yaml\n", encoding="utf-8")
+
+        with pytest.raises(ConfigError):
+            await service.reload()
+        assert system.read_bytes() == before
+
+    @pytest.mark.asyncio
+    async def test_the_start_writes_it_before_it_loads_the_jobs(self, svc, monkeypatch):
+        service, _jobs_file = svc
+        calls = []
+        monkeypatch.setattr(service, "_rewrite_system_file", lambda: calls.append("write"))
+
+        def load(*args, **kwargs):
+            calls.append("load")
+            raise RuntimeError("far enough")
+
+        monkeypatch.setattr(service, "_load_merged_jobs", load)
+        with pytest.raises(RuntimeError):
+            await service.start()
+        assert calls == ["write", "load"]

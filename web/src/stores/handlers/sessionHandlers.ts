@@ -2,13 +2,31 @@ import type { WSMessage } from '../../api/websocket';
 import type { PanelTab, Session } from '../../types/chat';
 import { applyStreamEvent, rebuildPanelTabsFromBuffer, deriveStatus, extractTodosFromBuffer, extractCCTasksFromBuffer } from '../helpers/bufferReplay';
 import { hydrateMessage } from '../../utils/hydrateMessage';
+import { reloadSessionsSoon } from '../helpers/sessionsReload';
 import { useAgentStore } from '../agentStore';
 import type { ChatState } from '../chatStore';
 import { planOpensPanel } from './panelHandlers';
+import { discardStreamDeltas, finalizeRunningPanels } from './streamingHandlers';
 import type { Get, Set } from './types';
 
 /** Tabs the person opened that a replayed buffer knows nothing about. */
-const KEPT_ON_REPLAY: ReadonlySet<PanelTab['type']> = new Set(['agents', 'agent', 'files']);
+const KEPT_ON_REPLAY: ReadonlySet<PanelTab['type']> = new Set(['agents', 'agent', 'files', 'tasks']);
+
+/**
+ * The view of a chat with nothing of a session in it: what opening a session
+ * starts from, and what is left of a session that the server does not have.
+ */
+export function emptyChatView(): Partial<ChatState> {
+  return {
+    messages: [], streamingBlocks: [], isStreaming: false,
+    agentStatus: { state: 'idle' }, contextUsage: null, backendStatus: null,
+    currentTodos: [], currentCCTasks: [], pendingInteraction: null,
+    planSummaries: {}, planEditRequest: null,
+    panels: [], activePanelId: null, panelVisible: false,
+    modifiedFiles: [], modifiedFilesCount: 0,
+    sessionTasks: null, sessionTasksFailed: false,
+  };
+}
 
 /**
  * Leave streaming mode: running tool calls complete and the streamed blocks
@@ -78,6 +96,10 @@ export function handleReviewLoopUpdate(
       sess.id === msg.session_id ? { ...sess, review_loop: chip } : sess,
     ) ?? null,
   }));
+  // A loop that starts or stops waiting moves its session into or out of
+  // "Needs you"; only the server list adds or drops a session from outside
+  // the feed.
+  reloadSessionsSoon();
   if (msg.message && msg.session_id && msg.session_id === get().activeSession) {
     const content = msg.message.content || '';
     set((s) => ({
@@ -98,6 +120,9 @@ export function handleSessionStatus(
   get: Get,
   set: Set,
 ): void {
+  // The server bound the socket to this session, so it has it: a session
+  // that was missing a connect ago exists now.
+  if (get().missingSession === msg.session_id) set({ missingSession: null });
   // The roster snapshot rides on every bind and switch, idle sessions included.
   if (msg.agents) {
     useAgentStore.getState().hydrate(msg.agents);
@@ -111,7 +136,23 @@ export function handleSessionStatus(
       set((s) => ({ sessions: s.sessions.map(patch), searchResults: s.searchResults?.map(patch) ?? null }));
     }
   }
-  if (!msg.is_running) return;
+  if (!msg.is_running) {
+    // The turn on screen ended while the socket was down (a phone that slept,
+    // a dropped network), so its done never came. Leave streaming mode and
+    // read the stored reply, which replaces the part that streamed. A
+    // question of that turn has no turn to answer any more.
+    if (get().isStreaming) {
+      set({
+        streamingBlocks: [],
+        isStreaming: false,
+        agentStatus: { state: 'idle' },
+        pendingInteraction: null,
+      });
+      finalizeRunningPanels(get);
+      void get().catchUp();
+    }
+    return;
+  }
 
   // Rebuild streaming state from buffered events
   let blocks = get().streamingBlocks.length > 0 ? [...get().streamingBlocks] : [];
@@ -251,6 +292,22 @@ export function handleSessionSwitched(
   get().switchSession(msg.session_id);
 }
 
+export function handleSessionNotFound(
+  msg: Extract<WSMessage, { type: 'session_not_found' }>,
+  get: Get,
+  set: Set,
+): void {
+  // The server does not have the session on screen. The dispatcher drops the
+  // answer for another session; an answer that names none is for no view.
+  if (!msg.session_id || msg.session_id !== get().activeSession) return;
+  // The chat page shows that in place of the chat. A tab can learn it at a
+  // reconnect, with the session's messages, panels and task lists still in
+  // the view: nothing of them stays.
+  discardStreamDeltas();
+  set({ ...emptyChatView(), missingSession: msg.session_id, loading: false });
+  useAgentStore.getState().reset(msg.session_id);
+}
+
 export function handleSessionForked(
   _msg: Extract<WSMessage, { type: 'session_forked' }>,
   get: Get,
@@ -290,6 +347,10 @@ export function handleSessionRunning(
   get: Get,
   set: Set,
 ): void {
+  // The session on screen that the server did not have runs or ran: it
+  // exists now. Its row takes the event as any row does, and then the
+  // session is opened again (below), which asks the server and loads it.
+  const reopen = msg.session_id === get().activeSession && get().missingSession === msg.session_id;
   // Global broadcast: a session started or stopped running. The event also
   // carries the session's pending work (scheduled wake-up / live background
   // task), so a session that only *looks* idle keeps its parked indicator
@@ -319,6 +380,7 @@ export function handleSessionRunning(
     // so the response is visible and input is disabled.
     // Guard: sendMessage() already sets isStreaming before the WS message,
     // so this only fires for server-initiated runs.
+    if (reopen) return updates;
     if (msg.session_id === s.activeSession && msg.is_running && !s.isStreaming) {
       updates.isStreaming = true;
       updates.streamingBlocks = [];
@@ -339,6 +401,14 @@ export function handleSessionRunning(
     }
     return updates;
   });
+
+  if (reopen) {
+    // The view gets its state from the session's status after the switch. A
+    // row that no list has yet comes with the next read of the lists.
+    void get().switchSession(msg.session_id);
+    reloadSessionsSoon();
+    return;
+  }
 
   // A backgrounded feed session that just STOPPED may have produced new content;
   // its updated_at only refreshes via loadSessions() (session_running carries
@@ -371,6 +441,9 @@ export function handleSessionAwaitingInput(
         : sess,
     ) ?? null,
   }));
+  // As for a review loop: the server list adds or drops a session from
+  // outside the feed (a cron session, a later page).
+  reloadSessionsSoon();
 }
 
 export function handleAnswerInjected(
@@ -408,7 +481,7 @@ export function handleUserMessage(
   const clientMsgId = msg.client_msg_id ?? null;
   if (clientMsgId && get().messages.some(m => m.client_msg_id === clientMsgId)) return;
   const hydrated = hydrateMessage({ role: 'user', content: msg.content, blocks: msg.blocks ?? undefined, created_at: new Date().toISOString(), actor_id: msg.actor_id ?? null });
-  // The sending tab's id: lets this tab mark the bubble "Queued" while the
-  // message waits in the server queue.
+  // The sending tab's id: while the message waits in the server queue, this
+  // tab shows it as a queue row and hides the bubble (MessageList).
   set(s => ({ messages: [...s.messages, { ...hydrated, client_msg_id: clientMsgId }] }));
 }

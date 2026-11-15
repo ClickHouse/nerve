@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from nerve.agent.engine import NotAcceptingTurnsError
+from nerve.agent.engine import NotAcceptingTurnsError, SessionClosedError
 from nerve.channels.access import (
     Decision,
     Identity,
@@ -162,14 +162,13 @@ def is_slack_id(pattern: str) -> bool:
     return bool(_SLACK_ID_RE.match(pattern))
 
 
-def notification_target(config: NerveConfig, *, warn_unset: bool = True) -> str | None:
-    """The conversation for notification cards, or ``None``.
+def notification_target(config: NerveConfig) -> str | None:
+    """The conversation for notification cards in Socket Mode, or ``None``.
 
     That is ``notifications.slack_channel_id``, else the first literal
-    conversation ID in ``slack.allow_channels``. The hosted channel uses the
-    same choice first. When the config names no conversation, the channel
-    gateway can choose one, so the hosted channel sets *warn_unset* to
-    false: then no warning is logged for that case.
+    conversation ID in ``slack.allow_channels``. In hosted mode the config
+    does not choose the conversation: the gateway posts each card in the
+    agent's notification channel, which an admin sets in the control plane.
     """
     configured = config.notifications.slack_channel_id.strip()
     if configured:
@@ -183,11 +182,10 @@ def notification_target(config: NerveConfig, *, warn_unset: bool = True) -> str 
     for entry in config.slack.allow_channels:
         if is_slack_id(entry) and entry[0] in "CG":
             return entry
-    if warn_unset:
-        logger.warning(
-            "No notifications.slack_channel_id is set and slack.allow_channels "
-            "has no literal conversation id",
-        )
+    logger.warning(
+        "No notifications.slack_channel_id is set and slack.allow_channels "
+        "has no literal conversation id",
+    )
     return None
 
 
@@ -879,6 +877,12 @@ class SlackChannel(BaseChannel):
         )
         return identity
 
+    async def conversation_name(self, channel_id: str) -> str | None:
+        """The name of a channel (``conversations.info``, cached), or
+        ``None`` for a direct message or when Slack does not answer."""
+        identity = await self._identify_conversation(channel_id, "channel", True)
+        return identity.names[0] if identity.names else None
+
     async def _identify_conversation(
         self, channel_id: str, channel_type: str, resolve: bool,
     ) -> Identity:
@@ -1212,6 +1216,16 @@ class SlackChannel(BaseChannel):
         if not handled:
             return
 
+        # A reply in the thread under a notification card goes to the session
+        # that raised the notification. Its target is that thread, in a DM
+        # too, so the answer lands there and the DM keeps its own session.
+        session_id = await self._notification_session(
+            channel_id, event.get("thread_ts") or "",
+        )
+        if session_id:
+            target = format_target(channel_id, event["thread_ts"])
+            channel_key = f"slack:{target}"
+
         text = slack_to_plain(event.get("text") or "", self._bot_user_id)
         self._cache_message(ts, target, text)
 
@@ -1235,23 +1249,74 @@ class SlackChannel(BaseChannel):
         if images:
             metadata["images"] = images
         self._remember(self._last_inbound_ts, target, ts, _INBOUND_TS_MAX)
+        # The channel name for the origin of a new session. The lookup is
+        # cached, and a direct message has no name.
+        conversation = await self._identify_conversation(
+            channel_id, channel_type, True,
+        )
 
         msg = InboundMessage(
             channel_name="slack",
             channel_key=channel_key,
             sender_id=target,
             text=text,
+            session_id=session_id,
             metadata=metadata,
+            conversation_title=next(iter(conversation.names), ""),
         )
 
         try:
-            await self.router.handle_message(msg)
+            try:
+                # A delete since the check leaves no row, and the router does
+                # not report that as a closed session.
+                if (
+                    msg.session_id is not None
+                    and await self.router.get_session(msg.session_id) is None
+                ):
+                    raise SessionClosedError("deleted")
+                await self.router.handle_message(msg)
+            except SessionClosedError:
+                if msg.session_id is None:
+                    raise
+                # The notification's session closed after the check. The
+                # message goes once more, to where it goes without a card.
+                target = format_target(channel_id, thread_ts)
+                msg.channel_key, msg.sender_id = f"slack:{target}", target
+                msg.session_id = None
+                self._cache_message(
+                    ts, target,
+                    slack_to_plain(event.get("text") or "", self._bot_user_id),
+                )
+                self._remember(self._last_inbound_ts, target, ts, _INBOUND_TS_MAX)
+                await self.router.handle_message(msg)
         except NotAcceptingTurnsError:
             # The stream adapter already sent the engine's error event.
             logger.info("Draining: refused a message from %s", target)
         except Exception as e:
             logger.error("Agent error for %s: %s", target, e, exc_info=True)
             await self._post(target, f"Error: {e}")
+
+    async def _notification_session(
+        self, channel_id: str, thread_ts: str,
+    ) -> str | None:
+        """The session behind the notification card that roots a thread.
+
+        That is the session that raised the notification, while it exists
+        and is not archived, else ``None``. A lookup that fails is logged and
+        gives ``None``: the message then goes where it goes without a card.
+        """
+        if not thread_ts or self._notification_service is None:
+            return None
+        try:
+            return await self._notification_service.reply_session(
+                channel="slack", message_id=thread_ts, target=channel_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "Slack could not look up the notification of thread %s: %s",
+                thread_ts, e,
+            )
+            return None
 
     async def _handle_reaction_event(self, event: dict[str, Any]) -> None:
         """Forward an emoji reaction on a cached message as text."""
@@ -1610,7 +1675,10 @@ class SlackChannel(BaseChannel):
         if not target:
             return None
         blocks = build_notification_blocks(text, notification_id, options)
-        message_id = await self._post(target, text, blocks)
+        # Beside blocks, the text is what Slack shows in a toast and a push
+        # notification, where it reads mrkdwn: a Markdown link would show
+        # there with its brackets and its address.
+        message_id = await self._post(target, _md_to_slack(text), blocks)
         if not message_id:
             return None
         self._cache_message(message_id, target, text)
@@ -1622,7 +1690,7 @@ class SlackChannel(BaseChannel):
         message_id: str,
         text: str,
     ) -> None:
-        """Replace a notification card with its expired state."""
+        """Replace a notification card with *text* and no buttons."""
         if not self.is_available:
             return
         channel_id, _ = parse_target(target)
@@ -1635,7 +1703,7 @@ class SlackChannel(BaseChannel):
             )
         except Exception as exc:
             logger.debug(
-                "Slack expiry edit failed for %s: %s", message_id, exc,
+                "Slack card edit failed for %s: %s", message_id, exc,
             )
 
     async def send(self, message: OutboundMessage) -> None:
@@ -1769,7 +1837,9 @@ class SlackChannel(BaseChannel):
         except Exception as e:
             logger.warning("Slack reactions.add failed for %s: %s", target, e)
 
-    async def send_file(self, target: str, file_path: str) -> bool:
+    async def send_file(
+        self, target: str, file_path: str, *, session_id: str | None = None,
+    ) -> bool:
         """Upload a file into the conversation as an attachment."""
         if not self.is_available or not target:
             return False

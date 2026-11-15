@@ -1,7 +1,7 @@
 import { useCronStore } from '../../stores/cronStore';
 import { Timer } from '../ui/icons';
 import { chatPath, jobLabel } from './utils';
-import { ChatLink, TriggerButton, JobTypeIcon } from './controls';
+import { ChatLink, TriggerButton, JobTypeIcon, RunStatusIcon } from './controls';
 
 export function CronSidebar({ inDrawer = false, onSelect }: {
   inDrawer?: boolean;
@@ -34,7 +34,7 @@ export function CronSidebar({ inDrawer = false, onSelect }: {
         <button onClick={() => { selectJob(null); onSelect?.(); }}
           className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-sm transition-colors cursor-pointer
             ${selectedJobId === null ? 'bg-accent/15 text-accent' : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'}`}>
-          <span className="flex items-center gap-2"><Timer size={14} /> All Jobs</span>
+          <span className="flex items-center gap-2"><Timer size={14} /> All jobs</span>
           <span className="text-xs opacity-70">{jobs.length}</span>
         </button>
 
@@ -60,8 +60,10 @@ export function CronSidebar({ inDrawer = false, onSelect }: {
               className={`w-full flex items-center justify-between px-2 py-1.5 rounded text-sm transition-colors cursor-pointer
                 ${selectedJobId === job.id ? 'bg-accent/15 text-accent' : 'text-text-muted hover:text-text-secondary hover:bg-surface-raised'}`}>
               <span className="flex items-center gap-2 min-w-0 truncate">
-                <JobTypeIcon type={job.type} />
+                <JobTypeIcon kind={job.kind} />
                 <span className="truncate">{jobLabel(job)}</span>
+                {/* A job whose latest run failed shows it in the list. */}
+                {job.last_run?.status === 'error' && <RunStatusIcon status="error" size={12} />}
               </span>
               <span className="flex items-center gap-1 shrink-0">
                 {job.last_session_id && (

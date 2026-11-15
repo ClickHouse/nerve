@@ -11,9 +11,8 @@ parts, reactions and the typing mark, the send tool allowed and refused,
 rate-limited, ambiguous, unavailable, and unsupported operations, a stream
 that closes during an operation, late results, and the in-flight operation
 limit. Also file uploads and attachment reads through transfers, the checks
-on read transfers, and notification cards with their answers and expiry, in
-the conversation that the config names or, through ``notify``, in the one
-that the gateway chooses.
+on read transfers, and notification cards with their answers and expiry,
+sent through ``notify`` to the conversation that the gateway chooses.
 """
 
 from __future__ import annotations
@@ -913,7 +912,8 @@ class TestReadTransfers:
 @pytest_asyncio.fixture
 async def noticed(tmp_path, db, monkeypatch):
     harness = await start_hosted(tmp_path, db, monkeypatch, notifications=True)
-    harness.config.notifications.slack_channel_id = TOOL_TARGET
+    # The agent's notification channel, as the control plane sets it.
+    harness.gateway.notification_conversation = TOOL_TARGET
     await db.create_session("s1", actor=None)
     try:
         yield harness
@@ -923,32 +923,31 @@ async def noticed(tmp_path, db, monkeypatch):
 
 async def question_card(hosted: Hosted) -> tuple[str, str]:
     """Ask a yes-or-no question, and return its ID and the card's message ID."""
-    await hosted.gateway.wait_for(lambda: hosted.runtime.streams.connections("send"))
+    await hosted.gateway.wait_for(lambda: hosted.runtime.streams.connections("notify"))
     asked = await hosted.notifications.ask_question(
         session_id="s1", title="Deploy now?", options=["yes", "no"],
     )
     notification_id = asked["notification_id"]
-    await hosted.gateway.wait_for(lambda: hosted.gateway.sent_operations("send"))
+    await hosted.gateway.wait_for(lambda: hosted.gateway.sent_operations("notify"))
     delivery = await hosted.db.get_latest_notification_delivery(notification_id, "slack")
     return notification_id, str(delivery["message_id"])
 
 
 class TestNotifications:
     async def test_a_card_without_text_is_not_sent(self, noticed):
-        stream = await noticed.stream()
+        stream = await notify_stream(noticed)
 
         posted = await noticed.runtime.channels["slack"].post_notification("n-empty", "", [("Yes", "yes")])
 
         assert posted is None
-        assert noticed.gateway.sent_operations("send") == []
+        assert noticed.gateway.sent_operations("notify") == []
         assert not stream.closed.is_set()
 
     async def test_a_question_is_a_card_with_buttons_and_a_press_answers_it(self, noticed):
-        stream = await noticed.stream()
+        stream = await notify_stream(noticed)
         notification_id, message_id = await question_card(noticed)
 
-        [card] = noticed.gateway.sent_operations("send")
-        assert card["destination"] == {"conversation": {"id": TOOL_TARGET}}
+        [card] = noticed.gateway.sent_operations("notify")
         assert "Deploy now?" in text_of(card["content"])
         elements = card["content"][-1]["actions"]["elements"]
         assert [(e["action_id"], e["value"], e.get("style")) for e in elements] == [
@@ -975,7 +974,7 @@ class TestNotifications:
         assert (notification["status"], notification["answer"]) == ("answered", "yes")
 
     async def test_a_press_in_another_conversation_does_not_answer(self, noticed):
-        stream = await noticed.stream()
+        stream = await notify_stream(noticed)
         notification_id, message_id = await question_card(noticed)
 
         inbox_id = noticed.gateway.store(interaction_event(
@@ -1004,7 +1003,7 @@ class TestNotifications:
         assert (notice["response"], text_of(notice["content"])) == ("acknowledge", "Service unavailable.")
 
     async def test_an_answer_that_cannot_be_recorded_is_deferred(self, noticed, monkeypatch):
-        stream = await noticed.stream()
+        stream = await notify_stream(noticed)
         notification_id, message_id = await question_card(noticed)
 
         calls: list[str] = []
@@ -1023,7 +1022,7 @@ class TestNotifications:
         assert noticed.gateway.sent_operations("interaction") == []
 
     async def test_a_press_the_provider_no_longer_takes_edits_the_card(self, noticed):
-        stream = await noticed.stream()
+        stream = await notify_stream(noticed)
         notification_id, message_id = await question_card(noticed)
         noticed.gateway.script("interaction", {"outcome": "unavailable", "reason_code": "expired"})
 
@@ -1037,7 +1036,7 @@ class TestNotifications:
         assert "✅ Answered: no" in text_of(edit["content"])
 
     async def test_a_press_on_another_element_is_rejected(self, noticed):
-        stream = await noticed.stream()
+        stream = await notify_stream(noticed)
         inbox_id = noticed.gateway.store(interaction_event("preview_fixture", message_id="1700000500.000100"))
 
         await stream.nudge("invoke")
@@ -1046,7 +1045,7 @@ class TestNotifications:
         assert noticed.gateway.sent_operations("interaction") == []
 
     async def test_an_expired_card_is_edited_without_buttons(self, noticed):
-        await noticed.stream()
+        await notify_stream(noticed)
         notification_id, message_id = await question_card(noticed)
         past = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
         await noticed.db.update_notification(notification_id, expires_at=past)
@@ -1059,25 +1058,15 @@ class TestNotifications:
         assert "Expired unanswered" in text_of(edit["content"])
         assert not any(part["kind"] == "actions" for part in edit["content"])
 
-    async def test_without_a_notification_conversation_nothing_is_posted(self, noticed):
-        await noticed.stream()
-        noticed.config.notifications.slack_channel_id = ""
-        await noticed.gateway.wait_for(lambda: noticed.runtime.streams.connections("send"))
-
-        await noticed.notifications.ask_question(session_id="s1", title="Deploy now?", options=["yes"])
-
-        assert noticed.gateway.sent_operations("send") == []
-
     async def test_a_switched_off_provider_posts_no_notification(self, noticed):
-        await noticed.stream()
-        await noticed.gateway.wait_for(lambda: noticed.runtime.streams.connections("send"))
+        await notify_stream(noticed)
         noticed.config.slack.enabled = False
 
         await noticed.notifications.ask_question(session_id="s1", title="Deploy now?", options=["yes"])
         posted = await noticed.runtime.channels["slack"].post_notification("n-off", "Deploy now?")
 
         assert posted is None
-        assert noticed.gateway.sent_operations("send") == []
+        assert noticed.gateway.sent_operations("notify") == []
 
 
 NOTIFY_OPERATIONS = [*CAPABILITIES["operations"], "notify"]
@@ -1086,7 +1075,8 @@ FIRST_MESSAGE_ID = "1700009000.000001"
 
 @pytest_asyncio.fixture
 async def unaddressed(tmp_path, db, monkeypatch, caplog):
-    """A hosted agent whose config names no notification conversation."""
+    """A hosted agent with notifications, whose cards the gateway posts in
+    ``NOTIFICATION_CONVERSATION``."""
     caplog.set_level(logging.DEBUG)
     harness = await start_hosted(tmp_path, db, monkeypatch, notifications=True)
     await db.create_session("s1", actor=None)
@@ -1122,20 +1112,20 @@ async def notify_card(hosted: Hosted) -> str:
 
 
 class TestGatewayNotificationConversation:
-    async def test_a_conversation_in_the_config_wins_over_notify(self, unaddressed):
+    async def test_a_conversation_in_the_config_does_not_choose_the_card_conversation(self, unaddressed):
         unaddressed.config.notifications.slack_channel_id = TOOL_TARGET
+        unaddressed.config.slack.allow_channels = ["C0456EFGH"]
         await notify_stream(unaddressed)
 
         posted = await unaddressed.runtime.channels["slack"].post_notification(
             "n1", "Deploy now?", [("Yes", "yes")],
         )
 
-        assert posted == (TOOL_TARGET, FIRST_MESSAGE_ID)
-        [card] = unaddressed.gateway.sent_operations("send")
-        assert card["destination"] == {"conversation": {"id": TOOL_TARGET}}
-        assert unaddressed.gateway.sent_operations("notify") == []
+        assert posted == (NOTIFICATION_CONVERSATION, FIRST_MESSAGE_ID)
+        assert len(records(unaddressed, "notify")) == 1
+        assert unaddressed.gateway.sent_operations("send") == []
 
-    async def test_without_one_the_card_goes_through_notify(self, unaddressed, caplog):
+    async def test_the_card_goes_through_notify(self, unaddressed):
         await notify_stream(unaddressed)
 
         notification_id = await notify_card(unaddressed)
@@ -1153,7 +1143,6 @@ class TestGatewayNotificationConversation:
         assert unaddressed.gateway.sent_operations("send") == []
         delivery = await unaddressed.db.get_latest_notification_delivery(notification_id, "slack")
         assert (delivery["target"], str(delivery["message_id"])) == (NOTIFICATION_CONVERSATION, FIRST_MESSAGE_ID)
-        assert "No notifications.slack_channel_id" not in caplog.text
 
     async def test_a_press_in_the_gateways_conversation_answers_the_card(self, unaddressed):
         stream = await notify_stream(unaddressed)
@@ -1189,14 +1178,13 @@ class TestGatewayNotificationConversation:
         assert "Expired unanswered" in text_of(edit["content"])
         assert not any(part["kind"] == "actions" for part in edit["content"])
 
-    async def test_a_gateway_without_notify_gets_no_card(self, unaddressed, caplog):
+    async def test_a_gateway_without_notify_gets_no_card(self, unaddressed):
         await notify_stream(unaddressed, CAPABILITIES["operations"])
 
         posted = await unaddressed.runtime.channels["slack"].post_notification("n1", "Deploy now?")
 
         assert posted is None
         assert unaddressed.gateway.operations == []
-        assert "No notifications.slack_channel_id" not in caplog.text
 
     async def test_no_channel_in_the_console_gives_no_card_and_one_info_line(self, unaddressed, caplog):
         unaddressed.gateway.notification_conversation = ""

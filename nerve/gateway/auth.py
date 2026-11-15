@@ -405,19 +405,28 @@ def decode_token(
 
 
 def get_token_from_request(request: Request) -> str:
-    """Extract JWT token from cookie, Authorization header, or query param."""
-    # Try cookie first
-    token = request.cookies.get("nerve_token")
+    """Extract JWT token from Authorization header, query param, or cookie.
+
+    What the client sent on purpose comes first, the ``nerve_token`` cookie
+    last. A cookie belongs to a host name, not to a port, so a page on
+    another port of this host can set one. Read first, a cookie that
+    somebody else set would stand in for the valid token the web UI sends
+    with every request: each request would be refused, and the person locked
+    out of every Nerve on that host name until they delete the cookie by
+    hand.
+    """
+    # Authorization header: what the web UI and API clients send
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer ") and auth[7:]:
+        return auth[7:]
+
+    # Query parameter (for <img src> and <a download> that can't set headers)
+    token = request.query_params.get("token")
     if token:
         return token
 
-    # Try Authorization header
-    auth = request.headers.get("Authorization", "")
-    if auth.startswith("Bearer "):
-        return auth[7:]
-
-    # Try query parameter (for <img src> and <a download> that can't set headers)
-    token = request.query_params.get("token")
+    # Cookie: only when the request names no token itself
+    token = request.cookies.get("nerve_token")
     if token:
         return token
 
@@ -790,6 +799,9 @@ async def authenticate_websocket(websocket: WebSocket) -> Actor | None:
                 logger.info("WebSocket refused: %s", e)
                 return None
 
+    # The same order as get_token_from_request: the token the client names
+    # (a browser's WebSocket can set no header, so it is the query parameter)
+    # before the cookie, which a page on another port of this host can set.
     token = websocket.query_params.get("token") or websocket.cookies.get("nerve_token")
     if not token:
         return None

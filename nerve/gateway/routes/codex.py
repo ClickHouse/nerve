@@ -6,6 +6,7 @@ import re
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
+from nerve.agent.backends.codex import daybreak
 from nerve.agent.backends.codex.ultracode import (
     installation_status,
     list_dashboard_runs,
@@ -74,7 +75,32 @@ async def mint_worker_token(request: Request):
     token = create_mcp_session_token(
         secret, session_id, ttl_seconds=2 * 60 * 60, worker_id=worker_id,
     )
-    return {"token": token, "worker_id": worker_id, "expires_in": 7200}
+    response = {"token": token, "worker_id": worker_id, "expires_in": 7200}
+    worker_daybreak = await _worker_daybreak(deps, session_id)
+    if worker_daybreak is not None:
+        response["daybreak"] = worker_daybreak
+    return response
+
+
+async def _worker_daybreak(deps, session_id: str) -> dict | None:
+    """What a worker needs to follow its parent chat's Daybreak switch.
+
+    ``None`` with the switch off: the answer is then what it was before the
+    switch existed. With it on, the chat's model and the program of each
+    model, and a mark when the Codex that Nerve runs cannot give a worker
+    the program (see ``CodexBackend.worker_daybreak``). The worker wrapper
+    adds the program to the worker's command line, and starts no worker
+    that would run without it.
+    """
+    # Without a database there is no session row, and so no switch.
+    db = getattr(deps, "db", None)
+    session = await db.get_session(session_id) if db is not None else None
+    if not daybreak.enabled(session):
+        return None
+    backend = deps.engine._backends["codex"]
+    return backend.worker_daybreak(
+        session.get("model") or backend.default_model(session.get("source") or "web"),
+    )
 
 
 @router.get("/api/codex/status", dependencies=[Depends(require_auth)])

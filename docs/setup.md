@@ -230,8 +230,9 @@ A few things worth knowing per step:
   the step would refuse — over 40 characters, or not a single line — is not
   offered, and nothing is offered under lockdown.
   Continuing accepts what the form shows; the step counts as decided. Nerve
-  records quiet hours for the agent and does not hold messages back itself
-  (see [Configuration → Quiet Hours](config.md#quiet-hours)).
+  records quiet hours for the agent and does not hold messages back itself;
+  during them, notifications below `urgent` arrive without sound (see
+  [Configuration → Quiet Hours](config.md#quiet-hours)).
 - **Channels.** A Telegram token is checked with Telegram before anything is
   written: a well-formed but revoked token would otherwise take the bot — and
   the next start — down. The bot itself starts with the new token after the
@@ -567,8 +568,9 @@ that regenerates files. On an existing install it asks first:
 **What gets overwritten:**
 - `config.yaml` and `config.local.yaml` — regenerated from your choices (each
   is copied to `*.bak` first unless it holds nothing)
-- `<workspace>/config/cron/system.yaml` — regenerated (picks up new built-in
-  cron prompts from Nerve updates)
+- `<workspace>/config/cron/system.yaml` — regenerated. The new built-in cron
+  prompts of a Nerve update do not need this: the scheduler writes them into
+  the file itself ([cron.md](cron.md#after-a-nerve-update))
 
 **What's preserved:**
 - All workspace files (`SOUL.md`, `IDENTITY.md`, `USER.md`, `MEMORY.md`, skills, tasks, etc.)

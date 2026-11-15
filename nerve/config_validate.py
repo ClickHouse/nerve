@@ -329,6 +329,7 @@ def validate_config_bundle(
         # typo'd sync schedule fails identically — and needs the same gate.
         _validate_source_schedules(config, result)
         _validate_delivery_debounce(config, result)
+        _validate_public_url(merged, config, result)
     # Files of the bundle that were actually opened, so "it validated" can be
     # told from "it found nothing to validate".
     read = [
@@ -884,6 +885,27 @@ def _validate_delivery_debounce(config, result: ValidationResult) -> None:
             f"cron.delivery_debounce_seconds: {seconds} is above the maximum of "
             f"{cfg.MAX_DELIVERY_DEBOUNCE_SECONDS}, so the jobs a hosted delivery "
             f"starts wait {cfg.MAX_DELIVERY_DEBOUNCE_SECONDS}s"
+        )
+
+
+def _validate_public_url(merged: dict[str, Any], config, result: ValidationResult) -> None:
+    """A ``gateway.public_url`` that Nerve refuses gives messages no links.
+
+    The daemon starts with it all the same and logs one line, so the place to
+    see it before that is here. The check is of the setting only: the
+    environment of the daemon, which can give the address too, is not the
+    environment of this run.
+    """
+    named = _nested_get(merged, ("gateway", "public_url"))
+    # Blank is unset, by the daemon's own rule, and an unset ${VAR} is reported
+    # with the other references.
+    if not cfg._setting_str(named) or _is_unresolved(named):
+        return
+    if not config.gateway.public_url:
+        result.warnings.append(
+            "gateway.public_url is not the address of the web UI (http:// or "
+            "https://, a host name or an IP address, an optional port, and "
+            "nothing after it), so messages get no links to the web UI"
         )
 
 

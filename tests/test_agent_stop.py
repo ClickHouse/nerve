@@ -674,9 +674,9 @@ async def test_an_unanswered_interrupt_counts_against_the_stop_wait(db, tmp_path
 
 @pytest.mark.asyncio
 async def test_stop_spares_a_queued_run_while_the_lock_changes_hands(db, tmp_path):
-    """No turn task and the run lock momentarily free (released, the next
-    waiter not resumed yet): a registered run that is still listed in the
-    queue is not cancelled."""
+    """No turn task while the run lock goes to the first queued run (the run
+    holds the lock but has not resumed yet): Stop does not cancel that run,
+    also when it is registered the legacy way."""
     client = _Client()
     engine = await _engine(db, tmp_path, client)
     release = asyncio.Event()
@@ -684,20 +684,17 @@ async def test_stop_spares_a_queued_run_while_the_lock_changes_hands(db, tmp_pat
     async def _waiting_run():
         await release.wait()
 
+    # The lock stays held while it goes from the ended turn to the queued run.
+    lock = engine._session_locks.setdefault(SID, asyncio.Lock())
+    await lock.acquire()
     queued = asyncio.create_task(_waiting_run())
     engine.register_task(SID, queued)
     await asyncio.sleep(0)
-    queues, _started, _msgs = engine._queue_state()
-
-    class _Entry:
-        task = queued
-
-    queues.setdefault(SID, []).append(_Entry())
     try:
         result = await engine.stop_turn(SID)
         await asyncio.sleep(0)
         assert not queued.cancelled() and result["turn"] in ("not_running", "stopped")
     finally:
-        queues.pop(SID, None)
         release.set()
         await _finish(queued)
+        lock.release()

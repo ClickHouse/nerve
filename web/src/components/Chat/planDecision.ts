@@ -61,6 +61,12 @@ const ONBOARDING_COPY: PlanDecisionCopy = {
 /** The feedback field's label. */
 export const PLAN_FEEDBACK_LABEL = 'What should change?';
 export const PLAN_FEEDBACK_SEND = 'Send';
+/** Opens the reason field of a decline (the plan page only). */
+export const PLAN_DECLINE = 'Decline…';
+export const PLAN_DECLINE_LABEL = 'Why decline? (optional)';
+/** A declined plan closes its task (`decline_plan` on the server). */
+export const PLAN_DECLINE_HINT = 'Declining also closes the task.';
+export const PLAN_DECLINE_SEND = 'Decline plan';
 /** Opens the plan in the side panel. */
 export const PLAN_READ = 'Read the plan';
 /** Turns the plan into a text field (in the panel). */

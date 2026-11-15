@@ -24,6 +24,23 @@ class RouteDeps:
     db: "Database"
     notification_service: "NotificationService | None" = None
     external_agents_sync: "SyncService | None" = None
+    # The gateway serves the sandbox document of MCP Apps, and with it shows
+    # views and widgets. The lifespan decides it once, at startup.
+    mcp_apps_serving: bool = False
+
+
+def set_mcp_apps_serving(serving: bool) -> None:
+    """Say whether this gateway serves the sandbox document of MCP Apps,
+    once the lifespan has decided it
+    (:func:`nerve.gateway.mcp_apps_sandbox.serves_sandbox`).
+
+    The MCP Apps routes, the widget routes, the route of the document itself
+    and the headers of the web UI read it through :func:`get_deps`: the
+    feature is on for the web UI as a whole or not at all.
+    """
+    if _deps is None:
+        raise RuntimeError("init_deps() must be called before set_mcp_apps_serving()")
+    _deps.mcp_apps_serving = bool(serving)
 
 
 def set_external_agents_sync(service: "SyncService | None") -> None:

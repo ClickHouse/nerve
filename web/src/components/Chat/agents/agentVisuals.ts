@@ -6,7 +6,7 @@
 // tokens, identity ("what kind of agent") uses the hue-* scale.
 
 import {
-  Bot, CheckCircle2, CircleDashed, CircleHelp, CircleX, Files, Hourglass, Lightbulb, ListTree, Loader2,
+  Bot, CheckCircle2, CircleDashed, CircleHelp, CircleX, Files, Hourglass, Lightbulb, ListChecks, ListTree, Loader2,
   MessageCircleQuestion, Radio, Search, Square, SquareTerminal, Unlink, Users, Workflow, Wrench,
   type Icon,
 } from '../../ui/icons';
@@ -71,6 +71,7 @@ const IDENTITY: Record<string, IdentityVisual> = {
   monitor: { Icon: Radio, className: 'text-hue-sky' },
   teammate: { Icon: Users, className: 'text-hue-purple' },
   files: { Icon: Files, className: 'text-hue-teal' },
+  tasks: { Icon: ListChecks, className: 'text-hue-blue' },
   agents: { Icon: ListTree, className: 'text-text-muted' },
 };
 
@@ -78,7 +79,7 @@ const DEFAULT_IDENTITY: IdentityVisual = { Icon: Bot, className: 'text-text-mute
 
 /**
  * Identity of a sub-agent type ("Explore"), an agent kind ("shell") or a side
- * panel tab type ("files", "agents"). Unknown types get the muted bot.
+ * panel tab type ("files", "tasks", "agents"). Unknown types get the muted bot.
  */
 export function identityVisual(type: string | null | undefined): IdentityVisual {
   return (type && IDENTITY[type]) || DEFAULT_IDENTITY;

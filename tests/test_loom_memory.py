@@ -629,6 +629,75 @@ async def test_a_condition_that_may_pass_is_tried_twice_for_a_read(make_memory) 
         await memory.startup_recall("plan")
 
 
+SESSION_ENDED = "MCP server session ended; the state of earlier calls is lost"
+
+
+def _session_ended() -> httpx.Response:
+    """The gateway's answer to a call that it did not send: its session with
+    Loom had ended."""
+    return rpc_error(-32002, SESSION_ENDED)
+
+
+@pytest.mark.asyncio
+async def test_a_call_the_gateway_did_not_send_goes_again(make_memory) -> None:
+    gateway = FakeGateway()
+    gateway.add_row(HOME, "k1", "the plan is ready")
+    memory = await make_memory(gateway, namespace=HOME)
+
+    # A transcript too: nothing reached Loom, so nothing is extracted twice.
+    gateway.fail("loom_memory_set_from_messages", _session_ended())
+    assert await memory.memorize_conversation("s", _messages(2, datetime.now(UTC))) is True
+    assert len(gateway.args("loom_memory_set_from_messages")) == 2
+    assert len(gateway.queued) == 1
+
+    # A read keeps its second try for another failure, before or after.
+    gateway.fail("loom_context_pack", _session_ended(), rpc_error(-32002, "MCP server unavailable"))
+    out = await memory.startup_recall("plan")
+    assert [m["id"] for m in out] == ["k1"]
+    assert len(gateway.args("loom_context_pack")) == 3
+    gateway.fail("loom_context_pack", rpc_error(-32002, "MCP server unavailable"), _session_ended())
+    out = await memory.startup_recall("plan")
+    assert [m["id"] for m in out] == ["k1"]
+    assert len(gateway.args("loom_context_pack")) == 6
+
+    assert memory._retired == set() and memory._inflight == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", [
+    lambda: rpc_error(-32002, "MCP server session ended"),
+    lambda: rpc_error(-32000, SESSION_ENDED),
+    lambda: rpc_error(-32002, SESSION_ENDED, status=429, **{"Retry-After": "30"}),
+], ids=["other words", "another code", "a paced answer"])
+async def test_only_the_gateways_own_answer_sends_a_transcript_again(make_memory, answer) -> None:
+    """A transcript goes again only on the gateway's own answer, word for
+    word: any other failure may come after the call reached Loom."""
+    gateway = FakeGateway()
+    memory = await make_memory(gateway)
+    gateway.fail("loom_memory_set_from_messages", answer())
+    with pytest.raises(MemoryBackendUnavailable):
+        await memory.memorize_conversation("s", _messages(2, datetime.now(UTC)))
+    assert len(gateway.args("loom_memory_set_from_messages")) == 1
+    assert gateway.queued == []
+
+
+@pytest.mark.asyncio
+async def test_session_ended_answers_in_a_row_are_bounded(make_memory) -> None:
+    """The gateway can give the answer a few times in a row; a gateway that
+    keeps answering so is an outage."""
+    gateway = FakeGateway()
+    memory = await make_memory(gateway)
+    gateway.fail("loom_memory_set_from_messages", *[_session_ended() for _ in range(3)])
+    assert await memory.memorize_conversation("s", _messages(2, datetime.now(UTC))) is True
+    assert len(gateway.args("loom_memory_set_from_messages")) == 4
+
+    gateway.fail("loom_memory_set_from_messages", *[_session_ended() for _ in range(4)])
+    with pytest.raises(MemoryBackendUnavailable, match="session ended"):
+        await memory.memorize_conversation("s2", _messages(2, datetime.now(UTC)))
+    assert len(gateway.args("loom_memory_set_from_messages")) == 8
+    assert len(gateway.queued) == 1
+
+
 @pytest.mark.asyncio
 async def test_no_answer_opens_the_breaker(make_memory) -> None:
     gateway = FakeGateway()

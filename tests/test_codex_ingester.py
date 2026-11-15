@@ -95,6 +95,7 @@ async def test_in_scope_thread_creates_satellite_session(db, tmp_path):
     assert meta["runtime"] == "codex-external"
     assert meta["codex_thread_id"] == tid
     assert meta["origin_ids"] == ["o1"]
+    assert (session["trigger"], session["origin_detail"]) == ("external", '{"client": "codex"}')
 
 
 @pytest.mark.asyncio

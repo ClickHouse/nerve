@@ -31,8 +31,12 @@ Treat the returned token as opaque.
 
 #### Authenticated requests
 
-Send the token as `Authorization: Bearer <jwt>`, as the `nerve_token` cookie,
-or as `?token=` (for `<img src>` and downloads, which cannot set headers).
+Send the token as `Authorization: Bearer <jwt>`, as `?token=` (for `<img src>`
+and downloads, which cannot set headers), or as the `nerve_token` cookie. They
+are read in that order, and the first one found decides: a cookie is read only
+when the request names no token itself. (A cookie belongs to a host name, so
+a page on another port of the host can set one; it must not stand in for the
+token that the request carries.)
 
 Every request resolves its token to an account actor or the system principal.
 Unknown and disabled accounts fail with `401`; unavailable startup identity
@@ -139,6 +143,7 @@ Failures:
 | `409` | Username or account-state conflict; the response explains the conflict |
 
 Disabling an account affects its next request and closes its open WebSockets.
+While it is disabled, its browsers get no [Web Push](#web-push).
 
 ### Setup
 
@@ -537,30 +542,32 @@ the `reason` names the variable.
 
 ```json
 Response: {
-  "models": [{ "id": "claude-opus-5-5", "label": "Claude Opus 5.5", "family": "opus", "recommended": true },
-             { "id": "claude-haiku-5-5", "label": "Claude Haiku 5.5", "family": "haiku", "recommended": false },
+  "models": [{ "id": "claude-fable-5-2", "label": "Claude Fable 5.2", "family": "fable", "recommended": false },
+             { "id": "claude-opus-5-5", "label": "Claude Opus 5.5", "family": "opus", "recommended": true },
              { "id": "claude-sonnet-5-5", "label": "Claude Sonnet 5.5", "family": "sonnet", "recommended": false },
-             { "id": "claude-fable-5-1", "label": "Claude Fable 5.1", "family": "fable", "recommended": false },
-             { "id": "claude-opus-5", "label": "Claude Opus 5", "family": "opus", "recommended": false }],
+             { "id": "claude-haiku-5-5", "label": "Claude Haiku 5.5", "family": "haiku", "recommended": false }],
   "current": { "model": "claude-opus-5-5", "effort": "xhigh" },
   "efforts": ["max", "xhigh", "high", "medium", "low"],
-  "discovered": true,
+  "discovered": false,
   "default_model": "claude-opus-5-5"
 }
 ```
 
-The configured model comes first, then the catalogue as the Anthropic Models
-API orders it (newest first), nothing else; without discovery the built-in
-list applies. `family` is `fable`, `opus`, `sonnet`, `haiku` or `other`
-(`fable` is checked first); `recommended` marks the configured model;
+The list is the same as in the composer's model menu: `agent.models`, else
+the catalogue as the Anthropic Models API orders it (newest first) when
+`agent.model_discovery` is on, else the built-in list of the newest model of
+each tier. The configured model is put first when the list does not name it.
+`family` is `fable`, `opus`, `sonnet`, `haiku` or `other` (`fable` is checked
+first); `recommended` marks the configured model;
 `default_model` is Nerve's own default (`nerve.config.DEFAULT_MODEL`), so the
 page can say which entry it is even when this instance was changed to another
 model. On Bedrock the ids carry the geo prefix and `discovered` is `false`.
 
-The catalogue is cached per credential fingerprint (provider, base URL, key
-tail). A successful `POST /api/setup/provider/test` with an API key fetches
-the catalogue for that candidate key in the background, keyed by its
-fingerprint, so the picker is complete the moment the key is saved; a failure
+With discovery on, the catalogue is cached per credential fingerprint
+(provider, base URL, key tail). A successful `POST /api/setup/provider/test`
+with an API key fetches the catalogue for that candidate key in the
+background, keyed by its fingerprint, so the picker is complete the moment the
+key is saved; a failure
 recorded while no key was configured is never served for a configuration
 that now carries one.
 
@@ -769,6 +776,184 @@ Sessions survive the restart: the signing secret is pinned and persisted, and
 nothing in the wizard rotates it. Allowed under lockdown, because a restart
 writes no configuration.
 
+### Settings
+
+The Settings page of the panel. Each section is a set of configuration
+fields, named by their dotted path. The routes use the guards of the setup
+checklist: a signed-in person (a system or MCP token is `403`) on a claimed
+instance.
+
+#### `GET /api/settings/notifications`
+
+```json
+{
+  "read_only_reason": null,
+  "hosted": false,
+  "fields": {
+    "notifications.channels": { "value": ["web", "slack"], "state": "editable", "file": "settings.yaml", "reason": null },
+    "notifications.levels.slack": { "value": "important", "state": "machine", "file": "config.yaml", "reason": null },
+    "notifications.slack_channel_id": { "value": "C0123ABCD", "state": "editable", "file": "settings.yaml", "reason": null }
+  },
+  "slack": { "connected": true, "channel_name": "alerts" },
+  "telegram": { "connected": false },
+  "quiet_hours": { "timezone": "Europe/Berlin" }
+}
+```
+
+The fields are `notifications.channels`, `notifications.levels.slack`,
+`notifications.levels.telegram`, `notifications.slack_channel_id`,
+`notifications.telegram_chat_id`, `notifications.default_expiry_hours`,
+`notifications.max_redeliveries`, `quiet_start` and `quiet_end` (`HH:MM`, or
+`""` for both when quiet hours are off). `state` is one of:
+
+| State | Meaning |
+|---|---|
+| `editable` | `settings.yaml` states the value, or no file does. A change goes to `settings.yaml` |
+| `machine` | `config.yaml` or `config.local.yaml` on this machine states it. A change goes to that file (`file`) |
+| `managed` | a `${VAR}` reference sets it, or the instance is hosted (see below). `reason` says which; the page cannot change it |
+| `read_only` | lockdown, or no configuration directory. `read_only_reason` and `reason` say why |
+
+`hosted` is `true` when the control plane's channel gateway carries the chat
+channels (`slack.mode: hosted`). Then:
+
+- `slack.connected` is `true` while the agent has a Slack app that the
+  control plane connected and a gateway stream can send for it. Notification
+  cards go to the agent's notification channel, which an admin sets in the
+  control plane, so `notifications.slack_channel_id` is `managed` and
+  `slack.channel_name` is `null`.
+- `notifications.levels.telegram` and `notifications.telegram_chat_id` are
+  `managed`: a hosted instance has no Telegram.
+
+In Socket Mode, `slack.connected` is `true` when Slack is on and has both
+tokens, and `slack.channel_name` is the name of the configured channel when
+Slack runs and answers `conversations.info`, else `null`.
+
+`quiet_hours.timezone` is the time zone of the quiet hours (`timezone`).
+
+#### `PUT /api/settings/notifications`
+
+A partial body of `{path: value}`; an omitted field is not changed. Each value
+is checked (`400 {detail, field}`), then the configuration validator checks
+copies of the configuration files with the change applied: an error that the
+files without the change do not have is `400`. Then each value goes to the
+file it comes from (see `state`), a new value to `settings.yaml`, and the
+configuration reloads. `null` or `""` for the Slack channel or the Telegram
+chat removes the key. `quiet_start` and `quiet_end` take a 24-hour `HH:MM`
+or `""`; after the change both must be set or both empty, with two different
+times (`400` names the field to fix). A `managed` field is `409` with its
+`field`; lockdown is `409`. The response is the `GET` body with `reload_errors`:
+`{part: error}` for each part that did not reload, `{}` when all did.
+
+```json
+PUT /api/settings/notifications  { "notifications.channels": ["web", "telegram"], "notifications.levels.telegram": "important" }
+```
+
+#### `POST /api/settings/notifications/test`
+
+Sends one `high` "Test notification" through the normal fan-out (so a
+channel at `important` gets it too) and answers
+`{notification_id, silenced, results: [{channel, delivered}]}`, one result
+for each channel in `notifications.channels`, and one for `webpush` when a
+browser has push on (`delivered`: a push service took it). `silenced` is true
+when a silence rule matched, so only the panel shows it.
+
+### Notifications
+
+#### `GET /api/notifications?status=&type=&session_id=&limit=50`
+
+The notifications that the web channel got, newest first. `status`
+(`pending`, `answered`, `dismissed`, `expired`, `silenced`), `type`
+(`notify`, `question`, `approval`) and `session_id` filter the list. `limit`
+is at most 200.
+
+```json
+Response: {
+  "notifications": [{ "id": "…", "session_id": "…", "session_title": "…", "type": "question", "title": "Deploy now?", "status": "pending", ... }],
+  "pending_count": 3,
+  "pending_answer_count": 1
+}
+```
+
+`pending_count` is the number of pending notifications, the number that the
+Notifs badge shows. `pending_answer_count` is the number of pending questions
+and approvals among them. While it is more than 0, the tab title starts with
+"!" (see [web-ui.md](web-ui.md#browser-alerts)). The filters and the limit do
+not apply to the two counts.
+
+#### `POST /api/notifications/{id}/dismiss`
+
+Dismisses a pending notification of any type and records the signed-in
+person in `dismissed_by_actor_id`. Answers `{notification_id, dismissed: true}`,
+or `409` when the row is not pending or an answer to an approval is already
+running. Every dismissal sends a `notification_dismissed` event.
+
+A question or an approval ends without an answer, as at expiry: the Telegram
+and Slack cards get "🔕 Dismissed without an answer" and lose their buttons.
+The session that asked a question gets the internal turn
+`[Question dismissed without an answer: <title>]`, written by the person who
+dismissed it. An external, archived or missing session gets no turn. While
+the engine drains, the dismissal of a question that would start a turn is
+refused (`503`) and the question stays pending. An approval gets an
+`approval-dismissed` record in the mechanical-actions audit log. A review loop
+that waits on its card proposes a new card at its next reconcile tick, as it
+does after an expiry.
+
+#### `POST /api/notifications/dismiss-all`
+
+Dismisses the pending `notify` rows only, and sends no event. Answers
+`{dismissed: <count>}`.
+
+### Web Push
+
+The installable panel and its push notifications (see
+[web-ui.md](web-ui.md#push-notifications) and
+[config.md](config.md#web-push)). The subscription routes need a signed-in
+person (a system or MCP token is `403`), and a person sees and removes only
+their own browsers.
+
+#### `GET /api/manifest.webmanifest`
+
+The web app manifest of the panel. It needs no sign-in, because the browser
+fetches it without the panel's token. `name` and `short_name` are the agent's
+name: the name line of `IDENTITY.md`, else `NERVE_DISPLAY_NAME`, else
+"Nerve". The icons are Nerve's app icon at 192 and 512 px, and a full-bleed
+512 px tile with `purpose: maskable` for launchers that cut their own shape.
+
+#### `GET /api/push/subscriptions`
+
+```json
+{
+  "public_key": "BKx9...q3M",
+  "subscriptions": [
+    { "id": 3, "endpoint": "https://fcm.googleapis.com/fcm/send/f1LsxkKphfQ", "level": "important",
+      "user_agent": "Mozilla/5.0 (Linux; Android 15) Chrome/141.0", "created_at": "2026-11-07T08:00:00+00:00",
+      "last_success_at": null }
+  ]
+}
+```
+
+`public_key` is the VAPID public key (base64url) that a browser subscribes
+with. `last_success_at` is when a push service last took a notification for
+the browser.
+
+#### `POST /api/push/subscriptions`
+
+The body is `PushSubscription.toJSON()` of the browser and a level:
+`{endpoint, keys: {p256dh, auth}, level}`. `level` is `important` (the
+default) or `all`. The endpoint must be an https URL of a browser push
+service (`fcm.googleapis.com`, `updates.push.services.mozilla.com`,
+`*.push.apple.com`, `*.notify.windows.com`) on the default port, with at most
+2048 characters; `p256dh` must be a point on P-256 and `auth` 16 bytes.
+Otherwise `400`. A second
+`POST` for the same endpoint changes its keys and level; a `POST` of another
+person moves the browser to that person. `409` when the person has 20
+browsers already. The answer is the browser as in the list.
+
+#### `DELETE /api/push/subscriptions/{id}`
+
+Turns push off for one browser of this person. `404` when the person has no
+browser with this id.
+
 ### Actors
 
 An actor is *who* something is attributed to: a person, or the agent's system
@@ -806,9 +991,26 @@ Sidebar feed: one page of conversations plus every starred session.
 
 `sessions` is a single page of the conversation feed (page size = `sessions.sidebar_page_size`, default 50; `0` = unlimited). The window covers only non-archived, non-system (cron/hook), non-starred rows, so cron traffic can never displace conversations. On the first page (`offset=0`) all starred sessions are prepended in full and are never truncated; pass the returned `next_offset` back as `?offset=N` to load subsequent pages. `archived_count`/`system_count` are the collapsed-group badge counts, and `has_more`/`next_offset` drive the "…" load-more control.
 
+The first page also contains every non-archived session that needs the user, of any source and outside the page window, so a later page can repeat one of them. A cron session with a pending plan is an example. `has_more`, `next_offset` and the counts do not include these rows.
+
+Each row of this list, and of the archived, system and search lists, has an `attention` object:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `questions` | integer | Pending `ask_user` questions of the session. |
+| `approvals` | integer | Pending approvals (`propose_action`) of the session. |
+| `plans` | integer | Pending plans that the session proposed. |
+| `awaiting_input` | boolean | A question inside a running turn (equal to `awaiting_input` of the row). |
+| `review` | boolean | The newest review loop of the session waits for a decision. |
+
+A session needs the user when a count is above zero or a boolean is true.
+
 ```json
 Response: {
-  "sessions": [{ "id": "main", "title": "Main", "source": "system", "updated_at": "..." }],
+  "sessions": [{
+    "id": "main", "title": "Main", "source": "system", "updated_at": "...",
+    "attention": { "questions": 1, "approvals": 0, "plans": 0, "awaiting_input": false, "review": false }
+  }],
   "archived_count": 12,
   "system_count": 3,
   "has_more": true,
@@ -854,6 +1056,14 @@ whose behalf all agent work in the session runs. Nerve sets it when it creates
 the session and never changes it (an actor id, or `null` when unknown). See
 [Attribution](accounts.md#attribution).
 
+`title_source` says who chose the title: `placeholder` (the first words of the
+first message), `generated` (the model's title from it), `fork` ("Fork of …"),
+`outcome` (the model's title from what the session did, see
+`agent.outcome_titles`), `manual` (a person renamed it), or `null` (the code
+that created the session named it, or nothing has yet). After the first
+message, Nerve renames a session on its own only from `placeholder`,
+`generated` and `fork`.
+
 Session list rows carry `pending_wakeup_at`, the fire time of the session's
 pending wakeup or deferred message (`null` when there is none), with
 `pending_wakeup_created_by_actor_id` (who scheduled it: a person, or the
@@ -861,10 +1071,41 @@ system actor when the agent did) and `pending_wakeup_caused_by_actor_id` (on
 whose behalf it was scheduled; the turn that it fires runs for the session's
 cause). The `session_running` WebSocket event carries the same three fields.
 
+Session payloads also carry where the session comes from:
+
+- `trigger`: the kind of event that started the session. One of `chat` (a
+  person in the web UI, also the onboarding conversation and forks), `api`
+  (`/api/chat`, other REST callers, webhooks), `slack`, `telegram`, `email`,
+  `cron` (cron jobs and "Run later" with a delay), `plan` (plan implementation and planner
+  sessions), `workflow` (workflow runs and review loop legs), `external` (MCP
+  satellite sessions and imported threads), `system` (the autonomous
+  onboarding) and `unknown`. The code path that
+  creates the session sets it once; it does not come from `source`. A
+  session from before this field gets a value derived from `source`, its id
+  and its channel mapping.
+- `origin_label`: one short sentence for display, for example
+  `"Started from Slack #general"` or `"Started by cron job daily-digest"`.
+- `origin_detail`: an object with the details that apply, each optional:
+  `channel`, `channel_name`, `thread`, `cron_job`, `run_later`, `plan_id`,
+  `task_id`, `fork_of`, `workflow_run`, `client`, `hook`.
+
+`POST /api/sessions` gives `chat` when `source` is `web` (the default) and
+`api` for another `source`. `POST /api/chat` with a new `session_id` gives
+`api`. `POST /api/sessions/run-later` changes a session
+without messages to `cron` for a delay, and to `chat` for `none`.
+
 Rows also carry `is_running` (the orchestrator's turn is in flight),
 `has_background_tasks` (sub-agents or background tasks are still live) and
 `background_count` (how many). The two are independent: agents can run
 between turns. See [Sub-agents and background tasks](agents.md).
+
+The payloads of Codex sessions (`backend` is `codex`) carry `codex_daybreak`
+(boolean): the chat's Daybreak switch, see
+[Daybreak](config.md#daybreak-per-chat-switch). The payloads of other
+sessions do not have the key. `POST /api/sessions` takes
+`codex_daybreak: true` to create a Codex session with the switch on. It
+answers `400` when the session is not a Codex session, and when its model has
+no Daybreak program for the signed-in Codex account.
 
 #### `GET /api/sessions/{id}`
 Get session details.
@@ -885,16 +1126,44 @@ provenance and is never identity. See
 
 #### `DELETE /api/sessions/{id}`
 Delete a session (cannot delete "main"). Disconnects any active SDK client before deletion.
-The delete removes the session's events and its agent records and
-transcripts. Nerve records the delete in
+The delete removes the session's events, its agent records and
+transcripts, and what its widgets saved (see [Widgets](#widgets)). Nerve
+records the delete in
 `session_deletions` with the signed-in person as actor and cause (see
 [Session changes](accounts.md#session-changes)).
+While a turn of the session runs, a message waits in its turn queue, or a
+background continuation of the runtime runs, the delete answers `409`: stop
+the session first. The delete expires the
+session's pending questions; the notification rows stay. A turn never creates
+a deleted session again: a run in it is refused.
 
 #### `PATCH /api/sessions/{id}`
-Update `title`, `starred`, `model` or `parent_session_id`. A `model` change
-recreates the session's runtime, which would end its live background agents:
-while any run it answers `409` with
+Update `title`, `starred`, `model`, `parent_session_id` or `codex_daybreak`.
+A `model` change recreates the session's runtime, which would end its live
+background agents: while any run it answers `409` with
 `{"detail": {"code": "live_background_agents", "message": "…", "live": 2}}`.
+A `title` sets the session's `title_source` to `manual`, so Nerve no longer
+renames it on its own.
+
+`codex_daybreak` (boolean) sets the chat's Daybreak switch from its next
+message on. It answers `400` for a session that is not a Codex session, and
+for `true` when the session's model (the `model` of the same request, if
+any) has no Daybreak program for the signed-in Codex account; `503` for
+`true` while the Codex model catalog cannot be read. A `model` change to a
+model without a program turns the switch off: the response then has
+`codex_daybreak: false` and a `codex_daybreak_notice` sentence for the
+person.
+
+#### `POST /api/sessions/{id}/regenerate-title`
+Retitle the session with `agent.title_model` from its first request and its
+last reply (a fork's own, with the parent's title), replacing any title, and
+broadcast `session_updated` to every client. Works whether or not
+`agent.outcome_titles` is on. Errors: `404` unknown session; `502` no title
+could be made (no API credential, a failed call, an empty conversation).
+
+```json
+Response: { "title": "Flaky checkout test timeout" }
+```
 
 #### `GET /api/sessions/{id}/status`
 Session status with lifecycle info.
@@ -921,6 +1190,20 @@ a numeric message row id as a string). The fork branches the source's
 pre-populated with the source's messages up to the fork point, so the new
 chat displays exactly the history the agent remembers.
 
+The fork stores the source's native id and the fork turn when it is created
+(`fork_source_native_id`, `fork_source_turn_id`). A fork of the whole chat
+branches at the source's last completed turn, so a turn that the source
+completes later is neither copied nor known to the fork's agent (history
+from before per-turn recording is forked whole). Each start of the fork's
+runtime branches from the stored source until a turn completes in the fork's
+own conversation. A stop, a crash, a restart, an archive, or a later change to
+the source does not change what the fork branches from. If the source
+conversation no longer exists, the fork's next turn fails with a message
+that says so, and the message after it starts a new conversation.
+
+What the source's widgets saved (see [Widgets](#widgets)) is not copied:
+the widgets of the fork start as the agent wrote them.
+
 Errors: `404` unknown source; `409` not forkable — the source has no native
 conversation yet (no completed turn), or the anchor message has no native
 turn mapping (sessions predating per-turn recording can only be forked
@@ -932,7 +1215,10 @@ Response: { "id": "fork-a1b2c3d4", "title": "My Fork", "source": "web", "status"
 ```
 
 #### `POST /api/sessions/{id}/resume`
-Resume a stopped or idle session (must have a stored `sdk_session_id`).
+Resume a stopped or idle session (must have a stored `sdk_session_id`). A
+`stopped`, `idle` or `error` session goes to `created`; any other status (for
+example `active`, while a turn runs) stays as it is. The next message resumes
+the stored native conversation.
 
 ```json
 Response: { "id": "a1b2c3d4", "status": "created", "sdk_session_id": "..." }
@@ -946,6 +1232,19 @@ its ancestors stay: `session is running` (a turn is in flight) or
 `background agents running` (archiving would stop them). `?force=true`
 archives those too; their agents end as `interrupted` (`archived`).
 `archived` is `false` when nothing was archived.
+
+An archive deletes the session's pending wakeups (a "Run later" message
+included) and expires its pending questions. Approvals stay pending, because
+their answer acts on their target, not on the session. No turn runs in an
+archived session: a wakeup or a queued message is refused, an answer is
+stored but starts no turn, and a channel message goes to a new session. Only these
+open an archived session again, each with an `unarchived` event: the
+unarchive endpoint, a star, and a person's own message into it (the web chat,
+`POST /api/chat` with its `session_id`, "Run later", a plan revision request
+for a plan that it proposed). The archive itself is refused (`session is
+running`) while a turn runs or waits, or while a background continuation of
+the runtime runs. A route that would run a turn in an archived session
+answers `409` with `{"detail": "...", "reason": "archived"}`.
 
 ```json
 Response: { "archived": true, "archived_ids": ["a1b2c3d4"], "skipped": [{ "id": "e5f6a7b8", "reason": "background agents running" }] }
@@ -970,6 +1269,48 @@ Response: {
 records the state of the runtime, for a change with no known person, and for
 legacy rows. The event types and their details are in
 [Session changes](accounts.md#session-changes).
+
+#### `GET /api/sessions/{id}/context`
+What fills the session's context window. With a live Claude runtime
+(`live: true`), the runtime measures it: `categories` are the parts of
+`total_tokens` (system prompt, tools, skills, messages, and so on; categories
+with no tokens and tools that load only on demand are not in the list), and
+`auto_compact_threshold` is where the runtime compacts by itself (`null` when
+auto-compact is off). Otherwise (`live: false`: a Codex session, no live
+runtime, or a runtime that did not answer) the totals come from the last
+turn's usage, as the context bar estimates them, and `categories` is empty.
+`can_compact` is `true` when the session has a live Claude runtime. `404`
+for an unknown session.
+
+```json
+Response: {
+  "session_id": "a1b2c3d4", "live": true, "can_compact": true,
+  "total_tokens": 20237, "max_tokens": 200000, "auto_compact_threshold": 167000,
+  "categories": [
+    { "name": "System prompt", "tokens": 170 },
+    { "name": "System tools", "tokens": 15149 },
+    { "name": "Skills", "tokens": 1715 },
+    { "name": "Messages", "tokens": 3203 }
+  ]
+}
+```
+
+#### `POST /api/sessions/{id}/compact`
+Compact the conversation: the runtime replaces the earlier messages with a
+summary, which frees context. The transcript in Nerve does not change. The
+compact runs as a turn: it takes the session's run lock, the session shows
+as running, and Stop ends it. Its cost and usage are recorded as for any
+turn, with no message. Its usage (the `done` event and the session's last
+usage) has `context_tokens`, the context use measured after the compact.
+A compact that compacts records the session event `compacted` with the
+person as actor and cause (see [Session changes](accounts.md#session-changes)).
+Responds with the `GET /api/sessions/{id}/context` shape, measured again.
+
+Errors are `{"detail": {"code": "…", "message": "…"}}`: `404`
+`session_not_found`; `409` `unavailable` (no live Claude runtime), `busy` (a
+turn runs or waits), `nothing_to_compact` (the runtime has no messages yet;
+its answer is not shown in the chat) or `stopped`; `502` `failed` (the
+runtime reported an error); `503` `not_accepting_turns` (Nerve shuts down).
 
 ### Modified Files
 
@@ -1024,7 +1365,10 @@ Response: { "response": "Hi there!", "session_id": "main" }
 `client_msg_id` is optional: a retry with an id the session saw in the last
 10 minutes runs nothing and answers with an empty `response`. While another
 turn of the session runs, the message waits in the session's
-[turn queue](#get-apisessionsidqueue) (source `api`).
+[turn queue](#get-apisessionsidqueue) (source `api`). A `session_id` of an
+archived session unarchives it first, in the caller's name. A `session_id` of
+a deleted session creates nothing and answers `409` with
+`{"detail": "This session was deleted.", "reason": "deleted"}`.
 
 For streaming, use the WebSocket endpoint.
 
@@ -1181,7 +1525,8 @@ Queued messages are never touched. Errors: `404 session_not_found`;
 `422 bad_scope`.
 
 #### `GET /api/sessions/{id}/queue`
-Messages waiting for the session's current turn to end.
+Messages waiting for the session's current turn to end, in run order (the
+first one runs next).
 
 ```json
 Response: { "items": [QueueEntryView] }
@@ -1200,6 +1545,22 @@ Response: { "cancelled": true, "content": "also run the e2e suite" }
 Errors: `404 queue_entry_not_found`; `409 already_started` (it holds the
 turn now); `403 not_owner` (someone else's message, a channel relay or an
 internal trigger).
+
+#### `PUT /api/sessions/{id}/queue/order`
+Set the run order of the queued messages. Any queued message can move,
+whoever sent it. `queue_ids` lists them from the one that runs next to the
+last. An id that is not queued any more (it started or was cancelled
+meanwhile) is skipped; a queued message that the list does not name keeps its
+place relative to the others, after the named ones. Every client of the
+session gets the new order in `queue_update`.
+
+```json
+Request:  { "queue_ids": ["q_9c1d2e3f", "q_1a2b3c4d"] }
+Response: { "items": [QueueEntryView] }
+```
+
+Errors: `404 session_not_found`; `422 bad_order` (not a list of at most 500
+strings).
 
 ### Tasks
 
@@ -1237,8 +1598,10 @@ Response: { "tags": [{ "name": "backend", "count": 7 }] }
 ```
 
 #### `POST /api/tasks`
-Create a task. Returns the created row; **409** if the duplicate guard refuses
-(retry with `confirm_duplicate: true` to override), **422** if `status` names a
+Create a task. Returns the created row plus `related` — look-alike tasks that
+did not block, each with `similarity` and the `shared` words; **409** if the
+duplicate guard refuses (the detail carries `duplicates` and `related`; retry
+with `confirm_duplicate: true` to override), **422** if `status` names a
 status that does not exist — a retry cannot fix that one, so it is kept
 distinct from the collision.
 
@@ -1250,11 +1613,26 @@ Response: { "task": { "id": "2026-03-01-fix-bug", ... }, "message": "Task create
 ```
 
 #### `GET /api/tasks/{id}`
-Get task details including full markdown file content.
+Get task details including full markdown file content, and `sessions`: the
+sessions that created, implemented or updated the task. Each session shows
+once, with the first relation that applies in the order `created`,
+`implemented`, `updated`. See [Sessions](tasks.md#sessions-created_session_id).
 
 ```json
-Response: { "id": "2026-03-01-fix-bug", "title": "Fix bug", "status": "pending", "content": "# Fix bug\n\n...", ... }
+Response: {
+  "id": "2026-03-01-fix-bug", "title": "Fix bug", "status": "pending", "content": "# Fix bug\n\n...",
+  "created_session_id": "a1b2c3d4", "created_session_title": "Triage the inbox",
+  "sessions": [
+    { "id": "a1b2c3d4", "title": "Triage the inbox", "relation": "created" },
+    { "id": "impl-5c2e9a1f", "title": "Implement: Fix bug", "relation": "implemented" }
+  ],
+  ...
+}
 ```
+
+Every task row (list, search, board, detail, the `task_updated` broadcast) has
+`created_session_id` (`null` when no session created the task) and
+`created_session_title` (`null` when that session does not exist).
 
 #### `PATCH /api/tasks/{id}`
 Update a task. All fields are optional. `content` replaces the full markdown
@@ -1269,6 +1647,15 @@ Request:  { "status": "done", "note": "Fixed in PR #123" }
 Request:  { "content": "# Updated Title\n\n**Deadline:** 2026-03-15\n\nNew details..." }
 Request:  { "deadline": "" }
 Response: { "task": { ... }, "task_id": "2026-03-01-fix-bug", "updated": true }
+```
+
+#### `GET /api/sessions/{id}/tasks`
+The tasks that the session created, implemented or updated, the most recently
+updated first. Each task row has `relation`: `created`, `implemented` or
+`updated`, the first that applies. **404** if the session does not exist.
+
+```json
+Response: { "tasks": [{ "id": "2026-03-01-fix-bug", "title": "Fix bug", "status": "pending", "relation": "created", ... }] }
 ```
 
 #### `GET /api/tasks/{id}/events`
@@ -1324,7 +1711,11 @@ neighbours itself, so a stale client board can't corrupt the ordering.
 directly below; omit both to append. Omit `status` to reorder in place.
 
 Moving into or out of `done` moves the markdown file between `active/` and
-`done/` as a side effect.
+`done/` as a side effect. Moving into `done` also closes a plan of the task
+that waits for review, and moving out puts it back in review when a
+signed-in person makes the request; a request with a system or API token
+leaves the plan closed (see [plans.md](plans.md#closing-the-task)).
+`PATCH /api/tasks/{id}` with a status does the same.
 
 ```json
 Request:  { "status": "in_progress", "before_id": "2026-03-01-a", "after_id": "2026-03-01-b" }
@@ -1500,6 +1891,209 @@ Re-read MCP server config from YAML files and refresh the in-memory cache. New s
 Response: { "reloaded": 2, "servers": [...] }
 ```
 
+### MCP Apps
+
+What the web UI needs to show the view of an MCP tool (see
+[mcp-apps.md](mcp-apps.md)). A tool call that opens a view carries `mcp_app`
+on its `tool_use` event and its stored block, and `mcp_app_result` once it
+has a result (see [Server → Client](#server--client)).
+
+Errors are `{"detail": "<code or message>"}`. While the feature is off, the
+config route says so and the session routes answer 404 `mcp_apps_disabled`.
+The session routes reach the MCP servers through the session's live Claude
+CLI: without one they answer 409 `session_not_running`.
+
+#### `GET /api/mcp-apps/config`
+Whether this instance shows MCP Apps (and widgets). `enabled` is true only
+when `mcp_apps.enabled` was set when the gateway started, in local mode. The
+frame of a view loads `/mcp-app-sandbox.html?csp=<url-encoded JSON>` from
+the address of this API.
+
+```json
+Response: { "enabled": true }
+Response: { "enabled": false }
+```
+
+#### `GET /mcp-app-sandbox.html?csp=<url-encoded JSON>`
+The sandbox document: the page of every view's and widget's frame (see
+[mcp-apps.md](mcp-apps.md#security-model)). Not under `/api`, and without
+authentication, like the files of the web UI: a frame's load carries no
+token, and the document is static and holds nothing. `csp` is the
+`_meta.ui.csp` of the view's resource, as the web UI passes it on; it is
+optional.
+
+Every answer for this path carries the header that takes the document's
+origin away, also the ones that are not the document:
+
+```
+Content-Security-Policy: sandbox allow-scripts allow-forms; default-src 'none';
+  script-src 'unsafe-inline' 'unsafe-eval' blob: data: <resourceDomains>;
+  style-src 'unsafe-inline' blob: data: <resourceDomains>;
+  img-src data: blob: <resourceDomains>; font-src data: blob: <resourceDomains>;
+  media-src data: blob: <resourceDomains>; connect-src <connectDomains>;
+  worker-src blob: <resourceDomains>; frame-src <frameDomains>; object-src 'none';
+  base-uri <baseUriDomains>; form-action <frameDomains>; frame-ancestors 'self'
+Cache-Control: no-store
+X-Content-Type-Options: nosniff
+Referrer-Policy: no-referrer
+```
+
+(One line in the response; a directive without sources reads `'none'`.) A
+declared source goes in only when it reads as an http(s) or ws(s) origin
+and is not on Nerve's own host.
+
+| Status | When |
+|--------|------|
+| 200 | `GET` or `HEAD`, the feature on |
+| 404 | The feature is off |
+| 405 | Another method (`Allow: GET, HEAD`) |
+| 503 | The web UI is not built: the document is missing |
+
+#### `GET /api/sessions/{session_id}/mcp-apps/resource?server=<server>&uri=<ui://…>`
+The document of a view. `html` is untrusted third-party HTML, for the sandbox
+frame only. `csp` and `permissions` are the resource's `_meta.ui.csp` and
+`_meta.ui.permissions` as the server sent them, `prefers_border` its
+`_meta.ui.prefersBorder`; each is null when absent. `cached: true` means the
+answer is the copy Nerve kept from an earlier read: the session has no live
+CLI, or its read just failed. A copy is served only for a server that
+`mcp_servers` has now, enabled.
+
+```json
+Response: {
+  "uri": "ui://example/view.html",
+  "mime_type": "text/html;profile=mcp-app",
+  "html": "<!doctype html>…",
+  "csp": { "connectDomains": ["https://api.example.com"], "resourceDomains": ["https://cdn.example.com"] },
+  "permissions": { "clipboardWrite": {} },
+  "prefers_border": true,
+  "cached": false
+}
+```
+
+| Status | `detail` |
+|--------|----------|
+| 400 | `bad_uri` (not a `ui://` URI, or longer than 2048 characters), `bad_server` |
+| 404 | `session_not_found`, `server_not_found` (also for `nerve`), `resource_not_found` |
+| 409 | `session_not_running`: no live CLI and no kept copy |
+| 502 | The reason: the server or the CLI failed or did not answer in 30 seconds, the resource is not one `text/html;profile=mcp-app` document, or it is larger than 5 MiB |
+
+#### `GET /api/sessions/{session_id}/mcp-apps/tools?server=<server>`
+The tools of an MCP server. `read_only` is the tool's `readOnlyHint`
+annotation. `visibility` is `_meta.ui.visibility` (`["model", "app"]` when the
+server does not say). `resource_uri` is the view the tool is linked to.
+
+```json
+Response: {
+  "tools": [
+    { "name": "show_counter", "read_only": true, "visibility": ["model", "app"], "resource_uri": "ui://example/view.html" },
+    { "name": "bump", "read_only": false, "visibility": ["app"], "resource_uri": "ui://example/view.html" },
+    { "name": "plain", "read_only": false, "visibility": ["model", "app"], "resource_uri": null }
+  ]
+}
+```
+
+400 `bad_server`; 404 `session_not_found`, `server_not_found`; 409
+`session_not_running`; 502 when the server is not connected or the CLI
+fails; 504 when the CLI does not answer in 5 seconds.
+
+#### `POST /api/sessions/{session_id}/mcp-apps/tool-call`
+Call a tool for a view, with no model turn. `tool` is the tool's own name,
+not `mcp__<server>__<tool>`. `arguments` may be left out. The answer is the
+MCP `CallToolResult`, also when the tool reports an error (`isError`). A
+result over 2 MiB loses its `structuredContent` and gets
+`"_meta": {"nerve/truncated": true}`.
+
+```json
+Request:  { "server": "example-server", "tool": "bump", "arguments": { "by": 2 } }
+Response: { "content": [{ "type": "text", "text": "counter is 2" }], "structuredContent": { "n": 2 } }
+Response: { "content": [{ "type": "text", "text": "the tool says no" }], "isError": true }
+```
+
+| Status | `detail` |
+|--------|----------|
+| 400 | `bad_json`, `bad_server`, `bad_tool`, `bad_arguments` (not an object), `body_too_large` (over 1 MiB) |
+| 403 | `tool_not_app_visible`: the tool's visibility lacks `app` |
+| 404 | `session_not_found`, `server_not_found` (always for `nerve`), `tool_not_found` |
+| 409 | `session_not_running` |
+| 502 | The reason: the server is not connected, or the CLI could not make the call |
+| 504 | The reason: the tool ran longer than 60 seconds, or the CLI did not answer |
+
+The route checks that the tool is for views. It cannot tell the views apart:
+that a view calls only its own server, and that a tool which changes
+something has the person's consent, is the web UI's part.
+
+### Widgets
+
+What a ```` ```widget ```` block saved in its `localStorage`, kept with the
+chat (see [widgets.md](widgets.md#what-a-widget-keeps)). The web UI reads
+the states of a chat's widgets before it draws the first of them, and writes
+a widget's keys and values when they change. The agent reads them with its
+tool `widget_state`.
+
+A widget is named by its id: the first 32 hex digits of the SHA-256 of its
+source (of the text's UTF-16 code units, low byte first). Its state is
+`items`: a list of `[key, value]` pairs of texts, each key once, in the
+order the widget first set the keys. `size` is the number of characters of
+the keys and values together, in UTF-16 code units, as a script counts
+them. The texts are the widget's own: any character, also half a surrogate
+pair, comes back as it went in.
+
+Errors are `{"detail": "<code>"}`. The routes need authentication like the
+other session routes. They answer 404 `widgets_disabled` while this instance
+draws no widgets (`mcp_apps` is off, or the gateway runs in external mode), and
+404 `session_not_found` for a session that does not exist. No route answers
+with the state of a chat other than the one in its path.
+
+#### `GET /api/sessions/{session_id}/widget-states`
+The saved state of every widget of the chat in one answer, the widget that
+changed last first, and the limits the server holds. A widget that saved
+nothing is not listed.
+
+```json
+Response: {
+  "widgets": [
+    { "id": "fedcba9876543210fedcba9876543210", "items": [["n", "7"]], "size": 2, "updated_at": "2026-01-02T03:05:00+00:00" },
+    { "id": "0123456789abcdef0123456789abcdef", "items": [["ticks", "[\"tent\",\"map\"]"], ["tab", "gear"]], "size": 26, "updated_at": "2026-01-02T03:04:05+00:00" }
+  ],
+  "limits": { "widget_chars": 65536, "widget_keys": 1024, "chat_chars": 1048576, "chat_widgets": 200 }
+}
+Response: { "widgets": [], "limits": { "widget_chars": 65536, "widget_keys": 1024, "chat_chars": 1048576, "chat_widgets": 200 } }
+```
+
+`limits`: one widget keeps at most `widget_chars` characters in at most
+`widget_keys` keys; the widgets of one chat keep at most `chat_chars`
+characters together, and at most `chat_widgets` of them have state.
+
+#### `PUT /api/sessions/{session_id}/widget-states/{widget_id}`
+Replace what one widget saved with `items`. The last write wins. An empty
+list forgets the widget, like the delete below: the answer then has `size`
+0 and `updated_at` null.
+
+```json
+Request:  { "items": [["ticks", "[\"tent\",\"map\"]"], ["tab", "gear"]] }
+Response: { "id": "0123456789abcdef0123456789abcdef", "size": 26, "updated_at": "2026-01-02T03:04:05+00:00" }
+Request:  { "items": [] }
+Response: { "id": "fedcba9876543210fedcba9876543210", "size": 0, "updated_at": null }
+```
+
+| Status | `detail` |
+|--------|----------|
+| 400 | `bad_widget_id` (not 32 lowercase hex digits), `bad_json` (the body is not a JSON object), `bad_items` (not a list of pairs of texts with each key once) |
+| 404 | `session_not_found`, `widgets_disabled` |
+| 413 | `body_too_large` (over 512 KiB), `widget_too_large` (over 65,536 characters), `too_many_keys` (over 1,024 keys), `chat_full` (the widgets of the chat would keep more than 1,048,576 characters together), `too_many_widgets` (200 widgets of the chat have state, and this one has none) |
+
+A write that is refused changes nothing.
+
+#### `DELETE /api/sessions/{session_id}/widget-states/{widget_id}`
+Forget what one widget saved (Reset in the web UI). `deleted` says whether
+there was something. 400 `bad_widget_id`; 404 `session_not_found`,
+`widgets_disabled`.
+
+```json
+Response: { "deleted": true }
+Response: { "deleted": false }
+```
+
 ### Memory Files
 
 #### `GET /api/memory/files`
@@ -1584,6 +2178,57 @@ Response: {
 }
 ```
 
+### GitHub
+
+#### `GET /api/github/pulls?url=...&url=...`
+Summaries of 1 to 10 GitHub pull requests, for the PR cards in the chat. Each
+`url` must be exactly `https://github.com/<owner>/<repo>/pull/<number>`. Any
+other value refuses the whole request with 400. The server runs
+`gh pr view <number> --repo github.com/<owner>/<repo> --json ...` with its own
+`gh` login. No shell runs, and the URL parts go to `gh` as separate arguments.
+The server keeps each result (also an error) for 60 s, and requests for one URL
+in that time share one `gh` call. At most 4 `gh` calls run at the same time,
+and a call stops after 15 s.
+
+The response has one result per distinct `url`, in request order, with `pull`
+or `error`. `state` is `draft`, `open`, `merged` or `closed`. `review` is
+`approved`, `changes_requested`, `review_required` or `null`. `error` is
+`no_access` (`gh` could not read the pull request: no login, no permission or
+no such pull request) or `gh_unavailable` (`gh` is not installed, gave no JSON,
+or did not answer in time).
+
+```json
+Response: {
+  "pulls": [
+    {
+      "url": "https://github.com/example/repo/pull/12", "error": null,
+      "pull": {
+        "repo": "example/repo", "number": 12, "title": "Fix the flaky login test",
+        "state": "open", "review": "approved",
+        "checks": { "passed": 12, "failed": 0, "running": 3, "cancelled": 0 },
+        "head_ref": "alice/fix-login", "base_ref": "main"
+      }
+    },
+    { "url": "https://github.com/example/repo/pull/13", "pull": null, "error": "no_access" }
+  ]
+}
+```
+
+A check run that ends as success, neutral or skipped counts as passed. A check
+run that ends as cancelled or stale counts as cancelled: it gave no result (a
+newer run replaced it, a fail-fast matrix stopped it, someone cancelled it), and
+it is not a failure. Every other conclusion counts as failed. A check run that
+has not completed counts as running. A commit status counts as running while it
+is pending or expected.
+
+A cancelled check run that a newer run of the same job replaced is not counted.
+A job is the pair `workflowName` and `name`; a newer run is one that started
+later (`startedAt`) or has not started yet. The head commit of a pull request
+often carries two runs of one workflow — a second trigger fired within seconds
+and the workflow's concurrency group cancelled the first — and the card then
+counts only the second. A run with a result always counts, whichever run is
+newer, and so does a cancelled run that no newer run of its job replaced.
+
 ### Diagnostics
 
 #### `GET /api/diagnostics`
@@ -1624,11 +2269,48 @@ and workflow runs that were cancelled while still queued, are not counted,
 so `cost_usd / runs` is the average cost per run. Jobs without usage are
 omitted.
 
-#### `GET /api/cron/logs?job_id=&limit=50&offset=0`
+#### `GET /api/cron/jobs`
+The cron jobs and source runners, with their schedule and next run. Each job
+also has:
+
+| Field | Meaning |
+|---|---|
+| `kind` | `agent`, `workflow` (a workflow-run job) or `source` |
+| `last_run` | `{status, started_at, finished_at}` of the latest run, or `null`. `status` is `null` while the run goes on |
+| `stats_7d` | `{runs, success, error, missed}`: the runs that started in the last 7 days |
+
+```json
+Response: { "jobs": [ { "id": "daily-digest", "type": "cron", "kind": "agent", "enabled": true,
+  "schedule": "0 8 * * *", "next_run": "2026-03-02T08:00:00+00:00",
+  "last_run": { "status": "success", "started_at": "2026-03-01 08:00:00", "finished_at": "2026-03-01T08:00:41+00:00" },
+  "stats_7d": { "runs": 7, "success": 6, "error": 1, "missed": 0 }, ... } ] }
+```
+
+#### `PUT /api/cron/jobs/{job_id}/enabled`
+Switch a cron job on or off. Writes `enabled` into the job's YAML file and
+reloads the cron jobs (see
+[Switching a job on and off](cron.md#switching-a-job-on-and-off)). A person's
+action: a system or MCP token gets `403`. Only the job's `enabled:` line
+changes. `404` for an unknown job or a source; `409` with the reason under
+lockdown, for a file in the workspace's `config/` while workspace sync is on,
+for a file that Nerve cannot write, and for a layout where one line
+cannot make the change; `400` when the reload refuses the files, which then
+get their old text back.
+
+```json
+Request:  { "enabled": false }
+Response: { "job_id": "daily-digest", "enabled": false }
+```
+
+#### `GET /api/cron/logs?job_id=&limit=50&offset=0&hide_empty=0`
 Get cron job execution logs, newest first. `limit` is clamped to 1–200;
 combine with `offset` for pagination. Each log row carries the
 `session_id` of the chat session the run executed in (null for source
-runners and missed runs).
+runners and missed runs), and `records`: the records that a source run
+fetched, stored plus dropped by the inbox guardrail (null for other runs). `hide_empty=1` leaves out the source runs
+that found nothing new (`records = 0`, status `success`); `total` counts
+the rows that the filter keeps. `empty` is the number of those source runs,
+with or without the filter.
 
 Each log row also carries `actor_id` (who started the run) and
 `caused_by_actor_id` (on whose behalf). Both are the system actor for a
@@ -1638,8 +2320,9 @@ scheduled run, and the person for a run that a person started with
 
 ```json
 Response: {
-  "logs": [ { "id": 12, "job_id": "...", "status": "success", "session_id": "cron:...", "actor_id": "…", "caused_by_actor_id": "…", ... } ],
+  "logs": [ { "id": 12, "job_id": "...", "status": "success", "session_id": "cron:...", "records": null, "actor_id": "…", "caused_by_actor_id": "…", ... } ],
   "total": 234,
+  "empty": 5400,
   "limit": 50,
   "offset": 0
 }
@@ -1730,7 +2413,10 @@ fresh.
 // stops over REST (POST /api/sessions/{id}/stop) to get the structured result.
 { type: "stop", session_id: "main" }
 
-// Switch active session (drops this socket's agent subscriptions)
+// Switch active session (drops this socket's agent subscriptions). A session
+// that does not exist, or a session_id that is no string, answers
+// { type: "session_not_found", session_id } and changes nothing: the socket
+// stays open and follows the session it followed.
 { type: "switch_session", session_id: "abc123" }
 
 // Follow one agent's live transcript (agent_event frames) / stop following.
@@ -1782,11 +2468,19 @@ those for another session. Events marked *global* go to every socket.
 { type: "thinking", session_id: "main", content: "Let me check..." }
 { type: "tool_use", session_id: "main", tool: "Read", input: { file_path: "..." }, tool_use_id: "toolu_..." }
 { type: "tool_result", session_id: "main", tool_use_id: "toolu_...", result: "...", is_error: false }
+// With MCP Apps on, the call of a tool that is linked to a view names it
+// (server as configured, the tool's own name), and its result comes also as
+// an MCP CallToolResult (content is always a list). The stored tool_call
+// block of the message carries the same two keys. A call that the person
+// stopped or refused has no mcp_app_result: the tool gave no result.
+{ type: "tool_use", session_id: "main", tool: "mcp__example-server__show_counter", input: {}, tool_use_id: "toolu_...", mcp_app: { server: "example-server", tool: "show_counter", resource_uri: "ui://example/view.html" } }
+{ type: "tool_result", session_id: "main", tool_use_id: "toolu_...", result: "{\"n\":0}", is_error: false, mcp_app_result: { content: [{ type: "text", text: "{\"n\":0}" }], structuredContent?: { n: 0 }, isError?: true, _meta?: { … } } }
 // Live output of a running command (Codex)
 { type: "tool_output", session_id: "main", tool_use_id: "toolu_...", content: "..." }
 
-// Turn complete (context usage)
-{ type: "done", session_id: "main", usage?: { input_tokens: 1234, output_tokens: 567, cache_read_input_tokens: 890, cache_creation_input_tokens: 0 }, max_context_tokens?: 1048576, num_turns?: 1 }
+// Turn complete (context usage). After a compact, usage also has
+// context_tokens: the measured context use, which the context bar shows.
+{ type: "done", session_id: "main", usage?: { input_tokens: 1234, output_tokens: 567, cache_read_input_tokens: 890, cache_creation_input_tokens: 0, context_tokens?: 20662 }, max_context_tokens?: 1048576, num_turns?: 1 }
 
 // Turn stopped by a user / error
 { type: "stopped", session_id: "main" }
@@ -1795,6 +2489,8 @@ those for another session. Events marked *global* go to every socket.
 // With client_msg_id, a tab that queued the message behind a running turn
 // puts the text back in the composer and keeps streaming that turn.
 { type: "error", session_id: "main", error: "...", client_msg_id: "4b6f…" | null }
+// A message for a session that does not exist is refused the same way, with
+// the session_id of the message, and the socket stays open.
 
 // An autonomous turn starts (the runtime resumed after background work
 // settled). triggers names the agents that settled since the last turn
@@ -1812,6 +2508,12 @@ those for another session. Events marked *global* go to every socket.
 // status, the agent snapshot, and the turn's buffered events when a turn runs
 { type: "session_status", session_id: "abc123", is_running: true, status: "active", buffered_events?: [...], agents: AgentSnapshot }
 { type: "session_switched", session_id: "abc123" }
+// The answer to a switch_session that names a session that does not exist: a
+// link that outlived its session, or a session deleted in another tab. The
+// web UI shows a notice in place of the chat. It names the session again at
+// every connect, as it does for any session on screen, and a session_status
+// for it ends the notice.
+{ type: "session_not_found", session_id: "abc123" }
 
 // Turn boundary (global): is_running is the orchestrator's turn only;
 // has_background_tasks / background_count are live agents
@@ -1907,10 +2609,13 @@ those for another session. Events marked *global* go to every socket.
 // A session waits for input, or no longer does (global)
 { type: "session_awaiting_input", session_id: "main", awaiting: true }
 
-// Notifications (global)
-{ type: "notification", notification_id: "…", notification_type: "notify" | "question" | …, session_id: "…", title: "…", body: "…", priority: "normal", options: [...] | null }
-{ type: "notification_answered", notification_id: "…", session_id: "…", answer: "…", answered_by: "…", actor_id: "…" }
+// Notifications (global). silent: true (else absent) during quiet hours for an item that is not urgent: show it without sound
+{ type: "notification", notification_id: "…", notification_type: "notify" | "question" | …, session_id: "…", title: "…", body: "…", priority: "normal", options: [...] | null, silent: true }
+{ type: "notification_answered", notification_id: "…", session_id: "…", answer: "…", answered_by: "…", answered_at: "…" | null, actor_id: "…" }
+// answered_at: the stored answer time (ISO 8601). A snoozed approval has approval_status: "snoozed" and snooze_until instead.
 { type: "notification_expired", notification_id: "…", session_id: "…", notification_type: "question", title: "…" }
+// One row was dismissed. actor_id: the person who dismissed it
+{ type: "notification_dismissed", notification_id: "…", session_id: "…", notification_type: "question", title: "…", actor_id: "…" }
 // An answer was relayed into the session as a message
 { type: "answer_injected", session_id: "…", notification_id: "…", title: "…", answer: "…", answered_by: "…", content: "…", actor_id: "…" }
 

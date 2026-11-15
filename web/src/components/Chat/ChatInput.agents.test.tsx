@@ -122,7 +122,7 @@ describe('ChatInput with agents', () => {
 
   it('locks the model picker while agents run', async () => {
     await renderComposer(false);
-    const picker = screen.getByRole('combobox');
+    const picker = screen.getByRole('button', { name: 'Model: model-a' });
     expect(picker).toBeDisabled();
     expect(picker).toHaveAttribute('title', 'Switching model restarts the runtime and would stop 5 running agents');
   });
@@ -130,7 +130,7 @@ describe('ChatInput with agents', () => {
   it('frees the model picker once no agent runs', async () => {
     useAgentStore.setState(makeAgentStoreSeed([FX_COMPLETED]));
     await renderComposer(false);
-    expect(screen.getByRole('combobox')).toBeEnabled();
+    expect(screen.getByRole('button', { name: 'Model: model-a' })).toBeEnabled();
   });
 
   it('applies text other surfaces put into the composer', async () => {
@@ -148,5 +148,49 @@ describe('ChatInput with agents', () => {
 
     act(() => { useAgentStore.getState().prefillComposer('only this', 'replace'); });
     expect(textbox()).toHaveValue('only this');
+  });
+
+  it('takes text that is offered only while it is empty, and leaves the focus where it is', async () => {
+    const user = userEvent.setup();
+    await renderComposer(false);
+    await act(async () => { await new Promise(r => setTimeout(r, 0)); });
+    // The person is somewhere else on the page: in the view of an MCP App, say.
+    const elsewhere = document.createElement('button');
+    document.body.appendChild(elsewhere);
+    try {
+      elsewhere.focus();
+      expect(useAgentStore.getState().composerHasText).toBe(false);
+
+      let taken!: boolean;
+      await act(async () => { taken = await useAgentStore.getState().offerToComposer('Plot the last hour.'); });
+
+      expect(taken).toBe(true);
+      expect(textbox()).toHaveValue('Plot the last hour.');
+      await act(async () => { await new Promise(r => setTimeout(r, 20)); });
+      expect(document.activeElement).toBe(elsewhere);
+      expect(onSend).not.toHaveBeenCalled();
+      expect(useAgentStore.getState().composerHasText).toBe(true);
+
+      // With words of the person's own in it, it takes nothing.
+      await user.clear(textbox());
+      await user.type(textbox(), 'my draft');
+      await act(async () => { taken = await useAgentStore.getState().offerToComposer('and do this too'); });
+
+      expect(taken).toBe(false);
+      expect(textbox()).toHaveValue('my draft');
+    } finally {
+      elsewhere.remove();
+    }
+  });
+
+  it('says that it holds no text once it is gone', async () => {
+    const user = userEvent.setup();
+    const view = await renderComposer(false);
+    await user.type(textbox(), 'my draft');
+    expect(useAgentStore.getState().composerHasText).toBe(true);
+
+    view.unmount();
+
+    expect(useAgentStore.getState().composerHasText).toBe(false);
   });
 });

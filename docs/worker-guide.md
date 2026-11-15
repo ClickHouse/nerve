@@ -52,7 +52,9 @@ mode and an optional task description itself and does not start the daemon
 (`nerve start` afterwards). Its worker path has no cron step, so it writes
 `skill-extractor`, `skill-reviser` and `machine-maintenance` with `enabled: false` too (`task-planner` is
 off on every path until onboarding enables it): set `enabled: true` in
-`config/cron/system.yaml` (or override the job by id in `jobs.yaml`) and `nerve reload`. Unattended installs set `NERVE_MODE=worker` and
+`config/cron/system.yaml` (or override the job by id in `jobs.yaml`) and `nerve reload`. A job in
+`jobs.yaml` has only the run gates that it states, so a copy there runs on every schedule; in
+`system.yaml` the three jobs wait for the agent's work ([cron.md](cron.md#built-in-system-crons)). Unattended installs set `NERVE_MODE=worker` and
 `NERVE_TASK="…"` for `nerve init --non-interactive` (see
 [Unattended installation](setup.md#unattended-installation)). On these two
 paths, a worker with a task description sets itself up without a person at its
@@ -247,10 +249,10 @@ Workers create their own skills during onboarding and refine them over time.
 - Skills can include reference docs (`references/`), scripts (`scripts/`), and assets (`assets/`)
 
 **Automated skill lifecycle:**
-- `skill-extractor` (every 12h) — watches for repeated workflows in conversations and completed tasks, proposes new skills via task+plan
-- `skill-reviser` (weekly) — reviews existing skills for accuracy, completeness, and quality, proposes revisions
+- `skill-extractor` (daily, when the agent has worked since its last run and fewer than three of its proposals wait for review) — watches for repeated workflows in conversations and completed tasks, proposes at most one new skill per run via task+plan; the plan states the evidence and the direction, not the skill
+- `skill-reviser` (weekly, when the agent has worked since its last run) — reviews existing skills for accuracy, completeness, and quality, proposes revisions
 
-When a skill-related plan is approved, an `impl-<id>` session is spawned like for any plan; its prompt tells it to apply the plan (a full SKILL.md) with `skill_create` or `skill_update` and close the task with `task_done`.
+When a skill-related plan is approved, an `impl-<id>` session is spawned like for any plan. For a new skill it writes the skill itself from the plan's evidence and direction and creates it with `skill_create`; for a revision it applies the plan (a full SKILL.md) with `skill_update`. Both close the task with `task_done`.
 
 ## Running Multiple Workers
 
@@ -312,7 +314,7 @@ Workers communicate through the notification system:
 - **`notify`** — status updates, completion alerts, issues found
 - **`ask_user`** — questions that need decisions (rendered as buttons in web UI and Telegram)
 
-Priority levels: `urgent`, `high`, `normal`, `low`. Quiet hours are optional and off for a worker by default (`quiet_start` and `quiet_end` empty in `<workspace>/config/settings.yaml`; see [Configuration → Quiet Hours](config.md#quiet-hours)). When set, they record the human's quiet window but gate nothing the agent sends; `notify` is not held back by them, so have the worker apply quiet hours itself for anything below `urgent` (see [Personal Best Practices → Notifications](personal-best-practices.md#notifications)).
+Priority levels: `urgent`, `high`, `normal`, `low`. Quiet hours are optional and off for a worker by default (`quiet_start` and `quiet_end` empty in `<workspace>/config/settings.yaml`; see [Configuration → Quiet Hours](config.md#quiet-hours)). When set, Nerve sends each notification below `urgent` without sound during them, but holds nothing back; `notify` still goes out, so have the worker apply quiet hours itself for anything below `urgent` (see [Personal Best Practices → Notifications](personal-best-practices.md#notifications)).
 
 ### Logs
 

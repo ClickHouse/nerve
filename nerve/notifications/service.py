@@ -20,8 +20,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from nerve.identity import actor_id_of, attribution_for
+from nerve.links import link_stays_whole, markdown_link, session_url, without_code
 from nerve.notifications import handlers as _handlers
+from nerve.notifications import webpush
 from nerve.notifications.date_render import render_iso_dates
+from nerve.notifications.quiet_hours import deliver_silently
 
 if TYPE_CHECKING:
     from nerve.agent.engine import AgentEngine
@@ -43,6 +46,30 @@ _APPROVAL_EMOJIS: dict[str, str] = {
 
 # Telegram caps an inline button's callback_data at 64 bytes.
 _CALLBACK_DATA_MAX_BYTES = 64
+
+# An http or https address that Telegram makes a link of: its host has a dot
+# or is an IPv6 address.
+_OWN_ADDRESS_RE = re.compile(
+    r"https?://(?:\[[0-9A-Fa-f:.]+\]|[^\s/?#\[\]]*[^\s/?#\[\].]\.[^\s/?#\[\].])",
+    re.IGNORECASE,
+)
+
+
+
+def _at_address(text: str, start: int, address: str) -> bool:
+    """Whether the address that begins at ``start`` in ``text`` is under
+    ``address``, a scheme with a host and an optional port: the same up to
+    there, and then no more of a host or a port."""
+    end = start + len(address)
+    if text[start:end].lower() != address.lower():
+        return False
+    return end == len(text) or not (text[end].isalnum() or text[end] in "._:-")
+
+
+# The line that a Telegram or Slack card gets when its question or approval
+# closes without an answer.
+_EXPIRED_LINE = "⏰ Expired unanswered"
+_DISMISSED_LINE = "🔕 Dismissed without an answer"
 
 
 def _fit_callback_value(notification_id: str, value: str) -> str:
@@ -270,6 +297,8 @@ class NotificationService:
         Args:
             channels: Override default notification channels (e.g. ["telegram"]).
             silent: If True, deliver without sound (Telegram disable_notification).
+                During quiet hours the fan-out does this for each item that
+                is not ``urgent``.
             force: If True, bypass silence matching and deliver normally.
                 A forced send that *still* matched a rule is delivered but
                 stamped + counted as an override for audit.
@@ -523,6 +552,32 @@ class NotificationService:
             return None
         return await self.db.get_notification(pending["id"])
 
+    async def reply_session(
+        self,
+        *,
+        channel: str,
+        message_id: str,
+        target: str | None = None,
+    ) -> str | None:
+        """The session that takes a reply to a delivered notification, or ``None``.
+
+        The notification is the one delivered on ``channel`` as the message
+        ``message_id``: in ``target``, or in whichever target when the caller
+        knows only the message. The session that raised it takes the reply
+        while it exists and is not archived.
+        """
+        if target is None:
+            notif = await self.db.find_notification_for_message(channel, message_id)
+        else:
+            notif = await self.db.find_notification_for_delivery(
+                channel, target, message_id,
+            )
+        session_id = (notif or {}).get("session_id")
+        session = await self.db.get_session(session_id) if session_id else None
+        if not session or session.get("status") == "archived":
+            return None
+        return session_id
+
     async def handle_answer(
         self,
         notification_id: str,
@@ -552,7 +607,8 @@ class NotificationService:
           maintenance tick (:meth:`redeliver_due`) fans it out again
           with a fresh card.
         - For ``type=question`` rows (legacy): persist the answer,
-          inject it back into the originating session, broadcast.
+          inject it back into the originating session, broadcast. For an
+          archived or deleted session, persist and broadcast only: no turn.
         - Fire-and-forget ``type=notify`` rows do not flow through this
           method; the dismiss endpoint handles those.
 
@@ -580,10 +636,16 @@ class NotificationService:
         is_external = bool(
             session_record and session_record.get("source") == "external"
         )
+        # An archived or deleted session runs no more turns: the answer is
+        # stored and shown, but nothing is delivered to the session.
+        is_closed = (
+            session_record is None
+            or session_record.get("status") == "archived"
+        )
 
         # During a drain the turn that delivers the answer is refused. Keep
         # the question pending, so the person can answer after the restart.
-        if not is_external and not self.engine.accepting_turns:
+        if not is_external and not is_closed and not self.engine.accepting_turns:
             from nerve.agent.engine import NotAcceptingTurnsError
 
             raise NotAcceptingTurnsError()
@@ -597,16 +659,24 @@ class NotificationService:
 
         answerer_id = actor_id_of(answerer)
         attribution = {"answered_by_actor": actor} if actor else {}
+        answered_at = await self._answered_at(notification_id)
 
         from nerve.agent.streaming import broadcaster
 
-        if is_external:
+        if is_closed:
+            logger.info(
+                "Answer to %s stored; session %s is %s, no turn",
+                notification_id, session_id,
+                "missing" if session_record is None else "archived",
+            )
+        if is_external or is_closed:
             await broadcaster.broadcast("__global__", {
                 "type": "notification_answered",
                 "notification_id": notification_id,
                 "session_id": session_id,
                 "answer": answer,
                 "answered_by": answered_by,
+                "answered_at": answered_at,
                 "actor_id": answerer_id,
                 **attribution,
             })
@@ -655,11 +725,17 @@ class NotificationService:
             "session_id": session_id,
             "answer": answer,
             "answered_by": answered_by,
+            "answered_at": answered_at,
             "actor_id": answerer_id,
             **attribution,
         })
 
         return True
+
+    async def _answered_at(self, notification_id: str) -> str | None:
+        """The stored answer time of a row, for the answer broadcast."""
+        row = await self.db.get_notification(notification_id)
+        return row.get("answered_at") if row else None
 
     async def _handle_approval_answer(
         self,
@@ -822,6 +898,8 @@ class NotificationService:
         }
         if snoozed:
             payload["snooze_until"] = snooze_until
+        else:
+            payload["answered_at"] = await self._answered_at(notification_id)
         await broadcaster.broadcast("__global__", payload)
 
         return True
@@ -919,24 +997,90 @@ class NotificationService:
         if task.cancelled():
             return
         exc = task.exception()
-        if exc:
+        from nerve.agent.engine import SessionClosedError
+
+        if isinstance(exc, SessionClosedError):
+            logger.info("Answer injection dropped: %s", exc)
+        elif exc:
             logger.error("Answer injection task failed: %s", exc)
 
     async def handle_dismiss(
         self, notification_id: str, *, actor: Actor | None = None,
     ) -> bool:
-        """Dismiss a notification (no answer routing needed).
+        """Dismiss a pending notification.
 
         ``actor`` is the person who dismissed it, recorded in
-        ``dismissed_by_actor_id``.
+        ``dismissed_by_actor_id``. Every dismissal sends a
+        ``notification_dismissed`` web broadcast. A question or an approval
+        then ends without an answer, as at expiry: the Telegram and Slack
+        cards say so and lose their buttons, an approval gets an
+        ``approval-dismissed`` audit event, and the asking session of a
+        question gets an internal note, written by ``actor``.
+
+        Raises:
+            NotAcceptingTurnsError: the dismissal of a question while the
+                engine drains, when its session takes the note. The
+                question stays pending.
         """
         notif = await self.db.get_notification(notification_id)
         if not notif or notif["status"] != "pending":
             return False
 
-        await self.db.dismiss_notification(
-            notification_id, attribution=attribution_for(actor),
+        kind = notif.get("type")
+        session_id = notif["session_id"]
+        title = notif.get("title") or ""
+        takes_note = kind == "question" and await self._takes_note(
+            session_id, "dismissal note",
         )
+        # During a drain the turn with the note is refused. Keep the
+        # question pending, so the person can dismiss it after the restart.
+        if takes_note and not self.engine.accepting_turns:
+            from nerve.agent.engine import NotAcceptingTurnsError
+
+            raise NotAcceptingTurnsError()
+
+        if not await self.db.dismiss_notification(
+            notification_id, attribution=attribution_for(actor),
+        ):
+            return False
+
+        from nerve.agent.streaming import broadcaster
+        try:
+            await broadcaster.broadcast("__global__", {
+                "type": "notification_dismissed",
+                "notification_id": notification_id,
+                "session_id": session_id,
+                "notification_type": kind,
+                "title": title,
+                "actor_id": actor_id_of(actor),
+            })
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "dismissal broadcast failed for %s: %s", notification_id, exc,
+            )
+
+        if kind in ("question", "approval"):
+            await self._edit_telegram_closed(notif, _DISMISSED_LINE)
+            await self._edit_slack_closed(notif, _DISMISSED_LINE)
+
+        if kind == "approval":
+            await self._append_approval_audit({
+                "event": "approval-dismissed",
+                "notification_id": notification_id,
+                "target_kind": notif.get("target_kind") or "",
+                "target_id": notif.get("target_id") or "",
+                "redelivery_count": notif.get("redelivery_count") or 0,
+                "dismissed_by_actor_id": actor_id_of(actor),
+            })
+
+        if takes_note:
+            self._dispatch_into_session(
+                session_id,
+                f"[Question dismissed without an answer: {title}]",
+                source="notification:dismiss",
+                actor=actor,
+                internal=True,
+            )
         return True
 
     # ------------------------------------------------------------------ #
@@ -972,8 +1116,23 @@ class NotificationService:
 
         ``plan_id`` names the plan of a ``notify`` row. Telegram adds an
         "Open plan" button for it.
+
+        Without ``channels`` the configured list goes out, with the panel
+        in it (:meth:`NotificationsConfig.delivery_channels`), and Web Push
+        to the browsers that turned it on (:func:`webpush.deliver`). A channel whose
+        ``notifications.levels`` entry is ``important`` skips an item below
+        that level (:meth:`NotificationsConfig.wants`).
+
+        During quiet hours an item that is not ``urgent`` goes out without
+        sound (:func:`deliver_silently`): Telegram gets
+        ``disable_notification`` and the web event gets ``silent: true``.
         """
-        target_channels = channels or self.config.notifications.channels
+        silent = silent or deliver_silently(self.config, priority)
+        settings = self.config.notifications
+        target_channels = [
+            name for name in (channels or [*settings.delivery_channels(), webpush.PUSH_CHANNEL])
+            if settings.wants(name, notif_type, priority)
+        ]
 
         async def _deliver(channel_name: str) -> str | None:
             """Deliver to a single channel, return name on success."""
@@ -983,7 +1142,7 @@ class NotificationService:
                         notification_id, session_id, notif_type,
                         title, body, priority, options,
                         option_labels=option_labels,
-                        extra=extra_web,
+                        extra={**(extra_web or {}), "silent": True} if silent else extra_web,
                     )
                     await self.db.record_notification_delivery(
                         notification_id, "web",
@@ -1011,6 +1170,13 @@ class NotificationService:
                     if not msg_id:
                         return None
                     return "slack"
+                elif channel_name == webpush.PUSH_CHANNEL:
+                    pushed = await webpush.deliver(
+                        self.db, self.config, notification_id=notification_id,
+                        notif_type=notif_type, title=title, body=body,
+                        priority=priority, silent=silent,
+                    )
+                    return webpush.PUSH_CHANNEL if pushed else None
                 else:
                     logger.warning(
                         "notifications.channels names %r, which nothing "
@@ -1142,7 +1308,31 @@ class NotificationService:
             return None
         return channel._app.bot
 
-    def _build_notification_text(
+    async def _session_link(self, session_id: str) -> str | None:
+        """A Markdown link to the page of a session in the web UI, or ``None``.
+
+        There is a link with ``gateway.public_url`` and a stored session: an
+        ID such as ``system`` names no session. The link text is the
+        session's title, or its ID while it has no title.
+        """
+        url = session_url(self.config, session_id)
+        if not url:
+            return None
+        try:
+            session = await self.db.get_session(session_id)
+        except Exception as exc:
+            # The link is a convenience: a failed lookup must not cost the
+            # delivery of the notification.
+            logger.warning(
+                "Session lookup for the link of %s failed: %s", session_id, exc,
+            )
+            return None
+        if not session:
+            return None
+        label = (session.get("title") or "").strip() or session_id
+        return markdown_link(label, url)
+
+    async def _build_notification_text(
         self, session_id: str, title: str, body: str, priority: str,
     ) -> str:
         """Compose the chat message text for a notification.
@@ -1151,6 +1341,13 @@ class NotificationService:
         delivery, the re-delivery tick, and the expiry edit (which rebuilds
         the original text to append a status line). Markdown is converted
         per channel at send time.
+
+        The last line names the session that raised the notification, unless
+        the label is switched off for it (``show_session_label``). It is a
+        link to the session in the web UI when there is one
+        (:meth:`_session_link`) and the text before it leaves the link whole
+        (:func:`nerve.links.link_stays_whole`). Otherwise it names the session
+        by its ID.
         """
         priority_prefix = self.config.notifications.priority_prefixes.get(priority, "")
         if title:
@@ -1160,8 +1357,30 @@ class NotificationService:
         else:
             text = body or ""
         if self._should_show_session_label(session_id):
-            text += f"\n\nSession: {session_id}"
+            text += "\n\nSession: "
+            link = await self._session_link(session_id)
+            text += link if link and link_stays_whole(text, link) else session_id
         return text
+
+    def _telegram_link_preview(self, session_id: str, title: str, body: str, text: str):
+        """The link preview options of a Telegram message with this ``text``.
+
+        Telegram shows a preview of the first address in a message. Where
+        that would be a page of the web UI, the preview is a card of the web
+        UI's own page under every notification, so it is switched off. A
+        message keeps Telegram's default when the first ``http://`` or
+        ``https://`` address in its title or body leads somewhere else, and
+        when it has no session link. An address inside code is none: Telegram
+        makes no link of it, and the session link would be the first.
+        """
+        url = session_url(self.config, session_id)
+        if not url or f"]({url})" not in text:
+            return None
+        own = _OWN_ADDRESS_RE.search(without_code(f"{title}\n{body}"))
+        if own and not _at_address(own.string, own.start(), self.config.gateway.public_url):
+            return None
+        from telegram import LinkPreviewOptions
+        return LinkPreviewOptions(is_disabled=True)
 
     async def _deliver_telegram(
         self,
@@ -1191,7 +1410,8 @@ class NotificationService:
         if not chat_id:
             return None
 
-        text = self._build_notification_text(session_id, title, body, priority)
+        text = await self._build_notification_text(session_id, title, body, priority)
+        link_preview = self._telegram_link_preview(session_id, title, body, text)
 
         if notif_type in ("question", "approval") and options:
             button_labels: list[str | tuple[str, str]] = []
@@ -1208,6 +1428,7 @@ class NotificationService:
                     button_labels.append(value)
             msg_id = await self._send_telegram_inline(
                 chat_id, notification_id, text, button_labels, silent=silent,
+                link_preview=link_preview,
             )
         else:
             markup = None
@@ -1219,14 +1440,18 @@ class NotificationService:
                 )
             msg = await self._send_telegram_html(
                 bot, chat_id, text, reply_markup=markup, silent=silent,
+                link_preview=link_preview,
             )
             msg_id = str(msg.message_id)
 
-        # Cache for reaction context lookups
+        # Cache for reaction context lookups, and record the reply route so a
+        # user replying to this notification reaches the session that raised
+        # it (e.g. a cron/background session).
         if msg_id:
             channel = self._get_telegram_channel()
             if channel:
                 channel._cache_message(int(msg_id), chat_id, text)
+                await channel._record_reply_route(int(msg_id), chat_id, session_id)
             await self.db.record_notification_delivery(
                 notification_id,
                 "telegram",
@@ -1244,11 +1469,18 @@ class NotificationService:
         *,
         reply_markup: object | None = None,
         silent: bool = False,
+        link_preview: object | None = None,
     ) -> object:
-        """Send a message with markdown→HTML conversion and plain-text fallback."""
+        """Send a message with markdown→HTML conversion and plain-text fallback.
+
+        ``link_preview`` is Telegram's ``link_preview_options`` for the
+        message (:meth:`_telegram_link_preview`); ``None`` leaves Telegram's
+        default.
+        """
         from nerve.channels.telegram import _md_to_tg_html
         from telegram.constants import ParseMode
 
+        preview = {"link_preview_options": link_preview} if link_preview is not None else {}
         html_text = _md_to_tg_html(text)
         try:
             return await bot.send_message(
@@ -1256,12 +1488,14 @@ class NotificationService:
                 parse_mode=ParseMode.HTML,
                 reply_markup=reply_markup,
                 disable_notification=silent,
+                **preview,
             )
         except Exception:
             return await bot.send_message(
                 chat_id=chat_id, text=text,
                 reply_markup=reply_markup,
                 disable_notification=silent,
+                **preview,
             )
 
     async def _send_telegram_inline(
@@ -1271,6 +1505,7 @@ class NotificationService:
         text: str,
         options: list[str | tuple[str, str]],
         silent: bool = False,
+        link_preview: object | None = None,
     ) -> str | None:
         """Send Telegram message with inline keyboard buttons.
 
@@ -1307,6 +1542,7 @@ class NotificationService:
 
         msg = await self._send_telegram_html(
             bot, chat_id, text, reply_markup=keyboard, silent=silent,
+            link_preview=link_preview,
         )
 
         await self.db.update_notification(
@@ -1375,7 +1611,7 @@ class NotificationService:
                 )
             return None
 
-        text = self._build_notification_text(session_id, title, body, priority)
+        text = await self._build_notification_text(session_id, title, body, priority)
 
         button_options: list[tuple[str, str]] = []
         if notif_type in ("question", "approval") and options:
@@ -1407,10 +1643,12 @@ class NotificationService:
         )
         return message_id
 
-    async def _edit_slack_expired(self, notif: dict[str, Any]) -> None:
-        """Best-effort edit of the Slack card to show it expired.
+    async def _edit_slack_closed(
+        self, notif: dict[str, Any], status_line: str,
+    ) -> None:
+        """Best-effort edit of the Slack card of a row that closed unanswered.
 
-        Rebuilds the original text from the row and appends the status line,
+        Rebuilds the original text from the row and appends ``status_line``,
         dropping the now-dead buttons. All failures are swallowed by design.
         """
         channel = self._get_slack_channel()
@@ -1422,13 +1660,13 @@ class NotificationService:
         if not delivery or not delivery.get("message_id"):
             return
 
-        text = self._build_notification_text(
+        text = await self._build_notification_text(
             notif["session_id"],
             notif.get("title") or "",
             notif.get("body") or "",
             notif.get("priority") or "normal",
         )
-        text += "\n\n⏰ Expired unanswered"
+        text += f"\n\n{status_line}"
         await channel.expire_notification(
             delivery["target"],
             str(delivery["message_id"]),
@@ -1553,6 +1791,23 @@ class NotificationService:
             await self._report_expired(rows)
         return len(rows)
 
+    async def expire_session_questions(self, session_id: str) -> int:
+        """Expire the pending questions of a session that was archived or
+        deleted, and report each one as :meth:`expire_stale` does (web
+        broadcast, Telegram and Slack card edits). The session gets no note:
+        :meth:`_takes_note` refuses an archived or missing session.
+        Approvals stay pending, because their answer acts on their target,
+        not on the session. Returns the number of expired questions.
+        """
+        rows = await self.db.expire_pending_questions_for_session(session_id)
+        if rows:
+            logger.info(
+                "Expired %d pending question(s) of closed session %s",
+                len(rows), session_id,
+            )
+            await self._report_expired(rows)
+        return len(rows)
+
     async def _report_expired(self, rows: list[dict[str, Any]]) -> None:
         """Report expired questions/approvals to every interested party.
 
@@ -1586,8 +1841,8 @@ class NotificationService:
                 )
 
             # Chat channels: mark the card expired, drop dead buttons.
-            await self._edit_telegram_expired(notif)
-            await self._edit_slack_expired(notif)
+            await self._edit_telegram_closed(notif, _EXPIRED_LINE)
+            await self._edit_slack_closed(notif, _EXPIRED_LINE)
 
             # Approvals: the proposer is the mechanical pipeline, not a
             # conversation — record the expiry in its audit log.
@@ -1618,36 +1873,11 @@ class NotificationService:
         Dispatched unconditionally — ``engine.run`` serializes per
         session, so a mid-turn session just processes the note when its
         current turn finishes (same pattern as the wakeup dispatcher
-        and ``handle_answer``). Skipped for external (satellite)
-        sessions, whose conversation loop Nerve doesn't own, and
-        archived/missing sessions — those got the web broadcast and
+        and ``handle_answer``). Skipped for the sessions that
+        :meth:`_takes_note` refuses; those got the web broadcast and
         nothing more.
         """
-        try:
-            session = await self.db.get_session(session_id)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning(
-                "expiry injection: session lookup failed for %s: %s",
-                session_id, exc,
-            )
-            return
-        if not session:
-            logger.info(
-                "expiry injection: session %s missing — broadcast only",
-                session_id,
-            )
-            return
-        if session.get("status") == "archived":
-            logger.info(
-                "expiry injection: session %s archived — broadcast only",
-                session_id,
-            )
-            return
-        if session.get("source") == "external":
-            logger.info(
-                "expiry injection: session %s is external — broadcast only",
-                session_id,
-            )
+        if not await self._takes_note(session_id, "expiry note"):
             return
 
         if len(rows) == 1:
@@ -1668,11 +1898,41 @@ class NotificationService:
             internal=True,
         )
 
-    async def _edit_telegram_expired(self, notif: dict[str, Any]) -> None:
-        """Best-effort edit of the Telegram card to show it expired.
+    async def _takes_note(self, session_id: str, purpose: str) -> bool:
+        """Whether a session gets a note about its closed question.
+
+        False for an external (satellite) session, whose conversation
+        loop Nerve does not own, and for an archived or missing session.
+        ``purpose`` names the note in the log.
+        """
+        try:
+            session = await self.db.get_session(session_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "%s: session lookup failed for %s: %s",
+                purpose, session_id, exc,
+            )
+            return False
+        if not session:
+            reason = "missing"
+        elif session.get("status") == "archived":
+            reason = "archived"
+        elif session.get("source") == "external":
+            reason = "external"
+        else:
+            return True
+        logger.info(
+            "%s: session %s is %s, no note", purpose, session_id, reason,
+        )
+        return False
+
+    async def _edit_telegram_closed(
+        self, notif: dict[str, Any], status_line: str,
+    ) -> None:
+        """Best-effort edit of the Telegram card of a row that closed unanswered.
 
         Rebuilds the original message text from the row (same builder
-        the delivery used) and appends the status line, dropping the
+        the delivery used) and appends ``status_line``, dropping the
         now-dead inline keyboard. Telegram refuses edits on old
         messages (>48h) — all failures are swallowed by design.
         """
@@ -1697,13 +1957,15 @@ class NotificationService:
         if not chat_id:
             return
 
-        text = self._build_notification_text(
-            notif["session_id"],
-            notif.get("title") or "",
-            notif.get("body") or "",
-            notif.get("priority") or "normal",
+        title = notif.get("title") or ""
+        body = notif.get("body") or ""
+        text = await self._build_notification_text(
+            notif["session_id"], title, body, notif.get("priority") or "normal",
         )
-        text += "\n\n⏰ Expired unanswered"
+        # An edit sets the preview again, so it gets the choice of the delivery.
+        link_preview = self._telegram_link_preview(notif["session_id"], title, body, text)
+        preview = {"link_preview_options": link_preview} if link_preview is not None else {}
+        text += f"\n\n{status_line}"
 
         from nerve.channels.telegram import _md_to_tg_html
         from telegram.constants import ParseMode
@@ -1712,15 +1974,17 @@ class NotificationService:
             await bot.edit_message_text(
                 chat_id=int(chat_id), message_id=int(message_id),
                 text=_md_to_tg_html(text), parse_mode=ParseMode.HTML,
+                **preview,
             )
         except Exception:
             try:
                 await bot.edit_message_text(
                     chat_id=int(chat_id), message_id=int(message_id),
                     text=text,
+                    **preview,
                 )
             except Exception as exc:
                 logger.debug(
-                    "telegram expiry edit failed for %s: %s",
+                    "telegram card edit failed for %s: %s",
                     notif["id"], exc,
                 )

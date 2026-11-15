@@ -13,6 +13,17 @@ direct message, a mention of the agent, a reply in a thread that the agent
 takes part in, a reaction, an interaction, or a command. A mention of the
 agent carries the ``self`` flag, so intake needs no capabilities.
 
+The capabilities of the event's connection can give a behaviour (see
+:class:`~nerve.channels.hosted.contract.model.ConnectionBehaviour`). With the
+``tool`` answer mode, the router sends nothing to the conversation for the
+turn, and the answer stays in the session. The turn's text then starts with
+a line that says so and names the reply tool, when the connection gives one
+(:func:`answer_note`). With the ``keep`` session mode, a conversation
+continues its last session however long it was idle, while that session is
+not archived or deleted. A connection without a behaviour, or whose
+capabilities Nerve does not have, has the ``post`` answer mode and the
+``rotate`` session mode: the session changes after the sticky period.
+
 An invoke event names the person that the gateway resolved from its author.
 In external mode, a message or reaction turn runs as that person, and an
 interaction answers its notification as that person. In local mode, the
@@ -28,24 +39,38 @@ only a deny rule. The stored observation names the person that the gateway
 linked to the author, for attribution only: the sender rules do not see it,
 and it adds no actor.
 
+The channel serves the connections of its provider. A connection whose
+capabilities name no provider, as from an older gateway, serves every hosted
+chat channel. An event on a connection whose capabilities name another
+provider is rejected, and no operation goes to such a connection. The provider's entry in
+:data:`~nerve.channels.hosted.providers.HOSTED_CHAT_PROVIDERS` gives the
+channel's switch and settings.
+
 Outbound messages are contract operations on the connection that the
-conversation's latest accepted event came on, or on the only connection that
-supports the operation. :meth:`send` posts CommonMark text in parts of at
-most the connection's advisory ``text_characters``. Streaming uses a
-placeholder message, edits paced by ``edit_interval_millis``, and a delete.
-The typing indicator is an ``eyes`` reaction on the message that started the
-turn. The gateway decides where the agent may post: a ``forbidden`` result of
-a send is a refusal, not a transport failure.
+conversation's latest accepted event came on, or on the only connection of
+the provider that supports the operation. :meth:`send` posts CommonMark text
+in parts of at most the connection's advisory ``text_characters``. Streaming
+uses a placeholder message, edits paced by ``edit_interval_millis``, and a
+delete. The typing indicator is an ``eyes`` reaction on the message that
+started the turn. The gateway decides where the agent may post: a
+``forbidden`` result of a send is a refusal, not a transport failure.
 
 Files go out through ``file_send``. The attachments of a message that starts
 a turn are read through ``file_read`` before the turn and use the
 self-hosted extraction rules. A notification is a message with one button
-for each answer. It goes to the conversation that the config names. When the
-config names none, it goes through ``notify``, and the gateway chooses the
-conversation that the control plane set for the agent. A button press
+for each answer. It goes through ``notify``, and the gateway posts it in the
+notification channel that the control plane set for the agent. The config
+does not choose this conversation. A button press
 arrives as an invoke ``interaction`` event: it answers the notification when
 the card was delivered in that conversation, and the ``interaction``
 operation then replaces the card without its buttons.
+
+A message that replies to a notification goes to the session that raised the
+notification, while that session exists and is not archived. The
+notification is the one that the event's ``reply_to`` names, or else the one
+delivered as the root of the message's thread. The message has the session
+key and the target of its own thread, in a direct conversation too: the
+answer goes to that thread, and the conversation keeps its own session.
 """
 
 from __future__ import annotations
@@ -60,7 +85,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping
 
-from nerve.agent.engine import NotAcceptingTurnsError
+from nerve.agent.engine import NotAcceptingTurnsError, SessionClosedError
 from nerve.channels.access import Decision, Identity, PatternGate, needs_name_resolution
 from nerve.channels.base import (
     BaseChannel,
@@ -72,7 +97,7 @@ from nerve.channels.base import (
     OutboundRefused,
 )
 from nerve.channels.hosted.attachments import extract_attachments
-from nerve.channels.hosted.contract import ContentPart, Event
+from nerve.channels.hosted.contract import ConnectionBehaviour, ContentPart, Event
 from nerve.channels.hosted.contract.model import (
     MAX_TRANSFER_BYTES,
     AttachmentReference,
@@ -108,6 +133,11 @@ from nerve.channels.hosted.outbound import (
     split_text,
     truncate_text,
     valid_identifier,
+)
+from nerve.channels.hosted.providers import (
+    STREAM_MODE_PARTIAL,
+    HostedChannelSettings,
+    HostedChatProvider,
 )
 from nerve.channels.observation import ObservationPolicy
 
@@ -182,6 +212,16 @@ def describe_attachments(event: Event) -> str:
     return " ".join(
         f"[File: {attachment.name or 'unnamed'}]" for attachment in event.attachments
     )
+
+
+def answer_note(provider: str, reply_tool: str = "") -> str:
+    """The line before the text of a turn whose answer Nerve does not post.
+
+    It names the provider, says that the answer in the session goes to no
+    one, and names the tool that can answer, when the connection gives one.
+    """
+    how = f"To answer, use the {reply_tool} tool." if reply_tool else "This channel does not send answers."
+    return f"This message came through {provider}. Your answer in this session is not sent to anyone. {how}"
 
 
 def _why(error: Exception) -> str:
@@ -265,7 +305,7 @@ class HostedChannel(BaseChannel):
 
     def __init__(
         self,
-        provider: str,
+        provider: HostedChatProvider,
         router: ChannelRouter,
         config: Callable[[], NerveConfig],
         *,
@@ -274,20 +314,18 @@ class HostedChannel(BaseChannel):
         operations: OperationRunner | None = None,
         reaction_names: Mapping[str, str] | None = None,
         notifications: Any | None = None,
-        notification_target: Callable[[NerveConfig], str | None] | None = None,
         button_style: Callable[[str], str] | None = None,
     ) -> None:
-        self._provider = provider
+        self._spec = provider
+        self._provider = provider.name
         self.router = router
         self._config = config
         self._max_inflight = max_inflight
         self._is_id = is_id
         self._operations = operations
         self._reaction_names = dict(reaction_names or {})
-        # The notification service, the choice of the notification
-        # conversation, and the style of an answer button.
+        # The notification service and the style of an answer button.
         self._notifications = notifications
-        self._notification_target = notification_target
         self._button_style = button_style or (lambda value: "")
         self._running = False
         # conversation -> the connection it last arrived on.
@@ -337,8 +375,7 @@ class HostedChannel(BaseChannel):
             | ChannelCapability.TYPING_INDICATOR
             | ChannelCapability.SEND_FILES
         )
-        section = getattr(self._config(), self._provider, None)
-        if getattr(section, "stream_mode", "partial") == "partial":
+        if self._settings().stream_mode == STREAM_MODE_PARTIAL:
             capabilities |= ChannelCapability.STREAMING
         return capabilities
 
@@ -354,8 +391,10 @@ class HostedChannel(BaseChannel):
         editable = True
         if self._operations is not None:
             streams = self._operations.streams
-            senders = streams.connections("send")
-            editable = senders <= streams.connections("edit") & streams.connections("delete")
+            senders = streams.connections("send", self._provider)
+            editable = senders <= (
+                streams.connections("edit", self._provider) & streams.connections("delete", self._provider)
+            )
         return ChannelConstraints(
             max_message_length=min(
                 (item.text_characters for item in limits), default=DEFAULT_TEXT_CHARACTERS,
@@ -368,19 +407,20 @@ class HostedChannel(BaseChannel):
 
     @property
     def is_available(self) -> bool:
-        """Whether the provider is switched on and a stream advertises ``send`` now."""
+        """Whether the provider is switched on and a stream advertises ``send`` for it now."""
         return (
             self._switched_on()
             and self._operations is not None
-            and bool(self._operations.streams.connections("send"))
+            and bool(self._operations.streams.connections("send", self._provider))
         )
 
     def _switched_on(self) -> bool:
-        """Whether the provider is enabled and in hosted mode, read per call."""
-        section = getattr(self._config(), self._provider, None)
-        return bool(
-            section is not None and section.enabled and getattr(section, "mode", "") == "hosted",
-        )
+        """Whether the provider is switched on, read per call."""
+        return bool(self._spec.switched_on(self._config()))
+
+    def _settings(self) -> HostedChannelSettings:
+        """The provider's channel settings, read per call."""
+        return self._spec.settings(self._config())
 
     async def start(self) -> None:
         self._running = True
@@ -434,17 +474,19 @@ class HostedChannel(BaseChannel):
         """The connection for outbound work in *conversation_id*.
 
         That is the connection of the conversation's latest accepted event,
-        else the only connection that advertises *operation*, which may take
-        a short wait for a stream. Raises :class:`OperationFailed` when
-        neither exists.
+        else the only connection of the provider that advertises
+        *operation*, which may take a short wait for a stream. Raises
+        :class:`OperationFailed` when neither exists.
         """
         if not conversation_id:
             raise OperationFailed(operation, "unavailable", "invalid_target", local=True,
                                   detail="the target names no conversation")
         connection = self._connections.get(conversation_id)
-        if connection is not None:
+        if connection is not None and not self._foreign(connection):
             return connection
-        candidates = await self._operations.connections(operation) if self._operations else set()
+        candidates = (
+            await self._operations.connections(operation, self._provider) if self._operations else set()
+        )
         if len(candidates) == 1:
             return next(iter(candidates))
         raise OperationFailed(
@@ -452,6 +494,17 @@ class HostedChannel(BaseChannel):
             local=True,
             detail=f"no single {self._provider} connection serves conversation {conversation_id}",
         )
+
+    def _foreign(self, connection_id: uuid.UUID) -> bool:
+        """Whether the capabilities of *connection_id* name another provider.
+
+        A connection without capabilities now, or whose capabilities name no
+        provider, is not foreign.
+        """
+        capabilities = (
+            self._operations.streams.capabilities_for(connection_id) if self._operations else None
+        )
+        return capabilities is not None and not capabilities.serves(self._provider)
 
     def _limits(self, connection_id: uuid.UUID) -> ConnectionLimits:
         capabilities = (
@@ -468,13 +521,19 @@ class HostedChannel(BaseChannel):
         if self._operations is None:
             return []
         streams = self._operations.streams
-        found = (streams.capabilities_for(connection) for connection in streams.connections("send"))
+        found = (
+            streams.capabilities_for(connection)
+            for connection in streams.connections("send", self._provider)
+        )
         return [capabilities.limits for capabilities in found if capabilities is not None]
 
     async def _perform(self, connection_id: uuid.UUID, kind: str, payload: Any, **options: Any):
         if self._operations is None:
             raise OperationFailed(kind, "unavailable", "provider_unavailable", local=True,
                                   detail="no gateway streams")
+        if self._foreign(connection_id):
+            raise OperationFailed(kind, "unavailable", "invalid_target", local=True,
+                                  detail=f"connection {connection_id} serves another provider")
         return await self._operations.perform(connection_id, kind, payload, **options)
 
     async def _fitting(
@@ -643,7 +702,9 @@ class HostedChannel(BaseChannel):
         except OperationFailed as error:
             logger.warning("Hosted %s reaction in %s failed: %s", self._provider, target, _why(error))
 
-    async def send_file(self, target: str, file_path: str) -> bool:
+    async def send_file(
+        self, target: str, file_path: str, *, session_id: str | None = None,
+    ) -> bool:
         """Upload a file into *target* through ``file_send``.
 
         Returns ``False`` without a send when the file is missing, empty, or
@@ -692,47 +753,37 @@ class HostedChannel(BaseChannel):
     ) -> tuple[str, str] | None:
         """Post a notification card: its text and one button for each option.
 
-        When the config names a conversation, the card goes there with
-        ``send``, the same as with the self-hosted channel. Otherwise the
-        card goes with ``notify`` to the conversation that the gateway
-        chooses, when exactly one connection advertises ``notify``. Returns
-        ``(target, message_id)``, where the target is the card's
-        conversation, or ``None`` when there is no conversation or the post
-        fails.
+        The card goes with ``notify``, and the gateway posts it in the
+        agent's notification channel, which an admin sets in the control
+        plane. The config does not choose the conversation. Nerve sends the
+        card only when exactly one connection of the provider advertises
+        ``notify``. Returns ``(target, message_id)``, where the target is the
+        card's conversation, or ``None`` when there is no conversation or the
+        post fails.
         """
-        config = self._config()
-        target = self._notification_target(config) if self._notification_target else None
         if not self.is_available:
             return None
         actions = notification_actions(notification_id, options, self._button_style)
-
-        def card(body: str) -> SendOperation | NotifyOperation:
-            content = _markdown(body) + actions
-            if target:
-                return SendOperation(destination=container_for(target, None), content=content)
-            return NotifyOperation(content=content)
-
         try:
-            if target:
-                kind, connection = "send", await self._connection(target, "send")
-            else:
-                kind, connection = "notify", self._notify_connection()
+            connection = self._notify_connection()
             if connection is None:
                 logger.debug(
-                    "Hosted %s notification %s has no conversation: the config names none, "
-                    "and no connection advertises notify", self._provider, notification_id,
+                    "Hosted %s notification %s has no conversation: no connection advertises notify",
+                    self._provider, notification_id,
                 )
                 return None
             result, body = await self._fitting(
-                kind, truncate_text(text, self._limits(connection).text_characters),
-                lambda body: self._perform(connection, kind, card(body)),
+                "notify", truncate_text(text, self._limits(connection).text_characters),
+                lambda body: self._perform(
+                    connection, "notify", NotifyOperation(content=_markdown(body) + actions),
+                ),
             )
         except OperationFailed as error:
             log = logger.info if _expected_card_failure(error) else logger.warning
             log("Hosted %s notification %s was not posted: %s", self._provider, notification_id, _why(error))
             return None
         located = result.target
-        conversation = target or located.conversation.id
+        conversation = located.conversation.id
         message_id = located.message.id
         _remember(self._targets, (conversation, message_id), (connection, located), _TARGET_CACHE_MAX)
         _remember(self._notification_texts, (conversation, message_id), body, _TARGET_CACHE_MAX)
@@ -740,7 +791,7 @@ class HostedChannel(BaseChannel):
         return conversation, message_id
 
     def _notify_connection(self) -> uuid.UUID | None:
-        """The only connection that advertises ``notify`` now, else ``None``.
+        """The only connection of the provider that advertises ``notify`` now, else ``None``.
 
         It does not wait for a stream. The caller first makes sure that a
         stream can send, and a gateway without ``notify`` never advertises
@@ -748,7 +799,9 @@ class HostedChannel(BaseChannel):
         advertise it, because Nerve cannot tell which connection the card
         is for.
         """
-        candidates = self._operations.streams.connections("notify") if self._operations else set()
+        candidates = (
+            self._operations.streams.connections("notify", self._provider) if self._operations else set()
+        )
         if len(candidates) > 1:
             raise OperationFailed(
                 "notify", "unavailable", "invalid_target", local=True,
@@ -783,20 +836,24 @@ class HostedChannel(BaseChannel):
         """
         if not self._switched_on():
             return Decision(False, f"{self._provider} is switched off ({self._provider}.enabled is false)")
-        section = getattr(self._config(), self._provider, None)
-        if not getattr(section, "allow_outbound", False):
+        settings = self._settings()
+        if not settings.allow_outbound:
+            setting = self._spec.outbound_setting
+            if not setting:
+                return Decision(
+                    False, f"the {self._provider} channel does not post to a conversation that the agent names",
+                )
             return Decision(
                 False,
-                f"{self._provider}.allow_outbound is not enabled, so the agent may not post "
-                "to a conversation it names",
+                f"{setting} is not enabled, so the agent may not post to a conversation it names",
             )
         conversation, _ = parse_target(target)
         if not conversation:
             return Decision(False, f"no {self._provider} conversation ID in the target")
         if self._is_id is not None and not self._is_id(conversation):
             return Decision(False, f"target must be a {self._provider} conversation ID, not a name")
-        allow = list(getattr(section, "allow_channels", None) or [])
-        deny = list(getattr(section, "deny_channels", None) or [])
+        allow = list(settings.allow_channels)
+        deny = list(settings.deny_channels)
         if allow or deny:
             gate = PatternGate("conversation", allow=allow, deny=deny)
             verdict = gate.check(self._identity(conversation, "", gate))
@@ -806,8 +863,9 @@ class HostedChannel(BaseChannel):
                 return Decision(
                     False, f"the destination is not approved by the {self._provider} channel policy",
                 )
-        if self._connections.get(conversation) is None and self._operations is not None:
-            candidates = self._operations.streams.connections("send")
+        known = self._connections.get(conversation)
+        if (known is None or self._foreign(known)) and self._operations is not None:
+            candidates = self._operations.streams.connections("send", self._provider)
             if len(candidates) > 1:
                 return Decision(
                     False,
@@ -840,22 +898,36 @@ class HostedChannel(BaseChannel):
     # ------------------------------------------------------------------ #
 
     def can_accept(self) -> bool:
-        """Whether the channel runs, is still switched on, and has room for a turn.
+        """Whether the channel runs, holds no events, and has room for a turn.
 
-        The provider section is read per call, so turning the provider off
-        by a reload stops intake until it is turned on again. Intake also
-        stops while the engine drains: the gateway keeps the events, and the
-        next start reads them.
+        The provider's switch is read per call. Turning a provider that
+        holds its events while off (Slack) off by a reload stops intake
+        until it is turned on again. A provider that does not hold them
+        never stops intake by its switch: :meth:`deliver` rejects its
+        events. Intake also stops while the engine drains: the gateway keeps
+        the events, and the next start reads them.
         """
         return (
             self._running
-            and self._switched_on()
+            and (self._switched_on() or not self._spec.hold_while_off)
             and len(self._inflight) < self._max_inflight
             and self.router.accepting_turns
         )
 
     async def deliver(self, event: Event) -> Disposition:
-        """Dispatch one admitted event and say what happened to it."""
+        """Dispatch one admitted event and say what happened to it.
+
+        While the provider is switched off, and it does not hold its events,
+        each event is rejected. So is an event on a connection whose
+        capabilities name another provider: it is not remembered, and its
+        connection's behaviour does not apply.
+        """
+        if not self._spec.hold_while_off and not self._switched_on():
+            return Disposition.rejected("configuration_invalid", f"{self._provider} is switched off")
+        if self._foreign(event.connection_id):
+            return Disposition.rejected(
+                "configuration_invalid", f"connection {event.connection_id} serves another provider",
+            )
         purpose = event.admission.purpose
         if purpose == "invoke" and event.kind == "message":
             disposition = await self._invoke_message(event)
@@ -880,27 +952,58 @@ class HostedChannel(BaseChannel):
         while len(self._connections) > _CONNECTION_CACHE_MAX:
             self._connections.popitem(last=False)
 
-    def _target(self, event: Event) -> str:
+    def _target(self, event: Event, *, in_thread: bool = False) -> str:
+        """The target of an event's message.
+
+        A direct conversation is one target, unless *in_thread*. Elsewhere,
+        and with *in_thread*, the target is the message's thread, which a
+        top-level message roots.
+        """
         conversation = event.conversation
-        if conversation.kind == "direct":
+        if conversation.kind == "direct" and not in_thread:
             return conversation.id
         thread_id = event.thread.id if event.thread is not None else event.message.id
         return f"{conversation.id}:{thread_id}"
+
+    async def _notification_session(self, event: Event) -> str | None:
+        """The session that takes a message as a reply to a notification, or ``None``.
+
+        The notification is the one that the event's ``reply_to`` names, in
+        whichever conversation this provider delivered it. Without
+        ``reply_to``, it is the one delivered as the root of the event's
+        thread. The session that raised it must exist and must not be
+        archived. A lookup that fails raises, and the reader takes the event
+        again later.
+        """
+        if self._notifications is None:
+            return None
+        reply_to = event.reply_to.id if event.reply_to is not None else ""
+        if reply_to:
+            return await self._notifications.reply_session(channel=self._provider, message_id=reply_to)
+        if event.thread is None:
+            return None
+        return await self._notifications.reply_session(
+            channel=self._provider, message_id=event.thread.id, target=event.conversation.id,
+        )
 
     async def _invoke_message(self, event: Event) -> Disposition:
         """Start a turn for a message that addresses the agent.
 
         A thread reply needs no local session: the agent also takes part in
-        threads that it started with its own posts.
+        threads that it started with its own posts. A reply to a
+        notification goes to the session that raised it (see
+        :meth:`_notification_session`). Its target is its own thread, in a
+        direct conversation too, so the answer goes to that thread, and the
+        session gets the session key of the thread, not of the conversation.
         """
-        target = self._target(event)
-        channel_key = f"{self._provider}:{target}"
         body = render_content(event.content)
         attachments = describe_attachments(event)
         text = f"{attachments}\n\n{body}" if attachments and body else attachments or body
         if not text:
             return Disposition.rejected("admission_rejected", "the message carries no text")
 
+        session_id = await self._notification_session(event)
+        target = self._target(event, in_thread=session_id is not None)
         self.remember_message(event.conversation.id, event.message.id, target, text)
         self._note_turn_message(event, target)
         self._note_handled(event)
@@ -913,14 +1016,25 @@ class HostedChannel(BaseChannel):
             "Hosted %s message in %s: %s", self._provider, target,
             text[:80] + ("..." if len(text) > 80 else ""),
         )
+        if session_id is not None:
+            logger.info(
+                "Hosted %s message in %s goes to session %s, which raised its notification",
+                self._provider, target, session_id,
+            )
         # The turn reads the attachments before it starts and puts them
         # before the text.
         return self._dispatch(InboundMessage(
             channel_name=self._provider,
-            channel_key=channel_key,
+            channel_key=f"{self._provider}:{target}",
             sender_id=target,
             text=body if event.attachments else text,
+            session_id=session_id,
             metadata=metadata,
+            # Untrusted presentation text, for the origin of a new session.
+            conversation_title=(
+                event.conversation.display_name
+                if event.conversation.kind != "direct" else ""
+            ),
         ), event, attachments=bool(event.attachments))
 
     async def _add_attachments(self, message: InboundMessage, event: Event) -> None:
@@ -937,7 +1051,7 @@ class HostedChannel(BaseChannel):
         self, event: Event, attachment: AttachmentReference, length: int,
     ) -> bytes | None:
         """Read up to *length* bytes of an attachment, or ``None`` on failure."""
-        if self._operations is None:
+        if self._operations is None or self._foreign(event.connection_id):
             return None
         try:
             return await self._operations.read(event.connection_id, "file_read", FileReadOperation(
@@ -1067,17 +1181,39 @@ class HostedChannel(BaseChannel):
     def _dispatch(self, message: InboundMessage, event: Event, *, attachments: bool = False) -> Disposition:
         """Start the turn as a task. Acceptance does not wait for the turn.
 
-        The task first resolves the event's person into the message's actor.
+        The behaviour of the event's connection goes with the message. The
+        task first resolves the event's person into the message's actor.
         With *attachments*, it also reads the event's attachments.
         """
         if not self.can_accept():
             return Disposition.deferred(f"{self._provider} has {len(self._inflight)} turns starting")
-        task = asyncio.create_task(self._run_turn(message, event, attachments))
+        behaviour = self._behaviour(event)
+        message.post_answer = behaviour.posts_answer
+        task = asyncio.create_task(self._run_turn(message, event, attachments, behaviour))
         self._inflight.add(task)
         task.add_done_callback(self._inflight.discard)
         return Disposition.accepted()
 
-    async def _run_turn(self, message: InboundMessage, event: Event, attachments: bool) -> None:
+    def _behaviour(self, event: Event) -> ConnectionBehaviour:
+        """The behaviour that the event's connection announced, else the defaults."""
+        capabilities = (
+            self._operations.streams.capabilities_for(event.connection_id) if self._operations else None
+        )
+        return capabilities.behaviour if capabilities is not None else ConnectionBehaviour()
+
+    async def _run_turn(
+        self, message: InboundMessage, event: Event, attachments: bool, behaviour: ConnectionBehaviour,
+    ) -> None:
+        """Run the turn of one message.
+
+        When the connection does not post answers, :func:`answer_note` comes
+        first, before the attachments that were read and the text. A reply
+        to a notification goes to the session that raised it. When that
+        session closed after the check, the reply goes once more, as a
+        message without a notification (:meth:`_retarget`). For such a
+        message, when the connection keeps sessions, the turn goes to the
+        conversation's last session, if it still has one.
+        """
         try:
             message.actor = await self.router.actor_for_principal(
                 event.admission.invoke.resolved_principal_id,
@@ -1085,11 +1221,32 @@ class HostedChannel(BaseChannel):
             )
             if attachments:
                 await self._add_attachments(message, event)
+            if not behaviour.posts_answer:
+                note = answer_note(self._provider, behaviour.reply_tool)
+                message.text = f"{note}\n\n{message.text}" if message.text else note
+            if message.session_id is not None:
+                try:
+                    # A delete since the check leaves no row, and the router
+                    # does not report that as a closed session.
+                    if await self.router.get_session(message.session_id) is None:
+                        raise SessionClosedError("deleted")
+                    await self.router.handle_message(message)
+                    return
+                except SessionClosedError:
+                    logger.info(
+                        "Hosted %s: session %s closed before a reply to its notification ran; "
+                        "the reply goes to %s without it",
+                        self._provider, message.session_id, self._target(event),
+                    )
+                    self._retarget(message, event)
+            if behaviour.keeps_session:
+                message.session_id = await self.router.get_last_session(message.channel_key)
             await self.router.handle_message(message)
         except asyncio.CancelledError:
             raise
         except NotAcceptingTurnsError:
-            # The stream adapter already sent the engine's error event.
+            # When the turn posts its answer, the stream adapter already sent
+            # the engine's error event.
             logger.info("Draining: refused a hosted %s turn for %s", self._provider, message.sender_id)
         except Exception as error:  # noqa: BLE001 - one turn must not stop intake
             logger.error(
@@ -1103,6 +1260,19 @@ class HostedChannel(BaseChannel):
         _remember(self._targets, key, (event.connection_id, _origin(event)), _TARGET_CACHE_MAX)
         _remember(self._last_inbound, target, key, _TARGET_CACHE_MAX)
 
+    def _retarget(self, message: InboundMessage, event: Event) -> None:
+        """Move a reply to a notification to where a message without one goes.
+
+        The message gets the session key and the target of its conversation
+        or thread, and no session. A later reaction to it goes there too.
+        """
+        target = self._target(event)
+        key = (event.conversation.id, event.message.id)
+        message.channel_key, message.sender_id, message.session_id = f"{self._provider}:{target}", target, None
+        if key in self._message_cache:
+            self._message_cache[key] = (target, self._message_cache[key][1])
+        self._note_turn_message(event, target)
+
     def _note_handled(self, event: Event) -> None:
         key = (event.connection_id, event.conversation.id, event.message.id)
         self._handled[key] = None
@@ -1115,8 +1285,7 @@ class HostedChannel(BaseChannel):
     # ------------------------------------------------------------------ #
 
     def _source(self) -> ChannelSourceConfig | None:
-        section = getattr(self._config(), self._provider, None)
-        return getattr(section, "source", None)
+        return self._settings().source
 
     def _identity(self, id_: str, display_name: str, gate: PatternGate) -> Identity:
         """An identity whose display name can deny but never grant.
@@ -1206,4 +1375,4 @@ class HostedChannel(BaseChannel):
         return Disposition.accepted()
 
 
-__all__ = ["HostedChannel", "describe_attachments", "render_content"]
+__all__ = ["HostedChannel", "answer_note", "describe_attachments", "render_content"]

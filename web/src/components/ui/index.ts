@@ -31,6 +31,7 @@ export { PageHeader } from './PageHeader';
 export { PaneToggle } from './PaneToggle';
 export { Select, type SelectOption, type SelectProps } from './Select';
 export { cx, type FieldSize } from './styles';
+export { Switch, type SwitchProps } from './Switch';
 export {
   TextArea,
   type TextAreaProps,

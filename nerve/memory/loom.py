@@ -40,7 +40,9 @@ policy refusal (``-32001``, :class:`LoomToolRefused`), a condition that may
 pass (``-32002``), a server fault, a timeout, a rate limit — raises
 :class:`~nerve.memory.backend.MemoryBackendUnavailable`, so a session starts
 without priors instead of crashing and the sweep keeps its watermark. A
-request Loom refused as invalid raises :class:`LoomRequestError`.
+request Loom refused as invalid raises :class:`LoomRequestError`. A call the
+gateway did not send, because the session it kept with Loom had ended, is
+sent again at once, a transcript for extraction too.
 
 Recalled text is data from anyone who writes to the namespaces the agent
 reads. It reaches the session inside the ``<session-context>`` block, so the
@@ -68,8 +70,10 @@ from nerve.mcp_gateway import (
     POLICY_REFUSED,
     RETRY_LATER,
     SERVER_FAULT,
+    SESSION_ENDED_MESSAGE,
     UPSTREAM_TIMEOUT_MESSAGE,
     GatewayCallError,
+    GatewayToolResult,
     McpGatewayCatalog,
     McpGatewayServer,
 )
@@ -126,11 +130,19 @@ LOOM_CALLS: dict[str, LoomCall] = {
     ),
 }
 
-# Ops safe to send again after a failure: reads only. A transcript queued for
-# extraction is never resent, since the lost answer may have queued it.
+# Ops safe to send again after a failure: reads only. A transcript is not
+# sent again after a failure, since the lost answer may have queued it; the
+# one exception is a call the gateway did not send (below).
 _RETRIED_OPS = frozenset({"context.pack", "search.query", "namespace.summary"})
 _MAX_ATTEMPTS = 2
 _BACKOFF_S = 0.5
+# A call the gateway answers with its session-ended message did not reach
+# Loom: the session the gateway kept with Loom had ended, and the next call
+# opens a new one. Such a call goes again at once, a transcript too, and
+# does not use up a read's second try. The gateway can give the answer a few
+# times in a row, so Nerve sends the call again at most this many times;
+# after that the answer is a failure like any other.
+_SESSION_ENDED_RESENDS = 3
 # Seconds a lifecycle call may take through the gateway, which gives the
 # upstream call up to two minutes: the startup read is on a session's way in
 # and must be quick; extraction waits for Loom's model pass, so it gets a bit
@@ -708,10 +720,8 @@ class LoomMemory:
             )
         attempts = _MAX_ATTEMPTS if op in _RETRIED_OPS else 1
         for attempt in range(1, attempts + 1):
-            server = await self._loom_server()
-            self._inflight[server] = self._inflight.get(server, 0) + 1
             try:
-                result = await server.call_tool(name, call_args, timeout=timeout)
+                result = await self._send(op, name, call_args, timeout)
             except GatewayCallError as e:
                 failure = self._gateway_failure(op, e)
                 no_answer = e.status is None and e.code is None
@@ -737,14 +747,45 @@ class LoomMemory:
                     raise failure from None
                 await asyncio.sleep(self._backoff_s * attempt)
                 continue
-            finally:
-                await self._release(server)
             self._breaker_failures = 0
             self._down_until = 0.0
             if result.is_error:
                 raise self._refusal(op, result.structured, result.text)
             return result.structured
         raise AssertionError("unreachable")  # pragma: no cover
+
+    async def _send(
+        self, op: str, name: str, call_args: dict[str, Any], timeout: float,
+    ) -> GatewayToolResult:
+        """One tool call through the gateway, on the client of Loom's server.
+
+        A call the gateway did not send because its session with Loom had
+        ended goes again at once (see ``_SESSION_ENDED_RESENDS``); every
+        other failure is the caller's.
+        """
+        resends = 0
+        while True:
+            server = await self._loom_server()
+            self._inflight[server] = self._inflight.get(server, 0) + 1
+            try:
+                return await server.call_tool(name, call_args, timeout=timeout)
+            except GatewayCallError as e:
+                # The gateway's own answer, word for word and unpaced: any
+                # other failure may come after the call reached Loom.
+                session_ended = (
+                    e.code == RETRY_LATER
+                    and e.rpc_message == SESSION_ENDED_MESSAGE
+                    and e.retry_after is None
+                )
+                if not session_ended or resends == _SESSION_ENDED_RESENDS:
+                    raise
+                resends += 1
+                logger.info(
+                    "Loom %s: the gateway's session with Loom had ended; sending the call again (%d of %d)",
+                    op, resends, _SESSION_ENDED_RESENDS,
+                )
+            finally:
+                await self._release(server)
 
     @staticmethod
     def _gateway_failure(op: str, e: GatewayCallError) -> Exception:

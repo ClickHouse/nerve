@@ -1,33 +1,53 @@
 import { Link } from 'react-router-dom';
-import { useCronStore } from '../../stores/cronStore';
+import { useCronStore, type CronJob, type CronRunStatus } from '../../stores/cronStore';
 import { Badge, Button, IconButton, type BadgeTone } from '../ui';
 import {
-  RotateCw, Play, Loader2, Clock, Inbox, MessageSquare,
-  CheckCircle2, XCircle,
+  RotateCw, Play, Loader2, Clock, Inbox, MessageSquare, Workflow,
+  Check, CheckCircle2, Minus, X, XCircle,
 } from '../ui/icons';
 import { chatPath } from './utils';
 
-export function JobTypeIcon({ type }: { type: string }) {
-  switch (type) {
-    case 'cron': return <Clock size={14} className="text-hue-amber" />;
-    case 'source': return <Inbox size={14} className="text-hue-blue" />;
-    default: return <Clock size={14} className="text-text-dim" />;
+type JobKind = CronJob['kind'];
+
+export function JobTypeIcon({ kind }: { kind: JobKind }) {
+  switch (kind) {
+    case 'agent': return <Clock size={14} className="text-hue-amber shrink-0" />;
+    case 'workflow': return <Workflow size={14} className="text-hue-violet shrink-0" />;
+    case 'source': return <Inbox size={14} className="text-hue-blue shrink-0" />;
+    default: return <Clock size={14} className="text-text-dim shrink-0" />;
   }
 }
 
 /**
  * Which kind of job this is — identity, not status, so it uses the `hue-*`
- * colours (through the Badge tones that carry them) and pairs with the amber /
- * blue of `JobTypeIcon` above. A green badge here would read as "healthy",
- * which is what `StatusBadge` is for.
+ * colours (through the Badge tones that carry them) and pairs with the colours
+ * of `JobTypeIcon` above. A green badge here would read as "healthy", which is
+ * what `RunStatusIcon` is for.
  */
-const JOB_TYPE_TONES: Record<string, BadgeTone> = {
-  cron: 'warning',
+const JOB_TYPE_TONES: Record<JobKind, BadgeTone> = {
+  agent: 'warning',
+  workflow: 'purple',
   source: 'info',
 };
 
-export function JobTypeBadge({ type }: { type: string }) {
-  return <Badge tone={JOB_TYPE_TONES[type] ?? 'neutral'}>{type}</Badge>;
+export function JobTypeBadge({ kind }: { kind: JobKind }) {
+  return <Badge tone={JOB_TYPE_TONES[kind] ?? 'neutral'}>{kind}</Badge>;
+}
+
+const RUN_STATUS_LABELS: Record<NonNullable<CronRunStatus>, string> = {
+  success: 'Succeeded',
+  error: 'Failed',
+  missed: 'Missed',
+};
+
+/** ✓, ✗ or − for a finished run, a spinner for a running one. */
+export function RunStatusIcon({ status, size = 14 }: { status: CronRunStatus; size?: number }) {
+  const label = status ? RUN_STATUS_LABELS[status] : 'Running';
+  const icon = status === 'success' ? <Check size={size} className="text-success" />
+    : status === 'error' ? <X size={size} className="text-error" />
+      : status === null ? <Loader2 size={size} className="text-warning animate-spin" />
+        : <Minus size={size} className="text-text-dim" />;
+  return <span role="img" aria-label={label} title={label} className="inline-flex shrink-0">{icon}</span>;
 }
 
 export function StatusBadge({ status }: { status: string | null | undefined }) {
@@ -89,9 +109,9 @@ export function TriggerButton({ jobId, small = false }: { jobId: string; small?:
 
   return (
     <Button variant="subtle" onClick={handleClick} disabled={isTriggering}
-      onAuxClick={(e) => e.stopPropagation()} title="Trigger now">
+      onAuxClick={(e) => e.stopPropagation()}>
       {glyph}
-      {!isTriggering && <span>Run</span>}
+      <span>Run now</span>
     </Button>
   );
 }

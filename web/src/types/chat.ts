@@ -1,4 +1,5 @@
 import type { AutoTurnTrigger } from './agents';
+import type { McpAppRef, McpCallToolResult } from './mcpApps';
 
 export interface ThinkingBlockData {
   type: 'thinking';
@@ -24,6 +25,12 @@ export interface ToolCallBlockData {
    *  transcript's `child_agent_id`). Absent on old history and on calls that
    *  spawn nothing; the store also resolves records by `toolUseId`. */
   agentId?: string;
+  /** The interactive view of the tool (MCP Apps): the call is linked to a
+   *  `ui://` resource of its MCP server. Absent on every other call. */
+  mcpApp?: McpAppRef;
+  /** The call's result as the view takes it: an MCP `CallToolResult`. Only on
+   *  a call with `mcpApp`, once it has a result; `result` stays the text. */
+  mcpAppResult?: McpCallToolResult;
 }
 
 // --- Dynamic workflow (Claude Code Workflow tool) progress ---
@@ -104,6 +111,10 @@ export type MessageBlock = ThinkingBlockData | TextBlockData | ToolCallBlockData
 
 export interface ChatMessage {
   id?: number;
+  /** The session this message is part of, as the server says with every
+      stored row. A row that this tab made itself has none until the server
+      hands it out. */
+  session_id?: string;
   role: 'user' | 'assistant';
   blocks: MessageBlock[];
   channel?: string;
@@ -120,10 +131,35 @@ export interface ChatMessage {
   client_msg_id?: string | null;
 }
 
+/** The kind of event that started a session: a closed vocabulary that the
+    server sets once, when it creates the session. */
+export type SessionTrigger =
+  | 'chat' | 'api' | 'slack' | 'telegram' | 'email' | 'cron' | 'plan'
+  | 'workflow' | 'external' | 'system' | 'unknown';
+
+/** Details of where a session comes from. Each key is optional. */
+export interface SessionOriginDetail {
+  channel?: string;
+  channel_name?: string;
+  thread?: string;
+  cron_job?: string;
+  run_later?: string;
+  plan_id?: string;
+  task_id?: string;
+  fork_of?: string;
+  workflow_run?: string;
+  client?: string;
+  hook?: string;
+}
+
 export interface Session {
   id: string;
   title: string;
   source: string;
+  trigger?: SessionTrigger;
+  /** One short sentence, for example "Started from Slack #general". */
+  origin_label?: string;
+  origin_detail?: SessionOriginDetail;
   /** Who created this session: an actor id to resolve against
       GET /api/actors. Null for legacy sessions and unidentified external
       people. This is an actor id, not an account id. */
@@ -142,6 +178,9 @@ export interface Session {
   model?: string;
   backend?: string;
   cwd?: string;
+  /** The Daybreak switch of a Codex chat (the composer's toggle sets it).
+      Only Codex sessions carry it; absent is off. */
+  codex_daybreak?: boolean;
   // Real-time running status (set by backend + WS updates)
   is_running?: boolean;
   // Paused mid-turn waiting for user input (AskUserQuestion / plan mode).
@@ -176,6 +215,24 @@ export interface Session {
     spent_usd?: number;
     updated_at?: string;
   };
+  /** What waits for the user in this session (GET /api/sessions). */
+  attention?: SessionAttention;
+}
+
+/** The pending items of a session that need the user. The two booleans
+    are true at fetch time; the live `awaiting_input` and
+    `review_loop.status` of the session take precedence over them. */
+export interface SessionAttention {
+  /** Pending ask_user questions. */
+  questions: number;
+  /** Pending approvals (propose_action). */
+  approvals: number;
+  /** Pending plans that this session proposed. */
+  plans: number;
+  /** A question inside a running turn. */
+  awaiting_input: boolean;
+  /** The newest review loop waits for a decision. */
+  review: boolean;
 }
 
 export type AgentStatus =
@@ -185,12 +242,13 @@ export type AgentStatus =
   | { state: 'writing' };
 
 export interface PanelTab {
-  id: string;              // toolUseId; 'agents-panel'; `agent:<agentId>`
+  id: string;              // toolUseId; 'agents-panel'; 'tasks-panel'; `agent:<agentId>`
   /** 'agents' is the singleton Agents roster; 'agent' is one agent's live
-   *  transcript; 'subagent' stays for the legacy result-only tab of old
-   *  history (no agent record). */
-  type: 'plan' | 'subagent' | 'files' | 'workflow' | 'agents' | 'agent';
-  label: string;           // "Plan", "Explore", "Agent", "Files", "Workflow"
+   *  transcript; 'tasks' is the singleton list of the session's tasks;
+   *  'subagent' stays for the legacy result-only tab of old history (no
+   *  agent record). */
+  type: 'plan' | 'subagent' | 'files' | 'workflow' | 'agents' | 'agent' | 'tasks';
+  label: string;           // "Plan", "Explore", "Agent", "Files", "Workflow", "Tasks"
   subagentType: string;    // "Plan", "Explore", "general-purpose", "Workflow"
   description: string;
   model?: string;

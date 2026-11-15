@@ -1,14 +1,18 @@
 import { useMemo } from 'react';
 import { Download, FileText, Clock, TrendingDown, TrendingUp } from '../ui/icons';
 import type { MessageBlock } from '../../types/chat';
+import type { RenderItem } from '../../types/renderBlocks';
 import { AutoTurnDivider } from './agents/AutoTurnDivider';
 import { ThinkingBlock } from './ThinkingBlock';
 import { ToolCallBlock } from './ToolCallBlock';
 import { ToolCallGroupBlock } from './ToolCallGroupBlock';
+import { ToolBurstBlock } from './ToolBurstBlock';
+import { groupToolBursts } from './toolBursts';
 import { MarkdownContent } from './MarkdownContent';
 import { groupToolCalls } from '../../utils/groupToolCalls';
 import { findRepeatWorkflowRunCalls } from '../../utils/workflowRunCards';
 import { authUrl } from '../../api/hosted';
+import { useMcpAppsStore } from '../../stores/mcpAppsStore';
 
 interface BlockRendererProps {
   blocks: MessageBlock[];
@@ -18,6 +22,8 @@ interface BlockRendererProps {
   cursorColor?: string;
   /** Optional wrapper class for text blocks (e.g. 'text-sm my-1'). */
   textClassName?: string;
+  /** Fold each run of thinking and tool calls to one summary line (the chat transcript). */
+  rollUpTools?: boolean;
 }
 
 export function BlockRenderer({
@@ -25,9 +31,15 @@ export function BlockRenderer({
   streaming = false,
   cursorColor = 'bg-accent',
   textClassName,
+  rollUpTools = false,
 }: BlockRendererProps) {
-  const renderItems = useMemo(() => groupToolCalls(blocks), [blocks]);
   const repeatRunCalls = useMemo(() => findRepeatWorkflowRunCalls(blocks), [blocks]);
+  // On a Nerve that hosts MCP Apps, a call with a view stays out of the bursts.
+  const mcpApps = useMcpAppsStore(s => s.enabled);
+  const renderItems = useMemo<RenderItem[]>(
+    () => (rollUpTools ? groupToolBursts(blocks, repeatRunCalls, mcpApps) : groupToolCalls(blocks)),
+    [blocks, rollUpTools, repeatRunCalls, mcpApps],
+  );
 
   return (
     <>
@@ -80,10 +92,12 @@ export function BlockRenderer({
             return <ToolCallBlock key={i} block={item} repeatRunCard={repeatRunCalls.has(item.toolUseId)} />;
           case 'tool_call_group':
             return <ToolCallGroupBlock key={i} group={item} repeatRunCalls={repeatRunCalls} />;
+          case 'tool_burst':
+            return <ToolBurstBlock key={i} burst={item} live={isLast} repeatRunCalls={repeatRunCalls} />;
           case 'text': {
             const inner = (
               <>
-                <MarkdownContent content={item.content} />
+                <MarkdownContent content={item.content} streaming={isLast} />
                 {isLast && (
                   <span
                     className={`streaming-cursor inline-block w-1.5 h-4 ${cursorColor} ml-0.5 align-text-bottom`}

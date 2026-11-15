@@ -246,12 +246,16 @@ class OperationRunner:
                 continue
             raise OperationFailed.from_result(result)
 
-    async def connections(self, kind: str) -> set[uuid.UUID]:
-        """The connections that advertise *kind*, after up to ``stream_wait`` for one."""
+    async def connections(self, kind: str, provider: str | None = None) -> set[uuid.UUID]:
+        """The connections that advertise *kind*, after up to ``stream_wait`` for one.
+
+        With *provider*, only the connections that serve that provider (see
+        :meth:`StreamManager.connections`).
+        """
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self._timing.stream_wait
         while True:
-            found = self._streams.connections(kind)
+            found = self._streams.connections(kind, provider)
             remaining = deadline - loop.time()
             if found or remaining <= 0:
                 return found

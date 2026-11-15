@@ -14,6 +14,7 @@ sql = psycopg.sql
 make_conninfo = psycopg.conninfo.make_conninfo
 
 SQL_DIR = Path(__file__).parents[2] / "nerve/db/postgres"
+LATEST_UPGRADE = (SQL_DIR / "migrations/003_operational_v073.sql").read_text()
 UPGRADE = (SQL_DIR / "migrations/002_operational_v061.sql").read_text()
 
 
@@ -60,9 +61,7 @@ def test_upgrade_preserves_scopes_and_backfills_deliveries(old_database):
             )
     conn.execute(UPGRADE)
     conn.execute(UPGRADE)
-    assert conn.execute("SELECT version FROM storage_version").fetchall() == [
-        (SCHEMA_VERSION,)
-    ]
+    assert conn.execute("SELECT version FROM storage_version").fetchall() == [(2,)]
     assert (
         conn.execute("SELECT content,revision,comment_count FROM tasks").fetchall()
         == [("durable", 1, 0)] * 2
@@ -107,9 +106,7 @@ def test_failed_upgrade_is_atomic_and_can_be_retried(old_database):
     ).fetchone() == (None,)
     conn.execute("DROP TABLE task_comments")
     conn.execute(UPGRADE)
-    assert conn.execute("SELECT version FROM storage_version").fetchone() == (
-        SCHEMA_VERSION,
-    )
+    assert conn.execute("SELECT version FROM storage_version").fetchone() == (2,)
 
 
 def test_unknown_version_is_refused(old_database):
@@ -158,6 +155,10 @@ async def test_runtime_refuses_old_schema_then_uses_upgraded_data(old_database):
         await db.connect()
     assert conn.execute("SELECT version FROM storage_version").fetchone() == (1,)
     conn.execute(UPGRADE)
+    with pytest.raises(RuntimeError, match="apply owner migrations"):
+        await db.connect()
+    assert conn.execute("SELECT version FROM storage_version").fetchone() == (2,)
+    conn.execute(LATEST_UPGRADE)
     grant_runtime()
     await db.connect()
     try:
@@ -169,3 +170,119 @@ async def test_runtime_refuses_old_schema_then_uses_upgraded_data(old_database):
             await db._write("CREATE TABLE nerve_pg.not_allowed (id integer)")
     finally:
         await db.close()
+
+
+def test_v3_backfills_each_scope_and_is_retryable(old_database):
+    conn = old_database
+    conn.execute(UPGRADE)
+    for workflow in ("one", "two"):
+        scope = json.dumps(["test", workflow], separators=(",", ":"))
+        conn.execute("SELECT set_config('nerve.scope',%s,false)", (scope,))
+        conn.execute("INSERT INTO scopes DEFAULT VALUES")
+        conn.execute(
+            "INSERT INTO sessions (id,sdk_session_id) VALUES ('parent',%s)", (workflow,)
+        )
+        for fork, own in (
+            ("fork-pending", workflow),
+            ("fork-independent", "own"),
+            ("fork-mapped", None),
+        ):
+            conn.execute(
+                "INSERT INTO sessions (id,parent_session_id,sdk_session_id) VALUES (%s,'parent',%s)",
+                (fork, own),
+            )
+        message = conn.execute(
+            "INSERT INTO messages (session_id,role,native_turn_id) VALUES ('parent','user',%s) RETURNING id",
+            (workflow + "-turn",),
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE sessions SET forked_from_message=%s WHERE _scope=%s AND id='fork-mapped'",
+            (str(message), scope),
+        )
+        conn.execute(
+            "INSERT INTO tasks (id,file_path,title) VALUES ('t','t.md','Kept')"
+        )
+        conn.execute(
+            "INSERT INTO task_events (task_id,to_status,actor,created_at) VALUES ('t','pending','parent','2026-01-01')"
+        )
+        conn.execute(
+            "INSERT INTO session_events (session_id,event_type,details) VALUES ('parent','title_changed',%s)",
+            (
+                json.dumps(
+                    {"reason": "generated" if workflow == "one" else "placeholder"}
+                ),
+            ),
+        )
+        conn.execute(
+            "INSERT INTO cron_logs (job_id,output) VALUES ('source:inbox','12 ingested, 3 dropped by guardrail')"
+        )
+        conn.execute(
+            "INSERT INTO cron_logs (job_id,output) VALUES ('agent','12 ingested')"
+        )
+    conn.execute(LATEST_UPGRADE)
+    conn.execute(LATEST_UPGRADE)
+    assert conn.execute("SELECT version FROM storage_version").fetchone() == (
+        SCHEMA_VERSION,
+    )
+    assert conn.execute(
+        "SELECT records FROM cron_logs WHERE job_id='source:inbox'"
+    ).fetchall() == [(15,), (15,)]
+    assert conn.execute(
+        "SELECT records FROM cron_logs WHERE job_id='agent'"
+    ).fetchall() == [(None,), (None,)]
+    assert conn.execute("SELECT created_session_id FROM tasks").fetchall() == [
+        ("parent",),
+        ("parent",),
+    ]
+    for workflow in ("one", "two"):
+        scope = json.dumps(["test", workflow], separators=(",", ":"))
+        rows = conn.execute(
+            "SELECT id,sdk_session_id,fork_source_native_id,fork_source_turn_id,title_source FROM sessions WHERE _scope=%s ORDER BY id",
+            (scope,),
+        ).fetchall()
+        assert rows == [
+            ("fork-independent", "own", None, None, None),
+            ("fork-mapped", None, workflow, workflow + "-turn", None),
+            ("fork-pending", None, workflow, None, None),
+            (
+                "parent",
+                workflow,
+                None,
+                None,
+                "generated" if workflow == "one" else "placeholder",
+            ),
+        ]
+    assert conn.execute(
+        "SELECT count(*) FROM pg_class WHERE relnamespace='nerve_pg'::regnamespace AND relname IN ('push_subscriptions','channel_reply_routes','widget_states') AND relrowsecurity AND relforcerowsecurity"
+    ).fetchone() == (3,)
+
+
+def test_v3_rolls_back_before_retry(old_database):
+    conn = old_database
+    conn.execute(UPGRADE)
+    conn.execute("CREATE TABLE widget_states (collision text)")
+    with pytest.raises(psycopg.errors.DuplicateTable):
+        conn.execute(LATEST_UPGRADE)
+    conn.execute("ROLLBACK")
+    assert conn.execute("SELECT version FROM storage_version").fetchone() == (2,)
+    assert conn.execute(
+        "SELECT to_regprocedure('nerve_pg.json_valid(text)')"
+    ).fetchone() == (None,)
+    assert conn.execute(
+        "SELECT to_regclass('nerve_pg.push_subscriptions')"
+    ).fetchone() == (None,)
+    conn.execute("DROP TABLE widget_states")
+    conn.execute(LATEST_UPGRADE)
+    assert conn.execute("SELECT version FROM storage_version").fetchone() == (
+        SCHEMA_VERSION,
+    )
+
+
+def test_v3_rejects_wrong_version(old_database):
+    conn = old_database
+    with pytest.raises(
+        psycopg.errors.RaiseException, match="Expected PostgreSQL schema 2"
+    ):
+        conn.execute(LATEST_UPGRADE)
+    conn.execute("ROLLBACK")
+    assert conn.execute("SELECT version FROM storage_version").fetchone() == (1,)

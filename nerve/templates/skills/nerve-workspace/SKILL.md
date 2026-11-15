@@ -8,7 +8,7 @@ description: >
   a cron job, create or change a skill, adjust settings, or "change your config".
   Triggers on "add a cron", "change your schedule", "edit your config",
   "update settings", "propose a config change".
-version: 1.0.1
+version: 1.0.2
 context: domain
 ---
 
@@ -50,7 +50,10 @@ belongs to this instance alone — that is what an ordinary install looks like.
   `POST`/`PUT`/`DELETE /api/skills` endpoints, and a shell command.
 - **No remote, not locked** — there is nothing to open a PR against and no
   review to route through. **Edit the files directly** and tell the user what you
-  changed. `propose_config_change` will refuse, and it is right to.
+  changed. `propose_config_change` will refuse, and it is right to. After the
+  edit, run `nerve reload`. It applies the change to the running instance, or
+  lists what still needs a restart. Without it, an added cron job does not run
+  until the next restart.
 
 If you don't know which you're in, try `propose_config_change` and read the
 refusal — it says whether the problem is a missing remote or a locked instance.

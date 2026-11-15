@@ -39,11 +39,14 @@ from nerve.agent.backends.base import (
     AgentClient,
     BackendCapabilities,
     BackendError,
+    ForkSourceMissingError,
     SessionSpec,
     TransportDiedError,
     TurnInput,
+    TurnRefusedError,
     config_excluded_tools,
 )
+from nerve.agent.backends.codex import daybreak
 from nerve.agent.backends.codex.appserver import (
     CodexAppServerClient,
     CodexRpcError,
@@ -59,6 +62,11 @@ from nerve.agent.backends.codex.ultracode import (
 )
 from nerve.agent.backends.images import validate_image_data
 from nerve.agent.interactive import defer_idle_timeout
+from nerve.inference_principal import (
+    INFERENCE_PRINCIPAL_HEADER,
+    inference_principal,
+    system_inference_headers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -131,16 +139,49 @@ def _toml_str(value: str) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-# The Codex model provider for ``codex.base_url``, and the child environment
-# variable that holds its bearer key (Codex reads it through ``env_key``).
+# The Codex model provider for ``codex.base_url``, the child environment
+# variable that holds its bearer key (Codex reads it through ``env_key``), and
+# the child environment variable that holds the inference principal (Codex
+# reads it through ``env_http_headers``).
 _ENDPOINT_PROVIDER = "nerve-endpoint"
 _ENDPOINT_KEY_ENV = "NERVE_CODEX_ENDPOINT_KEY"
+_ENDPOINT_PRINCIPAL_ENV = "NERVE_CODEX_INFERENCE_PRINCIPAL"
+
+
+def _inherited_env() -> dict[str, str]:
+    """The environment of Nerve for a Codex process, without a principal.
+
+    Only :meth:`CodexBackend.endpoint_env` sets the principal variable, so a
+    Codex process never names a principal that it inherits from Nerve.
+    """
+    env = os.environ.copy()
+    env.pop(_ENDPOINT_PRINCIPAL_ENV, None)
+    return env
 
 
 # Reasoning-effort vocabulary shared by nerve's effort_map values and the
 # app-server catalog, weakest first. Used only to clamp a requested effort
 # down to what the serving model advertises.
 _EFFORT_ORDER = ("none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra")
+
+# Token counters in the `total` and `last` of a codex tokenUsage payload.
+_USAGE_KEYS = ("inputTokens", "cachedInputTokens", "outputTokens")
+
+# ``codexErrorInfo`` of a turn that Codex's cyber policy refused.
+_CYBER_POLICY_ERROR = "cyberPolicy"
+
+# Added to such a refusal when the chat could run with Daybreak and does not.
+_DAYBREAK_HINT = (
+    "Daybreak is available for this chat and can be turned on in the composer."
+)
+
+
+def _is_cyber_refusal(error: Any) -> bool:
+    """Whether a ``TurnError`` says that Codex's cyber policy refused the turn."""
+    return (
+        isinstance(error, dict)
+        and error.get("codexErrorInfo") == _CYBER_POLICY_ERROR
+    )
 
 
 def _catalog_entries(result: dict) -> list[dict]:
@@ -202,21 +243,34 @@ class CodexBackend:
         self._preflight_lock = asyncio.Lock()
         self._live_models: set[str] = set()
         self._rate_limits: dict[str, Any] | None = None
+        # The Daybreak part of the latest catalog that an app-server of this
+        # home listed (preflight, or a client at connect): model id → program,
+        # and whether the catalog has access-program metadata at all.
+        self._daybreak_programs: dict[str, str] = {}
+        self._access_metadata = False
+        # The version that the Codex CLI reported last (a client build and a
+        # preflight both read it). ``None``: none was read yet.
+        self._cli_version: tuple[int, ...] | None = None
 
     def catalog(self, entries: list[dict]) -> dict[str, Any]:
         """Digest a ``model/list`` (``includeHidden``) result.
 
-        ``offered`` feeds the picker: every visible entry plus the configured
-        ``codex.models`` the live catalog actually serves (hidden entries are
-        hidden upstream for a reason — internal previews, reviewers — so they
-        are opt-in by name). ``allowed`` is what a session may run on: the
-        whole catalog, hidden included, plus the configured models
+        ``offered`` feeds the model menu: the configured ``codex.models`` that
+        the live catalog serves, in config order, with ``codex.model`` first
+        when the list does not name it. Hidden entries count, because a
+        configured name opts in to them. ``allowed`` is what a session may run
+        on: the whole catalog, hidden included, plus the configured models
         unconditionally. ``efforts`` maps model id → advertised reasoning
-        efforts, for clamping turn requests.
+        efforts, for clamping turn requests. ``daybreak`` maps model id → the
+        Daybreak program that the signed-in account may request on it (a
+        model without one is absent), and ``access_metadata`` says whether
+        any entry carries access-program metadata.
         """
         visible: list[str] = []
         all_ids: list[str] = []
         efforts: dict[str, list[str]] = {}
+        daybreak_programs: dict[str, str] = {}
+        access_metadata = False
         for item in entries:
             model_id = _model_id(item)
             if not model_id:
@@ -225,14 +279,56 @@ class CodexBackend:
             if not item.get("hidden"):
                 visible.append(model_id)
             efforts[model_id] = _supported_efforts(item)
+            if daybreak.advertised(item) is not None:
+                access_metadata = True
+            program = daybreak.program(item)
+            if program:
+                daybreak_programs[model_id] = program
         configured = [m for m in (self.codex.models or []) if m]
+        offered = [m for m in dict.fromkeys(configured) if m in all_ids]
+        if self.codex.model and self.codex.model not in offered:
+            offered.insert(0, self.codex.model)
         return {
             "listed": sorted(set(all_ids)),
-            "offered": sorted({*visible, *(m for m in configured if m in all_ids)}),
+            "offered": offered,
             "allowed": sorted({*all_ids, *configured}),
             "hidden": sorted(set(all_ids) - set(visible)),
             "efforts": efforts,
+            "daybreak": daybreak_programs,
+            "access_metadata": access_metadata,
         }
+
+    def note_access_programs(self, catalog: dict[str, Any]) -> None:
+        """Keep the Daybreak part of a catalog that an app-server just listed."""
+        self._daybreak_programs = dict(catalog["daybreak"])
+        self._access_metadata = bool(catalog["access_metadata"])
+
+    def daybreak_program(self, model: str) -> str | None:
+        """The Daybreak program that the signed-in account may request on
+        *model*, per the latest catalog. ``None``: it has none."""
+        return self._daybreak_programs.get(model)
+
+    def worker_daybreak(self, model: str) -> dict[str, Any]:
+        """What an Ultracode ``exec`` worker needs to follow a chat that has
+        Daybreak on: the chat's model, and the program of each model in the
+        spelling of ``codex exec --cyber-access-program``.
+
+        ``workers_need_codex`` is in it only when the Codex that Nerve runs
+        cannot give a worker the program: its ``exec`` has no such flag, or
+        its version is not known. It names the first version that can, and
+        the worker wrapper then starts no worker.
+        """
+        entry: dict[str, Any] = {
+            "model": model,
+            "programs": {
+                name: daybreak.PROGRAMS[program]
+                for name, program in self._daybreak_programs.items()
+            },
+        }
+        version = self._cli_version
+        if version is None or version < daybreak.EXEC_FLAG_SINCE:
+            entry["workers_need_codex"] = ".".join(map(str, daybreak.EXEC_FLAG_SINCE))
+        return entry
 
     @property
     def config(self):
@@ -279,7 +375,12 @@ class CodexBackend:
         if model in allowed:
             return
         preflight = await self.preflight()
-        live = set(preflight.get("models") or []) if preflight.get("available") else set()
+        # The preflight fills ``_live_models`` with the whole catalog. The
+        # menu list (``models``) is only part of it.
+        live = (
+            {*(preflight.get("models") or []), *self._live_models}
+            if preflight.get("available") else set()
+        )
         if model in live:
             return
         detail = preflight.get("reason") if not preflight.get("available") else None
@@ -336,6 +437,7 @@ class CodexBackend:
 
         output = await asyncio.to_thread(_read)
         current = self._version_tuple(output)
+        self._cli_version = current
         minimum = self._version_tuple(self.codex.min_version)
         maximum = self._version_tuple(self.codex.max_version)
         if current < minimum or current >= maximum:
@@ -364,16 +466,20 @@ class CodexBackend:
                     return {}
 
                 # The same endpoint provider as sessions, so that the
-                # checks below see what sessions see.
+                # checks below see what sessions see. The checks are
+                # Nerve's own model calls: they name the system actor.
+                principal = system_inference_headers().get(
+                    INFERENCE_PRINCIPAL_HEADER,
+                )
                 transport = CodexAppServerClient(
                     bin_path=self.codex.bin_path,
                     cwd=str(self.config.workspace),
                     env={
-                        **os.environ, "CODEX_HOME": self._home_dir(),
-                        **self.endpoint_env(),
+                        **_inherited_env(), "CODEX_HOME": self._home_dir(),
+                        **self.endpoint_env(principal),
                     },
                     server_request_handler=_decline,
-                    config_overrides=self.endpoint_overrides(),
+                    config_overrides=self.endpoint_overrides(principal),
                     request_timeout=10,
                 )
                 try:
@@ -407,6 +513,7 @@ class CodexBackend:
                         f"Configured Codex model {self.codex.model!r} is unavailable"
                     )
                 self._live_models = set(catalog["allowed"])
+                self.note_access_programs(catalog)
                 rate_limits = rate_result.get("rateLimits")
                 if isinstance(rate_limits, dict):
                     self._rate_limits = rate_limits
@@ -430,7 +537,11 @@ class CodexBackend:
                     ),
                     "account_type": account_type,
                     "models": model_ids or [self.codex.model],
+                    "catalog_models": catalog["listed"],
                     "hidden_models": catalog["hidden"],
+                    # Model id → Daybreak program, for the models that the
+                    # signed-in account may run with it.
+                    "daybreak_programs": catalog["daybreak"],
                     "default_model": self.codex.model,
                     "rate_limits": self._rate_limits,
                     "ultracode": plugin,
@@ -453,9 +564,9 @@ class CodexBackend:
     # -- config assembly (used by CodexClient) --------------------------- #
 
     def build_env(self, spec: SessionSpec) -> dict[str, str]:
-        env = os.environ.copy()
+        env = _inherited_env()
         env["CODEX_HOME"] = self._home_dir()
-        env.update(self.endpoint_env())
+        env.update(self.endpoint_env(spec.inference_principal))
         # Session-bound bearer token for the nerve MCP endpoint —
         # referenced from the MCP config via bearer_token_env_var so the
         # token never lands in any file.
@@ -585,7 +696,7 @@ class CodexBackend:
         if not self.codex.web_search:
             overrides.append("tools.web_search=false")
 
-        overrides += self.endpoint_overrides()
+        overrides += self.endpoint_overrides(spec.inference_principal)
 
         for key, value in (self.codex.extra_config or {}).items():
             if isinstance(value, str):
@@ -707,7 +818,7 @@ class CodexBackend:
             return os.environ.get(self.codex.api_key_env) or None
         return None
 
-    def endpoint_overrides(self) -> list[str]:
+    def endpoint_overrides(self, principal: str | None = None) -> list[str]:
         """``--config`` overrides that send Codex to ``codex.base_url``.
 
         Codex sends ``POST <base_url>/responses``. The only key source is
@@ -716,6 +827,11 @@ class CodexBackend:
         key, the provider reads it from the child environment (``env_key``),
         so the key is never in argv. Without a key, Codex sends no
         credential.
+
+        ``principal``: the principal that each request of the process names
+        (see :meth:`_endpoint_principal`). The provider reads it from the
+        child environment (``env_http_headers``) and sends it in one
+        ``X-Nerve-Inference-Principal`` header, so the value is not in argv.
         """
         if not self.codex.base_url:
             return []
@@ -728,13 +844,38 @@ class CodexBackend:
         ]
         if self.codex.api_key:
             overrides.append(f"{base}.env_key={_toml_str(_ENDPOINT_KEY_ENV)}")
+        if self._endpoint_principal(principal):
+            # A table value: for a header name in a quoted part of a dotted
+            # key, Codex 0.164.0 sends no header.
+            overrides.append(
+                f"{base}.env_http_headers="
+                f"{{{_toml_str(INFERENCE_PRINCIPAL_HEADER)}="
+                f"{_toml_str(_ENDPOINT_PRINCIPAL_ENV)}}}"
+            )
         return overrides
 
-    def endpoint_env(self) -> dict[str, str]:
+    def endpoint_env(self, principal: str | None = None) -> dict[str, str]:
         """The child environment for :meth:`endpoint_overrides`."""
+        env: dict[str, str] = {}
         if self.codex.base_url and self.codex.api_key:
-            return {_ENDPOINT_KEY_ENV: self.codex.api_key}
-        return {}
+            env[_ENDPOINT_KEY_ENV] = self.codex.api_key
+        principal = self._endpoint_principal(principal)
+        if principal:
+            env[_ENDPOINT_PRINCIPAL_ENV] = principal
+        return env
+
+    def _endpoint_principal(self, principal: str | None) -> str | None:
+        """The principal that the endpoint provider names, or ``None``.
+
+        Only with ``codex.base_url``: Codex's own provider sends no
+        principal. Checked again with
+        :func:`nerve.inference_principal.inference_principal`, because the
+        value goes into a header: ``None`` in local mode and for a value that
+        is not a canonical lower-case UUID.
+        """
+        if not self.codex.base_url:
+            return None
+        return inference_principal(principal)
 
 
 class CodexClient(AgentClient):
@@ -787,22 +928,30 @@ class CodexClient(AgentClient):
         # Serving model as resolved for this thread; updated on
         # model/rerouted notifications.
         self.model: str = spec.model or backend.codex.model
+        # The model the thread asks for. A reroute changes ``model`` for the
+        # answer it serves, not what the next turn asks for, and a Daybreak
+        # program belongs to the model asked for.
+        self._thread_model: str = self.model
+        # The chat's Daybreak switch (session metadata ``codex_daybreak``);
+        # set_daybreak changes it for the turns that follow.
+        self._daybreak: bool = spec.extra.get("daybreak") is True
+        # Codex's cyber policy refused the current turn.
+        self._cyber_refusal = False
         # item id -> item payload from item/started (approval correlation
         # + fileChange fan-out bookkeeping).
         self._items: dict[str, dict] = {}
         # Latest thread/tokenUsage/updated for the active turn.
         self._turn_usage: dict | None = None
-        # Cumulative `total` at the end of the previous turn on this client,
-        # kept across turns; the baseline for the next turn's delta when known.
-        self._prev_total_usage: dict | None = None
-        # Fallback baseline for the first turn on a fresh client (no previous
-        # total yet): (total - last) from the turn's first tokenUsage
-        # notification. Reset per turn.
-        self._turn_total_base: dict[str, int] | None = None
-        # Count of model responses (tokenUsage notifications) in this turn,
-        # reported as num_turns so the context bar can divide the turn-aggregate
-        # usage back down to a single call's context occupancy.
+        # Cumulative `total` from the latest tokenUsage notification on this
+        # client, kept across turns. It is the baseline for the next
+        # notification. None until known.
+        self._last_total: dict | None = None
+        # This turn's usage: the sum of the increases in `total`.
+        self._turn_counts: dict[str, int] | None = None
+        # Model responses in this turn, reported as num_turns.
         self._turn_response_count: int = 0
+        # Input tokens of the turn's latest model response.
+        self._turn_context_tokens: int | None = None
         self._context_window: int | None = None
         self._ultracode_usage: dict[str, int] | None = None
         self._ultracode_estimated_cost: float = 0.0
@@ -835,6 +984,7 @@ class CodexClient(AgentClient):
         spec = self._spec
         backend = self._backend
         params = backend.thread_params(spec)
+        start_params = self._thread_start_params(params)
 
         response: dict | None = None
         if spec.resume_native_id:
@@ -847,7 +997,7 @@ class CodexClient(AgentClient):
                 if not _is_missing_thread_error(e):
                     raise
                 if spec.fork:
-                    raise BackendError(
+                    raise ForkSourceMissingError(
                         f"Cannot fork missing Codex thread {spec.resume_native_id!r}"
                     ) from e
                 logger.warning(
@@ -856,7 +1006,7 @@ class CodexClient(AgentClient):
                     spec.resume_native_id[:12], spec.session_id,
                 )
                 self._resume_dropped = True
-                response = await self._transport.request("thread/start", params)
+                response = await self._transport.request("thread/start", start_params)
 
         try:
             if response is not None:
@@ -875,7 +1025,7 @@ class CodexClient(AgentClient):
                     {**params, "threadId": spec.resume_native_id},
                 )
             else:
-                response = await self._transport.request("thread/start", params)
+                response = await self._transport.request("thread/start", start_params)
         except CodexRpcError as e:
             # Resume-miss recovery: a wiped ~/.nerve/codex/sessions (or a
             # rollout the app-server refuses) must never brick the
@@ -890,7 +1040,7 @@ class CodexClient(AgentClient):
                 spec.resume_native_id[:12], spec.session_id, e,
             )
             self._resume_dropped = True
-            response = await self._transport.request("thread/start", params)
+            response = await self._transport.request("thread/start", start_params)
 
         thread = response.get("thread") if isinstance(response, dict) else None
         thread_id = (thread or {}).get("id") if isinstance(thread, dict) else None
@@ -899,6 +1049,8 @@ class CodexClient(AgentClient):
                 f"codex thread/start returned no thread id: {response!r}"
             )
         self._thread_id = str(thread_id)
+        if spec.resume_native_id and not self._resume_dropped:
+            await self._align_saved_choice(thread)
 
     async def _validate_live_model(self) -> None:
         """Confirm the selected model against the authenticated app-server.
@@ -918,6 +1070,7 @@ class CodexClient(AgentClient):
             ) from e
         catalog = self._backend.catalog(_catalog_entries(response))
         self._model_efforts = catalog["efforts"]
+        self._backend.note_access_programs(catalog)
         allowed = catalog["allowed"]
         if catalog["listed"] and self.model not in allowed:
             raise BackendError(
@@ -935,6 +1088,118 @@ class CodexClient(AgentClient):
                 self.model, effort, clamped,
             )
         return clamped
+
+    # -- Daybreak --------------------------------------------------------- #
+
+    async def set_daybreak(self, enabled: bool) -> None:
+        """Set the chat's Daybreak switch for the turns that start from now.
+
+        The program goes with each ``turn/start``, so the switch needs no new
+        runtime.
+        """
+        if enabled == self._daybreak:
+            return
+        self._daybreak = enabled
+        await self._save_daybreak_choice()
+
+    def _turn_program(self) -> str | None:
+        """The cyber access program that the next turn asks for: with the
+        switch on, the program of the thread's model. ``None`` with the
+        switch off: the request is then what it was before the switch
+        existed."""
+        if not self._daybreak:
+            return None
+        return self._backend.daybreak_program(self._thread_model)
+
+    async def turn_refusal(self) -> str | None:
+        """Why the next turn must not be sent, or ``None``.
+
+        The chat's Daybreak switch is on and the thread's model has no
+        program for the signed-in account: running the turn without the
+        program is not what the person asked for. The backend's copy of the
+        catalog can come from another app-server, so before it refuses this
+        reads the catalog again on its own runtime.
+        """
+        if not self._daybreak or self._turn_program() is not None:
+            return None
+        await self._reread_access_programs()
+        if self._turn_program() is not None:
+            return None
+        return (
+            "Daybreak is on for this chat, but "
+            f"{daybreak.no_program(self._thread_model)}. Turn Daybreak off or "
+            "choose another model."
+        )
+
+    async def _reread_access_programs(self) -> None:
+        """Read the catalog again on this runtime, for its access programs.
+        A read that fails (an error answer, no answer in time, a runtime
+        that died) leaves what the backend knows."""
+        try:
+            response = await self._transport.request(
+                "model/list", {"includeHidden": True}, timeout=10.0,
+            )
+        except (CodexRpcError, TransportDiedError) as e:
+            logger.warning(
+                "Codex session %s: the model catalog could not be read "
+                "again: %s", self._spec.session_id[:8], e,
+            )
+            return
+        self._backend.note_access_programs(
+            self._backend.catalog(_catalog_entries(response)),
+        )
+
+    def _thread_start_params(self, params: dict[str, Any]) -> dict[str, Any]:
+        """The ``thread/start`` parameters: with the switch on, Codex also
+        saves the choice on the thread (see :meth:`_save_daybreak_choice`).
+        A catalog without access-program metadata is a Codex that does not
+        know the field."""
+        if self._daybreak and self._backend._access_metadata:
+            return {**params, "daybreakEnabled": True}
+        return params
+
+    async def _align_saved_choice(self, thread: dict[str, Any]) -> None:
+        """Bring the choice saved on a resumed or forked thread in line with
+        the chat's switch.
+
+        ``thread/resume`` and ``thread/fork`` take no Daybreak field; their
+        answer says what the thread has saved (``daybreakEnabled``). A thread
+        can say ``true`` for a chat whose switch is off: the switch went off
+        while the chat had no runtime, or the thread is a fork of one that
+        had it. Nothing is sent when the two agree, so a chat that never used
+        Daybreak gets the requests it always got.
+        """
+        saved = thread.get("daybreakEnabled") is True
+        if saved != self._daybreak:
+            await self._save_daybreak_choice()
+
+    async def _save_daybreak_choice(self) -> None:
+        """Save the switch on the Codex thread, best effort.
+
+        Codex's own helper agents read the choice there. It selects no
+        turn's program, so a failure is logged and nothing else.
+        """
+        if not self._thread_id or not self._backend._access_metadata:
+            return
+        try:
+            await self._transport.request("thread/metadata/update", {
+                "threadId": self._thread_id,
+                "daybreakEnabled": self._daybreak,
+            }, timeout=10.0)
+        except (CodexRpcError, TransportDiedError) as e:
+            logger.warning(
+                "Codex did not save the Daybreak choice of session %s on its "
+                "thread: %s", self._spec.session_id[:8], e,
+            )
+
+    def _daybreak_would_help(self, turn_error: Any) -> bool:
+        """Whether a failed turn is a cyber-policy refusal in a chat that has
+        the switch off and a model with a program."""
+        return (
+            (self._cyber_refusal or _is_cyber_refusal(turn_error))
+            and not self._daybreak
+            and self._backend.daybreak_program(self._thread_model) is not None
+        )
 
     async def _ensure_auth(self) -> None:
         """Best-effort auth check with a clear operator hint.
@@ -988,8 +1253,15 @@ class CodexClient(AgentClient):
     async def start_turn(self, turn: TurnInput) -> None:
         if not self._thread_id:
             raise BackendError("codex client has no thread")
+        # Before anything else: a turn that Daybreak refuses is not sent. The
+        # engine asks turn_refusal first, so this is the last line of defence.
+        refusal = await self.turn_refusal()
+        if refusal:
+            raise TurnRefusedError(refusal)
+        program = self._turn_program()
         self._reset_turn_usage_accounting()
         self._last_error = None
+        self._cyber_refusal = False
         self._items.clear()
         self._ultracode_usage = None
         self._ultracode_estimated_cost = 0.0
@@ -1000,9 +1272,10 @@ class CodexClient(AgentClient):
         # (late tokenUsage updates etc.) so they can't bleed into this one.
         while not self._transport.notifications.empty():
             try:
-                self._transport.notifications.get_nowait()
+                note = self._transport.notifications.get_nowait()
             except Exception:
                 break
+            self._take_usage_baseline(note)
 
         params: dict[str, Any] = {
             "threadId": self._thread_id,
@@ -1011,8 +1284,15 @@ class CodexClient(AgentClient):
         effort = self.turn_effort()
         if effort:
             params["effort"] = effort
+        if program:
+            params["cyberAccessProgram"] = program
 
         response = await self._transport.request("turn/start", params)
+        if program:
+            logger.info(
+                "Codex session %s: turn sent on %s with cyber access program %s",
+                self._spec.session_id[:8], self._thread_model, program,
+            )
         turn_obj = response.get("turn") if isinstance(response, dict) else None
         self._turn_id = (
             str(turn_obj["id"])
@@ -1135,6 +1415,7 @@ class CodexClient(AgentClient):
             note_turn = params.get("turnId")
             if note_turn and self._turn_id and note_turn != self._turn_id:
                 logger.debug("codex: dropping stale notification %s", method)
+                self._take_usage_baseline(note)
                 continue
 
             for event in await self._map_notification(method, params):
@@ -1172,8 +1453,7 @@ class CodexClient(AgentClient):
             usage = params.get("tokenUsage") or {}
             if isinstance(usage, dict):
                 self._turn_usage = usage
-                self._turn_response_count += 1
-                self._capture_turn_total_base(usage)
+                self._record_token_usage(usage)
                 window = usage.get("modelContextWindow")
                 if isinstance(window, int) and window > 0:
                     self._context_window = window
@@ -1228,6 +1508,7 @@ class CodexClient(AgentClient):
                 # a system event meanwhile.
                 logger.warning("codex error: %s", message)
                 self._last_error = message
+                self._cyber_refusal = _is_cyber_refusal(params.get("error"))
                 out.append(ev.SystemEvent(
                     subtype="codex_error",
                     data={"message": message, "will_retry": False},
@@ -1496,13 +1777,15 @@ class CodexClient(AgentClient):
                 error = str(terr.get("message") or terr)
             else:
                 error = str(terr) if terr else (self._last_error or "turn failed")
+            if self._daybreak_would_help(terr):
+                error = f"{error.rstrip().rstrip('.')}. {_DAYBREAK_HINT}"
 
-        baseline = (
-            self._prev_total_usage
-            if self._prev_total_usage is not None
-            else self._turn_total_base
-        )
-        usage = self._normalize_usage(self._turn_usage, baseline)
+        counts = self._turn_counts
+        if counts is None and self._turn_usage:
+            # No cumulative total available: use the single last response.
+            last = self._turn_usage.get("last")
+            counts = last if isinstance(last, dict) else None
+        usage = self._normalize_usage(counts, self._turn_usage)
         if usage is None and self._ultracode_usage:
             # A turn can complete before app-server emits a parent tokenUsage
             # notification. Child usage is still authoritative and must not
@@ -1529,7 +1812,7 @@ class CodexClient(AgentClient):
             # compute_cost above priced every child token at the parent model;
             # per-worker journal pricing is more precise, so replace that
             # approximate child component when worker model data was present.
-            parent_usage = self._normalize_usage(self._turn_usage, baseline)
+            parent_usage = self._normalize_usage(counts, self._turn_usage)
             parent_cost = compute_cost(
                 self.model, parent_usage, self._backend.codex.pricing,
             )
@@ -1553,13 +1836,6 @@ class CodexClient(AgentClient):
             cost = None
             cost_basis = "unknown"
             estimated_cost = estimate
-        # Carry this turn's ending cumulative total as the next turn's baseline.
-        # A ContextWindowExceeded error resets total to 0 and later responses
-        # re-accumulate from 0, so the latest total is always the baseline.
-        if isinstance(self._turn_usage, dict) and isinstance(
-            self._turn_usage.get("total"), dict
-        ):
-            self._prev_total_usage = self._turn_usage["total"]
         return ev.TurnCompleted(
             native_session_id=self._thread_id,
             native_turn_id=self._turn_id,
@@ -1572,81 +1848,102 @@ class CodexClient(AgentClient):
             duration_api_ms=None,
             num_turns=max(1, self._turn_response_count),
             context_window=self._context_window,
+            context_tokens=self._turn_context_tokens,
             status=status,  # type: ignore[arg-type]
             error=error,
         )
 
     def _reset_turn_usage_accounting(self) -> None:
-        """Clear per-turn token-accounting state (latest tokenUsage payload,
-        turn-start cumulative baseline, response count) at turn start."""
+        """Clear the per-turn token accounting at turn start. The cumulative
+        baseline in ``_last_total`` stays."""
         self._turn_usage = None
-        self._turn_total_base = None
+        self._turn_counts = None
         self._turn_response_count = 0
+        self._turn_context_tokens = None
 
-    def _capture_turn_total_base(self, usage: dict) -> None:
-        """Record the fallback turn-start baseline from the turn's first
-        tokenUsage notification, used only when no previous-turn total is
-        carried (the first turn on a fresh client).
+    def _take_usage_baseline(self, note: dict) -> None:
+        """Use a tokenUsage notification from outside the turn as the
+        baseline when this client has none.
 
-        ``tokenUsage.total`` is the per-thread cumulative counter and
-        ``tokenUsage.last`` the most recent single response, so ``total - last``
-        on that first notification is the cumulative total just before the
-        turn's first response.
+        After ``thread/resume`` and ``thread/fork``, app-server sends the
+        restored usage of the thread with the id of an earlier turn. Its
+        ``total`` is the exact baseline for the first turn. When the client
+        already has a baseline, the notification is ignored, and the next
+        notification of the turn counts its tokens.
         """
-        if self._turn_total_base is not None:
+        if self._last_total is not None:
             return
+        if note.get("method") != "thread/tokenUsage/updated":
+            return
+        usage = (note.get("params") or {}).get("tokenUsage")
+        total = usage.get("total") if isinstance(usage, dict) else None
+        if isinstance(total, dict):
+            self._last_total = total
+
+    def _record_token_usage(self, usage: dict) -> None:
+        """Add a tokenUsage notification of the turn to the turn's usage.
+
+        ``total`` is the cumulative counter of the thread and ``last`` its
+        latest model response. The usage of the turn is the sum of the
+        increases in ``total``. A notification that does not increase
+        ``total`` is not a model response: codex also sends one after a
+        failed request, on a usage limit and after a compaction. A
+        ContextWindowExceeded error sets ``total`` to 0, and after that it
+        increases from 0.
+        """
         total = usage.get("total")
         if not isinstance(total, dict):
             return
         last = usage.get("last") if isinstance(usage.get("last"), dict) else {}
-        self._turn_total_base = {
-            key: max(0, int(total.get(key) or 0) - int(last.get(key) or 0))
-            for key in ("inputTokens", "cachedInputTokens", "outputTokens")
+        base = self._last_total
+        if base is None:
+            # No baseline (a resumed thread without the usage replay): use
+            # the total before this notification's response.
+            base = {
+                key: max(0, int(total.get(key) or 0) - int(last.get(key) or 0))
+                for key in _USAGE_KEYS
+            }
+        if int(total.get("inputTokens") or 0) < int(base.get("inputTokens") or 0):
+            base = {}  # the counters were reset to 0
+        increase = {
+            key: max(0, int(total.get(key) or 0) - int(base.get(key) or 0))
+            for key in _USAGE_KEYS
         }
+        self._last_total = total
+        counts = self._turn_counts or dict.fromkeys(_USAGE_KEYS, 0)
+        self._turn_counts = {key: counts[key] + increase[key] for key in _USAGE_KEYS}
+        if any(increase.values()):
+            self._turn_response_count += 1
+            self._turn_context_tokens = int(last.get("inputTokens") or 0)
 
     @staticmethod
     def _normalize_usage(
-        usage: dict | None,
-        baseline: dict | None = None,
+        counts: dict | None,
+        usage: dict | None = None,
     ) -> ev.NormalizedUsage | None:
-        """``thread/tokenUsage/updated`` → NormalizedUsage.
+        """Codex token counts → NormalizedUsage.
 
-        The turn's usage is the cumulative-``total`` delta over the turn:
-        ``total`` minus ``baseline`` (the cumulative counters as of turn start).
-        When no cumulative ``total`` is present, ``last`` — the most recent
-        single response — is used instead.
+        ``counts`` has codex's ``inputTokens``, ``cachedInputTokens`` and
+        ``outputTokens``. ``usage`` is the latest tokenUsage payload, which
+        goes into ``raw``.
 
         OpenAI's ``inputTokens`` INCLUDES the cached subset; nerve's
         Anthropic-style accounting keeps them disjoint (input = full
         price only), so the cached count is subtracted out here — the
         pricing module and the usage-dict contract both rely on it.
         """
-        if not usage:
+        if counts is None:
             return None
-        total = usage.get("total") if isinstance(usage.get("total"), dict) else None
-        last = usage.get("last") if isinstance(usage.get("last"), dict) else None
-        if total is not None:
-            # Per-turn delta of the cumulative thread total (clamped at zero).
-            base = baseline or {}
-            raw_input = max(0, int(total.get("inputTokens") or 0)
-                            - int(base.get("inputTokens") or 0))
-            raw_cached = max(0, int(total.get("cachedInputTokens") or 0)
-                             - int(base.get("cachedInputTokens") or 0))
-            raw_output = max(0, int(total.get("outputTokens") or 0)
-                             - int(base.get("outputTokens") or 0))
-        elif last is not None:
-            # No cumulative total available: use the single last response.
-            raw_input = int(last.get("inputTokens") or 0)
-            raw_cached = int(last.get("cachedInputTokens") or 0)
-            raw_output = int(last.get("outputTokens") or 0)
-        else:
-            return None
+        raw_input = int(counts.get("inputTokens") or 0)
+        raw_cached = int(counts.get("cachedInputTokens") or 0)
+        raw_output = int(counts.get("outputTokens") or 0)
+        usage = usage or {}
         return ev.NormalizedUsage(
             input_tokens=max(0, raw_input - raw_cached),
             output_tokens=raw_output,
             cache_read_tokens=raw_cached,
             cache_creation_tokens=0,
-            raw={"last": last, "total": usage.get("total")},
+            raw={"last": usage.get("last"), "total": usage.get("total")},
         )
 
     @staticmethod

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { useShallow } from 'zustand/react/shallow';
-import { useChatStore } from '../stores/chatStore';
+import { TASKS_PANEL_ID, useChatStore } from '../stores/chatStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
 import { MessageList } from '../components/Chat/MessageList';
 import { ChatInput } from '../components/Chat/ChatInput';
@@ -12,20 +12,23 @@ import { TodoPanel } from '../components/Chat/TodoPanel';
 import { SidePanel } from '../components/Chat/SidePanel';
 import { ChatWidthHandle } from '../components/Chat/ChatWidthHandle';
 import { AgentDock } from '../components/Chat/agents/AgentDock';
+import { MessageChatContext } from '../components/Chat/messageChat';
 import { ForceStopDialog } from '../components/Chat/agents/ForceStopDialog';
 import { StopAllDialog } from '../components/Chat/agents/StopAllDialog';
 import { StopEscalationBanner } from '../components/Chat/agents/StopEscalationBanner';
 import { ReviewLoopCard } from '../components/Chat/ReviewLoopCard';
 import { SessionCreator } from '../components/Chat/ActorLabel';
-import { Loader2, Files, ExternalLink, GitBranch } from '../components/ui/icons';
+import { Loader2, Files, ExternalLink, GitBranch, ListChecks } from '../components/ui/icons';
 import { Button, PaneToggle } from '../components/ui';
 import { api } from '../api/client';
 import { useKeyboardShortcuts } from '../hooks/useKeyboardShortcuts';
 import { useIsMobile } from '../hooks/useMediaQuery';
-import type { ShortcutDef } from '../utils/keyboard';
+import { useFetchedSession } from '../hooks/useFetchedSession';
+import { FOCUS_COMPOSER_COMBO, type ShortcutDef } from '../utils/keyboard';
 import { copyToClipboard } from '../utils/clipboard';
 import { forkChat } from '../utils/forkChat';
 import { findSessionById } from '../utils/findSession';
+import { modelLabel } from '../utils/modelNames';
 import { langfuseSessionUrl, type LangfuseLinkStatus } from '../utils/langfuseLinks';
 import type { ChatMessage, TextBlockData } from '../types/chat';
 
@@ -34,18 +37,22 @@ const STATUS_LABELS: Record<string, string> = {
   writing: 'Writing...',
 };
 
-/** Format a model identifier into a short display label. */
-function formatModelLabel(model: string): string {
-  const m = model.replace(/^claude-/, '');
-  const match = m.match(/^(\w+)-(\d+)-(\d+)/);
-  if (match) {
-    const name = match[1].charAt(0).toUpperCase() + match[1].slice(1);
-    return `${name} ${match[2]}.${match[3]}`;
-  }
-  return m.charAt(0).toUpperCase() + m.slice(1);
+/**
+ * The chat page. What a widget of an answer saves is kept with its chat, so
+ * everything the page shows is told which chat it is in. A stored message
+ * says that for itself (`MessageList`); this is for what the server has not
+ * handed out yet, the answer that is being written.
+ */
+export function ChatPage() {
+  const activeSession = useChatStore(s => s.activeSession);
+  return (
+    <MessageChatContext.Provider value={activeSession || null}>
+      <ChatPageView />
+    </MessageChatContext.Provider>
+  );
 }
 
-export function ChatPage() {
+function ChatPageView() {
   const { sessionId } = useParams();
   const navigate = useNavigate();
   const location = useLocation();
@@ -62,10 +69,10 @@ export function ChatPage() {
     isStreaming, loading,
     agentStatus, contextUsage, backendStatus, currentTodos, currentCCTasks,
     sidebarCollapsed, mobileSidebarOpen, panelVisible,
-    modifiedFiles, modifiedFilesCount,
+    modifiedFiles, modifiedFilesCount, sessionTasks,
     backendDefault, newChatBackend,
     loadSessions, switchSession, createSession, deleteSession,
-    sendMessage, stopSession, toggleSessionList, setMobileSidebarOpen, openFilesPanel,
+    sendMessage, stopSession, toggleSessionList, setMobileSidebarOpen, openFilesPanel, openTasksPanel,
   } = useChatStore(useShallow(s => ({
     sessions: s.sessions,
     archivedSessions: s.archivedSessions,
@@ -85,6 +92,7 @@ export function ChatPage() {
     panelVisible: s.panelVisible,
     modifiedFiles: s.modifiedFiles,
     modifiedFilesCount: s.modifiedFilesCount,
+    sessionTasks: s.sessionTasks,
     backendDefault: s.backendDefault,
     newChatBackend: s.newChatBackend,
     loadSessions: s.loadSessions,
@@ -96,12 +104,22 @@ export function ChatPage() {
     toggleSessionList: s.toggleSessionList,
     setMobileSidebarOpen: s.setMobileSidebarOpen,
     openFilesPanel: s.openFilesPanel,
+    openTasksPanel: s.openTasksPanel,
   })));
   const hasPanels = useChatStore(s => s.panels.length > 0);
+  // The server does not have the session of this address: a link that
+  // outlived its session, or a session deleted in another tab.
+  const sessionMissing = useChatStore(s => !!s.activeSession && s.missingSession === s.activeSession);
   const filesPanelActive = useChatStore(s => s.panels.some(p => p.id === 'files-panel'));
+  const tasksPanelActive = useChatStore(s => s.panels.some(p => p.id === TASKS_PANEL_ID));
 
-  // The active session row may live in the feed or a lazy archived/system group.
-  const activeSessionRow = findSessionById(activeSession, sessions, archivedSessions, systemSessions);
+  // The active session row may live in the feed or a lazy archived/system
+  // group. A session that none of them has loaded is read by its id.
+  const listedSessionRow = findSessionById(activeSession, sessions, archivedSessions, systemSessions);
+  const fetchedSessionRow = useFetchedSession(
+    listedSessionRow || !activeSession || virtualSession?.id === activeSession ? null : activeSession,
+  );
+  const activeSessionRow = listedSessionRow ?? fetchedSessionRow ?? undefined;
 
   // Forks of THIS chat keyed by their anchor message — MessageList marks the
   // divergence points with a pill. Memoized so the memo'd list doesn't
@@ -192,7 +210,7 @@ export function ChatPage() {
     },
     {
       id: 'chat-focus-input',
-      combo: { mod: true, shift: true, key: ';' },
+      combo: FOCUS_COMPOSER_COMBO,
       description: 'Focus message input',
       section: 'chat',
       allowInInput: true,
@@ -292,11 +310,12 @@ export function ChatPage() {
         if (sessionId !== activeSession || messages.length === 0) {
           switchSession(sessionId);
         }
-      } else if (!activeSession) {
-        // No URL param and no active session yet. A restored unsent chat wins
-        // over the most recent real one: it only survives a reload when it
-        // still holds draft text, and dropping the user somewhere else would
-        // hide the very prompt they were writing. A suggested first message
+      } else if (!activeSession || useChatStore.getState().missingSession === useChatStore.getState().activeSession) {
+        // No URL param, and no active session yet or one that the server does
+        // not have. A restored unsent chat wins over the most recent real
+        // one: it only survives a reload when it still holds draft text, and
+        // dropping the user somewhere else would hide the very prompt they
+        // were writing. A suggested first message
         // (from setup) opens a fresh chat rather than landing in an old one.
         const { sessions: loaded, virtualSession } = useChatStore.getState();
         if (suggestedMessage && !virtualSession) {
@@ -317,6 +336,7 @@ export function ChatPage() {
     : STATUS_LABELS[agentStatus.state] || null;
 
   const fileCount = modifiedFiles.length || modifiedFilesCount;
+  const taskCount = sessionTasks?.length ?? 0;
   // SidePanel renders nothing without a tab, so it only covers the column when
   // there is one.
   const panelCoversColumn = isMobile && panelVisible && hasPanels;
@@ -332,7 +352,7 @@ export function ChatPage() {
         onCreate={handleCreateSession}
         onDelete={handleDeleteSession}
         collapsed={!sessionListOpen}
-        mobile={isMobile}
+        layout={isMobile ? 'drawer' : 'column'}
         onRequestClose={() => setMobileSidebarOpen(false)}
       />
 
@@ -353,11 +373,14 @@ export function ChatPage() {
             <div className="flex items-center gap-2 min-w-0">
               <PaneToggle open={sessionListOpen} onToggle={toggleSessionList} label="sidebar" />
               <span className="font-medium text-base truncate">
-                {virtualSession?.id === activeSession
-                  ? 'New chat'
-                  : (activeSessionRow?.title || activeSession)}
+                {sessionMissing
+                  ? 'Session not found'
+                  : virtualSession?.id === activeSession
+                    ? 'New chat'
+                    : (activeSessionRow?.title || activeSession)}
               </span>
-              {(() => {
+              {/* A session that does not exist has no backend to name. */}
+              {!sessionMissing && (() => {
                 const backend = virtualSession?.id === activeSession
                   ? (newChatBackend ?? backendDefault ?? 'claude')
                   : (activeSessionRow?.backend ?? 'claude');
@@ -387,7 +410,7 @@ export function ChatPage() {
                 const model = activeSessionRow?.model;
                 return model ? (
                   <span className="hidden md:inline shrink-0 text-xs text-text-faint bg-surface-raised px-1.5 py-0.5 rounded">
-                    {formatModelLabel(model)}
+                    {modelLabel(model)}
                   </span>
                 ) : null;
               })()}
@@ -465,12 +488,33 @@ export function ChatPage() {
                   <span className="tabular-nums">{fileCount}</span>
                 </Button>
               )}
-              {contextUsage && (
-                <div className="hidden md:flex">
-                  <ContextBar usage={contextUsage} sessionCostUsd={activeSessionRow?.total_cost_usd} />
-                </div>
+              {taskCount > 0 && (
+                <Button
+                  variant="subtle"
+                  size="xs"
+                  onClick={openTasksPanel}
+                  title="Tasks from this session"
+                  aria-label={`Tasks from this session (${taskCount})`}
+                  // On a phone, the last button of the header: the pseudo-element
+                  // makes the tap target 44 px high (10 px up and down) and wider
+                  // (4 px into the gap, 12 px into the header's padding).
+                  className="relative max-md:before:absolute max-md:before:-inset-y-2.5 max-md:before:-left-1 max-md:before:-right-3 max-md:before:content-['']"
+                >
+                  <ListChecks size={14} className={tasksPanelActive ? 'text-hue-blue' : undefined} />
+                  <span className="tabular-nums">{taskCount}</span>
+                </Button>
               )}
-              {langfuseUrl && (
+              {contextUsage && activeSession && (
+                <ContextBar
+                  key={`context-${activeSession}`}
+                  usage={contextUsage}
+                  sessionId={activeSession}
+                  backend={activeSessionRow?.backend ?? 'claude'}
+                  busy={isStreaming}
+                  sessionCostUsd={activeSessionRow?.total_cost_usd}
+                />
+              )}
+              {langfuseUrl && !sessionMissing && (
                 <a
                   href={langfuseUrl}
                   target="_blank"
@@ -529,10 +573,22 @@ export function ChatPage() {
           <div className="relative flex-1 flex flex-col min-h-0">
             {loading ? (
               <div className="flex-1 flex items-center justify-center text-text-faint">Loading...</div>
+            ) : sessionMissing ? (
+              <div role="status" className="flex-1 flex flex-col items-center justify-center gap-2 text-center px-6">
+                <p className="text-text-faint text-lg">This session does not exist</p>
+                <p className="text-sm text-text-muted max-w-md">
+                  It was deleted, or it was a new chat that was never sent. Open another session
+                  from the list, or start a new chat.
+                </p>
+                <Button variant="secondary" size="sm" onClick={() => void handleCreateSession()}>
+                  New chat
+                </Button>
+              </div>
             ) : (
               <MessageList
                 messages={messages}
                 isStreaming={isStreaming}
+                unlistedSession={fetchedSessionRow}
                 onForkMessage={canForkSession ? handleForkMessage : undefined}
                 messageForks={messageForks}
               />
@@ -554,12 +610,17 @@ export function ChatPage() {
               Send for Queue next to the split Stop, and a message sent then
               waits in the server's queue and runs next. Agents running in the
               background never put it in that state. */}
-          <ChatInput
-            onSend={sendMessage}
-            onStop={stopSession}
-            isStreaming={isStreaming}
-            seed={suggestedMessage}
-          />
+          {/* No composer in sight for a session that does not exist: a message
+              for it has nowhere to go. It stays mounted, so that what it holds
+              is not lost and it does not start over when it comes back. */}
+          <div className={sessionMissing ? 'hidden' : 'contents'}>
+            <ChatInput
+              onSend={sendMessage}
+              onStop={stopSession}
+              isStreaming={isStreaming}
+              seed={suggestedMessage}
+            />
+          </div>
 
           {/* Portals: the stop confirmations. */}
           <StopAllDialog />

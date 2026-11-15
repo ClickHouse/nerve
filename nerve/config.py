@@ -22,7 +22,7 @@ from nerve.coerce import FALSY, TRUTHY
 from nerve.coerce import as_bool as _as_bool
 from nerve.coerce import coerced as _coerced
 from nerve.coerce import lenient_int as _lenient_int
-from nerve.inference_principal import direct_client_headers
+from nerve.inference_principal import direct_client_headers, has_custom_header_line
 
 import yaml
 
@@ -32,7 +32,7 @@ logger = logging.getLogger(__name__)
 #
 # This block is the only place a default model id is spelled. Every other
 # site (the setup writer, the Bedrock geo-prefixed ids, the Claude CLI's
-# ``opus`` and ``haiku`` aliases, the terminal wizard's example line)
+# ``opus``, ``haiku`` and ``fable`` aliases, the terminal wizard's example line)
 # references these names, and ``tests/test_default_models.py`` fails on a
 # model-id literal anywhere else under ``nerve/`` — so the next update is one
 # edit here plus the regenerated goldens, examples and docs.
@@ -42,16 +42,16 @@ DEFAULT_TITLE_MODEL = "claude-haiku-5-5"        # agent.title_model
 DEFAULT_RECALL_MODEL = "claude-sonnet-5-5"      # memory.recall_model
 DEFAULT_MEMORIZE_MODEL = "claude-sonnet-5-5"    # memory.memorize_model
 DEFAULT_FAST_MODEL = "claude-haiku-5-5"         # memory.fast_model; also the CLI's ``haiku`` alias
-DEFAULT_FALLBACK_MODEL = "claude-fable-5-1"     # second entry of the built-in picker list
+DEFAULT_FALLBACK_MODEL = "claude-fable-5-2"     # Fable entry of the built-in model menu; also the CLI's ``fable`` alias
 DEFAULT_EFFORT = "xhigh"                        # agent.effort (conversations); max is slower for no real gain on the 5.5 models
 
-# Fallback for the composer's Claude model picker when ``agent.models`` is
-# unset and live discovery is off or unavailable (see nerve/models_catalog.py)
-# — the current generation, the configured default first. Bare Anthropic API
-# IDs: they do not apply on Bedrock, where model IDs are region-prefixed.
+# The Claude models of the composer's model menu when ``agent.models`` is
+# unset: the newest model of each tier, largest first. Update it when a tier
+# gets a new model. Bare Anthropic API IDs: they do not apply on Bedrock, where
+# model IDs are region-prefixed.
 DEFAULT_CLAUDE_MODELS: tuple[str, ...] = (
-    DEFAULT_MODEL,
     DEFAULT_FALLBACK_MODEL,
+    DEFAULT_MODEL,
     "claude-sonnet-5-5",
     "claude-haiku-5-5",
 )
@@ -917,12 +917,69 @@ class SSLConfig:
 # here because ``uvicorn[standard]`` pulls it in.
 _GATEWAY_LOOPS = ("asyncio", "uvloop", "auto")
 
+#: The environment variable that gives the address of the web UI when no
+#: settings layer names ``gateway.public_url``. A hosted platform can set it
+#: for each agent.
+PUBLIC_URL_ENV = "NERVE_PUBLIC_ORIGIN"
+# The refused addresses that this process logged already, each with where it
+# came from: a config is built again at every reload.
+_refused_public_urls: set[tuple[str, str]] = set()
+# A scheme, a host and an optional port, in ASCII. The host is a name of
+# letters, digits, ``-``, ``.`` and ``_``, an IPv4 address or a bracketed IPv6
+# address. Nothing else is in the address, so it goes into a message's markup
+# as it is.
+_PUBLIC_URL_RE = re.compile(
+    r"https?://"
+    r"(?:\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)"
+    r"(?::(?P<port>[0-9]{1,5}))?",
+    re.IGNORECASE,
+)
+
+
+def _public_url(value: Any, source: str) -> str:
+    """``value`` as the address of the web UI, or ``""`` when it is not one.
+
+    The address is ``http://`` or ``https://``, a host and an optional port; a
+    ``/`` at its end is dropped. The web UI is served at the root of its
+    address, so an address with a path cannot open a page and is refused,
+    like one with credentials, a query or a fragment. A refused value gives
+    ``""`` and one warning that names ``source``, the setting or the variable
+    that the value came from: a wrong address costs the links in messages and
+    must not stop the gateway. A value that still holds a ``${VAR}`` reference
+    gives ``""`` without a warning, because the loader reports the reference.
+    """
+    url = "" if value is None else str(value).strip()
+    if not url or "${" in url:
+        return ""
+    address = url.rstrip("/")
+    match = _PUBLIC_URL_RE.fullmatch(address)
+    if match and (match["port"] is None or 0 < int(match["port"]) <= 65535):
+        return address
+    refused = (source, url)
+    if refused not in _refused_public_urls:
+        _refused_public_urls.add(refused)
+        logger.warning(
+            "%s must be the address of the web UI: http:// or https://, a host "
+            "name or an IP address, an optional port, and nothing after it; "
+            "messages get no links to the web UI",
+            source,
+        )
+    return ""
+
 
 @dataclass
 class GatewayConfig:
     host: str = "0.0.0.0"
     port: int = 8900
     ssl: SSLConfig = field(default_factory=SSLConfig)
+    # The address at which people open the web UI, for example
+    # ``https://nerve.example.com``. Nerve cannot tell it from the bind address
+    # (a reverse proxy, a tunnel or a host name can stand in front), so links
+    # to the web UI in messages that leave it, such as the session link of a
+    # Telegram or Slack notification, are built from this value. Empty means
+    # that those messages carry no links. Read at every use, so a reload
+    # applies it.
+    public_url: str = ""
     # The stdlib loop is the default on purpose. uvloop spawns subprocesses with a
     # full ``fork()``, which copies the parent's page tables: at the ~100 GB RSS a
     # memU-loaded gateway reaches, every spawn — each agent CLI session, each
@@ -947,12 +1004,21 @@ class GatewayConfig:
             raise ValueError(
                 f"gateway.loop must be one of {_GATEWAY_LOOPS}, got {loop!r}"
             )
+        # A blank value is unset, as for the path settings: the environment's
+        # address then applies. A value that is refused does not fall back to
+        # it.
+        named = _setting_str(d.get("public_url"))
+        public_url = (
+            _public_url(named, "gateway.public_url") if named
+            else _public_url(os.environ.get(PUBLIC_URL_ENV), PUBLIC_URL_ENV)
+        )
         return cls(
             host=d.get("host", "0.0.0.0"),
             port=d.get("port", 8900),
             ssl=SSLConfig.from_dict(d.get("ssl", {})),
             loop=loop,
             drain_timeout_seconds=d.get("drain_timeout_seconds", 0),
+            public_url=public_url,
         )
 
 
@@ -1028,6 +1094,53 @@ class PromptRewriteConfig:
 # SDK default of two gives up after about 1.5 s.
 PROXY_CLIENT_MAX_RETRIES = 6
 
+# Arguments that every Anthropic SDK client of Nerve gets. The SDK makes no
+# OpenTelemetry span of its own and sends no trace context headers. With
+# Langfuse on, ``AnthropicInstrumentor`` makes the span of each call (see
+# nerve.observability.langfuse). A span of the SDK would give Langfuse a
+# second span of the same call, with the same token counts.
+ANTHROPIC_CLIENT_OPTIONS: dict[str, Any] = {"open_telemetry": False}
+
+# The Anthropic SDK sends API version 2026-10-21. On Amazon Bedrock, this
+# version accepts only Claude 4.7 and later models.
+BEDROCK_SDK_MIN_CLAUDE_VERSION = (4, 7)
+
+# ``claude-<family>-<major>[-<minor>]``, for example ``claude-sonnet-4-5``.
+_CLAUDE_VERSION_NEW = re.compile(r"claude-[a-z]+-(\d+)(?:-(\d+))?")
+# ``claude-<major>[-<minor>]-<family>``, for example ``claude-3-5-haiku``.
+_CLAUDE_VERSION_OLD = re.compile(r"claude-(\d+)(?:-(\d+))?-[a-z]+")
+# The first IDs: ``claude-2.1`` and ``claude-instant-1.2``, and on Bedrock
+# ``claude-v2:1`` and ``claude-instant-v1``.
+_CLAUDE_VERSION_FIRST = re.compile(r"claude-(?:instant-)?v?(\d+)(?:[.:](\d+))?")
+
+
+def claude_model_version(model: str) -> tuple[int, int] | None:
+    """The ``(major, minor)`` version that a Claude model ID names.
+
+    Reads bare and dated IDs (``claude-opus-4-1-20250805``), the ``[1m]``
+    suffix, Bedrock IDs with a region prefix, a version suffix and a
+    context window (``us.anthropic.claude-sonnet-4-5-20250929-v1:0``,
+    ``anthropic.claude-3-haiku-20240307-v1:0:48k``), the first IDs
+    (``claude-2.1``, ``anthropic.claude-v2:1``,
+    ``anthropic.claude-instant-v1``), and an ARN that ends in such an ID.
+    ``None`` for an ID that it cannot read, for example an application
+    inference profile ARN or an alias.
+    """
+    m = model.strip().lower().rsplit("/", 1)[-1]
+    if "anthropic." in m:
+        m = m.rsplit("anthropic.", 1)[1]
+    m = m.split("[", 1)[0]
+    m = re.sub(r":\d+k$", "", m)
+    match = _CLAUDE_VERSION_FIRST.fullmatch(m)
+    if match is None:
+        m = re.sub(r"-v\d+(?::\d+)?$", "", m)
+        m = re.sub(r"-latest$", "", m)
+        m = re.sub(r"-20\d{6}$", "", m)
+        match = _CLAUDE_VERSION_NEW.fullmatch(m) or _CLAUDE_VERSION_OLD.fullmatch(m)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2) or 0)
+
 
 # The default model ids live in the constants block at the top of this file
 # (DEFAULT_MODEL and friends, DEFAULT_CLAUDE_MODELS).
@@ -1091,35 +1204,36 @@ class AgentConfig:
     model: str = DEFAULT_MODEL
     cron_model: str = DEFAULT_CRON_MODEL
     title_model: str = DEFAULT_TITLE_MODEL  # Session title generation
+    outcome_titles: bool = True  # Retitle a session from what its first answer did
     # Model-alias remapping for the Claude CLI subprocess: alias → model ID,
     # emitted as ANTHROPIC_DEFAULT_<ALIAS>_MODEL env vars so short aliases
     # ("opus" in Agent/Workflow tool calls, skill frontmatter, cron model
     # overrides) resolve to the mapped model. Supported aliases: opus,
-    # sonnet, haiku, fable. Nerve defaults opus → DEFAULT_MODEL and
-    # haiku → DEFAULT_FAST_MODEL on non-Bedrock providers; the CLI also uses
-    # the haiku model for its background calls. Entries here merge over those
+    # sonnet, haiku, fable. Nerve defaults opus → DEFAULT_MODEL,
+    # haiku → DEFAULT_FAST_MODEL and fable → DEFAULT_FALLBACK_MODEL on
+    # non-Bedrock providers; the CLI also uses the haiku model for its
+    # background calls. Entries here merge over those
     # defaults, and an empty value ("") unsets one (falls back to the CLI's
     # built-in mapping).
     model_aliases: dict[str, str] = field(default_factory=dict)
-    # Claude models selectable in the web composer's model picker
-    # (GET /api/models). The configured `model` above is always offered
-    # first; entries here extend the list (order-preserving, deduped).
-    # Empty → the models the configured credentials actually expose, read
-    # from the Anthropic Models API (see `model_discovery` below), falling
-    # back to a built-in current-generation list (DEFAULT_CLAUDE_MODELS).
+    # Claude models in the web composer's model menu (GET /api/models), in
+    # this order (deduped). The configured `model` above is put first when
+    # the list does not name it, so the menu always offers it.
+    # Empty → the whole catalog when `model_discovery` below is on, else the
+    # built-in list of the newest model of each tier (DEFAULT_CLAUDE_MODELS).
     # On Bedrock only the models named in config are offered (Bedrock IDs
     # are region-prefixed, so neither discovery nor the bare built-ins
     # resolve there).
     models: list[str] = field(default_factory=list)
     # Ask the Anthropic Models API (GET /v1/models) which models the
-    # configured credentials' catalog endpoint advertises, and offer those in
-    # the picker, so a newly released model needs no code change or config
-    # edit. Catalog membership is not a serving guarantee — an advertised ID
-    # can still fail on send, and discovery runs no serving probe (see
-    # `model_discovery_excluded_models` to prune such entries). Best-effort:
-    # ignored when `models` above is set explicitly, on Bedrock, without an
-    # API key, or when the API is unreachable — the built-in list applies.
-    model_discovery: bool = True
+    # configured credentials' catalog endpoint advertises, and offer all of
+    # them in the menu instead of the built-in list. Catalog membership is
+    # not a serving guarantee: an advertised ID can still fail on send, and
+    # discovery runs no serving probe (see `model_discovery_excluded_models`
+    # to prune such entries). Best-effort: ignored when `models` above is
+    # set explicitly, on Bedrock, without an API key, or when the API is
+    # unreachable; the built-in list applies then.
+    model_discovery: bool = False
     # Case-insensitive model-ID substrings pruned from the discovered catalog
     # before it reaches the picker (empty/whitespace patterns ignored). A
     # catalog advertising a model is not a serving guarantee — an advertised ID
@@ -1230,12 +1344,13 @@ class AgentConfig:
             model=d.get("model", DEFAULT_MODEL),
             cron_model=d.get("cron_model", DEFAULT_CRON_MODEL),
             title_model=d.get("title_model", DEFAULT_TITLE_MODEL),
+            outcome_titles=d.get("outcome_titles", True),
             model_aliases={
                 str(k): str(v or "")
                 for k, v in (d.get("model_aliases") or {}).items()
             },
             models=_str_list(d.get("models"), clean=True),
-            model_discovery=d.get("model_discovery", True),
+            model_discovery=d.get("model_discovery", False),
             model_discovery_excluded_models=_str_list(
                 d.get("model_discovery_excluded_models")
             ),
@@ -1543,6 +1658,14 @@ class TelegramConfig:
     #                         agent access for any Telegram user. A warning
     #                         is logged at startup.
     dm_policy: str = "pairing"
+    # On (the default), a Telegram *reply* is routed to the session that
+    # produced the replied-to message (and that session becomes active); a
+    # reply that can't be tied to a live session is refused with a hint rather
+    # than delivered to the active session. `/new <message>` is the escape
+    # hatch: it starts a fresh session with that message, reply or not. False
+    # restores the old behaviour: a reply is context-only — it quotes the
+    # replied-to message and lands in the active session, like a plain message.
+    reply_routes_to_origin_session: bool = True
     # Chats whose traffic feeds the inbox — see ChannelSourceConfig.
     source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
 
@@ -1588,6 +1711,9 @@ class TelegramConfig:
             allowed_users=d.get("allowed_users") or [],
             stream_mode=d.get("stream_mode", "partial"),
             dm_policy=dm_policy,
+            reply_routes_to_origin_session=d.get(
+                "reply_routes_to_origin_session", True,
+            ),
             source=ChannelSourceConfig.from_dict(
                 d.get("source", {}), subject="chats",
             ).outside_hosted_mode("chats"),
@@ -1750,6 +1876,28 @@ class SlackConfig:
             commands=_slack_commands(d.get("commands")),
             source=source,
         )
+
+
+@dataclass
+class EmailConfig:
+    """The email channel: mail that members of the agent send to its address.
+
+    Hosted mode only. The channel gateway delivers each member mail as an
+    event that starts or continues a session, and Nerve posts no answer: the
+    agent answers with a tool. The platform decides which mail reaches the
+    agent; ``enabled`` decides only whether Nerve takes it. The channel
+    exists when the ``channels.hosted`` settings are usable at startup, and
+    ``enabled`` is read for each event, so a reload switches it on or off.
+    Without usable ``channels.hosted`` settings, Nerve logs a warning and
+    registers no email channel. See docs/config.md "Email".
+    """
+
+    enabled: bool = False
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> EmailConfig:
+        return cls(enabled=d.get("enabled", False))
 
 
 @dataclass
@@ -2910,6 +3058,8 @@ class SessionsConfig:
     star_project_hook: bool = False  # opt-in; fire an internal agent turn on star/unstar transition
     # Rows per sidebar request; caps the conversation feed and sizes one lazy Archived/System page (0 = unlimited, starred exempt).
     sidebar_page_size: int = 50
+    # Days a pending plan puts its session in the sidebar's "Needs you" group, counted from the proposal (0 = no limit). The Plans page still lists older plans.
+    plan_attention_days: int = 7
 
     @classmethod
     @_coerced
@@ -2924,6 +3074,7 @@ class SessionsConfig:
             client_idle_timeout_minutes=d.get("client_idle_timeout_minutes", 60),
             star_project_hook=d.get("star_project_hook", False),
             sidebar_page_size=max(0, _lenient_int(d.get("sidebar_page_size"), 50)),
+            plan_attention_days=max(0, _lenient_int(d.get("plan_attention_days"), 7)),
         )
 
 
@@ -3074,12 +3225,53 @@ class SetupConfig:
         return cls(local_secrets=_as_local_secrets(d["local_secrets"]))
 
 
+#: ``notifications.levels`` values: a channel gets every item, or only the
+#: important ones (questions, approvals, and ``high`` or ``urgent`` items).
+NOTIFY_LEVEL_ALL = "all"
+NOTIFY_LEVEL_IMPORTANT = "important"
+NOTIFY_LEVELS = (NOTIFY_LEVEL_ALL, NOTIFY_LEVEL_IMPORTANT)
+_IMPORTANT_PRIORITIES = frozenset({"high", "urgent"})
+#: The channel that gets every item whatever its level: the panel is the record.
+NOTIFY_RECORD_CHANNEL = "web"
+#: The names ``notifications.channels`` can list (the channels the fan-out delivers to).
+NOTIFY_CHANNELS = (NOTIFY_RECORD_CHANNEL, "telegram", "slack")
+
+
+def level_wants(level: str, notif_type: str, priority: str) -> bool:
+    """Whether a channel at ``level`` gets an item of this type and priority:
+    ``important`` gets questions, approvals, and ``high`` or ``urgent`` items."""
+    if level != NOTIFY_LEVEL_IMPORTANT:
+        return True
+    return notif_type in ("question", "approval") or priority in _IMPORTANT_PRIORITIES
+
+
+def _notification_levels(raw: Any) -> dict[str, str]:
+    """``notifications.levels`` as ``{channel: level}``. An unknown level is
+    logged and read as ``all``, so a typo holds nothing back."""
+    if not isinstance(raw, dict):
+        if raw:
+            logger.warning("notifications.levels is not a mapping; every channel gets every item")
+        return {}
+    levels: dict[str, str] = {}
+    for channel, level in raw.items():
+        value = str(level or "").strip().lower()
+        if value not in NOTIFY_LEVELS:
+            logger.warning(
+                "notifications.levels.%s: unknown level %r, using %r", channel, level, NOTIFY_LEVEL_ALL,
+            )
+            value = NOTIFY_LEVEL_ALL
+        levels[str(channel)] = value
+    return levels
+
+
 @dataclass
 class NotificationsConfig:
     """Async notification delivery settings."""
     channels: list[str] = field(
         default_factory=lambda: ["web", "telegram", "slack"],
     )
+    # Per channel, ``all`` (the default) or ``important``: see :meth:`wants`.
+    levels: dict[str, str] = field(default_factory=dict)
     telegram_chat_id: int | None = None       # Target chat; falls back to first allowed_user
     # Opt-in, default off = backward compatible. When true AND telegram_chat_id
     # is a non-private group/supergroup, that chat is DELIVERY-ONLY: notifications
@@ -3100,11 +3292,29 @@ class NotificationsConfig:
     # from may be in any language. Unknown values fall back to English.
     date_locale: str = "en"
 
+    def delivery_channels(self) -> list[str]:
+        """``channels`` with the panel first when the list leaves it out. The
+        panel is the record and the place to answer, so a list written
+        without ``web`` (for example ``[telegram]``) still delivers there."""
+        channels = list(self.channels)
+        return channels if NOTIFY_RECORD_CHANNEL in channels else [NOTIFY_RECORD_CHANNEL, *channels]
+
+    def wants(self, channel: str, notif_type: str, priority: str) -> bool:
+        """Whether ``channel`` gets an item of this type and priority.
+
+        A channel at ``important`` gets questions, approvals, and ``high`` or
+        ``urgent`` items. The panel gets every item.
+        """
+        if channel == NOTIFY_RECORD_CHANNEL:
+            return True
+        return level_wants(self.levels.get(channel, NOTIFY_LEVEL_ALL), notif_type, priority)
+
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> NotificationsConfig:
         return cls(
             channels=d.get("channels", ["web", "telegram", "slack"]),
+            levels=_notification_levels(d.get("levels")),
             telegram_chat_id=d.get("telegram_chat_id"),
             delivery_only_sink=d.get("delivery_only_sink", False),
             slack_channel_id=str(d.get("slack_channel_id") or ""),
@@ -3309,6 +3519,30 @@ class McpEndpointConfig:
 
 
 @dataclass
+class McpAppsConfig:
+    """MCP Apps host (MCP extension ``io.modelcontextprotocol/ui``).
+
+    With ``enabled`` on, the web chat shows the interactive view that a tool
+    of a third-party MCP server links to, inside the message, and draws the
+    ```widget blocks of an answer. Both run in a frame whose document the
+    gateway serves from its own address with a policy that takes the
+    document's origin away, so that it shares none with the web UI (see
+    nerve/gateway/mcp_apps_sandbox.py). Views: Claude backend only. Off by
+    default; see docs/mcp-apps.md.
+
+    Not to be confused with :class:`McpServerConfig` (the servers themselves)
+    or :class:`McpEndpointConfig` (Nerve as an MCP server).
+    """
+
+    enabled: bool = False
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> McpAppsConfig:
+        return cls(enabled=d.get("enabled", False))
+
+
+@dataclass
 class ExternalAgentTargetConfig:
     """One configured external agent (Codex, Claude Code, ...).
 
@@ -3393,15 +3627,21 @@ _DEFAULT_CODEX_PRICING: dict[str, dict[str, float]] = {
     "gpt-5.6-luna":   {"input": 1.0,  "cached_input": 0.1,  "output": 6.0},
 }
 
-# Catalog entries the app-server hides from its default ``model/list``
-# (served only with ``includeHidden``) that Nerve still offers in the
-# picker when the authenticated account can reach them. GPT-6 Astra is
-# hidden upstream on purpose (API-key accounts; codex-cli 0.153.1+).
-_DEFAULT_CODEX_MODELS: tuple[str, ...] = ("gpt-6-astra",)
+# The OpenAI models of the composer's model menu when ``codex.models`` is
+# unset: the newest model of each tier, largest first. Update it when a tier
+# gets a new model. A model shows only when the account's catalog serves it,
+# hidden entries included: GPT-6 Astra is hidden upstream on purpose
+# (API-key accounts; codex-cli 0.153.1+).
+_DEFAULT_CODEX_MODELS: tuple[str, ...] = (
+    "gpt-6-astra",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+)
 
 
 def _codex_models(raw: Any) -> list[str]:
-    """``codex.models``: unset → built-in list; ``[]`` → offer none."""
+    """``codex.models``: unset → built-in list; ``[]`` → only ``codex.model``."""
     if raw is None:
         return list(_DEFAULT_CODEX_MODELS)
     if isinstance(raw, str):
@@ -3489,10 +3729,11 @@ class CodexConfig:
     home_dir: str = field(default_factory=lambda: str(paths.nerve_path("codex")))  # isolated CODEX_HOME (auth/config/sessions)
     model: str = "gpt-5.6-sol"
     cron_model: str = ""                    # empty → model
-    # Hidden catalog models to offer next to the visible ``model/list``
-    # (only when the live catalog serves them). Any model named here is
-    # also always accepted as a session model — the app-server stays the
-    # authority on whether a turn on it succeeds.
+    # OpenAI models in the web composer's model menu, in this order. Each
+    # shows only when the live catalog serves it (hidden entries included).
+    # ``model`` above is put first when the list does not name it. Any model
+    # named here is also always accepted as a session model: the app-server
+    # stays the authority on whether a turn on it succeeds.
     models: list[str] = field(default_factory=lambda: list(_DEFAULT_CODEX_MODELS))
     auth: str = "chatgpt"                   # chatgpt | api_key
     api_key: str = ""                       # literal key (config.local.yaml)
@@ -3949,6 +4190,23 @@ def default_timezone() -> str:
     return FALLBACK_TIMEZONE
 
 
+_MINUTES_PER_HOUR = 60
+
+
+def _as_clock_time(value: Any) -> Any:
+    """``quiet_start`` or ``quiet_end`` as ``HH:MM`` text.
+
+    YAML 1.1 reads an unquoted time that does not start with ``0`` as a
+    base-60 integer: ``22:00`` is 1320 (22 * 60 + 0), ``9:30`` is 570;
+    ``08:00`` stays text. This gives such an integer as ``HH:MM`` text (1320
+    is ``22:00``, 570 is ``09:30``). Any other value stays as it is.
+    """
+    if isinstance(value, int) and not isinstance(value, bool):
+        hours, minutes = divmod(value, _MINUTES_PER_HOUR)
+        return f"{hours:02d}:{minutes:02d}"
+    return value
+
+
 @dataclass
 class NerveConfig:
     workspace: Path = field(default_factory=paths.default_workspace)
@@ -3970,6 +4228,7 @@ class NerveConfig:
     agent: AgentConfig = field(default_factory=AgentConfig)
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     slack: SlackConfig = field(default_factory=SlackConfig)
+    email: EmailConfig = field(default_factory=EmailConfig)
     sync: SyncConfig = field(default_factory=SyncConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     cron: CronConfig = field(default_factory=CronConfig)
@@ -3991,6 +4250,7 @@ class NerveConfig:
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
     xmemory: XmemoryConfig = field(default_factory=XmemoryConfig)
     mcp_endpoint: McpEndpointConfig = field(default_factory=McpEndpointConfig)
+    mcp_apps: McpAppsConfig = field(default_factory=McpAppsConfig)
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
     # Base URL of the MCP gateway, without a trailing "/". In external mode
     # Nerve takes its MCP servers only from the gateway's catalog and does not
@@ -4082,6 +4342,13 @@ class NerveConfig:
         return self.ollama.enabled and self.proxy.enabled
 
     @property
+    def mcp_apps_active(self) -> bool:
+        """True when MCP Apps is enabled in the configuration. Whether the
+        gateway shows views is decided at its startup, in local mode only
+        (:func:`nerve.gateway.mcp_apps_sandbox.serves_sandbox`)."""
+        return bool(self.mcp_apps.enabled)
+
+    @property
     def outbound_channels(self) -> list[str]:
         """Transports an agent may post to unprompted.
 
@@ -4095,31 +4362,34 @@ class NerveConfig:
     def selectable_claude_models(
         self, discovered: list[str] | None = None,
     ) -> list[str]:
-        """Selectable Claude chat models for the composer's model picker.
+        """Selectable Claude chat models for the composer's model menu.
 
-        The configured default (``agent.model``) always leads; the rest come
-        from the first source that has anything to say:
+        The list comes from the first source that has anything to say:
 
-        1. ``agent.models`` — an explicit list always wins,
-        2. *discovered* — what the Anthropic Models API catalog advertises for
-           the configured credentials (see :mod:`nerve.models_catalog`; catalog
-           membership does not validate servability), minus any entry matching
+        1. ``agent.models``: an explicit list always wins,
+        2. *discovered*, only when ``agent.model_discovery`` is on: what the
+           Anthropic Models API catalog advertises for the configured
+           credentials (see :mod:`nerve.models_catalog`; catalog membership
+           does not validate servability), minus any entry matching
            ``agent.model_discovery_excluded_models``,
         3. the built-in :data:`DEFAULT_CLAUDE_MODELS` list.
 
+        The list keeps its order. The configured default (``agent.model``) is
+        put first when the list does not name it, so it is always offered.
+
         Bedrock model IDs are region-prefixed, so neither discovery nor the
-        bare built-ins apply there — Bedrock offers only configured models.
+        bare built-ins apply there. Bedrock offers only configured models.
 
         Exclusions apply at pick time to the *discovered* branch only, so a
         hot-reloaded pattern re-filters the cached catalog with no refetch, and
         the configured default / an explicit ``agent.models`` list are never
         filtered. If every discovered entry is excluded the result is just the
-        configured default — not a discovery failure, so it does not fall
-        through to the built-in list and re-introduce an excluded ID.
+        configured default. That is not a discovery failure, so it does not
+        fall through to the built-in list and re-introduce an excluded ID.
         """
         if self.agent.models:
             extras = list(self.agent.models)
-        elif discovered:
+        elif discovered and self.agent.model_discovery:
             extras = [
                 m for m in discovered
                 if not self.agent.is_model_discovery_excluded(m)
@@ -4130,15 +4400,65 @@ class NerveConfig:
             extras = list(DEFAULT_CLAUDE_MODELS)
 
         ordered: list[str] = []
-        for m in (self.agent.model, *extras):
+        for m in extras:
             if m and m not in ordered:
                 ordered.append(m)
+        if self.agent.model and self.agent.model not in ordered:
+            ordered.insert(0, self.agent.model)
         return ordered
 
     @property
     def claude_models(self) -> list[str]:
         """Config-only view of :meth:`selectable_claude_models` (no discovery)."""
         return self.selectable_claude_models()
+
+    def bedrock_region(self) -> str:
+        """The ``aws_region`` argument for Nerve's Bedrock SDK clients.
+
+        ``provider.aws_region`` when it is set. Else ``""``, which lets the
+        SDK find the region in ``AWS_REGION``, ``AWS_DEFAULT_REGION`` or the
+        AWS profile. When none of them gives a region, ``us-east-1``: the SDK
+        does not make a Bedrock client without a region.
+        """
+        if self.provider.aws_region:
+            return self.provider.aws_region
+        if os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"):
+            return ""
+        try:
+            import boto3
+
+            profile = self.provider.aws_profile or None
+            if boto3.Session(profile_name=profile).region_name:
+                return ""
+        except Exception:  # noqa: BLE001 - a profile that does not load gives no region
+            pass
+        return "us-east-1"
+
+    def anthropic_sdk_models(self) -> list[tuple[str, str]]:
+        """``(setting, model)`` for each model that Nerve's own calls use.
+
+        These calls go through the Anthropic Python SDK: session titles and
+        plan summaries, memory, source condensing, image description and the
+        prompt rewrite. The agent runs in the Claude CLI, which has its own
+        client, so ``agent.model`` is here only for the prompt rewrite.
+        """
+        models = [("agent.title_model", self.agent.title_model)]
+        if self.memory.backend == "memu":
+            models += [
+                ("memory.recall_model", self.memory.recall_model),
+                ("memory.memorize_model", self.memory.memorize_model),
+            ]
+        models.append(("memory.fast_model", self.memory.fast_model))
+        rewrite = self.agent.prompt_rewrite
+        if rewrite.enabled:
+            models.append(
+                ("agent.prompt_rewrite.model", rewrite.model) if rewrite.model
+                else ("agent.model (prompt rewrite)", self.agent.model)
+            )
+        imap = self.sync.imap
+        if imap.enabled and imap.vision.enabled and imap.vision.model:
+            models.append(("sync.imap.vision.model", imap.vision.model))
+        return models
 
     def _client_retry_kwargs(self, max_retries: int | None) -> dict[str, Any]:
         """The ``max_retries`` argument for an Anthropic client, if any.
@@ -4153,15 +4473,32 @@ class NerveConfig:
         return {}
 
     @staticmethod
-    def _client_header_kwargs(principal_id: str | None = None) -> dict[str, Any]:
+    def _client_header_kwargs(
+        principal_id: str | None = None, *, api: bool = False,
+    ) -> dict[str, Any]:
         """The ``default_headers`` argument for an Anthropic client, if any.
 
         In external mode, Nerve's own model calls name ``principal_id``, or
         the system actor of the server's database when it is ``None``, as the
         principal of the request, and never another principal from the
         environment (see :func:`nerve.inference_principal.direct_client_headers`).
+
+        ``api`` is true for a client of the Anthropic API or the proxy (not
+        Bedrock). Such a client sends the API key in ``Authorization``, and
+        also the lines of ``ANTHROPIC_CUSTOM_HEADERS``. A line replaces a
+        header of the same name. When the lines name ``X-Api-Key`` and not
+        ``Authorization``, the client sends no ``Authorization``, so the
+        request carries only the key of that line. When they name both, both
+        lines go out, and the configured key does not.
         """
         headers = direct_client_headers(principal_id=principal_id)
+        if (
+            api and has_custom_header_line("X-Api-Key")
+            and not has_custom_header_line("Authorization")
+        ):
+            from anthropic import omit
+
+            headers["Authorization"] = omit
         return {"default_headers": headers} if headers else {}
 
     def create_anthropic_client(
@@ -4186,11 +4523,12 @@ class NerveConfig:
         if self.provider.is_bedrock:
             from anthropic import AnthropicBedrock
             kwargs: dict[str, Any] = {
-                "timeout": timeout, **self._client_retry_kwargs(max_retries),
+                "timeout": timeout, **ANTHROPIC_CLIENT_OPTIONS,
+                **self._client_retry_kwargs(max_retries),
                 **self._client_header_kwargs(principal_id),
             }
-            if self.provider.aws_region:
-                kwargs["aws_region"] = self.provider.aws_region
+            if region := self.bedrock_region():
+                kwargs["aws_region"] = region
             if self.provider.aws_profile:
                 kwargs["aws_profile"] = self.provider.aws_profile
             if self.provider.aws_access_key_id:
@@ -4203,8 +4541,9 @@ class NerveConfig:
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
         kwargs = {
+            **ANTHROPIC_CLIENT_OPTIONS,
             **self._client_retry_kwargs(max_retries),
-            **self._client_header_kwargs(principal_id),
+            **self._client_header_kwargs(principal_id, api=True),
         }
         # The key the checks accept (config, else the environment). An explicit
         # ``api_key`` — ``""`` included — stops the SDK from reading the
@@ -4232,11 +4571,12 @@ class NerveConfig:
         if self.provider.is_bedrock:
             from anthropic import AsyncAnthropicBedrock
             kwargs: dict[str, Any] = {
-                "timeout": timeout, **self._client_retry_kwargs(max_retries),
+                "timeout": timeout, **ANTHROPIC_CLIENT_OPTIONS,
+                **self._client_retry_kwargs(max_retries),
                 **self._client_header_kwargs(principal_id),
             }
-            if self.provider.aws_region:
-                kwargs["aws_region"] = self.provider.aws_region
+            if region := self.bedrock_region():
+                kwargs["aws_region"] = region
             if self.provider.aws_profile:
                 kwargs["aws_profile"] = self.provider.aws_profile
             if self.provider.aws_access_key_id:
@@ -4248,8 +4588,9 @@ class NerveConfig:
         if base_url.endswith("/v1"):
             base_url = base_url[:-3]
         kwargs = {
+            **ANTHROPIC_CLIENT_OPTIONS,
             **self._client_retry_kwargs(max_retries),
-            **self._client_header_kwargs(principal_id),
+            **self._client_header_kwargs(principal_id, api=True),
         }
         return anthropic.AsyncAnthropic(
             api_key=self.resolve_anthropic_api_key(),  # see create_anthropic_client
@@ -4376,13 +4717,14 @@ class NerveConfig:
             timezone=d["timezone"] if "timezone" in d else default_timezone(),
             lockdown=locked,
             deployment=d.get("deployment", "server"),
-            quiet_start=d.get("quiet_start", "02:00"),
-            quiet_end=d.get("quiet_end", "08:00"),
+            quiet_start=_as_clock_time(d.get("quiet_start", "02:00")),
+            quiet_end=_as_clock_time(d.get("quiet_end", "08:00")),
             provider=ProviderConfig.from_dict(d.get("provider", {})),
             gateway=GatewayConfig.from_dict(d.get("gateway", {})),
             agent=AgentConfig.from_dict(d.get("agent", {})),
             telegram=TelegramConfig.from_dict(d.get("telegram", {}), locked=locked),
             slack=SlackConfig.from_dict(d.get("slack", {}), locked=locked),
+            email=EmailConfig.from_dict(d.get("email") or {}),
             sync=SyncConfig.from_dict(d.get("sync", {})),
             use_postgresql=d.get("use_postgresql", False),
             postgresql_dsn=d.get("postgresql_dsn", ""),
@@ -4408,6 +4750,7 @@ class NerveConfig:
             langfuse=LangfuseConfig.from_dict(d.get("langfuse", {})),
             xmemory=XmemoryConfig.from_dict(d.get("xmemory", {})),
             mcp_endpoint=McpEndpointConfig.from_dict(d.get("mcp_endpoint", {})),
+            mcp_apps=McpAppsConfig.from_dict(d.get("mcp_apps") or {}),
             mcp_servers=_parse_mcp_servers(d),
             mcp_gateway_url=_normalize_mcp_gateway_url(d.get("mcp_gateway_url")),
             external_agents=ExternalAgentsConfig.from_dict(d.get("external_agents", {})),

@@ -15,12 +15,18 @@ FAKE_CODEX_MODE env var:
                  only after the client answers
   resume_fail  — thread/resume|fork answer with a JSON-RPC error;
                  thread/start succeeds (resume-miss recovery path)
+  resume_gone  — thread/read answers, and thread/resume|fork answer that
+                 the thread is gone (resume-miss recovery after the read)
   resume_auth_fail — thread/read fails with a non-missing auth error;
                  the client must surface it and never start fresh
   interrupt    — turn runs "forever" until turn/interrupt, then emits
                  turn/completed with status=interrupted
   die_mid_turn — emits one delta then exits(1) mid-turn
   failed_turn  — emits an error notification then turn/completed(failed)
+  cyber_refusal — like failed_turn, with the error that Codex's cyber
+                 policy gives (codexErrorInfo "cyberPolicy")
+  metadata_update_fail — thread/metadata/update answers with a JSON-RPC
+                 error; everything else works
   big_line     — mcpToolCall item/completed whose result is ~2 MiB on a
                  single JSONL line (asyncio 64 KiB StreamReader-limit
                  regression: one large MCP response must not kill the
@@ -30,10 +36,29 @@ FAKE_CODEX_MODE env var:
   close_stdout_mid_turn — closes stdout mid-turn but KEEPS RUNNING
                  (reader-death liveness: is_alive() must flip False even
                  though the process is still up)
+  resume_usage — after the thread/resume response, sends the restored
+                 usage of the thread for an earlier turn; the turn then
+                 sends those counts again (a retry) before its one response
 
 The process also mirrors received config overrides (argv --config k=v)
 back in the initialize response under _fake.configOverrides so tests can
 assert what nerve sent (mcp_servers wiring etc.).
+
+FAKE_CODEX_ACCESS_PROGRAMS (a JSON object, model id → value) gives the
+named model/list entries an ``availableAccessPrograms`` of that value, as
+a newer codex-cli does (0.164). Unset, no entry has the key (the 0.153
+shape).
+
+FAKE_CODEX_SAVED_DAYBREAK (JSON: true, false or null) is what the thread
+of a thread/resume or thread/fork answer has saved as ``daybreakEnabled``
+(0.164). Unset, the thread has no such key (the 0.153 shape).
+
+FAKE_CODEX_VERSION is the version that ``--version`` reports (0.153.3
+when unset).
+
+Every request is appended to ``$CODEX_HOME/requests.jsonl`` as
+``{"method", "params"}``, so tests can assert what nerve sent and what it
+did not.
 """
 
 from __future__ import annotations
@@ -45,10 +70,12 @@ import threading
 import time
 
 if "--version" in sys.argv:
-    print("codex-cli 0.153.3")
+    print(f"codex-cli {os.environ.get('FAKE_CODEX_VERSION') or '0.153.3'}")
     raise SystemExit(0)
 
 MODE = os.environ.get("FAKE_CODEX_MODE", "basic")
+ACCESS_PROGRAMS = json.loads(os.environ.get("FAKE_CODEX_ACCESS_PROGRAMS") or "{}")
+SAVED_DAYBREAK = os.environ.get("FAKE_CODEX_SAVED_DAYBREAK")
 
 _out_lock = threading.Lock()
 _pending_approval_answer = threading.Event()
@@ -94,6 +121,21 @@ def _config_overrides() -> list[str]:
     return out
 
 
+def _log_request(method: str, params) -> None:
+    home = os.environ.get("CODEX_HOME")
+    if home:
+        with open(os.path.join(home, "requests.jsonl"), "a") as fh:
+            fh.write(json.dumps({"method": method, "params": params}) + "\n")
+
+
+def _resumed_thread(thread_id: str) -> dict:
+    """The thread of a thread/resume or thread/fork answer."""
+    thread: dict = {"id": thread_id}
+    if SAVED_DAYBREAK:
+        thread["daybreakEnabled"] = json.loads(SAVED_DAYBREAK)
+    return thread
+
+
 def _usage(turn_id: str, thread_id: str) -> None:
     notify("thread/tokenUsage/updated", {
         "threadId": thread_id, "turnId": turn_id,
@@ -111,6 +153,20 @@ def _usage(turn_id: str, thread_id: str) -> None:
             "modelContextWindow": 272000,
         },
     })
+
+
+def _tokens(inp: int, cached: int, out: int) -> dict:
+    return {"inputTokens": inp, "cachedInputTokens": cached,
+            "outputTokens": out, "reasoningOutputTokens": 0,
+            "totalTokens": inp + out}
+
+
+# resume_usage: the usage of the resumed thread at the end of its last turn.
+_RESTORED_USAGE = {
+    "total": _tokens(66_000_000, 64_000_000, 300_000),
+    "last": _tokens(132_000, 130_000, 40),
+    "modelContextWindow": 272000,
+}
 
 
 def _completed(turn_id: str, thread_id: str, status: str = "completed",
@@ -268,14 +324,33 @@ def run_turn(thread_id: str, turn_id: str) -> None:
         _completed(turn_id, thread_id, status="interrupted")
         return
 
-    if MODE == "failed_turn":
+    if MODE == "resume_usage":
+        notify("thread/tokenUsage/updated", {
+            "threadId": thread_id, "turnId": turn_id,
+            "tokenUsage": _RESTORED_USAGE,
+        })
+        notify("thread/tokenUsage/updated", {
+            "threadId": thread_id, "turnId": turn_id,
+            "tokenUsage": {
+                "total": _tokens(66_134_000, 64_131_000, 300_050),
+                "last": _tokens(134_000, 131_000, 50),
+                "modelContextWindow": 272000,
+            },
+        })
+        _completed(turn_id, thread_id)
+        return
+
+    if MODE in ("failed_turn", "cyber_refusal"):
+        error = {"message": "model exploded"}
+        if MODE == "cyber_refusal":
+            error = {"message": "This request was refused under the cyber policy.",
+                     "codexErrorInfo": "cyberPolicy", "additionalDetails": None}
         notify("error", {
             "threadId": thread_id, "turnId": turn_id,
-            "error": {"message": "model exploded"}, "willRetry": False,
+            "error": error, "willRetry": False,
         })
         _usage(turn_id, thread_id)
-        _completed(turn_id, thread_id, status="failed",
-                   error={"message": "model exploded"})
+        _completed(turn_id, thread_id, status="failed", error=error)
         return
 
     _usage(turn_id, thread_id)
@@ -303,6 +378,7 @@ def main() -> None:
 
         method = msg.get("method")
         req_id = msg.get("id")
+        _log_request(method, msg.get("params"))
 
         if method == "initialize":
             respond(req_id, {
@@ -346,6 +422,9 @@ def main() -> None:
             ]
             if not (msg.get("params") or {}).get("includeHidden"):
                 catalog = [m for m in catalog if not m["hidden"]]
+            for entry in catalog:
+                if entry["id"] in ACCESS_PROGRAMS:
+                    entry["availableAccessPrograms"] = ACCESS_PROGRAMS[entry["id"]]
             respond(req_id, {"data": catalog})
         elif method == "thread/read":
             if MODE == "resume_auth_fail":
@@ -358,14 +437,22 @@ def main() -> None:
             threads_started += 1
             respond(req_id, {"thread": {"id": f"th_fake_{threads_started}"}})
         elif method in ("thread/resume", "thread/fork"):
-            if MODE == "resume_fail":
+            if MODE in ("resume_fail", "resume_gone"):
                 respond_error(req_id, -32600, "no rollout found for thread")
             elif MODE == "resume_auth_fail":
                 respond_error(req_id, 401, "authentication expired")
             elif method == "thread/fork" and msg["params"].get("lastTurnId"):
-                respond(req_id, {"thread": {"id": "fork:" + msg["params"]["lastTurnId"]}})
+                respond(req_id, {
+                    "thread": _resumed_thread("fork:" + msg["params"]["lastTurnId"]),
+                })
             else:
-                respond(req_id, {"thread": {"id": msg["params"]["threadId"]}})
+                respond(req_id, {"thread": _resumed_thread(msg["params"]["threadId"])})
+                if MODE == "resume_usage" and method == "thread/resume":
+                    notify("thread/tokenUsage/updated", {
+                        "threadId": msg["params"]["threadId"],
+                        "turnId": "turn_old",
+                        "tokenUsage": _RESTORED_USAGE,
+                    })
         elif method == "turn/start":
             thread_id = msg["params"]["threadId"]
             turn_id = f"turn_{threads_started}_1"
@@ -383,6 +470,8 @@ def main() -> None:
         elif method == "turn/interrupt":
             respond(req_id, {})
             _interrupted.set()
+        elif method == "thread/metadata/update" and MODE == "metadata_update_fail":
+            respond_error(req_id, -32600, "thread metadata cannot be updated")
         else:
             respond(req_id, {})
 

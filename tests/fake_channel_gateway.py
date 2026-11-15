@@ -116,12 +116,26 @@ def gateway_negotiation(**limits: int) -> dict[str, Any]:
     }
 
 
-def capabilities(*, operations: list[str] | None = None, **limits: int) -> dict[str, Any]:
-    """The sample capabilities, with other operations or limits if given."""
+def capabilities(
+    *,
+    operations: list[str] | None = None,
+    provider: str | None = None,
+    behaviour: dict[str, str] | None = None,
+    **limits: int,
+) -> dict[str, Any]:
+    """The sample capabilities, with other operations, limits, provider, or behaviour if given.
+
+    Without a provider and a behaviour, the capabilities are those of a
+    gateway that announces neither.
+    """
     body = copy.deepcopy(CAPABILITIES)
     if operations is not None:
         body["operations"] = operations
     body["limits"].update(limits)
+    if provider is not None:
+        body["provider"] = provider
+    if behaviour is not None:
+        body["behaviour"] = behaviour
     return body
 
 
@@ -138,13 +152,17 @@ def message_event(
     event_id: str | None = None,
     connection_id: str = CONNECTION_ID,
     kind: str = "message",
+    provider: str = "slack",
+    reply_to: str | None = None,
 ) -> dict[str, Any]:
     """A message event in the shape of the contract samples, without a delivery.
 
     An invoke event gets the trigger that the contract's precedence selects,
-    as the gateway sets it.
+    as the gateway sets it. With *reply_to*, the event names that message as
+    the one that it replies to.
     """
     event = copy.deepcopy(MESSAGE_EVENT)
+    event["provider"] = provider
     event["kind"] = kind
     event["event_id"] = event_id or f"ev-{purpose}-{conversation}-{message_id}-{kind}"
     event["message_revision_id"] = f"revision:{message_id}:0"
@@ -154,6 +172,8 @@ def message_event(
     event["author"] = {"id": author, "kind": "human", "display_name": "Example Member"}
     if thread is not None:
         event["thread"] = {"id": thread}
+    if reply_to is not None:
+        event["reply_to"] = {"id": reply_to}
     content: list[dict[str, Any]] = []
     if mention_agent:
         content.append({"kind": "reference", "reference": {
@@ -700,10 +720,13 @@ class FakeStream:
         *,
         connection_id: str = CONNECTION_ID,
         operations: list[str] | None = None,
+        provider: str | None = None,
+        behaviour: dict[str, str] | None = None,
         **limits: int,
     ) -> None:
         await self.send(
-            "capabilities", capabilities(operations=operations, **limits),
+            "capabilities",
+            capabilities(operations=operations, provider=provider, behaviour=behaviour, **limits),
             connection_id=connection_id,
         )
 

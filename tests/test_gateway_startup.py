@@ -249,6 +249,30 @@ async def test_a_successful_startup_still_stops_everything_at_shutdown(harness):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enabled", "external", "said"),
+    [(True, False, [True]), (False, False, []), (True, True, [])],
+    ids=["enabled", "off", "enabled in external mode"],
+)
+async def test_mcp_apps_is_on_for_the_routes_only_where_the_gateway_serves_its_page(
+    harness, monkeypatch, enabled, external, said,
+):
+    """With ``mcp_apps.enabled``, in local mode, the lifespan tells the
+    routes that this gateway serves the sandbox document. Otherwise it says
+    nothing: the routes take the feature as off, and a startup that never
+    wired the routes still comes up."""
+    heard: list[bool] = []
+    monkeypatch.setattr(harness["server"], "set_mcp_apps_serving", heard.append)
+    monkeypatch.setattr("nerve.gateway.mcp_apps_sandbox.is_external_mode", lambda: external)
+    harness["config"].mcp_apps.enabled = enabled
+
+    async with harness["server"].lifespan(MagicMock()):
+        pass
+
+    assert heard == said
+
+
+@pytest.mark.asyncio
 async def test_a_failure_after_the_hosted_channels_start_stops_them(harness, monkeypatch):
     """Hosted channels that started are stopped when a later step fails."""
     import nerve.channels.hosted.runtime as hosted_module
@@ -299,6 +323,8 @@ async def test_hosted_source_deliveries_are_handed_to_the_cron_service(harness, 
     )
     monkeypatch.setattr(cron_module, "CronService", Cron)
     monkeypatch.setattr(harness["server"], "_hosted_channels", None)
+    # The usable hosted settings give the email channel too.
+    harness["engine"].router.get_channel.return_value = None
 
     async with harness["server"].lifespan(MagicMock()):
         runtime = harness["server"]._hosted_channels
@@ -326,6 +352,49 @@ async def test_hosted_channels_start_while_slack_is_switched_off(harness, monkey
         assert harness["server"]._hosted_channels is hosted
 
     assert hosted.stops == 1
+
+
+@pytest.mark.asyncio
+async def test_usable_hosted_settings_start_the_email_channel_while_email_is_off(harness, monkeypatch):
+    """A reload can switch email on only if its channel exists."""
+    from nerve.config import HostedChannelsConfig
+    from tests.fake_channel_gateway import FakeChannelGateway
+    from tests.test_hosted_channel_config import HOSTED
+
+    gateway = FakeChannelGateway(jwks_file=harness["config"].workspace.parent / "gateway-jwks.json")
+    harness["config"].channels.hosted = HostedChannelsConfig.from_dict(
+        {**HOSTED, "gateway_jwks_file": str(gateway.jwks_file)},
+    )
+    harness["engine"].router.get_channel.return_value = None
+    monkeypatch.setattr(harness["server"], "_hosted_channels", None)
+
+    async with harness["server"].lifespan(MagicMock()):
+        runtime = harness["server"]._hosted_channels
+        assert runtime is not None
+        assert (set(runtime.channels), runtime.sources) == ({"email"}, {})
+        harness["engine"].router.register.assert_called_once_with(runtime.channels["email"])
+
+
+@pytest.mark.asyncio
+async def test_email_without_hosted_settings_is_a_warning_and_starts_nothing(harness, monkeypatch, caplog):
+    import nerve.channels.hosted.runtime as hosted_module
+
+    hosted = _Recorder()
+    monkeypatch.setattr(hosted_module, "HostedChannelRuntime", lambda *a, **k: hosted)
+    monkeypatch.setattr(harness["server"], "_hosted_channels", None)
+    harness["config"].email.enabled = True
+
+    with caplog.at_level("WARNING", logger="nerve.gateway.server"):
+        async with harness["server"].lifespan(MagicMock()):
+            assert harness["server"]._hosted_channels is None
+
+    assert hosted.starts == 0
+    [warning] = [
+        record.getMessage() for record in caplog.records
+        if record.name == "nerve.gateway.server" and "email.enabled" in record.getMessage()
+    ]
+    assert warning.startswith("email.enabled is set, but mail comes only through the channel gateway")
+    assert "channels.hosted.gateway_jwks_file must name the gateway's public key file" in warning
 
 
 class _Reporter(_Recorder):

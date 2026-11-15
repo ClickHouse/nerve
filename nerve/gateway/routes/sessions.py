@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 from nerve.agent.backends.base import BackendError
+from nerve.agent.backends.codex import daybreak
 from nerve.agent.interactive import get_awaiting_ids
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
@@ -20,6 +21,14 @@ from nerve.gateway.routes._deps import get_deps
 from nerve.gateway.routes.files import session_upload_dir
 from nerve.identity import Actor, attribution_for
 from nerve.platform.activity import LEASE_MEMORIZE, keep_awake
+from nerve.session_origin import (
+    DETAIL_RUN_LATER,
+    TRIGGER_API,
+    TRIGGER_CHAT,
+    TRIGGER_CRON,
+    Origin,
+    origin_fields,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +101,10 @@ class SessionCreateRequest(BaseModel):
     # overrides on the WS path can still change it later.
     model: str | None = None
     cwd: str | None = None
+    # The Daybreak switch of a new Codex chat (the composer's toggle). Off
+    # when omitted; refused for another backend, and for a model without a
+    # Daybreak program for the signed-in Codex account.
+    codex_daybreak: bool | None = None
     # Optional review loop attached at creation: this session becomes the
     # loop's observer (milestones land here; cwd is the shared workspace).
     review_loop: ReviewLoopRequest | None = None
@@ -137,27 +150,177 @@ def _loop_summary(lp: dict) -> dict:
     }
 
 
-async def _attach_review_loops(deps, sessions: list[dict]) -> None:
-    """Stamp each observer session with its newest loop's summary — the
-    sidebar icon, status dot, and header chip rehydrate from this (the
+async def _newest_review_loops(deps) -> dict[str, dict]:
+    """``session_id -> newest loop`` of each observer session. The sidebar
+    icon, status dot, and header chip rehydrate from this (the
     review_loop_update WS event only covers the live tab)."""
     try:
         from nerve.workflows import get_review_loop_service
 
         if get_review_loop_service() is None:
-            return
-        loops = await deps.db.list_review_loops(limit=100)
+            return {}
+        recent = await deps.db.list_review_loops(limit=100)
+        # An open loop older than the recent ones can still wait for the
+        # user, so it counts too (oldest first, so reversed below).
+        open_loops = await deps.db.get_open_review_loops()
     except Exception:  # noqa: BLE001 — enrichment must never break listing
-        return
+        return {}
     newest: dict[str, dict] = {}
-    for lp in loops:  # newest first
+    for lp in [*recent, *reversed(open_loops)]:  # newest first
         sid = lp.get("session_id")
         if sid and sid not in newest:
             newest[sid] = lp
+    return newest
+
+
+def _plan_attention_since() -> str | None:
+    """Oldest proposal time of a plan that still counts as attention.
+
+    ``None`` when ``sessions.plan_attention_days`` is 0: every pending plan
+    counts. A plan waits on the Plans page for as long as it is pending,
+    but a session only stays in "Needs you" for this window, so plans that
+    nobody will review (an old cron proposal, a plan that the user approved
+    in a chat) do not hold sessions there for good.
+    """
+    days = get_config().sessions.plan_attention_days
+    if days <= 0:
+        return None
+    return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+
+async def _attention_map(deps, loops: dict[str, dict]) -> dict[str, dict]:
+    """``session_id -> attention`` for each session that waits for the user.
+
+    ``questions`` and ``approvals`` count pending ``ask_user`` and
+    ``propose_action`` notifications, ``plans`` counts the pending plans
+    that the session proposed in the last ``sessions.plan_attention_days``
+    days (all of them when the setting is 0), ``awaiting_input`` is a
+    question inside a running turn, and ``review`` is a newest review loop
+    that waits for a decision. A failed count leaves its fields at zero:
+    enrichment must never fail the listing.
+    """
+    try:
+        asks = await deps.db.count_pending_by_session()
+        plans = await deps.db.count_pending_plans_by_session(_plan_attention_since())
+    except Exception:  # noqa: BLE001 - enrichment must never break listing
+        logger.warning("attention counts failed", exc_info=True)
+        asks, plans = {}, {}
+    awaiting = get_awaiting_ids()
+    review = {sid for sid, lp in loops.items() if lp.get("status") == "awaiting_user"}
+    return {
+        sid: {
+            "questions": asks.get(sid, {}).get("question", 0),
+            "approvals": asks.get(sid, {}).get("approval", 0),
+            "plans": plans.get(sid, 0),
+            "awaiting_input": sid in awaiting,
+            "review": sid in review,
+        }
+        for sid in asks.keys() | plans.keys() | awaiting | review
+    }
+
+
+# The ``attention`` of a session that waits for nothing.
+_NO_ATTENTION = {
+    "questions": 0, "approvals": 0, "plans": 0, "awaiting_input": False, "review": False,
+}
+
+
+async def _attach_origins(deps, sessions: list[dict]) -> None:
+    """Stamp each row with ``trigger``, ``origin_label`` and ``origin_detail``.
+
+    A row from before the trigger column gets a derived origin, which also
+    reads the row's channel mapping.
+    """
+    legacy = [s["id"] for s in sessions if not s.get("trigger")]
+    try:
+        channel_keys = await deps.db.channel_keys_for_sessions(legacy)
+    except Exception:  # noqa: BLE001 - enrichment must never break listing
+        channel_keys = {}
     for s in sessions:
-        lp = newest.get(s["id"])
-        if lp:
-            s["review_loop"] = _loop_summary(lp)
+        s.update(origin_fields(s, channel_keys.get(s["id"])))
+
+
+def _is_codex(session: dict) -> bool:
+    """Whether a session row is a Codex chat. The backend is on the row, and
+    stays what it is for the life of the session."""
+    return session.get("backend") == "codex"
+
+
+def _stamp_daybreak(session: dict) -> dict:
+    """Add ``codex_daybreak``, the chat's Daybreak switch, to the payload of
+    a Codex session. The payload of another backend's session stays as it
+    is: such a session has no switch."""
+    if _is_codex(session):
+        session["codex_daybreak"] = daybreak.enabled(session)
+    return session
+
+
+async def _daybreak_programs(deps) -> dict[str, str] | None:
+    """Model id → Daybreak program of the signed-in Codex account, from the
+    Codex backend's (cached) preflight of the live catalog. ``None`` when the
+    catalog cannot be read now."""
+    backend = deps.engine._backends.get("codex")
+    preflight = await backend.preflight() if backend is not None else {}
+    if not preflight.get("available"):
+        return None
+    return dict(preflight.get("daybreak_programs") or {})
+
+
+async def _validate_daybreak(deps, codex: bool, model: str, enabled: bool) -> None:
+    """Refuse a Daybreak switch that cannot work: any value for a session of
+    another backend (400), and on for a model that has no program for the
+    signed-in Codex account (400), or while nothing can tell (503)."""
+    if not codex:
+        raise HTTPException(
+            status_code=400,
+            detail="Daybreak is only available for Codex sessions",
+        )
+    if not enabled:
+        return
+    programs = await _daybreak_programs(deps)
+    if programs is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Daybreak cannot be turned on: Codex is unavailable",
+        )
+    if model not in programs:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Daybreak cannot be turned on: {daybreak.no_program(model)}",
+        )
+
+
+async def _daybreak_change(
+    deps, session: dict, req: dict, new_model: str | None,
+) -> tuple[bool | None, str | None]:
+    """What an update does to a chat's Daybreak switch: ``(value, notice)``.
+
+    ``value`` is the switch after the update, or ``None`` when it stays as it
+    is. A request for the switch is validated against the model that the
+    session has after the update. A model change alone keeps the switch,
+    unless the catalog shows no program for the new model: then the switch
+    goes off, and ``notice`` says so.
+    """
+    if "codex_daybreak" in req:
+        wanted = req["codex_daybreak"]
+        if not isinstance(wanted, bool):
+            raise HTTPException(
+                status_code=400, detail="codex_daybreak must be true or false",
+            )
+        codex = _is_codex(session)
+        model = new_model or session.get("model")
+        if not model and codex and "codex" in deps.engine._backends:
+            # No model on the row yet: the engine takes the backend's default.
+            model = deps.engine._backends["codex"].default_model(
+                session.get("source") or "web",
+            )
+        await _validate_daybreak(deps, codex, model or "", wanted)
+        return (wanted if wanted != daybreak.enabled(session) else None), None
+    if new_model and _is_codex(session) and daybreak.enabled(session):
+        programs = await _daybreak_programs(deps)
+        if programs is not None and new_model not in programs:
+            return False, f"Daybreak was turned off: {daybreak.no_program(new_model)}."
+    return None, None
 
 
 def _page_size() -> int | None:
@@ -180,18 +343,30 @@ async def _pending_wakeup_map(deps) -> dict[str, dict]:
     return {r["session_id"]: r for r in rows if r.get("session_id")}
 
 
-async def _decorate(deps, sessions: list[dict]) -> list[dict]:
-    """Attach the live per-row bits every sidebar list needs."""
+async def _decorate(deps, sessions: list[dict], *, add_needs_you: bool = False) -> list[dict]:
+    """Attach the live per-row bits every sidebar list needs.
+
+    With ``add_needs_you``, first append to ``sessions`` each non-archived
+    session of any source that waits for the user and is not in the list,
+    so that the sidebar's "Needs you" group is complete.
+    """
+    loops = await _newest_review_loops(deps)
+    attention = await _attention_map(deps, loops)
+    if add_needs_you:
+        listed = {s["id"] for s in sessions}
+        sessions += await deps.db.list_unarchived_sessions(
+            [sid for sid in attention if sid not in listed],
+        )
     running_ids = deps.engine.sessions.get_running_ids()
-    awaiting_ids = get_awaiting_ids()
     # Pending work: no turn is in flight, yet the session isn't idle either —
     # a wakeup is scheduled, or a background task is still running inside its
     # CLI. The sidebar keeps those parked sessions in the "Running" group
     # (with their own dot colour) instead of dropping them to idle.
     wakeups = await _pending_wakeup_map(deps)
     for s in sessions:
+        s["attention"] = dict(attention.get(s["id"], _NO_ATTENTION))
         s["is_running"] = s["id"] in running_ids
-        s["awaiting_input"] = s["id"] in awaiting_ids
+        s["awaiting_input"] = s["attention"]["awaiting_input"]
         wakeup = wakeups.get(s["id"]) or {}
         s["pending_wakeup_at"] = wakeup.get("fire_at")
         # Who scheduled the wakeup (a person, or the system actor for the
@@ -201,7 +376,10 @@ async def _decorate(deps, sessions: list[dict]) -> list[dict]:
         s["has_background_tasks"] = deps.engine.has_live_background_tasks(s["id"])
         # How many agents still run (the sidebar's count).
         s["background_count"] = _background_count(deps, s["id"], s["has_background_tasks"])
-    await _attach_review_loops(deps, sessions)
+        if s["id"] in loops:
+            s["review_loop"] = _loop_summary(loops[s["id"]])
+        _stamp_daybreak(s)
+    await _attach_origins(deps, sessions)
     return sessions
 
 
@@ -226,13 +404,13 @@ def _page_meta(page: list[dict], offset: int, total: int, limit: int | None) -> 
 
 @router.get("/api/sessions")
 async def list_sessions(offset: int = 0, actor: Actor = Depends(require_auth)):
-    """Sidebar feed: one page of conversations, plus every starred session (starred ride along in full on offset=0)."""
+    """Sidebar feed: one page of conversations. On offset=0 every starred session and every session that needs the user (any source) ride along in full."""
     deps = get_deps()
     limit = _page_size()
     page = await deps.engine.sessions.list_conversation_sessions(limit=limit, offset=offset)
     total = await deps.engine.sessions.count_conversation_sessions()
     sessions = page if offset else await deps.engine.sessions.list_starred_sessions() + page
-    await _decorate(deps, sessions)
+    await _decorate(deps, sessions, add_needs_you=not offset)
     return {
         "sessions": sessions,
         "archived_count": await deps.engine.sessions.count_archived_sessions(),
@@ -324,15 +502,22 @@ async def create_session(req: SessionCreateRequest, actor: Actor = Depends(requi
             except BackendError as e:
                 raise HTTPException(status_code=400, detail=str(e)) from e
     model = requested_model or selected_backend.default_model(req.source)
+    if req.codex_daybreak is not None:
+        await _validate_daybreak(deps, backend == "codex", model, req.codex_daybreak)
+        if req.codex_daybreak:
+            metadata = {**(metadata or {}), daybreak.METADATA_KEY: True}
     session_id = str(uuid.uuid4())[:8]
     session = await deps.engine.sessions.get_or_create(
         session_id, title=req.title, source=req.source, metadata=metadata,
         backend=backend, model=model, cwd=cwd,
         actor=actor,
+        # The web UI sends no source. Another value is a REST caller.
+        origin=Origin(TRIGGER_CHAT if req.source == "web" else TRIGGER_API),
     )
     if req.review_loop is not None:
         session = await _attach_review_loop(deps, session, session_id, cwd, req, actor)
-    return session
+    await _attach_origins(deps, [session])
+    return _stamp_daybreak(session)
 
 
 async def _attach_review_loop(
@@ -397,7 +582,8 @@ async def get_session(session_id: str, actor: Actor = Depends(require_auth)):
     session = await deps.db.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    return session
+    await _attach_origins(deps, [session])
+    return _stamp_daybreak(session)
 
 
 @router.get("/api/sessions/{session_id}/messages")
@@ -445,7 +631,8 @@ async def _would_create_cycle(db, child_id: str, new_parent_id: str) -> bool:
 
 @router.patch("/api/sessions/{session_id}")
 async def update_session(session_id: str, req: dict, actor: Actor = Depends(require_auth)):
-    """Update session fields (title, starred, model, parent_session_id).
+    """Update session fields (title, starred, model, parent_session_id,
+    codex_daybreak).
 
     ``parent_session_id`` is the sidebar drag-to-nest relationship (null clears
     it → top-level). It is display-only: guarded against self/cycle links and
@@ -455,6 +642,12 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
     per-chat, not a global preference. The engine re-reads the session
     row each turn (per-message override -> ``sessions.model`` -> backend
     default), so the switch takes effect on the session's next message.
+
+    ``codex_daybreak`` sets the Daybreak switch of a Codex chat for its next
+    message (400 for another backend, and for turning it on with a model that
+    has no Daybreak program for the signed-in Codex account). A ``model``
+    change to a model without a program turns the switch off; the response
+    then carries ``codex_daybreak_notice``.
 
     When ``sessions.star_project_hook`` is enabled (default off), a ``starred``
     0<->1 transition fires a one-shot internal turn in that same session so the
@@ -471,6 +664,7 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
     fields: dict = {}
     if "title" in req:
         fields["title"] = req["title"]
+        fields["title_source"] = "manual"
     if "starred" in req:
         fields["starred"] = 1 if req["starred"] else 0
     if "model" in req:
@@ -515,32 +709,13 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
                 raise HTTPException(status_code=400, detail="A session cannot be its own parent")
             if not await deps.db.get_session(new_parent):
                 raise HTTPException(status_code=404, detail="Parent session not found")
-            # Fork-window guard: the engine reads parent_session_id to fork a
-            # brand-new session's first turn ONLY while status == 'created'.
-            # Refuse to set a parent in that window so a display drag can never
-            # turn a not-yet-started session into a fork. Anything already run
-            # (everything draggable in the sidebar) is unaffected.
-            if session.get("status") == "created":
-                raise HTTPException(
-                    status_code=409,
-                    detail="Send a first message before nesting this session",
-                )
             if await _would_create_cycle(deps.db, session_id, new_parent):
                 raise HTTPException(status_code=400, detail="That drop would create a cycle")
-        elif (
-            session.get("status") == "created"
-            and session.get("parent_session_id")
-        ):
-            # Symmetric fork-window guard: clearing the parent of a
-            # not-yet-started fork would silently discard the fork context
-            # its first turn is about to branch from.
-            raise HTTPException(
-                status_code=409,
-                detail="This fork hasn't started yet — send its first "
-                       "message before un-nesting it",
-            )
+        # Display only: a fork branches from the source that fork_session
+        # stored on its row, not from its parent.
         fields["parent_session_id"] = new_parent
-    if not fields:
+    switch, notice = await _daybreak_change(deps, session, req, fields.get("model"))
+    if not fields and "codex_daybreak" not in req:
         raise HTTPException(status_code=400, detail="No valid fields to update")
     old_starred = int(session.get("starred") or 0)
     attribution = attribution_for(actor)
@@ -554,11 +729,15 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
             fields["status"] = "idle"
             fields["archived_at"] = None
     await deps.db.change_session_fields(session_id, fields, attribution=attribution)
+    if switch is not None:
+        await deps.engine.set_session_daybreak(session_id, switch)
     updated = await deps.db.get_session(session_id)
     # Star = opt-in project registration (sessions.star_project_hook, default
-    # off). On a starred transition fire a one-shot internal turn.
+    # off). On a starred transition fire a one-shot internal turn. An
+    # archived session runs no turn (unstarring keeps it archived).
     if (get_config().sessions.star_project_hook and "starred" in fields
-            and deps.engine and fields["starred"] != old_starred):
+            and deps.engine and fields["starred"] != old_starred
+            and (updated or {}).get("status") != "archived"):
         promoted = fields["starred"] == 1
         trigger = (
             "[system:star-promote] This session was just STARRED, which registers it as a "
@@ -582,7 +761,26 @@ async def update_session(session_id: str, req: dict, actor: Actor = Depends(requ
             )
         except Exception as e:  # a hook failure must never break the PATCH
             logger.warning("star-project hook failed for %s: %s", session_id, e)
+    if updated:
+        _stamp_daybreak(updated)
+        if notice:
+            updated["codex_daybreak_notice"] = notice
     return updated
+
+
+@router.post("/api/sessions/{session_id}/regenerate-title")
+async def regenerate_session_title(session_id: str, actor: Actor = Depends(require_auth)):
+    """Retitle the session from its first request and its last reply, with
+    ``agent.title_model``, replacing whatever title it has."""
+    deps = get_deps()
+    if not await deps.db.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    title = await deps.engine.regenerate_session_title(
+        session_id, attribution=attribution_for(actor),
+    )
+    if not title:
+        raise HTTPException(status_code=502, detail="No title could be made")
+    return {"title": title}
 
 
 @router.delete("/api/sessions/{session_id}")
@@ -592,53 +790,77 @@ async def delete_session(session_id: str, actor: Actor = Depends(require_auth)):
     db = deps.db
 
     if engine:
-        # Disconnect client
-        client = engine.sessions.remove_client(session_id, reason="deleted")
-        if client:
-            try:
-                await client.disconnect()
-            except Exception:
-                pass
-        # Drop the session's agent records, queued writes and pending emits
-        # before the rows go (a write already in flight fails the foreign key
-        # and is dropped).
-        agents = getattr(engine, "agents", None)
-        if agents is not None:
-            await agents.forget_session(session_id)
-        # Snapshot messages for background memorization before deleting
-        session = await db.get_session(session_id)
-        connected_at = session.get("connected_at") if session else None
-        messages = await db.get_messages(session_id, limit=10000) if connected_at else []
-        # Delete from DB immediately (fast). The delete is recorded with
-        # the person, because the session's own events go with it.
-        await db.delete_session(session_id, attribution=attribution_for(actor))
-        # Cleanup uploaded files for this session
-        await _cleanup_uploaded_files(db, session_id)
-        # Memorize in background from snapshot
-        if messages and connected_at and engine._memory_bridge and engine._memory_bridge.available:
-            async def _bg_memorize():
-                try:
-                    context_msgs = []
-                    for msg in messages:
-                        created = msg.get("created_at", "")
-                        if created:
-                            norm = created if "T" in created else created.replace(" ", "T") + "Z"
-                            if norm >= connected_at:
-                                context_msgs.append(msg)
-                    if context_msgs:
-                        with keep_awake(LEASE_MEMORIZE):
-                            await engine._memory_bridge.memorize_conversation(
-                                session_id, context_msgs,
-                            )
-                        # Same window to xmemory (opt-in, fire-and-forget).
-                        engine.schedule_xmemory_transcript(session_id, context_msgs)
-                except Exception as e:
-                    logger.warning("Background memorize for deleted session %s failed: %s", session_id, e)
-            asyncio.create_task(_bg_memorize())
+        # A turn that runs or waits would write into the deleted rows, or
+        # create the session again. The person stops it first.
+        if engine.sessions.has_turn_work(session_id):
+            raise HTTPException(status_code=409, detail=_DELETE_BUSY_DETAIL)
+        with engine.sessions.closing(session_id, "deleted"):
+            await _delete_with_engine(engine, db, session_id, actor)
     else:
         await db.delete_session(session_id, attribution=attribution_for(actor))
         await _cleanup_uploaded_files(db, session_id)
     return {"deleted": True}
+
+
+_DELETE_BUSY_DETAIL = (
+    "The session is running or has queued messages. Stop it, then delete it."
+)
+
+
+async def _delete_with_engine(engine, db, session_id: str, actor: Actor) -> None:
+    """Delete a session that has no turn work: its client, agent records,
+    rows and uploads; memorize it from a snapshot; expire its questions."""
+    # Disconnect client
+    client = engine.sessions.remove_client(session_id, reason="deleted")
+    if client:
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+    # Drop the session's agent records, queued writes and pending emits
+    # before the rows go (a write already in flight fails the foreign key
+    # and is dropped).
+    agents = getattr(engine, "agents", None)
+    if agents is not None:
+        await agents.forget_session(session_id)
+    # Snapshot messages for background memorization before deleting
+    session = await db.get_session(session_id)
+    connected_at = session.get("connected_at") if session else None
+    messages = await db.get_messages(session_id, limit=10000) if connected_at else []
+    # Delete from DB immediately (fast). The delete is recorded with
+    # the person, because the session's own events go with it.
+    await db.delete_session(session_id, attribution=attribution_for(actor))
+    # Cleanup uploaded files for this session
+    await _cleanup_uploaded_files(db, session_id)
+    # Memorize in background from snapshot
+    if messages and connected_at and engine._memory_bridge and engine._memory_bridge.available:
+        async def _bg_memorize():
+            try:
+                context_msgs = []
+                for msg in messages:
+                    created = msg.get("created_at", "")
+                    if created:
+                        norm = created if "T" in created else created.replace(" ", "T") + "Z"
+                        if norm >= connected_at:
+                            context_msgs.append(msg)
+                if context_msgs:
+                    with keep_awake(LEASE_MEMORIZE):
+                        await engine._memory_bridge.memorize_conversation(
+                            session_id, context_msgs,
+                        )
+                    # Same window to xmemory (opt-in, fire-and-forget).
+                    engine.schedule_xmemory_transcript(session_id, context_msgs)
+            except Exception as e:
+                logger.warning("Background memorize for deleted session %s failed: %s", session_id, e)
+        asyncio.create_task(_bg_memorize())
+    # No question stays answerable for a deleted session. The rows stay
+    # as history.
+    try:
+        await engine.expire_session_questions(session_id)
+    except Exception as e:
+        logger.warning(
+            "Expire questions of deleted session %s failed: %s", session_id, e,
+        )
 
 
 @router.get("/api/sessions/{session_id}/status")
@@ -678,7 +900,8 @@ async def fork_session(req: ForkRequest, actor: Actor = Depends(require_auth)):
             req.source_session_id, req.at_message_id, req.title,
             actor=actor,
         )
-        return fork
+        await _attach_origins(deps, [fork])
+        return _stamp_daybreak(fork)
     except ValueError as e:
         status = 404 if "not found" in str(e).lower() else 409
         raise HTTPException(status_code=status, detail=str(e))
@@ -713,6 +936,12 @@ async def run_later(req: RunLaterRequest, actor: Actor = Depends(require_auth)):
     message = (req.message or "").strip()
     if not message and not req.file_ids:
         raise HTTPException(status_code=400, detail="Nothing to defer")
+    if deps.engine:
+        # The person's own message into an archived session opens it again,
+        # so that the deferred turn can run.
+        await deps.engine.reopen_archived(
+            req.session_id, attribution=attribution_for(actor),
+        )
 
     delay = (req.delay or "none").strip().lower()
     if delay != "none" and delay not in _RUN_LATER_TIMED:
@@ -720,6 +949,15 @@ async def run_later(req: RunLaterRequest, actor: Actor = Depends(require_auth)):
             status_code=400,
             detail=f"Unknown delay {delay!r} (want one of: 30m, 1h, 24h, none)",
         )
+    # The panel creates an empty session for each deferred prompt. With a
+    # timed option its first turn comes from the schedule, so a session
+    # without messages gets the cron trigger. With "none" the person runs the
+    # turn from the chat, so it gets the trigger of a web chat.
+    await deps.db.set_session_origin(
+        req.session_id,
+        Origin(TRIGGER_CRON, {DETAIL_RUN_LATER: delay}) if delay in _RUN_LATER_TIMED
+        else Origin(TRIGGER_CHAT),
+    )
 
     # Pending user message — mirror the block shape a normal send persists:
     # a text block plus one block per uploaded attachment. Resolve file_ids
@@ -812,7 +1050,7 @@ async def resume_session(session_id: str, actor: Actor = Depends(require_auth)):
         session = await deps.engine.resume_session(
             session_id, attribution=attribution_for(actor),
         )
-        return session
+        return _stamp_daybreak(session) if session else session
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -993,6 +1231,21 @@ async def chat(req: MessageRequest, actor: Actor = Depends(require_auth)):
     if session_id is None:
         session_id = await deps.engine.sessions.get_active_session(
             "api:default", source="api", actor=actor,
+        )
+    elif (
+        deps.engine.accepting_turns
+        and await deps.db.closed_session_reason(session_id) != "deleted"
+    ):
+        # A new session id from the caller: a session of the API. A draining
+        # engine creates nothing: run() refuses the turn with a 503. The id of
+        # a deleted session creates nothing either: run() refuses it with a
+        # 409.
+        await deps.engine.sessions.get_or_create(
+            session_id, source="web", actor=actor, origin=Origin(TRIGGER_API),
+        )
+        # The caller's own message into an archived session opens it again.
+        await deps.engine.reopen_archived(
+            session_id, attribution=attribution_for(actor),
         )
     response = await deps.engine.run(
         session_id=session_id,

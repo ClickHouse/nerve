@@ -69,7 +69,7 @@ TASK_CREATE_SCHEMA = {
         },
         "confirm_duplicate": {
             "type": "boolean",
-            "description": "Set to true to force creation even when duplicates exist",
+            "description": "Create even though a task with the same source_url or a nearly identical title exists (the refusal lists them)",
             "default": False,
         },
     },
@@ -482,6 +482,24 @@ READ_SOURCE_SCHEMA = {
 
 # ----- Plan tools -----
 
+#: The plan summary, the text that the plan page shows under the title. The
+#: handlers clip a longer one. The schema has no ``maxLength``: the MCP
+#: endpoint checks arguments against it, and a long summary must not refuse
+#: the whole plan.
+PLAN_SUMMARY_MAX_CHARS = 400
+
+PLAN_SUMMARY_PROPERTY = {
+    "type": "string",
+    "description": (
+        f"Optional, recommended. At most {PLAN_SUMMARY_MAX_CHARS} characters, "
+        "up to 3 short plain-text lines for the reviewer: "
+        "what the plan changes, where (repositories, number of PRs), and what it "
+        "will need from the user later. Shown under the plan title. Without it, "
+        "the page shows the first lines of the plan."
+    ),
+    "default": "",
+}
+
 PLAN_PROPOSE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -492,6 +510,7 @@ PLAN_PROPOSE_SCHEMA = {
             "description": "Plan type: 'generic' (default), 'skill-create', 'skill-update'. Auto-detected from task source if omitted.",
             "default": "",
         },
+        "summary": PLAN_SUMMARY_PROPERTY,
     },
     "required": ["task_id", "content"],
 }
@@ -506,6 +525,7 @@ PLAN_UPDATE_SCHEMA = {
             "description": "Optional reason for the revision — stored on the superseded plan",
             "default": "",
         },
+        "summary": PLAN_SUMMARY_PROPERTY,
     },
     "required": ["plan_id", "content"],
 }
@@ -515,7 +535,7 @@ PLAN_LIST_SCHEMA = {
     "properties": {
         "status": {
             "type": "string",
-            "description": "Filter by status: 'pending', 'approved', 'declined', 'implementing', 'superseded', or empty for pending+implementing",
+            "description": "Filter by status: 'pending', 'approved', 'declined', 'implementing', 'superseded', 'closed' (closed with its task, undecided), or empty for pending+implementing",
             "default": "",
         },
     },
@@ -539,6 +559,17 @@ PLAN_APPROVE_SCHEMA = {
         "plan_id": {
             "type": "string",
             "description": "The plan ID to approve (e.g. plan-abc12345)",
+        },
+        "implement_here": {
+            "type": "boolean",
+            "description": (
+                "Set true when the user approved the plan in this conversation and "
+                "this session does the work. The plan is recorded as approved and "
+                "linked to this session, and no new session starts. A task in "
+                "plan_review goes to in_progress; any other task status does not "
+                "change. It also takes a plan that was closed with its task, when "
+                "the task is done. Default false: start a new implementation session."
+            ),
         },
     },
     "required": ["plan_id"],
@@ -658,6 +689,11 @@ SKILL_UPDATE_SCHEMA = {
 ONBOARDING_DONE_SCHEMA = {"type": "object", "properties": {}, "required": []}
 
 
+# What the widgets of the calling session's chat saved. No argument: a tool
+# call cannot name another chat.
+WIDGET_STATE_SCHEMA = {"type": "object", "properties": {}, "required": []}
+
+
 NOTIFY_SCHEMA = {
     "type": "object",
     "properties": {
@@ -699,9 +735,19 @@ ASK_USER_SCHEMA = {
             "default": "",
         },
         "options": {
-            "type": "string",
-            "description": "Predefined answer options (shown as buttons). Comma-separated string or JSON array. Optional — user can always type free text.",
-            "default": "",
+            # A string stays valid for callers that send a JSON array as
+            # text or a comma-separated list; the handler parses both.
+            "anyOf": [
+                {"type": "array", "items": {"type": "string"}},
+                {"type": "string"},
+            ],
+            "description": (
+                "Answer options, one button each. Send an array of strings, "
+                'for example ["Yes, all of these", "No"]. End the option you '
+                'recommend with "(recommended)" to show it first. Optional: '
+                "the person can always type their own answer."
+            ),
+            "default": [],
         },
         "wait": {
             "type": "string",

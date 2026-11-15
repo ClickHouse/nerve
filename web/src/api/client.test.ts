@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from 'vitest';
 import type { ReviewLoopDecisionResult } from './client';
 
 // Node can expose a non-jsdom localStorage. Install the storage the client
@@ -41,7 +41,7 @@ function response(status: number, refreshedToken?: string): Response {
 }
 
 let fetchMock: ReturnType<typeof vi.fn>;
-let unauthorized: ReturnType<typeof vi.fn>;
+let unauthorized: Mock<() => void>;
 
 beforeEach(() => {
   data.clear();
@@ -145,6 +145,26 @@ describe('local requests', () => {
 
     expect(useHostedStore.getState().mode).toBe('local');
     expect(useHostedStore.getState().problem).toBeNull();
+  });
+});
+
+describe('the Daybreak switch', () => {
+  const body = (call: number) => JSON.parse(fetchMock.mock.calls[call][1].body as string);
+
+  it('goes into the session requests only when it is used', async () => {
+    fetchMock.mockImplementation(async () => response(200));
+
+    await api.createSession(undefined, 'codex', undefined, null, 'gpt-6-sol');
+    await api.createSession(undefined, 'codex', undefined, null, 'gpt-6-sol', false);
+    await api.createSession(undefined, 'codex', undefined, null, 'gpt-6-sol', true);
+    await api.updateSession('s1', { codex_daybreak: false });
+
+    // Off: the request that creates a chat is the one it always was.
+    expect(body(0)).toEqual({ backend: 'codex', model: 'gpt-6-sol' });
+    expect(body(1)).toEqual(body(0));
+    expect(body(2)).toEqual({ backend: 'codex', model: 'gpt-6-sol', codex_daybreak: true });
+    expect(fetchMock.mock.calls[3][0]).toBe('/api/sessions/s1');
+    expect(body(3)).toEqual({ codex_daybreak: false });
   });
 });
 

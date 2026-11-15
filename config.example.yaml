@@ -57,19 +57,21 @@ timezone: America/New_York
 # Agent
 agent:
   model: claude-opus-5-5         # Primary model for conversations (Nerve's default)
-  # Use claude-fable-5-1 for Anthropic's newest generation (Mythos-class).
-  # Note: ~2x the cost of Opus ($10/$50 per MTok in/out).
+  # Use claude-fable-5-2 for Anthropic's newest generation (Mythos-class).
+  # Note: 2x the cost of Opus 5.5 ($8/$40 per MTok in/out).
   cron_model: claude-sonnet-5-5  # Cheaper model for cron jobs
   title_model: claude-haiku-5-5  # Session title generation
+  # outcome_titles: false        # Keep the first-message title instead of renaming once the first answer ends
   # Model-alias remapping for the CLI: short aliases ("opus") used in
   # Agent/Workflow tool model options and skill frontmatter resolve to the
-  # mapped ID. Supported: opus, sonnet, haiku, fable. opus → claude-opus-5-5
-  # and haiku → claude-haiku-5-5 are the built-in defaults (not applied on
-  # Bedrock); "" unsets an alias. The CLI also uses the haiku model for its
-  # background calls.
+  # mapped ID. Supported: opus, sonnet, haiku, fable. opus → claude-opus-5-5,
+  # haiku → claude-haiku-5-5 and fable → claude-fable-5-2 are the built-in
+  # defaults (not applied on Bedrock); "" unsets an alias. The CLI also uses
+  # the haiku model for its background calls.
   # model_aliases:
   #   opus: claude-opus-5-5
   #   haiku: claude-haiku-5-5
+  #   fable: claude-fable-5-2
   # Claude models selectable in the web composer's model picker. The
   # configured `model` above is always offered first; entries here extend
   # the list. Unset → the models the Anthropic Models API reports for your
@@ -269,13 +271,22 @@ slack:
 #     agent_id: 00000000-0000-0000-0000-000000000000
 #     max_streams: 8
 
+# The email channel, hosted mode only (needs the channels.hosted settings
+# above): the gateway delivers the mail that members of the agent send to its
+# address, and each mail starts or continues a session. Nerve posts no answer;
+# the agent answers with the reply tool that the gateway names. A reload
+# switches it on or off. See docs/config.md#email.
+# email:
+#   enabled: false
+
 # Where notify, ask_user, and propose_action deliver. The list replaces the
-# default rather than adding to it, so name every transport you want. A
-# transport that is off costs nothing here.
+# default rather than adding to it, so name every transport you want. The
+# panel (web) is always in it. A transport that is off costs nothing here.
 notifications:
   channels: [web, telegram, slack]
   # Target conversation for Slack cards. Without this, the first literal ID
-  # in slack.allow_channels is used; names and globs are not resolved.
+  # in slack.allow_channels is used; names and globs are not resolved. In
+  # hosted mode the control plane's notification channel is used instead.
   # slack_channel_id: "C0456DEF"
 
 # Quiet hours (local timezone). Optional: set both to "" for none, which is
@@ -456,6 +467,16 @@ memory:
 #   path: /mcp/v1
 #   include_hoa: false   # Expose the deprecated houseofagents stub tools externally (default off)
 
+# MCP Apps (optional) — show the interactive view of an MCP tool inside the
+# chat message (MCP extension io.modelcontextprotocol/ui), and draw the
+# ```widget blocks of an answer. Views: Claude backend only. Off by default.
+# Both run in a frame whose page the gateway serves from its own address
+# with a policy that takes the page's origin away, so that it shares none
+# with the web UI. No other port is opened. Local mode only. Restart to
+# apply changes. See docs/mcp-apps.md.
+# mcp_apps:
+#   enabled: false
+
 # MCP gateway (external mode only, NERVE_AUTH_MODE=external). Nerve then takes
 # its MCP servers only from the gateway's catalog, and mcp_servers has no
 # effect. A change needs a restart. See docs/config.md "MCP servers in
@@ -469,6 +490,6 @@ memory:
 # langfuse:
 #   public_key: pk-lf-...        # from your Langfuse project (set in config.local.yaml)
 #   secret_key: sk-lf-...        # from your Langfuse project (set in config.local.yaml)
-#   host: https://cloud.langfuse.com
+#   host: https://cloud.langfuse.com   # self-hosted: Langfuse v4.59.0 or later
 #   # redact_patterns:           # optional — strip these regexes from spans
 #   #   - "sk-ant-[A-Za-z0-9_\\-]{20,}"

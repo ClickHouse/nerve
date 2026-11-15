@@ -11,7 +11,9 @@ requires-python = ">=3.13"
 license = { text = "Apache-2.0" }
 
 dependencies = [
-    "fastapi>=0.115.0",
+    # 0.142.0 is the first release with the `telemetry` argument, which
+    # nerve/gateway/server.py passes to each app.
+    "fastapi>=0.142.0",
     "uvicorn[standard]>=0.34.0",
     "aiosqlite>=0.21.0",
     "pyyaml>=6.0",
@@ -33,7 +35,13 @@ dependencies = [
     # rejects models released after it with "does not support this model;
     # version 2.1.251 or newer is required". 0.2.150 bundles 2.1.257. Every
     # release in 0.2.141..0.2.150 is a CLI-bundle bump only — no API change.
-    "claude-agent-sdk>=0.2.161",
+    # Floor raised to 0.2.180 (bundles 2.1.321) for Claude Fable 5.2: 0.2.176's
+    # 2.1.316 accepts the id but as an "unrecognized_model" — it reports a
+    # 200K context window (auto-compaction at a fifth of the real 1M) and
+    # prices the turn at Opus 5.5 rates, which is what Nerve records as the
+    # turn's cost. 0.2.177..0.2.180 change no Python API (one optional hook
+    # option added).
+    "claude-agent-sdk>=0.2.180",
     # Declared explicitly because nerve/mcp_server/ imports `mcp` directly
     # rather than only through claude-agent-sdk. Both bounds are load-bearing:
     # nerve/mcp_server/ is written against the 2.x lowlevel API (constructor
@@ -57,16 +65,27 @@ dependencies = [
     "telethon>=1.38.0",
     # [bedrock] pulls boto3/botocore, required by AnthropicBedrock for AWS SigV4
     # request signing (session title generation and other direct-SDK fast-model calls).
-    "anthropic[bedrock]>=0.45.0",  # used by memu_bridge for event date resolution
+    # 2.0 is the first version that sends API version 2026-10-21. The code and
+    # the tests expect it: no sampling parameters, the API key in
+    # `Authorization: Bearer`, and the `open_telemetry` client argument. On
+    # Bedrock, this API version accepts only Claude 4.7 and later models.
+    "anthropic[bedrock]>=2.0.0",  # used by memu_bridge for event date resolution
     "memu-py==1.4.0",  # pinned — nerve monkey-patches memU internals (see memu_bridge._patch_sqlite_bugs)
     "watchfiles>=1.0.0",
     "html2text>=2024.2.26",
+    # Web Push: VAPID signing and payload encryption for the panel's push
+    # notifications (nerve/notifications/webpush.py).
+    "pywebpush>=2.5.0",
     # Optional xmemory.ai structured-memory layer — only active when an
     # xmemory api_key + instance_id are configured (see XmemoryConfig).
     "xmemory-ai>=0.10.0",
     # Optional observability stack — only active when langfuse keys are
     # configured. All three are pure-Python wheels.
-    "langfuse>=4.17.0",
+    # langfuse 5 writes metadata span attributes as JSON text, and the span
+    # redaction in nerve/observability/langfuse.py is written for that shape.
+    # 5.0.1 is the first 5.x release. A self-hosted Langfuse server must be
+    # v4.59.0 or later (docs/observability.md).
+    "langfuse>=5.0.1",
     "langsmith[claude-agent-sdk]>=0.4.0",
     "opentelemetry-instrumentation-anthropic>=0.40.0",
 ]

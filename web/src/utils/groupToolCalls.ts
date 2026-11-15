@@ -1,5 +1,7 @@
 import type { MessageBlock, ToolCallBlockData } from '../types/chat';
-import type { RenderItem, ToolCallGroup } from '../types/renderBlocks';
+import type { ToolCallGroup } from '../types/renderBlocks';
+
+const isToolCall = (block: MessageBlock): block is ToolCallBlockData => block.type === 'tool_call';
 
 /**
  * Groups consecutive tool_call blocks with the same `tool` name.
@@ -9,9 +11,9 @@ import type { RenderItem, ToolCallGroup } from '../types/renderBlocks';
  * - Any non-tool block (text, thinking) breaks the current group.
  * - Different tool names break the current group.
  */
-export function groupToolCalls(blocks: MessageBlock[]): RenderItem[] {
-  const result: RenderItem[] = [];
-  let currentRun: ToolCallBlockData[] = [];
+export function groupToolCalls<B extends MessageBlock>(blocks: B[]): (B | ToolCallGroup)[] {
+  const result: (B | ToolCallGroup)[] = [];
+  let currentRun: (B & ToolCallBlockData)[] = [];
   let currentTool: string | null = null;
 
   function flushRun() {
@@ -30,7 +32,7 @@ export function groupToolCalls(blocks: MessageBlock[]): RenderItem[] {
   }
 
   for (const block of blocks) {
-    if (block.type === 'tool_call') {
+    if (isToolCall(block)) {
       if (currentTool === block.tool) {
         currentRun.push(block);
       } else {

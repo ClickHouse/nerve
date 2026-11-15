@@ -3,6 +3,7 @@ import { Calendar, Clock, ExternalLink, MessageSquare } from '../ui/icons';
 import type { Task } from '../../stores/taskStore';
 import { formatTimeAgo } from '../../utils/dateGroups';
 import { StatusBadge, StatusSelect } from './StatusControls';
+import { CreatedInLink } from './TaskSessions';
 
 export function TaskCard({ task, onStatusChange }: {
   task: Task;
@@ -54,7 +55,9 @@ export function TaskCard({ task, onStatusChange }: {
               <MessageSquare size={11} aria-hidden="true" /> {task.comment_count}
             </span>
           )}
-          {task.source && (
+          {task.created_session_title != null ? (
+            <CreatedInLink task={task} />
+          ) : task.source && (
             <span className="text-text-faint truncate">from {task.source}</span>
           )}
         </div>

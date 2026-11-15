@@ -48,6 +48,7 @@ import re
 import secrets
 import shutil
 import stat
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -161,7 +162,8 @@ PRODUCTIVITY_CRONS = [
             "1. Use task_list(status=\"pending\") to browse the tasks that are ready for work\n"
             "2. Use plan_list to see which tasks already have plans — skip those\n"
             "3. Pick ONE task and explore the relevant codebase\n"
-            "4. Call plan_propose(task_id, content) with your plan\n\n"
+            "4. Call plan_propose(task_id, content, summary) with your plan and a summary "
+            "of up to 3 short lines for the reviewer\n\n"
             "If all tasks have plans or none are actionable, say so and stop.\n\n"
             "plan_propose notifies the user with a link to the plan. "
             "Do not send another notification about it.\n"
@@ -171,20 +173,46 @@ PRODUCTIVITY_CRONS = [
         "id": "skill-extractor",
         "name": "Skill Extractor",
         "display_name": "Skill extractor",
-        "schedule": "0 */12 * * *",
-        "description": "Every 12 hours, analyzes your recent activity to detect repeated workflows. When it finds a pattern, it proposes a reusable skill for your review.",
+        # With memory-maintenance: a machine that is parked while idle is
+        # woken once for both.
+        "schedule": "0 5 * * *",
+        "description": "Once a day, analyzes your recent activity to detect repeated workflows. When it finds a pattern, it proposes a reusable skill for your review.",
         "requires": None,
         "session_mode": "persistent",
         "context_rotate_hours": 168,
         "reminder_mode": False,
+        # One proposal per run, and a plan that is a plan: the person who
+        # reviews it judges whether the skill is worth having, and the session
+        # that implements the approved plan writes the skill
+        # (nerve.agent.plan_service). The plan type is what briefs that
+        # session for a skill; plan_propose would also take it from the
+        # task's source, which says where the task came from. The tag is how
+        # a later run finds the task whatever became of the proposal: no tool
+        # lists tasks by their source, and a search needs words to look for.
+        # The limit is there because task_list stops at 100 without one.
         "prompt": (
-            "You are a skill extraction agent. Identify repeated workflows from recent activity and propose new skills.\n\n"
+            "You are a skill extraction agent. Find a workflow that is repeated in recent activity and propose one new skill for it.\n\n"
             "1. Recall recent behavior patterns and events\n"
-            "2. Check existing skills to avoid duplicates\n"
+            "2. Check the existing skills (skill_list) and what was proposed before: "
+            "task_list with status \"all\", tag \"skill-proposal\" and limit 1000 lists the tasks of earlier proposals; "
+            "plan_list shows the plans in review and, with status \"declined\", the declined ones. "
+            "Propose nothing that a skill already covers or that was proposed before, "
+            "whether the proposal waits for review, was declined, or ended with no skill\n"
             "3. Look for repeated tool sequences, domain knowledge clusters, and reusable patterns\n"
-            "4. For each candidate (max 2): create a task and propose a plan with the full SKILL.md\n\n"
-            "If no candidates found, say so and stop.\n"
-            "plan_propose notifies the user with a link to each plan. "
+            "4. Pick the one candidate with the strongest evidence. Propose at most one skill per run.\n"
+            "5. Create a task for it with "
+            "task_create(title, content, source=\"skill-extractor\", tags=\"skill-proposal\"), "
+            "where the content says in a few sentences what the skill is for, "
+            "then call plan_propose(task_id, content, summary, plan_type=\"skill-create\") "
+            "with the plan and a summary of up to 3 short lines for the reviewer\n\n"
+            "The plan is for a person who decides whether the skill is worth having. Write in it:\n"
+            "- What: the workflow, in one or two sentences, and when the skill would be used\n"
+            "- Evidence: where the workflow occurred (the sessions, tasks or dates) and what was repeated each time\n"
+            "- Direction: what the skill should cover, what it should leave out, and what is known to go wrong\n\n"
+            "Do not write the skill in the plan: no SKILL.md, no frontmatter, no step-by-step instructions. "
+            "The session that implements the approved plan writes the skill from the evidence.\n\n"
+            "If no workflow occurred more than once, say so and stop.\n"
+            "plan_propose notifies the user with a link to the plan. "
             "Do not send another notification about it.\n"
         ),
     },
@@ -1324,6 +1352,87 @@ def _cron_description(cron: dict[str, Any], memory_backend: str) -> str:
     return cron["description"]
 
 
+# The built-in jobs that look after the agent's own work. Each waits for the
+# agent to work (the default gates below). A run of one is no reason for
+# another to run, so each gate leaves the other three out.
+MAINTENANCE_CRON_IDS = (
+    "memory-maintenance", "skill-extractor", "skill-reviser", "machine-maintenance",
+)
+
+
+def _other_maintenance_crons(job_id: str) -> list[str]:
+    """The maintenance jobs besides *job_id*, whose own runs never count."""
+    return [cron_id for cron_id in MAINTENANCE_CRON_IDS if cron_id != job_id]
+
+
+# Run gates that a built-in job has without ``system.yaml`` stating them: the
+# scheduler gives them to an entry of the job that has no ``run_if``
+# (:func:`default_run_if`). Unlike the gates of inbox-processor and
+# task-planner, they are not written into the file: not by setup, and not
+# when the scheduler writes this release's values over what an earlier
+# release wrote (:func:`rewrite_superseded_cron_values`).
+#
+# * A Nerve that predates a gate type refuses a job that names it, so a file
+#   with the gate could not go back to the release before.
+# * Given at the load, a gate reaches every install, and a later change to it
+#   too: also an entry that was edited, and a file that is never written
+#   again (lockdown, a workspace that is a git repository).
+_DEFAULT_RUN_IF: dict[str, list[dict[str, Any]]] = {
+    # Nothing to clean up while the agent has done nothing since the last
+    # run. The prompt reviews the records of the day before the run, so what
+    # the agent did shortly before a run is left to the next one: with the
+    # overlap, the job runs at its next two times after the last activity.
+    "memory-maintenance": [{
+        "type": "agent_activity",
+        "ignore_jobs": _other_maintenance_crons("memory-maintenance"),
+        "overlap_hours": 24,
+    }],
+    # The job proposes a skill a run, for a person to decide on. While three
+    # of its proposals wait for that decision it does not add a fourth. That
+    # gate comes first, so that it is the reason a paused job shows: the one
+    # the person can do something about.
+    # Recent activity is all the job looks at: no run while there was none.
+    "skill-extractor": [
+        {"type": "plans_in_review", "below": 3},
+        {
+            "type": "agent_activity",
+            "ignore_jobs": _other_maintenance_crons("skill-extractor"),
+        },
+    ],
+    # The skills serve the agent's work, and what is out of date in them
+    # shows there: no review while the agent has done nothing since the last
+    # one.
+    "skill-reviser": [{
+        "type": "agent_activity",
+        "ignore_jobs": _other_maintenance_crons("skill-reviser"),
+    }],
+    # What the job removes is what work leaves on the machine, and an agent
+    # that has done nothing since the last run has left nothing more. The job
+    # removes only what is old, and the gate has no overlap: an item that was
+    # too new for the last run waits for the first run after the agent works
+    # again.
+    "machine-maintenance": [{
+        "type": "agent_activity",
+        "ignore_jobs": _other_maintenance_crons("machine-maintenance"),
+    }],
+}
+
+
+def default_run_if(job_id: str, memory_backend: str) -> list[dict[str, Any]]:
+    """The run gates of a built-in job whose ``system.yaml`` entry states
+    none, as the caller's own copy; empty for a job that has no default.
+
+    Under Loom, ``memory-maintenance`` checks the namespace as it is, not the
+    records of one day, so its gate has no overlap. What reaches Loom after a
+    check waits for the job's next run, after the agent has worked again.
+    """
+    specs = copy.deepcopy(_DEFAULT_RUN_IF.get(job_id, []))
+    if memory_backend == "loom" and job_id == "memory-maintenance":
+        for spec in specs:
+            spec.pop("overlap_hours", None)
+    return specs
+
+
 def loom_wording_of_shipped_job(
     job_id: str, prompt: str, description: str,
 ) -> tuple[str, str] | None:
@@ -1341,6 +1450,120 @@ def loom_wording_of_shipped_job(
     if description.strip() == str(shipped["description"]).strip():
         description = _cron_description(shipped, "loom")
     return loom_prompt, description
+
+
+# What earlier releases shipped for a built-in job where this release ships
+# something else, by job id and key. An entry of ``system.yaml`` that still
+# has one of these values gets the current one
+# (:func:`current_values_of_shipped_job`): the scheduler writes it into the
+# file when it starts and when it reloads
+# (:func:`rewrite_superseded_cron_values`), and loads the entry with it where
+# the file is left as written. A value that is not listed here was edited,
+# and is left alone; so is every entry in ``jobs.yaml``, which is the
+# operator's file. Texts are compared without the whitespace around them.
+#
+# A change to the schedule, the description or the prompt of a built-in job
+# needs the value it replaces here: without it, the installs that have that
+# value keep it. tests/test_setup_writer.py records a digest of each current
+# value and fails when one changes. The earlier texts are written out here,
+# never taken from the catalogue: they stay what they were when it changes.
+_SKILL_EXTRACTOR_STEPS_BEFORE_DAILY = (
+    "You are a skill extraction agent. Identify repeated workflows from recent activity and propose new skills.\n\n"
+    "1. Recall recent behavior patterns and events\n"
+    "2. Check existing skills to avoid duplicates\n"
+    "3. Look for repeated tool sequences, domain knowledge clusters, and reusable patterns\n"
+    "4. For each candidate (max 2): create a task and propose a plan with the full SKILL.md\n\n"
+    "If no candidates found, say so and stop.\n"
+)
+# The reviser's earlier prompt up to its last sentence.
+_EARLIER_SKILL_REVISER_STEPS = (
+    "You are a skill revision agent. Review existing skills and propose improvements.\n\n"
+    "1. Load all skills and their content\n"
+    "2. Check accuracy (outdated paths, commands, URLs)\n"
+    "3. Check completeness (missing steps, known gotchas)\n"
+    "4. Check quality (clear descriptions, good trigger phrases)\n"
+    "5. For skills needing changes (max 3): create task + propose plan with updated SKILL.md\n\n"
+    "If all skills look good, say so and stop.\n"
+)
+# What the planner's two earlier prompts share: what came before the first
+# step, and what came between it and the last sentence.
+_EARLIER_TASK_PLANNER_OPENING = (
+    "You are a proactive planning agent. Your job is to find a task worth working on "
+    "and produce an implementation plan.\n\n"
+)
+_EARLIER_TASK_PLANNER_STEPS = (
+    "2. Use plan_list to see which tasks already have plans — skip those\n"
+    "3. Pick ONE task and explore the relevant codebase\n"
+    "4. Call plan_propose(task_id, content) with your plan\n\n"
+    "If all tasks have plans or none are actionable, say so and stop.\n\n"
+)
+_SUPERSEDED_CRON_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
+    "skill-extractor": {
+        "schedule": ("0 */12 * * *",),
+        "description": (
+            "Every 12 hours, analyzes your recent activity to detect repeated workflows. "
+            "When it finds a pattern, it proposes a reusable skill for your review.",
+        ),
+        "prompt": (
+            # The first form.
+            _SKILL_EXTRACTOR_STEPS_BEFORE_DAILY
+            + "After proposing, use `notify` to alert the user.\n",
+            # The second: plan_propose had begun to notify.
+            _SKILL_EXTRACTOR_STEPS_BEFORE_DAILY
+            + "plan_propose notifies the user with a link to each plan. "
+            "Do not send another notification about it.\n",
+        ),
+    },
+    # The schedule and the description of the two jobs below never changed.
+    "skill-reviser": {
+        "prompt": (
+            # Until plan_propose began to notify.
+            _EARLIER_SKILL_REVISER_STEPS
+            + "After proposing, use `notify` to alert the user.\n",
+        ),
+    },
+    "task-planner": {
+        "prompt": (
+            # The first form: every open task, and a notification of its own.
+            _EARLIER_TASK_PLANNER_OPENING
+            + "1. Use task_list to browse open tasks\n"
+            + _EARLIER_TASK_PLANNER_STEPS
+            + "After proposing a plan, use `notify` to alert the user.\n",
+            # The second: only the tasks that are ready for work, and
+            # plan_propose had begun to notify. It did not ask for a plan
+            # summary yet.
+            _EARLIER_TASK_PLANNER_OPENING
+            + "1. Use task_list(status=\"pending\") to browse the tasks that are ready for work\n"
+            + _EARLIER_TASK_PLANNER_STEPS
+            + "plan_propose notifies the user with a link to the plan. "
+            "Do not send another notification about it.\n",
+        ),
+    },
+}
+
+
+def current_values_of_shipped_job(job_id: str, **values: object) -> dict[str, str]:
+    """What this release writes for the keys of a built-in job that still
+    hold what an earlier release wrote: of the given ``schedule``,
+    ``description`` and ``prompt``, the ones to replace, with their new
+    values. Empty for a job that never changed, and for values that are
+    current or were edited.
+
+    Each key stands alone: an entry whose schedule was edited keeps it and
+    still gets the current prompt. A value that is not text (a bare
+    ``description:`` in the file is None) is nothing an earlier release
+    wrote.
+    """
+    superseded = _SUPERSEDED_CRON_VALUES.get(job_id)
+    if not superseded:
+        return {}
+    shipped = next(c for c in (*CORE_CRONS, *PRODUCTIVITY_CRONS) if c["id"] == job_id)
+    return {
+        key: str(shipped[key])
+        for key, value in values.items()
+        if isinstance(value, str)
+        and value.strip() in {old.strip() for old in superseded.get(key, ())}
+    }
 
 
 def existing_memory_backend(config_dir: Path, workspace: Path | None = None) -> str:
@@ -1534,9 +1757,8 @@ def system_cron_file(workspace: Path) -> Path:
     return Path(workspace) / "config" / "cron" / "system.yaml"
 
 
-def _read_system_crons(workspace: Path) -> tuple[dict[str, Any] | None, str, str]:
-    """``(document, raw_text, problem)`` for the generated cron file."""
-    path = system_cron_file(workspace)
+def _read_cron_file(path: Path) -> tuple[dict[str, Any] | None, str, str]:
+    """``(document, raw_text, problem)`` for a cron file."""
     if not path.exists():
         return None, "", "missing"
     raw = path.read_text(encoding="utf-8")
@@ -1575,7 +1797,7 @@ def list_optional_crons(workspace: Path) -> list[CronToggle]:
     step has nothing to offer rather than inventing jobs that were never
     written.
     """
-    document, _raw, problem = _read_system_crons(workspace)
+    document, _raw, problem = _read_cron_file(system_cron_file(workspace))
     if problem or document is None:
         return []
     present = {
@@ -1613,7 +1835,7 @@ def plan_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronTogglePla
     error message is wrong.
     """
     path = system_cron_file(workspace)
-    document, raw, problem = _read_system_crons(workspace)
+    document, raw, problem = _read_cron_file(system_cron_file(workspace))
     if problem or document is None:
         return CronTogglePlan(path=path, text=None, problem=problem or "unreadable")
 
@@ -1657,6 +1879,181 @@ def set_optional_crons(workspace: Path, enabled_ids: set[str]) -> CronToggleOutc
     one call, for a caller with nothing else to coordinate.
     """
     return plan_optional_crons(workspace, enabled_ids).publish()
+
+
+# --- Turning one job on and off (the Cron page) --------------------------------
+#
+# For one job of any cron file, ``system.yaml`` or ``jobs.yaml``. A person
+# writes ``jobs.yaml``, so the file is not dumped again (that loses comments
+# and formatting): only the job's ``enabled:`` line changes, or one is added
+# under its ``id:`` line. The result is parsed again, and it is written only
+# if the job's ``enabled`` is the one difference from the file as it was.
+
+#: ``CronTogglePlan.problem`` values of :func:`plan_cron_job_enabled`, beside
+#: ``missing`` and ``unreadable: ...``.
+CRON_FILE_HAND_EDITED = "hand-edited"
+CRON_FILE_READ_ONLY = "read-only"
+CRON_JOB_MISSING = "no such job"
+
+# A job's ``id:`` line and ``enabled:`` line (``- id: x`` or ``id: x``), with
+# what comes before the key; the ``- `` that starts a list item.
+_ID_LINE = re.compile(r"""^(?P<lead>[ \t]*(?:-[ \t]+)?)id:[ \t]*(?P<q>["']?)(?P<id>[^#\r\n]*?)(?P=q)[ \t]*(?:#.*)?$""")
+_ENABLED_LINE = re.compile(r"^(?P<lead>[ \t]*(?:-[ \t]+)?)enabled:(?P<value>[^#\r\n]*)(?P<comment>#.*)?$")
+_ITEM_START = re.compile(r"^[ \t]*-[ \t]+")
+
+
+def _indent(line: str) -> int | None:
+    """The indentation of a line with content; None for a blank or comment line."""
+    stripped = line.lstrip(" ")
+    return None if not stripped.strip() or stripped.startswith("#") else len(line) - len(stripped)
+
+
+def _item_bounds(lines: list[str], i: int, column: int) -> tuple[int, int] | None:
+    """``(first, end)`` lines of the list item whose keys are at ``column`` and
+    which has line ``i``, or None when line ``i`` is in no such item."""
+    start = i
+    while not ((dash := _ITEM_START.match(lines[start])) and len(dash.group(0)) == column):
+        start -= 1
+        if start < 0:
+            return None
+        indent = _indent(lines[start])
+        if indent is not None and indent < column - 2:
+            return None
+    end = start + 1
+    while end < len(lines) and (_indent(lines[end]) is None or _indent(lines[end]) >= column):
+        end += 1
+    return start, end
+
+
+def _enabled_edits(raw: str, job_id: str, enabled: bool) -> Iterator[str]:
+    """Each text that ``raw`` becomes when the ``enabled:`` line of a list item
+    with ``id: <job_id>`` is set, or added under the ``id:`` line.
+
+    One text for each ``id:`` line that names the job; the caller keeps the
+    first one that parses as intended. A layout this cannot read (a flow
+    mapping, say) gives no text.
+    """
+    lines = raw.splitlines(keepends=True)
+    value = "true" if enabled else "false"
+    for i, line in enumerate(lines):
+        match = _ID_LINE.match(line.rstrip("\r\n"))
+        if not match or match["id"] != job_id:
+            continue
+        column = len(match["lead"])
+        bounds = _item_bounds(lines, i, column)
+        if bounds is None:
+            continue
+        edited = list(lines)
+        for k in range(*bounds):
+            found = _ENABLED_LINE.match(lines[k].rstrip("\r\n"))
+            if found and len(found["lead"]) == column:
+                old = found["value"]
+                rest = old[len(old.rstrip()):] + (found["comment"] or "")
+                eol = lines[k][len(lines[k].rstrip("\r\n")):]
+                edited[k] = f"{found['lead']}enabled: {value}{rest}{eol}"
+                break
+        else:
+            eol = line[len(line.rstrip("\r\n")):] or "\n"
+            edited[i] = line.rstrip("\r\n") + eol
+            edited.insert(i + 1, f"{' ' * column}enabled: {value}{eol}")
+        yield "".join(edited)
+
+
+def plan_cron_job_enabled(path: Path, job_id: str, enabled: bool) -> CronTogglePlan:
+    """Set ``enabled`` of the job ``job_id`` in the cron file ``path``.
+
+    Nothing is written: :meth:`CronTogglePlan.publish` does that. ``problem``
+    is set for a file without the job, a file that cannot be written, and a
+    file in which no edit of one line gives the intended change
+    (``CRON_FILE_HAND_EDITED``).
+    """
+    document, raw, problem = _read_cron_file(path)
+    if problem or document is None:
+        return CronTogglePlan(path=path, text=None, problem=problem or "unreadable")
+    jobs = [
+        job for job in document["jobs"]
+        if isinstance(job, dict) and str(job.get("id") or "") == job_id
+    ]
+    if not jobs:
+        return CronTogglePlan(path=path, text=None, problem=CRON_JOB_MISSING)
+    names = {"enabled": (job_id,)} if enabled else {"disabled": (job_id,)}
+    # A job without the key is enabled (CronJob.enabled defaults to True).
+    if all(bool(job.get("enabled", True)) == enabled for job in jobs):
+        return CronTogglePlan(path=path, text=None, **names)
+    # publish_text writes a temporary file beside the file, then renames it.
+    if not (os.access(path, os.W_OK) and os.access(path.parent, os.W_OK)):
+        return CronTogglePlan(path=path, text=None, problem=CRON_FILE_READ_ONLY)
+    for job in jobs:
+        job["enabled"] = enabled
+    for text in _enabled_edits(raw, job_id, enabled):
+        try:
+            if yaml.safe_load(text) == document:
+                return CronTogglePlan(path=path, text=text, **names)
+        except yaml.YAMLError:
+            continue
+    return CronTogglePlan(path=path, text=None, problem=CRON_FILE_HAND_EDITED)
+
+
+# --- Writing this release's values over an earlier release's -------------------
+
+
+def rewrite_superseded_cron_values(system_file: Path) -> dict[str, tuple[str, ...]]:
+    """Write this release's values into a ``system.yaml`` that holds what
+    earlier releases wrote for built-in jobs, so that the file shows what
+    runs. Returns the keys that were written, by job id; empty when the file
+    was left as it is.
+
+    In every entry with an id, each of the schedule, the description and the
+    inline prompt is replaced when it is what an earlier release wrote
+    (:func:`current_values_of_shipped_job`). A value that was edited stays,
+    and so does the inline prompt of a job that launches a workflow, which is
+    never sent.
+
+    The file is dumped again for this, which would lose comments and layout.
+    So it is written only when it has none to lose: the text after the
+    comment it opens with is exactly what Nerve writes for its content. A
+    file that was edited by hand, and one that is read-only, are left as they
+    are; the scheduler loads their jobs with this release's values all the
+    same (``bring_up_to_date`` in ``nerve.cron.service``).
+
+    The default gates and the Loom wording, which the scheduler also gives a
+    built-in job, are not written: see ``_DEFAULT_RUN_IF`` and
+    :func:`loom_wording_of_shipped_job`.
+    """
+    path = Path(system_file)
+    try:
+        # Not read_text: that would read other line endings as ``\n``.
+        text = path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return {}
+    opening = leading_comment(text)
+    body = text[len(opening):]
+    try:
+        document = yaml.safe_load(body)
+    except yaml.YAMLError:
+        return {}
+    if not isinstance(document, dict) or not isinstance(document.get("jobs"), list):
+        return {}
+    if yaml.safe_dump(document, default_flow_style=False, sort_keys=False) != body:
+        return {}
+    if not os.access(path, os.W_OK):
+        return {}
+
+    written: dict[str, set[str]] = {}
+    for entry in document["jobs"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+            continue
+        values = {"schedule": entry.get("schedule"), "description": entry.get("description")}
+        if entry.get("workflow") is None:
+            values["prompt"] = entry.get("prompt")
+        current = current_values_of_shipped_job(entry["id"], **values)
+        if current:
+            entry.update(current)
+            written.setdefault(entry["id"], set()).update(current)
+    if not written:
+        return {}
+    publish_text(path, opening + yaml.safe_dump(document, default_flow_style=False, sort_keys=False))
+    return {job_id: tuple(sorted(keys)) for job_id, keys in written.items()}
 
 
 _WEEKDAYS = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")

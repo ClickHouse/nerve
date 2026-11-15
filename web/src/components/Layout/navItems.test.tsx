@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -19,6 +19,7 @@ const { NavRail } = await import('./NavRail');
 const { BottomNav } = await import('./BottomNav');
 const { setAuthMode, useHostedStore } = await import('../../api/hosted');
 const { useSetupStore } = await import('../../stores/setupStore');
+const { api } = await import('../../api/client');
 const { makeState } = await import('../../test/setupFixtures');
 const { NAV_ITEMS, visibleNavItems } = await import('./navItems');
 
@@ -100,12 +101,11 @@ describe('the Setup entry', () => {
     expect(screen.getByRole('button', { name: 'Setup' })).toBeInTheDocument();
   });
 
-  it('leaves the rail list once setup is finished and stays one click away in the footer', async () => {
+  it('leaves the rail once setup is finished', async () => {
     useSetupStore.setState({ state: makeState({ finished: true, steps_left: 0 }) });
     await renderNav('rail');
-    // One control only: the footer's gear, not a list entry beside it.
-    await userEvent.click(screen.getByRole('button', { name: 'Setup' }));
-    expect(location()).toHaveTextContent('/setup');
+    // Settings has "Run setup again" for a finished setup.
+    expect(screen.queryByRole('button', { name: 'Setup' })).not.toBeInTheDocument();
   });
 
   it('stays in the phone menu once setup is finished', async () => {
@@ -135,7 +135,7 @@ describe('the Setup entry', () => {
 
   it('is decided by a pure filter', () => {
     const paths = (items: { path: string }[]) => items.map((i) => i.path);
-    const base = { hosted: false, ultracodeEnabled: false, setupKnown: true, setupFinished: false };
+    const base = { hosted: false, ultracodeEnabled: false, setupKnown: true, setupFinished: false, phone: false };
     expect(paths(visibleNavItems(NAV_ITEMS, { ...base, setupKnown: false })))
       .not.toContain('/setup');
     expect(paths(visibleNavItems(NAV_ITEMS, { ...base, hosted: true })))
@@ -144,5 +144,56 @@ describe('the Setup entry', () => {
       .not.toContain('/accounts');
     expect(paths(visibleNavItems(NAV_ITEMS, { ...base, setupFinished: true })))
       .not.toContain('/setup');
+    expect(paths(visibleNavItems(NAV_ITEMS, base))).not.toContain('/inbox');
+    expect(paths(visibleNavItems(NAV_ITEMS, { ...base, phone: true }))).toContain('/inbox');
+  });
+});
+
+describe('the phone bottom bar', () => {
+  it('holds Inbox, Chat, Tasks, Notifs and More, in this order', async () => {
+    await renderNav('bottom');
+
+    const bar = screen.getByRole('navigation', { name: 'Main' });
+    expect(within(bar).getAllByRole('button').map(b => b.textContent))
+      .toEqual(['Inbox', 'Chat', 'Tasks', 'Notifs', 'More']);
+    await userEvent.click(within(bar).getByRole('button', { name: 'Inbox' }));
+    expect(location()).toHaveTextContent('/inbox');
+  });
+
+  it('keeps Plans behind More', async () => {
+    await renderNav('bottom');
+    openMore();
+    await userEvent.click(screen.getByRole('button', { name: 'Plans' }));
+    expect(location()).toHaveTextContent('/plans');
+  });
+
+  it('keeps the pending count on Notifs', async () => {
+    vi.mocked(api.listNotifications).mockResolvedValueOnce({ notifications: [], pending_count: 3 } as never);
+
+    await renderNav('bottom');
+
+    expect(within(screen.getByRole('navigation', { name: 'Main' })).getByRole('button', { name: /^Notifs/ }))
+      .toHaveTextContent('Notifs3');
+  });
+
+  it('is not in the desktop nav rail', async () => {
+    await renderNav('rail');
+    expect(screen.queryByRole('button', { name: 'Inbox' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Plans' })).toBeInTheDocument();
+  });
+});
+
+describe('the Settings entry', () => {
+  it('is the gear in the rail footer, whatever the setup state', async () => {
+    await renderNav('rail');
+    await userEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    expect(location()).toHaveTextContent('/settings');
+  });
+
+  it('is a row of the phone menu', async () => {
+    await renderNav('bottom');
+    openMore();
+    await userEvent.click(screen.getByRole('button', { name: 'Settings' }));
+    expect(location()).toHaveTextContent('/settings');
   });
 });

@@ -322,6 +322,10 @@ class SourceRunner:
         there.
         """
         cursor = await self.db.get_sync_cursor(self.source.source_name)
+        if cursor is None:
+            error = await self._seed_consumer_cursors()
+            if error:
+                return IngestResult(records_ingested=0, error=error)
         total_ingested = 0
         total_dropped = 0
 
@@ -360,6 +364,35 @@ class SourceRunner:
         return IngestResult(
             records_ingested=total_ingested, records_dropped=total_dropped,
         )
+
+    async def _seed_consumer_cursors(self) -> str | None:
+        """Before a source's first run, start a cursor on it for each consumer
+        that reads every source (see :meth:`SourceStore.seed_consumer_cursors`).
+
+        This occurs before the source stores a record, so its first records
+        are unread for those consumers, and their ``messages`` gates see them.
+        Returns the error text of a failure, else ``None``. On a failure the
+        run stops before the fetch. The source then stores nothing and still
+        has no cursor, so the next run tries again.
+        """
+        from nerve.cron.gates import _consumer_cursor_ttl_days
+
+        try:
+            seeded = await self.db.seed_consumer_cursors(
+                self.source.source_name, ttl_days=_consumer_cursor_ttl_days(),
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "Source %s: could not start the consumers' cursors: %s",
+                self.source.source_name, e, exc_info=True,
+            )
+            return f"could not start the consumer cursors: {e}"
+        if seeded:
+            logger.info(
+                "Source %s: first run, started %d consumer cursor(s) on it",
+                self.source.source_name, seeded,
+            )
+        return None
 
     async def _ingest_batch(self, cursor: str | None) -> _BatchResult:
         """One fetch → preprocess → guardrail → persist → condense → drop hook → advance cycle."""

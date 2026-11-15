@@ -178,7 +178,13 @@ class StreamBroadcaster:
             msg["parent_tool_use_id"] = parent_tool_use_id
         await self.broadcast(session_id, msg)
 
-    async def broadcast_tool_use(self, session_id: str, tool_name: str, tool_input: dict, tool_use_id: str | None = None, parent_tool_use_id: str | None = None) -> None:
+    async def broadcast_tool_use(
+        self, session_id: str, tool_name: str, tool_input: dict,
+        tool_use_id: str | None = None, parent_tool_use_id: str | None = None,
+        mcp_app: dict[str, str] | None = None,
+    ) -> None:
+        """``mcp_app`` (``{"server", "tool", "resource_uri"}``) names the MCP
+        App the call opens, when its tool is linked to one (nerve/mcp_apps.py)."""
         msg: dict[str, Any] = {
             "type": "tool_use",
             "session_id": session_id,
@@ -188,9 +194,17 @@ class StreamBroadcaster:
         }
         if parent_tool_use_id:
             msg["parent_tool_use_id"] = parent_tool_use_id
+        if mcp_app:
+            msg["mcp_app"] = mcp_app
         await self.broadcast(session_id, msg)
 
-    async def broadcast_tool_result(self, session_id: str, result: str, tool_use_id: str | None = None, is_error: bool = False, parent_tool_use_id: str | None = None) -> None:
+    async def broadcast_tool_result(
+        self, session_id: str, result: str, tool_use_id: str | None = None,
+        is_error: bool = False, parent_tool_use_id: str | None = None,
+        mcp_app_result: dict[str, Any] | None = None,
+    ) -> None:
+        """``mcp_app_result`` is the result as an MCP ``CallToolResult``, for
+        a call that opened an MCP App."""
         msg: dict[str, Any] = {
             "type": "tool_result",
             "session_id": session_id,
@@ -200,6 +214,8 @@ class StreamBroadcaster:
         }
         if parent_tool_use_id:
             msg["parent_tool_use_id"] = parent_tool_use_id
+        if mcp_app_result is not None:
+            msg["mcp_app_result"] = mcp_app_result
         await self.broadcast(session_id, msg)
 
     async def broadcast_tool_output(
@@ -223,6 +239,7 @@ class StreamBroadcaster:
         usage: dict[str, Any] | None = None,
         max_context_tokens: int | None = None,
         num_turns: int | None = None,
+        context_tokens: int | None = None,
     ) -> None:
         msg: dict[str, Any] = {"type": "done", "session_id": session_id}
         if usage is not None:
@@ -231,6 +248,8 @@ class StreamBroadcaster:
             msg["max_context_tokens"] = max_context_tokens
         if num_turns is not None:
             msg["num_turns"] = num_turns
+        if context_tokens is not None:
+            msg["context_tokens"] = context_tokens
         await self.broadcast(session_id, msg)
 
     async def broadcast_plan_update(self, session_id: str, content: str) -> None:

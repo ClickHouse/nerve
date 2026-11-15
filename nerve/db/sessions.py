@@ -13,6 +13,7 @@ from nerve.identity import (
     CauseArg,
     resolve_cause,
 )
+from nerve.session_origin import Origin
 
 # Sources the sidebar treats as "system" (machine-driven); everything else is a conversation by exclusion, so a new source shows up in the feed by default.
 SYSTEM_SOURCES = ("cron", "hook")
@@ -64,6 +65,9 @@ class SessionStore:
         actor: Actor | None,
         cause: CauseArg = CAUSE_FROM_ACTOR,
         created_event: Attribution | None = None,
+        origin: Origin | None = None,
+        fork_source_native_id: str | None = None,
+        fork_source_turn_id: str | None = None,
     ) -> dict:
         """Insert a session row, recording who caused it to exist.
 
@@ -93,21 +97,34 @@ class SessionStore:
         session event with that attribution, only when this call's insert
         made the row. Of two callers that create one ID at the same time,
         only the one that the row names is recorded.
+
+        ``origin`` is the session's trigger and origin details
+        (:mod:`nerve.session_origin`), written once like the attribution.
+        Without it, both columns stay NULL, as in a row from before the
+        columns existed, and a reader derives the origin.
+
+        ``fork_source_native_id`` and ``fork_source_turn_id`` are the native
+        conversation and turn that a fork branches from (migration v072).
         """
         now = datetime.now(timezone.utc).isoformat()
         created_by = actor.actor_id if actor else None
         caused_by = resolve_cause(actor, cause)
+        trigger = origin.trigger if origin else None
+        origin_detail = origin.detail_json() if origin else None
         async with self._atomic():
             cursor = await self.db.execute(
                 """INSERT OR IGNORE INTO sessions
                    (id, title, source, metadata, status, parent_session_id,
                     forked_from_message, backend, model, cwd, created_by_actor_id,
-                    caused_by_actor_id, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    caused_by_actor_id, trigger, origin_detail,
+                    fork_source_native_id, fork_source_turn_id,
+                    created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (session_id, title or session_id, source,
                  json.dumps(metadata or {}), status,
                  parent_session_id, forked_from_message, backend, model, cwd,
-                 created_by, caused_by, now, now),
+                 created_by, caused_by, trigger, origin_detail,
+                 fork_source_native_id, fork_source_turn_id, now, now),
             )
             inserted = cursor.rowcount == 1
             await cursor.close()
@@ -132,7 +149,40 @@ class SessionStore:
             "backend": backend, "model": model, "cwd": cwd,
             "created_by_actor_id": created_by,
             "caused_by_actor_id": caused_by,
+            "trigger": trigger,
+            "origin_detail": origin_detail,
         }
+
+    async def set_session_origin(self, session_id: str, origin: Origin) -> bool:
+        """Replace the origin of a session that has no messages yet.
+
+        For a session that a person creates first and then gives its first
+        message in a different way ("Run later"). A session with messages
+        keeps its origin. Returns ``True`` when the row changed.
+        """
+        result = await self._write(
+            "UPDATE sessions SET trigger = ?, origin_detail = ?"
+            " WHERE id = ? AND COALESCE(message_count, 0) = 0",
+            (origin.trigger, origin.detail_json(), session_id),
+        )
+        return result.rowcount == 1
+
+    async def channel_keys_for_sessions(self, session_ids: list[str]) -> dict[str, str]:
+        """The mapped channel key of each session that has one.
+
+        ``channel_sessions`` maps each channel to its latest session, so an
+        older session of the channel has no entry. A session with more than
+        one mapped channel gives one of them.
+        """
+        if not session_ids:
+            return {}
+        placeholders = ",".join("?" for _ in session_ids)
+        async with self.db.execute(
+            f"SELECT session_id, channel_key FROM channel_sessions"
+            f" WHERE session_id IN ({placeholders})",
+            tuple(session_ids),
+        ) as cursor:
+            return {row[0]: row[1] async for row in cursor}
 
     async def get_session(self, session_id: str) -> dict | None:
         async with self.db.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)) as cursor:
@@ -312,6 +362,16 @@ class SessionStore:
             f"status != 'archived' AND starred = 0 AND source IN {_SYSTEM_SQL}",
         )
 
+    async def list_unarchived_sessions(self, session_ids: list[str]) -> list[dict]:
+        """The non-archived sessions among ``session_ids``, any source."""
+        if not session_ids:
+            return []
+        placeholders = ", ".join("?" for _ in session_ids)
+        return await self._page(
+            f"SELECT * FROM sessions WHERE id IN ({placeholders}) AND status != 'archived'",
+            tuple(session_ids), None, 0,
+        )
+
     async def search_sessions(self, query: str, limit: int = 100) -> list[dict]:
         """Search sessions by title (LIKE match), across all non-archived sessions."""
         sql = (
@@ -331,14 +391,34 @@ class SessionStore:
     async def update_session_title(
         self, session_id: str, title: str, *,
         attribution: Attribution = UNATTRIBUTED, reason: str | None = None,
-    ) -> None:
+        source: str | None = None,
+        only_from: tuple[str | None, ...] | None = None,
+    ) -> bool:
         """Set the title and record a ``title_changed`` event when it changes.
 
-        See :meth:`change_session_fields` for ``attribution`` and ``reason``.
+        ``source`` is stored as ``title_source`` (migration v070) when given.
+        With ``only_from``, nothing is written unless the stored
+        ``title_source`` is one of these. Returns whether the title was
+        written. See :meth:`change_session_fields` for ``attribution`` and
+        ``reason``.
         """
-        await self.change_session_fields(
-            session_id, {"title": title}, attribution=attribution, reason=reason,
+        fields: dict = {"title": title}
+        if source is not None:
+            fields["title_source"] = source
+        written = await self.change_session_fields(
+            session_id, fields, attribution=attribution, reason=reason,
+            only_from=None if only_from is None else {"title_source": only_from},
         )
+        return written is not None
+
+    async def recent_manual_titles(self, limit: int) -> list[str]:
+        """The titles people gave their sessions, newest session first."""
+        async with self.db.execute(
+            "SELECT title FROM sessions WHERE title_source = 'manual'"
+            " ORDER BY created_at DESC LIMIT ?",
+            (limit,),
+        ) as cursor:
+            return [row[0] for row in await cursor.fetchall() if row[0]]
 
     async def delete_session(
         self, session_id: str, *, attribution: Attribution = UNATTRIBUTED,
@@ -364,6 +444,8 @@ class SessionStore:
             await self.db.execute("DELETE FROM session_events WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM session_usage WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM channel_sessions WHERE session_id = ?", (session_id,))
+            # What the session's widgets saved goes with it.
+            await self.db.execute("DELETE FROM widget_states WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             await self.db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             if row is not None:
@@ -391,6 +473,16 @@ class SessionStore:
         ) as cursor:
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    async def closed_session_reason(self, session_id: str) -> str | None:
+        """``archived`` for an archived session, ``deleted`` for an id that
+        has no row and a ``session_deletions`` record, else ``None``."""
+        session = await self.get_session(session_id)
+        if session is not None:
+            return "archived" if session.get("status") == "archived" else None
+        if await self.get_session_deletion(session_id) is not None:
+            return "deleted"
+        return None
 
     async def update_session_metadata(self, session_id: str, metadata: dict) -> None:
         """Update the metadata JSON for a session.
@@ -434,7 +526,8 @@ class SessionStore:
             "status", "sdk_session_id", "connected_at", "last_activity_at",
             "archived_at", "title", "message_count", "total_cost_usd",
             "parent_session_id", "forked_from_message", "last_memorized_at",
-            "starred", "model", "backend", "cwd",
+            "starred", "model", "backend", "cwd", "title_source",
+            "fork_source_native_id", "fork_source_turn_id",
         }
         set_clauses: list[str] = []
         params: list = []
@@ -457,6 +550,23 @@ class SessionStore:
             return
         await self._write(*built)
 
+    async def update_unarchived_session_fields(
+        self, session_id: str, fields: dict,
+    ) -> bool:
+        """Like :meth:`update_session_fields`, but only for a session that is
+        not archived.
+
+        The runtime's status writes use it, so that only unarchive takes a
+        session out of ``archived``. Returns ``True`` when a row was written,
+        ``False`` for an archived or missing session.
+        """
+        built = self._build_session_fields_update(session_id, fields)
+        if built is None:
+            return False
+        sql, params = built
+        result = await self._write(f"{sql} AND status != 'archived'", params)
+        return (result.rowcount or 0) > 0
+
     async def change_session_fields(
         self,
         session_id: str,
@@ -464,7 +574,8 @@ class SessionStore:
         *,
         attribution: Attribution = UNATTRIBUTED,
         reason: str | None = None,
-    ) -> list[str]:
+        only_from: dict[str, tuple] | None = None,
+    ) -> list[str] | None:
         """Write session fields and record each tracked change as an event.
 
         Like :meth:`update_session_fields`. In the same transaction, each
@@ -476,7 +587,12 @@ class SessionStore:
         when it is set (for example ``generated`` for a title that the agent
         made). A field that keeps its value records nothing.
 
-        Returns the event types written, in the order of ``fields``.
+        ``only_from`` maps columns to the values they must hold for the write
+        to happen.
+
+        Returns the event types written, in the order of ``fields``, or
+        ``None`` when nothing was written: no such session, or ``only_from``
+        did not hold.
         """
         built = self._build_session_fields_update(session_id, fields)
         if built is None:
@@ -488,8 +604,13 @@ class SessionStore:
             ) as cursor:
                 row = await cursor.fetchone()
             if row is None:
-                return []
+                return None
             before = dict(row)
+            if only_from and any(
+                before.get(column) not in allowed
+                for column, allowed in only_from.items()
+            ):
+                return None
             await self.db.execute(*built)
             for field, value in fields.items():
                 previous = before.get(field)

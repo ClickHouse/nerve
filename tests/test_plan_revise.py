@@ -12,6 +12,7 @@ come back.
 from __future__ import annotations
 
 import asyncio
+import re
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,6 +26,7 @@ from nerve.agent.plan_service import (
     TaskNotFound,
     request_plan_revision,
 )
+from nerve.agent.tools.schemas import PLAN_UPDATE_SCHEMA
 from nerve.db import Database
 from nerve.identity import Actor
 
@@ -54,6 +56,7 @@ class FakeSessionManager:
         *,
         actor: Actor | None,
         cause=None,
+        origin=None,
     ) -> dict:
         self.calls.append({
             "session_id": session_id,
@@ -79,6 +82,7 @@ class FakeEngine:
         # Event flipped after every run() call so tests can await
         # dispatch deterministically instead of sleeping.
         self.run_event = asyncio.Event()
+        self.reopened: list[str] = []
 
     async def run(
         self,
@@ -97,6 +101,10 @@ class FakeEngine:
             "cause": cause,
         })
         self.run_event.set()
+
+    async def reopen_archived(self, session_id: str, *, attribution) -> bool:
+        self.reopened.append(session_id)
+        return False
 
 
 async def _setup(db: Database, tmp_path) -> tuple[FakeEngine, str]:
@@ -146,6 +154,12 @@ class TestRequestPlanRevision:
         # Crucial: plan_update with the plan_id, NOT plan_propose with the task_id.
         assert 'plan_update(plan_id="plan-orig"' in prompt
         assert "plan_propose(" not in prompt
+        # The summary of the old version is not copied, so the prompt asks
+        # for a new one with the parameter names of the tool schema.
+        call = re.search(r"plan_update\(([^)]*)\)", prompt)
+        params = [arg.split("=", 1)[0].strip() for arg in call.group(1).split(", ")]
+        assert "summary" in params
+        assert set(params) <= set(PLAN_UPDATE_SCHEMA["properties"])
         # Feedback is embedded verbatim.
         assert "be more specific about edge cases" in prompt
 
@@ -186,6 +200,25 @@ class TestRequestPlanRevision:
         # must route the feedback there, not to the cron fallback.
         assert engine.runs[0]["session_id"] == "sess-proposer"
         assert engine.sessions.calls[0]["session_id"] == "sess-proposer"
+        # An archived proposer session is unarchived before the run.
+        assert engine.reopened == ["sess-proposer"]
+
+    async def test_falls_back_to_cron_planner_when_proposer_was_deleted(
+        self, db: Database, tmp_path,
+    ):
+        engine, _ = await _setup(db, tmp_path)
+        await db.create_session("sess-proposer", actor=None)
+        await db.delete_session("sess-proposer")
+
+        await request_plan_revision(
+            db=db, engine=engine,
+            plan_id="plan-orig", feedback="rev",
+            actor=None, cause=None,
+        )
+        await asyncio.wait_for(engine.run_event.wait(), timeout=1.0)
+
+        assert engine.runs[0]["session_id"] == "cron:task-planner"
+        assert await db.get_session("sess-proposer") is None
 
     async def test_falls_back_to_cron_planner_when_session_unknown(
         self, db: Database, tmp_path,

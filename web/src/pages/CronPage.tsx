@@ -3,15 +3,15 @@ import { RefreshCw, Loader2 } from '../components/ui/icons';
 import { IconButton } from '../components/ui';
 import { useCronStore } from '../stores/cronStore';
 import { CronSidebar } from '../components/Cron/CronSidebar';
-import { JobInfoCard } from '../components/Cron/JobInfoCard';
-import { LogsTable } from '../components/Cron/LogsTable';
+import { JobSheet } from '../components/Cron/JobSheet';
+import { RunHistory } from '../components/Cron/RunHistory';
 import { PageHeader } from '../components/ui/PageHeader';
 import { PaneToggle } from '../components/ui/PaneToggle';
 import { Drawer } from '../components/ui/Drawer';
 import { useIsMobile } from '../hooks/useMediaQuery';
 
 export function CronPage() {
-  const { jobs, selectedJobId, loadJobs, loadLogs, refresh } = useCronStore();
+  const { jobs, selectedJobId, open, refresh } = useCronStore();
   const [refreshing, setRefreshing] = useState(false);
 
   // The job list is "which item within this section", so on a phone it
@@ -23,7 +23,7 @@ export function CronPage() {
 
   // Picking a job shuts the drawer, but that is driven by `CronSidebar`'s
   // `onSelect` rather than by watching `selectedJobId`: tapping the job that
-  // is already selected — "All Jobs", most often — leaves the id unchanged,
+  // is already selected ("All jobs", most often) leaves the id unchanged,
   // and the drawer would stay over the table it was asked to reveal.
   //
   // All that is left here is retiring the drawer when the layout leaves the
@@ -36,9 +36,9 @@ export function CronPage() {
     setListOpen(false);
   }
 
+  // Opens on a job's sheet: the selected job, or the first one.
   useEffect(() => {
-    loadJobs();
-    loadLogs();
+    void open();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -56,7 +56,7 @@ export function CronPage() {
         leading={isMobile
           ? <PaneToggle open={listOpen} onToggle={() => setListOpen(o => !o)} label="job list" />
           : undefined}
-        title="Cron Jobs"
+        title="Cron jobs"
         actions={
           <IconButton label="Refresh" onClick={handleRefresh} disabled={refreshing}>
             {refreshing ? <Loader2 size={16} className="animate-spin" /> : <RefreshCw size={16} />}
@@ -74,10 +74,12 @@ export function CronPage() {
           <CronSidebar />
         )}
 
-        <div className="flex-1 flex flex-col min-w-0">
-          {selectedJob && <JobInfoCard job={selectedJob} />}
-          <div className={`flex-1 flex flex-col min-h-0 ${selectedJob ? 'mt-2' : ''}`}>
-            <LogsTable showJobColumn={selectedJobId === null} />
+        {/* The sheet and the history scroll together: on a phone a sheet
+            fixed above the list would leave the list a few rows. */}
+        <div className="flex-1 min-w-0 overflow-y-auto">
+          <div className="max-w-5xl p-4 flex flex-col gap-5">
+            {selectedJob && <JobSheet job={selectedJob} />}
+            <RunHistory showJob={selectedJobId === null} />
           </div>
         </div>
       </div>

@@ -364,6 +364,75 @@ async def test_a_job_whose_gate_forecasts_a_skip_is_passed_over(held):
 
 
 @pytest.mark.asyncio
+async def test_a_job_gated_on_activity_is_the_next_tick_only_after_the_agent_worked(held, db):
+    """A maintenance job with nothing to look after is not the next scheduled
+    task, so a platform that parks the machine does not wake it for the job.
+    Once the agent has worked it is, and after its run it is passed over again."""
+    now = datetime.now(UTC)
+    svc = await held(
+        [_job("tidy", run_if=[{"type": "agent_activity", "ignore_jobs": ["sweep"]}])], db=db,
+    )
+    _due(svc, "tidy", now + timedelta(minutes=10))
+
+    async def turn(session_id: str) -> None:
+        await db.create_session(session_id, source="test", actor=None)
+        await db.record_turn_usage(
+            session_id=session_id, input_tokens=1, output_tokens=1,
+            cache_creation=0, cache_read=0, max_context=200_000,
+        )
+
+    assert await svc.next_scheduled(now=now) is None
+    report = {j["id"]: j for j in (await svc.schedule_report())["jobs"]}
+    assert report["tidy"]["forecast"] == "skip"
+    assert report["tidy"]["reason"].startswith("gate 'agent_activity' not satisfied")
+
+    await turn("cron:sweep:20260102-030405-0a1b2c3d")  # another maintenance job ran
+    assert await svc.next_scheduled(now=now) is None
+
+    await turn("chat-1")
+    tick = await svc.next_scheduled(now=now)
+    assert (tick.name, tick.at) == ("tidy", now + timedelta(minutes=10))
+
+    # The job runs: its own turn, and a run on record that started after the chat.
+    await db.db.execute("UPDATE session_usage SET created_at = datetime('now', '-1 minute')")
+    await db.db.commit()
+    await db.log_cron_finish(await db.log_cron_start("tidy"), "success")
+    await turn("cron:tidy:20260102-040506-1b2c3d4e")
+    assert await svc.next_scheduled(now=now) is None
+
+
+@pytest.mark.asyncio
+async def test_a_job_that_waits_for_its_proposals_to_be_decided_is_not_the_next_tick(held, db):
+    """A job with three of its proposals in review does not add a fourth, so
+    it is not the next scheduled task, and a platform that parks the machine
+    does not wake it for the job. It is again once one is decided."""
+    now = datetime.now(UTC)
+    svc = await held([_job("scout", run_if=[{"type": "plans_in_review", "below": 3}])], db=db)
+    _due(svc, "scout", now + timedelta(minutes=10))
+
+    for n in (1, 2, 3):
+        tick = await svc.next_scheduled(now=now)
+        assert (tick.name, tick.at) == ("scout", now + timedelta(minutes=10))
+        await db.upsert_task(task_id=f"t{n}", file_path=f"t{n}.md", title=f"Proposal {n}")
+        await db.create_plan(
+            plan_id=f"plan-{n}", task_id=f"t{n}", content="What, evidence, direction.",
+            session_id="cron:scout:20260102-030405-0a1b2c3d",
+        )
+
+    assert await svc.next_scheduled(now=now) is None
+    report = {j["id"]: j for j in (await svc.schedule_report())["jobs"]}
+    assert report["scout"]["forecast"] == "skip"
+    assert report["scout"]["reason"] == (
+        "gate 'plans_in_review' not satisfied "
+        "(fewer than 3 of this job's proposals wait for review)"
+    )
+
+    await db.update_plan("plan-2", status="declined")
+    tick = await svc.next_scheduled(now=now)
+    assert (tick.name, tick.at) == ("scout", now + timedelta(minutes=10))
+
+
+@pytest.mark.asyncio
 async def test_a_source_runner_counts(held):
     now = datetime.now(UTC)
     svc = await held([_job("digest")], [_runner("mail")])
@@ -1042,3 +1111,35 @@ def test_cron_next_with_nothing_scheduled(tmp_path, monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert result.output.splitlines()[0] == "Next: nothing scheduled in the next 7 days"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["worker", "personal"])
+async def test_the_built_in_jobs_give_an_agent_that_does_nothing_no_next_tick(held, db, tmp_path, mode):
+    """The jobs as the installer writes them and the scheduler loads them.
+    While the agent does nothing, none of them is the next scheduled task, so
+    a platform that parks the machine is given no time to wake it at. After
+    one turn, each maintenance job that is switched on is forecast to run."""
+    from nerve.setup_writer import MAINTENANCE_CRON_IDS
+    from tests.test_cron_gates import _load, _system_yaml
+
+    loaded = _load(tmp_path, _system_yaml(mode=mode))
+    switched_on = {job_id for job_id in MAINTENANCE_CRON_IDS if loaded[job_id].enabled}
+    assert {"memory-maintenance", "machine-maintenance"} <= switched_on
+    svc = await held(list(loaded.values()), db=db)
+
+    async def forecasts() -> dict[str, str]:
+        report = {job["id"]: job for job in (await svc.schedule_report())["jobs"]}
+        return {job_id: report[job_id]["forecast"] for job_id in switched_on}
+
+    assert await svc.next_scheduled() is None
+    assert set((await forecasts()).values()) == {"skip"}
+
+    await db.create_session("chat-1", source="test", actor=None)
+    await db.record_turn_usage(
+        session_id="chat-1", input_tokens=1, output_tokens=1,
+        cache_creation=0, cache_read=0, max_context=200_000,
+    )
+
+    assert set((await forecasts()).values()) == {"run"}
+    assert (await svc.next_scheduled()).name in switched_on

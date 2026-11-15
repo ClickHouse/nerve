@@ -211,6 +211,80 @@ class TestOutboundHelpers:
         assert split_text("   \n  ", 3) == []
         assert truncate_text("abcdef", 4) == "abc…"
 
+    def test_a_cut_does_not_divide_a_markdown_link(self):
+        """Half of a link reaches the reader as its markup. A notification
+        ends with the link to its session, where a cut falls first: the link
+        gives way to the part of its label before the cut."""
+        label = "Nightly report"
+        link = f"[{label}](https://nerve.example.com/chat/0a1b2c3d)"
+        head = "x" * 40 + "\n\nSession: "
+        text = head + link
+
+        for limit in range(len(head) + 2, len(text)):
+            cut = truncate_text(text, limit)
+            shown = label[:limit - 1 - len(head) - 1]
+            assert cut == (head + shown).rstrip() + "…"
+            assert len(cut) <= limit
+            assert "[" not in cut and "](" not in cut
+        # The whole text fits, and a cut before the link is where it was.
+        assert truncate_text(text, len(text)) == text
+        assert truncate_text(text, 20) == "x" * 19 + "…"
+
+    def test_a_link_that_fits_before_the_cut_stays(self):
+        link = "[docs](https://example.com/docs)"
+        text = f"See {link} and the rest of a long line."
+
+        assert truncate_text(text, len(f"See {link} and")) == f"See {link} an…"
+
+    def test_a_text_that_begins_with_the_divided_link_keeps_its_label(self):
+        text = "[Nightly report](https://nerve.example.com/chat/0a1b2c3d)"
+
+        assert truncate_text(text, 12) == "Nightly re…"
+        assert truncate_text(text, 40) == "Nightly report…"
+
+    def test_brackets_that_make_no_link_do_not_move_the_cut(self):
+        text = "rows [1, 2, 3] and (more) " * 10
+
+        assert truncate_text(text, 30) == text[:29] + "…"
+
+    def test_an_open_bracket_before_the_cut_is_not_the_divided_link(self):
+        """An open bracket, in code or not, pairs with nothing that the cut
+        text still holds: only a link at the cut gives way, and the bracket
+        stays where it is."""
+        link = "[Nightly report](https://nerve.example.com/chat/0a1b2c3d)"
+        for body in ("Ran `rows[0` twice. " + "y" * 870, "items: [1, 2, 3 " + "y" * 870):
+            text = body + "\n\nSession: " + link
+
+            # A cut inside the link: the link gives way, the body is whole.
+            assert truncate_text(text, len(text) - 20) == body + "\n\nSession: Nightly report…"
+            # A cut before the link: an ordinary cut, with the bracket in it.
+            for limit in (len(body) - 5, 400, 30):
+                assert truncate_text(text, limit) == text[:limit - 1] + "…"
+
+    def test_only_what_the_cut_removes_is_missing(self):
+        """Whatever the text holds, the result is the text up to the cut,
+        or up to a link at the cut and then the start of that link's label."""
+        import random
+
+        rng = random.Random(7)
+        pieces = ["[", "]", "(", ")", "`", "x", "y ", "\n", "[docs](https://example.com/d)", "é"]
+        for _ in range(3000):
+            text = "".join(rng.choice(pieces) for _ in range(rng.randint(1, 60)))
+            limit = rng.randint(1, len(text) + 2)
+            result = truncate_text(text, limit)
+            assert len(result) <= max(limit, 1) or len(text) <= limit
+            if len(text) <= limit:
+                assert result == text
+                continue
+            kept = result[:-1]
+            assert result.endswith("…")
+            if text.startswith(kept):
+                continue
+            # A link at the cut gave way: its bracket is gone, its label follows.
+            start = next(i for i in range(len(kept) + 1) if not text.startswith(kept[:i + 1]))
+            assert text[start] == "[", (text, limit, result)
+            assert (text[:start] + text[start + 1:]).startswith(kept.rstrip()) or text[:start].rstrip() == kept
+
     def test_reaction_names(self):
         names = slack_emoji_by_name()
 

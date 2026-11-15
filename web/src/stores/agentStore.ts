@@ -33,7 +33,23 @@ export interface PendingSend { clientMsgId: string; content: string; blocks: Mes
 export type EscalationState =
   | { kind: 'not_stopped'; wouldEnd: AgentBrief[]; shellCount: number }
   | { kind: 'needs_confirmation'; wouldEnd: AgentBrief[]; shellCount: number };
-export interface ComposerInsert { nonce: number; text: string; mode: 'replace' | 'append' }
+/**
+ * Text for the composer. `replace` and `append` put it in and take the focus,
+ * with the caret after it: for what the person asked for (Follow up…, a
+ * cancelled queued message). `offer` is for text the person neither wrote nor
+ * asked for (a view of an MCP App, once they allowed it): only an empty
+ * composer takes it, the focus stays where it is, and `taken` hears whether
+ * it went in.
+ */
+export interface ComposerInsert {
+  nonce: number;
+  text: string;
+  mode: 'replace' | 'append' | 'offer';
+  taken?: (inserted: boolean) => void;
+}
+
+/** How long an offer waits for a composer to answer: there may be none on the page. */
+const OFFER_WAIT_MS = 500;
 
 export interface AgentStoreState {
   sessionId: string | null;
@@ -51,6 +67,8 @@ export interface AgentStoreState {
   /** What the last stop request could not do (shown above the composer). */
   stopError: string | null;
   composerInsert: ComposerInsert | null;
+  /** The composer holds text. The composer keeps this up to date. */
+  composerHasText: boolean;
   focusNonce: number;                         // bumped by requestFocus(); AgentsPanel focuses its list
 
   reset(sessionId: string | null): void;
@@ -76,11 +94,20 @@ export interface AgentStoreState {
   stopAll(opts?: { includeShells?: boolean }): Promise<StopAllResult | null>;
   forceStop(): Promise<ForceStopResult | null>;
   cancelQueued(queueId: string): Promise<void>;
+  /** Set the run order of the queue: `queueIds` from the one that runs next to the last. */
+  reorderQueue(queueIds: string[]): Promise<void>;
   markSeen(agentIds: string[]): void;
   setStopDialog(d: 'all' | 'force' | null): void;
   dismissEscalation(): void;
   dismissStopError(): void;
   prefillComposer(text: string, mode?: 'replace' | 'append'): void;
+  setComposerHasText(has: boolean): void;
+  /**
+   * Offer `text` to the composer (see `ComposerInsert`): it goes in only
+   * when the composer is empty, and the focus does not move. Resolves true
+   * when it went in.
+   */
+  offerToComposer(text: string): Promise<boolean>;
   requestFocus(): void;
 }
 
@@ -389,6 +416,7 @@ export const useAgentStore = create<AgentStoreState>((set, get) => {
 
   return {
     ...emptyData(null),
+    composerHasText: false,
     focusNonce: 0,
 
     reset: (sessionId) => {
@@ -774,6 +802,30 @@ export const useAgentStore = create<AgentStoreState>((set, get) => {
       }
     },
 
+    reorderQueue: async (queueIds) => {
+      const s = get();
+      const sessionId = s.sessionId;
+      if (!sessionId) return;
+      const gen = generation;
+      // The new order shows at once, sorted as the server sorts it (entries
+      // not named keep their order, last). The queue_update that every tab
+      // gets then carries the server's order.
+      const rank = (q: QueueEntryView) => {
+        const at = queueIds.indexOf(q.queue_id);
+        return at < 0 ? queueIds.length : at;
+      };
+      set({ queue: [...s.queue].sort((a, b) => rank(a) - rank(b)) });
+      try {
+        await api.reorderQueue(sessionId, queueIds);
+      } catch (e) {
+        console.error('Failed to reorder the queue:', e);
+        const res = await api.getQueue(sessionId).catch(() => null);
+        if (res && gen === generation) {
+          set({ queue: res.items.filter(q => !removedQueueIds.has(q.queue_id)) });
+        }
+      }
+    },
+
     markSeen: (agentIds) => {
       const s = get();
       const fresh = agentIds.filter((id) => id && !s.seen[id]);
@@ -795,6 +847,22 @@ export const useAgentStore = create<AgentStoreState>((set, get) => {
     prefillComposer: (text, mode = 'append') => {
       set({ composerInsert: { nonce: Date.now() + Math.random(), text, mode } });
     },
+
+    setComposerHasText: (has) => {
+      if (get().composerHasText !== has) set({ composerHasText: has });
+    },
+
+    offerToComposer: (text) => new Promise<boolean>((resolve) => {
+      let answered = false;
+      const taken = (inserted: boolean) => {
+        if (answered) return;
+        answered = true;
+        resolve(inserted);
+      };
+      // A composer on the page answers within this call; without one, nobody does.
+      set({ composerInsert: { nonce: Date.now() + Math.random(), text, mode: 'offer', taken } });
+      setTimeout(() => taken(false), OFFER_WAIT_MS);
+    }),
 
     requestFocus: () => set((s) => ({ focusNonce: s.focusNonce + 1 })),
   };

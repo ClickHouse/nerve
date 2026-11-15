@@ -1412,15 +1412,16 @@ class TestContentHashReinforce:
 _TEMPERATURE_400 = "`temperature` is deprecated for this model."
 
 
-def _bedrock_temperature_400():
+def _bad_request(message: str):
+    """A 400 as the Anthropic SDK raises it."""
     import anthropic
-    import httpx
+    import httpx2
 
-    request = httpx.Request("POST", "https://bedrock-runtime.us-east-1.amazonaws.com/model/x/invoke")
+    request = httpx2.Request("POST", "https://bedrock-runtime.us-east-1.amazonaws.com/model/x/invoke")
     return anthropic.BadRequestError(
-        f"Error code: 400 - {{'message': '{_TEMPERATURE_400}'}}",
-        response=httpx.Response(400, request=request),
-        body={"message": _TEMPERATURE_400},
+        f"Error code: 400 - {{'message': '{message}'}}",
+        response=httpx2.Response(400, request=request),
+        body={"message": message},
     )
 
 
@@ -1544,66 +1545,52 @@ class TestSendsTemperature:
     def test_only_a_400_about_temperature_counts_as_rejection(self):
         from nerve.memory.memu_bridge import _is_temperature_rejected
 
-        assert _is_temperature_rejected(_bedrock_temperature_400())
+        assert _is_temperature_rejected(_bad_request(_TEMPERATURE_400))
         assert not _is_temperature_rejected(Exception(f"Error code: 500 - {_TEMPERATURE_400}"))
         assert not _is_temperature_rejected(Exception("Error code: 400 - max_tokens too large"))
 
 
+_BEDROCK_MODELS = [
+    "us.anthropic.claude-sonnet-5",
+    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "anthropic.claude-3-5-haiku-20241022-v1:0",
+    "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123",
+]
+
+
 @pytest.mark.asyncio
 class TestBedrockChatTemperature:
-    async def test_claude_5_request_has_no_temperature(self, fresh_temperature_memory):
+    """The Anthropic SDK has no sampling parameters, and API version
+    2026-10-21 rejects them. The Bedrock client sends no temperature for any
+    model, whatever memU gives."""
+
+    @pytest.mark.parametrize("model", _BEDROCK_MODELS)
+    @pytest.mark.parametrize("temperature", [0.3, 0.2, None])
+    async def test_no_request_has_a_temperature(self, model, temperature, fresh_temperature_memory):
         create = AsyncMock(return_value=_bedrock_ok())
-        client = _fake_bedrock_client("us.anthropic.claude-sonnet-5", create)
-        text, _ = await client.chat("hello")
+        client = _fake_bedrock_client(model, create)
+        text, _ = await client.chat("hello", temperature=temperature)
         assert text == "ok"
         assert "temperature" not in create.call_args.kwargs
 
-    async def test_claude_4_request_keeps_temperature(self, fresh_temperature_memory):
-        create = AsyncMock(return_value=_bedrock_ok())
-        client = _fake_bedrock_client("us.anthropic.claude-haiku-4-5-20251001-v1:0", create)
-        await client.chat("hello", temperature=0.3)
-        assert create.call_args.kwargs["temperature"] == 0.3
-
-    async def test_none_leaves_temperature_out(self, fresh_temperature_memory):
-        create = AsyncMock(return_value=_bedrock_ok())
-        client = _fake_bedrock_client("us.anthropic.claude-haiku-4-5-20251001-v1:0", create)
-        await client.chat("hello", temperature=None)
-        assert "temperature" not in create.call_args.kwargs
-
-    async def test_wrapped_client_retries_an_unreadable_id_once_without_temperature(
-        self, tmp_path, fresh_temperature_memory,
+    @pytest.mark.parametrize("model", _BEDROCK_MODELS)
+    async def test_wrapped_client_sends_one_request_without_temperature(
+        self, tmp_path, model, fresh_temperature_memory,
     ):
-        arn = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123"
-
-        async def create(**kwargs):
-            if "temperature" in kwargs:
-                raise _bedrock_temperature_400()
-            return _bedrock_ok()
-
-        mock = AsyncMock(side_effect=create)
-        client = _instrumented(tmp_path, _fake_bedrock_client(arn, mock))
+        create = AsyncMock(return_value=_bedrock_ok())
+        client = _instrumented(tmp_path, _fake_bedrock_client(model, create))
 
         text, _ = await client.chat("hello")
+
         assert text == "ok"
-        assert ["temperature" in c.kwargs for c in mock.call_args_list] == [True, False]
-        assert arn in fresh_temperature_memory
+        assert create.call_count == 1
+        assert "temperature" not in create.call_args.kwargs
+        assert not fresh_temperature_memory
 
-        # Later calls go straight out without temperature.
-        await client.chat("again")
-        assert mock.call_count == 3
-        assert "temperature" not in mock.call_args.kwargs
-
-    async def test_wrapped_client_does_not_retry_other_400s(self, tmp_path, fresh_temperature_memory):
+    async def test_wrapped_client_does_not_retry_a_400(self, tmp_path, fresh_temperature_memory):
         import anthropic
-        import httpx
 
-        request = httpx.Request("POST", "https://bedrock-runtime.us-east-1.amazonaws.com/model/x/invoke")
-        error = anthropic.BadRequestError(
-            "Error code: 400 - {'message': 'prompt is too long'}",
-            response=httpx.Response(400, request=request),
-            body={"message": "prompt is too long"},
-        )
-        mock = AsyncMock(side_effect=error)
+        mock = AsyncMock(side_effect=_bad_request("prompt is too long"))
         client = _instrumented(
             tmp_path, _fake_bedrock_client("us.anthropic.claude-haiku-4-5-20251001-v1:0", mock),
         )

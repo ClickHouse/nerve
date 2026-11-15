@@ -422,7 +422,7 @@ class ReviewLoopService:
             # existing title (MCP-started loops attach to real chats).
             with contextlib.suppress(Exception):
                 session = await self.db.get_session(session_id)
-                if session is not None and not str(session.get("title") or "").strip():
+                if session is not None and session.get("title") in (None, "", session_id):
                     coro = self.engine._generate_session_title(  # noqa: SLF001 — engine-internal by design
                         session_id, f"Review loop goal: {goal[:300]}",
                     )
@@ -1865,8 +1865,8 @@ class ReviewLoopService:
                         await self._milestone(
                             fresh,
                             f"❌ **Review loop {loop['id']} closed** — its "
-                            "decision card expired "
-                            f"{count + 1}× unanswered. Last state: "
+                            "decision card closed "
+                            f"{count + 1}× without an answer. Last state: "
                             f"{loop.get('failure_reason')}.",
                             notify=True,
                         )
@@ -1876,7 +1876,8 @@ class ReviewLoopService:
                 )
                 await self._propose_card(
                     loop,
-                    f"(re-proposed — previous card expired) Parked on: "
+                    "(re-proposed: the previous card closed without an "
+                    "answer) Parked on: "
                     f"{loop.get('failure_reason')}",
                 )
             elif loop["status"] in ("implementing", "verifying"):

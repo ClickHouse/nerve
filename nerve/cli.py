@@ -54,6 +54,7 @@ def setup_logging(verbose: bool = False) -> None:
     )
     # Quiet noisy loggers
     logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("telegram").setLevel(logging.WARNING)
 
@@ -1566,12 +1567,12 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
 
     The gateway decides admission and where the agent may post, so only the
     send tool switch, its local conversation limit, the channel source's
-    local grant, and the notification conversation are reported. A config
-    without a notification conversation is not a problem: the gateway can
-    then post the cards in the notification channel set in the console.
-    Slash commands do not reach Nerve.
+    local grant, and where notification cards go are reported. The gateway
+    posts the cards in the notification channel set in the control plane;
+    ``notifications.slack_channel_id`` is not read. Slash commands do not
+    reach Nerve.
     """
-    from nerve.channels.slack import is_slack_id, notification_target
+    from nerve.channels.slack import is_slack_id
     from nerve.config import SLACK_HOST_COMMANDS
 
     slack = config.slack
@@ -1613,18 +1614,11 @@ def _hosted_slack_lines(config, warnings: list[str]) -> list[str]:
             "[WARN] Slack channel source collects nothing: set slack.source.gateway_grant, "
             "or list channel ids in slack.source.allow_channels"
         )
-    target = notification_target(config, warn_unset=False)
-    if target:
-        lines.append(f"[OK] Slack notifications go to {target}")
-    elif config.notifications.slack_channel_id.strip():
+    lines.append("[--] Slack notifications go to the notification channel set in the control plane")
+    if config.notifications.slack_channel_id.strip():
         warnings.append(
-            "[WARN] notifications.slack_channel_id is not a Slack conversation id; "
-            "the gateway chooses the notification conversation instead"
-        )
-    else:
-        lines.append(
-            "[--] Slack notifications: the config names no conversation; the gateway "
-            "can post them in the notification channel set in the console"
+            "[WARN] notifications.slack_channel_id is not read in hosted mode; "
+            "set the notification channel in the control plane"
         )
     lines.append("[--] Slack /nerve commands are not available in hosted mode")
     host = [name for name in slack.commands or () if name in SLACK_HOST_COMMANDS]
@@ -1685,6 +1679,37 @@ def _hosted_github_lines(config, errors: list[str], warnings: list[str]) -> list
             "hosted GitHub records wait there too"
         )
     return lines
+
+
+def _email_lines(config, errors: list[str], warnings: list[str]) -> list[str]:
+    """Doctor lines for the email channel (``email.enabled``).
+
+    Mail comes only through the channel gateway, so the channel needs usable
+    ``channels.hosted`` settings and a key file that can be read. A
+    switched-off hosted Slack holds member mail back too. Nothing is shown
+    while email is switched off.
+    """
+    if not config.email.enabled:
+        return []
+    from nerve.channels.hosted.auth import KeyFileError, read_key_file
+    from nerve.channels.hosted.providers import email_warning
+
+    problem = email_warning(config)
+    if problem is not None:
+        warnings.append(f"[WARN] {problem}")
+        return []
+    try:
+        read_key_file(config.channels.hosted.gateway_jwks_file)
+    except KeyFileError as error:
+        errors.append(f"[ERR] Email is on but channels.hosted.gateway_jwks_file: {error}")
+        return []
+    if config.slack.mode == "hosted" and not config.slack.enabled:
+        warnings.append(
+            "[WARN] Slack is hosted but switched off (slack.enabled is false): Nerve "
+            "reads nothing from the channel gateway until it is switched on, so member "
+            "mail waits there too"
+        )
+    return ["[OK] Email from members comes from the channel gateway; Nerve posts no answer"]
 
 
 def _actor_context_lines(config, errors: list[str], warnings: list[str]) -> list[str]:
@@ -2082,6 +2107,19 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
                     f"[WARN] {label} '{model}' uses the '{geo}.' inference profile "
                     f"but region {region} is '{expected}.' — expect 400 errors"
                 )
+        # Nerve's own model calls go through the Anthropic SDK. Its API
+        # version accepts only Claude 4.7 and later models on Bedrock. An ID
+        # that the check cannot read gets no warning.
+        from nerve.config import BEDROCK_SDK_MIN_CLAUDE_VERSION, claude_model_version
+        minimum = ".".join(map(str, BEDROCK_SDK_MIN_CLAUDE_VERSION))
+        for label, model in config.anthropic_sdk_models():
+            version = claude_model_version(model)
+            if version is not None and version < BEDROCK_SDK_MIN_CLAUDE_VERSION:
+                warnings.append(
+                    f"[WARN] {label} '{model}' is older than Claude {minimum}. "
+                    f"On Bedrock, Nerve's own calls with this model fail; "
+                    f"set Claude {minimum} or later"
+                )
     elif config.proxy.enabled:
         if config.anthropic_api_key:
             lines.append("[--] Anthropic API key set (proxy takes precedence)")
@@ -2240,6 +2278,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         lines.append("[--] Slack disabled")
     lines.extend(_hosted_github_lines(config, errors, warnings))
     lines.extend(_github_repos_lines(config, warnings))
+    lines.extend(_email_lines(config, errors, warnings))
 
     # Check SSL
     if config.gateway.ssl.enabled:
@@ -3003,12 +3042,17 @@ def codex_doctor(ctx: click.Context, json_output: bool) -> None:
             click.echo(f"[--] Endpoint: {status['base_url']} (no Codex login)")
         if status.get("available"):
             click.echo(f"[OK] {status.get('version')} ({status.get('auth')})")
-            click.echo(f"[OK] Models: {', '.join(status.get('models') or [])}")
-            hidden = status.get("hidden_models") or []
-            if hidden:
+            offered = status.get("models") or []
+            click.echo(f"[OK] Model menu (codex.models): {', '.join(offered)}")
+            hidden = set(status.get("hidden_models") or [])
+            others = [
+                m for m in status.get("catalog_models") or sorted(hidden)
+                if m not in offered
+            ]
+            if others:
                 click.echo(
-                    "[--] Hidden catalog entries (opt in via codex.models): "
-                    + ", ".join(hidden)
+                    "[--] Other catalog models (add to codex.models to offer them): "
+                    + ", ".join(f"{m} (hidden)" if m in hidden else m for m in others)
                 )
             if status.get("auth_mismatch"):
                 click.echo(
@@ -3284,6 +3328,17 @@ def cron(ctx: click.Context, job_id: str) -> None:
                 for j in system_jobs:
                     if j.id not in seen_ids:
                         all_jobs.append(("system", j))
+
+                # As the daemon loads a built-in job whose system.yaml entry
+                # still holds what an earlier release shipped: the entry that
+                # runs, which is the last one with its id. It logs which job
+                # that is. The daemon also writes this release's values into
+                # the file, when it starts and when it reloads; the listing
+                # writes nothing.
+                from nerve.cron.jobs import merge_jobs
+                from nerve.cron.service import bring_up_to_date
+
+                bring_up_to_date([j for j in merge_jobs(system_jobs, []) if j.id not in seen_ids])
 
                 for source, job in all_jobs:
                     # A reserved id is never scheduled by the daemon. Show the

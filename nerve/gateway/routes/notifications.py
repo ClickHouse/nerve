@@ -18,6 +18,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(dependencies=[Depends(require_auth)])
 
+# The notification types that wait for an answer from the person.
+_ANSWER_TYPES = ("question", "approval")
+
 
 class NotificationAnswerRequest(BaseModel):
     answer: str
@@ -45,7 +48,17 @@ async def list_notifications(
         channel="web",
     )
     pending_count = await deps.db.count_pending_notifications(channel="web")
-    return {"notifications": notifications, "pending_count": pending_count}
+    # The counts ignore the filters and the limit: the list can leave out a
+    # pending row, for example of a cron session, which the session list
+    # also leaves out.
+    pending_answer_count = await deps.db.count_pending_notifications(
+        channel="web", types=_ANSWER_TYPES,
+    )
+    return {
+        "notifications": notifications,
+        "pending_count": pending_count,
+        "pending_answer_count": pending_answer_count,
+    }
 
 
 # --------------------------------------------------------------------- #

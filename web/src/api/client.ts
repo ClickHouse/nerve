@@ -6,6 +6,10 @@ import type {
   AgentDetail, AgentOutput, AgentSnapshot, AgentTranscriptPage, ForceStopResult, QueueEntryView,
   StopAgentResponse, StopAllResult, StopTurnResult,
 } from '../types/agents';
+import type { PullRequestResult } from '../types/github';
+import type { McpAppResource, McpAppTool, McpAppsConfig, McpCallToolResult } from '../types/mcpApps';
+import type { NotificationSettingValues, NotificationSettings, NotificationTestResult } from './settings';
+import type { PushDevice, PushDevices, PushSubscriptionBody } from './push';
 
 const API_BASE = '/api';
 
@@ -681,7 +685,28 @@ export interface Task {
   updated_at: string;
   /** Number of comments. Server-maintained. */
   comment_count?: number;
+  /** The session that created the task; null when it was not a session. */
+  created_session_id?: string | null;
+  /** That session's title (its id when untitled); null once it is deleted. */
+  created_session_title?: string | null;
   content?: string;
+  /** The sessions of the task. Only `GET /api/tasks/{id}` returns it. */
+  sessions?: TaskSession[];
+}
+
+/** How a session relates to a task, in order of precedence. */
+export type TaskSessionRelation = 'created' | 'implemented' | 'updated';
+
+/** A session that created, implemented or updated a task. */
+export interface TaskSession {
+  id: string;
+  title: string;
+  relation: TaskSessionRelation;
+}
+
+/** A task of a session, from `GET /api/sessions/{id}/tasks`. */
+export interface SessionTask extends Task {
+  relation: TaskSessionRelation;
 }
 
 export interface UltracodeUsage {
@@ -1076,6 +1101,33 @@ export function apiErrorDetail(e: unknown): Record<string, unknown> | null {
   }
 }
 
+/**
+ * What one widget of a chat saved (`docs/widgets.md`): the keys and values
+ * its script wrote to `localStorage`, in the order it first set the keys.
+ */
+export interface WidgetState {
+  /** The widget: the first 32 hex digits of the SHA-256 of its source. */
+  id: string;
+  items: Array<[string, string]>;
+  /** The characters of the keys and values together. */
+  size: number;
+  updated_at: string;
+}
+
+/** What the server holds a write of widget state to. */
+export interface WidgetStateLimits {
+  widget_chars: number;
+  widget_keys: number;
+  chat_chars: number;
+  chat_widgets: number;
+}
+
+/** `GET /api/sessions/{id}/widget-states`: every widget of the chat that saved something, newest first. */
+export interface WidgetStates {
+  widgets: WidgetState[];
+  limits: WidgetStateLimits;
+}
+
 /** The body of `POST /api/sessions/{id}/stop`, one shape per scope. */
 export type StopSessionBody =
   | { scope: 'turn'; confirm_kill_background?: boolean }
@@ -1087,6 +1139,21 @@ export interface ArchiveSessionResult {
   archived: boolean;
   archived_ids: string[];
   skipped: { id: string; reason: string }[];
+}
+
+/**
+ * `GET /api/sessions/{id}/context`: what fills the context window. `live`:
+ * measured by the session's runtime, with `categories` (each part of
+ * `total_tokens`); otherwise the last turn's totals and no categories.
+ */
+export interface SessionContext {
+  session_id: string;
+  live: boolean;
+  can_compact: boolean;
+  total_tokens: number;
+  max_tokens: number;
+  auto_compact_threshold: number | null;
+  categories: { name: string; tokens: number }[];
 }
 
 /**
@@ -1293,6 +1360,22 @@ export const api = {
 
   setupEnvironment: () => request<SetupEnvironment>('/setup/environment'),
 
+  // Settings: the same guards as setup; a PUT answers the whole section.
+  settingsNotifications: () => request<NotificationSettings>('/settings/notifications'),
+  saveSettingsNotifications: (values: NotificationSettingValues) =>
+    request<NotificationSettings>('/settings/notifications', {
+      method: 'PUT', body: JSON.stringify(values),
+    }),
+  testSettingsNotifications: () =>
+    request<NotificationTestResult>('/settings/notifications/test', { method: 'POST', body: '{}' }),
+
+  // Web Push: the browsers of the signed-in person.
+  pushDevices: () => request<PushDevices>('/push/subscriptions'),
+  savePushDevice: (body: PushSubscriptionBody) =>
+    request<PushDevice>('/push/subscriptions', { method: 'POST', body: JSON.stringify(body) }),
+  deletePushDevice: (id: number) =>
+    request<{ deleted: boolean }>(`/push/subscriptions/${id}`, { method: 'DELETE' }),
+
   restartSystem: () =>
     request<RestartResponse>('/system/restart', { method: 'POST', body: '{}' }),
 
@@ -1328,6 +1411,12 @@ export const api = {
   // whole list; re-fetch after a rename rather than caching a name anywhere.
   listActors: () => request<{ actors: ActorRef[] }>('/actors'),
 
+  // GitHub pull requests for the PR cards, read with the server's gh login.
+  getPullRequests: (urls: string[]) =>
+    request<{ pulls: PullRequestResult[] }>(
+      `/github/pulls?${new URLSearchParams(urls.map(url => ['url', url]))}`,
+    ),
+
   // Models — chat models offered to the composer's picker, per backend
   // (the configured Claude list, Codex app-server models, and any
   // locally-installed Ollama models, auto-discovered server-side).
@@ -1337,7 +1426,9 @@ export const api = {
       defaults?: Record<string, string>;
       backends?: {
         default: string;
-        options: { id: string; label: string; model: string; models?: string[]; available?: boolean; reason?: string }[];
+        // `daybreak_programs` (Codex only): model id → Daybreak program, for
+        // the models that the signed-in Codex account may run with Daybreak.
+        options: { id: string; label: string; model: string; models?: string[]; available?: boolean; reason?: string; daybreak_programs?: Record<string, string> }[];
         diagnostics?: Record<string, { available: boolean; reason?: string }>;
       };
       models: { id: string; provider: string; backend: string }[];
@@ -1355,7 +1446,7 @@ export const api = {
   searchSessions: (q: string) =>
     request<{ sessions: any[] }>(`/sessions/search?q=${encodeURIComponent(q)}`),
   getSession: (id: string) => request<any>(`/sessions/${id}`),
-  createSession: (title?: string, backend?: string | null, cwd?: string | null, reviewLoop?: ReviewLoopCreatePayload | null, model?: string | null) =>
+  createSession: (title?: string, backend?: string | null, cwd?: string | null, reviewLoop?: ReviewLoopCreatePayload | null, model?: string | null, daybreak?: boolean) =>
     request<any>('/sessions', {
       method: 'POST',
       body: JSON.stringify({
@@ -1367,6 +1458,8 @@ export const api = {
         ...(model ? { model } : {}),
         ...(cwd ? { cwd } : {}),
         ...(reviewLoop ? { review_loop: reviewLoop } : {}),
+        // The composer's Daybreak switch (Codex), sent only when it is on.
+        ...(daybreak ? { codex_daybreak: true } : {}),
       }),
     }),
   // Run later — defer a composed prompt into a (freshly created) session
@@ -1412,10 +1505,12 @@ export const api = {
     ),
   deleteSession: (id: string) =>
     request<any>(`/sessions/${id}`, { method: 'DELETE' }),
-  updateSession: (id: string, data: { title?: string; starred?: boolean; model?: string; parent_session_id?: string | null }) =>
+  updateSession: (id: string, data: { title?: string; starred?: boolean; model?: string; parent_session_id?: string | null; codex_daybreak?: boolean }) =>
     request<any>(`/sessions/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  regenerateSessionTitle: (id: string) =>
+    request<{ title: string }>(`/sessions/${id}/regenerate-title`, { method: 'POST' }),
   getMessages: (sessionId: string, limit = 100) =>
-    request<{ messages: any[]; last_usage?: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number; cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }; max_context_tokens: number; num_turns?: number } }>(`/sessions/${sessionId}/messages?limit=${limit}`),
+    request<{ messages: any[]; last_usage?: { input_tokens: number; output_tokens: number; cache_creation_input_tokens: number; cache_read_input_tokens: number; cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }; max_context_tokens: number; num_turns?: number; context_tokens?: number } }>(`/sessions/${sessionId}/messages?limit=${limit}`),
   forkSession: (sourceSessionId: string, atMessageId?: string, title?: string) =>
     request<any>('/sessions/fork', {
       method: 'POST',
@@ -1434,6 +1529,11 @@ export const api = {
     request<any>(`/sessions/${id}/status`),
   getSessionEvents: (id: string, limit = 50) =>
     request<{ events: any[] }>(`/sessions/${id}/events?limit=${limit}`),
+  getSessionContext: (id: string) =>
+    request<SessionContext>(`/sessions/${encodeURIComponent(id)}/context`),
+  /** Runs as a turn; answers with the context measured after it. */
+  compactSession: (id: string) =>
+    request<SessionContext>(`/sessions/${encodeURIComponent(id)}/compact`, { method: 'POST' }),
 
   // Agents — the subagent / background-task records of one session, their
   // transcripts and output, scoped stops, and the server-visible turn queue.
@@ -1480,6 +1580,12 @@ export const api = {
     request<{ cancelled: true; content: string | null }>(
       `/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(queueId)}`,
       { method: 'DELETE' },
+    ),
+  /** Set the run order of the queued messages, the one that runs next first. */
+  reorderQueue: (sessionId: string, queueIds: string[]) =>
+    request<{ items: QueueEntryView[] }>(
+      `/sessions/${encodeURIComponent(sessionId)}/queue/order`,
+      { method: 'PUT', body: JSON.stringify({ queue_ids: queueIds }) },
     ),
 
   // Chat (non-streaming)
@@ -1551,6 +1657,9 @@ export const api = {
       method: 'DELETE',
     }),
   getTask: (id: string) => request<any>(`/tasks/${id}`),
+  /** The tasks that a session created, implemented or updated. */
+  getSessionTasks: (sessionId: string) =>
+    request<{ tasks: SessionTask[] }>(`/sessions/${encodeURIComponent(sessionId)}/tasks`),
   createTask: (data: {
     title: string; content?: string; deadline?: string;
     tags?: string; status?: string; confirm_duplicate?: boolean;
@@ -1689,9 +1798,10 @@ export const api = {
 
   // Diagnostics
   getDiagnostics: () => request<any>('/diagnostics'),
-  getCronLogs: (jobId?: string, limit = 50, offset = 0) =>
-    request<{ logs: any[]; total: number; limit: number; offset: number }>(
-      `/cron/logs?job_id=${jobId || ''}&limit=${limit}&offset=${offset}`),
+  getCronLogs: (jobId?: string, limit = 50, offset = 0, hideEmpty = false) =>
+    request<{ logs: any[]; total: number; empty: number; limit: number; offset: number }>(
+      `/cron/logs?job_id=${encodeURIComponent(jobId || '')}&limit=${limit}&offset=${offset}`
+      + (hideEmpty ? '&hide_empty=1' : '')),
 
   // Observability — lightweight status for UI deep-links
   getObservabilityStatus: () =>
@@ -1723,6 +1833,11 @@ export const api = {
     request<any>(`/cron/jobs/${encodeURIComponent(jobId)}/trigger`, { method: 'POST' }),
   rotateCronJob: (jobId: string) =>
     request<any>(`/cron/jobs/${encodeURIComponent(jobId)}/rotate`, { method: 'POST' }),
+  setCronJobEnabled: (jobId: string, enabled: boolean) =>
+    request<{ job_id: string; enabled: boolean }>(`/cron/jobs/${encodeURIComponent(jobId)}/enabled`, {
+      method: 'PUT',
+      body: JSON.stringify({ enabled }),
+    }),
 
   // Skills
   listSkills: () => request<{ skills: any[] }>('/skills'),
@@ -1748,6 +1863,53 @@ export const api = {
     request<any>(`/mcp-servers/${encodeURIComponent(name)}/usage?limit=${limit}`),
   reloadMcpServers: () =>
     request<any>('/mcp-servers/reload', { method: 'POST' }),
+
+  // MCP Apps — the interactive views of MCP tools (`io.modelcontextprotocol/ui`).
+  // The chat is their host: it reads the feature switch once, then, for one
+  // session, the document of a view, the tools of its server, and the result
+  // of a tool call that a view makes. Each call takes a deadline (`signal`).
+  getMcpAppsConfig: (signal?: AbortSignal) => request<McpAppsConfig>('/mcp-apps/config', { signal }),
+  /** The document of the view at a `ui://` address of `server`. */
+  getMcpAppResource: (sessionId: string, server: string, uri: string, signal?: AbortSignal) =>
+    request<McpAppResource>(
+      `/sessions/${encodeURIComponent(sessionId)}/mcp-apps/resource?server=${encodeURIComponent(server)}&uri=${encodeURIComponent(uri)}`,
+      { signal },
+    ),
+  /** The tools of `server`, with who may call each one. */
+  getMcpAppTools: (sessionId: string, server: string, signal?: AbortSignal) =>
+    request<{ tools: McpAppTool[] }>(
+      `/sessions/${encodeURIComponent(sessionId)}/mcp-apps/tools?server=${encodeURIComponent(server)}`,
+      { signal },
+    ),
+  /** Call a tool of `server` for a view. A tool that reports an error still answers 200. */
+  callMcpAppTool: (
+    sessionId: string,
+    body: { server: string; tool: string; arguments: Record<string, unknown> },
+    signal?: AbortSignal,
+  ) =>
+    request<McpCallToolResult>(
+      `/sessions/${encodeURIComponent(sessionId)}/mcp-apps/tool-call`,
+      { method: 'POST', body: JSON.stringify(body), signal },
+    ),
+
+  // Widgets — what the ```widget blocks of a chat saved. The chat reads all of
+  // a session's states in one request before it draws its widgets, writes one
+  // widget's keys and values when they change, and deletes them on Reset.
+  // `keepalive` lets a write go out while the page is being left.
+  getWidgetStates: (sessionId: string, signal?: AbortSignal) =>
+    request<WidgetStates>(`/sessions/${encodeURIComponent(sessionId)}/widget-states`, { signal }),
+  saveWidgetState: (
+    sessionId: string, widgetId: string, items: ReadonlyArray<readonly [string, string]>, keepalive = false,
+  ) =>
+    request<{ id: string; size: number; updated_at: string | null }>(
+      `/sessions/${encodeURIComponent(sessionId)}/widget-states/${encodeURIComponent(widgetId)}`,
+      { method: 'PUT', body: JSON.stringify({ items }), keepalive },
+    ),
+  deleteWidgetState: (sessionId: string, widgetId: string, keepalive = false) =>
+    request<{ deleted: boolean }>(
+      `/sessions/${encodeURIComponent(sessionId)}/widget-states/${encodeURIComponent(widgetId)}`,
+      { method: 'DELETE', keepalive },
+    ),
 
   // Plans
   listPlans: (status?: string, taskId?: string) => {
@@ -1776,7 +1938,7 @@ export const api = {
     if (type) qs.set('type', type);
     if (sessionId) qs.set('session_id', sessionId);
     const q = qs.toString();
-    return request<{ notifications: any[]; pending_count: number }>(
+    return request<{ notifications: any[]; pending_count: number; pending_answer_count: number }>(
       `/notifications${q ? '?' + q : ''}`
     );
   },

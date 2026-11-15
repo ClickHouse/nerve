@@ -26,7 +26,7 @@ installStorage();
 vi.mock('../../api/client', () => ({
   api: {
     listActors: vi.fn(), listSessions: vi.fn(), listArchivedSessions: vi.fn(),
-    listSystemSessions: vi.fn(), searchSessions: vi.fn(),
+    listSystemSessions: vi.fn(), searchSessions: vi.fn(), getSession: vi.fn(),
     getObservabilityStatus: vi.fn(async () => ({ enabled: false })),
     getPromptRewriteStatus: vi.fn(async () => ({ enabled: false })),
     getModels: vi.fn(async () => ({ models: [], default: null })),
@@ -183,6 +183,17 @@ describe('the open-session header', () => {
     render(<SessionCreator actorId={null} />);
     expect(headerChip()).toBeNull();
     expect(listActors).not.toHaveBeenCalled();
+  });
+
+  it('reads a linked session that no loaded list has', async () => {
+    const getSession = api.getSession as unknown as ReturnType<typeof vi.fn>;
+    getSession.mockResolvedValue({ ...chat('cron:digest:1', SYSTEM), title: 'Cron: digest' });
+    useChatStore.setState({ sessions: [], activeSession: 'cron:digest:1' });
+    render(<MemoryRouter><ChatPage /></MemoryRouter>);
+
+    await waitFor(() => expect(headerChip()).toHaveTextContent('Started by Nerve'));
+    expect(screen.getAllByText('Cron: digest').length).toBeGreaterThan(0);
+    expect(getSession).toHaveBeenCalledWith('cron:digest:1');
   });
 
   it('always shows Nerve in the real chat page', async () => {

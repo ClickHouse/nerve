@@ -5,6 +5,7 @@ import type { Task } from '../../../api/client';
 import { formatTimeAgo } from '../../../utils/dateGroups';
 import { Badge } from '../../ui';
 import { Calendar, Clock, ExternalLink, Hourglass, MessageSquare } from '../../ui/icons';
+import { CreatedInLink } from '../TaskSessions';
 
 /**
  * Deadline urgency, as a token class rather than a raw colour so it tracks
@@ -129,7 +130,9 @@ function BoardCardInner({ task, statusSince, onOpen }: BoardCardProps) {
             <MessageSquare size={10} aria-hidden="true" /> {task.comment_count}
           </span>
         )}
-        {task.source && task.source !== 'manual' && (
+        {task.created_session_title != null ? (
+          <CreatedInLink task={task} className="max-w-full" />
+        ) : task.source && task.source !== 'manual' && (
           <span className="text-text-faint">{task.source}</span>
         )}
         {task.source_url && (

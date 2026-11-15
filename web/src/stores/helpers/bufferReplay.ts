@@ -1,6 +1,7 @@
 import type { WSMessage } from '../../api/websocket';
 import type { ChatMessage, MessageBlock, PanelTab, AgentStatus } from '../../types/chat';
 import { extractResultText } from '../../utils/extractResultText';
+import { mcpAppRef, mcpAppResult } from '../../utils/mcpAppFields';
 import type { TodoItem, CCTask } from '../chatStore';
 import {
   applyCCTaskCreateInput,
@@ -39,12 +40,15 @@ export function applyStreamEvent(blocks: MessageBlock[], event: WSMessage): Mess
       break;
     }
     case 'tool_use': {
+      const mcpApp = mcpAppRef(event.mcp_app);
       result.push({
         type: 'tool_call',
         toolUseId: event.tool_use_id || '',
         tool: event.tool,
         input: event.input,
         status: 'running',
+        // As live (handleToolUse): the view of an MCP Apps tool.
+        ...(mcpApp ? { mcpApp } : {}),
       });
       break;
     }
@@ -52,7 +56,11 @@ export function applyStreamEvent(blocks: MessageBlock[], event: WSMessage): Mess
       for (let i = 0; i < result.length; i++) {
         const b = result[i];
         if (b.type === 'tool_call' && b.toolUseId === event.tool_use_id) {
-          result[i] = { ...b, result: event.result, isError: event.is_error, status: 'complete' as const };
+          const appResult = b.mcpApp ? mcpAppResult(event.mcp_app_result) : undefined;
+          result[i] = {
+            ...b, result: event.result, isError: event.is_error, status: 'complete' as const,
+            ...(appResult ? { mcpAppResult: appResult } : {}),
+          };
           break;
         }
       }

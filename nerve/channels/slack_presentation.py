@@ -96,8 +96,13 @@ def _md_to_slack(text: str) -> str:
     text = re.sub(r"`([^`]+)`", lambda match: protect(f"`{match.group(1)}`"), text)
 
     def link(match: re.Match) -> str:
-        label = _escape_ampersands(match.group(1))
-        url = _escape_ampersands(match.group(2))
+        # Slack ends the link at the first ``>`` and the address at the first
+        # ``|``, so the label's angle brackets become entities and the
+        # address's reserved characters are percent-encoded.
+        label = _escape_ampersands(match.group(1)).replace("<", "&lt;").replace(">", "&gt;")
+        url = _escape_ampersands(
+            match.group(2).replace("<", "%3C").replace(">", "%3E").replace("|", "%7C"),
+        )
         return protect(f"<{url}|{label}>")
 
     text = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", link, text)

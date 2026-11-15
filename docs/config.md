@@ -23,7 +23,7 @@ and migration splits a legacy `config.yaml` on the same table:
 
 | Layer | Gets |
 |-------|------|
-| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `proxy`, `docker`, `telegram.enabled`, `slack.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `workflows.runs_dir` |
+| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `gateway.public_url`, `proxy`, `docker`, `telegram.enabled`, `slack.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `mcp_apps`, `workflows.runs_dir` |
 | `settings.yaml` | `timezone`, `gateway.host`/`port`/`loop`, `provider.type`/`aws_region` (incl. the region-scoped Bedrock model IDs), `agent.*`, `memory.*`, `sessions.*`, `sync.*`, the rest of `workflows.*` (the budget caps and cadence), `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode` |
 
 The test is whether the value would be wrong on another machine: filesystem
@@ -250,13 +250,15 @@ A reload is always explicit. Two things cause one:
 | `setup.local_secrets` | ✅ read on every request of the setup page |
 | Web gateway auth (`auth.*`) | partly. `auth.jwt_expiry_hours` follows a reload for newly issued or refreshed tokens. The deprecated `auth.password_hash` follows a reload only for accounts without a local password. `auth.external.*` follows a reload, which also reads the file that `gateway_jwks_file` names again. `auth.jwt_secret` requires a restart (see the restart table) |
 | `gateway.drain_timeout_seconds` | ✅ read when the shutdown signal arrives (see [Shutdown Sequence](architecture.md#shutdown-sequence)) |
+| `gateway.public_url` | ✅ read for each message that links to the web UI (see [Links to the web UI](#links-to-the-web-ui)) |
 | `notifications.*` | ✅ read per notification |
 | `workspace_sync.*` | ✅ from the next sync cycle |
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
-| `telegram.dm_policy`, `.stream_mode` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; `allowed_users` does not follow it (see the restart table) |
-| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
+| `telegram.dm_policy`, `.stream_mode`, `.reply_routes_to_origin_session` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; toggling `reply_routes_to_origin_session` takes effect on the next message, and applies to replies to earlier messages too (routes are recorded while it is off); `allowed_users` does not follow it (see the restart table) |
+| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source and the events of the other hosted providers included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
+| `email.enabled` | ✅ read per event. The reload publishes the subscriptions to the gateway again, which then takes or refuses new mail. When no stream sends them, the reload reports `subscriptions` with a "not sent yet" note, which is not an error: the next stream that connects sends them before Nerve reads from it. The email channel must exist: usable `channels.hosted` settings at startup give it. Without usable settings the reload repeats the startup warning under `email`; with usable settings and no email channel it says that a restart is needed (see [Email](#email)) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
 | **`agent.*` and `codex.*`**: backend choice and models (`agent.backend`, `agent.cron_model`, `agent.model`, `codex.model`, `codex.cron_model`, `codex.models`), `max_turns`, `agent.effort`/`cron_effort` and `codex.effort_map`, `agent.thinking`, `agent.context_1m*`, `agent.background_agent_permissions`, `agent.agent_teams`, `agent.subagents.*`, idle timeouts, cache TTL, `codex.sandbox`, `.approval_policy`, `.web_search`, `.extra_config`, `.tool_timeout_sec`, `.bin_path`, `.auth`/`.api_key`/`.api_key_env`, `.base_url`, `.pricing`, `.min_version`/`.max_version`, `.ultracode.*` | ✅ for sessions and turns **started after** the reload. The engine and both backends resolve these through one live reference, so a key cannot be hot in one and frozen in the other |
@@ -298,8 +300,9 @@ reload cannot inspect, and are documented here only.
 | `langfuse.*` | set up before the engine: the Langfuse client is built once with the keys, host and redaction patterns, and keeps them for the life of the process |
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
+| `mcp_apps.*` | whether the gateway answers for the sandbox document, and whether the documents of its web UI refuse every frame, is settled once at startup. Until a restart, turning the feature on shows no view. Turning it off does take effect at once: new sessions are no longer told to host, and the web UI is told that the feature is off; the sandbox document itself stays answered until the restart, which harms nothing (it is static and holds nothing). See [MCP Apps](#mcp-apps) |
 | `mcp_gateway_url` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
-| `slack.mode`, `channels.hosted.*` | the hosted channel, its stream endpoint, and its token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
+| `slack.mode`, `channels.hosted.*` | the hosted channels, the email channel included, their stream endpoint, and their token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
 | `sync.github.mode` | the GitHub sources (`github` and the repository watch, `github_repos`), and in hosted mode the stream endpoint and the consumers of the gateway's records, are chosen at startup. Until a restart the sources keep the mode they started with, and so does the `github_pr_activity` gate. The filters, `pr_watch`, `inbox` and `sync.github_repos` do follow a reload: in hosted mode the reload publishes them to the gateway again. To go back to `poll`, set `enabled: false` (and `sync.github_repos.enabled: false`) and reload first (see [sources.md](sources.md#hosted-github-source)) |
 | `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
@@ -582,7 +585,11 @@ meant to run only reviewed config would be running local code. Commit, discard o
 push local edits; the failure message names the paths. So a skill the agent created
 at runtime, or a locally edited `SOUL.md`, blocks the merge until it is committed or
 dropped. Files matched by `.gitignore` in there are warnings rather than refusals,
-since the shared repo can never carry them.
+since the shared repo can never carry them. Nerve does not edit a reviewed file
+itself after an update: in a workspace that is a git repository, with the
+periodic sync on or off, the scheduler leaves `config/cron/system.yaml` as the
+repository has it, where it otherwise writes the new prompt of a built-in job
+into it ([cron.md](cron.md#after-a-nerve-update)).
 
 **A blocked sync says so.** Left to a log line it is invisible: the instance keeps
 answering normally while every later config change stops arriving, indefinitely.
@@ -986,10 +993,11 @@ Backups follow the same rule:
 |-----|------|---------|-------------|
 | `agent.model` | string | `claude-opus-5-5` | Primary model for conversations. The default (and every other default model id) is defined once, in the constants block at the top of `nerve/config.py` |
 | `agent.cron_model` | string | `claude-sonnet-5-5` | Model for cron jobs. The setup page's Model step sets it to the model you pick, so scheduled work runs on the chosen model; set a cheaper one here afterwards if you want it |
-| `agent.models` | list | `[]` | Claude models offered in the composer's model picker. `agent.model` always leads; entries extend the list. Empty → the discovered catalog (see `agent.model_discovery`), else a built-in current-generation list (opus / fable / sonnet / haiku); on Bedrock only configured models are offered |
-| `agent.model_discovery` | bool | `true` | Ask the Anthropic Models API (`GET /v1/models`) which models the configured credentials' catalog endpoint advertises, and offer those in the picker — so a newly released model needs no config edit. Catalog membership is not a serving guarantee (an advertised ID can still 404 on send; discovery runs no serving probe — see `agent.model_discovery_excluded_models`). Primed at gateway startup, cached in-process (6h) and refreshed in the background. Best-effort: ignored when `agent.models` is set, on Bedrock (the Bedrock client has no Models API), without an API key, or when the API is unreachable — the built-in list applies |
+| `agent.outcome_titles` | bool | `true` | Rename a session when the agent's answer to its first message ends (when that turn leaves background work running, the turn that settles it), with `agent.title_model`, from the first request and the agent's reply, in the style of titles people gave other sessions. A fork's first message renames it too, from what the fork does. A later message never does, nor is a session renamed that someone renamed; a first turn that fails or is stopped, a second message before it settles, or a restart in between leave the first title. Needs an API key, Bedrock or the proxy (a subscription token does not reach the API). `false` keeps the first-message title; the onboarding conversation asks about it. Hot: read when a first message arrives |
+| `agent.models` | list | `[]` | Claude models in the composer's model menu, in this order. `agent.model` is put first when the list does not name it. Empty: the whole catalog when `agent.model_discovery` is on, else the built-in list of the newest model of each tier (Fable, Opus, Sonnet, Haiku), which is updated with each release. On Bedrock only configured models are offered |
+| `agent.model_discovery` | bool | `false` | Ask the Anthropic Models API (`GET /v1/models`) which models the configured credentials' catalog endpoint advertises, and offer all of them in the menu instead of the built-in list. Catalog membership is not a serving guarantee (an advertised ID can still 404 on send; discovery runs no serving probe; see `agent.model_discovery_excluded_models`). Primed at gateway startup, cached in-process (6h) and refreshed in the background. Best-effort: ignored when `agent.models` is set, on Bedrock (the Bedrock client has no Models API), without an API key, or when the API is unreachable; the built-in list applies then |
 | `agent.model_discovery_excluded_models` | list | `[]` | Model-ID substrings pruned from **discovery** results before the picker sees them (case-insensitive; empty/whitespace patterns ignored). A proxy/provider catalog is not a serving guarantee — e.g. a retired ID that `GET /v1/models` still advertises but that 404s on send — so this drops such entries without a code change, and hot-reloads (read at pick time, not baked into the 6h discovery cache). Applied only to discovered entries: `agent.model` and an explicit `agent.models` list are never filtered, so naming a model in config overrides an exclusion. Excluding everything discovery returns just leaves the configured default (not a fallback to the built-in list) |
-| `agent.model_aliases` | map | `{opus: claude-opus-5-5, haiku: claude-haiku-5-5}` | Alias → model ID remapping for the CLI (emitted as `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` env vars). Aliases (`opus`, `sonnet`, `haiku`, `fable`) used in Agent/Workflow tool model options, skill frontmatter, and cron overrides resolve to the mapped ID. Entries merge over the built-in `opus → claude-opus-5-5` and `haiku → claude-haiku-5-5` defaults (the `agent.model` and `memory.fast_model` defaults; not applied on Bedrock — set geo-prefixed IDs explicitly there); `""` unsets an alias. The CLI also uses the `haiku` model for its background calls unless `ANTHROPIC_SMALL_FAST_MODEL` is set |
+| `agent.model_aliases` | map | `{opus: claude-opus-5-5, haiku: claude-haiku-5-5, fable: claude-fable-5-2}` | Alias → model ID remapping for the CLI (emitted as `ANTHROPIC_DEFAULT_<ALIAS>_MODEL` env vars). Aliases (`opus`, `sonnet`, `haiku`, `fable`) used in Agent/Workflow tool model options, skill frontmatter, and cron overrides resolve to the mapped ID. Entries merge over the built-in `opus → claude-opus-5-5`, `haiku → claude-haiku-5-5` and `fable → claude-fable-5-2` defaults (the `agent.model` and `memory.fast_model` defaults and the picker's second built-in entry; not applied on Bedrock — set geo-prefixed IDs explicitly there); `""` unsets an alias. The CLI also uses the `haiku` model for its background calls unless `ANTHROPIC_SMALL_FAST_MODEL` is set |
 | `agent.max_turns` | int | `1000` | Max agentic turns (model ↔ tool round-trips) per request on the Claude backend; a request that reaches it fails with "Reached maximum number of turns (N)". A last-resort stop for a looping agent, not a budget — real work routinely passes 50 and 100. `0` = no cap (the CLI gets no `--max-turns` flag). Read when a session's CLI client is built, so a changed value applies to new sessions, and to existing ones once their client is rebuilt |
 | `agent.max_concurrent` | int | `32` | Max concurrent agent sessions |
 | `agent.cache_ttl` | string | `"5m"` | Prompt-cache write TTL policy: `5m` (status quo), `1h` (always request the 1-hour TTL), or `auto` (per session at client-build time: sparse-cadence sessions — persistent crons, wakeup loops, spaced chats — get `1h`; dense sessions stay on `5m`). Per-cron-job override via `cache_ttl` in jobs.yaml. See `nerve/agent/cache_policy.py` |
@@ -1034,7 +1042,7 @@ codex:                     # active when a codex backend is selected
   home_dir: ~/.nerve/codex # isolated CODEX_HOME (auth, config, sessions)
   model: gpt-5.6-sol
   cron_model: null         # null → model
-  models: [gpt-6-astra]    # hidden catalog entries to offer when the account serves them
+  models: [gpt-6-astra, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna]  # the model menu, in order; each shows when the account serves it
   auth: chatgpt            # chatgpt | api_key
   api_key: null            # config.local.yaml; or api_key_env: OPENAI_API_KEY
   base_url: ""             # OpenAI-compatible Responses endpoint; empty → Codex's own provider
@@ -1060,6 +1068,13 @@ codex:                     # active when a codex backend is selected
     default_token_budget: 250000 # default and maximum per workflow
     max_agents: 8               # lifetime worker cap per workflow
 ```
+
+`codex.models` lists the OpenAI models of the composer's model menu, in this
+order. The menu shows a model only when the Codex catalog of the account
+serves it, hidden entries included. `codex.model` is put first when the list
+does not name it. Every model in the list is also accepted as a session
+model. Unset: the newest model of each tier. `[]`: only `codex.model`.
+`nerve codex doctor` lists the catalog models that the list does not name.
 
 `codex.ultracode.dashboard` exposes run journals in Nerve's authenticated UI.
 It does not start Ultracode's detached dashboard process. Keep
@@ -1113,6 +1128,9 @@ codex:
   `${PROXY_API_KEY:-}` when the key is optional. In this mode Nerve does not
   read `codex.api_key_env` or the top-level `openai_api_key`, because they
   can hold an OpenAI key.
+- In external mode, each request names the principal that caused the work
+  in the `X-Nerve-Inference-Principal` header. See
+  [Inference principal header](#inference-principal-header).
 - Codex needs no login, and `codex.auth` has no effect. Preflight does not
   require an account and uses the same provider. `nerve codex doctor` and
   `GET /api/codex/status` show the endpoint in `preflight.base_url`.
@@ -1141,6 +1159,85 @@ default `approval_policy: never` + full-access sandbox, codex sessions
 behave like claude's auto-approved tools; tightening the policy surfaces
 Approve/Decline cards in the web UI.
 
+### Daybreak (per-chat switch)
+
+Daybreak is Codex's account-gated cyber access program. It is not a model: a
+client asks for it per turn, and Codex decides whether the signed-in account
+may use it. Nerve has one switch per chat for it. There is no config key and
+no global setting, and the switch is off unless a person turns it on.
+
+- **Where it shows.** The composer of a Codex chat has a **Daybreak** toggle
+  next to the model menu when the Codex model catalog lists a Daybreak
+  program for the signed-in account on at least one model. An older Codex
+  lists no access programs, and an account without Daybreak has none: both
+  see no toggle. On a model without a program the toggle is greyed out and
+  names the models that have one.
+- **Off.** Nerve sends to Codex what it sent before the switch existed.
+- **On.** Each turn of the chat asks for the program of the chat's model
+  (`cyberAccessProgram` on `turn/start`: `daybreakBlue`, or `daybreakRed` for
+  a model that lists only that one). A change applies from the chat's next
+  message, without a new runtime. Nerve logs one line per turn that it sends
+  with a program: the session, the model and the program.
+- **No program.** When the switch is on and the model has no program at that
+  time (the access ended, another account is signed in), Nerve does not send
+  the turn. The turn ends as failed: the error names the model and says to
+  turn Daybreak off or to choose another model. Nerve never runs such a turn
+  without the program.
+- **Model change.** A change to a model without a program turns the switch
+  off, and the chat says so.
+- **Refusals.** When Codex refuses a turn under its cyber policy in a chat
+  that has the switch off and a model with a program, the error says that
+  Daybreak can be turned on.
+- **Ultracode workers** follow the chat. For a worker of the `exec`
+  transport the worker wrapper adds `--cyber-access-program` for the
+  worker's model, and it gives a worker that names no model the chat's
+  model. It does not start a worker that would run without the program: the
+  worker's model has none, the installed Codex cannot pass the program to
+  workers (see the versions below), or the worker's command has options
+  before `exec`. Such a worker ends with an error that says why. A worker of
+  the `app-server` transport takes its turns over its own connection, where
+  the wrapper cannot add the program, so the wrapper does not start it
+  either: Ultracode then runs that worker on `exec`, unless the run set
+  `transport_strict`.
+- **Storage and API.** The switch is the session metadata key
+  `codex_daybreak` (absent: off). `POST /api/sessions` and
+  `PATCH /api/sessions/{id}` take `codex_daybreak`, see
+  [api.md](api.md#sessions). `GET /api/models` lists the program of each
+  offered model in `daybreak_programs` of the Codex backend option.
+
+Codex can also save the choice on its thread (`daybreakEnabled`), where its
+own helper agents read it. Nerve sends it when the catalog lists access
+programs: at `thread/start` of a chat that has the switch on, when the
+switch changes on a live thread, and after a resume or a fork when the
+choice that the thread has saved differs from the chat's switch (the switch
+went off while the chat had no runtime, or the thread is a fork of a chat
+that has it on). While the switch is off, a thread that has not saved `true`
+gets no such request. This save selects no turn's program, and a failure of
+it changes nothing else.
+
+Codex versions:
+
+- The model catalog lists access programs from Codex 0.156.0. An older Codex
+  shows no toggle.
+- `codex exec` takes `--cyber-access-program` from Codex 0.161.0. On Codex
+  0.156.0 to 0.160.x a chat can have Daybreak on and its turns run with the
+  program, but its `exec` workers are not started: their error says to turn
+  Daybreak off or to update Codex.
+
+Known limits:
+
+- A model named for one message (`model` on a WebSocket `message`) does not
+  turn the switch off. When that model has no program, the turn is refused,
+  as under "No program".
+- Availability follows the latest listing of the catalog. A listing without
+  access-program metadata hides the toggle until the next listing that has
+  it.
+- Other open tabs show a change of the switch after their sessions reload.
+- "Run later" from a new chat on the default backend creates the deferred
+  chat on that backend's default model, not on the model picked in the
+  composer. The switch goes with the prompt only when that default model has
+  a program.
+
 ## Gateway
 
 | Key | Type | Default | Description |
@@ -1149,6 +1246,76 @@ Approve/Decline cards in the web UI.
 | `gateway.port` | int | `8900` | Port number |
 | `gateway.ssl.cert` | path | - | SSL certificate path |
 | `gateway.ssl.key` | path | - | SSL private key path |
+| `gateway.public_url` | string | `$NERVE_PUBLIC_ORIGIN`, else `""` | The address at which people open the web UI, for example `https://nerve.example.com`. Messages that leave the web UI link to it (see [Links to the web UI](#links-to-the-web-ui)) |
+
+### Links to the web UI
+
+A message in Telegram or Slack can point back at the web UI only with a full
+address. Nerve cannot tell its own: it knows the address it binds, and a
+reverse proxy, a tunnel or a host name can stand in front of that. Set the
+address that people type into the browser:
+
+```yaml
+# config.yaml
+gateway:
+  public_url: https://nerve.example.com
+```
+
+With it, the last line of a notification in Telegram and Slack links to the
+session that raised the notification, and the link text is the session's
+title (its ID while the session has no title):
+
+```text
+Session: Cron: nightly-report
+```
+
+Without it the line names the session by its ID, for example
+`Session: cron:nightly-report:20260101-050000-0a1b2c3d`. Some lines name the
+ID in both cases:
+
+- A notification that no session raised, such as a backup report, keeps
+  `Session: system`.
+- A notification whose title or body holds an open `[` or an unfinished
+  Markdown link outside code, as a cut text or a log line can. The Markdown
+  conversion of a channel would join it with the link and spoil both.
+
+A cron job with `show_session_label: false` has no such line.
+
+The value is `http://` or `https://`, a host and an optional port, for
+example `https://nerve.example.com` or `http://192.0.2.10:8900`. The host is
+a name of letters, digits, `-`, `.` and `_`, an IPv4 address, or an IPv6
+address in brackets; a name with other characters is written in its ASCII
+form (`xn--...`). A `/` at its end is dropped. The web UI is served at the
+root of its address, so a value with a path is refused, as is one with
+credentials, a query or a fragment. The address only has to be one that the
+people who read the messages can open: a public host name, a LAN address, a
+VPN name. A refused value is ignored with one warning in the log, and the
+messages carry no links; `nerve config validate` reports a refused
+`gateway.public_url`.
+
+The address belongs to one machine, so it goes into `config.yaml`. When no
+layer names `gateway.public_url`, or its value is blank, the environment
+variable `NERVE_PUBLIC_ORIGIN` gives the address; a hosting platform can set
+it for each agent. A reload applies a change to the next message.
+
+The link opens the session's page (`/chat/<session ID>`). A person who is not
+signed in signs in first and then arrives at the session.
+
+In Telegram:
+
+- Telegram makes a link only when the host is an IP address or has a dot in
+  its name. With `http://localhost:8900` the line shows the title as plain
+  text.
+- Telegram shows a preview of the first address in a message. A notification
+  keeps Telegram's default when the first `http://` or `https://` address in
+  its title or body, outside code, leads somewhere else than the web UI. The
+  address counts when Telegram makes a link of it: its host has a dot or is
+  an IP address. Every other notification with the session link is sent with
+  the preview off, so no card of the web UI's own page appears under it. An
+  address without `http://` or `https://` does not count, so the preview of
+  such a notification is off too.
+- The card of an answered question keeps its formatting and its links when
+  the answer is added to it.
 
 ### Favicon
 
@@ -1158,7 +1325,8 @@ config like anything else under `config/`, so a config repo carries it to every
 instance that syncs, and a fleet can be told apart by its browser tabs. Nothing
 is copied into the web bundle — the file is read per request, so one that arrives
 by sync appears without a restart, and removing it goes back to the browser
-default.
+default. The panel draws a coloured dot on the icon while something waits for
+the person (see [Browser alerts](web-ui.md#browser-alerts)).
 
 Use one. If several are present the first of `.svg`, `.png`, `.ico` wins.
 
@@ -1188,6 +1356,7 @@ carry text. A `.png` or `.ico` has to be committed by a human.
 | `telegram.dm_policy` | string | `pairing` | `pairing` (allowlist + one-time pairing codes) or `open` (anyone — dangerous) |
 | `telegram.allowed_users` | list[int] | `[]` | User IDs allowed to use the bot in private and group chats |
 | `telegram.stream_mode` | string | `partial` | `partial` (edit msgs) or `full` |
+| `telegram.reply_routes_to_origin_session` | bool | `true` | A reply routes to the session that produced the replied-to message (and makes it active); a reply that cannot be tied to a live session is refused with a hint. `/new <message>` is the escape hatch: it starts a fresh session with that message, reply or not. `false` restores the old behaviour: a reply is context-only and lands in the active session. The message→session map is stored in the database (`channel_reply_routes`, kept 90 days) whether the flag is on or off, so it survives a restart and turning the flag back on covers earlier messages. Either way, a reply to a pending `ask_user` card answers the question, like `/reply` |
 
 ### Notification sink
 
@@ -1370,7 +1539,10 @@ hosted mode the switch is ignored, with a warning.
 
 Nerve accepts events from every Slack connection that the gateway serves
 for this agent. For each conversation, Nerve records the connection of the
-latest accepted event.
+latest accepted event. When the gateway names the provider of each
+connection, the Slack channel uses only the Slack connections for its
+replies, notifications, and limits. A connection whose provider the gateway
+does not name serves every hosted chat channel.
 
 Each event that starts a turn or answers a notification names the person that
 the gateway resolved from the Slack user. In external mode, the turn runs as
@@ -1392,7 +1564,8 @@ gateway's inbox until a reload sets `enabled` to `true`. While it is paused,
 Nerve sends no notifications and refuses `send_channel_message`. A turn that
 is already running still sends its reply. Nerve reads nothing from the
 gateway's inbox while Slack is paused, so the records of a hosted GitHub
-source wait there too (see below).
+source and the events of the other hosted providers wait there too (see
+below and [Connection behaviour](#connection-behaviour)).
 
 Replies, reactions, and `send_channel_message` go to Slack as operations on
 a gateway stream that advertises them for the connection. A reply goes on the
@@ -1419,24 +1592,36 @@ files are unpacked one level. One file is read up to 16 MiB less one byte.
 The files of one message are read up to 32 MiB together, and the content
 unpacked from ZIP files counts against the same limit.
 
-Notifications go to the same conversation as in Socket Mode
-(`notifications.slack_channel_id`, else the first literal conversation ID in
-`slack.allow_channels`), with one button for each answer. A button press
-answers the notification only in the conversation where it was delivered,
-and the card then shows the answer without buttons. A press that answers
-nothing, for example a second press, gets a short notice and the card stays.
-An expired card is edited without buttons.
+A notification card has one button for each answer. Nerve sends it through
+the gateway's `notify` operation, and the gateway posts it in the agent's
+notification channel, which an administrator sets in the control plane.
+Nerve does not read `notifications.slack_channel_id` or the conversation IDs
+in `slack.allow_channels` to choose this conversation. The notification
+channel must allow posts in the agent's Slack access rules, and the agent's
+Slack app must be a member of it. Nerve uses `notify` only when exactly one
+connection advertises it. A gateway that does not advertise it gets no card.
+When the control plane sets no notification channel, the gateway refuses the
+card, and Nerve logs one INFO line for each card. Any other failure logs one
+warning.
 
-When the config names no conversation, Nerve sends the card through the
-gateway's `notify` operation. The gateway posts it in the agent's
-notification channel, which an administrator sets in the hosted platform's
-console. That channel must allow posts in the agent's Slack access rules, and
-the agent's Slack app must be a member of it. A conversation in the config
-takes precedence. Nerve uses `notify` only when exactly one connection
-advertises it. A gateway that does not advertise it gets no card, and Nerve
-logs no warning about the missing `notifications.slack_channel_id`. When the
-console sets no notification channel, the gateway refuses the card, and Nerve
-logs one INFO line for each card. Any other failure logs one warning.
+A button press answers the notification only in the conversation where it
+was delivered, and the card then shows the answer without buttons. A press
+that answers nothing, for example a second press, gets a short notice and
+the card stays. An expired card is edited without buttons.
+
+A message in the thread under a notification card goes to the session that
+raised the notification, and Nerve answers in that thread. The session must
+exist and must not be archived; otherwise the message goes where a message
+without a card goes. In a direct message too, only that thread goes to the
+session: the direct message keeps its own session for every other message.
+An event can also name the message that it replies to (`reply_to`). When
+that is a card, for example because the gateway posted the card as copies in
+other conversations and the person replied under a copy, the message goes to
+the session of that card in the same way. This holds for every person whose
+message the gateway admits: the turn runs in the session that raised the
+notification, as that person, and the answer is posted in the thread of the
+reply. That session can be one that another person started, for example in
+the web interface.
 
 `/nerve` commands, including the host commands
 `doctor` and `restart`, are not available in hosted mode; `nerve doctor`
@@ -1452,16 +1637,58 @@ notifications, and with `sync.github_repos` the repositories it watches; the
 `channels.hosted` settings above apply unchanged, and they are enough on their
 own: Slack need not be hosted too. See
 [Hosted GitHub source](sources.md#hosted-github-source) and
-[Hosted repository watch](sources.md#hosted-repository-watch).
+[Hosted repository watch](sources.md#hosted-repository-watch). They also
+carry the mail that members send to the agent: the usable `channels.hosted`
+settings give the email channel, which `email.enabled` switches on (see
+[Email](#email)).
 
-When Slack is hosted as well, its switch also holds GitHub back. Nerve reads
-the events of every hosted provider from one ordered inbox, and it reads
-nothing while hosted Slack is switched off (`slack.enabled: false`): the
-GitHub records wait at the gateway until Slack is switched on again, and past
-the gateway's limit of stored records the oldest are dropped. Keep a hosted
-Slack switched on while GitHub is hosted; `nerve doctor` warns when it is off.
-This is a known limitation: a read for each provider on its own, which would
-keep GitHub records arriving while hosted Slack is off, is a follow-up.
+When Slack is hosted as well, its switch also holds GitHub and member mail
+back. Nerve reads the events of every hosted provider from one ordered
+inbox, and it reads nothing while hosted Slack is switched off
+(`slack.enabled: false`): the GitHub records wait at the gateway until Slack
+is switched on again, and past the gateway's limit of stored records the
+oldest are dropped. Keep a hosted Slack switched on while GitHub is hosted;
+`nerve doctor` warns when it is off. This is a known limitation: a read for
+each provider on its own, which would keep GitHub records arriving while
+hosted Slack is off, is a follow-up.
+
+#### Connection behaviour
+
+Nerve builds one hosted channel for each chat provider in hosted mode. The
+hosted chat providers of this version are Slack and email (see
+[Email](#email)). The capabilities that the gateway sends for a connection
+can name the connection's provider and a behaviour, which tells Nerve how to
+answer the turns of its events and which session they go to:
+
+| Member | Values | Default | Effect |
+|--------|--------|---------|--------|
+| `answer` | `post`, `tool` | `post` | `post`: Nerve posts the turn's answer in the conversation, with the typing indicator, the streamed placeholder, and an `Error:` message when the turn fails. `tool`: Nerve posts nothing in the conversation for the turn. The answer stays in the session, and the agent answers only with a tool |
+| `reply_tool` | tool name | none | Only with `tool`: the tool that the agent can answer with |
+| `session` | `rotate`, `keep` | `rotate` | `rotate`: a conversation gets a new session after `sessions.sticky_period_minutes` of idle time. `keep`: a conversation continues its last session, however long it was idle, until that session is archived or deleted |
+
+Slack connections post and rotate, so a gateway that sends no behaviour
+changes nothing. The email connection answers with `tool`, names the reply
+tool, and keeps its sessions. A connection whose capabilities Nerve does not
+have posts and rotates too. In `tool` mode, Nerve puts one line before the
+text of the turn: "This message came through *provider*. Your answer in this
+session is not sent to anyone. To answer, use the *reply tool* tool."
+Without a reply tool, the line ends with "This channel does not send
+answers."
+
+Each hosted chat provider has its own switch. Because the gateway keeps the
+events of every provider in one ordered inbox, a provider that is switched
+off either holds the events of all providers or refuses its own events.
+Hosted Slack holds them: while `slack.enabled` is `false`, Nerve reads
+nothing, and the events of the other hosted providers wait in the gateway
+inbox too. Any other hosted chat provider refuses, email included: while it
+is switched off, Nerve rejects its events and continues to read the events
+of the other providers. Nerve also stops reading, for every provider, while
+one hosted channel has 100 turns in progress, and continues when one of them
+ends.
+
+An event on a connection whose capabilities name another provider is
+rejected, and Nerve sends no operation of a channel through such a
+connection.
 
 ### Setting up the Slack app
 
@@ -1628,6 +1855,14 @@ sender is resolved.
   session.
 - Each shared-channel thread has its own session and all replies stay there;
   shared channels never have a channel-wide session.
+- A reply in the thread under a notification card goes to the session that
+  raised the notification, while that session exists and is not archived, and
+  the answer stays in that thread. In a DM, only that thread goes there: the
+  DM keeps its own session. In a shared channel, the reply must still mention
+  the bot, until the thread has that session. This holds for every person
+  who may talk to the bot there: the turn runs in the session that raised the
+  notification, which another person may have started, and the answer is
+  posted in the thread.
 - Messages another app wrote itself are ignored, so two agents in one channel
   cannot answer each other without end. A person posting through an
   integration still reaches the agent, because they keep their own user ID.
@@ -1663,7 +1898,9 @@ scoped to the caller. Unknown command names are ignored with a warning;
 
 Slack slash-command payloads have no thread ID. In a shared channel, `new` and
 `sessions` therefore refuse, while `stop`, `star`, and `unstar` select among
-that channel's active thread sessions. Commands work normally in DMs.
+that channel's active thread sessions. Commands work normally in DMs. In a DM
+where a reply under a notification card reached the card's session, `stop`,
+`star`, and `unstar` select between that session and the DM's own.
 
 `doctor` and `restart` are **DM-only**, whatever the allow lists say. Enabling
 one decides whether this instance offers it; it does not decide that every
@@ -1693,16 +1930,18 @@ Question and approval cards go to Slack by default.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `notifications.channels` | list | `[web, telegram, slack]` | Where `notify`, `ask_user`, and `propose_action` deliver |
-| `notifications.slack_channel_id` | string | `""` | Target channel ID; defaults to the first literal ID in `slack.allow_channels` |
+| `notifications.slack_channel_id` | string | `""` | Target channel ID; defaults to the first literal ID in `slack.allow_channels`. Not read in hosted mode |
 
 `notifications.channels` replaces the default rather than adding to it, so
-list every transport you want. A name nothing delivers to is skipped with a
+list every transport you want. The panel (`web`) is always in the list: Nerve
+adds it to a list without it. A name nothing delivers to is skipped with a
 warning. Slack in the list costs nothing while Slack is off.
 
 Names and globs are not resolved for the `slack_channel_id` fallback. Without
 a literal channel ID, delivery is skipped with a warning. In
-[hosted mode](#hosted-mode), the channel gateway can post the card in the
-notification channel set in the console instead, so there is no warning.
+[hosted mode](#hosted-mode), Nerve does not read these keys to choose the
+conversation: the channel gateway posts each card in the notification channel
+that an administrator sets in the control plane.
 
 ### Outbound Slack message tool
 
@@ -1733,6 +1972,114 @@ Three differences from the inbound policy:
   `G` target costs one cached lookup; a lookup that cannot answer is refused
   rather than guessed.
 
+## Email
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `email.enabled` | bool | `false` | Take the mail that members of the agent send to its address. Hosted mode only |
+
+```yaml
+email:
+  enabled: true
+```
+
+In hosted mode, the platform can give the agent an email address. The channel
+gateway delivers the mail that members of the agent send to that address, on
+the same streams as hosted Slack and the hosted GitHub source (see
+[Hosted mode](#hosted-mode)). The platform decides which mail reaches the
+agent; `email.enabled` decides only whether Nerve takes it. Email has no
+other mode, so it needs usable `channels.hosted` settings. Without them,
+Nerve logs a warning at startup, `nerve doctor` shows the same warning, and
+there is no email channel.
+
+Each mail starts a turn. The conversation of a mail is one sender and one
+email thread: the gateway gives each pair its own conversation ID, so two
+members never share a session, and the session key is
+`email:<conversation ID>`. A conversation continues its last session however
+long it was idle, until that session is archived or deleted.
+
+Nerve posts no answer to a mail: no typing indicator, no streamed answer, and
+no `Error:` message. The answer stays in the session. The agent answers by
+email only with the reply tool that the gateway names for the email
+connection, and only when sending email is on for the agent. The text of the
+turn starts with the line of [Connection behaviour](#connection-behaviour),
+then the mail as the gateway gives it: the sender's name and member ID, the
+subject, the date, the message and thread IDs, the attachments by name (they
+are not delivered), and the body. The agent never sees the sender's email
+address.
+
+The gateway takes mail for the agent only while the agent's subscriptions
+name `email`, and Nerve names it while `email.enabled` is `true`. Usable
+`channels.hosted` settings at startup give the email channel also while
+`email.enabled` is `false`, and Nerve reads the switch for each event. Thus
+a reload switches email on or off without a restart:
+
+- Switched on, the reload sends the subscriptions with `email` on every
+  stream, and the gateway takes new mail.
+- Switched off, the reload sends them without `email`, and the gateway
+  refuses new mail. Nerve rejects the mail that is still in the gateway
+  inbox, and continues to read the events of the other providers.
+
+The gateway changes only when a stream sends it the subscriptions. When no
+stream is open, or no open stream sends them in time, the reload reports
+`subscriptions` with a note that says they are not sent yet. The note is
+not an error, and the reload stays `ok`: each stream sends the current
+subscriptions when it connects, before Nerve reads from it, so the gateway
+gets them. Until then the gateway keeps the subscriptions that it had:
+after a switch off, it can store more mail, and Nerve rejects that mail
+when it reads it. That is the result of the switch, not a fault.
+
+A reload while `email.enabled` is `true` also says what stops the channel:
+without usable `channels.hosted` settings, the reload repeats the startup
+warning under `email`. When the settings are usable but this process has no
+email channel, because the settings became usable after startup or the
+hosted channels did not start, it says that a restart is needed.
+
+While a hosted Slack is switched off, Nerve reads nothing from the gateway
+inbox, so member mail waits there too (see
+[Connection behaviour](#connection-behaviour)). `send_channel_message`
+cannot post through the email channel.
+
+## Notification delivery
+
+`notify`, `ask_user` and `propose_action` go to each channel in
+`notifications.channels` (see [Slack](#notifications) and
+[Telegram](#notification-sink) for the destinations). The Notifications
+section of the panel's Settings page changes these keys (see
+[web-ui.md](web-ui.md#settings)).
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `notifications.levels` | map | `{}` | For each channel, `all` or `important` |
+| `notifications.default_expiry_hours` | int | `48` | Hours until an unanswered question or approval expires, when the agent gives no time |
+| `notifications.max_redeliveries` | int | `3` | How often one snoozed item comes back, at most. At this count it expires |
+
+A channel at `important` gets questions, approvals, and items with priority
+`high` or `urgent`. It does not get other items. The panel (`web`) gets every
+item. A channel without an entry gets every item, and so does a channel with
+an unknown level (Nerve logs a warning).
+
+```yaml
+notifications:
+  channels: [web, slack, telegram]
+  levels:
+    slack: all
+    telegram: important
+```
+
+In Telegram and Slack the last line of an item names the session that raised
+it. With [`gateway.public_url`](#links-to-the-web-ui) set, that line is a link
+to the session in the web UI.
+
+### Web Push
+
+The fan-out also sends each item as a push notification (channel `webpush`)
+to the browsers where a person turned push on. `notifications.channels` does
+not list it, and `notifications.levels.webpush: important` limits all
+browsers. The instance must reach the push services of the browsers; on Nerve
+Cloud that works only for agents in open internet mode. How push works, the
+VAPID key and the hosts: [web-ui.md](web-ui.md#push-notifications).
+
 ## Quiet Hours
 
 | Key | Type | Default | Description |
@@ -1742,20 +2089,33 @@ Three differences from the inbound policy:
 
 Quiet hours are optional. Both values empty (`''`) means there are none;
 otherwise both are `HH:MM`, and the window may cross midnight (`22:00` to
-`07:00`). The setup writers (the setup page's Mode step, `nerve init
+`07:00`). A value that is not a 24-hour time from `00:00` to `23:59` also
+means no quiet hours. An unquoted time such as `quiet_start: 22:00` is read
+as `22:00` too: YAML reads it as the number 1320 (the minutes after
+midnight), and Nerve changes that number back to the time. The setup writers (the setup page's Mode step, `nerve init
 --terminal` and `--non-interactive`) state the mode's default in
 `settings.yaml`: `02:00`/`08:00` for a personal install, and empty values for
 a worker, so a worker has no quiet hours until someone turns them on (the
 setup page's Operator step, or these two keys). A key that no layer sets falls
 back to `02:00`/`08:00`.
 
-Nerve stores quiet hours for the agent; it does not enforce them. On a
-personal install the setup page also fills the `Quiet hours:` line of
-`USER.md`, and `AGENTS.md` tells the agent to hold anything below `urgent`
-during them. A worker's brain files do not mention them, so state the rule in
-`TASK.md` if the worker should keep them. No built-in delivery gating is
-attached today: `notify`, `ask_user` and cron runs go out whenever they
-happen.
+During quiet hours, each notification (`notify`, `ask_user`,
+`propose_action`, and a re-delivered snoozed item) with a priority other than
+`urgent` goes out without sound: Telegram sends it with
+`disable_notification`, and the panel's `notification` event has
+`silent: true`, so a browser alert of the panel makes no sound either. Nerve
+still delivers it at once. An `urgent` item makes a
+sound. Slack has no such option for one message, so Slack follows its own
+notification settings. The Notifications section of the panel's Settings page
+changes the two keys (see [web-ui.md](web-ui.md#settings)).
+
+Nerve holds nothing back during quiet hours: `notify`, `ask_user` and cron
+runs go out whenever they happen. On a personal install the setup page also
+fills the `Quiet hours:` line of `USER.md`, and `AGENTS.md` tells the agent to
+hold anything below `urgent` during them. A worker's brain files do not
+mention them, so state the rule in `TASK.md` if the worker should keep them.
+The deadline escalation check pauses during quiet hours (see
+[tasks.md](tasks.md)).
 
 ## Sources (sync)
 
@@ -1978,7 +2338,14 @@ also when the backend did not start at all, and nothing is frozen into it;
 the sweep keeps its watermark, so the window is offered again. Reads are
 tried twice, and wait out a `Retry-After` of up to 2 seconds once (the
 gateway's per-agent limit sends 1); a longer one holds that operation (at
-most 60 seconds). When the gateway is not reached, or a call gets no answer
+most 60 seconds). A call the gateway answers with
+`MCP server session ended; the state of earlier calls is lost`
+did not reach Loom: the session the gateway kept with Loom had ended. Nerve
+sends such a call again at once, an extraction batch too, at most three
+times in a row, without using up a read's second try. A fourth such answer
+in a row is a failure like any other `-32002`: a read goes on to its second
+try, and a batch waits for the sweep. When the gateway is not reached, or a
+call gets no answer
 in time (a read gives up long before the gateway's call limit, extraction a
 little after it), calls fail at once for 15 seconds, doubling with each such
 failure in a row up to 5 minutes: the gateway's own circuit does not count
@@ -2180,6 +2547,39 @@ A session with an earlier catalog gets no access that the policy does not
 allow: the gateway checks each call against the current policy and refuses
 a server or a tool that the organization removed.
 
+## MCP Apps
+
+Shows the interactive view of an MCP tool inside the chat message (the MCP
+extension `io.modelcontextprotocol/ui`). Off by default, Claude backend only,
+and only in local mode: in [external mode](#authentication-mode) it stays off.
+[mcp-apps.md](mcp-apps.md) describes what it does, its security model and its
+limits.
+
+```yaml
+# config.yaml
+mcp_apps:
+  enabled: true
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `mcp_apps.enabled` | bool | `false` | Host MCP Apps: tell the Claude CLI to act as a host, mark the tool calls that open a view, and serve the routes and the sandbox document the web UI needs. The sandbox document is a page of the gateway's own address (`/mcp-app-sandbox.html`), sent with a header that takes its origin away: no other port is opened, and nothing else is to configure. |
+
+The key needs a restart (see
+[What still needs a restart](#what-still-needs-a-restart)). When the web UI
+is not built, so that the sandbox document is missing, startup logs a warning
+and no view can load until it is.
+
+Whether one machine's gateway runs third-party views next to its web UI is
+decided for that machine, so the section belongs in `config.yaml`. Under
+lockdown, state it in the tracked settings with a `${VAR}` reference:
+
+```yaml
+# workspace/config/settings.yaml
+mcp_apps:
+  enabled: ${NERVE_MCP_APPS:-false}
+```
+
 ## Auth
 
 | Key | Type | Default | Description |
@@ -2306,8 +2706,75 @@ environment only when it starts. The session's cause never changes, so a CLI
 process keeps its header for its whole life, and a process that Nerve starts
 again for the session (after a model change or a crash) gets the same header.
 
+Codex sends the header only to `codex.base_url` (see
+[Codex through an OpenAI-compatible endpoint](#codex-through-an-openai-compatible-endpoint)).
+Nerve gives the value to each Codex process in the environment variable
+`NERVE_CODEX_INFERENCE_PRINCIPAL`, and the `nerve-endpoint` provider reads it
+through `env_http_headers`. The value is not in the arguments of the process.
+One Codex process serves one session, and it keeps its header for its whole
+life, as the Claude CLI does. Nerve removes `NERVE_CODEX_INFERENCE_PRINCIPAL`
+from the environment that a Codex process inherits, so a session with no
+cause and local mode send no header. The Codex preflight (setup check and
+model catalogue) names the system actor.
+
 These requests have no header: memory embedding requests to the OpenAI API,
-and Codex sessions.
+and Codex requests to Codex's own provider (no `codex.base_url`).
+
+#### Inference trigger header
+
+In external mode, Nerve also adds one `X-Nerve-Inference-Trigger` header to
+each model request of a session, also a session with no cause, and to each of
+its own model calls. The value is the kind of event that started the work:
+
+| Requests | Trigger |
+|---|---|
+| The model requests of an agent session | The session's `trigger`: `chat`, `api`, `slack`, `telegram`, `email`, `cron`, `plan`, `workflow`, `external`, `system` (the autonomous onboarding) or `unknown`. See `trigger` in [api.md](api.md#sessions) |
+| Nerve's own model calls (the second row of the table above) | `system` |
+
+Nerve sets a session's trigger when it creates the session, from the code
+path that creates it, and never changes it. A session from before the
+trigger field sends the value that Nerve derives from its source and its
+id. The header has the same rules as the principal header: local mode sends
+none, Nerve removes an inherited line for it from `ANTHROPIC_CUSTOM_HEADERS`,
+and a CLI process keeps it for its whole life. Nerve does not prove the
+value. The same requests as above have no header, and Codex requests to
+`codex.base_url` have no trigger header.
+
+#### Inference origin header
+
+In external mode, Nerve also adds one `X-Nerve-Inference-Origin` header to
+each model request of a session that has a specific origin. The header names
+where the session comes from: the cron job, the channel conversation, the
+hook, the plan, the workflow run or the external client that started it. The
+value is `<kind>=<value>`, from the session's `trigger` and `origin_detail`
+(see [api.md](api.md#sessions)):
+
+| Session `trigger` | Value |
+|---|---|
+| `cron`, for a cron job | `cron=` and the job ID |
+| `slack`, `telegram` or `email` | `channel=` and the conversation ID, for example a Slack channel ID. Never the thread or the channel name |
+| `api`, for a webhook | `hook=` and the hook name |
+| `plan` | `plan=` and the plan ID |
+| `workflow` | `workflow=` and the workflow run ID |
+| `external` | `client=` and the name of the external client |
+
+The value after `=` has 1 to 56 bytes of `A`-`Z`, `a`-`z`, `0`-`9`, `.`, `_`
+and `-`, and the whole header value has at most 64 bytes. Nerve replaces each
+other byte of the detail with `_` (a character outside ASCII gives one `_` for
+each byte of its UTF-8 form) and cuts the result to 56 bytes, or to 55 for
+`workflow`. For example, a session of the cron job `nightly` sends
+`cron=nightly`.
+
+A session of another trigger (`chat`, `system`, `unknown`) or without the
+detail sends no origin header: for example a "Run later" session has no cron
+job, and a session of `/api/chat` has no hook. Nerve's own model calls send
+no origin header. Nerve sets a session's origin when it creates the session
+and never changes it; a session from before the trigger field sends the
+value from the origin that Nerve derives, when that has the detail. The
+header has the same rules as the principal header: local mode sends none,
+Nerve removes an inherited line for it from `ANTHROPIC_CUSTOM_HEADERS`, and a
+CLI process keeps it for its whole life. Nerve does not prove the value.
+Codex sends no origin header.
 
 ### System principal ID
 
@@ -2336,6 +2803,39 @@ reason.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `setup.local_secrets` | bool | `true` | Whether the browser setup page may store a credential it is given (an API key, a bot token, a Telegram sign-in) in the files on this machine. `false` on an instance whose connections the operator provides: the Memory, Channels, Sources and Agents steps are closed, the setup page does not show them, and their writes are refused (`409`); the Model step accepts Bedrock or a credential from the environment, never a pasted key; Slack through a channel gateway keeps its switch, and so does the GitHub source when its token comes from the environment (`GH_TOKEN` / `GITHUB_TOKEN`, or a `${VAR}` reference); the Sources step then offers that one toggle while Gmail and Telegram stay closed. Usually set in the tracked `settings.yaml`. `NERVE_SETUP_LOCAL_SECRETS=0` in the service environment forces it off, one way only, like `NERVE_LOCKDOWN`: the variable can turn the storage off, never on. Read per request, so a reload applies it. See [Instances that keep no credentials](setup.md#instances-that-keep-no-credentials). |
+
+## Amazon Bedrock
+
+With `provider.type: bedrock`, Nerve's own model calls go to Bedrock through
+the Anthropic Python SDK: session titles, plan summaries, the prompt rewrite,
+memU, source condensing, image description and the model check of
+`nerve doctor` and of the setup page. The agent runs in the Claude CLI, which
+has its own client.
+
+The SDK sends API version `2026-10-21`. On Bedrock, this version accepts only
+Claude 4.7 and later models, so these calls fail with an older model. These
+settings name the models of these calls:
+
+| Setting | Used for |
+|---------|----------|
+| `agent.title_model` | Session titles, plan summaries, the model check |
+| `memory.recall_model`, `memory.memorize_model` | memU (not with `memory.backend: loom`) |
+| `memory.fast_model` | memU, source condensing, image description when `sync.imap.vision.model` is empty |
+| `agent.prompt_rewrite.model` | The prompt rewrite. When it is empty, `agent.model` |
+| `sync.imap.vision.model` | Image description |
+
+`nerve doctor` shows a warning for each of these settings that names a Claude
+model older than 4.7, for example
+`us.anthropic.claude-sonnet-4-5-20250929-v1:0`. It reads the version from the
+model ID, also with a region prefix (`us.`, `eu.`, `apac.`, `global.`), with a
+context window (`:200k`) or in an inference profile ARN. It also reads the
+first IDs, such as `anthropic.claude-v2:1` and `anthropic.claude-instant-v1`.
+An ID that it cannot read, such as an application
+inference profile ARN, gets no warning. Nerve starts with an older model in
+these settings. Only the calls above fail.
+
+When `provider.aws_region` is empty, these calls use `AWS_REGION`,
+`AWS_DEFAULT_REGION` or the region of the AWS profile, else `us-east-1`.
 
 ## API Keys (config.local.yaml)
 
@@ -2367,6 +2867,17 @@ The endpoint must serve `POST /v1/messages`. memU also needs
 `POST /v1/chat/completions`, and model discovery uses `GET /v1/models`. The model
 IDs in `agent.*` and `memory.*` must be ones the endpoint serves, including the
 CLI aliases in `agent.model_aliases`.
+
+The key comes in two headers. The direct SDK calls, memU and model discovery
+send it as `Authorization: Bearer <key>`. The Claude CLI sends it as
+`X-Api-Key: <key>`. The endpoint must read the key from both headers.
+
+When `ANTHROPIC_CUSTOM_HEADERS` in Nerve's environment has an `X-Api-Key`
+line and no `Authorization` line, the direct SDK calls and model discovery send
+that line and no `Authorization` header. A request then carries one key, the
+one in that line. When it has both lines, for example a gateway token and the
+key for the API behind the gateway, both lines go out and the configured key
+does not. Header names match in any case.
 
 It cannot be set together with `proxy.enabled` or `provider.type: bedrock`, and a
 change needs a restart.
@@ -2415,6 +2926,7 @@ The proxy binary is automatically downloaded from [CLIProxyAPI](https://github.c
 | `sessions.max_sessions` | int | `500` | Max active (non-archived) sessions before cleanup |
 | `sessions.cron_session_mode` | string | `per_run` | `per_run` (unique session per cron run) or `reuse` (shared session per job) |
 | `sessions.sidebar_page_size` | int | `50` | Rows per sidebar request: caps the conversation feed and sizes one lazy Archived/System page. `0` = unlimited (a group loads in a single request). Starred sessions are exempt and always returned in full. |
+| `sessions.plan_attention_days` | int | `7` | Days a pending plan puts its proposing session in the sidebar's "Needs you" group, counted from the proposal (a new version with `plan_update` starts the count again). `0` = no limit. The Plans page still lists older pending plans. Questions and approvals are not affected: they expire on their own (`notifications.default_expiry_hours`). |
 
 **Starred sessions are exempt from all auto-archival.** A session starred via
 the star toggle (web sidebar, or the Telegram `/sessions` list / `/star`) is

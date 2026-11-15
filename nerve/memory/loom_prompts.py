@@ -41,8 +41,10 @@ versions and find its neighbours; `loom_context_pack` loads what a task needs \
 in one call.
 - **Save**: `loom_memory_set` stores one fact per call under a readable \
 `memory_key` (`<scope>/<kind>/<id>`), the claim in plain text, facets in \
-`tags`. A fact you read that has changed gets `loom_memory_update` under the \
-same key, never a second copy. `loom_memory_pin` is for a standing rule, \
+`tags`. Leave `memory_type` unset: Loom keeps a memory typed `episodic` or \
+`profile` out of search, so `loom_search` never finds it. A fact you read \
+that has changed gets `loom_memory_update` under the same key, never a \
+second copy. `loom_memory_pin` is for a standing rule, \
 `loom_memory_delete` only for an explicit request to forget, and \
 `loom_blacklist_add` for something that must never be remembered.
 - **Scratch**: `loom_working_memory_set`, `loom_working_memory_append`, \

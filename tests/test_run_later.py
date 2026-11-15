@@ -41,6 +41,8 @@ async def _install(db: Database, engine) -> None:
 def _fake_engine() -> MagicMock:
     engine = MagicMock()
     engine.run = AsyncMock()  # must never be awaited by run-later
+    # Run-later unarchives an archived session first; these sessions are open.
+    engine.reopen_archived = AsyncMock(return_value=False)
     return engine
 
 

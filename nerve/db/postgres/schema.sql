@@ -965,3 +965,4 @@ COMMIT;
 
 -- New installations use the same upgrade path as existing databases.
 \ir migrations/002_operational_v061.sql
+\ir migrations/003_operational_v073.sql

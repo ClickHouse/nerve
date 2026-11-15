@@ -135,6 +135,7 @@ Powered by `python-telegram-bot` v21+.
 - Streaming responses via edit-in-place
 - Inline keyboard buttons for interactive tool questions
 - `/reply` command for free-text answers
+- Replying to a message continues the session it belongs to; `/new [message]` starts a fresh one
 - Configurable DM policy (`open` or `pairing`)
 
 ### 💬 Slack Bot
@@ -147,6 +148,7 @@ behind NAT with no public URL.
 - Each thread is its own conversation, so several people can work in one channel
 - In a channel it stays quiet until you `@mention` it
 - Reply to its questions by pressing a button, or send it a file to read
+- Replying in the thread under a notification continues the session that sent it
 - You decide who may talk to it and where — by person, by channel, or both
 
 ### ⏰ Cron Jobs
@@ -159,7 +161,7 @@ Scheduled AI sessions via APScheduler. Three session modes:
 | **Persistent** | Accumulates context across runs. Optional rotation to manage token usage. Reminder mode for lightweight follow-ups. |
 | **Main** | Runs inside the user's primary conversation — full context access. |
 
-Built-in crons (personal mode): `skill-extractor` (12h), `skill-reviser` (weekly), `inbox-processor` (30min), `task-planner` (4h), `machine-maintenance` (weekly). Worker mode ships with `skill-reviser`, `skill-extractor` and `machine-maintenance` on and `task-planner` off; onboarding enables `task-planner` when the worker should plan through the approval loop, and configures the worker's own crons.
+Built-in crons (personal mode): `skill-extractor` (daily), `skill-reviser` (weekly), `inbox-processor` (30min), `task-planner` (4h), `machine-maintenance` (weekly). Worker mode ships with `skill-reviser`, `skill-extractor` and `machine-maintenance` on and `task-planner` off; onboarding enables `task-planner` when the worker should plan through the approval loop, and configures the worker's own crons.
 
 ### 📡 Source Sync
 
@@ -198,7 +200,7 @@ Memory categories adapt to mode — personal agents track relationships, health,
 Markdown files backed by SQLite FTS5 full-text search.
 
 - Statuses: `pending` → `in_progress` → `done` / `deferred`
-- Duplicate detection: exact URL match + fuzzy FTS fallback
+- Duplicate detection: exact URL match + title similarity (near-duplicates refused, look-alikes reported)
 - Escalation reminders: deadline → +30min follow-up → +2h URGENT (respects quiet hours)
 - Full markdown editor in the web UI
 

@@ -7,7 +7,7 @@ public function is a no-op and Nerve runs identically.
 
 Implementation notes
 --------------------
-- Built on the Langfuse Python SDK (>= 4.17), which itself wraps
+- Built on the Langfuse Python SDK (>= 5.0.1), which itself wraps
   OpenTelemetry.
 - The keys go only to the ``Langfuse`` client constructor. Nerve does not
   write them to ``os.environ``, so child processes (the Claude CLI, the
@@ -24,8 +24,11 @@ Implementation notes
   :func:`langfuse.propagate_attributes`, through the in-process
   OpenTelemetry context.
 - ``langfuse.redact_patterns`` are applied to text in span attributes,
-  including bytes, nested values and serialized JSON, before the SDK
-  extracts media. Span names and span events are not redacted.
+  including bytes and nested values, before the SDK extracts media. The
+  patterns match each string as text and, if it is JSON text, each string
+  in the decoded value too. Span names and span events are not redacted.
+  The SDK writes Langfuse metadata attributes as JSON text. They are
+  decoded, redacted and encoded again, so they stay JSON text.
 
 Failure mode
 ------------
@@ -50,6 +53,17 @@ from typing import Any, Iterator
 logger = logging.getLogger(__name__)
 
 REDACTED = "[REDACTED]"
+
+# Return value of ``_decode_json`` for text that is not JSON.
+_NOT_JSON = object()
+
+# The Langfuse SDK writes the value of these attributes, and of each
+# ``<prefix>.<key>`` attribute, as JSON text. A string value is also
+# JSON-encoded.
+_METADATA_ATTRIBUTE_PREFIXES = (
+    "langfuse.trace.metadata",
+    "langfuse.observation.metadata",
+)
 
 # HTTP statuses with which a Langfuse host rejects a key pair.
 _REJECTED_KEY_STATUSES = frozenset({401, 403})
@@ -277,6 +291,58 @@ def _redact_text(text: str, patterns: list[re.Pattern[str]]) -> str:
     return out
 
 
+def _decode_json(text: str) -> Any:
+    """Return the decoded value of JSON object, array or string text.
+
+    Returns ``_NOT_JSON`` for any other text.
+    """
+    if not text.lstrip().startswith(("{", "[", '"')):
+        return _NOT_JSON
+    try:
+        return json.loads(text)
+    except ValueError:
+        return _NOT_JSON
+
+
+def _encode_json(value: Any, like: str) -> str:
+    """Encode ``value`` as JSON text with the separators that ``like`` uses."""
+    spaced = ": " in like or ", " in like
+    separators = (", ", ": ") if spaced else (",", ":")
+    return json.dumps(value, ensure_ascii=False, separators=separators)
+
+
+def _redact_string(value: str, patterns: list[re.Pattern[str]]) -> str:
+    """Return a redacted copy of a string, or ``value`` itself.
+
+    The patterns match the string as text first. If the result is JSON
+    text, they also match each string, key and scalar in the decoded
+    value. If a decoded part changes, the value is encoded again with the
+    same separators and the patterns match the new text. A match that
+    the first step removed is not in the decoded value, so the new
+    encoding cannot bring it back.
+
+    If the text match makes JSON text invalid and the decoded original
+    value also has a match (for example behind an escaped character), no
+    single form is safe: a new encoding can lose the layout that the text
+    match needed. The whole string then becomes the redaction marker.
+    """
+    text = _redact_text(value, patterns)
+    decoded = _decode_json(text)
+    if decoded is _NOT_JSON:
+        if text == value:
+            return value
+        decoded = _decode_json(value)
+        if decoded is _NOT_JSON:
+            return text
+        if _redact_json(decoded, patterns) is decoded:
+            return text
+        return REDACTED
+    redacted = _redact_json(decoded, patterns)
+    if redacted is not decoded:
+        text = _redact_text(_encode_json(redacted, text), patterns)
+    return value if text == value else text
+
+
 def _redact_value(value: Any, patterns: list[re.Pattern[str]]) -> Any:
     """Return a redacted copy of an OTEL attribute value.
 
@@ -289,21 +355,10 @@ def _redact_value(value: Any, patterns: list[re.Pattern[str]]) -> Any:
             text = value.decode("utf-8")
         except UnicodeDecodeError:
             return REDACTED.encode("utf-8")
-        redacted = _redact_value(text, patterns)
+        redacted = _redact_string(text, patterns)
         return value if redacted is text else redacted.encode("utf-8")
     if isinstance(value, str):
-        if value.lstrip().startswith(("{", "[", '"')):
-            try:
-                decoded = json.loads(value)
-            except ValueError:
-                pass
-            else:
-                redacted = _redact_value(decoded, patterns)
-                if redacted is not decoded:
-                    return json.dumps(redacted, ensure_ascii=False)
-                return value
-        redacted = _redact_text(value, patterns)
-        return value if redacted == value else redacted
+        return _redact_string(value, patterns)
     if isinstance(value, Mapping):
         items = {
             _redact_text(key, patterns): _redact_value(item, patterns)
@@ -316,6 +371,91 @@ def _redact_value(value: Any, patterns: list[re.Pattern[str]]) -> Any:
     return value
 
 
+def _is_metadata_attribute(key: Any) -> bool:
+    return isinstance(key, str) and any(
+        key == prefix or key.startswith(prefix + ".")
+        for prefix in _METADATA_ATTRIBUTE_PREFIXES
+    )
+
+
+def _redact_json(value: Any, patterns: list[re.Pattern[str]]) -> Any:
+    """Return a redacted copy of a decoded JSON value.
+
+    Returns ``value`` itself when nothing matched. Strings go through
+    :func:`_redact_string`. A number, boolean or null whose JSON text a
+    pattern matches becomes the redacted text, as a string.
+    """
+    if isinstance(value, str):
+        return _redact_string(value, patterns)
+    if isinstance(value, dict):
+        items: dict[str, Any] = {}
+        changed = False
+        for key, item in value.items():
+            new_key = _redact_text(key, patterns)
+            new_item = _redact_json(item, patterns)
+            changed = changed or new_key != key or new_item is not item
+            items[new_key] = new_item
+        return items if changed else value
+    if isinstance(value, list):
+        items_list = [_redact_json(item, patterns) for item in value]
+        if any(a is not b for a, b in zip(value, items_list)):
+            return items_list
+        return value
+    text = json.dumps(value)
+    redacted = _redact_text(text, patterns)
+    return value if redacted == text else redacted
+
+
+def _redact_metadata_value(value: Any, patterns: list[re.Pattern[str]]) -> Any:
+    """Return a redacted copy of a Langfuse metadata attribute value.
+
+    Returns ``value`` itself when nothing matched. The result is always
+    JSON text. The SDK encodes each metadata value as JSON text:
+
+    - A string value gets quotes from the SDK. The string is decoded and
+      goes through :func:`_redact_string`, so the patterns do not match
+      the quotes that the SDK adds.
+    - An object, array, number or boolean gets no quotes. The attribute
+      text goes through :func:`_redact_string`, as for other attributes.
+      If the result is not JSON text, it is encoded as a JSON string.
+
+    A value that is not JSON text is redacted as plain text.
+    """
+    if not isinstance(value, str):
+        return _redact_value(value, patterns)
+    try:
+        decoded = json.loads(value)
+    except ValueError:
+        return _redact_value(value, patterns)
+    if isinstance(decoded, str):
+        redacted = _redact_string(decoded, patterns)
+        if redacted is decoded:
+            return value
+        return json.dumps(redacted, ensure_ascii=False)
+    redacted = _redact_string(value, patterns)
+    if redacted is value:
+        return value
+    try:
+        json.loads(redacted)
+    except ValueError:
+        return _encode_json_string(redacted, patterns)
+    return redacted
+
+
+def _encode_json_string(text: str, patterns: list[re.Pattern[str]]) -> str:
+    """Encode text that has no match as a JSON string.
+
+    The encoding adds an escape character in front of each quote and
+    backslash. If a pattern matches the escaped text, the result is the
+    JSON string of the redaction marker.
+    """
+    encoded = json.dumps(text, ensure_ascii=False)
+    escaped = encoded[1:-1]
+    if _redact_text(escaped, patterns) != escaped:
+        return json.dumps(REDACTED)
+    return encoded
+
+
 def redact_attributes(
     attributes: Any, patterns: list[re.Pattern[str]],
 ) -> dict[str, Any]:
@@ -324,7 +464,10 @@ def redact_attributes(
     if not patterns:
         return changed
     for key, value in attributes.items():
-        redacted = _redact_value(value, patterns)
+        if _is_metadata_attribute(key):
+            redacted = _redact_metadata_value(value, patterns)
+        else:
+            redacted = _redact_value(value, patterns)
         if redacted is not value:
             changed[key] = redacted
     return changed
@@ -356,7 +499,7 @@ def _mask_otel_spans(*, params: Any) -> Any:
 def _install_redaction(client: Any) -> None:
     """Install masking ahead of the client's media-processing exporter.
 
-    Requires the Langfuse 4.17 / OpenTelemetry 1.45 exporter layout. The
+    Requires the Langfuse 5 / OpenTelemetry 1.45 exporter layout. The
     client's span filter stays closed until this setup succeeds.
     """
     from langfuse._client.span_exporter import LangfuseTransformingSpanExporter

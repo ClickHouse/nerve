@@ -38,6 +38,8 @@ from nerve.db.notifications import NotificationStore
 from nerve.db.observations import ObservationStore
 from nerve.db.onboarding import OnboardingStore
 from nerve.db.plans import PlanStore
+from nerve.db.push_subscriptions import PushSubscriptionStore
+from nerve.db.reply_routes import ReplyRouteStore
 from nerve.db.review_loops import ReviewLoopStore
 from nerve.db.sessions import SessionStore
 from nerve.db.skills import SkillStore
@@ -46,6 +48,7 @@ from nerve.db.task_statuses import TaskStatusStore
 from nerve.db.tasks import TaskStore
 from nerve.db.usage import UsageStore
 from nerve.db.wakeups import WakeupStore
+from nerve.db.widget_states import WidgetStateStore
 from nerve.db.workflow_runs import WorkflowRunStore
 from nerve.identity import ACTOR_KIND_SYSTEM, Actor
 
@@ -349,6 +352,7 @@ class Database(
     PlanStore,
     NotificationStore,
     ObservationStore,
+    ReplyRouteStore,
     SourceStore,
     CronStore,
     SkillStore,
@@ -363,6 +367,8 @@ class Database(
     MaintenanceStore,
     AgentStore,
     OnboardingStore,
+    PushSubscriptionStore,
+    WidgetStateStore,
 ):
     """Async SQLite database wrapper.
 

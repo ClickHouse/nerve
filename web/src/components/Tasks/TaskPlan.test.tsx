@@ -54,10 +54,9 @@ describe('TaskPlan', () => {
     renderAt();
 
     const region = await screen.findByRole('region', { name: 'Plan' });
-    expect(region).toHaveTextContent('A plan waits for your review');
-    expect(region).toHaveTextContent('v2');
+    expect(region).toHaveTextContent('Plan v2 waits for your review');
 
-    await userEvent.click(screen.getByRole('button', { name: 'Open plan' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Review' }));
     expect(await screen.findByText('plan page plan-2')).toBeInTheDocument();
   });
 

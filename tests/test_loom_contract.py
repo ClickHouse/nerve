@@ -102,7 +102,9 @@ def test_agents_are_told_only_about_tools_loom_lists() -> None:
 
 def test_only_reads_are_retried() -> None:
     """A call Nerve sends again after a lost answer must be one Loom marks
-    idempotent: queueing a transcript twice extracts it twice."""
+    idempotent: queueing a transcript twice extracts it twice. A call the
+    gateway did not send is another matter: Nerve sends it again whatever
+    the op (``tests/test_loom_memory.py``)."""
     from nerve.memory.loom import _RETRIED_OPS
 
     assert {op for op in _RETRIED_OPS if not OPS[op]["idempotent"]} == set()

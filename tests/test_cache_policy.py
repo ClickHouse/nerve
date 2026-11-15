@@ -251,6 +251,21 @@ def test_build_env_default_haiku_alias_maps_to_the_fast_model():
     assert "ANTHROPIC_SMALL_FAST_MODEL" not in env
 
 
+def test_build_env_default_fable_alias_maps_to_the_fallback_model():
+    # The "fable" alias resolves to nerve.config.DEFAULT_FALLBACK_MODEL (the
+    # picker's second built-in entry), so an Agent/Workflow call asking for
+    # "fable" gets Nerve's current Fable whatever the CLI's own default is.
+    from nerve.config import DEFAULT_FALLBACK_MODEL
+
+    env = _make_env_backend()._build_env()
+    assert env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == DEFAULT_FALLBACK_MODEL == "claude-fable-5-2"
+    # Config overrides it and "" unsets it like the other defaults; Bedrock gets none.
+    env = _make_env_backend(aliases={"fable": "claude-fable-5-1"})._build_env()
+    assert env["ANTHROPIC_DEFAULT_FABLE_MODEL"] == "claude-fable-5-1"
+    assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in _make_env_backend(aliases={"fable": ""})._build_env()
+    assert "ANTHROPIC_DEFAULT_FABLE_MODEL" not in _make_env_backend(is_bedrock=True)._build_env()
+
+
 def test_build_env_haiku_alias_config_overrides_and_unsets_default():
     env = _make_env_backend(aliases={"haiku": "claude-haiku-4-5"})._build_env()
     assert env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] == "claude-haiku-4-5"

@@ -25,6 +25,7 @@ from nerve.agent.tools.schemas import (
     PLAN_PROPOSE_SCHEMA,
     PLAN_READ_SCHEMA,
     PLAN_REVISE_SCHEMA,
+    PLAN_SUMMARY_MAX_CHARS,
     PLAN_UPDATE_SCHEMA,
 )
 
@@ -32,8 +33,8 @@ from nerve.agent.tools.schemas import (
 # handlers without going through the registry. This is the chosen pattern
 # for intra-package coupling (see plan-a217db3c "Cross-handler calls").
 from nerve.agent.tools.handlers.tasks import task_update_handler
+from nerve.db.plans import CLOSED_WITH_TASK
 from nerve.db.task_statuses import PLAN_REVIEW_FROM, PLAN_REVIEW_STATUS
-from nerve.tasks.escalation import _is_quiet_hour
 
 logger = logging.getLogger(__name__)
 
@@ -69,19 +70,17 @@ async def _notify_plan_ready(
 
     The notification stores the plan id and the task id, so the web UI and
     Telegram can open the plan from it. It replaces the task's earlier plan
-    notifications, and it makes no sound during quiet hours.
+    notifications. During quiet hours the fan-out sends it without sound.
     """
     if not ctx.notification_service:
         return False
     try:
         await ctx.db.dismiss_plan_notifications(task["id"], attribution=ctx.attribution)
-        service = ctx.notification_service
-        await service.send_notification(
+        await ctx.notification_service.send_notification(
             session_id=ctx.session_id,
             title=f"Plan ready for review: {task['title']}",
             body=f"Version {version} of plan {plan_id} waits for your decision.",
             priority="high",
-            silent=_is_quiet_hour(service.config),
             metadata={"plan_id": plan_id, "task_id": task["id"]},
         )
     except Exception:
@@ -90,9 +89,23 @@ async def _notify_plan_ready(
     return True
 
 
-def _review_summary(moved: bool, notified: bool) -> str:
+def _plan_summary(args: dict) -> tuple[str | None, bool]:
+    """The ``summary`` argument, trimmed, and whether it had to be clipped.
+
+    ``None`` for an empty summary. A summary longer than
+    ``PLAN_SUMMARY_MAX_CHARS`` is clipped to that length, with an ellipsis.
+    """
+    summary = (args.get("summary", "") or "").strip()
+    if len(summary) <= PLAN_SUMMARY_MAX_CHARS:
+        return summary or None, False
+    return summary[:PLAN_SUMMARY_MAX_CHARS - 1].rstrip() + "…", True
+
+
+def _review_summary(moved: bool, notified: bool, clipped: bool = False) -> str:
     """The lines of a plan tool result that say what else happened."""
     lines = []
+    if clipped:
+        lines.append(f"The summary was clipped to {PLAN_SUMMARY_MAX_CHARS} characters.")
     if moved:
         lines.append(f"Task moved to {PLAN_REVIEW_STATUS}.")
     if notified:
@@ -107,6 +120,7 @@ async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
     task_id = args["task_id"]
     content = args["content"]
     plan_type = (args.get("plan_type", "") or "").strip()
+    summary, clipped = _plan_summary(args)
 
     if not ctx.db:
         return ToolResult.text("Database not available.")
@@ -153,6 +167,7 @@ async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
         plan_type=plan_type,
         # Written by the system actor for the session's cause.
         attribution=ctx.attribution,
+        summary=summary,
     )
 
     moved = await _move_to_plan_review(ctx, task_id)
@@ -160,12 +175,30 @@ async def plan_propose_handler(ctx: ToolContext, args: dict) -> ToolResult:
         "task_id": task_id,
         "note": f"Plan proposed: {plan_link(plan_id)} (v{version})",
     })
+    if await _closed_meanwhile(ctx, plan_id):
+        return ToolResult.text(_CLOSED_MEANWHILE.format(plan_id=plan_id, version=version))
     notified = await _notify_plan_ready(ctx, task, plan_id, version)
 
     return ToolResult.text(
         f"Plan proposed: {plan_id} (v{version}) for task '{task['title']}'. "
-        "Awaiting human review.\n" + _review_summary(moved, notified)
+        "Awaiting human review.\n" + _review_summary(moved, notified, clipped)
     )
+
+
+# A plan is written before the task's lock is taken for the note, so the task
+# can be closed in between, and the close takes the new plan with it.
+_CLOSED_MEANWHILE = (
+    "Plan {plan_id} (v{version}) was written, but its task was closed at the same "
+    "moment and the plan was closed with it, undecided. No notification was sent. "
+    "The plan is in review again when the user reopens the task; once the task is "
+    "open, it can also be proposed again."
+)
+
+
+async def _closed_meanwhile(ctx: ToolContext, plan_id: str) -> bool:
+    """Whether the plan that this call just wrote was closed with its task."""
+    plan = await ctx.db.get_plan(plan_id)
+    return plan is not None and plan.get("status") == CLOSED_WITH_TASK
 
 
 async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
@@ -179,6 +212,8 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
     plan_id = args["plan_id"]
     content = args["content"]
     feedback = (args.get("feedback", "") or "").strip()
+    # The new version's own summary: the old one may no longer match.
+    summary, clipped = _plan_summary(args)
 
     if not ctx.db:
         return ToolResult.text("Database not available.")
@@ -215,6 +250,7 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         parent_plan_id=plan_id,
         plan_type=old_plan.get("plan_type", "generic"),
         attribution=ctx.attribution,
+        summary=summary,
     )
 
     task_id = old_plan["task_id"]
@@ -223,13 +259,17 @@ async def plan_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         note += f": {feedback}"
     moved = await _move_to_plan_review(ctx, task_id)
     await task_update_handler(ctx, {"task_id": task_id, "note": note})
+    if await _closed_meanwhile(ctx, new_plan_id):
+        return ToolResult.text(
+            _CLOSED_MEANWHILE.format(plan_id=new_plan_id, version=new_version)
+        )
     task = await ctx.db.get_task(task_id)
     notified = bool(task) and await _notify_plan_ready(ctx, task, new_plan_id, new_version)
 
     return ToolResult.text(
         f"Plan {plan_id} superseded by {new_plan_id} (v{new_version}). "
         "The new version is pending review.\n"
-        + _review_summary(moved, notified)
+        + _review_summary(moved, notified, clipped)
     )
 
 
@@ -275,6 +315,8 @@ async def plan_read_handler(ctx: ToolContext, args: dict) -> ToolResult:
         f"Task: {task_title} ({plan['task_id']})\n"
         f"Type: {plan.get('plan_type', 'generic')} | Created: {plan['created_at'][:10]}"
     )
+    if plan.get("summary"):
+        header += f"\nSummary: {plan['summary']}"
     if plan.get("feedback"):
         header += f"\nFeedback: {plan['feedback']}"
     if plan.get("impl_session_id"):
@@ -302,6 +344,8 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
 
     if not ctx.db:
         return ToolResult.text("Database not available.")
+    if args.get("implement_here"):
+        return await _record_plan_approval(ctx, plan_id)
     if not ctx.engine:
         return ToolResult.text("Engine not available — cannot spawn implementation session.")
 
@@ -323,6 +367,46 @@ async def plan_approve_handler(ctx: ToolContext, args: dict) -> ToolResult:
     return ToolResult.text(
         f"Plan {result['plan_id']} approved. "
         f"Implementation session started: {result['impl_session_id']}"
+    )
+
+
+async def _record_plan_approval(ctx: ToolContext, plan_id: str) -> ToolResult:
+    """``plan_approve`` with ``implement_here``: record, start nothing."""
+    from nerve.agent.plan_service import (
+        PlanNotFound,
+        PlanNotPending,
+        TaskNotFound,
+        record_plan_approval,
+    )
+
+    if not ctx.session_id:
+        return ToolResult.text(
+            "implement_here needs a calling session. Approve without it to "
+            "start an implementation session."
+        )
+    try:
+        result = await record_plan_approval(
+            db=ctx.db, engine=ctx.engine, plan_id=plan_id,
+            session_id=ctx.session_id,
+            # As for approve: the agent records the approval through its own
+            # tool, for the cause of the calling session.
+            actor=ctx.db.system_actor, cause=ctx.cause_id,
+        )
+    except PlanNotFound:
+        return ToolResult.text(f"Plan not found: {plan_id}")
+    except TaskNotFound:
+        return ToolResult.text("Task not found for this plan.")
+    except PlanNotPending as exc:
+        return ToolResult.text(str(exc))
+
+    task_text = (
+        "The task moved from plan_review to in_progress. "
+        if result["task_started"] else "The task status did not change. "
+    )
+    return ToolResult.text(
+        f"Plan {result['plan_id']} approved and linked to this session "
+        f"(plan status: {result['status']}). No new session started. "
+        f"{task_text}Update the task status with task_update as the work goes on."
     )
 
 
@@ -434,7 +518,12 @@ PLAN_READ_SPEC = ToolSpec(
 
 PLAN_APPROVE_SPEC = ToolSpec(
     name="plan_approve",
-    description="Approve a pending plan and spawn an implementation session. Use when the user approves a proposed plan.",
+    description=(
+        "Approve a pending plan and spawn an implementation session. Use when the user "
+        "approves a proposed plan. When the user approved it in this conversation and "
+        "this session does the work, set implement_here=true: the plan is recorded as "
+        "approved and linked to this session, and no new session starts."
+    ),
     input_schema=PLAN_APPROVE_SCHEMA,
     handler=plan_approve_handler,
 )

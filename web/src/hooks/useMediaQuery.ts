@@ -36,6 +36,19 @@ export function useIsMobile(): boolean {
 }
 
 /**
+ * The primary pointer is a finger: phones and tablets. These devices usually
+ * type on an on-screen keyboard, which has no Shift+Enter. Independent of the
+ * viewport width: a narrow desktop window still has a hardware keyboard, and a
+ * tablet is wider than `md`.
+ */
+export const TOUCH_QUERY = '(pointer: coarse)';
+
+/** True when the primary pointer is a touch screen. */
+export function useIsTouch(): boolean {
+  return useMediaQuery(TOUCH_QUERY);
+}
+
+/**
  * One-shot check for code that runs outside React — store actions and keyboard
  * shortcut handlers, which need the current layout but cannot call hooks.
  */

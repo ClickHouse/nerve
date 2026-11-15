@@ -1,6 +1,7 @@
 import type { WSMessage } from '../../api/websocket';
 import type { MessageBlock } from '../../types/chat';
 import { extractResultText } from '../../utils/extractResultText';
+import { mcpAppRef, mcpAppResult } from '../../utils/mcpAppFields';
 import type { TodoItem, CCTask } from '../chatStore';
 import {
   applyCCTaskCreateInput,
@@ -230,12 +231,15 @@ export function handleToolUse(
 
   // Normal: add to main chat
   const blocks = [...state.streamingBlocks];
+  const mcpApp = mcpAppRef(msg.mcp_app);
   blocks.push({
     type: 'tool_call',
     toolUseId: msg.tool_use_id || '',
     tool: msg.tool,
     input: msg.input,
     status: 'running',
+    // The tool has an interactive view (MCP Apps): the block shows it.
+    ...(mcpApp ? { mcpApp } : {}),
   });
   const extraUpdate: Record<string, unknown> = {};
   if (msg.tool === 'TodoWrite' && Array.isArray(msg.input?.todos)) {
@@ -278,9 +282,14 @@ export function handleToolResult(
   }
 
   // Update the main chat (an Agent / Task result completes its spawn card).
+  // A call with a view also takes the result in the form the view reads.
+  const appResult = mcpAppResult(msg.mcp_app_result);
   const blocks = state.streamingBlocks.map(b => {
     if (b.type === 'tool_call' && b.toolUseId === msg.tool_use_id) {
-      return { ...b, result: msg.result, isError: msg.is_error, status: 'complete' as const };
+      return {
+        ...b, result: msg.result, isError: msg.is_error, status: 'complete' as const,
+        ...(b.mcpApp && appResult ? { mcpAppResult: appResult } : {}),
+      };
     }
     return b;
   });
@@ -352,7 +361,7 @@ export function handleToolOutput(
 /** Settle a plan tab still streaming when the turn ends. Workflows settle on
  *  their own terminal workflow_progress, and the Agents / agent tabs follow
  *  the agent records, so neither ends with the turn. */
-function finalizeRunningPanels(get: Get): void {
+export function finalizeRunningPanels(get: Get): void {
   for (const panel of get().panels) {
     if (panel.type !== 'plan' || panel.status !== 'running') continue;
     get().updatePanelTab(panel.id, {
@@ -383,6 +392,7 @@ export function handleDone(
       cache_creation_1h_input_tokens: cc?.ephemeral_1h_input_tokens ?? 0,
       max_context_tokens: msg.max_context_tokens || 200_000,
       num_turns: msg.num_turns || 1,
+      context_tokens: msg.usage.context_tokens ?? msg.context_tokens,
     };
   }
   // A turn that produced nothing but its "background" marker (e.g. the

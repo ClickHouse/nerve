@@ -256,13 +256,72 @@ class NotificationStore:
             row = await cursor.fetchone()
             return dict(row) if row else None
 
+    async def find_notification_for_delivery(
+        self,
+        channel: str,
+        target: str,
+        message_id: str,
+    ) -> dict | None:
+        """Find the notification delivered as one exact message in one target.
+
+        How a channel ties a user's reply to a message back to the card they
+        replied to. An empty ``message_id`` marks a delivery whose id was not
+        recorded, so it matches nothing.
+        """
+        if not message_id:
+            return None
+        async with self.db.execute(
+            """SELECT n.*, s.title AS session_title
+               FROM notification_deliveries d
+               JOIN notifications n ON n.id = d.notification_id
+               LEFT JOIN sessions s ON n.session_id = s.id
+               WHERE d.channel = ? AND d.target = ? AND d.message_id = ?
+               ORDER BY d.delivered_at DESC
+               LIMIT 1""",
+            (channel, target, message_id),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def find_notification_for_message(
+        self,
+        channel: str,
+        message_id: str,
+    ) -> dict | None:
+        """Find the notification delivered as one exact message in any target.
+
+        For a reply that names the message and not the target of its
+        delivery. A message ID is unique only within a target, so an ID that
+        was delivered in more than one target matches nothing, like an empty
+        one.
+        """
+        if not message_id:
+            return None
+        async with self.db.execute(
+            """SELECT DISTINCT target FROM notification_deliveries
+               WHERE channel = ? AND message_id = ?
+               LIMIT 2""",
+            (channel, message_id),
+        ) as cursor:
+            targets = [row[0] async for row in cursor]
+        if len(targets) != 1:
+            return None
+        return await self.find_notification_for_delivery(
+            channel, targets[0], message_id,
+        )
+
     async def dismiss_notification(
         self, notification_id: str, *, attribution: Attribution = UNATTRIBUTED,
     ) -> bool:
-        """Dismiss a pending row. ``attribution.actor_id`` is who dismissed it."""
+        """Dismiss a pending row. ``attribution.actor_id`` is who dismissed it.
+
+        An approval that a press claimed (see :meth:`claim_pending_approval`)
+        is not dismissed: its dispatcher runs the decision.
+        """
         async with self._atomic():
             async with self.db.execute(
-                "SELECT id FROM notifications WHERE id = ? AND status = 'pending'",
+                """SELECT id FROM notifications
+                   WHERE id = ? AND status = 'pending' AND answered_at IS NULL""",
                 (notification_id,),
             ) as cursor:
                 if not await cursor.fetchone():
@@ -363,28 +422,33 @@ class NotificationStore:
             )
         return True
 
-    async def expire_pending_questions_for_session(self, session_id: str) -> int:
+    async def expire_pending_questions_for_session(
+        self, session_id: str,
+    ) -> list[dict]:
         """Expire a session's pending ``question`` notifications.
 
-        Called when an idle session is auto-archived so the user isn't left
-        with a phantom pending question on a closed session (and the periodic
-        expiry pass has nothing to inject into the now-archived session).
-        Returns the number of questions expired.
+        Called when a session is archived or deleted, so that no question
+        stays answerable for a session that runs no more turns. Approvals
+        stay pending: their answer acts on their target, not on the session.
+        Returns the expired rows, with ``status`` set to ``'expired'``, for
+        the service layer to report (as :meth:`expire_due_notifications`).
         """
         async with self._atomic():
             async with self.db.execute(
-                """SELECT id FROM notifications
+                """SELECT * FROM notifications
                    WHERE session_id = ? AND status = 'pending' AND type = 'question'""",
                 (session_id,),
             ) as cursor:
-                ids = [row[0] async for row in cursor]
-            if ids:
-                ph = ",".join("?" for _ in ids)
+                rows = [dict(row) async for row in cursor]
+            if rows:
+                ph = ",".join("?" for _ in rows)
                 await self.db.execute(
                     f"UPDATE notifications SET status = 'expired' WHERE id IN ({ph})",
-                    tuple(ids),
+                    tuple(r["id"] for r in rows),
                 )
-        return len(ids)
+        for r in rows:
+            r["status"] = "expired"
+        return rows
 
     async def snooze_notification(
         self, notification_id: str, redeliver_at: str, new_expires_at: str,
@@ -479,13 +543,36 @@ class NotificationStore:
                 )
         return True
 
-    async def count_pending_notifications(self, channel: str | None = None) -> int:
+    async def count_pending_by_session(self) -> dict[str, dict[str, int]]:
+        """Pending questions and approvals, counted per session and type.
+
+        Returns ``{session_id: {"question": n, "approval": m}}`` with only
+        the sessions and types that have pending rows.
+        """
+        counts: dict[str, dict[str, int]] = {}
+        async with self.db.execute(
+            """SELECT session_id, type, COUNT(*) FROM notifications
+               WHERE status = 'pending' AND type IN ('question', 'approval')
+                 AND session_id IS NOT NULL
+               GROUP BY session_id, type"""
+        ) as cursor:
+            async for session_id, kind, count in cursor:
+                counts.setdefault(session_id, {})[kind] = count
+        return counts
+
+    async def count_pending_notifications(
+        self, channel: str | None = None, types: tuple[str, ...] = (),
+    ) -> int:
+        """Pending rows delivered to ``channel``, of ``types`` when given."""
         sql = "SELECT COUNT(*) FROM notifications WHERE status = 'pending'"
-        params: tuple = ()
+        params: list = []
         if channel:
             sql += ' AND (channels_delivered IS NULL OR channels_delivered LIKE ?)'
-            params = (f'%"{channel}"%',)
-        async with self.db.execute(sql, params) as cursor:
+            params.append(f'%"{channel}"%')
+        if types:
+            sql += f" AND type IN ({', '.join('?' for _ in types)})"
+            params.extend(types)
+        async with self.db.execute(sql, tuple(params)) as cursor:
             row = await cursor.fetchone()
             return row[0] if row else 0
 

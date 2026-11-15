@@ -15,8 +15,10 @@ import json
 import logging
 import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 from zoneinfo import ZoneInfo
 
@@ -26,9 +28,9 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
 from nerve import paths
-from nerve.agent.engine import AgentEngine, NotAcceptingTurnsError
+from nerve.agent.engine import AgentEngine, NotAcceptingTurnsError, SessionClosedError
 from nerve.agent.sessions import new_cron_run_id
-from nerve.config import ConfigError, NerveConfig
+from nerve.config import ConfigError, NerveConfig, _is_within, workspace_reviewed_paths
 from nerve.cron.jobs import (
     CronJob,
     describe_reserved_job_ids,
@@ -37,13 +39,24 @@ from nerve.cron.jobs import (
     merge_jobs,
 )
 from nerve.db import Database
+from nerve.db.reply_routes import REPLY_ROUTE_RETENTION_DAYS
 from nerve.identity import CAUSE_FROM_ACTOR, Attribution, CauseArg, attribution_for
+from nerve.session_origin import cron_origin
+from nerve.setup_writer import (
+    CRON_FILE_HAND_EDITED,
+    CRON_FILE_READ_ONLY,
+    CRON_JOB_MISSING,
+    default_run_if,
+    plan_cron_job_enabled,
+    publish_text,
+    rewrite_superseded_cron_values,
+)
 from nerve.utils.aio import GRACEFUL_STOP_SECONDS
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterator
 
-    from nerve.cron.gates import CronGate
+    from nerve.cron.gates import CronGate, GateContext
     from nerve.sources.runner import SourceRunner
 
 logger = logging.getLogger(__name__)
@@ -88,6 +101,47 @@ _PAUSED_MISS = "run skipped: came due while the machine was paused (catchup: fal
 # by hand (the Cron page's "Run now", the trigger API), or for source records
 # that a hosted source delivered (see CronService.on_source_delivered).
 RunOrigin = Literal["schedule", "catchup", "manual", "delivery"]
+
+# The window of the run counts that GET /api/cron/jobs gives for each job.
+_STATS_DAYS = 7
+
+# How much of a failed run's error goes into the notice that a job fails.
+_FAILURE_NOTICE_LINES = 5
+_FAILURE_NOTICE_CHARS = 600
+
+# Why the Cron page cannot switch a job on or off. ``{file}`` is the name of
+# the job's YAML file. The keys are CronTogglePlan problems (setup_writer).
+_TOGGLE_LOCKDOWN = "This instance is in lockdown. Change the job in the config repository."
+_TOGGLE_SYNCED = "This workspace syncs from a config repository. Change the job there."
+_TOGGLE_PROBLEMS = {
+    CRON_FILE_HAND_EDITED: "Nerve could not change only the enabled line of this "
+                           "job in {file}. Change it in the file.",
+    CRON_FILE_READ_ONLY: "Nerve cannot write {file}.",
+    CRON_JOB_MISSING: "{file} does not have this job.",
+}
+_TOGGLE_UNREADABLE = "Nerve cannot read {file}."
+
+
+class CronToggleRefused(Exception):
+    """A job cannot be switched on or off through the API. The message says why."""
+
+
+def _toggle_refusal(problem: str, file: Path) -> str:
+    return _TOGGLE_PROBLEMS.get(problem, _TOGGLE_UNREADABLE).format(file=file.name)
+
+
+def _failure_notice_body(error: str | None) -> str:
+    """The first lines of a run's error, as a code block."""
+    lines = (error or "").strip().splitlines()[:_FAILURE_NOTICE_LINES]
+    head = "\n".join(lines)[:_FAILURE_NOTICE_CHARS].replace("```", "'''")
+    return f"```\n{head}\n```" if head else "The run ended with an error."
+
+
+def _with_gate_notes(prompt: str, notes: list[str]) -> str:
+    """*prompt* with the text that the job's gates gave the run after it."""
+    if not notes:
+        return prompt
+    return prompt.rstrip() + "\n\n---\n\n" + "\n\n".join(note.strip() for note in notes)
 
 
 class _RunsInFlight:
@@ -438,6 +492,86 @@ class _ClockCheckingScheduler(AsyncIOScheduler):
         return super()._process_jobs()
 
 
+def _values_of_this_release(job: CronJob) -> dict[str, str]:
+    """What this release ships for the keys of a built-in job's entry that
+    still hold what an earlier release shipped: its schedule, its description
+    and its inline prompt, each on its own
+    (:func:`nerve.setup_writer.current_values_of_shipped_job`). Empty for an
+    entry that holds none, and for a job that is not built in.
+
+    The inline prompt of a job with a ``prompt_file`` counts: it is what runs
+    when the file cannot be read. That of a workflow job is never sent, and
+    is left out."""
+    from nerve.setup_writer import current_values_of_shipped_job
+
+    values: dict[str, object] = {"schedule": job.schedule, "description": job.description}
+    if job.workflow is None:
+        values["prompt"] = job.prompt
+    return current_values_of_shipped_job(job.id, **values)
+
+
+def _keys_said(current: dict[str, str]) -> tuple[str, str]:
+    """The keys of an entry as a log line names them, and the verb that
+    follows them."""
+    return ", ".join(sorted(current)), "is" if len(current) == 1 else "are"
+
+
+def bring_up_to_date(jobs: list[CronJob]) -> None:
+    """A built-in job whose entry in ``system.yaml`` still holds what an
+    earlier release shipped is loaded as this release ships it. Each of the
+    schedule, the description and the inline prompt is replaced when it is
+    one that an earlier release shipped; an edited one is left alone. The
+    file is not changed here.
+
+    The scheduler also writes this release's values into the file, at its
+    start and once a reload is applied (:meth:`CronService._rewrite_system_file`).
+    This is what gives the jobs their values where the file stays as it is:
+    one that was edited, one under lockdown or in a workspace that is a git
+    repository, and a load that writes nothing (a manual run, the listing of
+    ``nerve cron``).
+
+    ``jobs`` are the ``system.yaml`` entries that run. An entry in
+    ``jobs.yaml`` is the operator's and is never brought up to date
+    (:func:`_say_what_jobs_yaml_keeps`), so a schedule that an earlier
+    release shipped can still be chosen there.
+    """
+    for job in jobs:
+        current = _values_of_this_release(job)
+        if not current:
+            continue
+        for key, value in current.items():
+            setattr(job, key, value)
+        keys, verb = _keys_said(current)
+        logger.info(
+            "Cron job %s: its %s in system.yaml %s what an earlier release shipped; "
+            "the job is loaded with this release's%s",
+            job.id, keys, verb,
+            f" (schedule {job.schedule})" if "schedule" in current else "",
+        )
+
+
+def _say_what_jobs_yaml_keeps(jobs: list[CronJob]) -> None:
+    """An entry in ``jobs.yaml`` is loaded as written. One that still holds
+    the prompt an earlier release shipped for a built-in job is most likely
+    the copy that an install from before ``system.yaml`` has there, and
+    nothing but this line tells the operator that the job is not the one this
+    release ships. An entry with a prompt of its own says nothing: a schedule
+    that an earlier release shipped is then the operator's choice.
+
+    ``jobs`` are the ``jobs.yaml`` entries that are loaded."""
+    for job in jobs:
+        current = _values_of_this_release(job)
+        if "prompt" not in current:
+            continue
+        keys, verb = _keys_said(current)
+        logger.info(
+            "Cron job %s: its %s in jobs.yaml %s what an earlier release shipped; "
+            "the job is loaded as that file has it%s",
+            job.id, keys, verb,
+            f" (this release ships schedule {current['schedule']})" if "schedule" in current else "",
+        )
+
+
 def _reword_for_loom(jobs: list[CronJob]) -> None:
     """Under the Loom memory backend, a built-in job that still carries the
     prompt Nerve wrote for memU (a ``system.yaml`` from before the switch)
@@ -490,6 +624,9 @@ class CronService:
         self._clock_sample: tuple[float, float] | None = None
         self._clock_watch_task: asyncio.Task | None = None
         self._catchup_due: dict[str, int] = {}
+        # When each of those jobs came due during the pause: the time its
+        # catch-up asks the gates about.
+        self._catchup_due_at: dict[str, datetime] = {}
         self._catchup_lock = asyncio.Lock()
         self._catchup_tasks: set[asyncio.Task] = set()
         # Called whenever the schedule may have changed (see
@@ -525,6 +662,10 @@ class CronService:
         from nerve.cron.gate_plugins import load_gate_plugins
 
         load_gate_plugins(self.config.cron.gate_plugins_dir)
+
+        # Before the load, so that the jobs come from a file that shows what
+        # runs.
+        self._rewrite_system_file()
 
         # Load job definitions from both files
         self._jobs = self._load_merged_jobs()
@@ -681,10 +822,17 @@ class CronService:
         carry out raises with the running schedule exactly as it was. That
         covers the gate registry too; see :meth:`_reload_locked`.
 
+        Once the reload is applied, ``system.yaml`` gets this release's values
+        where it holds what an earlier release shipped for a built-in job
+        (:meth:`_rewrite_system_file`): the load has given the jobs those
+        values already. A reload that is refused changes no file.
+
         Serialized via a lock so concurrent callers (sync loop, HTTP routes)
         can't interleave scheduler mutations. The two properties are
         separate: the lock keeps two reloads from overlapping, and the planning
-        pass keeps a single failing one from applying half of itself.
+        pass keeps a single failing one from applying half of itself. The
+        write to ``system.yaml`` is under the lock too, which keeps it apart
+        from the one of :meth:`set_job_enabled`.
 
         Returns a summary dict: ``{"added", "removed", "updated", "enabled",
         "rejected"}``. ``updated`` is every enabled job that already had a
@@ -696,6 +844,9 @@ class CronService:
         """
         async with self._reload_lock:
             summary = await self._reload_locked()
+            # After the load, which raises when the reload is refused: such
+            # a reload must leave the files as they are.
+            self._rewrite_system_file()
         self._schedule_changed()
         return summary
 
@@ -1224,6 +1375,7 @@ class CronService:
                 if catchup:
                     if self._may_start(sched_job.id, "catchup"):
                         due.append(sched_job.id)
+                        self._catchup_due_at[sched_job.id] = missed
                 elif func == self._run_job_wrapper:
                     asyncio.create_task(
                         self._record_paused_run(sched_job.args[0], missed),
@@ -1265,10 +1417,10 @@ class CronService:
         forecast that raises lets the run through, as a check that raises does.
         """
         if job.gates:
-            from nerve.cron.gates import GateContext, forecast_gates
+            from nerve.cron.gates import forecast_gates
 
             decision = await forecast_gates(
-                job.gates, GateContext(job_id=job.id, db=self.db), due,
+                job.gates, self._gate_context(job, as_of=due), due,
             )
             if not decision.should_run:
                 logger.debug(
@@ -1290,7 +1442,9 @@ class CronService:
         then looks each job up as the scheduler holds it now: a job removed
         meanwhile does not run, one redefined runs as it is now, and one that
         has started a run since it was queued is not caught up on top of it.
-        Gates, ``lock`` and the run log apply as for a scheduled run.
+        Gates, ``lock`` and the run log apply as for a scheduled run; the
+        gates are asked about the time the job came due (see
+        :attr:`nerve.cron.gates.GateContext.as_of`).
         """
         await asyncio.sleep(_CATCHUP_SETTLE_SECONDS)
         async with self._catchup_lock:
@@ -1310,6 +1464,7 @@ class CronService:
     def _catch_up_run(self, job_id: str, started: int) -> Awaitable[None] | None:
         """The catch-up run of *job_id*, which had started *started* runs when
         it was queued — or ``None`` when it is gone or has run since."""
+        came_due = self._catchup_due_at.pop(job_id, None)
         sched_job = self.scheduler.get_job(job_id)
         if sched_job is None:
             logger.info("Not catching up %s: it is no longer scheduled", job_id)
@@ -1318,7 +1473,9 @@ class CronService:
             logger.info("Not catching up %s: it has run since the pause", job_id)
             return None
         if sched_job.func == self._run_job_wrapper:
-            return self._run_job_wrapper(sched_job.args[0], origin="catchup")
+            return self._run_job_wrapper(
+                sched_job.args[0], origin="catchup", as_of=came_due,
+            )
         if sched_job.func == self._run_source_wrapper:
             return self._run_source_wrapper(sched_job.args[0], origin="catchup")
         if sched_job.func == self._cleanup_expired:
@@ -1394,7 +1551,10 @@ class CronService:
         )
         async with self._catchup_lock:
             await asyncio.gather(
-                *(self._run_job_wrapper(job, origin="catchup") for job in overdue),
+                *(
+                    self._run_job_wrapper(job, origin="catchup", as_of=now)
+                    for job in overdue
+                ),
             )
 
     @staticmethod
@@ -1483,7 +1643,7 @@ class CronService:
         session_id = f"cron:{job_id}:{new_cron_run_id()}"
         await self.engine.sessions.get_or_create(
             session_id, title=f"Cron: {job_id}", source="cron",
-            actor=self.db.system_actor, cause=cause,
+            actor=self.db.system_actor, cause=cause, origin=cron_origin(job_id),
         )
         await self.db.set_channel_session(self._channel_key(job_id), session_id)
         logger.info(
@@ -1641,11 +1801,43 @@ class CronService:
 
     # -- End persistent session generations ----------------------------------
 
+    def _rewrite_system_file(self) -> None:
+        """``system.yaml`` gets this release's values where it holds what an
+        earlier release shipped for a built-in job, so that the file shows
+        what runs (:func:`nerve.setup_writer.rewrite_superseded_cron_values`):
+        at the start before the jobs are loaded, at a reload once it is
+        applied.
+
+        Not under lockdown, and not in a workspace that is a git repository:
+        there the file changes through the repository
+        (:meth:`_in_git_workspace`). The jobs of a file that is left as it is
+        have this release's values all the same (:func:`bring_up_to_date`).
+        Whatever goes wrong here, the scheduler goes on: a failure to write a
+        file must not cost the schedule.
+        """
+        system_file = self.config.cron.system_file
+        try:
+            path = Path(system_file)
+            if self.config.lockdown or self._in_git_workspace(path):
+                return
+            written = rewrite_superseded_cron_values(path)
+        except Exception as e:  # noqa: BLE001 — never at the cost of the schedule
+            logger.warning(
+                "Cron: could not write this release's values into %s: %s", system_file, e,
+            )
+            return
+        for job_id, keys in written.items():
+            logger.info(
+                "Cron job %s: its %s in system.yaml %s what an earlier release shipped; "
+                "the file now has this release's",
+                job_id, ", ".join(keys), "was" if len(keys) == 1 else "were",
+            )
+
     def _load_merged_jobs(self, strict: bool = False) -> list[CronJob]:
         """Load and merge jobs from system.yaml and jobs.yaml.
 
         System jobs come from system.yaml (managed by `nerve init`).
-        User jobs come from jobs.yaml (user-defined, never touched by Nerve).
+        User jobs come from jobs.yaml (user-defined; Nerve only switches a job there).
         If a user job has the same ID as a system job, the user version wins.
 
         Jobs holding an id the daemon reserves for itself are dropped here, so
@@ -1657,8 +1849,18 @@ class CronService:
         system_file = self.config.cron.system_file
         jobs_file = self.config.cron.jobs_file
 
-        system_jobs = load_jobs(system_file, strict=strict)
         user_jobs = load_jobs(jobs_file, strict=strict)
+        # A built-in job has the gates it ships with unless its entry states
+        # some. A job that jobs.yaml replaces is not loaded for running, so
+        # it is given none (and no line in the log says it runs under them).
+        replaced = {j.id for j in user_jobs}
+        backend = self.config.memory.backend
+        system_jobs = load_jobs(
+            system_file, strict=strict,
+            default_run_if=lambda job_id: (
+                [] if job_id in replaced else default_run_if(job_id, backend)
+            ),
+        )
 
         if not system_jobs and user_jobs:
             # Backward compat: old install with everything in jobs.yaml
@@ -1669,6 +1871,7 @@ class CronService:
             # Tag all as user-sourced (no system file yet)
             for j in user_jobs:
                 j.metadata["_source"] = "user"
+            _say_what_jobs_yaml_keeps(user_jobs)
             if self.config.memory.backend == "loom":
                 # The built-in jobs live here too on such an install.
                 _reword_for_loom(user_jobs)
@@ -1678,10 +1881,15 @@ class CronService:
         # Tag sources for display in CLI
         for j in system_jobs:
             j.metadata["_source"] = "system"
-        if self.config.memory.backend == "loom":
-            _reword_for_loom(system_jobs)
         for j in user_jobs:
             j.metadata["_source"] = "user"
+        merged = merge_jobs(system_jobs, user_jobs)
+        # The system.yaml entries that run, and before the Loom wording: that
+        # is told by the memU prompt this release ships.
+        bring_up_to_date([j for j in merged if j.metadata["_source"] == "system"])
+        if self.config.memory.backend == "loom":
+            _reword_for_loom(system_jobs)
+        _say_what_jobs_yaml_keeps([j for j in merged if j.metadata["_source"] == "user"])
 
         # Merge: user jobs override system jobs with same ID
         system_ids = {j.id for j in system_jobs}
@@ -1692,18 +1900,20 @@ class CronService:
                     job.id,
                 )
 
-        kept, self._rejected_job_ids = _drop_reserved(merge_jobs(system_jobs, user_jobs))
+        kept, self._rejected_job_ids = _drop_reserved(merged)
         return kept
 
     async def _run_job_wrapper(
         self, job: CronJob, attribution: Attribution | None = None,
-        *, origin: RunOrigin = "schedule",
+        *, origin: RunOrigin = "schedule", as_of: datetime | None = None,
     ) -> None:
         """Wrapper to run a cron job with logging and optional lock.
 
         ``attribution`` names who started the run and its cause. ``None``
         (the scheduler's call) is the instance's own run. ``origin`` says how
-        the run was started; the scheduler's call is ``"schedule"``. A run that
+        the run was started; the scheduler's call is ``"schedule"``. ``as_of``
+        is the time a catch-up asks the gates about (see
+        :meth:`_run_job_inner`). A run that
         would overlap another run of the job is skipped as :meth:`_may_start`
         says; otherwise it counts as in progress until it ends.
 
@@ -1718,9 +1928,13 @@ class CronService:
                 if job.lock:
                     lock = self._job_locks.setdefault(job.id, asyncio.Lock())
                     async with lock:
-                        await self._run_job_inner(job, attribution)
+                        await self._run_job_inner(
+                            job, attribution, origin=origin, as_of=as_of,
+                        )
                 else:
-                    await self._run_job_inner(job, attribution)
+                    await self._run_job_inner(
+                        job, attribution, origin=origin, as_of=as_of,
+                    )
         finally:
             self._schedule_changed()
 
@@ -1757,26 +1971,59 @@ class CronService:
             return False
         return True
 
+    def _gate_context(self, job: CronJob, as_of: datetime | None = None) -> GateContext:
+        """What the gates of *job* are checked and forecast with: the loaded
+        jobs, and the time the check is made for when that is not now."""
+        from nerve.cron.gates import GateContext
+
+        return GateContext(
+            job_id=job.id, db=self.db, jobs={j.id: j for j in self._jobs},
+            as_of=as_of,
+        )
+
     async def _run_job_inner(
         self, job: CronJob, attribution: Attribution | None = None,
+        *, origin: RunOrigin = "schedule", as_of: datetime | None = None,
     ) -> None:
-        """Inner implementation of job execution."""
+        """Inner implementation of job execution.
+
+        ``origin`` says how the run was started: a manual run is checked only
+        by the gates that hold for one. ``as_of`` is the time a catch-up asks
+        the gates about: when the run it stands in for came due.
+        """
         # The engine is draining before a shutdown. Write no log row, so the
         # catch-up after the restart sees the job as overdue.
         if not self.engine.accepting_turns:
             logger.info("Skipping cron job %s: Nerve is draining", job.id)
             return
 
-        # Pre-check: skip if any configured run gate is unsatisfied.
-        if job.gates:
-            from nerve.cron.gates import GateContext, evaluate_gates
+        # Pre-check: skip if any configured run gate is unsatisfied. A run
+        # that a person starts is checked only by the gates that say whether
+        # the job has anything to act on (CronGate.checked_on_manual_runs).
+        gate_notes: list[str] = []
+        decision = None
 
-            decision = await evaluate_gates(
-                job.gates, GateContext(job_id=job.id, db=self.db),
-            )
+        def record_run() -> None:
+            """Tell the gates that the run starts (see GateDecision.record_run)."""
+            if decision is not None:
+                decision.record_run(job.id)
+
+        gates = job.gates
+        if origin == "manual":
+            gates = [gate for gate in gates if gate.checked_on_manual_runs]
+        if gates:
+            from nerve.cron.gates import evaluate_gates
+
+            ctx = self._gate_context(job, as_of)
+            ctx.mcp_servers = self.engine.current_mcp_servers
+            ctx.mcp_managed = self.engine.managed_mcp
+            decision = await evaluate_gates(gates, ctx)
+            if decision.notices:
+                await self._send_gate_notices(job.id, decision.notices)
             if not decision.should_run:
                 logger.info("Skipping cron job %s: %s", job.id, decision.reason)
                 return
+            gate_notes = decision.notes
 
         attribution = attribution or self._own_attribution()
         log_id = await self.db.log_cron_start(job.id, attribution=attribution)
@@ -1786,7 +2033,9 @@ class CronService:
             # Workflow-run job: launch a budget-capped workflow run and
             # return — the run executes and notifies on its own, so none
             # of the cron session machinery below applies.
-            await self._start_workflow_run(job, log_id, attribution)
+            await self._start_workflow_run(
+                job, log_id, attribution, gate_notes=gate_notes, on_start=record_run,
+            )
             return
 
         session_id: str | None = None
@@ -1845,9 +2094,10 @@ class CronService:
                             "Continue executing these instructions each time."
                         )
 
+                record_run()
                 result = await self.engine.run_persistent_cron(
                     job_id=job.id,
-                    prompt=prompt,
+                    prompt=_with_gate_notes(prompt, gate_notes),
                     model=model,
                     session_id=session_id,
                     cache_ttl=job.cache_ttl,
@@ -1855,9 +2105,10 @@ class CronService:
                     cause=attribution.caused_by_actor_id,
                 )
             else:
+                record_run()
                 result = await self.engine.run_cron(
                     job_id=job.id,
-                    prompt=base_prompt,
+                    prompt=_with_gate_notes(base_prompt, gate_notes),
                     model=model,
                     run_id=run_id,
                     cache_ttl=job.cache_ttl,
@@ -1876,21 +2127,98 @@ class CronService:
                     log_id, "success", output=output, session_id=session_id,
                 )
                 logger.info("Cron job %s completed (%d chars)", job.id, len(response))
+                await self._send_health_notice(job.id, log_id, "success", session_id=session_id)
             else:
                 error = result.outcome.describe()
                 await self.db.log_cron_finish(
                     log_id, "error", output=output, error=error, session_id=session_id,
                 )
                 logger.warning("Cron job %s ended with %s", job.id, error)
+                await self._send_health_notice(
+                    job.id, log_id, "error", error=error, session_id=session_id,
+                )
 
         except Exception as e:
             logger.error("Cron job %s failed: %s", job.id, e, exc_info=True)
             await self.db.log_cron_finish(
                 log_id, "error", error=str(e), session_id=session_id,
             )
+            await self._send_health_notice(
+                job.id, log_id, "error", error=str(e), session_id=session_id,
+            )
+
+    async def _send_gate_notices(self, job_id: str, notices: list) -> None:
+        """Send the notices that the job's gates give about their own checks
+        (:class:`nerve.cron.gates.GateNotice`).
+
+        "Cron job <id>: run gate check failed" (high) carries the gate's
+        message, "Cron job <id>: run gate check works again" (low) follows
+        it. A gate gives each notice once, so this sends each one. A gate
+        check is not a run: no run log row is written, and the job's run
+        status and its run notices (:meth:`_send_health_notice`) stay as the
+        runs left them. A notice that fails is logged.
+        """
+        for notice in notices:
+            if notice.failed:
+                logger.warning("Cron job %s: %s", job_id, notice.message)
+            else:
+                logger.info("Cron job %s: %s", job_id, notice.message)
+            service = self.notification_service
+            if service is None:
+                continue
+            title = f"Cron job {job_id}: run gate check " + (
+                "failed" if notice.failed else "works again"
+            )
+            try:
+                await service.send_notification(
+                    session_id="system", title=title,
+                    body=_failure_notice_body(notice.message) if notice.failed else notice.message,
+                    priority="high" if notice.failed else "low",
+                    metadata={"cron_job_id": job_id},
+                )
+            except Exception:
+                logger.warning("Gate notice for cron job %s failed", job_id, exc_info=True)
+
+    async def _send_health_notice(
+        self, job_id: str, log_id: int, status: str, *,
+        error: str | None = None, session_id: str | None = None,
+    ) -> None:
+        """Tell the user when an agent job starts to fail, and when it works again.
+
+        The job's previous run decides: the latest run with a result that
+        started before this one (``get_previous_cron_status``). An error after
+        a success, or as the job's first recorded run, sends "Cron job <id>
+        failed" (high); more errors send nothing. The first success after an error sends
+        "Cron job <id> works again" (low). The notice goes through the
+        notification service, so silences and channels apply, and it names the
+        run's session. A notice that fails is logged and does not change the run.
+
+        Agent jobs only: a workflow run and a source runner send their own.
+        """
+        service = self.notification_service
+        if service is None:
+            return
+        try:
+            previous = await self.db.get_previous_cron_status(log_id)
+            if status == "error" and previous != "error":
+                title = f"Cron job {job_id} failed"
+                body, priority = _failure_notice_body(error), "high"
+            elif status == "success" and previous == "error":
+                title, body, priority = f"Cron job {job_id} works again", "", "low"
+            else:
+                return
+            await service.send_notification(
+                session_id=session_id or "system", title=title, body=body,
+                priority=priority,
+                metadata={"cron_job_id": job_id, "cron_log_id": log_id},
+            )
+        except Exception:
+            logger.warning("Health notice for cron job %s failed", job_id, exc_info=True)
 
     async def _start_workflow_run(
         self, job: CronJob, log_id: int, attribution: Attribution | None = None,
+        *, gate_notes: list[str] | None = None,
+        on_start: Callable[[], None] | None = None,
     ) -> None:
         """Start the workflow run a job declares instead of a prompt.
 
@@ -1902,7 +2230,10 @@ class CronService:
         ``attribution`` is the run log's (see :meth:`_run_job_wrapper`).
         The cron service starts the run, so its actor is the system actor;
         its cause is the cause of the cron run, and the run's turns run for
-        it.
+        it. ``gate_notes`` is the text of the job's gates for the run
+        (:attr:`nerve.cron.gates.GateDecision.notes`), added to the prompt.
+        ``on_start`` is called once the run is started, and not for a launch
+        that is refused or that ``lock`` skips.
         """
         from nerve.workflows import get_workflow_run_service
 
@@ -1946,7 +2277,7 @@ class CronService:
             run = await service.start_run(
                 engine_kind=w["engine"],
                 spec={
-                    "prompt": w["prompt"],
+                    "prompt": _with_gate_notes(w["prompt"], gate_notes or []),
                     "model": w.get("model") or "",
                     "effort": w.get("effort") or "",
                     "cwd": w.get("cwd") or "",
@@ -1958,6 +2289,8 @@ class CronService:
                 # run that a person started is the system's, for that person.
                 attribution=attribution_for(self.db.system_actor, cause_id),
             )
+            if on_start is not None:
+                on_start()
             session_id = run.get("session_id") or ("workflow:" + run["id"])
             await self.db.set_cron_log_session(log_id, session_id)
             budget = float(run.get("budget_usd") or w["budget_usd"])
@@ -2013,7 +2346,10 @@ class CronService:
                 summary += f", error: {result.error}"
 
             status = "success" if result.error is None else "error"
-            await self.db.log_cron_finish(log_id, status, output=summary[:2000])
+            await self.db.log_cron_finish(
+                log_id, status, output=summary[:2000],
+                records=result.records_ingested + result.records_dropped,
+            )
             await self.db.log_source_run(
                 source=runner.source.source_name,
                 records_fetched=result.records_ingested,
@@ -2030,18 +2366,21 @@ class CronService:
             )
 
     async def _cleanup_expired(self) -> None:
-        """Clean up expired source messages, cursors, cron logs, and observations."""
+        """Clean up expired source messages, cursors, cron logs, observations,
+        and old reply routes."""
         try:
             msg_count = await self.db.cleanup_expired_messages()
             cursor_count = await self.db.cleanup_expired_consumer_cursors()
             cron_log_count = await self.db.cleanup_old_cron_logs(days=14)
             obs_count = await self.db.cleanup_expired_channel_observations()
-            if msg_count or cursor_count or cron_log_count or obs_count:
+            route_count = await self.db.cleanup_old_reply_routes()
+            if msg_count or cursor_count or cron_log_count or obs_count or route_count:
                 logger.info(
                     "Cleanup: %d expired messages, %d expired consumer cursors, "
                     "%d cron logs older than 14 days, %d expired channel "
-                    "observations",
+                    "observations, %d reply routes older than %d days",
                     msg_count, cursor_count, cron_log_count, obs_count,
+                    route_count, REPLY_ROUTE_RETENTION_DAYS,
                 )
         except Exception as e:
             logger.error("Cleanup failed: %s", e, exc_info=True)
@@ -2122,7 +2461,12 @@ class CronService:
 
         def _done(t: asyncio.Task) -> None:
             exc = t.exception() if not t.cancelled() else None
-            if exc is not None:
+            if isinstance(exc, SessionClosedError):
+                logger.info(
+                    "Wakeup %s dropped: session %s is %s",
+                    wakeup["id"], session_id, exc.reason,
+                )
+            elif exc is not None:
                 logger.error(
                     "Wakeup %s run failed for session %s: %s",
                     wakeup["id"], session_id, exc,
@@ -2331,7 +2675,20 @@ class CronService:
         }
 
     async def list_jobs(self) -> list[dict]:
-        """List all registered jobs (cron + sources) with their next run times."""
+        """List all registered jobs (cron + sources) with their next run times.
+
+        Each job also has its kind (``agent``, ``workflow`` or ``source``), its
+        latest run and its run counts of the last 7 days.
+        """
+        last_runs = await self.db.get_last_cron_runs()
+        stats = await self.db.get_cron_job_stats(_STATS_DAYS)
+
+        def health(job_id: str) -> dict:
+            return {
+                "last_run": last_runs.get(job_id),
+                "stats_7d": stats.get(job_id, {"runs": 0, "success": 0, "error": 0, "missed": 0}),
+            }
+
         result = []
         for job in self._jobs:
             sched_job = self.scheduler.get_job(job.id)
@@ -2343,6 +2700,7 @@ class CronService:
             result.append({
                 "id": job.id,
                 "type": "cron",
+                "kind": "workflow" if job.workflow is not None else "agent",
                 "source": job.metadata.get("_source", "unknown"),
                 "schedule": job.schedule,
                 "description": job.description,
@@ -2353,6 +2711,7 @@ class CronService:
                 "gates": [gate.describe() for gate in job.gates],
                 "next_run": next_run.isoformat() if next_run else None,
                 "last_session_id": last_session_id,
+                **health(job.id),
             })
 
         # Include source runners
@@ -2369,14 +2728,82 @@ class CronService:
             result.append({
                 "id": runner.job_id,
                 "type": "source",
+                "kind": "source",
                 "schedule": schedule,
                 "description": f"Source: {source_name} (ingestor)",
                 "enabled": True,
                 "next_run": next_run.isoformat() if next_run else None,
                 "last_session_id": None,
+                **health(runner.job_id),
             })
 
         return result
+
+    def _job_file(self, job: CronJob) -> Path:
+        """The YAML file that the job comes from: a job in ``jobs.yaml``
+        replaces the ``system.yaml`` job with its id."""
+        if job.metadata.get("_source") == "user":
+            return Path(self.config.cron.jobs_file)
+        return Path(self.config.cron.system_file)
+
+    def _synced_from_config_repo(self, path: Path) -> bool:
+        """Whether workspace sync owns ``path``: it is in the reviewed surface
+        of a workspace that syncs. Sync refuses to merge while a file there has
+        a local change, so a change must go through the config repository."""
+        if not self.config.workspace_sync.enabled:
+            return False
+        return any(
+            _is_within(path, reviewed)
+            for reviewed in workspace_reviewed_paths(self.config.workspace)
+        )
+
+    def _in_git_workspace(self, path: Path) -> bool:
+        """Whether ``path`` is in the reviewed surface of a workspace that is
+        a git repository. A file there changes through the repository:
+        workspace sync and ``nerve config sync`` refuse to merge while it has
+        a local change."""
+        from nerve.sync_service import is_git_repo
+
+        workspace = self.config.workspace
+        return is_git_repo(workspace) and any(
+            _is_within(path, reviewed) for reviewed in workspace_reviewed_paths(workspace)
+        )
+
+    async def set_job_enabled(self, job_id: str, enabled: bool) -> dict:
+        """Write ``enabled`` into the job's YAML file, then reload.
+
+        Only the job's ``enabled:`` line changes
+        (:func:`nerve.setup_writer.plan_cron_job_enabled`). Raises ValueError
+        for an unknown job, CronToggleRefused under lockdown, for a file that
+        workspace sync owns or for a file in which that one line cannot be
+        changed, and the reload's ConfigError. A reload
+        that fails leaves the schedule as it was, so the file gets its old
+        text back before the error goes on. Returns the reload summary, as
+        :meth:`reload` does.
+        """
+        async with self._reload_lock:
+            job = next((j for j in self._jobs if j.id == job_id), None)
+            if job is None:
+                raise ValueError(f"Unknown cron job: {job_id}")
+            if self.config.lockdown:
+                raise CronToggleRefused(_TOGGLE_LOCKDOWN)
+            path = self._job_file(job)
+            if self._synced_from_config_repo(path):
+                raise CronToggleRefused(_TOGGLE_SYNCED)
+            plan = plan_cron_job_enabled(path, job_id, enabled)
+            if not plan.ok:
+                raise CronToggleRefused(_toggle_refusal(plan.problem, path))
+            original = path.read_text(encoding="utf-8")
+            plan.publish()
+            try:
+                summary = await self._reload_locked()
+            except BaseException:
+                if plan.changes_anything:
+                    publish_text(path, original)
+                raise
+        self._schedule_changed()
+        logger.info("Cron job %s %s", job_id, "enabled" if enabled else "disabled")
+        return summary
 
     # -- What runs next --------------------------------------------------------
 
@@ -2395,7 +2822,11 @@ class CronService:
         (``ScheduleWakeup``) does so inside its turn, which has no reference to
         this service; tasks created, moved or edited from a chat turn, the
         web UI or the API change what a ``tasks`` gate forecasts without any
-        call here; and a message a channel buffers for its
+        call here; a turn, or a message stored in a session, changes what an
+        ``agent_activity`` gate forecasts without one; a plan that is proposed
+        or decided changes what a ``plans_in_review`` gate forecasts without
+        one; and a message a channel
+        buffers for its
         ``<channel>:observed`` drain makes that drain count (see
         :meth:`_undrained`) without one. Those count from the next
         :meth:`next_scheduled` on, so a caller that keeps the answer should
@@ -2557,13 +2988,13 @@ class CronService:
         are tried, asking only the gates with a forecast of their own: a
         gate's real check never runs more than once per forecast.
         """
-        from nerve.cron.gates import GateContext, forecast_gates, has_own_forecast
+        from nerve.cron.gates import forecast_gates, has_own_forecast
 
         job = sched_job.args[0]  # the job the scheduler will run, gates included
         next_run = getattr(sched_job, "next_run_time", None)
         if next_run is None or not job.gates:
             return _Forecast("cron", next_run, runs=True, runs_at=next_run)
-        ctx = GateContext(job_id=job.id, db=self.db)
+        ctx = self._gate_context(job)
         steady = [gate for gate in job.gates if not has_own_forecast(gate)]
         timed = [gate for gate in job.gates if has_own_forecast(gate)]
         decision = await forecast_gates(steady, ctx, next_run)

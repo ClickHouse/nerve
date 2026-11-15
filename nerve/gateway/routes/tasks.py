@@ -252,12 +252,15 @@ async def create_task(req: TaskCreateRequest, actor: Actor = Depends(require_aut
                 "message": message,
                 "reason": reason,
                 "duplicates": outcome.get("duplicates", []),
+                "related": outcome.get("related", []),
             },
         )
 
     deps = get_deps()
     task = await deps.db.get_task(outcome["task_id"])
-    return {"task": task, "message": message}
+    # Look-alikes that did not block the create, for a client that wants to
+    # offer "link" or "merge" next to the new card.
+    return {"task": task, "message": message, "related": outcome.get("related", [])}
 
 
 @router.post("/api/tasks/{task_id}/move")
@@ -306,6 +309,15 @@ async def _move_task(task_id: str, req: TaskMoveRequest, actor: Actor) -> dict:
 
     await emit_task_event(moved, "moved")
     return {"task": moved}
+
+
+@router.get("/api/sessions/{session_id}/tasks")
+async def list_session_tasks(session_id: str):
+    """The tasks that a session created, implemented or updated."""
+    deps = get_deps()
+    if not await deps.db.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"tasks": await deps.db.list_session_tasks(session_id)}
 
 
 @router.get("/api/tasks/{task_id}/events")
@@ -378,7 +390,8 @@ async def get_task(task_id: str):
     content = ""
     if file_path.exists():
         content = await asyncio.to_thread(file_path.read_text, encoding="utf-8")
-    return {**dict(task), "content": content}
+    sessions = await deps.db.list_task_sessions(task_id)
+    return {**dict(task), "content": content, "sessions": sessions}
 
 
 @router.patch("/api/tasks/{task_id}")

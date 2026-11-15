@@ -441,6 +441,10 @@ async def test_a_rest_run_records_the_person_and_its_session_is_for_them(install
     assert install.tool_call_causes[session_id] == [alice]
     assert await install.session_cause_of(session_id) == alice
     assert (await install.db.get_session(session_id))["created_by_actor_id"] == system
+    assert (await install.db.get_session(session_id))["trigger"] == "workflow"
+    assert json.loads((await install.db.get_session(session_id))["origin_detail"]) == {
+        "workflow_run": run_id,
+    }
     # The session's created event: the system actor, for Alice.
     assert await install.created_event(session_id) == (system, alice)
     # The live update and the journal carry the IDs.

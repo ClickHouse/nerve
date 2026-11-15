@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { ChevronRight, ChevronDown, Lightbulb, ListTodo, FileText, Check, X, MessageSquare, Loader2, ExternalLink, RefreshCw } from '../../ui/icons';
 import { useNavigate } from 'react-router-dom';
 import { MarkdownContent } from '../MarkdownContent';
+import { PlanReviewModal } from '../../Plans/PlanReviewModal';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { Badge, Button, type BadgeTone } from '../../ui';
 
@@ -68,6 +69,8 @@ const TOOL_CONFIG: Record<PlanTool, { label: string; icon: typeof Lightbulb; run
 
 export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
   const [expanded, setExpanded] = useState(false);
+  // The plan that the review dialog shows, when it is open.
+  const [reviewPlanId, setReviewPlanId] = useState<string | null>(null);
   const navigate = useNavigate();
   const isRunning = block.status === 'running';
 
@@ -122,6 +125,7 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
     : 'text-hue-amber';
 
   return (
+    <>
     <div className="my-1.5 border border-hue-amber/20 rounded-lg bg-surface overflow-hidden">
       <button
         onClick={() => setExpanded(!expanded)}
@@ -155,7 +159,7 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
                   variant="ghost"
                   size="xs"
                   className="mt-2 -ml-2"
-                  onClick={(e) => { e.stopPropagation(); navigate(`/plans/${proposedPlanId}`); }}
+                  onClick={(e) => { e.stopPropagation(); setReviewPlanId(proposedPlanId); }}
                 >
                   <ExternalLink size={10} className="text-hue-amber" /> Review plan
                 </Button>
@@ -281,7 +285,7 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
                   variant="ghost"
                   size="xs"
                   className="mt-2 -ml-2"
-                  onClick={(e) => { e.stopPropagation(); navigate(`/plans/${updatedNewPlanId}`); }}
+                  onClick={(e) => { e.stopPropagation(); setReviewPlanId(updatedNewPlanId); }}
                 >
                   <ExternalLink size={10} className="text-hue-amber" /> Review v{updatedNewVersion}
                 </Button>
@@ -326,5 +330,7 @@ export function PlanToolBlock({ block }: { block: ToolCallBlockData }) {
         </div>
       )}
     </div>
+    {reviewPlanId && <PlanReviewModal planId={reviewPlanId} onClose={() => setReviewPlanId(null)} />}
+    </>
   );
 }

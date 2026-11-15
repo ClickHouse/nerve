@@ -814,6 +814,9 @@ class _RecordingEngine:
     async def run(self, **kwargs):
         self.runs.append(kwargs)
 
+    async def reopen_archived(self, *_args, **_kwargs):
+        return False
+
     def register_task(self, *_args, **_kwargs):
         return None
 

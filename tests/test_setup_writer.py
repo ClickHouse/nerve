@@ -37,6 +37,9 @@ import pytest
 import yaml
 
 from nerve import setup_writer
+from nerve.agent.tools.schemas import (
+    PLAN_LIST_SCHEMA, PLAN_PROPOSE_SCHEMA, TASK_CREATE_SCHEMA, TASK_LIST_SCHEMA,
+)
 from nerve.bootstrap import SetupChoices, SetupWizard, run_non_interactive
 from nerve.config import DEFAULT_MODEL, NerveConfig
 from nerve.onboarding_catalog import WorkSelection
@@ -1176,6 +1179,311 @@ class TestMachineMaintenance:
         assert setup_writer._cron_prompt(job, "loom") == job["prompt"]
 
 
+class TestMaintenanceJobsWaitForActivity:
+    """The four maintenance jobs look after the agent's own work, so each has
+    a default gate on the agent's activity: an agent that has done nothing
+    since the job's last run is not started, or woken, for it. The scheduler
+    gives the gate to an entry that states none (``default_run_if``)."""
+
+    OTHERS = {
+        "memory-maintenance": ["skill-extractor", "skill-reviser", "machine-maintenance"],
+        "skill-extractor": ["memory-maintenance", "skill-reviser", "machine-maintenance"],
+        "skill-reviser": ["memory-maintenance", "skill-extractor", "machine-maintenance"],
+        "machine-maintenance": ["memory-maintenance", "skill-extractor", "skill-reviser"],
+    }
+
+    @staticmethod
+    def _jobs(mode: str, backend: str) -> dict[str, dict]:
+        choices = SetupChoices(
+            mode=mode, enabled_crons=list(setup_writer.DEFAULT_CRONS[mode]), memory_backend=backend,
+        )
+        return {job["id"]: job for job in setup_writer.build_cron_jobs(choices)}
+
+    @staticmethod
+    def _activity(job_id: str, backend: str) -> dict:
+        """The job's default gate on the agent's activity."""
+        (spec,) = [
+            spec for spec in setup_writer.default_run_if(job_id, backend)
+            if spec["type"] == "agent_activity"
+        ]
+        return spec
+
+    @pytest.mark.parametrize("backend", ["memu", "loom"])
+    def test_each_job_has_a_default_gate_on_activity(self, backend: str) -> None:
+        for job_id, others in self.OTHERS.items():
+            assert self._activity(job_id, backend)["ignore_jobs"] == others
+            # It is the one default gate of each of them but skill-extractor.
+            gates = 2 if job_id == "skill-extractor" else 1
+            assert len(setup_writer.default_run_if(job_id, backend)) == gates
+
+    def test_no_maintenance_job_counts_as_work_for_another(self) -> None:
+        """A run of one is no reason for a memory check, a search for new
+        skills, a review of the skills or a cleanup of the machine. Every
+        maintenance job has the gate, and each leaves the other three out."""
+        assert set(setup_writer.MAINTENANCE_CRON_IDS) == {
+            "memory-maintenance", "skill-extractor", "skill-reviser", "machine-maintenance",
+        }
+        known = {c["id"] for c in (*setup_writer.CORE_CRONS, *setup_writer.PRODUCTIVITY_CRONS)}
+        assert set(setup_writer.MAINTENANCE_CRON_IDS) <= known
+        for backend in ("memu", "loom"):
+            gated = {job_id for job_id in known if setup_writer.default_run_if(job_id, backend)}
+            assert gated == set(setup_writer.MAINTENANCE_CRON_IDS)
+            for job_id in gated:
+                spec = self._activity(job_id, backend)
+                assert set(spec["ignore_jobs"]) == set(setup_writer.MAINTENANCE_CRON_IDS) - {job_id}
+
+    def test_only_memus_memory_job_looks_back_before_its_last_run(self) -> None:
+        """memU's prompt reviews the records of the day before the run, so
+        what the agent did shortly before a run is reviewed by the next one.
+        Loom's checks the namespace as it is."""
+        (memu,) = setup_writer.default_run_if("memory-maintenance", "memu")
+        (loom,) = setup_writer.default_run_if("memory-maintenance", "loom")
+        assert memu["overlap_hours"] == 24
+        assert "overlap_hours" not in loom
+        prompt = self._jobs("worker", "memu")["memory-maintenance"]["prompt"]
+        assert "memory_records_by_date(date=yesterday" in prompt
+        # No other job looks back. skill-reviser checks the skills as they
+        # are. machine-maintenance removes only what is old: what was too new
+        # for a run waits for the first run after the agent works again.
+        for backend in ("memu", "loom"):
+            for job_id in ("skill-extractor", "skill-reviser", "machine-maintenance"):
+                assert "overlap_hours" not in self._activity(job_id, backend)
+        # Giving Loom its gate leaves memU's as it is.
+        assert setup_writer.default_run_if("memory-maintenance", "memu") == [memu]
+
+    def test_the_gates_build_and_validate(self) -> None:
+        from nerve.cron.gates import AgentActivityGate, PlansInReviewGate, build_gates
+
+        kinds = {
+            "memory-maintenance": [AgentActivityGate],
+            "skill-extractor": [PlansInReviewGate, AgentActivityGate],
+            "skill-reviser": [AgentActivityGate],
+            "machine-maintenance": [AgentActivityGate],
+        }
+        for backend in ("memu", "loom"):
+            for job_id in self.OTHERS:
+                specs = setup_writer.default_run_if(job_id, backend)
+                gates = build_gates(specs)
+                assert [type(gate) for gate in gates] == kinds[job_id]
+                for spec, gate in zip(specs, gates, strict=True):
+                    assert set(spec) - {"type"} <= gate.spec_keys
+
+    @pytest.mark.parametrize("mode", ["personal", "worker"])
+    @pytest.mark.parametrize("backend", ["memu", "loom"])
+    def test_system_yaml_does_not_state_them(self, mode: str, backend: str) -> None:
+        """Nothing writes the file again when Nerve is updated, so a gate
+        written there would never change again; and a Nerve from before the
+        gate type would refuse the jobs of a file that names it."""
+        jobs = self._jobs(mode, backend)
+        for job_id in self.OTHERS:
+            assert "run_if" not in jobs[job_id]
+        written = yaml.safe_dump(list(jobs.values()))
+        assert "agent_activity" not in written and "plans_in_review" not in written
+        # The gates that are older than this rule stay in the file.
+        assert jobs["task-planner"]["run_if"] == [{"type": "tasks", "status": "pending"}]
+
+    @pytest.mark.parametrize("backend", ["memu", "loom"])
+    def test_no_other_job_has_a_default_gate(self, backend: str) -> None:
+        """inbox-processor and task-planner wait for what they act on, with
+        the gates that the file states."""
+        for other in ("inbox-processor", "task-planner", "mine"):
+            assert setup_writer.default_run_if(other, backend) == []
+
+    def test_a_default_gate_is_the_callers_copy(self) -> None:
+        self._activity("skill-extractor", "memu")["ignore_jobs"].append("x")
+        assert "x" not in self._activity("skill-extractor", "memu")["ignore_jobs"]
+        setup_writer.default_run_if("skill-extractor", "memu")[0]["below"] = 99
+        assert setup_writer.default_run_if("skill-extractor", "memu")[0]["below"] == 3
+
+
+class TestSkillExtractorWaitsForItsProposalsToBeDecided:
+    """The job proposes a skill a run, for a person to decide on. While three
+    of its proposals wait for that decision, it does not add a fourth: a
+    default gate, given by the scheduler like the one on activity."""
+
+    @pytest.mark.parametrize("backend", ["memu", "loom"])
+    def test_the_job_stops_at_three_proposals_in_review(self, backend: str) -> None:
+        review, activity = setup_writer.default_run_if("skill-extractor", backend)
+
+        assert review == {"type": "plans_in_review", "below": 3}
+        # After it, so that a job that waits for both names this one: the
+        # reason that a person can do something about.
+        assert activity["type"] == "agent_activity"
+
+
+def test_task_planner_asks_for_a_plan_summary() -> None:
+    """The plan page shows the summary under the plan title. The planner
+    prompt asks for it with the parameter names of the tool schema."""
+    job = next(c for c in setup_writer.PRODUCTIVITY_CRONS if c["id"] == "task-planner")
+    call = re.search(r"plan_propose\(([^)]*)\)", job["prompt"])
+    params = [p.strip() for p in call.group(1).split(",")]
+    assert "summary" in params
+    assert set(params) <= set(PLAN_PROPOSE_SCHEMA["properties"])
+
+
+class TestSkillExtractor:
+    """The job that proposes new skills: once a day, one proposal a run, and
+    a plan that is a plan."""
+
+    @staticmethod
+    def _job() -> dict:
+        return next(c for c in setup_writer.PRODUCTIVITY_CRONS if c["id"] == "skill-extractor")
+
+    def test_runs_once_a_day_with_memory_maintenance(self) -> None:
+        """A machine that is parked while idle is woken once for both."""
+        job = self._job()
+        (memory,) = [c for c in setup_writer.CORE_CRONS if c["id"] == "memory-maintenance"]
+        assert job["schedule"] == memory["schedule"]
+        assert setup_writer.describe_cron(job["schedule"]) == "daily at 05:00"
+        assert job["description"].startswith("Once a day, ")
+
+    def test_proposes_at_most_one_skill_a_run(self) -> None:
+        prompt = self._job()["prompt"]
+        assert "at most one skill per run" in prompt
+        assert "max 2" not in prompt and "For each candidate" not in prompt
+
+    def test_proposes_nothing_that_was_proposed_before(self) -> None:
+        """It runs every day over much the same activity. The job tags the
+        task of each proposal, and the task stays whatever became of the plan
+        (declined, or approved and closed with no skill), so the tag lists
+        them all; ``plan_list`` adds the plans proposed some other way. That
+        the tools do this is in tests/test_plan_review_flow.py."""
+        prompt = self._job()["prompt"]
+        assert "Check the existing skills (skill_list) and what was proposed before" in prompt
+        # task_list stops at 100 tasks unless it is given a limit.
+        assert (
+            'task_list with status "all", tag "skill-proposal" and limit 1000 lists the tasks of earlier proposals'
+        ) in prompt
+        assert 'plan_list shows the plans in review and, with status "declined", the declined ones' in prompt
+        assert (
+            "Propose nothing that a skill already covers or that was proposed before, "
+            "whether the proposal waits for review, was declined, or ended with no skill"
+        ) in prompt
+        assert {"status", "tag", "limit"} <= set(TASK_LIST_SCHEMA["properties"])
+        assert TASK_LIST_SCHEMA["properties"]["limit"]["default"] == 100
+        assert "'all' for everything" in TASK_LIST_SCHEMA["properties"]["status"]["description"]
+        assert "empty for pending+implementing" in PLAN_LIST_SCHEMA["properties"]["status"]["description"]
+        assert "'declined'" in PLAN_LIST_SCHEMA["properties"]["status"]["description"]
+
+    def test_says_what_is_not_enough_for_a_proposal(self) -> None:
+        assert "If no workflow occurred more than once, say so and stop." in self._job()["prompt"]
+
+    def test_the_plan_is_a_plan_not_the_skill(self) -> None:
+        """The person who reviews it judges whether the skill is worth having;
+        the session that implements the approved plan writes the skill."""
+        prompt = self._job()["prompt"]
+        for part in ("- What: ", "- Evidence: ", "- Direction: "):
+            assert part in prompt
+        assert "Do not write the skill in the plan: no SKILL.md" in prompt
+        assert "the full SKILL.md" not in prompt
+
+    def test_proposes_the_plan_as_a_skill_proposal(self) -> None:
+        """The approval of a ``skill-create`` plan briefs a session to write a
+        skill; a plan of no stated type is a generic one, briefed to follow
+        its steps. The task's source says where the task came from."""
+        prompt = self._job()["prompt"]
+        create = re.search(r"task_create\(([^)]*)\)", prompt)
+        params = [p.strip() for p in create.group(1).split(",")]
+        assert 'source="skill-extractor"' in params and 'tags="skill-proposal"' in params
+        assert {p.partition("=")[0] for p in params} <= set(TASK_CREATE_SCHEMA["properties"])
+        assert "where the content says in a few sentences what the skill is for" in prompt
+        call = re.search(r"plan_propose\(([^)]*)\)", prompt)
+        params = [p.strip() for p in call.group(1).split(",")]
+        assert 'plan_type="skill-create"' in params and "summary" in params
+        assert {p.partition("=")[0] for p in params} <= set(PLAN_PROPOSE_SCHEMA["properties"])
+
+    def test_names_no_memory_tool(self) -> None:
+        """The wording is the same under every memory backend."""
+        job = self._job()
+        memory_tools = {
+            "memory_recall", "memory_expand_category", "session_context", "conversation_history",
+            "memory_records_by_date", "memorize", "memory_update", "memory_delete", "category_update",
+        }
+        assert not {name for name in memory_tools if re.search(rf"\b{name}\b", job["prompt"])}
+        assert setup_writer._cron_prompt(job, "loom") == job["prompt"]
+
+
+class TestValuesOfEarlierReleases:
+    """Nothing writes system.yaml again when Nerve is updated. An entry there
+    that still holds what an earlier release wrote is loaded as this release
+    ships the job. The files those releases wrote are loaded in
+    tests/test_cron.py."""
+
+    BEFORE = {
+        "schedule": "0 */12 * * *",
+        "description": (
+            "Every 12 hours, analyzes your recent activity to detect repeated workflows. "
+            "When it finds a pattern, it proposes a reusable skill for your review."
+        ),
+    }
+    STEPS = (
+        "You are a skill extraction agent. Identify repeated workflows from recent activity and propose new skills.\n\n"
+        "1. Recall recent behavior patterns and events\n"
+        "2. Check existing skills to avoid duplicates\n"
+        "3. Look for repeated tool sequences, domain knowledge clusters, and reusable patterns\n"
+        "4. For each candidate (max 2): create a task and propose a plan with the full SKILL.md\n\n"
+        "If no candidates found, say so and stop.\n"
+    )
+    PROMPTS = {
+        "the first": STEPS + "After proposing, use `notify` to alert the user.\n",
+        "the one with the plan notice": STEPS + (
+            "plan_propose notifies the user with a link to each plan. "
+            "Do not send another notification about it.\n"
+        ),
+    }
+
+    @staticmethod
+    def _now() -> dict:
+        job = next(c for c in setup_writer.PRODUCTIVITY_CRONS if c["id"] == "skill-extractor")
+        return {key: job[key] for key in ("schedule", "description", "prompt")}
+
+    @pytest.mark.parametrize("wording", list(PROMPTS))
+    def test_every_form_the_job_shipped_in_becomes_the_current_one(self, wording: str) -> None:
+        current = setup_writer.current_values_of_shipped_job(
+            "skill-extractor", prompt=self.PROMPTS[wording], **self.BEFORE,
+        )
+        assert current == self._now()
+
+    def test_a_text_is_compared_without_the_space_around_it(self) -> None:
+        """YAML keeps the text, not always its last line break."""
+        prompt = self.PROMPTS["the first"].rstrip("\n")
+        current = setup_writer.current_values_of_shipped_job("skill-extractor", prompt=prompt)
+        assert current == {"prompt": self._now()["prompt"]}
+
+    def test_each_key_stands_alone(self) -> None:
+        """An edited schedule is kept, and the prompt beside it still moves."""
+        current = setup_writer.current_values_of_shipped_job(
+            "skill-extractor", schedule="0 9 * * 1", description=self.BEFORE["description"],
+            prompt=self.PROMPTS["the first"],
+        )
+        assert current == {key: self._now()[key] for key in ("description", "prompt")}
+
+    def test_edited_and_current_values_are_left_alone(self) -> None:
+        assert setup_writer.current_values_of_shipped_job(
+            "skill-extractor", schedule="0 9 * * 1", description="Mine.", prompt="Find what I do twice.",
+        ) == {}
+        assert setup_writer.current_values_of_shipped_job("skill-extractor", **self._now()) == {}
+
+    def test_a_value_that_is_not_text_is_not_one_an_earlier_release_wrote(self) -> None:
+        """A bare ``description:`` in the file is None, and a number can stand
+        where the schedule should. Neither stops the jobs from loading."""
+        assert setup_writer.current_values_of_shipped_job(
+            "skill-extractor", schedule=43200, description=None, prompt=None,
+        ) == {}
+        assert setup_writer.current_values_of_shipped_job(
+            "skill-extractor", schedule=self.BEFORE["schedule"], description=None,
+        ) == {"schedule": self._now()["schedule"]}
+
+    def test_only_the_job_that_changed_is_touched(self) -> None:
+        for job in (*setup_writer.CORE_CRONS, *setup_writer.PRODUCTIVITY_CRONS):
+            if job["id"] == "skill-extractor":
+                continue
+            assert setup_writer.current_values_of_shipped_job(
+                job["id"], schedule=self.BEFORE["schedule"], prompt=self.PROMPTS["the first"],
+            ) == {}
+        assert setup_writer.current_values_of_shipped_job("mine", **self.BEFORE) == {}
+
+
 class TestHostedGitHubKeepsTheEventsSourceOff:
     """The events source reads with gh on this machine, which a GitHub that
     the channel gateway polls does not set up. Wherever the writers derive it
@@ -1234,3 +1542,159 @@ class TestHostedGitHubKeepsTheEventsSourceOff:
         assert portable["sync"]["github_events"] == {"enabled": False}
         polled = choices_from_config(NerveConfig.from_dict({"workspace": str(tmp_path / "ws")}))
         assert polled.github_mode == "poll"
+
+
+# ---------------------------------------------------------------------------
+# What earlier releases shipped, and the file that still holds it
+# ---------------------------------------------------------------------------
+
+# A worker's system.yaml from before plan_propose began to notify: the first
+# prompts of the skill extractor, the skill reviser and the task planner.
+_FIRST_PROMPTS = Path(__file__).parent / "fixtures" / "cron" / "system-with-the-first-skill-extractor-prompt.yaml"
+# The planner's second prompt: it listed the pending tasks only, and did not
+# ask for a summary of the plan yet.
+_PLANNER_SECOND_PROMPT = (
+    "You are a proactive planning agent. Your job is to find a task worth working on "
+    "and produce an implementation plan.\n\n"
+    "1. Use task_list(status=\"pending\") to browse the tasks that are ready for work\n"
+    "2. Use plan_list to see which tasks already have plans — skip those\n"
+    "3. Pick ONE task and explore the relevant codebase\n"
+    "4. Call plan_propose(task_id, content) with your plan\n\n"
+    "If all tasks have plans or none are actionable, say so and stop.\n\n"
+    "plan_propose notifies the user with a link to the plan. "
+    "Do not send another notification about it.\n"
+)
+
+
+def _shipped_job(job_id: str) -> dict:
+    return next(
+        c for c in (*setup_writer.CORE_CRONS, *setup_writer.PRODUCTIVITY_CRONS) if c["id"] == job_id
+    )
+
+
+def _jobs_of(path: Path) -> dict[str, dict]:
+    return {job["id"]: job for job in yaml.safe_load(path.read_text(encoding="utf-8"))["jobs"]}
+
+
+class TestEarlierPromptsOfTheReviserAndThePlanner:
+    """Both told the agent to send a notification of its own after a
+    proposal; the planner also listed every open task, and later proposed
+    without a summary."""
+
+    @pytest.mark.parametrize("job_id", ["skill-reviser", "task-planner"])
+    def test_the_first_prompt_becomes_the_current_one(self, job_id: str) -> None:
+        earlier, current = _jobs_of(_FIRST_PROMPTS)[job_id]["prompt"], _shipped_job(job_id)["prompt"]
+        assert earlier != current and "use `notify`" in earlier
+        assert setup_writer.current_values_of_shipped_job(job_id, prompt=earlier) == {"prompt": current}
+
+    def test_the_planners_second_prompt_becomes_the_current_one(self) -> None:
+        assert setup_writer.current_values_of_shipped_job(
+            "task-planner", prompt=_PLANNER_SECOND_PROMPT,
+        ) == {"prompt": _shipped_job("task-planner")["prompt"]}
+
+    @pytest.mark.parametrize("job_id", ["skill-reviser", "task-planner"])
+    def test_an_edited_prompt_stays(self, job_id: str) -> None:
+        assert setup_writer.current_values_of_shipped_job(job_id, prompt="Mine.") == {}
+
+
+class TestAChangedBuiltInJobNeedsItsEarlierValue:
+    """An install keeps the schedule, the description and the prompt that its
+    system.yaml was written with, unless the earlier value is in the table of
+    what earlier releases shipped. This fails when one of them changes."""
+
+    # sha256 of the stripped value, 16 hex digits: schedule, description, prompt.
+    DIGESTS = {
+        "memory-maintenance": ("d9fdb8516ce96c9a", "fce1b81d52afe073", "6479ac370490bf6f"),
+        "inbox-processor": ("03cec5ca8e0d93cd", "07583577c07d5d08", "234047458c87472d"),
+        "task-planner": ("641898abf01533c3", "f22747568bf437d6", "13ca985f3570e5c6"),
+        "skill-extractor": ("d9fdb8516ce96c9a", "c152e537f9adad0a", "510639628dc38b0e"),
+        "skill-reviser": ("5077355b926bf223", "c1d65b8f9fdfbedb", "128074108934930e"),
+        "machine-maintenance": ("f8db192e9cd0c5b1", "622965a85b99afd0", "319624dd7797863e"),
+    }
+
+    def test_the_catalogue_is_what_the_digests_record(self) -> None:
+        import hashlib
+
+        current = {
+            cron["id"]: tuple(
+                hashlib.sha256(str(cron[key]).strip().encode()).hexdigest()[:16]
+                for key in ("schedule", "description", "prompt")
+            )
+            for cron in (*setup_writer.CORE_CRONS, *setup_writer.PRODUCTIVITY_CRONS)
+        }
+        assert current == self.DIGESTS, (
+            "The schedule, the description or the prompt of a built-in job changed. "
+            "Add the value it replaces to setup_writer._SUPERSEDED_CRON_VALUES first, "
+            "so that installs that have it get the new one; then update the digest here."
+        )
+
+
+class TestRewritingAnEarlierSystemFile:
+    """The file gets this release's values where it holds what an earlier
+    release wrote, when writing it again loses nothing."""
+
+    WRITTEN = {
+        "skill-extractor": ("description", "prompt", "schedule"),
+        "skill-reviser": ("prompt",),
+        "task-planner": ("prompt",),
+    }
+
+    @staticmethod
+    def _file(tmp_path: Path) -> Path:
+        path = tmp_path / "system.yaml"
+        path.write_bytes(_FIRST_PROMPTS.read_bytes())
+        return path
+
+    def test_the_file_gets_this_releases_values(self, tmp_path: Path) -> None:
+        path = self._file(tmp_path)
+        before = _jobs_of(path)
+        opening = setup_writer.leading_comment(path.read_text(encoding="utf-8"))
+
+        assert setup_writer.rewrite_superseded_cron_values(path) == self.WRITTEN
+
+        after = _jobs_of(path)
+        assert opening and path.read_text(encoding="utf-8").startswith(opening)
+        assert list(after) == list(before)
+        for job_id, entry in before.items():
+            assert list(after[job_id]) == list(entry)
+            for key, value in entry.items():
+                if key in self.WRITTEN.get(job_id, ()):
+                    assert after[job_id][key] == _shipped_job(job_id)[key] != value
+                else:
+                    assert after[job_id][key] == value
+        # Nothing is left to replace.
+        written = path.read_bytes()
+        assert setup_writer.rewrite_superseded_cron_values(path) == {}
+        assert path.read_bytes() == written
+
+    def test_an_edited_value_stays(self, tmp_path: Path) -> None:
+        path = self._file(tmp_path)
+        text = path.read_text(encoding="utf-8")
+        assert "  schedule: 0 */12 * * *\n" in text
+        path.write_text(text.replace("  schedule: 0 */12 * * *\n", "  schedule: 0 9 * * 1\n"), encoding="utf-8")
+
+        assert setup_writer.rewrite_superseded_cron_values(path)["skill-extractor"] == ("description", "prompt")
+        assert _jobs_of(path)["skill-extractor"]["schedule"] == "0 9 * * 1"
+
+    def test_a_file_that_was_edited_by_hand_is_left_as_it_is(self, tmp_path: Path) -> None:
+        """Dumped again, it would lose the comment."""
+        path = self._file(tmp_path)
+        text = path.read_text(encoding="utf-8")
+        assert "- id: skill-extractor\n" in text
+        path.write_text(text.replace("- id: skill-extractor\n", "# Mine.\n- id: skill-extractor\n"), encoding="utf-8")
+        before = path.read_bytes()
+
+        assert setup_writer.rewrite_superseded_cron_values(path) == {}
+        assert path.read_bytes() == before
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root may write a read-only file")
+    def test_a_read_only_file_is_left_as_it_is(self, tmp_path: Path) -> None:
+        path = self._file(tmp_path)
+        path.chmod(0o444)
+        before = path.read_bytes()
+
+        assert setup_writer.rewrite_superseded_cron_values(path) == {}
+        assert path.read_bytes() == before
+
+    def test_a_missing_file_has_nothing_to_write(self, tmp_path: Path) -> None:
+        assert setup_writer.rewrite_superseded_cron_values(tmp_path / "system.yaml") == {}

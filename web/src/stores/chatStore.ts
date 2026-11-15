@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { api } from '../api/client';
+import { api, type SessionTask } from '../api/client';
 import { setBeforeReenter } from '../api/hosted';
 import { ws } from '../api/websocket';
 import type { WSMessage } from '../api/websocket';
@@ -8,21 +8,24 @@ import type { InteractionAgentRef } from '../types/agents';
 import { hydrateMessage } from '../utils/hydrateMessage';
 import { isMobileViewport } from '../hooks/useMediaQuery';
 import { randomUUID } from '../utils/uuid';
+import { errorDetail } from './accountStore';
 import { bindSender, selfActorId } from './authStore';
 import { useAgentStore } from './agentStore';
 // Helpers
 import { MAX_COMPLETED_TABS } from './helpers/blockHelpers';
 import { extractTodosFromMessages, extractCCTasksFromMessages } from './helpers/bufferReplay';
+import { mergeCatchUp, sameRows } from './helpers/catchUp';
 import { loadDrafts, persistDraft, removeDraft, pruneDrafts } from './helpers/draftStorage';
 import { loadReads, persistRead, removeRead, loadBaseline } from './helpers/readStorage';
 import { removeSeen } from './helpers/agentSeen';
 import { loadVirtualSession, persistVirtualSession, clearVirtualSession } from './helpers/virtualSessionStorage';
 import { onViewerStorageChange } from './helpers/viewerStorage';
+import { registerSessionsLoader, reloadSessionsSoon } from './helpers/sessionsReload';
 // Handlers
 import { discardStreamDeltas, flushStreamDeltas, handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
-import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate, exitStreaming } from './handlers/sessionHandlers';
+import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionNotFound, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate, emptyChatView, exitStreaming } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleWorkflowProgress } from './handlers/panelHandlers';
-import { handleInteraction, handleInteractionResolved, handlePlanSummary, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired } from './handlers/auxiliaryHandlers';
+import { handleInteraction, handleInteractionResolved, handlePlanSummary, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired, handleNotificationDismissed } from './handlers/auxiliaryHandlers';
 
 export interface TodoItem {
   content: string;
@@ -90,6 +93,71 @@ const QUOTE_DEFAULTS: Record<QuoteAction, string> = {
 
 let _quoteId = 0;
 
+/** The catch-up read that runs (see `catchUp`); `again` asks it to read again. */
+let catchUpRun: { session: string; again: boolean } | null = null;
+
+type LastUsage = NonNullable<Awaited<ReturnType<typeof api.getMessages>>['last_usage']>;
+
+/** The context bar's numbers from the usage of the last stored turn. */
+function contextUsageFrom(usage: LastUsage): NonNullable<ChatState['contextUsage']> {
+  const cc = usage.cache_creation as
+    | { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }
+    | undefined;
+  return {
+    input_tokens: usage.input_tokens || 0,
+    output_tokens: usage.output_tokens || 0,
+    cache_creation_input_tokens: usage.cache_creation_input_tokens || 0,
+    cache_read_input_tokens: usage.cache_read_input_tokens || 0,
+    cache_creation_5m_input_tokens: cc?.ephemeral_5m_input_tokens ?? 0,
+    cache_creation_1h_input_tokens: cc?.ephemeral_1h_input_tokens ?? 0,
+    max_context_tokens: usage.max_context_tokens || 200_000,
+    num_turns: usage.num_turns || 1,
+    context_tokens: usage.context_tokens,
+  };
+}
+
+/**
+ * Model id → Daybreak program, for the Codex models that the signed-in Codex
+ * account may run with Daybreak (GET /api/models). Empty when the account
+ * has none: the composer then shows no Daybreak switch.
+ */
+export function daybreakPrograms(options: ChatState['backendOptions']): Record<string, string> {
+  return options.find(o => o.id === 'codex')?.daybreak_programs ?? {};
+}
+
+/** Whether the signed-in Codex account may run this model with Daybreak. */
+export function offersDaybreak(options: ChatState['backendOptions'], model: string | null | undefined): boolean {
+  return !!model && typeof daybreakPrograms(options)[model] === 'string';
+}
+
+/**
+ * Whether a new chat on this backend and model is created with Daybreak: the
+ * person turned it on, and that model still offers it.
+ */
+function newChatHasDaybreak(state: ChatState, backend: string | null, model: string | null | undefined): boolean {
+  const effBackend = backend ?? state.backendDefault ?? 'claude';
+  return state.newChatDaybreak && effBackend === 'codex'
+    && offersDaybreak(state.backendOptions, model ?? state.modelDefaults[effBackend]);
+}
+
+/** Patch one session row where the composer finds it: the feed or a lazy group. */
+function patchSessionRow(state: ChatState, id: string, patch: Partial<Session>): Partial<ChatState> {
+  const apply = (rows: Session[]) => rows.map(s => (s.id === id ? { ...s, ...patch } : s));
+  return {
+    sessions: apply(state.sessions),
+    archivedSessions: state.archivedSessions && apply(state.archivedSessions),
+    systemSessions: state.systemSessions && apply(state.systemSessions),
+  };
+}
+
+/** A line that Nerve writes into the open chat itself. Not stored: gone on reload. */
+function chatNote(state: ChatState, sessionId: string, text: string): Partial<ChatState> {
+  if (state.activeSession !== sessionId) return {};
+  return {
+    messages: [...state.messages, { role: 'assistant' as const, blocks: [{ type: 'text', content: text }] }],
+  };
+}
+
 // WS event types that mutate the *active* chat view — stream tokens, panels,
 // interaction prompts, file changes. They're dropped when their session_id
 // doesn't match the active session: a reconnect binds the socket to the
@@ -100,7 +168,7 @@ let _quoteId = 0;
 // session_agents, …) stay unguarded so background sessions keep updating their row.
 const VIEW_SCOPED_EVENTS = new Set<WSMessage['type']>([
   'thinking', 'token', 'tool_use', 'tool_result', 'tool_output', 'done', 'stopped', 'error',
-  'wakeup', 'auto_turn', 'model_changed', 'session_status', 'plan_update', 'plan_summary',
+  'wakeup', 'auto_turn', 'model_changed', 'session_status', 'session_not_found', 'plan_update', 'plan_summary',
   'backend_status', 'workflow_progress',
   'agent_update', 'agent_event', 'queue_update', 'interaction',
   'interaction_resolved', 'file_changed',
@@ -108,6 +176,16 @@ const VIEW_SCOPED_EVENTS = new Set<WSMessage['type']>([
 
 /** The singleton Agents roster tab. */
 export const AGENTS_PANEL_ID = 'agents-panel';
+/** The singleton tab of the open session's tasks. */
+export const TASKS_PANEL_ID = 'tasks-panel';
+/**
+ * The `task_updated` events that can change the session's task list. The
+ * event does not name the session that made the change, so each of these
+ * reads the list again.
+ */
+const SESSION_TASK_EVENTS = new Set(['created', 'updated', 'moved', 'done']);
+/** The newest read of the session's tasks; an older answer is dropped. */
+let sessionTasksRequest = 0;
 /** The tab of one agent's transcript. */
 export const agentTabId = (agentId: string) => `agent:${agentId}`;
 /** At most this many agent tabs stay open (the least recently focused closes). */
@@ -129,6 +207,11 @@ interface ChatState {
   // Not-yet-persisted "new chat" from the + button. Materializes in the API
   // on the first sent message; rendered pinned at the top of the sidebar.
   virtualSession: Session | null;
+  // The session on screen when the server does not have it: a link that
+  // outlived its session, or a session deleted in another tab. The chat page
+  // says so in place of the messages and the composer. It counts only while
+  // it equals activeSession, and a session_status for it clears it.
+  missingSession: string | null;
   // Per-session unsent input text, keyed by session id (incl. the virtual one).
   drafts: Record<string, string>;
   // Per-session "last seen" moment (ms) + a one-time baseline. A session is
@@ -152,8 +235,11 @@ interface ChatState {
     cache_creation_1h_input_tokens?: number;
     max_context_tokens: number;
     num_turns: number;
+    // Measured after a compact, or the input of the last model call (Codex);
+    // the bar shows it instead of its estimate.
+    context_tokens?: number;
   } | null;
-  backendStatus: { subtype: string; data: Record<string, unknown> } | null;
+  backendStatus:{ subtype: string; data: Record<string, unknown> } | null;
   // TodoWrite panel state (legacy Claude Code todos)
   currentTodos: TodoItem[];
   // Claude Code 2.1+ task panel state (TaskCreate / TaskUpdate / TaskList)
@@ -208,6 +294,10 @@ interface ChatState {
   // Modified files tracking
   modifiedFiles: ModifiedFileSummary[];
   modifiedFilesCount: number;
+  /** The tasks that the open session created, implemented or updated; null until they load. */
+  sessionTasks: SessionTask[] | null;
+  /** The last read of `sessionTasks` failed. */
+  sessionTasksFailed: boolean;
 
   // Feed pagination: the server sends one page of conversations (page size = sessions.sidebar_page_size, 0 = unlimited) plus every starred session.
   sessionsHasMore: boolean;
@@ -236,8 +326,9 @@ interface ChatState {
   // current pick (null = use the server default).
   availableModels: { id: string; provider: string; backend: string }[];
   modelDefaults: Record<string, string>;
-  // Agent backends for the new-chat selector (claude / codex).
-  backendOptions: { id: string; label: string; model: string; models?: string[]; available?: boolean; reason?: string }[];
+  // Agent backends for the new-chat selector (claude / codex). Codex also
+  // lists the Daybreak program of each model that has one (daybreakPrograms).
+  backendOptions: { id: string; label: string; model: string; models?: string[]; available?: boolean; reason?: string; daybreak_programs?: Record<string, string> }[];
   backendDefault: string | null;
   // Backend picked for the CURRENT virtual (unsent) chat; null = default.
   // Bound at session materialization (ensureRealSession) and reset after.
@@ -252,9 +343,25 @@ interface ChatState {
   // session row (sessions[].model) and is changed via setSessionModel, so
   // a pick in one chat never affects any other chat.
   newChatModels: Record<string, string | null>;
+  // The Daybreak switch of the CURRENT virtual (unsent) Codex chat. Bound at
+  // session materialization (like newChatBackend) and reset after. A real
+  // session's switch lives on its row (sessions[].codex_daybreak) and is
+  // changed via setSessionDaybreak.
+  newChatDaybreak: boolean;
 
   loadSessions: () => Promise<void>;
   switchSession: (id: string) => Promise<void>;
+  /**
+   * Load the messages and the tasks of the open chat again after the socket
+   * was down, so that the view shows what happened meanwhile. A call while
+   * one runs makes that one read the messages again.
+   */
+  catchUp: () => Promise<void>;
+  /**
+   * Open the unsent new chat, or make one. When the session on screen does
+   * not exist (`missingSession`), what was typed for it moves into the new
+   * chat, after the text that the unsent chat holds already.
+   */
   createSession: () => Promise<void>;
   /**
    * Materialize the virtual "new chat" in the API and adopt the server-minted
@@ -287,6 +394,8 @@ interface ChatState {
   /** Star an archived session: unarchive + star in one PATCH (hook fires). */
   starArchivedSession: (id: string) => Promise<void>;
   renameSession: (id: string, title: string) => Promise<void>;
+  /** Retitle a session from what it did (the server's title model). */
+  regenerateSessionTitle: (id: string) => Promise<void>;
   toggleStar: (id: string) => Promise<void>;
   /** Re-parent a session (drag onto another) or clear it (null → top-level). */
   setSessionParent: (childId: string, parentId: string | null) => Promise<void>;
@@ -295,12 +404,21 @@ interface ChatState {
   /** Trigger the sidebar to mount + focus the search input (used by Cmd+K). */
   requestSearchFocus: () => void;
   /** Send a message. While a turn streams it is queued on the server (the
-   *  agent store tracks it as a pending send) instead of opening a turn. */
+   *  agent store tracks it as a pending send) instead of opening a turn.
+   *  Resolves to the id of the session that got the message, or null when
+   *  the message could not be sent. */
   sendMessage: (
     content: string,
     fileIds?: string[],
     imageBlocks?: Array<{ url: string; filename: string; media_type: string }>,
-  ) => Promise<void>;
+  ) => Promise<string | null>;
+  /** Start a new chat with the default backend and model, open it and send
+   *  `content` to it. The unsent new chat, its draft and its settings stay
+   *  as they are. `retryId` is the chat that an earlier call created but
+   *  could not send to: while it is in the session list, the call sends to
+   *  it and creates no chat. Resolves to the chat and whether the message
+   *  was sent, or null when the chat could not be created. */
+  startChat: (content: string, retryId?: string) => Promise<{ sessionId: string; sent: boolean } | null>;
   /** Defer a composed prompt into a new session without running the model
    *  now. ``delay`` is one of "30m" | "1h" | "24h" | "none". */
   runLater: (
@@ -318,6 +436,11 @@ interface ChatState {
   setNewChatModel: (backend: string, model: string | null) => void;
   /** Re-point ONE existing session's model (persisted on its row). */
   setSessionModel: (sessionId: string, model: string) => Promise<void>;
+  /** Turn Daybreak on or off for the current virtual chat. */
+  setNewChatDaybreak: (enabled: boolean) => void;
+  /** Turn Daybreak on or off for ONE existing Codex session. The row takes
+   *  the server's answer; a refusal shows as an error line in the chat. */
+  setSessionDaybreak: (sessionId: string, enabled: boolean) => Promise<void>;
   /** Stop the turn (agents keep running where the runtime allows it). */
   stopSession: () => Promise<void>;
   handleWSMessage: (msg: WSMessage) => void;
@@ -361,6 +484,10 @@ interface ChatState {
   // Modified files
   fetchModifiedFiles: (sessionId: string) => Promise<void>;
   openFilesPanel: () => void;
+  // Tasks of the session
+  fetchSessionTasks: (sessionId: string) => Promise<void>;
+  /** Open (or focus) the Tasks tab, and read the list again. */
+  openTasksPanel: () => void;
 }
 
 /**
@@ -401,6 +528,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   // so losing the id on reload orphaned the draft. Restoring it brings the
   // half-written prompt back with the chat.
   virtualSession: restoreVirtualSession(),
+  missingSession: null,
   // Rehydrated from localStorage so unsent composer text survives a reload.
   drafts: loadDrafts(),
   // Read/unread tracking (client-only): per-session last-seen stamps + the
@@ -430,6 +558,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   mobileSidebarOpen: false,
   modifiedFiles: [],
   modifiedFilesCount: 0,
+  sessionTasks: null,
+  sessionTasksFailed: false,
   searchQuery: '',
   searchResults: null,
   searchLoading: false,
@@ -441,6 +571,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   newChatBackend: null,
   newChatReviewLoop: null,
   newChatModels: {},
+  newChatDaybreak: false,
 
   addQuote: (text: string, action: QuoteAction) => {
     const id = `q${++_quoteId}`;
@@ -689,6 +820,40 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   // ------------------------------------------------------------------ //
+  //  Tasks of the session                                                //
+  // ------------------------------------------------------------------ //
+
+  fetchSessionTasks: async (sessionId: string) => {
+    // A new chat is not on the server until its first message.
+    if (!sessionId || sessionId === get().virtualSession?.id) return;
+    const request = ++sessionTasksRequest;
+    const current = () => request === sessionTasksRequest && get().activeSession === sessionId;
+    try {
+      const { tasks } = await api.getSessionTasks(sessionId);
+      if (current()) set({ sessionTasks: tasks, sessionTasksFailed: false });
+    } catch {
+      if (current()) set({ sessionTasksFailed: true });
+    }
+  },
+
+  openTasksPanel: () => {
+    get().openPanelTab({
+      id: TASKS_PANEL_ID,
+      type: 'tasks',
+      label: 'Tasks',
+      subagentType: 'tasks',
+      description: '',
+      content: null,
+      prompt: '',
+      streaming: false,
+      status: 'complete',
+      startedAt: Date.now(),
+      blocks: [],
+    });
+    void get().fetchSessionTasks(get().activeSession);
+  },
+
+  // ------------------------------------------------------------------ //
   //  Session management                                                  //
   // ------------------------------------------------------------------ //
 
@@ -743,21 +908,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       set((s) => {
         const drafts = { ...s.drafts };
         delete drafts[vs.id];
-        return { virtualSession: null, drafts };
+        // The next new chat starts with Daybreak off.
+        return { virtualSession: null, newChatDaybreak: false, drafts };
       });
     }
     if (id === get().activeSession && get().messages.length > 0) return;
     discardStreamDeltas();
     tabFocus.clear();
-    set({
-      activeSession: id, messages: [], loading: true, streamingBlocks: [],
-      isStreaming: false, agentStatus: { state: 'idle' }, contextUsage: null,
-      backendStatus: null,
-      currentTodos: [], currentCCTasks: [], pendingInteraction: null,
-      planSummaries: {}, planEditRequest: null,
-      panels: [], activePanelId: null, panelVisible: false,
-      modifiedFiles: [], modifiedFilesCount: 0,
-    });
+    set({ ...emptyChatView(), activeSession: id, missingSession: null, loading: true });
     // The agent roster follows the view (it unsubscribes the old transcripts).
     useAgentStore.getState().reset(id);
     // A virtual chat isn't known to the server (it's created on first send),
@@ -779,36 +937,70 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // never reorders the session list.
     try {
       const data = await api.getMessages(id);
+      // The person opened another chat while this one's history was on its
+      // way: the answer is not that chat's, and must not take its place.
+      if (get().activeSession !== id) return;
       const hydrated = data.messages.map(hydrateMessage);
       const update: Record<string, unknown> = {
         messages: hydrated,
         loading: false,
       };
       // Restore context usage from last turn (for context bar)
-      if (data.last_usage) {
-        const cc = data.last_usage.cache_creation as
-          | { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number }
-          | undefined;
-        update.contextUsage = {
-          input_tokens: data.last_usage.input_tokens || 0,
-          output_tokens: data.last_usage.output_tokens || 0,
-          cache_creation_input_tokens: data.last_usage.cache_creation_input_tokens || 0,
-          cache_read_input_tokens: data.last_usage.cache_read_input_tokens || 0,
-          cache_creation_5m_input_tokens: cc?.ephemeral_5m_input_tokens ?? 0,
-          cache_creation_1h_input_tokens: cc?.ephemeral_1h_input_tokens ?? 0,
-          max_context_tokens: data.last_usage.max_context_tokens || 200_000,
-          num_turns: data.last_usage.num_turns || 1,
-        };
-      }
+      if (data.last_usage) update.contextUsage = contextUsageFrom(data.last_usage);
       // Restore todos from last TodoWrite call in history (legacy)
       update.currentTodos = extractTodosFromMessages(hydrated);
       // Restore Claude Code 2.1+ task panel from history
       update.currentCCTasks = extractCCTasksFromMessages(hydrated);
       set(update);
-      // Fetch modified files for this session (non-blocking)
+      // Fetch the modified files and the tasks of this session (non-blocking)
       get().fetchModifiedFiles(id);
+      void get().fetchSessionTasks(id);
     } catch {
-      set({ loading: false });
+      if (get().activeSession === id) set({ loading: false });
+    }
+  },
+
+  catchUp: async () => {
+    const session = get().activeSession;
+    if (!session || session === get().virtualSession?.id) return;
+    if (catchUpRun?.session === session) {
+      catchUpRun.again = true;
+      return;
+    }
+    const run = { session, again: false };
+    catchUpRun = run;
+    // The task events sent while the socket was down are lost too.
+    void get().fetchSessionTasks(session);
+    try {
+      // Live events can change the rows during the read. Then the read can
+      // be older than the rows on screen, so read again.
+      for (let attempt = 0; attempt < 3; attempt++) {
+        run.again = false;
+        const before = get().messages;
+        let data: Awaited<ReturnType<typeof api.getMessages>>;
+        try {
+          data = await api.getMessages(session);
+        } catch (e) {
+          console.error('Failed to load messages:', e);
+          return;
+        }
+        if (get().activeSession !== session) return;
+        if (run.again || get().messages !== before) continue;
+        const merged = mergeCatchUp(data.messages.map(hydrateMessage), before);
+        if (sameRows(merged, before)) return;
+        const update: Partial<ChatState> = { messages: merged };
+        // While a turn runs, its replayed events own the todos and the usage.
+        if (!get().isStreaming) {
+          if (data.last_usage) update.contextUsage = contextUsageFrom(data.last_usage);
+          update.currentTodos = extractTodosFromMessages(merged);
+          update.currentCCTasks = extractCCTasksFromMessages(merged);
+        }
+        set(update);
+        get().fetchModifiedFiles(session);
+        return;
+      }
+    } finally {
+      if (catchUpRun === run) catchUpRun = null;
     }
   },
 
@@ -818,8 +1010,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // the server id. Reuse an existing unsent one rather than stacking empty
     // chats. The temp id is a full UUID so it never collides with a real
     // server id (uuid4()[:8]) and is never sent to the backend.
+    //
+    // What was typed for a session that does not exist has no chat to wait
+    // in: it moves into the new chat. The composer reads a chat's draft when
+    // the chat opens, so the text goes into the draft before the switch.
+    const from = get().activeSession;
+    const typed = from && get().missingSession === from ? (get().drafts[from] ?? '') : '';
+    const moveTyped = (to: string) => {
+      if (!typed.trim() || to === from) return;
+      const own = get().drafts[to] ?? '';
+      get().setDraft(to, own.trim() ? `${own}\n\n${typed}` : typed);
+      get().setDraft(from, '');
+    };
     const existing = get().virtualSession;
     if (existing) {
+      moveTyped(existing.id);
       if (get().activeSession !== existing.id) await get().switchSession(existing.id);
       return;
     }
@@ -834,6 +1039,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // remembers.
     persistVirtualSession(id, now);
     set({ virtualSession: virtual });
+    moveTyped(id);
     await get().switchSession(id);
   },
 
@@ -878,8 +1084,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // instead of the backend default until the first turn resolves it.
     const effBackend = get().newChatBackend ?? get().backendDefault ?? 'claude';
     const pickedModel = get().newChatModels[effBackend] ?? undefined;
+    // The composer's Daybreak switch, dropped when the model has no program.
+    const daybreak = newChatHasDaybreak(get(), get().newChatBackend, pickedModel);
     const real: Session = await api.createSession(
-      undefined, get().newChatBackend, rlCwd, rlPayload, pickedModel,
+      undefined, get().newChatBackend, rlCwd, rlPayload, pickedModel, daybreak,
     );
     set((state) => {
       const drafts = { ...state.drafts };
@@ -900,6 +1108,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         virtualSession: null,
         newChatBackend: null,  // bound into the created session; reset for the next chat
         newChatModels: {},     // ditto — the pick now lives on the session row
+        newChatDaybreak: false,   // ditto — the switch now lives on the session row
         newChatReviewLoop: null,  // ditto — the loop (if any) is now running server-side
         drafts,
         // POST /api/sessions returns a partial row (no updated_at); fill the
@@ -918,7 +1127,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   discardVirtualSession: () => {
     const vs = get().virtualSession;
     if (!vs) return;
-    set({ newChatBackend: null, newChatModels: {}, newChatReviewLoop: null });
+    set({ newChatBackend: null, newChatModels: {}, newChatDaybreak: false, newChatReviewLoop: null });
     removeDraft(vs.id);
     clearVirtualSession();
     set((s) => {
@@ -988,6 +1197,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       }
     } catch (e) {
       console.error('Failed to delete session:', e);
+      // 409: a turn of the session runs or waits in its queue.
+      if (e instanceof Error && e.message.startsWith('409:')) {
+        window.alert('Could not delete this chat: it is running or has queued messages. Stop it, then delete it.');
+      }
     }
   },
 
@@ -1037,6 +1250,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }
   },
 
+  regenerateSessionTitle: async (id: string) => {
+    try {
+      const { title } = await api.regenerateSessionTitle(id);
+      set(s => ({
+        sessions: s.sessions.map(sess =>
+          sess.id === id ? { ...sess, title } : sess
+        ),
+      }));
+    } catch (e) {
+      console.error('Failed to regenerate session title:', e);
+      window.alert('Could not regenerate the name: no title could be made (a model API key, Bedrock or the proxy is needed).');
+    }
+  },
+
   toggleStar: async (id: string) => {
     const session = get().sessions.find(s => s.id === id);
     if (!session) return;
@@ -1080,11 +1307,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // Feed '...': append the next page of conversations (starred already arrived in full on page 1).
     try {
       const { sessions, has_more, next_offset } = await api.listSessions(get().sessionsNextOffset);
-      set(s => ({
-        sessions: [...s.sessions, ...sessions],
-        sessionsHasMore: !!has_more,
-        sessionsNextOffset: next_offset ?? s.sessionsNextOffset + sessions.length,
-      }));
+      set(s => {
+        // Page 1 also holds the sessions that need you, so a later page
+        // can repeat one of them.
+        const listed = new Set(s.sessions.map(x => x.id));
+        return {
+          sessions: [...s.sessions, ...sessions.filter(x => !listed.has(x.id))],
+          sessionsHasMore: !!has_more,
+          sessionsNextOffset: next_offset ?? s.sessionsNextOffset + sessions.length,
+        };
+      });
     } catch (e) {
       console.error('Failed to load more sessions:', e);
     }
@@ -1242,10 +1474,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
     repoint(model);
     try {
-      await api.updateSession(sessionId, { model });
+      const updated = await api.updateSession(sessionId, { model });
+      // On a model without a Daybreak program the server turns the switch of
+      // a Codex chat off, and says so. The answer for a chat of another
+      // backend has no switch, and its row gets none.
+      set((state) => ({
+        ...(typeof updated?.codex_daybreak === 'boolean'
+          ? patchSessionRow(state, sessionId, { codex_daybreak: updated.codex_daybreak })
+          : {}),
+        ...(updated?.codex_daybreak_notice ? chatNote(state, sessionId, updated.codex_daybreak_notice) : {}),
+      }));
     } catch (e) {
       console.error('Failed to update session model:', e);
       repoint(prev);
+    }
+  },
+
+  setNewChatDaybreak: (enabled: boolean) => set({ newChatDaybreak: enabled }),
+
+  setSessionDaybreak: async (sessionId: string, enabled: boolean) => {
+    // Not optimistic: the switch shows what the server stored.
+    try {
+      const updated = await api.updateSession(sessionId, { codex_daybreak: enabled });
+      set((state) => patchSessionRow(state, sessionId, { codex_daybreak: updated?.codex_daybreak === true }));
+    } catch (e) {
+      console.error('Failed to update Daybreak:', e);
+      set((state) => chatNote(state, sessionId, `Error: ${errorDetail(e, 'Daybreak could not be changed.')}`));
     }
   },
 
@@ -1276,8 +1530,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
             blocks: [{ type: 'text', content: 'Error: Message could not be sent. The connection is closed; please retry.' }],
           }],
         }));
+        return null;
       }
-      return;
+      return session;
     }
     // Optimistic update: append the user message, flip to streaming. If the
     // socket isn't open, send() returns 'queued' (will flush on reconnect)
@@ -1310,7 +1565,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           isStreaming: false,
           agentStatus: { state: 'idle' },
         }));
-        return;
+        return null;
       }
     }
     // No per-message model override: the session row is the source of
@@ -1335,7 +1590,34 @@ export const useChatStore = create<ChatState>((set, get) => ({
         isStreaming: false,
         agentStatus: { state: 'idle' },
       }));
+      return null;
     }
+    return session;
+  },
+
+  startChat: async (content: string, retryId?: string) => {
+    let id = retryId && get().sessions.some(s => s.id === retryId) ? retryId : null;
+    if (!id) {
+      let created: Session;
+      try {
+        created = await api.createSession();
+      } catch (e) {
+        console.error('Failed to create session:', e);
+        return null;
+      }
+      set((state) => ({
+        // POST /api/sessions returns a partial row; fill what the list needs.
+        sessions: [
+          { ...created, title: 'New chat', is_running: false, updated_at: new Date().toISOString() },
+          ...state.sessions,
+        ],
+      }));
+      id = created.id;
+    }
+    await get().switchSession(id);
+    // The view moved to another chat while the messages loaded: do not send there.
+    const sent = get().activeSession === id && (await get().sendMessage(content)) !== null;
+    return { sessionId: id, sent };
   },
 
   runLater: async (content, delay, fileIds, imageBlocks) => {
@@ -1362,8 +1644,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const pickedModel = effBackend
       ? (get().newChatModels[effBackend] ?? null)
       : null;
+    // The Daybreak switch is the unsent chat's own: it goes with the prompt
+    // only when the composer is in that chat, and the session created here
+    // (this backend and model) offers Daybreak.
+    const daybreak = !!vs && get().activeSession === vs.id
+      && newChatHasDaybreak(get(), effBackend, pickedModel);
     const real: Session = await api.createSession(
-      undefined, effBackend, undefined, null, pickedModel,
+      undefined, effBackend, undefined, null, pickedModel, daybreak,
     );
     // If auth changed, keep the server row but do not show it in this tab.
     if (!sender.stillCurrent()) return;
@@ -1384,6 +1671,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         virtualSession: null,
         newChatBackend: null,
         newChatModels: {},
+        newChatDaybreak: false,
         newChatReviewLoop: null,
         drafts,
         streamingBlocks: [],
@@ -1464,6 +1752,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'session_updated':  return handleSessionUpdated(msg, get, set);
       case 'session_status':   return handleSessionStatus(msg, get, set);
       case 'session_switched': return handleSessionSwitched(msg, get, set);
+      case 'session_not_found':
+        // The composer goes out of sight with the notice: what it holds is
+        // written to the session's draft first, for the new chat to take.
+        flushComposer?.();
+        return handleSessionNotFound(msg, get, set);
       case 'session_forked':   return handleSessionForked(msg, get, set);
       case 'session_resumed':  return handleSessionResumed(msg, get, set);
       case 'session_archived': return handleSessionArchived(msg, get, set);
@@ -1486,18 +1779,34 @@ export const useChatStore = create<ChatState>((set, get) => ({
         useAgentStore.getState().applyAgentEvent(msg);
         return;
       case 'queue_update': {
-        // A send this tab queued while a turn ran has started: its bubble
-        // appears now, in the order the server runs it.
         const { started } = useAgentStore.getState().applyQueueUpdate(msg);
-        if (started.length > 0) {
-          const now = new Date().toISOString();
-          const actor = selfActorId();
-          set((s) => ({
-            messages: [...s.messages, ...started.map((p) => ({
-              role: 'user' as const, blocks: p.blocks, created_at: now, actor_id: actor, client_msg_id: p.clientMsgId,
-            }))],
-          }));
-        }
+        const removed = msg.removed ?? [];
+        const idsOf = (reasons: string[]) => removed
+          .filter(r => r.client_msg_id && reasons.includes(r.reason))
+          .map(r => r.client_msg_id as string);
+        // A queued message that never ran (cancelled by its sender, refused
+        // at shutdown) keeps no bubble: drop the echo of another tab's send.
+        const unsent = idsOf(['cancelled', 'refused']);
+        // A message that starts runs after every reply on screen: its bubble
+        // goes to the end, in the order the server runs it, in every tab,
+        // with the start time that the stored message gets. The bubble is the
+        // echo of the send, or a new one for a send that this tab queued.
+        const startedIds = idsOf(['started']);
+        if (unsent.length === 0 && startedIds.length === 0) return;
+        const queuedHere = new Map(started.map(p => [p.clientMsgId, p]));
+        const gone = new Set([...unsent, ...startedIds]);
+        const now = new Date().toISOString();
+        const actor = selfActorId();
+        set((s) => {
+          const moved = startedIds.flatMap((id): ChatMessage[] => {
+            const echo = s.messages.find(m => m.role === 'user' && m.client_msg_id === id);
+            if (echo) return [{ ...echo, created_at: now }];
+            const p = queuedHere.get(id);
+            return p ? [{ role: 'user', blocks: p.blocks, created_at: now, actor_id: actor, client_msg_id: id }] : [];
+          });
+          const kept = s.messages.filter(m => m.role !== 'user' || !m.client_msg_id || !gone.has(m.client_msg_id));
+          return { messages: [...kept, ...moved] };
+        });
         return;
       }
       // Global: the sidebar row's agent count between turns.
@@ -1527,9 +1836,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // reflects a change made by the agent in any session, by another
       // tab, or over the API. Must stay out of VIEW_SCOPED_EVENTS.
       case 'task_updated':
+        // A plan decision from any place (another tab, Telegram, the API)
+        // writes the plan's task, and this event is its only broadcast. The
+        // reload clears the session's "Plan to review".
+        reloadSessionsSoon();
         void import('./taskStore').then(({ useTaskStore }) =>
           useTaskStore.getState().handleTaskEvent(msg.task)
         );
+        if (SESSION_TASK_EVENTS.has(msg.event)) void get().fetchSessionTasks(get().activeSession);
         return;
       // Auxiliary
       case 'interaction':              return handleInteraction(msg, get, set);
@@ -1538,6 +1852,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'notification':             return handleNotification(msg, get, set);
       case 'notification_answered':    return handleNotificationAnswered(msg, get, set);
       case 'notification_expired':     return handleNotificationExpired(msg, get, set);
+      case 'notification_dismissed':   return handleNotificationDismissed(msg, get, set);
     }
   },
 }));
@@ -1570,17 +1885,27 @@ let socketOpenedBefore = false;
 if (typeof ws.onOpen === 'function') {
   ws.onOpen(() => {
     const s = useChatStore.getState();
+    // A session that the server did not have is named again too: it can
+    // exist by now, and the answer says which.
     if (s.activeSession && s.activeSession !== s.virtualSession?.id) {
       ws.switchSession(s.activeSession);
       useAgentStore.getState().resubscribeAll();
     }
-    // A reconnect (a gateway restart, a dropped network) missed the global
-    // events sent meanwhile, and a restarted server never re-sends the zero
-    // counts: the sidebar rows come back from the server.
-    if (socketOpenedBefore) void s.loadSessions();
+    // A reconnect (a gateway restart, a dropped network, a phone that slept)
+    // missed the events sent meanwhile, and a restarted server never re-sends
+    // the zero counts: the sidebar rows, the open chat's messages and the
+    // notifications (the badge count, the questions that put "!" in the tab
+    // title) come back from the server.
+    if (socketOpenedBefore) {
+      void s.loadSessions();
+      void s.catchUp();
+      void import('./notificationStore').then(({ useNotificationStore }) => useNotificationStore.getState().loadNotifications());
+    }
     socketOpenedBefore = true;
   });
 }
+
+registerSessionsLoader(() => void useChatStore.getState().loadSessions());
 
 onViewerStorageChange(() => {
   tabFocus.clear();

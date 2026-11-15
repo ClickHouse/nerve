@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="robots" content="noindex" />
+    <!--
+      The sandbox proxy of Nerve's MCP Apps host (MCP extension
+      `io.modelcontextprotocol/ui`, "Sandbox proxy" in the specification).
+
+      The chat embeds this page in an iframe. The page loads the HTML of an
+      app or of a widget (third-party content) into an inner iframe and
+      passes JSON-RPC messages between the chat and that content, unchanged.
+      Nothing of Nerve is here to reach: no token, no cookie, no API.
+
+      The page comes from the chat's own address, and it is kept apart from
+      the chat by the Content-Security-Policy response header that the
+      gateway sends with it:
+
+      - `sandbox allow-scripts allow-forms` takes this document's origin
+        away. It cannot read the chat's storage, cookies or DOM, its requests
+        to this address count as another site's, it opens no window and
+        navigates nothing but itself.
+      - the fetch directives, from the `?csp=` query, say what the content
+        may load. The content's document goes into the inner frame as
+        `srcdoc`, so it inherits them and cannot loosen them.
+      - `frame-ancestors 'self'` lets only a page of this address embed it.
+
+      All three are one header. So this page checks one thing before it
+      takes any HTML: that it has no origin. If it has one, the header did
+      not arrive, and with it neither the limits on what the content may
+      load: the page shows a notice, tells the chat why, and does nothing.
+
+      The inner frame is sandboxed again, by its own attribute: the content
+      runs in an origin of its own (an opaque one), with no storage and no
+      cookie, and cannot reach this page or the frames of other content. All
+      it has is the channel to the chat that this page relays.
+
+      One thing this page says for itself: whether the person has just
+      pressed in the content (a pointer or a key). The chat asks when the
+      frame takes the keyboard, to tell the person's click from a script
+      that took it. The browser counts a press in the content for the
+      frames around it, this one included, and a press in the chat not at
+      all here (this page shares no origin with the chat), so the answer is
+      about the content alone. The content cannot give it and has no say in
+      what the browser counts.
+
+      The file is self-contained on purpose: one inline script, no assets.
+    -->
+    <title>Nerve app sandbox</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        width: 100%;
+        /* The chat shows through until the app paints a background. */
+        background-color: transparent;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      iframe {
+        flex: 1 1 auto;
+        width: 100%;
+        min-height: 0;
+        padding: 0;
+        border: 0 none transparent;
+        background-color: transparent;
+        /* The same colour scheme as the chat, so the frame stays transparent. */
+        color-scheme: inherit;
+      }
+      #notice {
+        margin: 0;
+        padding: 16px;
+        font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+        color: CanvasText;
+        background-color: Canvas;
+      }
+    </style>
+  </head>
+  <body>
+    <p id="notice" hidden></p>
+    <script>
+      (function () {
+        'use strict';
+
+        var RESOURCE_READY = 'ui/notifications/sandbox-resource-ready';
+        var PROXY_READY = 'ui/notifications/sandbox-proxy-ready';
+        /** Not in the specification: this page tells whoever embeds it why it does nothing. */
+        var PROXY_REFUSED = 'ui/notifications/sandbox-proxy-refused';
+        /** Not in the specification: the chat's question whether the person has just pressed in the content, and the answer. */
+        var PROXY_PRESSED = 'ui/notifications/sandbox-pressed';
+        /** Methods that belong to the proxy itself and are never passed on. */
+        var RESERVED_PREFIX = 'ui/notifications/sandbox-';
+        /** What the frame of the content may do at most. This page may do no more itself. */
+        var INNER_SANDBOX = ['allow-scripts', 'allow-forms'];
+        /** What a document without an origin says its origin is, and what its messages carry. */
+        var NO_ORIGIN = 'null';
+        /**
+         * The origin of the chat: the address this page was loaded from. The
+         * chat embeds the page from its own address, and the browser lets no
+         * page of another address embed it (`frame-ancestors`).
+         */
+        var CHAT_ORIGIN = window.location.origin;
+
+        function say(text) {
+          var notice = document.getElementById('notice');
+          notice.textContent = text;
+          notice.hidden = false;
+        }
+
+        // Opened as a page of its own, this does nothing.
+        if (window.self === window.top) {
+          say('Nerve app sandbox. This page works only inside a Nerve chat. You can close this tab.');
+          return;
+        }
+
+        /**
+         * Do nothing, and say why: on the page, and to the page that embeds
+         * this one, so that a chat can show the reason in place of content
+         * that never comes. The reason is one of the sentences below and
+         * holds nothing worth keeping from anybody.
+         */
+        function refuse(reason) {
+          say('Nerve app sandbox: refused, because ' + reason);
+          try {
+            window.parent.postMessage({ jsonrpc: '2.0', method: PROXY_REFUSED, params: { reason: reason } }, '*');
+          } catch (error) {
+            // Nobody to tell.
+          }
+        }
+
+        // The header that takes this document's origin away is the header
+        // that limits what the content may load. With an origin, neither is
+        // here: this is a page of the chat's own address, and it must not
+        // run anything it is handed.
+        if (window.origin !== NO_ORIGIN) {
+          refuse('this page was served without its sandbox policy.');
+          return;
+        }
+
+        /** True when a script of this page can reach into `other`. */
+        function reaches(other) {
+          try {
+            return !!other.document;
+          } catch (error) {
+            return false;
+          }
+        }
+
+        // The same, seen from the other side: a page without an origin
+        // reaches no other page. If the page that embeds this one is within
+        // reach, the content could reach it too.
+        if (reaches(window.parent) || reaches(window.top)) {
+          refuse('the embedding page is within reach of this one.');
+          return;
+        }
+
+        /** The origin of the embedding page, when the browser tells it. */
+        function embedderOrigin() {
+          try {
+            var ancestors = window.location.ancestorOrigins;
+            if (ancestors && ancestors.length > 0) return ancestors[0];
+          } catch (error) {
+            // Not every browser has it.
+          }
+          try {
+            if (document.referrer) return new URL(document.referrer).origin;
+          } catch (error) {
+            // An address that is not a URL.
+          }
+          return null;
+        }
+
+        // The browser already refuses any embedder but a page of this
+        // address. Where it also says who embeds this page, that is checked.
+        var announced = embedderOrigin();
+        if (announced !== null && announced !== CHAT_ORIGIN) {
+          refuse('the embedding page is not the chat of this address.');
+          return;
+        }
+
+        /** The frame of the content, once the chat has sent its HTML. */
+        var inner = null;
+
+        /**
+         * The `sandbox` of the content's frame, from what the chat asks for:
+         * scripts and forms at most. Never `allow-same-origin`, whoever
+         * asks: with it the content would have this page's place, and with
+         * that this page and the channel to the chat.
+         */
+        function innerSandbox(asked) {
+          if (typeof asked !== 'string') return INNER_SANDBOX.join(' ');
+          return asked.split(/\s+/).filter(function (token) {
+            return INNER_SANDBOX.indexOf(token.toLowerCase()) >= 0;
+          }).join(' ');
+        }
+
+        function allowAttribute(permissions) {
+          if (!permissions || typeof permissions !== 'object') return '';
+          var list = [];
+          if (permissions.camera) list.push('camera');
+          if (permissions.microphone) list.push('microphone');
+          if (permissions.geolocation) list.push('geolocation');
+          if (permissions.clipboardWrite) list.push('clipboard-write');
+          return list.join('; ');
+        }
+
+        function loadApp(params) {
+          if (!params || typeof params.html !== 'string') return;
+          var allow = allowAttribute(params.permissions);
+
+          // A new frame for every document: `sandbox` and `allow` count for a
+          // document only when they are set before the frame holds it.
+          var frame = document.createElement('iframe');
+          frame.setAttribute('sandbox', innerSandbox(params.sandbox));
+          if (allow) frame.setAttribute('allow', allow);
+          // As `srcdoc` the document gets this page's Content-Security-Policy
+          // and, in a frame sandboxed like this one, an origin of its own.
+          frame.srcdoc = params.html;
+          if (inner) inner.remove();
+          inner = frame;
+          document.body.appendChild(frame);
+        }
+
+        /**
+         * Answer the chat: has the person just pressed in the content? What
+         * the browser says of this document, `null` where it says nothing.
+         * Where it can, the browser adds its own word of the same to the
+         * message, which no script can set.
+         */
+        function tellPressed() {
+          var activation = window.navigator.userActivation;
+          var message = {
+            jsonrpc: '2.0', method: PROXY_PRESSED,
+            params: { pressed: activation ? activation.isActive === true : null },
+          };
+          try {
+            window.parent.postMessage(message, { targetOrigin: CHAT_ORIGIN, includeUserActivation: true });
+          } catch (error) {
+            // A browser that takes no options there.
+            window.parent.postMessage(message, CHAT_ORIGIN);
+          }
+        }
+
+        function isReserved(data) {
+          return !!data && typeof data.method === 'string' && data.method.indexOf(RESERVED_PREFIX) === 0;
+        }
+
+        function onMessage(event) {
+          if (event.source === window.parent) {
+            // From the chat: the page that embeds this one, at this address.
+            if (event.origin !== CHAT_ORIGIN) return;
+
+            var data = event.data;
+            if (data && data.method === RESOURCE_READY) {
+              loadApp(data.params);
+            } else if (data && data.method === PROXY_PRESSED) {
+              tellPressed();
+            } else if (!isReserved(data) && inner && inner.contentWindow) {
+              // A frame without an origin can be addressed in no other way.
+              // What goes there is what the chat sends to this content.
+              inner.contentWindow.postMessage(data, '*');
+            }
+          } else if (inner && event.source === inner.contentWindow) {
+            // From the content: a frame that has no origin either.
+            if (event.origin !== NO_ORIGIN) return;
+            // The content does not speak for the proxy.
+            if (isReserved(event.data)) return;
+            window.parent.postMessage(event.data, CHAT_ORIGIN);
+          }
+          // A message from any other window is dropped: "null" is the
+          // origin of every sandboxed frame, so it says nothing of who sent it.
+        }
+
+        window.addEventListener('message', onMessage);
+        // Ready for the HTML of the content. To the chat, and to no other
+        // page that might hold this one.
+        window.parent.postMessage({ jsonrpc: '2.0', method: PROXY_READY, params: {} }, CHAT_ORIGIN);
+      })();
+    </script>
+  </body>
+</html>

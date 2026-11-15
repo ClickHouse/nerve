@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
 
 from nerve.config import NerveConfig
 from nerve.db import Database
+from nerve.notifications.quiet_hours import in_quiet_hours
 from nerve.tasks.models import Task
 
 logger = logging.getLogger(__name__)
@@ -29,40 +29,12 @@ ESCALATION_INTERVALS = {
 }
 
 
-def _is_quiet_hour(config: NerveConfig) -> bool:
-    """Check if we're in quiet hours.
-
-    Quiet hours are optional: an empty ``quiet_start`` or ``quiet_end`` (a
-    worker's default is both) means there are none, so never quiet.
-    """
-    start = str(config.quiet_start or "").strip()
-    end = str(config.quiet_end or "").strip()
-    if not start or not end:
-        return False
-    try:
-        tz = ZoneInfo(config.timezone)
-        now = datetime.now(tz)
-        current_minutes = now.hour * 60 + now.minute
-
-        start_h, start_m = map(int, start.split(":"))
-        end_h, end_m = map(int, end.split(":"))
-        start_minutes = start_h * 60 + start_m
-        end_minutes = end_h * 60 + end_m
-
-        if start_minutes <= end_minutes:
-            return start_minutes <= current_minutes < end_minutes
-        else:
-            return current_minutes >= start_minutes or current_minutes < end_minutes
-    except Exception:
-        return False
-
-
 async def check_escalations(
     db: Database,
     config: NerveConfig,
 ) -> list[dict]:
     """Check all tasks for escalation needs. Returns list of {task, level} for tasks needing reminders."""
-    if _is_quiet_hour(config):
+    if in_quiet_hours(config):
         return []
 
     tasks = await db.list_tasks(status="pending")

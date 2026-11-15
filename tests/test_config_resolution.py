@@ -442,21 +442,32 @@ class TestClaudeModels:
         from nerve.config import DEFAULT_CLAUDE_MODELS, NerveConfig
 
         cfg = NerveConfig()
-        # The configured default always leads; the built-ins follow.
-        assert cfg.claude_models[0] == cfg.agent.model
-        for model_id in DEFAULT_CLAUDE_MODELS:
-            assert model_id in cfg.claude_models
+        # The built-in list, in its order; it names the configured default.
+        assert cfg.claude_models == list(DEFAULT_CLAUDE_MODELS)
+        assert cfg.agent.model in cfg.claude_models
         # More than one entry → the web composer renders the picker.
         assert len(cfg.claude_models) > 1
 
-    def test_configured_model_leads_and_dedupes(self):
+    def test_discovery_is_off_by_default(self):
+        from nerve.config import DEFAULT_CLAUDE_MODELS, AgentConfig, NerveConfig
+
+        assert AgentConfig().model_discovery is False
+        assert AgentConfig.from_dict({}).model_discovery is False
+        # A catalog handed in while discovery is off does not reach the menu.
+        cfg = NerveConfig()
+        assert cfg.selectable_claude_models(
+            ["claude-opus-4-6", "claude-sonnet-4-5-20250929"],
+        ) == list(DEFAULT_CLAUDE_MODELS)
+
+    def test_list_order_is_kept_and_deduped(self):
         from nerve.config import AgentConfig, NerveConfig
 
         cfg = NerveConfig(agent=AgentConfig.from_dict({
             "model": "claude-sonnet-4-6",
-            "models": ["claude-opus-5", "claude-sonnet-4-6"],
+            "models": ["claude-opus-5", "claude-sonnet-4-6", "claude-opus-5"],
         }))
-        assert cfg.claude_models == ["claude-sonnet-4-6", "claude-opus-5"]
+        # The default is in the list, so it keeps its place.
+        assert cfg.claude_models == ["claude-opus-5", "claude-sonnet-4-6"]
 
     def test_explicit_models_replace_builtins(self):
         from nerve.config import AgentConfig, NerveConfig
@@ -516,7 +527,7 @@ class TestModelDiscoveryExclusions:
     def _cfg(self, *, model="claude-opus-5", excluded=None, models=None):
         from nerve.config import AgentConfig, NerveConfig
 
-        agent = {"model": model}
+        agent = {"model": model, "model_discovery": True}
         if excluded is not None:
             agent["model_discovery_excluded_models"] = excluded
         if models is not None:
@@ -565,6 +576,7 @@ class TestModelDiscoveryExclusions:
 
         agent = AgentConfig.from_dict({
             "model": "claude-opus-5",
+            "model_discovery": True,
             "model_discovery_excluded_models": {"haiku": False},
         })
         cfg = NerveConfig(agent=agent)
@@ -641,8 +653,9 @@ class TestModelDiscoveryExclusions:
             "claude-sonnet-4-6", "claude-fable-5", "claude-opus-5",
             "claude-sonnet-4-6",  # duplicate
         ])
-        # Default first; discovery order otherwise; fable pruned; deduped.
-        assert got == ["claude-opus-5", "claude-sonnet-4-6"]
+        # Discovery order; fable pruned; deduped. The catalog names the
+        # default, so it keeps its place.
+        assert got == ["claude-sonnet-4-6", "claude-opus-5"]
 
     def test_key_recognized_by_validator(self):
         merged = {"agent": {"model_discovery_excluded_models": ["haiku"]}}

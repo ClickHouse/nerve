@@ -15,6 +15,8 @@ vi.mock('../api/client', async () => {
       stopAgent: vi.fn(),
       stopSession: vi.fn(),
       cancelQueued: vi.fn(),
+      reorderQueue: vi.fn(),
+      getQueue: vi.fn(),
     },
   };
 });
@@ -492,6 +494,35 @@ describe('queue', () => {
   });
 });
 
+describe('reorderQueue', () => {
+  const ids = () => store().queue.map(q => q.queue_id);
+  const [a, b, c] = ['q_a', 'q_b', 'q_c'].map(queue_id => fx.makeQueueEntry({ queue_id }));
+
+  it('shows the new order at once and sends it', async () => {
+    store().hydrate(fx.makeSnapshot([], { queue: [a, b, c] }));
+    vi.mocked(api.reorderQueue).mockResolvedValueOnce({ items: [c, a, b] });
+
+    const done = store().reorderQueue(['q_c', 'q_a']);
+    expect(ids()).toEqual(['q_c', 'q_a', 'q_b']);   // not named: last, in order
+    await done;
+
+    expect(api.reorderQueue).toHaveBeenCalledWith(SID, ['q_c', 'q_a']);
+    expect(ids()).toEqual(['q_c', 'q_a', 'q_b']);
+  });
+
+  it('shows the server queue again when the request fails', async () => {
+    store().hydrate(fx.makeSnapshot([], { queue: [a, b, c] }));
+    vi.mocked(api.reorderQueue).mockRejectedValueOnce(apiError(500, 'internal'));
+    vi.mocked(api.getQueue).mockResolvedValueOnce({ items: [a, b, c] });
+    vi.spyOn(console, 'error').mockImplementationOnce(() => {});
+
+    await store().reorderQueue(['q_c', 'q_b', 'q_a']);
+
+    expect(api.getQueue).toHaveBeenCalledWith(SID);
+    expect(ids()).toEqual(['q_a', 'q_b', 'q_c']);
+  });
+});
+
 describe('stop', () => {
   const brief = { id: fx.FX_RUNNING.id, label: 'build-api', kind: 'agent' as const, status: 'running' as const, started_at: null, tokens: 1 };
 
@@ -622,5 +653,22 @@ describe('seen and composer', () => {
     store().requestFocus();
     store().reset(SID);
     expect(store().focusNonce).toBe(nonce + 1);
+  });
+
+  it('offers text to a composer, and hears nothing went in when no composer answers', async () => {
+    const offered = store().offerToComposer('Plot the last hour.');
+    expect(store().composerInsert).toMatchObject({ text: 'Plot the last hour.', mode: 'offer' });
+
+    // No composer is on the page to take it.
+    await expect(offered).resolves.toBe(false);
+  });
+
+  it('hears from the composer whether the offered text went in, once', async () => {
+    const offered = store().offerToComposer('Plot the last hour.');
+
+    store().composerInsert!.taken!(true);
+    store().composerInsert!.taken!(false);
+
+    await expect(offered).resolves.toBe(true);
   });
 });
