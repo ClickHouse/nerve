@@ -857,7 +857,6 @@ A Nerve update can change the schedule, the description or the prompt of a built
 When the scheduler starts, and after every reload that it applies, Nerve writes this release's values into `system.yaml`, so that the file shows what runs:
 
 - In each entry of a built-in job, the schedule, the description and the inline prompt are replaced. Each of the three is replaced on its own, and only when it is what an earlier release shipped, the whitespace around it aside: a schedule or prompt that you edited stays. A `prompt_file` is still the prompt that is sent. The inline prompt of an entry with a `workflow` is never sent, and stays.
-- A built-in job that every mode switches on by default, and that the file has no entry for, is added, switched on: `machine-maintenance`, on an install from before that job existed. A job that you switched off has its entry, with `enabled: false`, and stays off; an entry that was removed from the file is added again.
 - Everything else in the file stays as it is: the comment at its top, the other keys of an entry (`enabled`, `model`, a `run_if` of its own) and the other jobs.
 - The log has one line for each job whose entry was written. A file that has the current values is not written again, and a reload that is refused writes nothing.
 

@@ -2000,19 +2000,14 @@ def plan_cron_job_enabled(path: Path, job_id: str, enabled: bool) -> CronToggleP
 def rewrite_superseded_cron_values(system_file: Path) -> dict[str, tuple[str, ...]]:
     """Write this release's values into a ``system.yaml`` that holds what
     earlier releases wrote for built-in jobs, so that the file shows what
-    runs. Returns the keys that were written, by job id, ``("added",)`` for a
-    job that was added; empty when the file was left as it is.
+    runs. Returns the keys that were written, by job id; empty when the file
+    was left as it is.
 
     In every entry with an id, each of the schedule, the description and the
     inline prompt is replaced when it is what an earlier release wrote
     (:func:`current_values_of_shipped_job`). A value that was edited stays,
     and so does the inline prompt of a job that launches a workflow, which is
     never sent.
-
-    A built-in job that every mode switches on by default and that the file
-    has no entry for is added as the installer writes it: the file is from
-    before the job existed. A job that was switched off has its entry, with
-    ``enabled: false``, and stays off.
 
     The file is dumped again for this, which would lose comments and layout.
     So it is written only when it has none to lose: the text after the
@@ -2055,27 +2050,10 @@ def rewrite_superseded_cron_values(system_file: Path) -> dict[str, tuple[str, ..
         if current:
             entry.update(current)
             written.setdefault(entry["id"], set()).update(current)
-    present = {entry.get("id") for entry in document["jobs"] if isinstance(entry, dict)}
-    for job_id in _crons_on_in_every_mode():
-        if job_id not in present:
-            document["jobs"].append(_installer_entry(job_id))
-            written[job_id] = {"added"}
     if not written:
         return {}
     publish_text(path, opening + yaml.safe_dump(document, default_flow_style=False, sort_keys=False))
     return {job_id: tuple(sorted(keys)) for job_id, keys in written.items()}
-
-
-def _crons_on_in_every_mode() -> tuple[str, ...]:
-    """The optional jobs that every mode switches on by default."""
-    on = set.intersection(*(set(ids) for ids in DEFAULT_CRONS.values()))
-    return tuple(cron["id"] for cron in PRODUCTIVITY_CRONS if cron["id"] in on)
-
-
-def _installer_entry(job_id: str) -> dict[str, Any]:
-    """The entry the installer writes for an optional job that is on."""
-    jobs = build_cron_jobs(SetupChoices(mode="worker", enabled_crons=[job_id]))
-    return next(job for job in jobs if job["id"] == job_id)
 
 
 _WEEKDAYS = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
