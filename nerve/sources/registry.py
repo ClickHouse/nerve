@@ -284,6 +284,36 @@ def build_source_runners(
             gh_repos.deny_authors or [],
         )
 
+    # Linear: hosted only. The channel gateway polls Linear with the agent's
+    # Linear connector and streams the records; the runner drains them with
+    # the rules of sync.linear as the guardrail, which the gateway applied
+    # before it stored them.
+    linear = config.sync.linear
+    if linear.enabled:
+        from nerve.channels.hosted.sources import LINEAR
+        from nerve.sources.filters import DataRule, InboxFilter
+        from nerve.sources.hosted import HostedSource
+
+        runners.append(SourceRunner(
+            source=HostedSource(db, LINEAR),
+            db=db,
+            batch_size=linear.batch_size,
+            condense=linear.condense,
+            condense_model=condense_model,
+            condense_client_factory=condense_factory,
+            ttl_days=ttl_days,
+            inbox_filter=InboxFilter(rules=[
+                DataRule(rule.path, allow=tuple(rule.allow), deny=tuple(rule.deny))
+                for rule in linear.rules
+            ]),
+        ))
+        logger.info(
+            "Registered source: linear (hosted) (batch=%d, events=%s, inbox=%s, "
+            "include_bots=%s, drop_own_actions=%s, rules=%d)",
+            linear.batch_size, linear.events, linear.inbox, linear.include_bots,
+            linear.drop_own_actions, len(linear.rules),
+        )
+
     # Channel source drains. Not a poll: the channel transport already
     # delivered and buffered these events. This only moves them into the
     # inbox. What to watch is a property of the channel, so the config lives at

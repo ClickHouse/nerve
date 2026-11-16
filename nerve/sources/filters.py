@@ -29,6 +29,12 @@ Matching is case-insensitive and supports shell-style globs
 (``ClickHouse/*``). List-valued metadata (e.g. Gmail ``labels``) matches if
 *any* element matches. Non-string scalars (e.g. Telegram ``chat_id``) are
 coerced to ``str`` before matching.
+
+A generic hosted source (Linear, for example) uses :class:`DataRule`: the
+record's metadata holds the JSON data that the provider sent, and each rule
+names a value in it with a JSON Pointer. The channel gateway applies the same
+rules before it stores a record, so these semantics are the channel
+contract's, and the two sides drop the same records.
 """
 
 from __future__ import annotations
@@ -36,13 +42,26 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 import logging
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
+
+from nerve.sources.source_json import (
+    SourceJSONError,
+    canonical_number,
+    pointer_tokens,
+    record_data,
+    resolve_pointer,
+)
 
 if TYPE_CHECKING:
     from nerve.sources.models import SourceRecord
 
 logger = logging.getLogger(__name__)
+
+# The names of a rule's two lists, as a log line names the one that fired.
+ALLOW = "allow"
+DENY = "deny"
 
 
 def _norm(value: object) -> str:
@@ -50,7 +69,7 @@ def _norm(value: object) -> str:
     return str(value).strip().lower()
 
 
-def matches_any(value: object, patterns: list[str]) -> bool:
+def matches_any(value: object, patterns: Iterable[str]) -> bool:
     """Case-insensitive shell-glob match of *value* against any pattern.
 
     The guardrail rules, for a source that applies them itself (the GitHub
@@ -101,34 +120,114 @@ class FieldRule:
             return [str(v) for v in raw if v is not None]
         return [str(raw)]
 
+    def fired_list(self, record: SourceRecord) -> str:
+        """``deny`` or ``allow``: the list that drops *record*, for a log line."""
+        return DENY if self.deny and any(matches_any(v, self.deny) for v in self._values(record)) else ALLOW
+
     def passes(self, record: SourceRecord) -> bool:
         """Return True if *record* satisfies this rule (should be kept)."""
         if record.record_type in self.exempt_record_types:
             return True
-        values = self._values(record)
+        return _passes(self._values(record), self.allow, self.deny)
 
-        # deny wins — drop on any deny match.
-        if self.deny and any(matches_any(v, self.deny) for v in values):
+
+def _passes(values: list[str], allow: Sequence[str], deny: Sequence[str]) -> bool:
+    """The decision of one rule on its values, with the semantics at the top of this module."""
+    # Deny wins: drop on any deny match.
+    if deny and any(matches_any(v, deny) for v in values):
+        return False
+
+    # Allow gate: when set, require a match. An absent field fails closed.
+    if allow:
+        if not values:
             return False
+        return any(matches_any(v, allow) for v in values)
 
-        # allow gate — when set, require a match. An absent field fails closed.
-        if self.allow:
-            if not values:
-                return False
-            return any(matches_any(v, self.allow) for v in values)
+    return True
 
-        return True
+
+@dataclass(frozen=True)
+class DataRule:
+    """Allow/deny matching on a value in the data of a generic hosted record.
+
+    ``path`` is a JSON Pointer (RFC 6901) into the record's data, the JSON
+    object that the provider sent, such as ``/actor/kind``. The record's
+    metadata holds it next to its schema (see
+    :func:`nerve.sources.source_json.record_data`); a record without data
+    has no value at any path. The values at the path are:
+
+    * a string, as it is;
+    * a number, as its canonical JSON text: ``2`` for ``2.0``, ``1.5``;
+    * ``true``, ``false`` and ``null``, as those words;
+    * each element of an array that is one of the above.
+
+    An object, an array or object in an array, an empty array, and a path
+    that names nothing in the data give no value. ``allow`` and ``deny``
+    match those values as :class:`FieldRule` matches: a deny match drops the
+    record, and a non-empty allow list drops a record without a match, also
+    one without a value. A path that is not a valid JSON Pointer names
+    nothing.
+    """
+
+    path: str
+    allow: tuple[str, ...] = ()
+    deny: tuple[str, ...] = ()
+
+    @property
+    def field(self) -> str:
+        """The path, as the runner's drop log and the drop hook name a rule."""
+        return self.path
+
+    @property
+    def active(self) -> bool:
+        return bool(self.allow or self.deny)
+
+    def _resolved(self, record: SourceRecord) -> tuple[bool, Any]:
+        tokens = pointer_tokens(self.path)
+        stored = record_data(record.metadata)
+        if tokens is None or stored is None:
+            return False, None
+        return resolve_pointer(stored[1], tokens)
+
+    def values(self, record: SourceRecord) -> list[str]:
+        """The values that the rule judges in *record*."""
+        found, value = self._resolved(record)
+        if not found:
+            return []
+        values: list[str] = []
+        for element in value if isinstance(value, (list, tuple)) else [value]:
+            if isinstance(element, str):
+                values.append(element)
+            elif element is None:
+                values.append("null")
+            elif isinstance(element, bool):
+                values.append("true" if element else "false")
+            elif isinstance(element, (int, float)):
+                try:
+                    values.append(canonical_number(element))
+                except SourceJSONError:  # a number that no JSON data can hold
+                    continue
+        return values
+
+    def fired_list(self, record: SourceRecord) -> str:
+        """``deny`` or ``allow``: the list of the rule, which is the one that drops *record*."""
+        return DENY if self.deny else ALLOW
+
+    def passes(self, record: SourceRecord) -> bool:
+        """Return True if *record* satisfies this rule (should be kept)."""
+        return _passes(self.values(record), self.allow, self.deny)
 
 
 @dataclass
 class InboxFilter:
-    """A set of :class:`FieldRule` applied to source records (logical AND).
+    """A set of rules applied to source records (logical AND).
 
-    An inactive filter (no rules, or all rules empty) is a pass-through —
+    Each rule is a :class:`FieldRule` or a :class:`DataRule`. An inactive
+    filter (no rules, or all rules empty) is a pass-through:
     :meth:`partition` returns every record as kept with nothing dropped.
     """
 
-    rules: list[FieldRule] = dataclasses.field(default_factory=list)
+    rules: list[FieldRule | DataRule] = dataclasses.field(default_factory=list)
 
     @property
     def active(self) -> bool:
@@ -139,7 +238,7 @@ class InboxFilter:
         """Return True if *record* passes all rules (should be kept)."""
         return all(r.passes(record) for r in self.rules)
 
-    def rejects(self, record: SourceRecord) -> FieldRule | None:
+    def rejects(self, record: SourceRecord) -> FieldRule | DataRule | None:
         """The first rule that drops *record*, or None if it passes.
 
         Dropped records are never persisted, so this is the only way to tell

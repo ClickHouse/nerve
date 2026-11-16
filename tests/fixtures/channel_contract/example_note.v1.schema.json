@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "example.note/1",
+  "description": "Test-only data of the record type example_note of the provider example. No gateway produces it.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event", "note", "actor"],
+  "properties": {
+    "event": {"type": "string", "enum": ["created", "commented"]},
+    "note": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "key", "title"],
+      "properties": {
+        "id": {"type": "string"},
+        "key": {"type": "string", "maxLength": 32},
+        "title": {"type": "string", "maxLength": 256},
+        "url": {"type": "string"},
+        "priority": {"type": "integer", "minimum": 0, "maximum": 4},
+        "labels": {"type": "array", "maxItems": 16, "items": {"type": "string"}}
+      }
+    },
+    "actor": {"$ref": "#/$defs/person"},
+    "comment": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "required": ["id", "body"],
+      "properties": {
+        "id": {"type": "string"},
+        "body": {"type": "string", "maxLength": 4000}
+      }
+    },
+    "score": {"type": "number"}
+  },
+  "$defs": {
+    "person": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "kind"],
+      "properties": {
+        "id": {"type": "string"},
+        "name": {"type": "string"},
+        "kind": {"type": "string", "enum": ["user", "bot"]}
+      }
+    }
+  }
+}

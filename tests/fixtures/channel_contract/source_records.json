@@ -1,0 +1,491 @@
+{
+  "records": [
+    {
+      "name": "a generic record",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "example_note",
+        "schema": "example.note/1",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": {
+          "event": "created",
+          "note": {
+            "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+            "key": "NOTE-7",
+            "title": "Plan"
+          },
+          "actor": {
+            "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+            "kind": "user"
+          }
+        }
+      },
+      "reason": ""
+    },
+    {
+      "name": "the largest major version",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "example_note",
+        "schema": "example.note/999999",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": {
+          "event": "created",
+          "note": {
+            "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+            "key": "NOTE-7",
+            "title": "Plan"
+          },
+          "actor": {
+            "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+            "kind": "user"
+          }
+        }
+      },
+      "reason": ""
+    },
+    {
+      "name": "a record type of another provider",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "other_note",
+        "schema": "example.note/1",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": {
+          "event": "created",
+          "note": {
+            "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+            "key": "NOTE-7",
+            "title": "Plan"
+          },
+          "actor": {
+            "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+            "kind": "user"
+          }
+        }
+      },
+      "reason": "kind_unsupported"
+    },
+    {
+      "name": "a record type without the provider",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "note",
+        "schema": "example.note/1",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": {
+          "event": "created",
+          "note": {
+            "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+            "key": "NOTE-7",
+            "title": "Plan"
+          },
+          "actor": {
+            "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+            "kind": "user"
+          }
+        }
+      },
+      "reason": "kind_unsupported"
+    },
+    {
+      "name": "an upper-case record type",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "example_Note",
+        "schema": "example.note/1",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": {
+          "event": "created",
+          "note": {
+            "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+            "key": "NOTE-7",
+            "title": "Plan"
+          },
+          "actor": {
+            "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+            "kind": "user"
+          }
+        }
+      },
+      "reason": "kind_unsupported"
+    },
+    {
+      "name": "a record type of more than 64 bytes",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "example_nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn",
+        "schema": "example.nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn/1",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": {
+          "event": "created",
+          "note": {
+            "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+            "key": "NOTE-7",
+            "title": "Plan"
+          },
+          "actor": {
+            "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+            "kind": "user"
+          }
+        }
+      },
+      "reason": "kind_unsupported"
+    },
+    {
+      "name": "no schema",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "example_note",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": {
+          "event": "created",
+          "note": {
+            "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+            "key": "NOTE-7",
+            "title": "Plan"
+          },
+          "actor": {
+            "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+            "kind": "user"
+          }
+        }
+      },
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "a schema of another record type",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "example_note",
+        "schema": "example.task/1",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": {
+          "event": "created",
+          "note": {
+            "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+            "key": "NOTE-7",
+            "title": "Plan"
+          },
+          "actor": {
+            "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+            "kind": "user"
+          }
+        }
+      },
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "a schema of another provider",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "example_note",
+        "schema": "other.note/1",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": {
+          "event": "created",
+          "note": {
+            "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+            "key": "NOTE-7",
+            "title": "Plan"
+          },
+          "actor": {
+            "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+            "kind": "user"
+          }
+        }
+      },
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "a schema without a major version",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "example_note",
+        "schema": "example.note",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": {
+          "event": "created",
+          "note": {
+            "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+            "key": "NOTE-7",
+            "title": "Plan"
+          },
+          "actor": {
+            "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+            "kind": "user"
+          }
+        }
+      },
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "empty metadata",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "example_note",
+        "schema": "example.note/1",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": {
+          "event": "created",
+          "note": {
+            "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+            "key": "NOTE-7",
+            "title": "Plan"
+          },
+          "actor": {
+            "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+            "kind": "user"
+          }
+        },
+        "metadata": []
+      },
+      "reason": ""
+    },
+    {
+      "name": "metadata",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "example_note",
+        "schema": "example.note/1",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": {
+          "event": "created",
+          "note": {
+            "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+            "key": "NOTE-7",
+            "title": "Plan"
+          },
+          "actor": {
+            "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+            "kind": "user"
+          }
+        },
+        "metadata": [
+          {
+            "key": "reason",
+            "value": "mention"
+          }
+        ]
+      },
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "no data",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "example_note",
+        "schema": "example.note/1",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z"
+      },
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "null data",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "example_note",
+        "schema": "example.note/1",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": null
+      },
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "data that is not an object",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "example_note",
+        "schema": "example.note/1",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": [
+          {
+            "event": "created",
+            "note": {
+              "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+              "key": "NOTE-7",
+              "title": "Plan"
+            },
+            "actor": {
+              "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+              "kind": "user"
+            }
+          }
+        ]
+      },
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "data of nine levels",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "example_note",
+        "schema": "example.note/1",
+        "summary": "[NOTE-7] New note: Plan",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": {
+          "a": {
+            "b": {
+              "c": {
+                "d": {
+                  "e": {
+                    "f": {
+                      "g": {
+                        "h": {}
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "reason": "limit_exceeded"
+    },
+    {
+      "name": "an empty summary",
+      "provider": "example",
+      "record": {
+        "id": "note:5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+        "record_type": "example_note",
+        "schema": "example.note/1",
+        "summary": "",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "data": {
+          "event": "created",
+          "note": {
+            "id": "5f0c1b9e-3c2a-4d7e-9b1f-8a6d2e4c7b30",
+            "key": "NOTE-7",
+            "title": "Plan"
+          },
+          "actor": {
+            "id": "0b7d4c2a-6e1f-4a3b-9c8d-2f5e7a1b3c49",
+            "kind": "user"
+          }
+        }
+      },
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "a github record",
+      "provider": "github",
+      "record": {
+        "id": "9000000001",
+        "record_type": "github_notification",
+        "summary": "[owner/repo] Fix",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "metadata": [
+          {
+            "key": "reason",
+            "value": "mention"
+          }
+        ]
+      },
+      "reason": ""
+    },
+    {
+      "name": "a github record with a schema",
+      "provider": "github",
+      "record": {
+        "id": "9000000001",
+        "record_type": "github_notification",
+        "summary": "[owner/repo] Fix",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "metadata": [
+          {
+            "key": "reason",
+            "value": "mention"
+          }
+        ],
+        "schema": "github.notification/1"
+      },
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "a github record with data",
+      "provider": "github",
+      "record": {
+        "id": "9000000001",
+        "record_type": "github_notification",
+        "summary": "[owner/repo] Fix",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "metadata": [
+          {
+            "key": "reason",
+            "value": "mention"
+          }
+        ],
+        "data": {}
+      },
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "a github record with an empty schema",
+      "provider": "github",
+      "record": {
+        "id": "9000000001",
+        "record_type": "github_notification",
+        "summary": "[owner/repo] Fix",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "metadata": [
+          {
+            "key": "reason",
+            "value": "mention"
+          }
+        ],
+        "schema": ""
+      },
+      "reason": ""
+    },
+    {
+      "name": "a github record with null data",
+      "provider": "github",
+      "record": {
+        "id": "9000000001",
+        "record_type": "github_notification",
+        "summary": "[owner/repo] Fix",
+        "timestamp": "2026-11-10T08:00:00Z",
+        "metadata": [
+          {
+            "key": "reason",
+            "value": "mention"
+          }
+        ],
+        "data": null
+      },
+      "reason": "malformed_frame"
+    }
+  ]
+}

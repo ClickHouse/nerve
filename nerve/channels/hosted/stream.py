@@ -645,9 +645,17 @@ class ChannelStream:
     def _subscriptions_frame(self, request_id: str) -> str | None:
         """The ``subscriptions`` frame from the current settings, encoded.
 
+        Subscriptions that the gateway would refuse, or whose frame exceeds
+        its frame limit, go narrower in two steps. First without the filter
+        patterns of the GitHub sources, which the inbox guardrail still
+        applies. Then also without each subscription that carries rules (a
+        generic source, such as Linear): it is never sent without them,
+        because the gateway would then store the records that they drop, so
+        it leaves the frame and the gateway stores nothing for it.
+
         ``None`` when there is nothing to send: no hosted sources, settings
         that cannot be read, or subscriptions that the gateway would refuse
-        even without their filter patterns.
+        even so.
         """
         try:
             body = self._subscriptions()
@@ -656,37 +664,42 @@ class ChannelStream:
             return None
         if body is None:
             return None
+        text, problem = self._encoded_subscriptions(body, request_id)
+        if text is not None:
+            return text
+        wide = body.without_filters()
+        text, still = self._encoded_subscriptions(wide, request_id)
+        if text is not None:
+            logger.warning(
+                "Channel stream %d: source subscriptions exceed the gateway's bounds or frame "
+                "limit (%s); sending them without filter patterns", self.id, problem,
+            )
+            return text
+        ruled = wide.ruled_providers()
+        if ruled:
+            text, still = self._encoded_subscriptions(wide.without_providers(ruled), request_id)
+            if text is not None:
+                logger.error(
+                    "Channel stream %d: the subscriptions of %s are not sent: with their rules "
+                    "the subscriptions exceed the gateway's bounds or frame limit (%s), and a "
+                    "source with rules is never sent without them. The gateway stores nothing "
+                    "for these providers until %s are shorter; nerve doctor checks them",
+                    self.id, ", ".join(ruled), problem, ", ".join(f"sync.{p}.rules" for p in ruled),
+                )
+                return text
+        logger.warning(
+            "Channel stream %d: source subscriptions not sent: the gateway would refuse them "
+            "(%s)", self.id, still,
+        )
+        return None
+
+    def _encoded_subscriptions(self, body: Subscriptions, request_id: str) -> tuple[str | None, str]:
+        """The frame of *body*, or ``None`` and why the gateway would refuse it."""
         try:
             body.validate()
+            return self._encode("subscriptions", body, None, request_id), ""
         except Rejected as error:
-            wide = body.without_filters()
-            try:
-                wide.validate()
-            except Rejected as still:
-                logger.warning(
-                    "Channel stream %d: source subscriptions not sent: the gateway would "
-                    "refuse them (%s)", self.id, still.detail,
-                )
-                return None
-            logger.warning(
-                "Channel stream %d: source subscriptions exceed the gateway's bounds (%s); "
-                "sending them without filter patterns", self.id, error.detail,
-            )
-            body = wide
-        try:
-            try:
-                return self._encode("subscriptions", body, None, request_id)
-            except Rejected as error:
-                if error.reason != RejectionReason.FRAME_TOO_LARGE:
-                    raise
-                logger.warning(
-                    "Channel stream %d: source subscriptions exceed the gateway's frame "
-                    "limit; sending them without filter patterns", self.id,
-                )
-                return self._encode("subscriptions", body.without_filters(), None, request_id)
-        except Rejected as error:
-            logger.warning("Channel stream %d: source subscriptions not sent: %s", self.id, error)
-            return None
+            return None, error.detail
 
     def _publish_done(self, task: asyncio.Task) -> None:
         """Log a failure of the publish that negotiation started, when it happens."""

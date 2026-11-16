@@ -7,6 +7,7 @@ trigger any actual sync work (that's the cron-driven source runners).
 
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime, timezone
 
@@ -19,6 +20,7 @@ from nerve.agent.tools.schemas import (
     SYNC_STATUS_SCHEMA,
 )
 from nerve.sources.models import cursor_text
+from nerve.sources.source_json import record_data
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +77,13 @@ def _format_source_batch(messages: list[dict], source: str | None = None) -> str
         parts.append(f"**Type:** {record_type} | **Time:** {timestamp} ({relative}) | **seq:** {rowid}")
 
         metadata = m.get("metadata")
-        if metadata and isinstance(metadata, dict):
+        generic = record_data(metadata)
+        if generic is not None:
+            # The data of a generic hosted source, every member as it came.
+            schema, data = generic
+            parts.append(f"**Schema:** {schema}")
+            parts.append(f"**Data:** {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}")
+        elif metadata and isinstance(metadata, dict):
             interesting = {k: v for k, v in metadata.items() if v and k not in ("message_id",)}
             if interesting:
                 meta_str = ", ".join(f"{k}={v}" for k, v in interesting.items())

@@ -1,0 +1,186 @@
+{
+  "canonical": [
+    {
+      "name": "white space and member order",
+      "json": "{ \"b\" : 2 , \"a\" : [ 1 , { \"d\" : true , \"c\" : null } ] }",
+      "canonical": "{\"a\":[1,{\"c\":null,\"d\":true}],\"b\":2}"
+    },
+    {
+      "name": "the example of RFC 8785 section 3.2.2",
+      "json": "{\n  \"numbers\": [333333333.33333329, 1E30, 4.50, 2e-3, 0.000000000000000000000000001],\n  \"string\": \"\\u20ac$\\u000F\\u000aA'\\u0042\\u0022\\u005c\\\\\\\"\\/\",\n  \"literals\": [null, true, false]\n}",
+      "canonical": "{\"literals\":[null,true,false],\"numbers\":[333333333.3333333,1e+30,4.5,0.002,1e-27],\"string\":\"\u20ac$\\u000f\\nA'B\\\"\\\\\\\\\\\"/\"}"
+    },
+    {
+      "name": "member names sorted by UTF-16 code units (RFC 8785 section 3.2.3)",
+      "json": "{\"\\u20ac\":\"Euro Sign\",\"\\r\":\"Carriage Return\",\"\\ufb33\":\"Hebrew Letter Dalet With Dagesh\",\"1\":\"One\",\"\\ud83d\\ude00\":\"Emoji: Grinning Face\",\"\\u0080\":\"Control\",\"\\u00f6\":\"Latin Small Letter O With Diaeresis\"}",
+      "canonical": "{\"\\r\":\"Carriage Return\",\"1\":\"One\",\"\u0080\":\"Control\",\"\u00f6\":\"Latin Small Letter O With Diaeresis\",\"\u20ac\":\"Euro Sign\",\"\ud83d\ude00\":\"Emoji: Grinning Face\",\"\ufb33\":\"Hebrew Letter Dalet With Dagesh\"}"
+    },
+    {
+      "name": "characters that need no escape stay as they are",
+      "json": "{\"a\\/b\":\"<>&\\u007f\\u2028\\u2029\\/\\u00e9\"}",
+      "canonical": "{\"a/b\":\"<>&\u007f\u2028\u2029/\u00e9\"}"
+    },
+    {
+      "name": "control characters use the short escapes or lowercase hexadecimal",
+      "json": "{\"a\":\"\\u0000\\u0001\\u001F\\u0008\\u000c\\u000A\\u000d\\u0009\"}",
+      "canonical": "{\"a\":\"\\u0000\\u0001\\u001f\\b\\f\\n\\r\\t\"}"
+    },
+    {
+      "name": "numbers in their shortest ECMAScript form",
+      "json": "[0, -0, -0.0, 1.0, 100e-2, 1E2, 1e21, 1e-7, 0.000001, 1e-6, 0.1, 1.5e300, 123456789012345678901234567890, 12345678901234567890, 9007199254740993, -9007199254740992, 5e-324, -5e-324, 1e-400, -1e-400, 1.7976931348623157e308, -1.7976931348623157e308, 295147905179352830000, 9.999999999999997e+22, 1e23, 1.0000000000000001e+23, 999999999999999700000, 999999999999999900000, 999999999999999999999, 9.999999999999997e-7, 333333333.3333332, 333333333.33333325, 333333333.3333333, 333333333.3333334, 333333333.33333343, -0.0000033333333333333333, 1424953923781206.2]",
+      "canonical": "[0,0,0,1,1,100,1e+21,1e-7,0.000001,0.000001,0.1,1.5e+300,1.2345678901234568e+29,12345678901234567000,9007199254740992,-9007199254740992,5e-324,-5e-324,0,0,1.7976931348623157e+308,-1.7976931348623157e+308,295147905179352830000,9.999999999999997e+22,1e+23,1.0000000000000001e+23,999999999999999700000,999999999999999900000,1e+21,9.999999999999997e-7,333333333.3333332,333333333.33333325,333333333.3333333,333333333.3333334,333333333.33333343,-0.0000033333333333333333,1424953923781206.2]"
+    },
+    {
+      "name": "empty containers and strings",
+      "json": "{\"c\":\"\",\"b\":[],\"a\":{}}",
+      "canonical": "{\"a\":{},\"b\":[],\"c\":\"\"}"
+    },
+    {
+      "name": "eight levels of objects and arrays",
+      "json": "{\"a\":[[[[[[[1]]]]]]]}",
+      "canonical": "{\"a\":[[[[[[[1]]]]]]]}"
+    }
+  ],
+  "rejected": [
+    {
+      "name": "an array",
+      "json": "[]",
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "a string",
+      "json": "\"text\"",
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "null",
+      "json": "null",
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "invalid JSON",
+      "json": "{\"a\":}",
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "trailing data",
+      "json": "{} {}",
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "a repeated member name",
+      "json": "{\"a\":1,\"a\":1}",
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "a repeated member name in a nested object",
+      "json": "{\"a\":[{\"b\":1,\"b\":2}]}",
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "an unpaired high surrogate escape",
+      "json": "{\"a\":\"\\ud800\"}",
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "an unpaired low surrogate escape",
+      "json": "{\"a\":\"\\udc00x\"}",
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "a number outside binary64",
+      "json": "{\"a\":-1e309}",
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "NaN",
+      "json": "{\"a\":NaN}",
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "Infinity",
+      "json": "{\"a\":Infinity}",
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "a leading zero",
+      "json": "{\"a\":01}",
+      "reason": "malformed_frame"
+    },
+    {
+      "name": "nine levels of arrays",
+      "json": "{\"a\":[[[[[[[[1]]]]]]]]}",
+      "reason": "limit_exceeded"
+    },
+    {
+      "name": "nine levels of objects",
+      "json": "{\"a\":{\"b\":{\"c\":{\"d\":{\"e\":{\"f\":{\"g\":{\"h\":{}}}}}}}}}",
+      "reason": "limit_exceeded"
+    }
+  ],
+  "bounds": [
+    {
+      "name": "the largest data",
+      "object": "data",
+      "prefix": "{\"a\":\"",
+      "repeat": "x",
+      "count": 32760,
+      "suffix": "\"}",
+      "reason": ""
+    },
+    {
+      "name": "data one byte too large",
+      "object": "data",
+      "prefix": "{\"a\":\"",
+      "repeat": "x",
+      "count": 32761,
+      "suffix": "\"}",
+      "reason": "limit_exceeded"
+    },
+    {
+      "name": "white space does not count",
+      "object": "data",
+      "prefix": "{ \"a\" : \"",
+      "repeat": "x",
+      "count": 32760,
+      "suffix": "\" }",
+      "reason": ""
+    },
+    {
+      "name": "an escape counts as the character that it writes",
+      "object": "data",
+      "prefix": "{\"a\":\"",
+      "repeat": "\\u0078",
+      "count": 32760,
+      "suffix": "\"}",
+      "reason": ""
+    },
+    {
+      "name": "a two-byte character counts two bytes",
+      "object": "data",
+      "prefix": "{\"a\":\"x",
+      "repeat": "\u00e9",
+      "count": 16380,
+      "suffix": "\"}",
+      "reason": "limit_exceeded"
+    },
+    {
+      "name": "the largest settings",
+      "object": "settings",
+      "prefix": "{\"a\":\"",
+      "repeat": "x",
+      "count": 8184,
+      "suffix": "\"}",
+      "reason": ""
+    },
+    {
+      "name": "settings one byte too large",
+      "object": "settings",
+      "prefix": "{\"a\":\"",
+      "repeat": "x",
+      "count": 8185,
+      "suffix": "\"}",
+      "reason": "limit_exceeded"
+    }
+  ]
+}

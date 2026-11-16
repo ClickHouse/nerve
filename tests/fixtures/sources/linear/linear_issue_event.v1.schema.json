@@ -1,0 +1,145 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "linear.issue_event/1",
+  "description": "Data of the record type linear_issue_event of the provider linear: one event of an issue in the projects that the agent's Linear connector reaches. It holds only what the connector would show the agent: no item of a project outside that scope, and no project outside it, by name or by ID.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event", "via", "server", "issue", "actor"],
+  "properties": {
+    "event": {
+      "description": "What happened.",
+      "type": "string",
+      "enum": [
+        "issue_created", "assigned", "unassigned", "delegated", "state_changed", "priority_changed",
+        "moved_in", "commented", "mentioned"
+      ]
+    },
+    "via": {
+      "description": "watch: an event of an issue in the projects of the scope. inbox: a notification of the Linear user of the agent's own credential about it.",
+      "type": "string",
+      "enum": ["watch", "inbox"]
+    },
+    "server": {
+      "description": "The catalog entry of the Linear connector whose credential and scope read the event: its catalog server ID and its display name.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name"],
+      "properties": {
+        "id": {"type": "string", "maxLength": 32},
+        "name": {"$ref": "#/$defs/name"}
+      }
+    },
+    "issue": {
+      "description": "The issue as it is when the gateway read the event.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "identifier", "title", "url", "project"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "identifier": {"type": "string", "maxLength": 64},
+        "title": {"$ref": "#/$defs/line"},
+        "url": {"$ref": "#/$defs/url"},
+        "team": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["key"],
+          "properties": {
+            "key": {"type": "string", "maxLength": 64}
+          }
+        },
+        "project": {
+          "description": "The project of the issue, always a project of the scope.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "name"],
+          "properties": {
+            "id": {"$ref": "#/$defs/id"},
+            "name": {"$ref": "#/$defs/name"}
+          }
+        },
+        "state": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["name", "type"],
+          "properties": {
+            "name": {"$ref": "#/$defs/name"},
+            "type": {"type": "string", "maxLength": 64}
+          }
+        },
+        "priority": {
+          "description": "0 no priority, 1 urgent, 2 high, 3 medium, 4 low.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4
+        },
+        "assignee": {"$ref": "#/$defs/user"},
+        "delegate": {"$ref": "#/$defs/user"}
+      }
+    },
+    "comment": {
+      "description": "The comment of a commented event, and of a mentioned event whose mention is in a comment.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "url", "body"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "url": {"$ref": "#/$defs/url"},
+        "body": {"type": "string", "maxLength": 4000},
+        "truncated": {"description": "True when the body was cut to its bound.", "type": "boolean"},
+        "parent_id": {"$ref": "#/$defs/id"}
+      }
+    },
+    "actor": {
+      "description": "Who acted. kind: user, a person; app, the user of an OAuth app, such as an agent; bot, an automation of Linear; integration, an integration such as GitHub or Slack; external, a person outside the workspace; system, a change without an actor.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "id": {"type": "string", "maxLength": 64},
+        "name": {"$ref": "#/$defs/name"},
+        "kind": {"type": "string", "enum": ["user", "app", "bot", "integration", "external", "system"]},
+        "credential_user": {
+          "description": "True when the actor is the Linear user of the credential that read the event.",
+          "type": "boolean"
+        }
+      }
+    },
+    "changes": {
+      "description": "The fields that the event changed.",
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["field"],
+        "properties": {
+          "field": {"type": "string", "enum": ["assignee", "delegate", "state", "priority", "project"]},
+          "from": {"$ref": "#/$defs/value"},
+          "to": {"$ref": "#/$defs/value"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": {"type": "string", "maxLength": 64},
+    "name": {"type": "string", "maxLength": 256},
+    "line": {"type": "string", "maxLength": 1000},
+    "url": {"type": "string", "maxLength": 2048},
+    "user": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "name": {"$ref": "#/$defs/name"}
+      }
+    },
+    "value": {
+      "description": "A value of a field: a name of a user, a state, or a project, or a priority.",
+      "type": ["string", "integer"],
+      "maxLength": 256,
+      "minimum": 0,
+      "maximum": 4
+    }
+  }
+}

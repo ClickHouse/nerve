@@ -74,9 +74,10 @@ def hosted_channel_providers(config: NerveConfig) -> list[str]:
 def hosted_providers(config: NerveConfig) -> list[str]:
     """Every provider whose traffic comes from the gateway: chat, then sources.
 
-    A hosted source that is switched off is included too: the gateway is
-    told that the agent subscribes to nothing, and the records already on
-    their way are kept for when it is switched on.
+    A hosted GitHub source that is switched off is included too: the gateway
+    is told that the agent subscribes to nothing, and the records already on
+    their way are kept for when it is switched on. Linear is included while
+    it is switched on (see :func:`~nerve.channels.hosted.sources.hosted_sources`).
     """
     return hosted_channel_providers(config) + hosted_sources(config)
 

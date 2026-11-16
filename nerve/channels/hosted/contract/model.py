@@ -13,6 +13,7 @@ import dataclasses
 import re
 import unicodedata
 import uuid
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -24,8 +25,10 @@ from nerve.channels.hosted.contract.wire import (
     omit_empty,
     parse_json,
     reject,
+    source_json,
     struct,
 )
+from nerve.sources.source_json import SourceJSONError, check_source_json_object, pointer_tokens
 
 _record = dataclasses.dataclass(frozen=True)
 
@@ -81,6 +84,29 @@ _REPO_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_.-]{1,100
 # A provider name is a lowercase token of at most this many bytes.
 MAX_PROVIDER_BYTES = 64
 _PROVIDER_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-.")
+# The provider of GitHub notifications and pull request activity.
+GITHUB_PROVIDER = "github"
+# The providers with a closed vocabulary: their records carry metadata from a
+# closed set of keys, and their subscriptions have members of their own.
+# Every other provider is a generic source: its records carry a schema and
+# data that the provider defines, and its subscriptions carry settings,
+# record schemas, and rules (see SourceSubscription).
+CLOSED_PROVIDERS = frozenset({GITHUB_PROVIDER, REPO_WATCH_PROVIDER, EMAIL_PROVIDER})
+# The conversation kind of a tracked item, such as an issue.
+CONVERSATION_KIND_ITEM = "item"
+# Bounds of generic sources. The data of a record and the settings of a
+# subscription count the UTF-8 bytes of their canonical form.
+MAX_SOURCE_DATA_BYTES = 32 * 1024
+MAX_SOURCE_SETTINGS_BYTES = 8 * 1024
+MAX_RECORD_TYPE_BYTES = 64
+MAX_RECORD_SCHEMA_MAJOR_DIGITS = 6
+MAX_SUBSCRIPTION_SCHEMAS = 16
+MAX_SOURCE_RULES = 16
+MAX_SOURCE_RULE_PATTERNS = 64
+# The name of a generic record type after its provider and "_".
+_RECORD_TYPE_NAME = re.compile(r"[a-z0-9_]+")
+# The major version of a record schema: decimal, without a leading zero.
+_MAJOR_VERSION = re.compile(rf"[1-9][0-9]{{0,{MAX_RECORD_SCHEMA_MAJOR_DIGITS - 1}}}")
 # How Nerve answers the turns of a connection's events (ConnectionBehaviour).
 ANSWER_POST = "post"
 ANSWER_TOOL = "tool"
@@ -153,6 +179,54 @@ def valid_provider(provider: str) -> bool:
         and all(character in _PROVIDER_CHARACTERS for character in provider)
         and len(provider) <= MAX_PROVIDER_BYTES
     )
+
+
+def generic_provider(provider: str) -> bool:
+    """Whether *provider* is a generic source (not in :data:`CLOSED_PROVIDERS`)."""
+    return provider not in CLOSED_PROVIDERS
+
+
+def valid_record_type(provider: str, record_type: str) -> bool:
+    """Whether a generic *provider* can produce *record_type*.
+
+    That is the provider, ``_``, and a name of lowercase ASCII letters,
+    digits and ``_``, at most :data:`MAX_RECORD_TYPE_BYTES` in total, such as
+    ``linear_issue_event``.
+    """
+    prefix = f"{provider}_"
+    return (
+        record_type.startswith(prefix)
+        and byte_length(record_type) <= MAX_RECORD_TYPE_BYTES
+        and _RECORD_TYPE_NAME.fullmatch(record_type[len(prefix):]) is not None
+    )
+
+
+def schema_record_type(provider: str, schema: str) -> str:
+    """The record type that a record schema of a generic *provider* names.
+
+    A schema is the provider, ``.``, the record type's name, ``/``, and its
+    major version (up to :data:`MAX_RECORD_SCHEMA_MAJOR_DIGITS` digits,
+    without a leading zero): ``linear.issue_event/1`` names the record type
+    ``linear_issue_event``. Anything else is malformed.
+    """
+    prefix = f"{provider}."
+    name, slash, major = schema[len(prefix):].partition("/")
+    record_type = f"{provider}_{name}"
+    if not (
+        schema.startswith(prefix) and slash and generic_provider(provider)
+        and valid_record_type(provider, record_type) and _MAJOR_VERSION.fullmatch(major)
+    ):
+        malformed(f"record schema is not a schema of provider {provider!r}")
+    return record_type
+
+
+def _validate_source_json(name: str, value: dict[str, Any], maximum_bytes: int) -> None:
+    """Check a source JSON object (the data of a record, the settings of a subscription)."""
+    try:
+        check_source_json_object(value, maximum_bytes)
+    except SourceJSONError as error:
+        reason = RejectionReason.LIMIT_EXCEEDED if error.limit else RejectionReason.MALFORMED_FRAME
+        reject(reason, f"{name} {error}")
 
 
 # ---------------------------------------------------------------------- #
@@ -363,22 +437,45 @@ class SourceRecordPayload:
 
     ``id`` is the source's own key for the record. A changed record keeps its
     ID, and Nerve stores it in place of the earlier copy.
+
+    A record of a provider in :data:`CLOSED_PROVIDERS` carries ``metadata``
+    from the closed vocabulary of its record type, and no ``schema`` or
+    ``data``. A record of a generic source carries ``schema`` and ``data``
+    and no metadata: ``data`` is a JSON object that the provider defines and
+    that the schema describes. Nerve keeps every member of it, also the ones
+    that it does not know.
     """
 
     id: str = ""
     record_type: str = ""
+    schema: str = omit_empty()
     summary: str = ""
     content: str = omit_empty()
     timestamp: datetime = ZERO_TIME
     metadata: tuple[MetadataEntry, ...] = omit_empty(())
+    data: dict[str, Any] | None = source_json()
 
-    def validate(self) -> None:
+    def validate(self, provider: str) -> None:
+        """Check the record of a source of *provider*, as the gateway does."""
         if not self.id or not self.record_type or not self.summary:
             malformed("source record has no ID, record type, or summary")
         if max(byte_length(self.id), byte_length(self.record_type)) > MAX_IDENTIFIER_BYTES:
             reject(RejectionReason.LIMIT_EXCEEDED, "source record ID or type exceeds the identifier limit")
         if max(byte_length(self.summary), byte_length(self.content)) > MAX_TEXT_BYTES:
             reject(RejectionReason.LIMIT_EXCEEDED, "source record text exceeds the text limit")
+        if not generic_provider(provider):
+            if self.schema or self.data is not None:
+                malformed(f"a {provider} source record carries a schema or data")
+            return
+        if not valid_record_type(provider, self.record_type):
+            reject(RejectionReason.KIND_UNSUPPORTED, f"record type is not valid for provider {provider!r}")
+        if schema_record_type(provider, self.schema) != self.record_type:
+            malformed("source record schema names another record type")
+        if self.metadata:
+            malformed("a generic source record carries metadata")
+        if self.data is None:
+            malformed("a generic source record has no data")
+        _validate_source_json("source record data", self.data, MAX_SOURCE_DATA_BYTES)
 
 
 @_record
@@ -430,7 +527,7 @@ class Event:
         if self.kind == EVENT_KIND_SOURCE_RECORD:
             if self.record is None:
                 malformed("source record event has no record")
-            self.record.validate()
+            self.record.validate(self.provider)
 
 
 # ---------------------------------------------------------------------- #
@@ -863,6 +960,43 @@ class RepoWatch:
 
 
 @_record
+class SourceRule:
+    """Keeps or drops the records of a generic source by a value of their data.
+
+    ``path`` is a JSON Pointer into the data, such as ``/actor/kind``. A rule
+    has exactly one non-empty list of glob patterns, ``allow`` or ``deny``,
+    which match as the filter patterns do. A deny rule drops a record when
+    one of the values at its path matches; an allow rule drops a record when
+    none does, also when the record has no value there. The gateway applies
+    the rules before it stores a record, and Nerve's inbox guardrail applies
+    them again (:class:`nerve.sources.filters.DataRule`, which also defines
+    the values at a path).
+    """
+
+    path: str = ""
+    allow: tuple[str, ...] = omit_empty(())
+    deny: tuple[str, ...] = omit_empty(())
+
+    def validate(self) -> None:
+        """Check the rule as the gateway does.
+
+        The path is a bounded JSON Pointer (see
+        :func:`nerve.sources.source_json.pointer_tokens`), and the rule has
+        one list of 1 to :data:`MAX_SOURCE_RULE_PATTERNS` patterns that a
+        filter list takes.
+        """
+        if pointer_tokens(self.path) is None:
+            malformed("subscription rule path is not a bounded JSON Pointer")
+        if bool(self.allow) == bool(self.deny):
+            malformed("a subscription rule needs exactly one of allow and deny")
+        patterns = self.deny or self.allow
+        if len(patterns) > MAX_SOURCE_RULE_PATTERNS:
+            reject(RejectionReason.LIMIT_EXCEEDED, "a subscription rule has too many patterns")
+        if not all(valid_pattern(pattern) for pattern in patterns):
+            malformed("a subscription rule pattern is empty, too long, or has a control character")
+
+
+@_record
 class SourceSubscription:
     """What the agent takes from one provider's hosted source.
 
@@ -878,6 +1012,16 @@ class SourceSubscription:
     is switched on, so every other frame is unchanged.
 
     The ``email`` subscription carries only its provider and empty filters.
+
+    A subscription of a generic source names its record ``schemas``: the
+    versions of the data that Nerve reads, at least one. For each record
+    type, the gateway sends the highest major version that ``schemas`` names
+    and that it produces. It then carries ``settings``, a JSON object that
+    the provider defines (absent settings are the provider's defaults), and
+    ``rules`` on the data of its records (see :class:`SourceRule`), and none
+    of the members above other than empty filters. A subscription of a
+    provider outside :data:`CLOSED_PROVIDERS` without schemas is not generic,
+    and carries no settings or rules either.
     """
 
     provider: str = ""
@@ -885,6 +1029,9 @@ class SourceSubscription:
     pr_watch: bool = omit_empty(False)
     inbox: str = omit_empty("")
     repos: tuple[RepoWatch, ...] = omit_empty(())
+    settings: dict[str, Any] | None = source_json()
+    schemas: tuple[str, ...] = omit_empty(())
+    rules: tuple[SourceRule, ...] = omit_empty(())
 
 
 @_record
@@ -903,9 +1050,11 @@ class Subscriptions:
 
         The version, the number of sources, each provider name and that no
         provider appears twice, each inbox, the bounds of every filter list,
-        the watched repositories, which only ``github_repos`` names (see
-        :func:`_validate_repo_watches`), and that an ``email`` subscription
-        carries nothing but its provider.
+        the watched repositories (see :func:`_validate_repo_entries`), which
+        ``github``, ``email`` and a generic source do not name and
+        ``github_repos`` must name, that an ``email`` subscription
+        carries nothing but its provider, and the members of a generic
+        source (see :func:`_validate_generic_members`).
         """
         if self.version != SUBSCRIPTIONS_VERSION:
             reject(RejectionReason.VERSION_UNSUPPORTED, f"unknown subscriptions version {self.version!r}")
@@ -926,21 +1075,25 @@ class Subscriptions:
                 malformed("source subscription inbox is not 'participating' or 'all'")
             for patterns in source.filters.pattern_lists().values():
                 _validate_patterns(patterns, "source filter")
+            _validate_repo_entries(source.repos)
             if source.provider == REPO_WATCH_PROVIDER:
-                _validate_repo_watches(source)
-            elif source.repos:
-                malformed(f"only a {REPO_WATCH_PROVIDER} subscription names repositories")
+                _validate_repo_watch(source)
+            elif source.repos and not generic_provider(source.provider):
+                malformed(f"a {source.provider} subscription names repositories")
             if source.provider == EMAIL_PROVIDER and (
                 any(source.filters.pattern_lists().values()) or source.pr_watch or source.inbox
             ):
                 malformed(f"an {EMAIL_PROVIDER} subscription carries filters, pr_watch or an inbox")
+            _validate_generic_members(source)
 
     def without_filters(self) -> Subscriptions:
         """The same sources with no filter patterns.
 
         The gateway then keeps every record of those sources, and Nerve's own
         inbox filter is the only one that drops records. A watched
-        repository's ``deny_authors`` are filter patterns too.
+        repository's ``deny_authors`` are filter patterns too. The rules of a
+        generic source stay: it is never sent wider (see
+        :meth:`without_providers`).
         """
         return dataclasses.replace(self, sources=tuple(
             dataclasses.replace(
@@ -950,6 +1103,63 @@ class Subscriptions:
             )
             for source in self.sources
         ))
+
+    def ruled_providers(self) -> tuple[str, ...]:
+        """The providers whose subscriptions carry rules, in frame order.
+
+        Such a subscription is never sent without its rules: the gateway
+        would then store the records that the rules drop.
+        """
+        return tuple(source.provider for source in self.sources if source.rules)
+
+    def without_providers(self, providers: Iterable[str]) -> Subscriptions:
+        """The same subscriptions without the sources of *providers*.
+
+        The gateway stores nothing for a provider that the frame leaves out.
+        """
+        left_out = set(providers)
+        return dataclasses.replace(
+            self, sources=tuple(source for source in self.sources if source.provider not in left_out),
+        )
+
+
+def _validate_generic_members(source: SourceSubscription) -> None:
+    """Check ``settings``, ``schemas`` and ``rules`` as the gateway does.
+
+    Their counts are bounded (:data:`MAX_SUBSCRIPTION_SCHEMAS`,
+    :data:`MAX_SOURCE_RULES`). A subscription is generic when its provider
+    is outside :data:`CLOSED_PROVIDERS` and it names at least one schema.
+    Then it has no filter pattern, ``pr_watch``, ``inbox`` or ``repos``; its
+    settings are a source JSON object within
+    :data:`MAX_SOURCE_SETTINGS_BYTES`; its schemas are distinct schemas of its
+    provider (see :func:`schema_record_type`); and its rules are valid. Any
+    other subscription names none of the three. A member with its zero value
+    counts as absent, except the settings, which count whenever they are
+    present.
+    """
+    if len(source.schemas) > MAX_SUBSCRIPTION_SCHEMAS:
+        reject(RejectionReason.LIMIT_EXCEEDED, "a subscription names too many record schemas")
+    if len(source.rules) > MAX_SOURCE_RULES:
+        reject(RejectionReason.LIMIT_EXCEEDED, "a subscription has too many rules")
+    if not (generic_provider(source.provider) and source.schemas):
+        if source.settings is not None or source.schemas or source.rules:
+            malformed(
+                "a subscription of a closed provider, or without record schemas, names "
+                "settings, record schemas, or rules"
+            )
+        return
+    if any(source.filters.pattern_lists().values()) or source.pr_watch or source.inbox or source.repos:
+        malformed("a generic subscription names filters, a pull request watch, an inbox, or repositories")
+    if source.settings is not None:
+        _validate_source_json("subscription settings", source.settings, MAX_SOURCE_SETTINGS_BYTES)
+    seen: set[str] = set()
+    for schema in source.schemas:
+        schema_record_type(source.provider, schema)
+        if schema in seen:
+            malformed("subscription schemas repeat a schema")
+        seen.add(schema)
+    for rule in source.rules:
+        rule.validate()
 
 
 def _validate_patterns(patterns: tuple[str, ...], what: str) -> None:
@@ -963,31 +1173,24 @@ def _validate_patterns(patterns: tuple[str, ...], what: str) -> None:
         )
 
 
-def _validate_repo_watches(source: SourceSubscription) -> None:
-    """Check a ``github_repos`` subscription as the gateway does.
+def _validate_repo_entries(repos: tuple[RepoWatch, ...]) -> None:
+    """Check the watched repositories of any subscription, as the gateway does.
 
-    It names 1 to :data:`MAX_REPO_WATCHES` repositories, each an
-    ``owner/repo`` name (:func:`valid_repo_name`) and each once, ignoring
-    case; every one reports one or more of :data:`REPO_WATCH_TYPES`, each
-    once, and has at most :data:`MAX_SUBSCRIPTION_PATTERNS` ``deny_authors``
-    that a filter list would take. It carries no filters, ``pr_watch`` or
-    ``inbox``.
+    At most :data:`MAX_REPO_WATCHES`, each an ``owner/repo`` name
+    (:func:`valid_repo_name`) and each once, ignoring case; every one
+    reports one or more of :data:`REPO_WATCH_TYPES`, each once, and has at
+    most :data:`MAX_SUBSCRIPTION_PATTERNS` ``deny_authors`` that a filter
+    list would take. Which providers may name repositories at all is
+    checked by the caller.
     """
-    if any(source.filters.pattern_lists().values()) or source.pr_watch or source.inbox:
-        malformed(f"a {REPO_WATCH_PROVIDER} subscription carries filters, pr_watch or an inbox")
-    if not source.repos:
-        malformed(f"a {REPO_WATCH_PROVIDER} subscription names no repository")
-    if len(source.repos) > MAX_REPO_WATCHES:
-        reject(
-            RejectionReason.LIMIT_EXCEEDED,
-            f"a {REPO_WATCH_PROVIDER} subscription names too many repositories",
-        )
+    if len(repos) > MAX_REPO_WATCHES:
+        reject(RejectionReason.LIMIT_EXCEEDED, "a subscription names too many repositories")
     names: set[str] = set()
-    for repo in source.repos:
+    for repo in repos:
         if not valid_repo_name(repo.name):
             malformed("a watched repository is not an owner/repo name")
         if repo.name.lower() in names:
-            malformed(f"a {REPO_WATCH_PROVIDER} subscription repeats a repository")
+            malformed("a subscription repeats a repository")
         names.add(repo.name.lower())
         for kind in repo.types:
             if kind not in REPO_WATCH_TYPES:
@@ -1001,6 +1204,18 @@ def _validate_repo_watches(source: SourceSubscription) -> None:
                 "a watched repository's deny_authors pattern is empty, too long, or has a "
                 "control character"
             )
+
+
+def _validate_repo_watch(source: SourceSubscription) -> None:
+    """Check what only a ``github_repos`` subscription must hold.
+
+    It names at least one repository, and no filters, ``pr_watch`` or
+    ``inbox``.
+    """
+    if any(source.filters.pattern_lists().values()) or source.pr_watch or source.inbox:
+        malformed(f"a {REPO_WATCH_PROVIDER} subscription carries filters, pr_watch or an inbox")
+    if not source.repos:
+        malformed(f"a {REPO_WATCH_PROVIDER} subscription names no repository")
 
 
 # ---------------------------------------------------------------------- #
