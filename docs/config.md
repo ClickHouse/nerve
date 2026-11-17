@@ -243,7 +243,7 @@ A reload is always explicit. Two things cause one:
 | Custom cron gate plugins (new, edited *and* deleted `.py` files) | ✅ the registry is rebuilt from the directory |
 | Cron file locations (`cron.jobs_file`, `system_file`, `gate_plugins_dir`) | ✅ re-read from the new config |
 | Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. In hosted mode the GitHub filters, `pr_watch`, `inbox` and the repository watch (`sync.github_repos`) are published to the gateway again. **`sync.codex` and `sync.github.mode` are not among these**; see the restart table |
-| `cron.delivery_debounce_seconds` | ✅ read for each delivery |
+| `cron.delivery_debounce_seconds`, `cron.delivery_min_interval_seconds` | ✅ read for each delivery |
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
 | Skills (`skills/`, and the platform skills in `skills/` in the config directory) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
@@ -2200,7 +2200,13 @@ reload:
 
 `cron.delivery_debounce_seconds` (int, default `60`) spaces the job runs that a
 hosted delivery starts; a negative value reads as `0`, and a value above `600`
-waits `600` seconds (`nerve config validate` warns). See
+waits `600` seconds (`nerve config validate` warns).
+`cron.delivery_min_interval_seconds` (int, default `1800`): a hosted delivery
+starts no run of a job whose last run started less than this many seconds ago
+and whose schedule is forecast to run it again before that time is over; the
+records wait in the inbox for that scheduled run. `0` runs the jobs for every
+burst, a negative value reads as `0`, and a value above `21600` is used as
+`21600` (`nerve config validate` warns). See
 [cron.md](cron.md#runs-on-delivery).
 
 ## Memory

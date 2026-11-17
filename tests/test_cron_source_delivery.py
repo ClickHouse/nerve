@@ -8,6 +8,7 @@ instead of reaching an agent.
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -18,13 +19,14 @@ from apscheduler.triggers.cron import CronTrigger
 
 from nerve.config import NerveConfig
 from nerve.cron.jobs import CronJob
-from nerve.cron.service import CronService
+from nerve.cron.service import CronService, _Forecast, _parse_timestamp
 from nerve.identity import attribution_for
 from nerve.sources.github import GitHubSource
 from nerve.sources.github_hosted import HostedGitHubSource
 from nerve.sources.github_repos import GitHubReposSource
 from nerve.sources.models import IngestResult
 from tests.actor_rows import FAKE_SYSTEM_ACTOR, mock_system_principal
+from tests.test_cron_gates import _message, _read_up_to_date
 
 pytestmark = pytest.mark.asyncio
 
@@ -98,6 +100,7 @@ async def svc(monkeypatch):
     config = MagicMock()
     config.timezone = "UTC"
     config.cron.delivery_debounce_seconds = 0
+    config.cron.delivery_min_interval_seconds = 0
     db = AsyncMock()
     mock_system_principal(db)
     service = CronService(config, AsyncMock(), db)
@@ -359,6 +362,61 @@ class TestJobs:
 
         assert svc.runs.finished == ["pr-monitor", "pr-monitor"]
 
+    @pytest.mark.parametrize(("started_ago", "scheduled_in", "runs"), [
+        (10 * 60, 5 * 60, False),   # the schedule runs the job within the interval
+        (10 * 60, 25 * 60, True),   # its next run comes after the interval ends
+        (10 * 60, None, True),      # no scheduled run is forecast to happen
+        (31 * 60, 5 * 60, True),    # the interval has passed
+        (None, 5 * 60, True),       # the job never ran
+        (-10 * 60, 5 * 60, True),   # the last run lies in the future: the clock was set back
+        # A schedule that fires every interval, at a fraction of a second: the
+        # run log keeps the start of the last run in whole seconds.
+        (10 * 60, 20 * 60 + 0.5, False),
+    ])
+    async def test_a_delivery_is_left_to_a_scheduled_run_within_the_minimum_interval(
+        self, svc, monkeypatch, started_ago, scheduled_in, runs,
+    ):
+        svc.config.cron.delivery_min_interval_seconds = 30 * 60
+        now = datetime.now(UTC).replace(microsecond=0)
+        started_at = None
+        if started_ago is not None:
+            started_at = (now - timedelta(seconds=started_ago)).strftime("%Y-%m-%d %H:%M:%S")
+        svc.db.get_last_cron_start = AsyncMock(return_value=started_at)
+        runs_at = None if scheduled_in is None else now + timedelta(seconds=scheduled_in)
+        forecast = _Forecast("cron", runs_at, runs=runs_at is not None, runs_at=runs_at)
+        monkeypatch.setattr(svc, "_forecast_job", AsyncMock(return_value=forecast))
+        install(svc, job("pr-monitor", sources=["github"]))
+
+        await svc.on_source_delivered("github")
+        await eventually(lambda: not svc._delivery_tasks and not svc._delivery_started)
+
+        assert svc.runs.ids() == (["pr-monitor"] if runs else [])
+
+    async def test_a_run_that_starts_while_the_run_log_is_read_is_waited_for(self, svc):
+        """Reading the run log takes a moment. The delivery does not run on
+        top of a scheduled run that starts in it: it waits for that run and
+        reads the log again."""
+        svc.config.cron.delivery_min_interval_seconds = 30 * 60
+        monitor = job("pr-monitor", sources=["github"])
+        install(svc, monitor)
+        svc.runs.hold["pr-monitor"] = asyncio.Event()
+        scheduled: list[asyncio.Task] = []
+
+        async def get_last_cron_start(job_id):
+            if not scheduled:
+                scheduled.append(asyncio.create_task(svc._run_job_wrapper(monitor)))
+                await eventually(lambda: svc.runs.ids() == ["pr-monitor"])
+            return None
+
+        svc.db.get_last_cron_start = get_last_cron_start
+        await svc.on_source_delivered("github")
+        await eventually(lambda: svc.runs.ids() == ["pr-monitor"])
+        await asyncio.sleep(0.05)
+        assert len(svc.runs.started) == 1
+        svc.runs.hold["pr-monitor"].set()
+
+        await eventually(lambda: svc.runs.finished == ["pr-monitor", "pr-monitor"])
+
     async def test_a_job_removed_by_a_reload_before_its_run_is_not_run(self, svc):
         svc.config.cron.delivery_debounce_seconds = 1
         install(svc, job("pr-monitor", sources=["github"]))
@@ -445,6 +503,15 @@ class TestJobs:
 
         assert svc._delivery_debounce() == expected
 
+    @pytest.mark.parametrize(("value", "expected"), [
+        ("soon", 1800.0), (None, 1800.0), (True, 1800.0), (-1, 0.0), (0, 0.0), (7200, 7200.0),
+        (90000, 21600.0),
+    ])
+    async def test_the_minimum_interval_is_held_within_its_range(self, svc, value, expected):
+        svc.config.cron.delivery_min_interval_seconds = value
+
+        assert svc._delivery_min_interval() == expected
+
 
 async def test_source_reloads_keep_the_github_mode_the_service_started_with():
     """The repository watch keeps it too: GitHub is hosted as a whole."""
@@ -486,3 +553,52 @@ async def test_a_service_started_in_poll_mode_keeps_polling():
         assert isinstance(watch.source, GitHubReposSource)
     finally:
         await service.stop()
+
+
+@pytest.mark.parametrize(("scheduled_in", "cursor_expires_in", "left"), [
+    (timedelta(minutes=10), timedelta(days=1), True),
+    (timedelta(hours=12), timedelta(days=1), False),  # the schedule comes after the interval
+    (timedelta(minutes=10), timedelta(minutes=5), False),  # that run would find nothing
+])
+async def test_records_are_left_only_to_a_scheduled_run_that_will_read_them(
+    db, scheduled_in, cursor_expires_in, left,
+):
+    """The run log, the gates' forecast and the scheduler as they are. A job
+    that ran a moment ago has an unread record. The record is left to the
+    job's schedule only when that runs the job within the interval and the
+    consumer's cursor is still live then: an expired cursor starts again at
+    the newest message, so that run would not see the record."""
+    service = CronService(NerveConfig(), AsyncMock(), db)
+    service.scheduler.start(paused=True)
+    try:
+        # A crontab from the clock: every hour at the minute that is ten
+        # minutes away, or every day at the time that is twelve hours away.
+        at = datetime.now(service.timezone) + scheduled_in
+        hour = "*" if scheduled_in < timedelta(hours=1) else at.hour
+        schedule = f"{at.minute} {hour} * * *"
+        monitor = job("pr-monitor", sources=["github"])
+        service._jobs = [monitor]
+        service.scheduler.add_job(
+            service._run_job_wrapper, CronTrigger.from_crontab(schedule, timezone=service.timezone),
+            args=[monitor], id=monitor.id,
+        )
+        await _read_up_to_date(db, "inbox", "github", cursor_expires_in)
+        await db.insert_source_messages([_message("1")], "github")
+        await db.log_cron_start("pr-monitor")
+
+        assert (await service._left_to_schedule("pr-monitor") is not None) is left
+    finally:
+        await service.stop()
+
+
+async def test_the_last_start_of_a_job_is_its_latest_run_that_started(db):
+    """A run that is still going counts, a missed run never started, and the
+    time reads as the wall clock time of the start."""
+    assert await db.get_last_cron_start("pr-monitor") is None
+
+    await db.log_cron_start("pr-monitor")
+    await db.log_cron_missed("pr-monitor", "2099-01-01 00:00:00")
+    await db.log_cron_start("mail-triage")
+    started_at = await db.get_last_cron_start("pr-monitor")
+
+    assert abs((datetime.now(UTC) - _parse_timestamp(started_at)).total_seconds()) < 60

@@ -442,7 +442,7 @@ With `sync.github.mode: hosted` the gate always passes and runs no `gh`: the
 channel gateway watches the agent's own open pull requests (`sync.github.pr_watch`)
 and delivers a `github_pr_activity` record for each change. A record does not
 start a job by itself. It starts a job gated on `messages` with
-`sources: [github]` at once (see [Runs on delivery](#runs-on-delivery)), so gate
+`sources: [github]`, as [Runs on delivery](#runs-on-delivery) describes, so gate
 pull request monitors that way. A job gated on `github_pr_activity` alone is
 never started by a delivery, and since the gate always passes, it runs, in full,
 on every scheduled tick; `nerve doctor` names the jobs that still use this gate.
@@ -1068,9 +1068,32 @@ naming no source, runs once `cron.delivery_debounce_seconds` after the first
 delivery of a burst. Later deliveries in that window add nothing: one burst,
 one run.
 
+A delivery starts no run of a job that ran a short while ago and that its
+schedule is about to run again. Both have to hold: the job's last run started
+less than `cron.delivery_min_interval_seconds` ago, and the job's schedule is
+forecast to run it before that interval ends. The records then wait in the
+inbox for that scheduled run, so they never wait longer than the interval.
+
+- Every run of the job counts as its last run, whether its schedule, a delivery
+  or a person started it. A run that the gates skipped does not: nothing ran.
+- The forecast is the one of [What runs next](#what-runs-next). A scheduled run
+  that the job's gates are expected to skip is not waited for. A `messages`
+  gate that names its sources expects that when the consumer's cursor expires
+  before the run.
+- When the job's next scheduled run comes later than that, the delivery runs
+  the job, as before. So a job that is scheduled less often than the interval
+  is left to its schedule only while a scheduled run is near.
+- `0` runs the jobs for every burst. At most 21600 seconds (6 hours) apply: a
+  consumer's cursor is live for longer than that after a run of the job, so a
+  record that waits is still unread when the scheduled run comes.
+
+With the default, `inbox-processor`, which is scheduled every 30 minutes, runs
+about every half hour while a source delivers all day, not once for each burst.
+
 ```yaml
 cron:
-  delivery_debounce_seconds: 60   # default; 0 runs the jobs as soon as the records are in, at most 600 applies
+  delivery_debounce_seconds: 60        # default; 0 runs the jobs as soon as the records are in, at most 600 applies
+  delivery_min_interval_seconds: 1800  # default; 0 runs the jobs for every burst, at most 21600 applies
 ```
 
 Such a run goes through the job's gates, `lock` and run log like a scheduled
@@ -1081,8 +1104,8 @@ catch-up is skipped, as it is while any run of the job goes on; and a run
 started by hand starts as it always does. A catch-up queued before the run does
 not run the job again, since the job has run since. The drain counts as a run
 of the source's runner in the same way. Jobs without such a gate keep to their
-schedule, and the schedules stay the fallback for everything. The setting is
-read for each delivery, so a reload applies it. A scheduled run of a source
+schedule, and the schedules stay the fallback for everything. Both settings are
+read for each delivery, so a reload applies them. A scheduled run of a source
 that runs on delivery is not counted as the next scheduled task while nothing
 waits in its buffer (see [What runs next](#what-runs-next)): it normally finds
 nothing, so a platform that parks the machine is not told to wake it for that

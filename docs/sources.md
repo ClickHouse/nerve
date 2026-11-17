@@ -242,7 +242,11 @@ running. Nerve reads them over the hosted channel streams.
 - **Runs on delivery.** As soon as records arrive, the runner drains them, and
   the jobs gated on `messages` for `github`, or for any source, run once
   `cron.delivery_debounce_seconds` (default 60) after the first record of a
-  burst; see [Runs on delivery](cron.md#runs-on-delivery). Gate a pull request
+  burst. A job whose last run started less than
+  `cron.delivery_min_interval_seconds` (default 1800) ago, and whose schedule
+  runs it again before that time is over, does not run for the delivery: the
+  records wait for the scheduled run. See
+  [Runs on delivery](cron.md#runs-on-delivery). Gate a pull request
   monitor on `messages` with `sources: [github]` rather than on
   `github_pr_activity`, which always passes in hosted mode.
 - **The events source stays off.** `github_events` reads your own activity
