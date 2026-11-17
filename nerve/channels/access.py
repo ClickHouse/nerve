@@ -67,10 +67,15 @@ class Identity:
 
 @dataclass(frozen=True)
 class Decision:
-    """The outcome of a policy check, with a reason fit for a log line."""
+    """The outcome of a policy check, with a reason fit for a log line.
+
+    A delivery that passed the check also names the target of the posted
+    message's thread, when its channel knows it.
+    """
 
     allowed: bool
     reason: str = ""
+    thread_target: str | None = None
 
     def __bool__(self) -> bool:
         return self.allowed
