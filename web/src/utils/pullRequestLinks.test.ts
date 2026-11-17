@@ -87,7 +87,7 @@ describe('findPullRequests', () => {
   });
 
   it(`stops at ${MAX_PR_CARDS}`, () => {
-    const many = Array.from({ length: 8 }, (_, i) => `https://github.com/example/repo/pull/${i + 1}`).join(' ');
+    const many = Array.from({ length: 12 }, (_, i) => `https://github.com/example/repo/pull/${i + 1}`).join(' ');
     expect(urls([text(many)])).toHaveLength(MAX_PR_CARDS);
   });
 

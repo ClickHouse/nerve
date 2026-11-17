@@ -1,7 +1,7 @@
 import type { MessageBlock } from '../types/chat';
 
 /** Most PR cards under one message. */
-export const MAX_PR_CARDS = 5;
+export const MAX_PR_CARDS = 10;
 
 /**
  * The same owner, repo and number rules as the server's `PULL_URL`. After the
