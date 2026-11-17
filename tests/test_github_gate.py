@@ -47,7 +47,7 @@ def kinds(command: str) -> list[str]:
 
 @pytest.mark.parametrize("command, expected", [
     # The push of 2026-11-10 that this gate exists for.
-    ("timeout 120 git push seva seva/x:refs/heads/seva/x 2>&1 | tail -4", ["push"]),
+    ("timeout 120 git push fork fork/x:refs/heads/fork/x 2>&1 | tail -4", ["push"]),
     ("cd /x && git -C repo push origin HEAD", ["push"]),
     ("git -c user.name=x push origin main", ["push"]),
     ("cd repo\ngit push origin x", ["push"]),
@@ -85,7 +85,19 @@ def kinds(command: str) -> list[str]:
     ("gh api -X GET search/issues -f q=x", []),
     ("gh api repos/a/b/issues/1/comments -f body=hi", ["post"]),
     ("gh api -XPOST repos/a/b/issues/1/comments -F body=@f", ["post"]),
-    ("gh api --method=PATCH repos/a/b/issues/1 -f state=open", ["post"]),
+    # Unknown API writes fail closed: a close, repository, collaborator or
+    # secret change, or a commit through the contents API always asks.
+    ("gh api --method=PATCH repos/a/b/issues/1 -f state=closed", ["destructive"]),
+    ("gh api -X PATCH repos/a/b -f visibility=public", ["destructive"]),
+    ("gh api -X PUT repos/a/b/collaborators/someone", ["destructive"]),
+    ("gh api -X PUT repos/a/b/actions/secrets/TOKEN -f encrypted_value=x", ["destructive"]),
+    ("gh api -X PUT repos/a/b/contents/README.md -f message=m -f content=eA==", ["destructive"]),
+    ("gh api repos/a/b/issues -f title=t", ["post"]),
+    ("gh api repos/a/b/pulls -f title=t -f head=x -f base=main", ["post"]),
+    ("gh api repos/a/b/pulls/1/reviews -f event=COMMENT -f body=b", ["post"]),
+    ("gh api repos/a/b/pulls/1/comments/5/replies -f body=b", ["post"]),
+    ("gh api repos/a/b/issues/comments/5/reactions -f content=+1", ["post"]),
+    ("gh api -X PATCH repos/a/b/issues/comments/5 -f body=b", ["post"]),
     ("gh api -X POST repos/a/b/actions/runs/123/rerun-failed-jobs", ["rerun"]),
     ("gh api -X POST repos/a/b/actions/runs/123/rerun", ["rerun"]),
     ("gh api -X POST repos/a/b/actions/jobs/9/rerun", ["rerun"]),
@@ -117,7 +129,7 @@ def test_classify_command(command, expected):
 def test_classify_names_what_it_found():
     [write] = gg.classify_command("gh pr comment 9050 -b hi")
     assert write.what == "gh pr comment 9050 -b hi"
-    assert "push: git push seva main" in gg.describe(gg.classify_command("git push seva main"))
+    assert "push: git push fork main" in gg.describe(gg.classify_command("git push fork main"))
 
 
 # --------------------------------------------------------------------- #
@@ -137,7 +149,7 @@ def test_classify_names_what_it_found():
     ("ok post and push", {"post", "push"}),
     # Not an order to push or post.
     ("when did i ask you to fucking push it", set()),
-    ("create and discuss plan for partial on separate branch on seva-potapov/nerve", set()),
+    ("draft a plan for the parser fix on a separate branch on octo/nerve", set()),
     ("delete it of course", set()),
     ("don't push", set()),
     ("do not post that", set()),

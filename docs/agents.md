@@ -191,8 +191,8 @@ It runs without a card when:
 - the person's message that started the turn starts with "push" or "post"
   (after an optional "yes", "ok", "go"), is at most 80 characters, asks no
   question and has no "don't", "not", "never", "no" or "without". "push"
-  covers pushes, "post" covers comments, issues, PRs, reviews and other API
-  writes. A Telegram reply counts only the person's own text;
+  covers pushes, "post" covers new issues and PRs, comments, reviews and
+  reactions (an API write to any other endpoint always asks). A Telegram reply counts only the person's own text;
 - it is a CI rerun (`gh run rerun`, `POST …/actions/runs/{id}/rerun`,
   `…/rerun-failed-jobs`, `…/actions/jobs/{id}/rerun`), as a cron job that
   reruns failed CI does.

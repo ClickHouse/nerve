@@ -52,9 +52,9 @@ APPROVAL_KINDS = frozenset({
 # The ``tool_name`` of a GitHub-write approval (nerve/agent/github_gate.py).
 GITHUB_WRITE_TOOL = "GitHubWrite"
 UNREACHABLE_MESSAGE = (
-    "This command writes to GitHub and needs Seva's approval, but nobody can "
-    "approve it from this session (no web UI and no Telegram). Ask him with "
-    "the notify or ask_user tool and let him run it from a chat."
+    "This command writes to GitHub and needs the person's approval, but nobody "
+    "can approve it from this session (no web UI and no Telegram). Ask them with "
+    "the notify or ask_user tool and let them run it from a chat."
 )
 
 # Tools that modify files — trigger pre-execution snapshot

@@ -68,7 +68,7 @@ class Write:
     """One GitHub write found in a command."""
 
     kind: str   # PUSH, POST, DESTRUCTIVE, RERUN, DECLARED or UNPARSED
-    what: str   # what it does, for the card ("git push seva main")
+    what: str   # what it does, for the card ("git push fork main")
 
 
 # --------------------------------------------------------------------- #
@@ -126,6 +126,21 @@ _RERUN_ENDPOINT = re.compile(
 _REF_ENDPOINT = re.compile(r"^/?repos/[^/]+/[^/]+/git/refs(?:/|$)")
 _GIT_OBJECT_ENDPOINT = re.compile(r"^/?repos/[^/]+/[^/]+/git/(?:commits|trees|blobs|tags)/?$")
 _MERGE_ENDPOINT = re.compile(r"^/?repos/[^/]+/[^/]+/(?:merges|pulls/\d+/merge)/?$")
+# The API writes a "post" message covers: new issues and PRs, comments,
+# reviews, review replies and reactions, and edits of a comment. Any other
+# write (a close, a repository, collaborator or secret change, a commit
+# through the contents API) always asks: unknown endpoints fail closed.
+_POST_ENDPOINTS = {
+    "POST": re.compile(
+        r"^/?repos/[^/]+/[^/]+/(?:"
+        r"issues|pulls"
+        r"|issues/\d+/comments|pulls/\d+/comments(?:/\d+/replies)?"
+        r"|pulls/\d+/reviews(?:/\d+/events)?"
+        r"|issues/\d+/reactions|issues/comments/\d+/reactions|pulls/comments/\d+/reactions"
+        r")/?$",
+    ),
+    "PATCH": re.compile(r"^/?repos/[^/]+/[^/]+/(?:issues|pulls)/comments/\d+/?$"),
+}
 
 
 def _strip_heredocs(text: str) -> str:
@@ -378,7 +393,10 @@ def _classify_gh_api(
         return Write(PUSH, what)
     if _GIT_OBJECT_ENDPOINT.match(endpoint):
         return Write(PUSH, what)
-    return Write(POST, what)
+    post = _POST_ENDPOINTS.get(method)
+    if post is not None and post.match(endpoint):
+        return Write(POST, what)
+    return Write(DESTRUCTIVE, what)
 
 
 # --------------------------------------------------------------------- #
@@ -570,7 +588,7 @@ def install_wrappers(base: Path | None = None, python: str | None = None) -> Pat
 def _refuse(writes: list[Write]) -> int:
     sys.stderr.write(
         "nerve: GitHub write blocked: " + describe(writes) + "\n"
-        "Writes need Seva's approval. Run the write as its own command so Nerve can ask,\n"
+        "Writes need the person's approval. Run the write as its own command so Nerve can ask,\n"
         f"or start a script that writes with {DECLARE_ENV}=1.\n"
     )
     return REFUSED_EXIT

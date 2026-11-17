@@ -29,8 +29,8 @@ describe('ApprovalCard', () => {
         interactionId: 'i1', interactionType: 'command_approval', toolName: 'GitHubWrite',
         toolInput: {
           title: 'Agent wants to write to GitHub',
-          item: { command: 'git push seva seva/x' },
-          reason: 'push: git push seva seva/x',
+          item: { command: 'git push fork fork/x' },
+          reason: 'push: git push fork fork/x',
           github: true,
         },
         agent: null,
@@ -38,8 +38,8 @@ describe('ApprovalCard', () => {
     });
     render(<ApprovalCard />);
     expect(screen.getByText('Agent wants to write to GitHub')).toBeInTheDocument();
-    expect(screen.getByText('git push seva seva/x')).toBeInTheDocument();
-    expect(screen.getByText('push: git push seva seva/x')).toBeInTheDocument();
+    expect(screen.getByText('git push fork fork/x')).toBeInTheDocument();
+    expect(screen.getByText('push: git push fork fork/x')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Approve/ })).toBeInTheDocument();
   });
 
