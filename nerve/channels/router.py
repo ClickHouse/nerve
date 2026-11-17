@@ -15,7 +15,7 @@ import itertools
 import logging
 import sqlite3
 import uuid
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, TYPE_CHECKING
 
 from nerve.agent.engine import SessionClosedError
@@ -741,7 +741,7 @@ class ChannelRouter:
 
         formatted = channel.format_response(message)
         try:
-            await channel.send(OutboundMessage(
+            thread_target = await channel.send(OutboundMessage(
                 target=target,
                 text=formatted,
                 session_id=session_id or "",
@@ -751,7 +751,7 @@ class ChannelRouter:
                 "Refused addressed delivery to %s at delivery: %s", channel_name, refusal.reason,
             )
             return Decision(False, refusal.reason)
-        return verdict
+        return replace(verdict, thread_target=thread_target)
 
     # ------------------------------------------------------------------ #
     #  Streaming adapter lifecycle                                         #

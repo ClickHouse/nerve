@@ -526,7 +526,8 @@ async def send_channel_message_handler(ctx: ToolContext, args: dict) -> ToolResu
         )
 
     if decision.allowed:
-        return ToolResult.text(f"Message sent to {channel} target {target}.")
+        thread = f" To reply in its thread, use target {decision.thread_target}." if decision.thread_target else ""
+        return ToolResult.text(f"Message sent to {channel} target {target}.{thread}")
     return ToolResult.text(
         f"Refused: cannot send to {channel} target {target} — {decision.reason}"
     )

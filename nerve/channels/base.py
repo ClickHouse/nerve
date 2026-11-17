@@ -167,8 +167,12 @@ class BaseChannel(abc.ABC):
         ...
 
     @abc.abstractmethod
-    async def send(self, message: OutboundMessage) -> None:
-        """Send a complete message to a target."""
+    async def send(self, message: OutboundMessage) -> str | None:
+        """Send a complete message to a target.
+
+        Returns the target that replies in the message's thread use, when
+        the channel knows it.
+        """
         ...
 
     def format_response(self, text: str) -> str:

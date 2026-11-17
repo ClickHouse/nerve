@@ -1066,7 +1066,8 @@ SEND_CHANNEL_MESSAGE_SCHEMA = {
             "description": (
                 "Conversation to post to, in that transport's own addressing. "
                 "Slack: a conversation id such as 'C0123ABCD', or "
-                "'C0123ABCD:1700000000.000100' to reply inside a thread."
+                "'C0123ABCD:1700000000.000100' to reply inside a thread. "
+                "A successful send names the target of its own thread."
             ),
         },
         "text": {

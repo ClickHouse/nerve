@@ -1942,7 +1942,8 @@ that an administrator sets in the control plane.
 ### Outbound Slack message tool
 
 The `send_channel_message` tool posts to a given conversation. That makes it usable
-from a cron run with no conversation attached.
+from a cron run with no conversation attached. Its result names the target of
+the posted message's thread, so the agent can reply there.
 
 It is **off by default**: `slack.allow_outbound: true` enables the capability,
 and `slack.allow_channels` then bounds where it may go. The target must be a literal conversation id.
