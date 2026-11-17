@@ -75,3 +75,18 @@ def test_a_symlink_to_an_excluded_file_is_not_found(client, ws):
     (ws / "link.txt").symlink_to(ws / "secrets" / "token.txt")
 
     assert client.get("/api/files/download", params={"path": str(ws / "link.txt")}).status_code == 404
+
+
+def test_a_symlink_before_dotdot_cannot_reach_an_excluded_file(client, ws):
+    from nerve.config import FilesConfig
+
+    cfg._config.files = FilesConfig(exclude=["secrets"])
+    (ws / "secrets" / "sub").mkdir(parents=True)
+    (ws / "secrets" / "token.txt").write_text("x")
+    (ws / "token.txt").write_text("decoy")
+    (ws / "L").symlink_to(ws / "secrets" / "sub")
+
+    # Lexically <ws>/token.txt, but it resolves to secrets/token.txt.
+    r = client.get("/api/files/download", params={"path": f"{ws}/L/../token.txt"})
+    assert r.status_code == 404
+    assert client.get("/api/files/download", params={"path": str(ws / "token.txt")}).text == "decoy"

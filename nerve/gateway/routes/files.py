@@ -215,7 +215,10 @@ async def download_file(
         asked.relative_to(workspace_root) if asked.is_relative_to(workspace_root)
         else resolved.relative_to(workspace_root)
     )
-    if resolve_workspace_path(workspace_root, rel.as_posix(), config.files.patterns) is None:
+    # Serve only what the check approved: a symlink before a ".." makes the
+    # lexical path and the resolved one differ, and the resolved one is sent.
+    approved = resolve_workspace_path(workspace_root, rel.as_posix(), config.files.patterns)
+    if approved is None or approved != resolved:
         raise HTTPException(status_code=404, detail="File not found")
 
     if not resolved.exists() or not resolved.is_file():
