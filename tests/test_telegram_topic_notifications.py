@@ -257,3 +257,71 @@ async def test_a_sink_without_a_topic_is_one_way_everywhere():
 def test_thread_id_config():
     assert NotificationsConfig.from_dict({"telegram_thread_id": "42"}).telegram_thread_id == 42
     assert NotificationsConfig.from_dict({}).telegram_thread_id is None
+
+
+class _GoneTopicBot(_Bot):
+    """A bot whose session topic was deleted by a person."""
+
+    async def send_message(self, **kwargs):
+        if kwargs.get("message_thread_id") == TOPIC:
+            from telegram.error import BadRequest
+
+            self.calls.append(("refused", kwargs))
+            raise BadRequest("Message thread not found")
+        return await super().send_message(**kwargs)
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_topic_is_unbound_and_the_push_goes_to_the_sink(config, db, monkeypatch):
+    from nerve.agent import streaming
+
+    monkeypatch.setattr(streaming, "broadcaster", SimpleNamespace(broadcast=AsyncMock()))
+    gone = _GoneTopicBot()
+    channel = SimpleNamespace(
+        _app=SimpleNamespace(bot=gone), _cache_message=MagicMock(),
+        _record_reply_route=AsyncMock(),
+    )
+    engine = MagicMock()
+    engine.sessions.is_running.return_value = False
+    engine.router.get_channel.return_value = channel
+    engine.router.forget_channel = AsyncMock()
+    service = NotificationService(config, db, engine)
+    await _session_in_topic(db)
+
+    nid = await service.send_notification("s1", "Build done", "All green")
+
+    # Tried in the topic (with HTML, then plain), then in the sink.
+    refused = gone.named("refused")
+    assert refused and all(r["message_thread_id"] == TOPIC for r in refused)
+    (sent,) = gone.named("send_message")
+    assert sent["chat_id"] == SINK and "message_thread_id" not in sent
+    assert "Session: s1" in sent["text"]  # the sink labels its session
+    engine.router.forget_channel.assert_awaited_once_with(f"telegram:{CHAT}:{TOPIC}")
+    assert await db.get_notification_delivery(nid, "telegram", str(SINK))
+
+
+@pytest.mark.asyncio
+async def test_another_telegram_error_in_a_topic_is_not_rerouted(config, db, monkeypatch):
+    from nerve.agent import streaming
+    from telegram.error import BadRequest
+
+    monkeypatch.setattr(streaming, "broadcaster", SimpleNamespace(broadcast=AsyncMock()))
+    bot = _Bot()
+    bot.send_message = AsyncMock(side_effect=BadRequest("Chat not found"))
+    channel = SimpleNamespace(
+        _app=SimpleNamespace(bot=bot), _cache_message=MagicMock(),
+        _record_reply_route=AsyncMock(),
+    )
+    engine = MagicMock()
+    engine.sessions.is_running.return_value = False
+    engine.router.get_channel.return_value = channel
+    engine.router.forget_channel = AsyncMock()
+    service = NotificationService(config, db, engine)
+    await _session_in_topic(db)
+
+    await service.send_notification("s1", "Build done")
+
+    # Tried in the topic only, never the sink.
+    calls = bot.send_message.await_args_list
+    assert calls and all(c.kwargs.get("message_thread_id") == TOPIC for c in calls)
+    engine.router.forget_channel.assert_not_awaited()

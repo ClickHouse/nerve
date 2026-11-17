@@ -1440,12 +1440,52 @@ class NotificationService:
             logger.warning("Telegram bot not available for notification %s", notification_id)
             return None
 
-        target = (
-            await self._telegram_topic_of(session_id)
-            or self._resolve_telegram_target()
-        )
-        if not target:
+        from nerve.channels.telegram import _TOPIC_GONE_ERRORS, _error_says
+
+        topic = await self._telegram_topic_of(session_id)
+        sink = self._resolve_telegram_target()
+        if topic and topic != sink:
+            try:
+                return await self._send_telegram_to(
+                    topic, bot, notification_id, notif_type, session_id, title,
+                    body, priority, options, silent, option_labels, plan_id,
+                )
+            except Exception as exc:
+                if not _error_says(exc, _TOPIC_GONE_ERRORS):
+                    raise
+                # A person deleted the session's topic. Unbind it, so later
+                # pushes stop trying it, and deliver this one to the sink.
+                logger.info(
+                    "Telegram topic %s of session %s is gone; unbound it, "
+                    "notification %s goes to the notification chat",
+                    topic, session_id, notification_id,
+                )
+                router = getattr(self.engine, "router", None)
+                if router is not None and hasattr(router, "forget_channel"):
+                    await router.forget_channel(f"telegram:{topic}")
+        if not sink:
             return None
+        return await self._send_telegram_to(
+            sink, bot, notification_id, notif_type, session_id, title,
+            body, priority, options, silent, option_labels, plan_id,
+        )
+
+    async def _send_telegram_to(
+        self,
+        target: str,
+        bot: object,
+        notification_id: str,
+        notif_type: str,
+        session_id: str,
+        title: str,
+        body: str,
+        priority: str,
+        options: list[str] | None,
+        silent: bool,
+        option_labels: dict[str, str] | None,
+        plan_id: str | None,
+    ) -> str | None:
+        """Send one notification card to *target* (a chat, or a topic in it)."""
         from nerve.channels.telegram import parse_target
         chat_id, thread_id = parse_target(target)
 
