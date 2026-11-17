@@ -122,6 +122,13 @@ _MODEL_ALIAS_ENV_VARS: dict[str, str] = {
     "fable": "ANTHROPIC_DEFAULT_FABLE_MODEL",
 }
 
+# The variable in which a launcher (agent.cli_launcher) finds the CLI it is to
+# start, in the CLI's own environment.
+CLI_PATH_ENV = "NERVE_AGENT_CLI_PATH"
+# The launchers that could not be used, each reported once per process: the
+# setting is read at every start of a CLI.
+_refused_launchers: set[str] = set()
+
 # The CLI keeps a session's history in ~/.claude/projects/<name>/, where
 # <name> is the cwd with every character outside [a-zA-Z0-9] replaced by
 # '-'. When that name is longer than _PROJECT_DIR_MAX_LEN, the CLI cuts it
@@ -706,7 +713,21 @@ class ClaudeBackend:
         if spec.interactive is not None:
             can_use_tool = ClaudeToolPermissions(spec.interactive).can_use_tool
 
+        env = self._build_env(
+            cache_ttl=spec.cache_ttl,
+            inference_principal=spec.inference_principal,
+            inference_trigger=spec.inference_trigger,
+            inference_origin=spec.inference_origin,
+        )
+        # A launcher stands where the CLI stood on the command line and is
+        # told which CLI to become (see agent.cli_launcher).
+        cli_path = None
+        launch = self._cli_launch()
+        if launch:
+            cli_path, env[CLI_PATH_ENV] = launch
+
         return ClaudeAgentOptions(
+            cli_path=cli_path,
             model=selected_model,
             system_prompt=system_prompt,
             # 0 (or anything non-positive) = no cap: None keeps `--max-turns`
@@ -746,12 +767,7 @@ class ClaudeBackend:
             # CLI's own autonomous firing is suppressed via the
             # CLAUDE_CODE_DISABLE_CRON env var set in ``_build_env``.
             disallowed_tools=["CronCreate", "CronList", "CronDelete"],
-            env=self._build_env(
-                cache_ttl=spec.cache_ttl,
-                inference_principal=spec.inference_principal,
-                inference_trigger=spec.inference_trigger,
-                inference_origin=spec.inference_origin,
-            ),
+            env=env,
             cwd=spec.cwd,
             # Load no filesystem settings/memory: Nerve owns the entire
             # prompt. It injects the full identity/memory bundle
@@ -852,6 +868,43 @@ class ClaudeBackend:
                     os.chmod(old, 0o600)
             except OSError:
                 pass
+
+    def _cli_launch(self) -> tuple[str, str] | None:
+        """``(launcher, cli)`` when a launcher starts the CLI
+        (``agent.cli_launcher``): the program to run and the CLI it is to
+        become. ``None`` when no launcher is set, or the one set cannot be
+        used: the CLI then starts as it does without one, since an agent that
+        works outside the launcher's limits is better than one that cannot
+        start. The refusal is logged once per launcher.
+        """
+        launcher = os.path.expanduser(
+            getattr(self.config.agent, "cli_launcher", "") or "",
+        )
+        if not launcher:
+            return None
+        if not os.path.isabs(launcher):
+            problem = "is not an absolute path"
+        elif not os.path.isfile(launcher):
+            problem = "is not a file"
+        elif not os.access(launcher, os.X_OK):
+            problem = "is not executable"
+        else:
+            try:
+                import importlib
+
+                claude_transport = importlib.import_module(
+                    "nerve.agent.backends.claude_transport",
+                )
+                return launcher, claude_transport.default_cli_path()
+            except Exception as e:  # noqa: BLE001 — a moved seam must not break the session
+                problem = f"cannot be told which CLI to start ({e})"
+        if launcher not in _refused_launchers:
+            _refused_launchers.add(launcher)
+            logger.warning(
+                "agent.cli_launcher %s %s; the CLI starts without it",
+                launcher, problem,
+            )
+        return None
 
     def _build_env(
         self, cache_ttl: str = "5m", inference_principal: str | None = None,

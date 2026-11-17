@@ -21,17 +21,36 @@ Private SDK seams, pinned by ``tests/test_claude_transport.py``:
 When a seam moves, nothing is patched: :attr:`NerveCLITransport.init_patched`
 stays False, ``ClaudeClient.interrupt_spares_background`` reports False, and
 Stop asks before it would end background agents instead of killing them.
+
+One more seam, for :func:`default_cli_path`: ``_find_cli`` is the search the
+SDK runs when it is given no ``cli_path`` (its bundled CLI first).
 """
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 from typing import Any, AsyncIterator
 
+from claude_agent_sdk import ClaudeAgentOptions
 from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
 logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def default_cli_path() -> str:
+    """The CLI the SDK starts when it is given no ``cli_path``.
+
+    A launcher (``agent.cli_launcher``) takes the CLI's place on the command
+    line, so Nerve names the CLI for it; asking the SDK's own search keeps
+    that the CLI a start without a launcher would have run. Raises the SDK's
+    ``CLINotFoundError`` when there is none, as that start would. The answer
+    does not change while the process runs.
+    """
+    transport = SubprocessCLITransport(prompt="", options=ClaudeAgentOptions())
+    return transport._find_cli()
 
 
 async def _never_yields() -> AsyncIterator[dict[str, Any]]:

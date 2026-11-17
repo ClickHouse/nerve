@@ -1001,6 +1001,7 @@ Backups follow the same rule:
 | `agent.static_system_prompt` | bool | `true` | Keep the appended system prompt byte-identical across sessions of the same workspace/source/tool set so Anthropic's exact-prefix prompt cache shares it between sessions (a cache read instead of a full re-write at every session start). The per-session parts — session id and pre-recalled memories — are delivered once, in a `<session-context>` block at the top of the session's first user message; `mcp__nerve__session_context` returns them live. `false` restores the legacy shape (id and recall inline in the system prompt) |
 | `agent.cli_idle_timeout_seconds` | int | `900` | Hung-runtime detection: the longest silence between two messages of a turn before Nerve treats the agent runtime as hung, ends the turn and replaces the runtime (also the default of `codex.turn_idle_timeout_seconds`). It never fires while a question or a plan decision waits for the person: the interaction timeout (one hour) governs that wait. `0` disables it |
 | `agent.cli_max_message_bytes` | int | `67108864` (64 MiB) | Upper bound on one stream-json message read from the Claude CLI subprocess (the Agent SDK's `max_buffer_size`). The SDK's own default is 1 MiB, and a line over the bound aborts the whole turn — image tool results routinely exceed it: the Read tool ships the base64 image twice per line and re-encodes anything over 2000 px, so a 300 KB screenshot can become a 1.3 MB line. The Read image validator also refuses images whose encoded line cannot fit under this bound, so a too-big image fails as a tool error instead of killing the turn |
+| `agent.cli_launcher` | string | `$NERVE_AGENT_CLI_LAUNCHER`, else `""` | The absolute path of a program that starts the Claude CLI in Nerve's place, so that the agent's commands can run apart from Nerve: under a memory limit, at a lower priority, in a process group of their own. Nerve runs it with the CLI's arguments and names the CLI in `NERVE_AGENT_CLI_PATH`; the program ends by replacing itself with that CLI. Empty: Nerve starts the CLI itself. Read at every start of a CLI. See [A launcher for the agent CLI](#a-launcher-for-the-agent-cli) |
 | `agent.agent_teams` | bool | `true` | Set `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` for the CLI subprocess, which registers the `SendMessage` tool. The Agent tool advertises `SendMessage` for resuming a sub-agent whether or not the flag is set, so with it off the model reaches for a tool that does not exist. Nerve loads no settings files (`setting_sources=[]`), so the env dict is the flag's only route in. Teammates stay opt-in per turn and cost a full context window each; the CLI cannot restore in-process teammates when a session's client is recycled (idle timeout, restart, crash retry) |
 | `agent.subagents.per_task_stop_affordance` | bool | `true` | Stop (the red button, Esc, channel `/stop`) ends only the orchestrator's turn and spares background agents and workflows. Sent to the Claude CLI as the `perTaskStopAffordance` flag of its first `initialize`, which the Python SDK cannot express (Nerve adds it to that frame). Off, or when the patch cannot apply after an SDK upgrade: an interrupt would end every background agent, so Stop asks first (`needs_confirmation`). Applies to runtimes started after a change. See [agents.md](agents.md#stopping) |
 | `agent.subagents.progress_summaries` | bool | `true` | A one-line, model-written status per running agent (`agentProgressSummaries`; a few small-model calls per agent). Applies to runtimes started after a change |
@@ -1017,6 +1018,77 @@ Backups follow the same rule:
 **Prompt rewrite:** when the ✨ toggle in the composer is on, the first prompt of a new chat is rewritten by a fast model to better express intent. The result is previewed (editable) and only sent after explicit approval — the user can always send the original instead. Trivial or already-clear prompts are sent unchanged without a preview.
 
 **Note:** The engine uses a `can_use_tool` callback (not `bypassPermissions`) so that interactive tools (`AskUserQuestion`, `ExitPlanMode`) can pause mid-turn for user input; `EnterPlanMode` is allowed without a pause. All other tools are auto-approved. See [sdk-sessions.md](sdk-sessions.md#permissions--interactive-tools) for details.
+
+### A launcher for the agent CLI
+
+Every command the agent runs is started by the Claude CLI, and Nerve starts
+the CLI. Left alone, the agent's work therefore runs where Nerve runs: in
+the same service, the same control group, with the same limits. On a machine
+where the agent builds or tests software that has a cost. A command that
+takes the machine's memory takes it from Nerve too, and Nerve stops
+answering. And under systemd, when the kernel kills one process of a service
+for memory, the default (`OOMPolicy=stop`) stops the whole service: Nerve
+and every session, for one command that grew too large.
+
+`agent.cli_launcher` names a program that Nerve runs where it would have run
+the CLI. The contract:
+
+- Nerve starts the program with the arguments it would have given the CLI,
+  and with `NERVE_AGENT_CLI_PATH` in its environment: the path of the CLI
+  that Nerve would have started.
+- The program does what it is there for and ends by replacing itself with
+  the CLI: `exec "$NERVE_AGENT_CLI_PATH" "$@"`. It must not start the CLI as
+  a child and wait: Nerve talks to the process it started through its pipes
+  and stops it with signals, and both must reach the CLI itself.
+- Whatever the program set up (a control group, a priority, a resource
+  limit) holds for the CLI and for every command the CLI starts.
+
+The value is an absolute path (`~` is expanded). A value that is not an
+executable file is not used: Nerve logs a warning once and starts the CLI
+itself, since an agent that works without the launcher is better than one
+that cannot start. When no settings layer names `agent.cli_launcher`, the
+environment variable `NERVE_AGENT_CLI_LAUNCHER` does, so a service unit can
+set it for the machine. The setting is read at every start of a CLI: a
+change applies to the sessions started after it.
+
+An example for a machine where Nerve runs as a systemd service. The agent's
+work gets a slice of its own with a memory limit, and a command that grows
+past the limit is killed alone, inside that slice:
+
+```ini
+# /etc/systemd/system/agent-work.slice
+[Slice]
+MemoryMax=6G
+```
+
+```sh
+#!/bin/sh
+# /usr/local/bin/agent-work-launch
+exec systemd-run --scope --quiet --collect --slice=agent-work.slice \
+  --property=OOMPolicy=continue -- "$NERVE_AGENT_CLI_PATH" "$@"
+```
+
+```yaml
+# config.yaml
+agent:
+  cli_launcher: /usr/local/bin/agent-work-launch
+```
+
+`systemd-run --scope` replaces itself with the command it is given, which is
+what the contract asks for. Three things to know about this setup:
+
+- A system-level `systemd-run --scope` needs root. A Nerve that runs as
+  another user starts its scopes in that user's manager (`systemd-run --user
+  --scope`), which must run and must be allowed the memory controller.
+- A scope is a unit of its own, so stopping Nerve's service no longer stops
+  what the agent left running. To keep that, stop the slice when the service
+  stops: `ExecStopPost=/usr/bin/systemctl stop agent-work.slice` in the
+  service unit.
+- The launcher is not a sandbox. It runs with Nerve's privileges, and the
+  agent's commands can do what they could do before.
+
+The setting applies to the Claude backend. The Codex backend starts
+`codex.bin_path`, which can name a wrapper that does the same.
 
 ## Agent Backends (claude / codex)
 
