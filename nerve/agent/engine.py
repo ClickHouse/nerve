@@ -63,6 +63,7 @@ from nerve.agent.cache_policy import resolve_cache_ttl
 from nerve.agent.interactive import (
     InteractiveToolHandler,
     defer_idle_timeout,
+    file_github_approval,
     register_handler,
     unregister_handler,
     get_handler,
@@ -322,9 +323,9 @@ _QUEUE_PREVIEW_CHARS = 200
 _INTERNAL_QUEUE_LABELS = {"wakeup": "Scheduled wakeup", "cron": "Scheduled run"}
 
 # Session sources a person answers in: GitHub-write approvals there are also
-# posted to Telegram. Cron, hook and workflow sessions have no person, so
-# their GitHub writes are declined.
-_PERSON_SOURCES = frozenset({"web", "telegram", "api", "wakeup"})
+# sent as an approval notification, to every notification channel. Cron, hook
+# and workflow sessions have no person, so their GitHub writes are declined.
+_PERSON_SOURCES = frozenset({"web", "telegram", "slack", "api", "wakeup"})
 _RECENT_IDS_KEPT = 64
 _CLIENT_MSG_TTL_SECONDS = 600.0
 
@@ -1843,8 +1844,11 @@ class AgentEngine:
                 interactive_capable=is_interactive,
             )
             self._wire_interaction_hooks(session_id, handler)
-            if source in _PERSON_SOURCES:
-                # GitHub writes also ask in Telegram (nerve/agent/github_gate.py).
+            if source in _PERSON_SOURCES or source == getattr(
+                getattr(self.config, "slack", None), "source", None,
+            ):
+                # GitHub writes also ask outside the web UI
+                # (nerve/agent/github_gate.py).
                 handler.approval_relay = self._github_approval_relay(session_id)
             register_handler(session_id, handler)
 
@@ -2338,24 +2342,24 @@ class AgentEngine:
         return outcome
 
     def _github_approval_relay(self, session_id: str):
-        """The hub's ``approval_relay`` for *session_id*: posts a GitHub-write
-        approval with buttons in Telegram, unless the person has the web
-        card in front of them (a web client watches the session and the turn
-        did not come from Telegram)."""
+        """The hub's ``approval_relay`` for *session_id*: files the GitHub
+        write as an approval notification (``propose_action``, target kind
+        ``github-write``), which goes to every notification channel
+        (Telegram, Slack, hosted channels, web push) and is answered once.
+        Skipped while the person has the web card in front of them: a web
+        client watches the session and the turn came from the web UI."""
         async def relay(interaction_id: str, payload: dict):
-            router = getattr(self, "router", None)
-            channel = router.get_channel("telegram") if router is not None else None
-            post = getattr(channel, "post_github_approval", None)
-            if post is None:
+            service = getattr(self, "notification_service", None)
+            if service is None:
                 return None
             hub = get_handler(session_id)
             if (
                 hub is not None and hub.interactive_capable
-                and hub.turn_source != "telegram"
+                and hub.turn_source in (None, "web", "api", "wakeup")
                 and broadcaster.has_listeners(session_id)
             ):
                 return None
-            return await post(session_id, interaction_id, payload)
+            return await file_github_approval(service, session_id, interaction_id, payload)
         return relay
 
     async def _run_stop_listeners(

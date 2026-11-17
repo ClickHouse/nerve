@@ -9,6 +9,7 @@ Telegram relay, the Telegram buttons, and the engine's relay choice.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 from pathlib import Path
@@ -21,6 +22,8 @@ from nerve.agent import github_gate as gg
 from nerve.agent.backends.base import SessionSpec
 from nerve.agent.backends.claude import ClaudeBackend, ClaudeToolPermissions, github_gate_check
 from nerve.agent.interactive import (
+    GITHUB_WRITE_KIND,
+    file_github_approval,
     GITHUB_WRITE_TOOL,
     UNREACHABLE_MESSAGE,
     InteractiveToolHandler,
@@ -615,91 +618,73 @@ def test_the_turn_message_lasts_one_turn(monkeypatch):
 
 
 # --------------------------------------------------------------------- #
-#  Telegram                                                              #
+#  The approval notification (every channel)                             #
 # --------------------------------------------------------------------- #
 
-class _Bot:
-    def __init__(self):
-        self.calls: list[tuple[str, dict]] = []
-        self._next = 10
+class _Service:
+    """Stands in for NotificationService: records propose_action and dismissals."""
 
-    async def send_message(self, **kwargs):
-        self.calls.append(("send_message", kwargs))
-        self._next += 1
-        return SimpleNamespace(message_id=self._next, chat_id=kwargs.get("chat_id"))
+    def __init__(self, delivered):
+        self.proposed: list[tuple] = []
+        self.dismissed: list[str] = []
+        self.status = "pending"
+        rows = self
 
-    async def edit_message_text(self, **kwargs):
-        self.calls.append(("edit_message_text", kwargs))
+        class _NotifDb:
+            async def get_notification(self, nid):
+                return {"id": nid, "status": rows.status,
+                        "channels_delivered": json.dumps(delivered)}
 
+        self.db = _NotifDb()
 
-class _Db:
-    def __init__(self, keys):
-        self.keys = keys
+    async def propose_action(self, session_id, target_kind, target_id, title, body, **kw):
+        self.proposed.append((session_id, target_kind, target_id, title, body, kw))
+        return {"notification_id": "approval-1", "status": "sent"}
 
-    async def channel_keys_for_sessions(self, sids):
-        return {sid: self.keys[0] for sid in sids} if self.keys else {}
-
-
-class _Router:
-    def __init__(self, keys):
-        self.engine = SimpleNamespace(db=_Db(keys))
-
-    async def get_session(self, sid):
-        return {"id": sid, "title": "Nerve <work>"}
-
-
-def _telegram(keys):
-    from nerve.channels.telegram import TelegramChannel
-    from nerve.config import NerveConfig
-
-    cfg = NerveConfig()
-    cfg.telegram.allowed_users = [4242]
-    channel = TelegramChannel(lambda: cfg, router=_Router(keys))
-    channel._app = SimpleNamespace(bot=_Bot())
-    return channel
+    async def handle_dismiss(self, nid, **kw):
+        self.dismissed.append(nid)
+        self.status = "dismissed"
+        return True
 
 
 @pytest.mark.asyncio
-async def test_telegram_posts_the_approval_in_the_sessions_chat():
-    channel = _telegram(["telegram:1001"])
-    finish = await channel.post_github_approval(
-        "s1", "iid-1", {"item": {"command": "git push <x>"}, "reason": "push: git push"},
+async def test_a_write_is_filed_as_an_approval_for_every_channel():
+    service = _Service(["web", "telegram", "slack"])
+    finish = await file_github_approval(
+        service, "s1", "iid-1", {"item": {"command": "git push fork main"}, "reason": "push"},
     )
-    [(name, sent)] = channel._app.bot.calls
-    assert name == "send_message" and sent["chat_id"] == 1001
-    assert "git push &lt;x&gt;" in sent["text"] and "Nerve &lt;work&gt;" in sent["text"]
-    buttons = [b.callback_data for b in sent["reply_markup"].inline_keyboard[0]]
-    assert buttons == ["ghw:a:iid-1", "ghw:d:iid-1"]
+    [(sid, kind, target, title, body, kw)] = service.proposed
+    assert (sid, kind, target) == ("s1", GITHUB_WRITE_KIND, "iid-1")
+    assert "GitHub write" in title and "```\ngit push fork main\n```" in body
+    assert [o["value"] for o in kw["options"]] == ["approve", "decline"]
+    assert kw["expiry_hours"] == 1
+    # The interaction ended another way (the web card): the card closes.
     await finish("approved")
-    edited = channel._app.bot.calls[-1][1]
-    assert edited["text"].endswith("✅ Approved") and edited["reply_markup"] is None
+    assert service.dismissed == ["approval-1"]
 
 
 @pytest.mark.asyncio
-async def test_telegram_falls_back_to_the_home_chat():
-    channel = _telegram([])
-    assert await channel.post_github_approval("s1", "iid-2", {}) is not None
-    sent = channel._app.bot.calls[0][1]
-    assert sent["chat_id"] == 4242 and "message_thread_id" not in sent
-
-
-class _Query:
-    def __init__(self, data):
-        self.data = data
-        self.from_user = SimpleNamespace(id=4242)
-        self.answers: list[tuple] = []
-        self.markup_cleared = False
-
-    async def answer(self, text=None, show_alert=False):
-        self.answers.append((text, show_alert))
-
-    async def edit_message_reply_markup(self, reply_markup=None):
-        self.markup_cleared = True
+async def test_an_answered_card_is_left_alone():
+    service = _Service(["telegram"])
+    finish = await file_github_approval(service, "s1", "iid-1", {})
+    service.status = "answered"
+    await finish("approved")
+    assert service.dismissed == []
 
 
 @pytest.mark.asyncio
-async def test_telegram_button_approves_the_pending_write():
-    hub = _real_hub("gh-btn", interactive=False)
+async def test_no_channel_outside_the_web_means_nobody_to_ask():
+    service = _Service(["web"])
+    assert await file_github_approval(service, "s1", "iid-1", {}) is None
+    assert service.dismissed == ["approval-1"]
+
+
+@pytest.mark.asyncio
+async def test_an_answer_from_any_channel_settles_the_write():
+    from nerve.notifications import handlers
+
+    assert handlers.get(GITHUB_WRITE_KIND) is not None
+    hub = _real_hub("gh-any", interactive=False)
 
     async def relay(interaction_id, payload):
         async def finish(outcome):
@@ -707,22 +692,20 @@ async def test_telegram_button_approves_the_pending_write():
         return finish
 
     hub.approval_relay = relay
-    channel = _telegram([])
+    dispatch = handlers.get(GITHUB_WRITE_KIND)
     try:
         task = asyncio.create_task(hub.request_github_approval({}))
-        query = _Query(f"ghw:a:{await _pending_id(hub)}")
-        await channel._handle_callback_query(SimpleNamespace(callback_query=query), None)
-        assert (await task).approved and query.answers == [("Approved", False)]
+        iid = await _pending_id(hub)
+        result = await dispatch({"id": "approval-1"}, iid, "approve", None, actor=None)
+        assert result.ok and (await task).approved
+        task = asyncio.create_task(hub.request_github_approval({}))
+        iid = await _pending_id(hub)
+        result = await dispatch({"id": "approval-2"}, iid, "decline", None, actor=None)
+        assert result.ok and (await task).denied
+        gone = await dispatch({"id": "approval-3"}, "gone", "approve", None, actor=None)
+        assert not gone.ok
     finally:
-        unregister_handler("gh-btn")
-
-
-@pytest.mark.asyncio
-async def test_telegram_button_for_a_settled_write_says_so():
-    channel = _telegram([])
-    query = _Query("ghw:d:gone")
-    await channel._handle_callback_query(SimpleNamespace(callback_query=query), None)
-    assert query.answers == [("Already answered or expired", True)] and query.markup_cleared
+        unregister_handler("gh-any")
 
 
 # --------------------------------------------------------------------- #
@@ -730,28 +713,33 @@ async def test_telegram_button_for_a_settled_write_says_so():
 # --------------------------------------------------------------------- #
 
 @pytest.mark.asyncio
-async def test_engine_relay_skips_telegram_when_the_web_card_is_watched(monkeypatch):
+async def test_engine_relay_files_unless_the_web_card_is_watched(monkeypatch):
     from nerve.agent import engine as engine_mod
 
-    posted: list[str] = []
+    filed: list[str] = []
 
-    async def post(sid, interaction_id, payload):
-        posted.append(sid)
+    async def fake_file(service, sid, interaction_id, payload):
+        filed.append(interaction_id)
         return "finish"
 
-    channel = SimpleNamespace(post_github_approval=post)
-    fake = SimpleNamespace(router=SimpleNamespace(get_channel=lambda name: channel))
+    monkeypatch.setattr(engine_mod, "file_github_approval", fake_file)
+    fake = SimpleNamespace(notification_service=object())
     relay = engine_mod.AgentEngine._github_approval_relay(fake, "gh-eng")
     hub = _real_hub("gh-eng", interactive=True)
     try:
         monkeypatch.setattr(engine_mod.broadcaster, "has_listeners", lambda sid: True)
         hub.begin_turn("hi", "web")
-        assert await relay("i1", {}) is None and posted == []
-        hub.begin_turn("hi", "telegram")
-        assert await relay("i2", {}) == "finish"
+        assert await relay("i1", {}) is None and filed == []
+        for source in ("telegram", "slack"):
+            hub.begin_turn("hi", source)
+            assert await relay(f"i-{source}", {}) == "finish"
         monkeypatch.setattr(engine_mod.broadcaster, "has_listeners", lambda sid: False)
         hub.begin_turn("hi", "web")
-        assert await relay("i3", {}) == "finish" and posted == ["gh-eng", "gh-eng"]
+        assert await relay("i3", {}) == "finish"
+        assert filed == ["i-telegram", "i-slack", "i3"]
+        assert await engine_mod.AgentEngine._github_approval_relay(
+            SimpleNamespace(notification_service=None), "gh-eng",
+        )("i4", {}) is None
     finally:
         unregister_handler("gh-eng")
 
@@ -772,7 +760,7 @@ def test_engine_end_turn_clears_the_turn_message():
 def test_person_sources():
     from nerve.agent.engine import _PERSON_SOURCES
 
-    assert {"web", "telegram"} <= _PERSON_SOURCES
+    assert {"web", "telegram", "slack"} <= _PERSON_SOURCES
     assert not {"cron", "hook", "workflow"} & _PERSON_SOURCES
 
 
@@ -783,3 +771,97 @@ def test_gate_module_runs_without_nerve(tmp_path):
         capture_output=True, text=True, timeout=30,
     )
     assert out.returncode == 0 and out.stdout.startswith("push git push o x")
+
+
+# --------------------------------------------------------------------- #
+#  End to end with the notification service                              #
+# --------------------------------------------------------------------- #
+
+class _TgBot:
+    def __init__(self):
+        self.calls: list[tuple[str, dict]] = []
+        self._next = 10
+
+    async def send_message(self, **kwargs):
+        self.calls.append(("send_message", kwargs))
+        self._next += 1
+        return SimpleNamespace(message_id=self._next)
+
+    async def edit_message_text(self, **kwargs):
+        self.calls.append(("edit_message_text", kwargs))
+
+    def named(self, name):
+        return [kw for called, kw in self.calls if called == name]
+
+
+async def _service_with_telegram(db, tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock, MagicMock
+
+    from nerve.agent import streaming
+    from nerve.config import NerveConfig, NotificationsConfig
+    from nerve.notifications.service import NotificationService
+    from tests.actor_rows import ensure_system_principal
+
+    await ensure_system_principal(db)
+    monkeypatch.setattr(streaming, "broadcaster", SimpleNamespace(broadcast=AsyncMock()))
+    cfg = NerveConfig()
+    cfg.workspace = tmp_path
+    cfg.telegram.allowed_users = [4242]
+    cfg.notifications = NotificationsConfig(channels=["telegram"], telegram_chat_id=4242)
+    bot = _TgBot()
+    channel = SimpleNamespace(
+        _app=SimpleNamespace(bot=bot), _cache_message=MagicMock(),
+        _record_reply_route=AsyncMock(),
+    )
+    engine = MagicMock()
+    engine.sessions.is_running.return_value = False
+    engine.router.get_channel.return_value = channel
+    return NotificationService(cfg, db, engine), bot
+
+
+@pytest.mark.asyncio
+async def test_a_telegram_answer_through_the_notification_approves(db, tmp_path, monkeypatch):
+    service, bot = await _service_with_telegram(db, tmp_path, monkeypatch)
+    await db.create_session("gh-e2e", title="e2e", source="slack", actor=None)
+    hub = _real_hub("gh-e2e", interactive=False)
+    hub.approval_relay = lambda iid, payload: file_github_approval(service, "gh-e2e", iid, payload)
+    try:
+        task = asyncio.create_task(
+            hub.request_github_approval({"item": {"command": "gh pr create"}}),
+        )
+        await _pending_id(hub)
+        for _ in range(200):
+            if bot.named("send_message"):
+                break
+            await asyncio.sleep(0.005)
+        (sent,) = bot.named("send_message")
+        assert "gh pr create" in sent["text"]
+        buttons = [b.callback_data for b in sent["reply_markup"].inline_keyboard[0]]
+        nid = buttons[0].split(":")[1]
+        assert await service.handle_answer(nid, "approve", "telegram")
+        assert (await asyncio.wait_for(task, 2)).approved
+        assert (await db.get_notification(nid))["status"] == "answered"
+    finally:
+        unregister_handler("gh-e2e")
+
+
+@pytest.mark.asyncio
+async def test_a_write_approved_on_the_web_closes_its_card(db, tmp_path, monkeypatch):
+    service, bot = await _service_with_telegram(db, tmp_path, monkeypatch)
+    await db.create_session("gh-e2w", title="e2w", source="web", actor=None)
+    hub = _real_hub("gh-e2w", interactive=True)
+    hub.approval_relay = lambda iid, payload: file_github_approval(service, "gh-e2w", iid, payload)
+    try:
+        task = asyncio.create_task(hub.request_github_approval({"item": {"command": "git push"}}))
+        iid = await _pending_id(hub)
+        for _ in range(200):
+            if bot.named("send_message"):
+                break
+            await asyncio.sleep(0.005)
+        nid = bot.named("send_message")[0]["reply_markup"].inline_keyboard[0][0].callback_data.split(":")[1]
+        hub.resolve(iid, None)  # the web card
+        assert (await asyncio.wait_for(task, 2)).approved
+        assert (await db.get_notification(nid))["status"] == "dismissed"
+        assert bot.named("edit_message_text")  # the Telegram card lost its buttons
+    finally:
+        unregister_handler("gh-e2w")

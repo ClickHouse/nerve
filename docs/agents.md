@@ -180,11 +180,15 @@ the model never sees it during an earlier turn.
 With `agent.github_write_gate: true` (off by default), a shell command that
 pushes, posts or changes something on GitHub waits for the person
 (`nerve/agent/github_gate.py`, Claude sessions). The web UI shows
-an "Agent wants to write to GitHub" card with the command; Telegram gets the
-same with ✅ Approve / ❌ Decline buttons, in the chat the session is bound
-to, else the notification chat. Telegram is skipped when
-a web client watches the session and the turn did not come from Telegram. No
-answer within an hour declines it.
+an "Agent wants to write to GitHub" card with the command. The same request
+goes out as an approval notification with Approve / Decline buttons, to every
+channel in `notifications.channels` (Telegram, Slack, hosted channels, web
+push), and the first answer anywhere settles it (target kind
+`github-write`). The notification is skipped while a web client watches the
+session and the turn came from the web UI. When the write is settled another
+way (the web card, a stop), its cards close. A session that only a channel
+can reach (Slack, Telegram) and whose notification reached no channel is
+declined at once. No answer within an hour declines it.
 
 It runs without a card when:
 

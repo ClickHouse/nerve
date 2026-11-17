@@ -53,8 +53,8 @@ APPROVAL_KINDS = frozenset({
 GITHUB_WRITE_TOOL = "GitHubWrite"
 UNREACHABLE_MESSAGE = (
     "This command writes to GitHub and needs the person's approval, but nobody "
-    "can approve it from this session (no web UI and no Telegram). Ask them with "
-    "the notify or ask_user tool and let them run it from a chat."
+    "can approve it from this session (no web UI and no notification channel). "
+    "Ask them with the notify or ask_user tool and let them run it from a chat."
 )
 
 # Tools that modify files — trigger pre-execution snapshot
@@ -557,6 +557,103 @@ def unregister_handler(session_id: str) -> None:
 def get_handler(session_id: str) -> InteractiveToolHandler | None:
     """Get the handler for a session."""
     return _handlers.get(session_id)
+
+
+# The ``target_kind`` of the approval notification a GitHub write files
+# (``NotificationService.propose_action``); its target id is the interaction.
+GITHUB_WRITE_KIND = "github-write"
+_GITHUB_WRITE_OPTIONS = [
+    {"label": "Approve", "value": "approve"},
+    {"label": "Decline", "value": "decline"},
+]
+# An approval waits this long (interactions time out after an hour too).
+_GITHUB_WRITE_EXPIRY_HOURS = 1
+
+
+def _github_write_text(payload: dict[str, Any]) -> tuple[str, str]:
+    """The approval notification's title and Markdown body."""
+    command = str((payload.get("item") or {}).get("command") or "")
+    if len(command) > 2500:
+        command = command[:2500] + "…"
+    reason = str(payload.get("reason") or "")[:600]
+    fence = "````" if "```" in command else "```"
+    body = f"{fence}\n{command}\n{fence}" + (f"\n{reason}" if reason else "")
+    return "🔐 GitHub write needs your OK", body
+
+
+async def file_github_approval(
+    service: Any, session_id: str, interaction_id: str, payload: dict[str, Any],
+) -> Callable[[str], Coroutine[Any, Any, None]] | None:
+    """File a GitHub write as an approval notification, for every channel.
+
+    The answer comes back through the ``github-write`` dispatcher, which
+    resolves the pending interaction. Returns the relay's ``finish``: it
+    closes a card that is still pending once the interaction ended another
+    way (the web card, expiry, a stop). Returns None when no channel
+    outside the web UI took the card, so a session nobody watches in the
+    web UI is declined at once rather than waiting an hour.
+    """
+    title, body = _github_write_text(payload)
+    result = await service.propose_action(
+        session_id, GITHUB_WRITE_KIND, interaction_id, title, body,
+        options=_GITHUB_WRITE_OPTIONS, priority="high",
+        expiry_hours=_GITHUB_WRITE_EXPIRY_HOURS,
+    )
+    notification_id = result["notification_id"]
+    row = await service.db.get_notification(notification_id) or {}
+    try:
+        import json
+
+        delivered = json.loads(row.get("channels_delivered") or "[]")
+    except (TypeError, ValueError):
+        delivered = []
+    reached = [c for c in delivered if c != "web"]
+
+    async def finish(outcome: str) -> None:
+        current = await service.db.get_notification(notification_id)
+        if current and current.get("status") == "pending":
+            await service.handle_dismiss(notification_id)
+
+    if not reached:
+        await finish("unreachable")
+        return None
+    return finish
+
+
+async def _dispatch_github_write(
+    notification: dict[str, Any],
+    target_id: str,
+    decision: str,
+    config: Any,
+    *,
+    actor: Any,
+) -> Any:
+    """An answer to a GitHub-write approval card, from any channel."""
+    from nerve.notifications import handlers as notification_handlers
+
+    approve = decision == "approve"
+    session_id = answer_github_approval(target_id, approve)
+    return notification_handlers.DispatchResult(
+        ok=session_id is not None,
+        audit_event={
+            "event": "approval-acted",
+            "notification_id": notification.get("id"),
+            "target_kind": GITHUB_WRITE_KIND,
+            "target_id": target_id,
+            "decision": decision,
+            "ok": session_id is not None,
+            **({} if session_id else {"error": "no session waits on this approval"}),
+        },
+    )
+
+
+def _register_github_write_dispatcher() -> None:
+    from nerve.notifications import handlers as notification_handlers
+
+    notification_handlers.register(GITHUB_WRITE_KIND, _dispatch_github_write)
+
+
+_register_github_write_dispatcher()
 
 
 def answer_github_approval(interaction_id: str, approve: bool) -> str | None:
