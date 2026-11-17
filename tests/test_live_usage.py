@@ -332,3 +332,54 @@ async def test_session_status_carries_the_live_estimate(monkeypatch):
     assert sent[-1]["live_usage"] == live and sent[-1]["agents_cost_base"] == 1.0
     await server._send_session_status(_Socket(), SID, False, {"status": "active"}, agents={})
     assert "live_usage" not in sent[-1]
+
+
+# --------------------------------------------------------------------- #
+#  A message_delta that carries only part of the usage                   #
+# --------------------------------------------------------------------- #
+
+def test_a_delta_with_only_the_output_keeps_the_input_side():
+    from nerve.agent.engine import _merge_call_usage
+
+    assert _merge_call_usage(START, {"output_tokens": 380}) == {**START, "output_tokens": 380}
+    # Missing, null or 0 input and cache fields keep the start values.
+    update = {"input_tokens": None, "cache_read_input_tokens": 0, "output_tokens": 380}
+    assert _merge_call_usage(START, update) == {**START, "output_tokens": 380}
+    # A full delta wins field by field.
+    assert _merge_call_usage(START, {**START, "output_tokens": 9}) == {**START, "output_tokens": 9}
+    assert _merge_call_usage(None, {"output_tokens": 1, "input_tokens": None}) == {"output_tokens": 1}
+
+
+@pytest.mark.asyncio
+async def test_an_output_only_delta_keeps_the_calls_input_cost():
+    CallUsage = ev.CallUsage
+    st = _TurnState()
+    sent: list[dict] = []
+
+    async def get_session(_sid):
+        return {"total_cost_usd": 0.0}
+
+    fake = SimpleNamespace(
+        db=SimpleNamespace(get_session=get_session),
+        agents=SimpleNamespace(summary=lambda _sid: {"cost_usd": 0.0}),
+        config=SimpleNamespace(agent=SimpleNamespace(context_1m_enabled_for=lambda _m: True)),
+        _live_usage={}, _agents_cost_base={},
+    )
+    fake._agents_cost_now = lambda sid: AgentEngine._agents_cost_now(fake, sid)
+    fake._live_payload = lambda sid, s: AgentEngine._live_payload(fake, sid, s)
+    real = broadcaster.broadcast_usage_update
+
+    async def capture(_sid, live):
+        sent.append(live)
+
+    broadcaster.broadcast_usage_update = capture
+    try:
+        start = CallUsage(message_id="m1", model="claude-opus-5-5", usage=dict(START), final=False)
+        end = CallUsage(message_id="m1", model="claude-opus-5-5",
+                        usage={"output_tokens": 380, "input_tokens": None}, final=True)
+        await AgentEngine._on_call_usage(fake, SID, start, st)
+        await AgentEngine._on_call_usage(fake, SID, end, st)
+    finally:
+        broadcaster.broadcast_usage_update = real
+    assert st.calls["m1"][1] == {**START, "output_tokens": 380}
+    assert sent[1]["turn_cost_usd"] > sent[0]["turn_cost_usd"] > 0

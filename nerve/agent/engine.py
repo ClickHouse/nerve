@@ -433,6 +433,28 @@ class TurnWatch:
     outcome: TurnOutcome | None = None
 
 
+def _merge_call_usage(started: dict | None, update: dict) -> dict:
+    """A call's usage after one more frame: *update* over *started*.
+
+    A ``message_delta`` may carry only the output count, or input and cache
+    fields that are missing, ``null`` or 0. Like the CLI's own accumulator,
+    such fields keep the ``message_start`` values, so the call keeps its
+    input cost and a ``null`` never reaches the estimate.
+    """
+    merged = dict(started or {})
+    for name, value in (update or {}).items():
+        if value is None:
+            continue
+        if isinstance(value, dict):
+            if value:
+                merged[name] = _merge_call_usage(merged.get(name) if isinstance(merged.get(name), dict) else None, value)
+            continue
+        if value == 0 and name != "output_tokens" and merged.get(name):
+            continue
+        merged[name] = value
+    return {k: v for k, v in merged.items() if v is not None}
+
+
 class AgentEngine:
     """Core agent engine wrapping claude-agent-sdk.
 
@@ -3579,7 +3601,10 @@ class AgentEngine:
             )
 
         elif isinstance(event, CallUsage):
-            await self._on_call_usage(session_id, event, st)
+            try:
+                await self._on_call_usage(session_id, event, st)
+            except Exception:  # noqa: BLE001 — an estimate never fails a turn
+                logger.debug("live usage update failed for %s", session_id, exc_info=True)
 
         elif isinstance(event, ModelObserved):
             # Main-agent serving-model observation (backends already gate
@@ -3662,9 +3687,10 @@ class AgentEngine:
         previous = st.calls.get(key)
         if previous is not None and previous[2] and not event.final:
             return  # the call's final usage stands
-        if previous is not None and previous[1] == event.usage and previous[2] == event.final:
+        usage = _merge_call_usage(previous[1] if previous is not None else None, event.usage)
+        if previous is not None and previous[1] == usage and previous[2] == event.final:
             return  # one more frame of the same call: nothing new
-        st.calls[key] = (event.model or st.last_model, dict(event.usage), bool(event.final))
+        st.calls[key] = (event.model or st.last_model, usage, bool(event.final))
         st.last_call = key
         if st.live_base_cost is None:
             record = await self.db.get_session(session_id)
