@@ -114,6 +114,14 @@ def kinds(command: str) -> list[str]:
     ("gh api -X PUT repos/a/b/pulls/1/merge", ["destructive"]),
     ("gh api graphql -f query='query { viewer { login } }'", []),
     ("gh api graphql -f query='mutation { addComment(input:{}) { x } }'", ["post"]),
+    # Only the post list's mutations are posts; any other always asks.
+    ("gh api graphql -f query='mutation { a: addReaction(input:{}) { x } }'", ["post"]),
+    ("gh api graphql -f query='mutation { mergePullRequest(input:{}) { x } }'", ["destructive"]),
+    ("gh api graphql -f query='mutation { closeIssue(input:{}) { x } }'", ["destructive"]),
+    ("gh api graphql -f query='mutation { deleteRef(input:{}) { x } }'", ["destructive"]),
+    ("gh api graphql -f query='mutation { createCommitOnBranch(input:{}) { x } }'", ["destructive"]),
+    ("gh api graphql -f query='mutation { addComment(input:{}) { x } closeIssue(input:{}) { y } }'", ["destructive"]),
+    ("gh api graphql -f query='mutation { ...F }'", ["destructive"]),
     # A query in a file passes here; the gh wrapper reads the file.
     ("gh api graphql -F query=@q.graphql -f path=x", []),
     ("gh api graphql --input body.json", []),
@@ -643,6 +651,7 @@ class _Service:
 
     async def handle_dismiss(self, nid, **kw):
         self.dismissed.append(nid)
+        self.dismiss_kwargs = kw
         self.status = "dismissed"
         return True
 
@@ -658,9 +667,12 @@ async def test_a_write_is_filed_as_an_approval_for_every_channel():
     assert "GitHub write" in title and "```\ngit push fork main\n```" in body
     assert [o["value"] for o in kw["options"]] == ["approve", "decline"]
     assert kw["expiry_hours"] == 1
-    # The interaction ended another way (the web card): the card closes.
+    # The interaction ended another way (the web card): the card closes and
+    # says what happened.
     await finish("approved")
     assert service.dismissed == ["approval-1"]
+    assert service.dismiss_kwargs["settled"] == "approved"
+    assert "Approved" in service.dismiss_kwargs["settled_line"]
 
 
 @pytest.mark.asyncio
@@ -862,6 +874,22 @@ async def test_a_write_approved_on_the_web_closes_its_card(db, tmp_path, monkeyp
         hub.resolve(iid, None)  # the web card
         assert (await asyncio.wait_for(task, 2)).approved
         assert (await db.get_notification(nid))["status"] == "dismissed"
-        assert bot.named("edit_message_text")  # the Telegram card lost its buttons
+        edits = bot.named("edit_message_text")  # the Telegram card lost its buttons
+        assert edits and "Approved in another place" in edits[-1]["text"]
     finally:
         unregister_handler("gh-e2w")
+
+
+@pytest.mark.parametrize("document, fields", [
+    ("mutation { addComment(input:{}) { x } }", ["addComment"]),
+    ("mutation M($i: X!) { a: addComment(input: $i) { x } b: addReaction(input: {}) { y } }",
+     ["addComment", "addReaction"]),
+    ('mutation { addComment(input: {body: "} closeIssue"}) { x } }', ["addComment"]),
+    ("mutation { addComment(input: {}) @skip(if: false) { x } }", ["addComment"]),
+    ("query { a } mutation M { addStar(input: {}) { x } }", ["addStar"]),
+    ("mutation { ", None),
+    ("mutation { ...F }", None),
+    ("mutation { addComment(input: {}) { x }", None),
+])
+def test_mutation_fields(document, fields):
+    assert gg.mutation_fields(document) == fields

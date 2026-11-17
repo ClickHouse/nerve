@@ -186,7 +186,7 @@ channel in `notifications.channels` (Telegram, Slack, hosted channels, web
 push), and the first answer anywhere settles it (target kind
 `github-write`). The notification is skipped while a web client watches the
 session and the turn came from the web UI. When the write is settled another
-way (the web card, a stop), its cards close. A session that only a channel
+way (the web card, a stop), its cards close and say how it was settled. A session that only a channel
 can reach (Slack, Telegram) and whose notification reached no channel is
 declined at once. No answer within an hour declines it.
 
@@ -206,7 +206,7 @@ settings changes always ask. Sessions without a person (cron, hooks,
 workflow runs) are refused; background sub-agents too, since the CLI never
 asks for them.
 
-GraphQL (`gh api graphql`) writes only through a `mutation`. An inline query asks only when it holds one (comments and strings don't count). A query in a file (`-F query=@file`, `--input file`, or `-` for stdin) passes the command check, and the `gh` wrapper reads it where the command runs: a mutation there, or a file it can't read, is refused unless approved.
+GraphQL (`gh api graphql`) writes only through a `mutation`. An inline query asks only when it holds one (comments and strings don't count). As for REST, only the comment, review, reaction and create mutations (`addComment`, `addPullRequestReview`, `submitPullRequestReview`, `addReaction`, `createIssue`, `createPullRequest` and their kin) count as a post; any other mutation (`mergePullRequest`, `closeIssue`, `deleteRef`, `updateRepository`, `createCommitOnBranch`…), a fragment spread, or a document the gate can't read always asks. A query in a file (`-F query=@file`, `--input file`, or `-` for stdin) passes the command check, and the `gh` wrapper reads it where the command runs: a mutation there, or a file it can't read, is refused unless approved.
 
 Writes inside a script are caught by `git` and `gh` wrappers that come first
 on the runtime's PATH (`~/.nerve/github-gate/bin`). They let a write through

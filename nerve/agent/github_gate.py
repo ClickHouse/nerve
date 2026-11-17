@@ -306,6 +306,80 @@ def has_mutation(document: str) -> bool:
     return re.search(r"\bmutation\b", _GQL_STRIP_RE.sub(" ", document)) is not None
 
 
+# GraphQL mutations a "post" message covers, as for REST: new issues and PRs,
+# comments, reviews, review replies, reactions and comment edits. Any other
+# mutation (a merge, a close, a ref, a repository, a commit) always asks.
+_POST_MUTATIONS = frozenset({
+    "addComment", "addDiscussionComment", "addPullRequestReview",
+    "addPullRequestReviewComment", "addPullRequestReviewThread",
+    "addPullRequestReviewThreadReply", "submitPullRequestReview",
+    "updatePullRequestReview", "updatePullRequestReviewComment",
+    "updateIssueComment", "addReaction", "removeReaction", "createIssue",
+    "createPullRequest",
+})
+_GQL_NAME_RE = re.compile(r"[_A-Za-z][_0-9A-Za-z]*")
+
+
+def mutation_fields(document: str) -> list[str] | None:
+    """The top-level fields of every mutation operation in *document*.
+
+    At the top level of a mutation's selection, outside parentheses, a name
+    is an alias (a ``:`` follows), a directive (``@`` before it) or a field.
+    None when the document can't be read that far (an operation without a
+    selection, unbalanced brackets, a fragment spread), so the caller fails
+    closed.
+    """
+    text = _GQL_STRIP_RE.sub(" ", document)
+    fields: list[str] = []
+    for match in re.finditer(r"\bmutation\b", text):
+        i = text.find("{", match.end())
+        if i < 0:
+            return None
+        depth, parens, n = 0, 0, len(text)
+        while i < n:
+            ch = text[i]
+            if ch == "(":
+                parens += 1
+            elif ch == ")":
+                parens -= 1
+            elif parens == 0 and ch == "{":
+                depth += 1
+            elif parens == 0 and ch == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            elif parens == 0 and depth == 1:
+                if text.startswith("...", i):
+                    return None  # a fragment spread: its fields are elsewhere
+                name = _GQL_NAME_RE.match(text, i)
+                if name is not None and (i == 0 or not (text[i - 1].isalnum() or text[i - 1] == "_")):
+                    after = text[name.end():].lstrip()
+                    if not after.startswith(":") and text[i - 1:i] != "@":
+                        fields.append(name.group())
+                    i = name.end()
+                    continue
+            i += 1
+        if depth != 0 or parens != 0:
+            return None
+    return fields
+
+
+def _graphql_write(documents: list[str | None], what: str) -> Write | None:
+    """The write a set of GraphQL documents makes, if any: a post when every
+    mutation is on the post list, else one that always asks."""
+    kind: str | None = None
+    for doc in documents:
+        if doc is None:
+            return Write(DESTRUCTIVE, what + " (GraphQL, unreadable)")
+        if not has_mutation(doc):
+            continue
+        names = mutation_fields(doc)
+        if not names or any(name not in _POST_MUTATIONS for name in names):
+            return Write(DESTRUCTIVE, what + " (GraphQL mutation)")
+        kind = POST
+    return Write(kind, what + " (GraphQL mutation)") if kind else None
+
+
 def _input_query(body: str) -> str | None:
     """The ``query`` of a ``--input`` JSON body; None when it isn't one."""
     try:
@@ -377,10 +451,8 @@ def _classify_gh_api(
         if input_path is not None and load is not None:
             body = load(input_path)
             documents.append(None if body is None else _input_query(body))
-        # Unreadable or not a query: ask, it could be anything.
-        if any(doc is None or has_mutation(doc) for doc in documents):
-            return Write(POST, what + " (GraphQL mutation)")
-        return None
+        # Unreadable or not a query: always ask, it could be anything.
+        return _graphql_write(documents, what)
     if method in ("GET", "HEAD"):
         return None
     if method == "POST" and _RERUN_ENDPOINT.match(endpoint):

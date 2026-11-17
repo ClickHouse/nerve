@@ -566,6 +566,14 @@ _GITHUB_WRITE_OPTIONS = [
     {"label": "Approve", "value": "approve"},
     {"label": "Decline", "value": "decline"},
 ]
+# What a card says when the write was settled somewhere else.
+_SETTLED_LINES = {
+    "approved": "✅ Approved in another place",
+    "declined": "❌ Declined in another place",
+    "expired": "⏰ Expired unanswered",
+    "cancelled": "🔕 Cancelled",
+    "unreachable": "🔕 Cancelled",
+}
 # An approval waits this long (interactions time out after an hour too).
 _GITHUB_WRITE_EXPIRY_HOURS = 1
 
@@ -612,7 +620,10 @@ async def file_github_approval(
     async def finish(outcome: str) -> None:
         current = await service.db.get_notification(notification_id)
         if current and current.get("status") == "pending":
-            await service.handle_dismiss(notification_id)
+            await service.handle_dismiss(
+                notification_id, settled=outcome,
+                settled_line=_SETTLED_LINES.get(outcome, _SETTLED_LINES["cancelled"]),
+            )
 
     if not reached:
         await finish("unreachable")
