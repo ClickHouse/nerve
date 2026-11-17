@@ -507,6 +507,12 @@ def test_hybrid_recall_needs_an_explicit_embedder(tmp_path) -> None:
     assert MemUBridge(explicit)._hybrid_recall
     assert MemUBridge(_make_config(tmp_path, embedder="local"))._hybrid_recall
     assert not MemUBridge(_make_config(tmp_path, embedder="none"))._hybrid_recall
+    # extraction: none stores transcript chunks, which need the hybrid path
+    # (labels, the chunk cap): it goes by the embedder in effect.
+    no_llm = _make_config(tmp_path, extraction="none")
+    no_llm.openai_api_key = "sk-test"
+    assert MemUBridge(no_llm)._hybrid_recall
+    assert not MemUBridge(_make_config(tmp_path, extraction="none"))._hybrid_recall
 
 
 def test_config_refuses_a_local_embedder_without_fastembed(monkeypatch) -> None:

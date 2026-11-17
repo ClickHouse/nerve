@@ -4958,7 +4958,11 @@ class MemUBridge:
     @property
     def _hybrid_recall(self) -> bool:
         """Whether recall runs Nerve's hybrid search and the startup backfill
-        embeds stored rows: only when ``memory.embedder`` names an embedder.
-        An install that leaves it unset keeps memU's own recall, as before,
-        even with ``openai_api_key`` set."""
-        return self._has_embeddings and self.config.memory.embedder in ("local", "openai")
+        embeds stored rows: when ``memory.embedder`` names an embedder, and
+        in ``extraction: none`` mode with whichever embedder is in effect
+        (its chunks need the labelled, capped hybrid path). Otherwise an
+        install that leaves ``embedder`` unset keeps memU's own recall, as
+        before, even with ``openai_api_key`` set."""
+        if not self._has_embeddings:
+            return False
+        return self.config.memory.embedder in ("local", "openai") or self._verbatim
