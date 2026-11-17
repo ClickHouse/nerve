@@ -193,13 +193,30 @@ async def get_uploaded_file(
 async def download_file(
     path: str,
 ):
-    """Download a workspace file by absolute path."""
+    """Download a workspace file by absolute path.
+
+    ``files.exclude`` applies here as on the Files page's routes: an
+    excluded path, or a path that resolves to one, is not found.
+    """
+    import os
+
+    from nerve.gateway.routes.workspace import resolve_workspace_path
+
     config = get_config()
     workspace_root = config.workspace.resolve()
 
     resolved = Path(path).resolve()
     if not resolved.is_relative_to(workspace_root):
         raise HTTPException(status_code=403, detail="Access denied: path outside workspace")
+
+    # Judge the path as asked (lexically, ".." folded) and where it resolves.
+    asked = Path(os.path.normpath(path))
+    rel = (
+        asked.relative_to(workspace_root) if asked.is_relative_to(workspace_root)
+        else resolved.relative_to(workspace_root)
+    )
+    if resolve_workspace_path(workspace_root, rel.as_posix(), config.files.patterns) is None:
+        raise HTTPException(status_code=404, detail="File not found")
 
     if not resolved.exists() or not resolved.is_file():
         raise HTTPException(status_code=404, detail="File not found")
