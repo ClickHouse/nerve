@@ -2713,15 +2713,38 @@ DEFAULT_DELIVERY_DEBOUNCE_SECONDS = 60
 MAX_DELIVERY_DEBOUNCE_SECONDS = 600
 
 
-def _delivery_debounce(value: object) -> int:
-    """Coerce ``cron.delivery_debounce_seconds``, holding it at or above 0."""
-    seconds = _lenient_int(
-        value, DEFAULT_DELIVERY_DEBOUNCE_SECONDS, label="cron.delivery_debounce_seconds",
-    )
+# How long after the start of a job's last run a hosted delivery leaves its
+# records to a scheduled run of the job that comes within that time.
+DEFAULT_DELIVERY_MIN_INTERVAL_SECONDS = 1800
+# The longest interval the cron service applies; a larger value is used as
+# this, and `nerve config validate` says so. It is shorter than the time a
+# consumer's cursor has left after a run of the job (half of
+# sync.consumer_cursor_ttl_days or more), so a record that waits for a
+# scheduled run is still unread when that run comes.
+MAX_DELIVERY_MIN_INTERVAL_SECONDS = 21600
+
+
+def _seconds_from_zero(value: object, default: int, label: str) -> int:
+    """Coerce a whole number of seconds, holding it at or above 0."""
+    seconds = _lenient_int(value, default, label=label)
     if seconds >= 0:
         return seconds
-    logger.warning("cron.delivery_debounce_seconds is %r, below 0; using 0", value)
+    logger.warning("%s is %r, below 0; using 0", label, value)
     return 0
+
+
+def _delivery_debounce(value: object) -> int:
+    """Coerce ``cron.delivery_debounce_seconds``, holding it at or above 0."""
+    return _seconds_from_zero(
+        value, DEFAULT_DELIVERY_DEBOUNCE_SECONDS, "cron.delivery_debounce_seconds",
+    )
+
+
+def _delivery_min_interval(value: object) -> int:
+    """Coerce ``cron.delivery_min_interval_seconds``, holding it at or above 0."""
+    return _seconds_from_zero(
+        value, DEFAULT_DELIVERY_MIN_INTERVAL_SECONDS, "cron.delivery_min_interval_seconds",
+    )
 
 
 @dataclass
@@ -2738,6 +2761,13 @@ class CronConfig:
     # run. 0 runs them as soon as the records are in the inbox; at most
     # MAX_DELIVERY_DEBOUNCE_SECONDS applies. Read per delivery.
     delivery_debounce_seconds: int = DEFAULT_DELIVERY_DEBOUNCE_SECONDS
+    # A delivery starts no run of a job whose last run, however it was
+    # started, started less than this many seconds ago and whose schedule is
+    # forecast to run it again before that time is over. The records wait in
+    # the inbox for that scheduled run, so a steady stream of deliveries does
+    # not become a run for each burst. 0 runs the jobs for every burst; at
+    # most MAX_DELIVERY_MIN_INTERVAL_SECONDS applies. Read per delivery.
+    delivery_min_interval_seconds: int = DEFAULT_DELIVERY_MIN_INTERVAL_SECONDS
 
     @classmethod
     @_coerced
@@ -2769,6 +2799,9 @@ class CronConfig:
             system_file=system_file,
             gate_plugins_dir=gate_plugins_dir,
             delivery_debounce_seconds=_delivery_debounce(d.get("delivery_debounce_seconds")),
+            delivery_min_interval_seconds=_delivery_min_interval(
+                d.get("delivery_min_interval_seconds"),
+            ),
         )
 
 

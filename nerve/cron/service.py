@@ -2513,7 +2513,12 @@ class CronService:
         *source*, or naming no source, gets one run
         ``cron.delivery_debounce_seconds`` after the first delivery of a
         burst: later deliveries in that window add nothing. That run waits
-        for a run of the job already in flight, and goes through the gates,
+        for a run of the job already in flight. It does not start when the
+        job's last run started less than
+        ``cron.delivery_min_interval_seconds`` ago and the job's schedule is
+        forecast to run it before that interval ends
+        (:meth:`_left_to_schedule`): the records then wait in the inbox for
+        that scheduled run. Otherwise it goes through the gates,
         ``lock`` and the run log like any other; while it goes on, the job's
         runs are skipped or wait as :meth:`_may_start` says. The drain counts
         as a run of the source runner in the same way. Jobs without such a
@@ -2561,6 +2566,58 @@ class CronService:
             seconds = DEFAULT_DELIVERY_DEBOUNCE_SECONDS
         return float(min(max(seconds, 0), MAX_DELIVERY_DEBOUNCE_SECONDS))
 
+    def _delivery_min_interval(self) -> float:
+        """``cron.delivery_min_interval_seconds``, within 0 and its maximum."""
+        from nerve.config import (
+            DEFAULT_DELIVERY_MIN_INTERVAL_SECONDS,
+            MAX_DELIVERY_MIN_INTERVAL_SECONDS,
+        )
+
+        seconds = getattr(
+            getattr(self.config, "cron", None), "delivery_min_interval_seconds", None,
+        )
+        if not isinstance(seconds, int) or isinstance(seconds, bool):
+            seconds = DEFAULT_DELIVERY_MIN_INTERVAL_SECONDS
+        return float(min(max(seconds, 0), MAX_DELIVERY_MIN_INTERVAL_SECONDS))
+
+    async def _left_to_schedule(self, job_id: str) -> datetime | None:
+        """The scheduled run of *job_id* that takes newly delivered records,
+        when a delivery is to start no run of the job; ``None`` when the
+        delivery starts one.
+
+        A delivery starts no run when the job's last run started less than
+        ``cron.delivery_min_interval_seconds`` ago and the job's schedule is
+        forecast to run it before that interval ends. The forecast is the one
+        :meth:`next_scheduled` reports, so the records wait for a run that is
+        coming, and no longer than the interval. When the job's next scheduled
+        run comes later, or its gates will skip that run (a ``messages`` gate
+        that names its sources, when the consumer's cursor expires first), the
+        delivery runs the job.
+
+        The run log is asked, so every run counts, however it was started, and
+        a run that the gates skipped does not: it has no row. The times are
+        wall clock times, so a pause of the machine counts as time passed. A
+        last run in the future (the clock was set back) holds nothing up. The
+        log keeps whole seconds, so the interval ends a second later here: a
+        schedule that fires every interval, at a fraction of a second, still
+        counts as within it.
+        """
+        interval = self._delivery_min_interval()
+        if interval <= 0:
+            return None
+        started_at = await self.db.get_last_cron_start(job_id)
+        if not started_at:
+            return None
+        started = _parse_timestamp(started_at)
+        if not 0 <= (datetime.now(UTC) - started).total_seconds() < interval:
+            return None
+        sched_job = self.scheduler.get_job(job_id)
+        if sched_job is None:
+            return None
+        until = started + timedelta(seconds=interval + 1)
+        runs_at = (await self._forecast_job(sched_job, until)).runs_at
+        return runs_at if runs_at is not None and runs_at <= until else None
+
     def _schedule_delivery_runs(self, source: str) -> None:
         """Give each job gated on *source* one pending delivery run."""
         from nerve.cron.gates import MessagesGate
@@ -2585,10 +2642,27 @@ class CronService:
             task.add_done_callback(functools.partial(self._delivery_run_done, job.id))
 
     async def _run_after_delivery(self, job_id: str, delay: float) -> None:
-        """The pending delivery run of *job_id*: wait out the window, then run."""
+        """The pending delivery run of *job_id*: wait out the window, then run,
+        unless the records are left to the job's schedule
+        (:meth:`_left_to_schedule`)."""
         if delay > 0:
             await asyncio.sleep(delay)
-        await self._runs.wait_until_idle(job_id)
+        while True:
+            await self._runs.wait_until_idle(job_id)
+            started = self._runs.started(job_id)
+            scheduled = await self._left_to_schedule(job_id)
+            # Reading the run log takes a moment. A run of the job that
+            # started in it is waited for, and the log is read again.
+            if scheduled is not None or self._runs.started(job_id) == started:
+                break
+        if scheduled is not None:
+            logger.info(
+                "Not running cron job %s for newly delivered source records: it ran "
+                "within cron.delivery_min_interval_seconds, and its scheduled run at "
+                "%s takes them",
+                job_id, scheduled.astimezone(UTC).isoformat(timespec="seconds"),
+            )
+            return
         # From here on a new delivery schedules a run of its own: this one may
         # already have looked at the inbox by the time those records land.
         # It moves to the started runs in the same step, so stop() finds it in

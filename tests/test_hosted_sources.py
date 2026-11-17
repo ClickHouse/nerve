@@ -19,6 +19,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_asyncio
@@ -321,6 +322,14 @@ class TestSettings:
 
         assert NerveConfig.from_dict({"cron": cron}).cron.delivery_debounce_seconds == expected
 
+    @pytest.mark.parametrize(("value", "expected"), [
+        (None, 1800), (0, 0), ("120", 120), (7200, 7200), (-5, 0), ("soon", 1800),
+    ])
+    def test_the_delivery_minimum_interval_is_read_as_a_whole_number_of_seconds(self, value, expected):
+        cron = {} if value is None else {"delivery_min_interval_seconds": value}
+
+        assert NerveConfig.from_dict({"cron": cron}).cron.delivery_min_interval_seconds == expected
+
     def test_config_validate_warns_about_a_debounce_above_the_maximum(self, tmp_path):
         from nerve.config_validate import ValidationResult, _validate_delivery_debounce
 
@@ -337,10 +346,26 @@ class TestSettings:
         )]
         assert quiet.warnings == []
 
+    def test_config_validate_warns_about_a_minimum_interval_above_the_maximum(self):
+        from nerve.config_validate import ValidationResult, _validate_delivery_min_interval
+
+        result = ValidationResult()
+        _validate_delivery_min_interval(
+            NerveConfig.from_dict({"cron": {"delivery_min_interval_seconds": 90000}}), result,
+        )
+        quiet = ValidationResult()
+        _validate_delivery_min_interval(NerveConfig(), quiet)
+
+        assert result.warnings == [(
+            "cron.delivery_min_interval_seconds: 90000 is above the maximum of 21600, so a "
+            "hosted delivery is left to a scheduled run for 21600s after a run at most"
+        )]
+        assert quiet.warnings == []
+
     def test_the_new_keys_are_known(self):
         merged = {
             "sync": {"github": {"mode": "hosted", "pr_watch": True}},
-            "cron": {"delivery_debounce_seconds": 30},
+            "cron": {"delivery_debounce_seconds": 30, "delivery_min_interval_seconds": 900},
         }
 
         assert validate_config_keys(merged) == []
@@ -1390,8 +1415,11 @@ class TestRunsOnDelivery:
         harness.config.cron.gate_plugins_dir = cron_dir / "gates"
         harness.config.cron.delivery_debounce_seconds = 1
         never = "0 0 1 1 *"
+        # The schedule runs pr-monitor in about ten minutes: within the
+        # minimum interval after a run, and not during the test.
+        soon = datetime.now(ZoneInfo(harness.config.timezone)) + timedelta(minutes=10)
         write_jobs(harness.config.cron.jobs_file, [
-            {"id": "pr-monitor", "schedule": never, "prompt": "Look at the PRs",
+            {"id": "pr-monitor", "schedule": f"{soon.minute} * * * *", "prompt": "Look at the PRs",
              "run_if": [{"type": "messages", "sources": ["github"]}]},
             {"id": "mail-triage", "schedule": never, "prompt": "Look at the mail",
              "run_if": [{"type": "messages", "sources": ["gmail"]}]},
@@ -1427,6 +1455,23 @@ class TestRunsOnDelivery:
             assert turns == ["pr-monitor"]
             logs = await db.get_cron_logs(job_id="source:github", limit=10)
             assert logs and all(log["status"] == "success" for log in logs)
+
+            # The job ran a moment ago and its schedule runs it again within
+            # the minimum interval, so the next delivery starts no run of it:
+            # the record waits in the inbox for that run. With no minimum
+            # interval, the delivery after that runs the job again.
+            later = harness.gateway.store(source_record_event(record_id="9000000020"))
+            await stream.nudge("observe")
+            await harness.acknowledged(later)
+            await asyncio.sleep(1.5)
+            assert await db.get_source_message("github", "9000000020") is not None
+            assert turns == ["pr-monitor"]
+
+            harness.config.cron.delivery_min_interval_seconds = 0
+            last = harness.gateway.store(source_record_event(record_id="9000000021"))
+            await stream.nudge("observe")
+            await harness.acknowledged(last)
+            await eventually(lambda: turns == ["pr-monitor", "pr-monitor"])
         finally:
             await cron.stop()
             await stop(harness)

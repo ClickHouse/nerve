@@ -329,6 +329,7 @@ def validate_config_bundle(
         # typo'd sync schedule fails identically — and needs the same gate.
         _validate_source_schedules(config, result)
         _validate_delivery_debounce(config, result)
+        _validate_delivery_min_interval(config, result)
         _validate_public_url(merged, config, result)
     # Files of the bundle that were actually opened, so "it validated" can be
     # told from "it found nothing to validate".
@@ -885,6 +886,18 @@ def _validate_delivery_debounce(config, result: ValidationResult) -> None:
             f"cron.delivery_debounce_seconds: {seconds} is above the maximum of "
             f"{cfg.MAX_DELIVERY_DEBOUNCE_SECONDS}, so the jobs a hosted delivery "
             f"starts wait {cfg.MAX_DELIVERY_DEBOUNCE_SECONDS}s"
+        )
+
+
+def _validate_delivery_min_interval(config, result: ValidationResult) -> None:
+    """``cron.delivery_min_interval_seconds`` above its maximum is the maximum."""
+    seconds = config.cron.delivery_min_interval_seconds
+    if isinstance(seconds, int) and seconds > cfg.MAX_DELIVERY_MIN_INTERVAL_SECONDS:
+        result.warnings.append(
+            f"cron.delivery_min_interval_seconds: {seconds} is above the maximum of "
+            f"{cfg.MAX_DELIVERY_MIN_INTERVAL_SECONDS}, so a hosted delivery is left "
+            f"to a scheduled run for {cfg.MAX_DELIVERY_MIN_INTERVAL_SECONDS}s after a "
+            f"run at most"
         )
 
 

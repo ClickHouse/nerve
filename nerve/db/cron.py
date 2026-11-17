@@ -263,6 +263,20 @@ class CronStore:
                 async for row in cursor
             }
 
+    async def get_last_cron_start(self, job_id: str) -> str | None:
+        """When the latest run of a job started, whether or not it has ended.
+
+        A ``missed`` row is not a run: it never started. None when the job
+        has no run on record.
+        """
+        async with self.db.execute(
+            "SELECT started_at FROM cron_logs WHERE job_id = ? AND status IS NOT 'missed' "
+            "ORDER BY started_at DESC, id DESC LIMIT 1",
+            (job_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row["started_at"] if row else None
+
     async def get_previous_cron_status(self, log_id: int) -> str | None:
         """The status of the run before run ``log_id``: the latest run of the
         same job that started before it and has a result.
