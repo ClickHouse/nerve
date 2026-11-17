@@ -1416,7 +1416,9 @@ one this way.
 Code can do the same for any session, one that never touched Telegram
 included: `POST /api/sessions/{id}/telegram-topic` and the agent tool
 `session_open_topic` open it in a topic of the notification chat
-(`notifications.telegram_chat_id`, else the first allowed user's DM).
+(`notifications.telegram_chat_id`, else the first allowed user's DM). The
+API route takes an optional `chat_id`; the agent tool has none, so an agent
+never picks the chat.
 `DELETE` on the same path and `session_close_topic` post a last note, close
 the topic and unbind it, and leave the session running. Telegram closes
 topics only in forums, so in a private chat the topic is unbound and stays

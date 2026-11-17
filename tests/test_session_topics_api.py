@@ -76,23 +76,25 @@ async def test_open_tool_defaults_to_this_session():
 
     result = await session_open_topic_handler(ctx, {})
 
-    channel.open_session_topic.assert_awaited_once_with("cron0001", title=None, chat_id=None)
+    channel.open_session_topic.assert_awaited_once_with("cron0001", title=None)
     assert not result.is_error
     assert result.text_content == f"Opened a new topic: {KEY} (session cron0001)."
     assert result.structured == {"channel_key": KEY, "opened": True}
 
 
 @pytest.mark.asyncio
-async def test_open_tool_passes_a_session_a_title_and_a_chat():
+async def test_open_tool_passes_a_session_and_a_title_but_never_a_chat():
     channel = _telegram(opened=SessionTopic(KEY, opened=False))
     ctx = ToolContext(session_id="cron0001", engine=_engine(channel))
 
+    # A chat_id the agent sends anyway is ignored: the agent never picks a
+    # Telegram destination.
     result = await session_open_topic_handler(
         ctx, {"session_id": " case0001 ", "title": "INC-1 Keeper", "chat_id": -100},
     )
 
     channel.open_session_topic.assert_awaited_once_with(
-        "case0001", title="INC-1 Keeper", chat_id=-100,
+        "case0001", title="INC-1 Keeper",
     )
     assert result.text_content.startswith("The session has a topic already")
 
