@@ -99,6 +99,7 @@ class WebChannel(BaseChannel):
 
     async def send_image(
         self, target: str, *, file_path: str = "", url: str = "", caption: str = "",
+        session_id: str | None = None,
     ) -> bool:
         """Web image delivery is the persisted tool_call block, as for files.
 

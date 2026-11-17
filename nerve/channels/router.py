@@ -572,6 +572,7 @@ class ChannelRouter:
         target = ctx["target"] if ctx and ctx.get("channel_name") == channel else ""
         return await chan_obj.send_image(
             target, file_path=file_path, url=url, caption=caption,
+            session_id=session_id,
         )
 
     # ------------------------------------------------------------------ #

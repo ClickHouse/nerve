@@ -298,6 +298,7 @@ class BaseChannel(abc.ABC):
 
     async def send_image(
         self, target: str, *, file_path: str = "", url: str = "", caption: str = "",
+        session_id: str | None = None,
     ) -> bool:
         """Deliver an image inline to a target.
 

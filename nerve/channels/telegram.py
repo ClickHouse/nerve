@@ -1289,6 +1289,7 @@ class TelegramChannel(BaseChannel):
 
     async def send_image(
         self, target: str, *, file_path: str = "", url: str = "", caption: str = "",
+        session_id: str | None = None,
     ) -> bool:
         """Send an image to a Telegram chat as an inline photo.
 
@@ -1296,7 +1297,8 @@ class TelegramChannel(BaseChannel):
         must be provided.  Telegram accepts JPEG, PNG, GIF (non-animated),
         BMP, TIFF, and WebP; photos up to 10 MiB, dimensions up to
         10 000 px total (width + height).  Captions are capped at 1024
-        characters by the Telegram API.
+        characters by the Telegram API. A reply to the photo routes to
+        ``session_id`` (see ``_record_reply_route``), as for ``send_file``.
         """
         if self._app is None:
             return False
@@ -1314,26 +1316,31 @@ class TelegramChannel(BaseChannel):
         # Convert markdown caption to Telegram HTML, same as send().
         html_caption = _md_to_tg_html(caption) if caption else None
         try:
-            await self._app.bot.send_photo(
-                chat_id=int(target),
+            chat_id = int(target)
+        except (TypeError, ValueError):
+            return False
+        try:
+            sent = await self._app.bot.send_photo(
+                chat_id=chat_id,
                 photo=photo,
                 caption=html_caption,
                 parse_mode=ParseMode.HTML if html_caption else None,
             )
-            return True
         except Exception:
             # Fallback: retry with plain-text caption (HTML parse failure,
             # or caption too long after conversion).
             try:
-                await self._app.bot.send_photo(
-                    chat_id=int(target),
+                sent = await self._app.bot.send_photo(
+                    chat_id=chat_id,
                     photo=photo,
                     caption=caption[:1024] if caption else None,
                 )
-                return True
             except Exception as e:
                 logger.warning("send_image: send_photo failed for %s: %s", target, e)
                 return False
+        if session_id and sent is not None:
+            await self._record_reply_route(sent.message_id, chat_id, session_id)
+        return True
 
     # ------------------------------------------------------------------ #
     #  Message cache (for reaction context)                                #

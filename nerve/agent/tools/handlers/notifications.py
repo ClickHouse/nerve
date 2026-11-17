@@ -618,6 +618,8 @@ async def send_image_handler(ctx: ToolContext, args: dict) -> ToolResult:
         web_url = await _snapshot_for_web(ctx, resolved)
 
     delivered = False
+    as_file = False
+    active_channel = None
     if ctx.engine is not None:
         try:
             active_channel = ctx.engine.get_active_channel(ctx.session_id)
@@ -628,6 +630,12 @@ async def send_image_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 caption=caption,
                 channel=active_channel,
             )
+            if not delivered and file_path and active_channel not in (None, "web"):
+                # The channel can't show it inline (Slack, a hosted channel)
+                # or refused it (a Telegram photo over 10 MB): send the file.
+                as_file = delivered = await ctx.engine.router.send_file(
+                    ctx.session_id, file_path, channel=active_channel,
+                )
         except Exception as e:
             logger.error("send_image dispatch failed: %s", e)
             delivered = False
@@ -635,7 +643,15 @@ async def send_image_handler(ctx: ToolContext, args: dict) -> ToolResult:
     source = Path(file_path).name if file_path else url
     suffix = f"\nweb_url: {web_url}" if web_url else ""
     if delivered:
-        return ToolResult.text(f"Image sent: {source}{suffix}")
+        how = "Image sent as a file" if as_file else "Image sent"
+        return ToolResult.text(f"{how}: {source}{suffix}")
+    if active_channel not in (None, "web"):
+        # The person is on that channel and got nothing: say so.
+        return ToolResult.text(
+            f"Error: the image could not be delivered on {active_channel}: {source}."
+            + (" The web UI shows it." if web_url else " Try send_file, or share a link.")
+            + suffix,
+        )
     if web_url:
         # No channel took it (a cron run, say), but the web UI shows the copy.
         return ToolResult.text(f"Image shown in the web UI only: {source}{suffix}")
