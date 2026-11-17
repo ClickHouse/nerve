@@ -199,7 +199,7 @@ def _message(
         message_id=message_id,
         date=datetime.now(timezone.utc),
         chat=chat,
-        from_user=User(id=user_id, first_name="Seva", is_bot=False),
+        from_user=User(id=user_id, first_name="Alex", is_bot=False),
         text=text,
         message_thread_id=thread,
         is_topic_message=topic,
@@ -221,7 +221,7 @@ def _reaction(chat=None, message_id=7, emoji="👍"):
         date=datetime.now(timezone.utc),
         old_reaction=(),
         new_reaction=(ReactionTypeEmoji(emoji),),
-        user=User(id=OWNER, first_name="Seva", is_bot=False),
+        user=User(id=OWNER, first_name="Alex", is_bot=False),
     ))
 
 
@@ -297,7 +297,7 @@ def _topic_root(chat=None, thread=TOPIC):
         message_id=thread,
         date=datetime.now(timezone.utc),
         chat=chat or _chat(),
-        from_user=User(id=OWNER, first_name="Seva", is_bot=False),
+        from_user=User(id=OWNER, first_name="Alex", is_bot=False),
         forum_topic_created=ForumTopicCreated(name="Taxes", icon_color=7322096),
     )
 
@@ -322,7 +322,7 @@ async def test_a_real_reply_inside_a_topic_keeps_its_context():
         _update(thread=TOPIC, topic=True, reply_to=earlier), None,
     )
 
-    assert router.handled[0].text == '[Reply to Seva: "earlier"]\n\nhello'
+    assert router.handled[0].text == '[Reply to Alex: "earlier"]\n\nhello'
 
 
 @pytest.mark.asyncio
@@ -689,7 +689,7 @@ def _service(chat=None, *, user_id=OWNER, thread=TOPIC, **service):
         message_id=thread if "forum_topic_created" in service else 77,
         date=datetime.now(timezone.utc),
         chat=chat or _chat(),
-        from_user=User(id=user_id, first_name="Seva", is_bot=user_id == BOT_ID),
+        from_user=User(id=user_id, first_name="Alex", is_bot=user_id == BOT_ID),
         message_thread_id=thread,
         is_topic_message=True,
         **service,

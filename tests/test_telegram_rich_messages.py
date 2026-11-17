@@ -266,7 +266,7 @@ def test_a_reply_to_a_rich_message_quotes_its_text():
         message_id=6,
         date=datetime.now(timezone.utc),
         chat=Chat(id=1, type="private"),
-        from_user=User(id=7, first_name="Seva", is_bot=False),
+        from_user=User(id=7, first_name="Alex", is_bot=False),
         text="why?",
         reply_to_message=answer,
     )

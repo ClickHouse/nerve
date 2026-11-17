@@ -202,7 +202,7 @@ def _message(chat_id=CHAT, chat_type="supergroup", thread=None, text="hello", bo
     chat = Chat(id=chat_id, type=chat_type, is_forum=True if chat_type == "supergroup" else None)
     msg = Message(
         message_id=7, date=datetime.now(timezone.utc), chat=chat,
-        from_user=User(id=OWNER, first_name="Seva", is_bot=False),
+        from_user=User(id=OWNER, first_name="Alex", is_bot=False),
         text=text, message_thread_id=thread, is_topic_message=True if thread else None,
     )
     if bot is not None:
