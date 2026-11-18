@@ -2322,8 +2322,8 @@ writes to the namespaces the agent reads, and it lands in the session's
 escaped as Loom escapes them (`&lt;`, `&gt;`); the fallback search's text is
 escaped the same way. A startup call has 5 seconds; a pack the gateway's
 policy refuses gets the search as well. `tests/test_loom_contract.py` holds
-these calls, and the tools the agent is told about, to
-`tests/fixtures/loom_lifecycle_ops.json`, which
+these calls, the tools the agent is told about and the operations it is told
+to run through `loom_op`, to `tests/fixtures/loom_lifecycle_ops.json`, which
 `scripts/loom_contract_fixture.py` generates from a Loom checkout.
 
 **Identity.** Loom's MCP has no `whoami`; `namespace.summary` names the org

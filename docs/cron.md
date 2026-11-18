@@ -787,7 +787,7 @@ These ship in `<workspace>/config/cron/system.yaml`, written when the mode is ch
 
 | Job | Schedule | Session Mode | Description | Personal | Worker |
 |-----|----------|-------------|-------------|:--------:|:------:|
-| `memory-maintenance` | Daily 5 AM, when the agent has worked (see below) | isolated | Dedup, prune stale entries, improve memory wording. Runs silently. On an install set up with `memory.backend: loom`: runs Loom's integrity report (`loom_namespace_validate`) on the home namespace and fixes what is its own, leaving deduplication to Loom; a `system.yaml` written for memU runs in this wording while its prompt is the shipped one. | ✅ always | ✅ always |
+| `memory-maintenance` | Daily 5 AM, when the agent has worked (see below) | isolated | Dedup, prune stale entries, improve memory wording. Runs silently. On an install set up with `memory.backend: loom`: runs Loom's integrity report (`namespace.validate`, through the `loom_op` tool) on the home namespace and fixes what is its own, leaving deduplication to Loom; a `system.yaml` written for memU, or with the first Loom wording (see [After a Nerve update](#after-a-nerve-update)), runs in this wording while its prompt is the one Nerve shipped. | ✅ always | ✅ always |
 | `inbox-processor` | Every 30 min | persistent (24h rotation, reminder mode) | Polls all sync sources (email, GitHub, Telegram). Triages, creates tasks, memorizes facts, sends notifications for urgent items. | ✅ default | — |
 | `task-planner` | Every 4 hours | persistent (168h rotation) | Reviews open tasks, explores codebases, proposes implementation plans via plan-approve workflow. Gated on `tasks` (status `pending`) — stays idle when there's nothing to plan. | ✅ default | off; onboarding enables it |
 | `skill-extractor` | Daily 5 AM, when the agent has worked and fewer than three of its proposals wait for review (see below) | persistent | Identifies repeated workflows from recent conversations, memory, and completed tasks. Proposes at most one new skill per run, as a task with a plan. The plan says what the skill is for, the evidence for it and the direction it should take; it does not hold the skill. | ✅ optional | ✅ default |
@@ -853,6 +853,7 @@ A Nerve update can change the schedule, the description or the prompt of a built
 - `skill-extractor`: earlier releases ran it every 12 hours, let it propose up to two skills a run, and had it put the full SKILL.md into the plan. The earliest also had it send a notification of its own after it proposed.
 - `skill-reviser`: earlier releases had it send a notification of its own after it proposed. `plan_propose` sends one now.
 - `task-planner`: the earliest releases had it look at every open task and send a notification of its own. Later ones had it look at the `pending` tasks only, as now, and did not ask for a summary of the plan yet.
+- `memory-maintenance`, on a Loom install: the first Loom wording named the tool `loom_namespace_validate`, which Loom's default tool list does not carry from Loom 1.2.0. In its place the file gets memU's prompt, which runs in the current Loom wording (see below).
 
 When the scheduler starts, and after every reload that it applies, Nerve writes this release's values into `system.yaml`, so that the file shows what runs:
 

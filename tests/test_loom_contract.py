@@ -6,7 +6,8 @@ hold ``nerve/memory/loom.py`` to it: each op is served on MCP by the tool
 Nerve calls, every argument Nerve sends on the wire exists in Loom's request
 schema with the type Loom declares, and every result field Nerve reads is one
 Loom answers with. The tools the agent-facing wording names
-(``nerve/memory/loom_prompts.py``) are ones Loom lists by default.
+(``nerve/memory/loom_prompts.py``) are ones Loom lists by default, and the
+ops it names for ``loom_op`` are ones ``loom_op`` runs.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import pytest
 import pytest_asyncio
 
 from nerve.memory.loom import LOOM_CALLS, LOOM_OP, LoomCall, LoomMemory
-from nerve.memory.loom_prompts import tool_names
+from nerve.memory.loom_prompts import op_names, tool_names
 from tests.test_loom_memory import HOME, ORG, FakeGateway, _config, _messages
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,6 +99,12 @@ def test_nerve_names_only_fields_loom_has(op) -> None:
 def test_agents_are_told_only_about_tools_loom_lists() -> None:
     """The generator refused any named tool the default toolset does not list."""
     assert tool_names() == set(FIXTURE["tools_named_in_prompts"]), REGENERATE
+
+
+def test_agents_run_through_loom_op_only_ops_it_runs() -> None:
+    """The generator refused any op named for ``loom_op`` that Loom does
+    not have or keeps off MCP."""
+    assert op_names() == set(FIXTURE["ops_named_in_prompts"]), REGENERATE
 
 
 def test_only_reads_are_retried() -> None:
@@ -232,9 +239,9 @@ def generator(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
 
-    def build(named: set[str] | None = None, **calls: LoomCall):
+    def build(named: set[str] | None = None, named_ops: set[str] | None = None, **calls: LoomCall):
         monkeypatch.setattr(module, "LOOM_CALLS", {k.replace("_", "."): v for k, v in calls.items()})
-        return module.build(_OPS_SOURCE, _TOOLSETS_SOURCE, named or set())
+        return module.build(_OPS_SOURCE, _TOOLSETS_SOURCE, named or set(), named_ops or set())
 
     return build
 
@@ -308,4 +315,16 @@ def test_the_generator_checks_the_named_tools(generator) -> None:
         "Loom does not list loom_a_hidden by default",
         "Loom does not list loom_a_unlisted by default",
         "Loom lists no tool loom_b_*",
+    ]
+
+
+def test_the_generator_checks_the_ops_named_for_loom_op(generator) -> None:
+    fixture, errors = generator(named_ops={"a.read", "a.unlisted", "a.*"})
+    assert errors == []
+    assert fixture["ops_named_in_prompts"] == ["a.*", "a.read", "a.unlisted"]
+    _, errors = generator(named_ops={"a.hidden", "a.missing", "b.*"})
+    assert errors == [
+        "Loom keeps a.hidden off MCP: loom_op does not run it",
+        "Loom has no op a.missing",
+        "loom_op runs no op b.*",
     ]
