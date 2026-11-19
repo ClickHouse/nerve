@@ -231,6 +231,43 @@ class ScheduledTick:
         return {"at": self.at.isoformat(), "name": self.name, "kind": self.kind}
 
 
+@dataclass(frozen=True)
+class FailingJob:
+    """A scheduled job whose latest run failed, and for how long it has.
+
+    ``since`` is when the first failure of the streak happened and
+    ``last_run_at`` when the latest one did, both in UTC; ``failures`` is the
+    number of failed runs in a row.
+    """
+
+    job_id: str
+    since: datetime
+    failures: int
+    last_run_at: datetime
+
+
+@dataclass(frozen=True)
+class JobHealth:
+    """How the scheduled jobs do (see :meth:`CronService.job_health`)."""
+
+    # False when the scheduler does not run.
+    running: bool
+    # The enabled jobs that the forecast counts: agent jobs, workflow jobs
+    # and source runners.
+    total: int
+    # Every failing job, in no order.
+    failing: tuple[FailingJob, ...]
+
+
+def _stored_time(value: str) -> datetime:
+    """A time as ``cron_logs`` stores it, ``YYYY-MM-DD HH:MM:SS`` in UTC or
+    ISO 8601, as an aware UTC datetime."""
+    at = datetime.fromisoformat(value)
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=UTC)
+    return at.astimezone(UTC)
+
+
 def _tick_name(raw: str) -> str:
     """*raw* in the alphabet and length a tick name allows."""
     return _TICK_NAME_DISALLOWED.sub("_", raw)[:_TICK_NAME_MAX]
@@ -3007,6 +3044,49 @@ class CronService:
                 "reason": None if forecast.runs else forecast.reason,
             })
         return {"next": tick.as_dict() if tick else None, "jobs": jobs}
+
+    async def job_health(self) -> JobHealth:
+        """Which scheduled jobs fail now, and since when.
+
+        An agent job fails while its latest finished run failed; its streak
+        comes from ``cron_logs`` (:meth:`Database.get_failing_cron_streaks`).
+        A source runner fails while its circuit breaker counts failures:
+        a source that backs off logs its skipped runs as successes that found
+        nothing, so the logs cannot tell. Its streak is the breaker's, which
+        lives in memory and starts again with the process. A workflow job
+        counts in the total but is never judged here: its run log says only
+        that the run was launched. The housekeeping jobs never count.
+        """
+        jobs = [job for job in self._jobs if job.enabled]
+        agent_jobs = {job.id for job in jobs if job.workflow is None}
+        streaks = await self.db.get_failing_cron_streaks()
+
+        failing: list[FailingJob] = []
+        for job_id, streak in streaks.items():
+            if job_id not in agent_jobs:
+                continue
+            failing.append(FailingJob(
+                job_id=job_id,
+                since=_stored_time(streak["since"]),
+                failures=int(streak["failures"]),
+                last_run_at=_stored_time(streak["last_run"]),
+            ))
+        for runner in self._source_runners:
+            health = runner.health
+            if health.consecutive_failures < 1:
+                continue
+            last = health.last_error_at or datetime.now(UTC)
+            failing.append(FailingJob(
+                job_id=runner.job_id,
+                since=health.failing_since or last,
+                failures=health.consecutive_failures,
+                last_run_at=last,
+            ))
+        return JobHealth(
+            running=bool(getattr(self.scheduler, "running", False)),
+            total=len(jobs) + len(self._source_runners),
+            failing=tuple(failing),
+        )
 
     async def _forecast_scheduled(self, limit: datetime) -> dict[str, _Forecast]:
         """Every cron job and source runner on the scheduler, by id, with

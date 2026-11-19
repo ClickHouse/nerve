@@ -21,6 +21,11 @@ What is sent:
   to the reporter (a message deferred with "Run later" in the web UI, say).
   A turn start goes out at once with the last one, so it is never held up by
   a forecast.
+* With it, ``scheduledJobs``: whether the scheduler runs, how many jobs it
+  has, and which of them fail, since when (see :func:`scheduled_jobs_summary`
+  for the shape and the bounds). It is read again when a job or source run
+  ends, when the schedule changes, and with the periodic report, and kept
+  between them, so the reports of turns and clients never read the database.
 * Keep-awake leases for background work that is not a turn
   (``POST /v1/leases``, renewed every half ``platform.lease_ttl_seconds``,
   ``DELETE /v1/leases/<name>`` when the work ends). Work takes one with
@@ -54,7 +59,7 @@ from nerve.utils.aio import stop_background_task
 
 if TYPE_CHECKING:
     from nerve.config import NerveConfig
-    from nerve.cron.service import CronService, ScheduledTick
+    from nerve.cron.service import CronService, JobHealth, ScheduledTick
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +87,15 @@ REPORT_MIN_SPACING_SECONDS = 0.25
 REQUEST_TIMEOUT_SECONDS = 2.0
 # Bound on asking the cron service for the next task.
 SCHEDULE_TIMEOUT_SECONDS = 5.0
+# Bound on asking the cron service how the scheduled jobs do, which reads the
+# database: a stuck database never holds a report up for longer.
+JOB_HEALTH_TIMEOUT_SECONDS = 5.0
+# A report names at most this many failing jobs; failingCount counts all.
+MAX_FAILING_JOBS = 16
+# The states of the scheduler in scheduledJobs: it runs, or the cron service
+# did not start or does not run. Nerve has no setting that turns cron off.
+SCHEDULER_RUNNING = "running"
+SCHEDULER_FAILED = "failed"
 # Bound on releasing leases and the last report at shutdown.
 STOP_TIMEOUT_SECONDS = 3.0
 # A lease request that failed is tried again after this long, or after a
@@ -95,8 +109,10 @@ REPEAT_FAILURE_LOG_SECONDS = 300.0
 _ERROR_CODE = re.compile(r"[a-z_]{1,40}")
 # The wall clock, for lease lifetimes (see _Lease).
 _wall_time = time.time
-# The key a socket that predates it refuses (see _post_activity).
+# The keys a socket that predates them refuses (see _post_activity).
 _TASK_NAME_KEY = "nextScheduledName"
+_SCHEDULED_JOBS_KEY = "scheduledJobs"
+_OPTIONAL_KEYS = (_TASK_NAME_KEY, _SCHEDULED_JOBS_KEY)
 
 
 def activity_socket_present(path: str) -> bool:
@@ -251,6 +267,42 @@ def next_task_name(name: object) -> str | None:
     return cleaned or None
 
 
+def scheduled_jobs_summary(health: JobHealth | None) -> dict[str, Any]:
+    """The ``scheduledJobs`` value of a report, from the cron service's
+    :class:`~nerve.cron.service.JobHealth`, or for no cron service.
+
+    ``{"state", "total", "failingCount", "failing"}``: ``state`` is
+    :data:`SCHEDULER_RUNNING` or :data:`SCHEDULER_FAILED` (always failed
+    without a cron service), ``total`` the enabled jobs the forecast counts,
+    ``failingCount`` every failing job, and ``failing`` at most
+    :data:`MAX_FAILING_JOBS` of them, the one failing longest first and then
+    by id: ``{"name", "since", "failures", "lastRunAt"}``, with the name in
+    the form :func:`next_task_name` gives and the times in UTC to the second.
+    No error text: the summary goes outside the machine.
+    """
+    if health is None:
+        return {"state": SCHEDULER_FAILED, "total": 0, "failingCount": 0, "failing": []}
+    failing = sorted(health.failing, key=lambda job: (job.since, job.job_id))
+    return {
+        "state": SCHEDULER_RUNNING if health.running else SCHEDULER_FAILED,
+        "total": health.total,
+        "failingCount": len(failing),
+        "failing": [
+            {
+                "name": next_task_name(job.job_id) or "_",
+                "since": _rfc3339(job.since),
+                "failures": job.failures,
+                "lastRunAt": _rfc3339(job.last_run_at),
+            }
+            for job in failing[:MAX_FAILING_JOBS]
+        ],
+    }
+
+
+def _without_optional_keys(body: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in body.items() if key not in _OPTIONAL_KEYS}
+
+
 @dataclass
 class _Lease:
     """A lease the socket may hold. Recorded when first asked for, so that a
@@ -286,8 +338,9 @@ class ActivityReporter:
     Inert unless ``config.platform.activity_socket`` names an existing socket
     when :meth:`start` runs. Reads ``engine.sessions`` (running turns),
     ``engine.agents`` (live background agents), ``db`` (active workflow
-    runs) and ``cron_service`` (the next scheduled task; ``None`` when the
-    scheduler did not start, and nothing is then reported as scheduled).
+    runs) and ``cron_service`` (the next scheduled task and how the jobs do;
+    ``None`` when the scheduler did not start, and nothing is then reported
+    as scheduled, and the scheduler as failed).
     ``connection_count`` returns the number of open web client connections.
     """
 
@@ -335,20 +388,31 @@ class ActivityReporter:
         # The cron service's last answer. Every report sends it; a failed
         # forecast leaves it as it was.
         self._next_tick: ScheduledTick | None = None
+        # A new summary of the scheduled jobs is wanted with the next
+        # forecast, and the last summary, which every report sends; None
+        # until the first one was read, and a failed read leaves it as it was.
+        self._jobs_wanted = False
+        self._scheduled_jobs: dict[str, Any] | None = (
+            scheduled_jobs_summary(None) if cron_service is None else None
+        )
         # Leases the socket may hold, by name.
         self._leases: dict[str, _Lease] = {}
         self._last_post = -math.inf
-        # Whether the socket takes nextScheduledName (see _post_activity).
-        self._send_task_name = True
-        # The socket refused a report even without the name, and has taken
-        # none since (see _post_activity).
-        self._refused_without_name = False
+        # Whether the socket takes nextScheduledName and scheduledJobs (see
+        # _post_activity).
+        self._send_optional_keys = True
+        # The socket refused a report even without them, and has taken none
+        # since (see _post_activity).
+        self._refused_without_optional_keys = False
 
         self._activity_failures = _FailureLog("activity report")
         self._lease_failures = _FailureLog("keep-awake lease")
         # Neither of these is the socket's doing.
         self._schedule_failures = _FailureLog(
             "forecast of the next scheduled task", "Activity reporter",
+        )
+        self._job_health_failures = _FailureLog(
+            "summary of the scheduled jobs", "Activity reporter",
         )
         self._loop_failures = _FailureLog("reporting", "Activity reporter")
 
@@ -465,7 +529,7 @@ class ActivityReporter:
     #  Triggers                                                           #
     # ------------------------------------------------------------------ #
 
-    def _wake_up(self, *, report: bool = False, forecast: bool = False) -> None:
+    def _wake_up(self, *, report: bool = False, forecast: bool = False, jobs: bool = False) -> None:
         loop, wake = self._loop, self._wake
         if loop is None or wake is None or self._stopped:
             return
@@ -475,6 +539,8 @@ class ActivityReporter:
                 self._report_wanted = True
             if forecast:
                 self._forecast_wanted = True
+            if jobs:
+                self._jobs_wanted = True
             wake.set()
 
         try:
@@ -523,8 +589,9 @@ class ActivityReporter:
             self._wake_up(forecast=True)
 
     def _on_schedule_changed(self) -> None:
-        """The cron service's schedule listener: forecast again, then report."""
-        self._wake_up(forecast=True)
+        """The cron service's schedule listener: forecast again, read how the
+        jobs do (a run may have ended), then report."""
+        self._wake_up(forecast=True, jobs=True)
 
     # ------------------------------------------------------------------ #
     #  The loop                                                           #
@@ -545,6 +612,7 @@ class ActivityReporter:
                     # new one, unless one is under way or has just finished.
                     if self._forecast is None and not self._forecast_unreported:
                         self._forecast_wanted = True
+                    self._jobs_wanted = True
                     next_report = loop.time() + self.interval
                 self._start_forecast()
                 if self._report_wanted and self._may_report():
@@ -592,6 +660,9 @@ class ActivityReporter:
     async def _refresh_forecast(self) -> None:
         try:
             await self._next_scheduled()
+            if self._jobs_wanted:
+                self._jobs_wanted = False  # a change from now on asks again
+                await self._read_job_health()
         finally:
             self._forecast = None
             self._forecast_unreported = True
@@ -619,43 +690,47 @@ class ActivityReporter:
             self._wake_up(report=True)
         return self._body(running, self._active_sessions(), self._next_tick)
 
-    @staticmethod
-    def _body(running: int, sessions: int, tick: ScheduledTick | None) -> dict[str, Any]:
-        return {
+    def _body(self, running: int, sessions: int, tick: ScheduledTick | None) -> dict[str, Any]:
+        body: dict[str, Any] = {
             "runningTurns": running,
             "activeSessions": sessions,
             "nextScheduledAt": _rfc3339(tick.at) if tick else None,
             _TASK_NAME_KEY: next_task_name(tick.name) if tick else None,
         }
+        if self._scheduled_jobs is not None:
+            body[_SCHEDULED_JOBS_KEY] = self._scheduled_jobs
+        return body
 
     async def _post_activity(self, body: dict[str, Any]) -> bool:
-        if not self._send_task_name or self._refused_without_name:
-            body = {key: value for key, value in body.items() if key != _TASK_NAME_KEY}
+        if not self._send_optional_keys or self._refused_without_optional_keys:
+            body = _without_optional_keys(body)
         self._last_post = asyncio.get_running_loop().time()
         response = await self._request("POST", ACTIVITY_ROUTE, body, self._activity_failures)
         if response is None:
             return False
-        if response.status_code == 400 and _TASK_NAME_KEY in body:
-            # A socket that predates the task's name refuses the unknown field,
-            # and with it the whole report. Send the report once more without
-            # the name; if that is taken, leave the name out from now on.
-            retry = {key: value for key, value in body.items() if key != _TASK_NAME_KEY}
+        if response.status_code == 400 and any(key in body for key in _OPTIONAL_KEYS):
+            # A socket that predates the task's name refuses unknown fields,
+            # and with them the whole report; the summary of the jobs came
+            # later still. Send the report once more without both; if that
+            # is taken, leave them out from now on.
+            retry = _without_optional_keys(body)
             second = await self._request("POST", ACTIVITY_ROUTE, retry, None)
             if second is not None and second.is_success:
-                self._send_task_name = False
+                self._send_optional_keys = False
                 self._activity_failures.succeeded()
                 logger.info(
                     "Platform activity socket does not accept task names; "
-                    "reporting times only (%s)", _error_detail(response),
+                    "reporting times only, without the summary of the scheduled jobs (%s)",
+                    _error_detail(response),
                 )
                 return True
-            # Not taken without the name either, so the name is not what the
-            # socket refuses. Until it takes a report, each report goes out
-            # once, without the name (the form any socket takes); the report
-            # after the one it takes carries the name again.
-            self._refused_without_name = True
+            # Not taken without them either, so they are not what the socket
+            # refuses. Until it takes a report, each report goes out once,
+            # without them (the form any socket takes); the report after the
+            # one it takes carries them again.
+            self._refused_without_optional_keys = True
         if response.is_success:
-            self._refused_without_name = False
+            self._refused_without_optional_keys = False
             self._activity_failures.succeeded()
             return True
         self._activity_failures.failed(_error_detail(response))
@@ -701,6 +776,24 @@ class ActivityReporter:
         self._schedule_failures.succeeded()
         self._next_tick = tick
         return tick
+
+    async def _read_job_health(self) -> None:
+        """Read how the scheduled jobs do into the summary every report sends.
+
+        Bounded by :data:`JOB_HEALTH_TIMEOUT_SECONDS`; a read that fails or
+        times out keeps the last summary.
+        """
+        if self._cron is None:
+            return
+        try:
+            health = await asyncio.wait_for(self._cron.job_health(), JOB_HEALTH_TIMEOUT_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 - keep the last known summary
+            self._job_health_failures.failed(f"{type(e).__name__}: {e}")
+            return
+        self._job_health_failures.succeeded()
+        self._scheduled_jobs = scheduled_jobs_summary(health)
 
     # ------------------------------------------------------------------ #
     #  Leases                                                             #

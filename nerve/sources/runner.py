@@ -48,6 +48,10 @@ class SourceHealth:
     last_success_at: datetime | None = None
     state: str = "healthy"  # healthy | degraded | open
     backoff_until: datetime | None = None
+    # When the first failure of the current streak happened, or None while
+    # the last run succeeded. Kept in memory like the rest: after a restart
+    # a streak counts from its first failure since the restart.
+    failing_since: datetime | None = None
 
     # Thresholds
     DEGRADED_AFTER: int = 2
@@ -63,6 +67,7 @@ class SourceHealth:
         self.last_success_at = datetime.now(timezone.utc)
         self.state = "healthy"
         self.backoff_until = None
+        self.failing_since = None
         return prev if prev != "healthy" else None
 
     def record_failure(self, error: str) -> str | None:
@@ -71,6 +76,8 @@ class SourceHealth:
         self.consecutive_failures += 1
         self.last_error = error
         self.last_error_at = datetime.now(timezone.utc)
+        if self.failing_since is None:
+            self.failing_since = self.last_error_at
 
         # State transitions
         if self.consecutive_failures >= self.OPEN_AFTER:
