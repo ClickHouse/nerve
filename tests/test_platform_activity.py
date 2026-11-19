@@ -28,17 +28,19 @@ import pytest_asyncio
 import nerve.config
 from nerve.agent.sessions import SessionManager
 from nerve.config import NerveConfig, PlatformConfig
-from nerve.cron.service import ScheduledTick
+from nerve.cron.service import FailingJob, JobHealth, ScheduledTick
 from nerve.platform import activity
 from nerve.platform.activity import (
     LEASE_BACKGROUND,
     LEASE_BACKUP,
     LEASE_CONFIG_SYNC,
     LEASE_MEMORIZE,
+    MAX_FAILING_JOBS,
     ActivityReporter,
     activity_socket_present,
     keep_awake,
     next_task_name,
+    scheduled_jobs_summary,
 )
 
 # --------------------------------------------------------------------------- #
@@ -219,9 +221,9 @@ def tick(at: datetime, name: str, kind: str = "cron") -> ScheduledTick:
 
 
 class FakeCron:
-    """The cron service's schedule surface, with a settable answer."""
+    """The cron service's schedule surface, with settable answers."""
 
-    def __init__(self, tick: ScheduledTick | None = None) -> None:
+    def __init__(self, tick: ScheduledTick | None = None, health: JobHealth | None = None) -> None:
         self.tick = tick
         self.listeners: list[Callable[[], Any]] = []
         self.fail = False
@@ -229,6 +231,20 @@ class FakeCron:
         self.calls = 0
         # While set to an event, a forecast does not finish before it is set.
         self.hold: asyncio.Event | None = None
+        # What job_health answers, how often it was asked, and, while set
+        # to an event, a read that does not finish before it is set.
+        self.health = health or JobHealth(running=True, total=0, failing=())
+        self.health_calls = 0
+        self.health_hold: asyncio.Event | None = None
+        self.health_fail = False
+
+    async def job_health(self) -> JobHealth:
+        self.health_calls += 1
+        if self.health_hold is not None:
+            await self.health_hold.wait()
+        if self.health_fail:
+            raise RuntimeError("database broke")
+        return self.health
 
     async def next_scheduled(self, now: datetime | None = None, horizon: timedelta | None = None):
         self.calls += 1
@@ -375,6 +391,8 @@ async def test_first_report_goes_out_at_start(fake_socket, reporters, caplog):
         "activeSessions": 0,
         "nextScheduledAt": None,
         "nextScheduledName": None,
+        # No cron service: the scheduler did not start.
+        "scheduledJobs": {"state": "failed", "total": 0, "failingCount": 0, "failing": []},
     }
     assert any(
         "Reporting activity to the platform's local activity socket" in r.getMessage()
@@ -995,6 +1013,7 @@ async def test_stop_releases_leases_and_reports_nothing_running(fake_socket):
         "activeSessions": 0,
         "nextScheduledAt": "2026-10-22T03:00:00Z",
         "nextScheduledName": "digest",
+        "scheduledJobs": {"state": "running", "total": 0, "failingCount": 0, "failing": []},
     }
     assert not reporter.active
     assert engine.sessions._running_listeners == ()
@@ -1229,6 +1248,7 @@ async def cron_service(tmp_path, monkeypatch):
     db.log_cron_start = AsyncMock(return_value=1)
     db.get_last_successful_cron_run = AsyncMock(return_value=None)
     db.list_pending_wakeups = AsyncMock(return_value=[])
+    db.get_failing_cron_streaks = AsyncMock(return_value={})
     mock_system_principal(db)
     service = CronService(config, engine, db)
     jobs = [
@@ -1380,3 +1400,176 @@ async def test_the_engines_turns_and_background_agents_reach_the_socket(
     await fake_socket.wait_for(lambda: fake_socket.lease_calls()[-1][:2] == (
         "DELETE", "/v1/leases/nerve-background",
     ))
+
+
+# --------------------------------------------------------------------------- #
+#  The summary of the scheduled jobs                                          #
+# --------------------------------------------------------------------------- #
+
+
+def _failing(job_id: str, since: datetime, failures: int = 1) -> FailingJob:
+    return FailingJob(job_id=job_id, since=since, failures=failures, last_run_at=since + timedelta(hours=failures))
+
+
+@pytest.mark.asyncio
+async def test_the_summary_says_the_scheduler_runs_and_no_job_fails(fake_socket, reporters):
+    cron = FakeCron(health=JobHealth(running=True, total=4, failing=()))
+    await started(reporters, make_reporter(fake_socket.path, cron=cron))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+
+    assert fake_socket.reports()[0]["scheduledJobs"] == {
+        "state": "running", "total": 4, "failingCount": 0, "failing": [],
+    }
+
+
+@pytest.mark.asyncio
+async def test_no_cron_service_means_a_failed_scheduler(fake_socket, reporters):
+    await started(reporters, make_reporter(fake_socket.path, cron=None))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+    assert fake_socket.reports()[0]["scheduledJobs"]["state"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_failing_jobs_are_reported_longest_failing_first(fake_socket, reporters):
+    early = datetime(2026, 10, 20, 8, 0, 30, 500000, tzinfo=UTC)
+    cron = FakeCron(health=JobHealth(running=True, total=6, failing=(
+        _failing("source:mail", early + timedelta(days=1), failures=7),
+        _failing("weekly review", early, failures=3),
+        _failing("digest", early, failures=2),
+    )))
+    await started(reporters, make_reporter(fake_socket.path, cron=cron))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+
+    assert fake_socket.reports()[0]["scheduledJobs"] == {
+        "state": "running",
+        "total": 6,
+        "failingCount": 3,
+        "failing": [
+            {"name": "digest", "since": "2026-10-20T08:00:30Z", "failures": 2, "lastRunAt": "2026-10-20T10:00:30Z"},
+            {"name": "weekly_review", "since": "2026-10-20T08:00:30Z", "failures": 3, "lastRunAt": "2026-10-20T11:00:30Z"},
+            {"name": "source:mail", "since": "2026-10-21T08:00:30Z", "failures": 7, "lastRunAt": "2026-10-21T15:00:30Z"},
+        ],
+    }
+
+
+def test_the_summary_names_at_most_sixteen_jobs_and_counts_them_all():
+    start = datetime(2026, 10, 1, tzinfo=UTC)
+    failing = tuple(_failing(f"job-{i:02d}", start + timedelta(hours=i)) for i in range(20))
+    summary = scheduled_jobs_summary(JobHealth(running=True, total=25, failing=failing))
+
+    assert MAX_FAILING_JOBS == 16
+    assert summary["failingCount"] == 20
+    assert [job["name"] for job in summary["failing"]] == [f"job-{i:02d}" for i in range(16)]
+
+
+def test_the_summary_names_jobs_as_the_socket_takes_them():
+    since = datetime(2026, 10, 1, tzinfo=UTC)
+    summary = scheduled_jobs_summary(JobHealth(running=False, total=1, failing=(
+        _failing("très/long " + "x" * 80, since),
+    )))
+
+    name = summary["failing"][0]["name"]
+    assert summary["state"] == "failed"
+    assert name == next_task_name("très/long " + "x" * 80)
+    assert re.fullmatch(r"[A-Za-z0-9._:-]{1,64}", name)
+
+
+@pytest.mark.asyncio
+async def test_the_summary_is_read_again_only_when_a_run_ends_or_the_schedule_changes(
+    fake_socket, reporters,
+):
+    engine = FakeEngine()
+    cron = FakeCron(health=JobHealth(running=True, total=1, failing=()))
+    reporter = await started(reporters, make_reporter(
+        fake_socket.path, engine=engine, cron=cron, connections=lambda: 0,
+    ))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+    assert cron.health_calls == 1
+
+    # Turns, clients and workflow runs do not read the database for it.
+    engine.sessions.mark_running("web:main")
+    await fake_socket.wait_for(lambda: fake_socket.reports()[-1]["runningTurns"] == 1)
+    engine.sessions.mark_not_running("web:main")
+    await fake_socket.wait_for(lambda: fake_socket.reports()[-1]["runningTurns"] == 0)
+    reporter.notify()
+    await fake_socket.wait_for(lambda: len(fake_socket.reports()) >= 4)
+    assert cron.health_calls == 1
+    assert all(report["scheduledJobs"]["total"] == 1 for report in fake_socket.reports())
+
+    # The end of a run tells the schedule listeners.
+    cron.health = JobHealth(running=True, total=1, failing=(
+        _failing("digest", datetime(2026, 10, 20, tzinfo=UTC)),
+    ))
+    cron.changed()
+    await fake_socket.wait_for(lambda: fake_socket.reports()[-1]["scheduledJobs"]["failingCount"] == 1)
+    assert cron.health_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_the_periodic_report_reads_the_summary_again(fake_socket, reporters):
+    cron = FakeCron()
+    await started(reporters, make_reporter(fake_socket.path, cron=cron, interval=0.3))
+    await fake_socket.wait_for(lambda: len(fake_socket.reports()) >= 3)
+    assert cron.health_calls >= 3
+
+
+@pytest.mark.asyncio
+async def test_a_stuck_database_keeps_the_last_summary(fake_socket, reporters, monkeypatch, caplog):
+    monkeypatch.setattr(activity, "JOB_HEALTH_TIMEOUT_SECONDS", 0.2)
+    cron = FakeCron(health=JobHealth(running=True, total=2, failing=()))
+    with caplog.at_level(logging.INFO, logger="nerve.platform.activity"):
+        await started(reporters, make_reporter(fake_socket.path, cron=cron))
+        await fake_socket.wait_for(lambda: fake_socket.reports())
+
+        cron.health = JobHealth(running=True, total=3, failing=())
+        cron.health_hold = asyncio.Event()  # never set: the read times out
+        for count in (2, 3):
+            cron.changed()
+            await fake_socket.wait_for(lambda count=count: len(fake_socket.reports()) >= count)
+
+    assert [report["scheduledJobs"]["total"] for report in fake_socket.reports()] == [2, 2, 2]
+    said = [r for r in caplog.records if "summary of the scheduled jobs failed" in r.getMessage()]
+    assert len(said) == 1 and said[0].levelno == logging.INFO
+    assert "TimeoutError" in said[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_first_read_leaves_the_summary_out(fake_socket, reporters):
+    cron = FakeCron()
+    cron.health_fail = True
+    reporter = await started(reporters, make_reporter(fake_socket.path, cron=cron))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+    assert "scheduledJobs" not in fake_socket.reports()[0]
+
+    cron.health_fail = False
+    cron.changed()
+    await fake_socket.wait_for(lambda: "scheduledJobs" in fake_socket.reports()[-1])
+    assert reporter.active
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refused", ["nextScheduledName", "scheduledJobs"])
+async def test_a_socket_that_predates_the_new_keys_gets_reports_without_both(
+    fake_socket, reporters, refused,
+):
+    fake_socket.unknown_fields = {refused}
+    cron = FakeCron(tick(datetime(2026, 10, 22, 3, 0, tzinfo=UTC), "digest"))
+    reporter = await started(reporters, make_reporter(fake_socket.path, cron=cron))
+    await fake_socket.wait_for(lambda: len(fake_socket.reports()) >= 2)
+
+    first, retry = fake_socket.reports()[:2]
+    assert {"nextScheduledName", "scheduledJobs"} <= first.keys()
+    assert retry == {"runningTurns": 0, "activeSessions": 0, "nextScheduledAt": "2026-10-22T03:00:00Z"}
+    reporter.notify()
+    await fake_socket.wait_for(lambda: len(fake_socket.reports()) >= 3)
+    assert fake_socket.reports()[2].keys() == retry.keys()
+
+
+@pytest.mark.asyncio
+async def test_the_cron_services_summary_reaches_the_socket(fake_socket, reporters, cron_service):
+    await started(reporters, make_reporter(fake_socket.path, cron=cron_service))
+    await fake_socket.wait_for(lambda: fake_socket.reports())
+
+    assert fake_socket.reports()[0]["scheduledJobs"] == {
+        "state": "running", "total": 2, "failingCount": 0, "failing": [],
+    }

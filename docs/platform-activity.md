@@ -37,7 +37,15 @@ Every report is `POST /v1/activity` with this JSON body:
   "runningTurns": 1,
   "activeSessions": 2,
   "nextScheduledAt": "2026-10-22T03:00:00Z",
-  "nextScheduledName": "memory-maintenance"
+  "nextScheduledName": "memory-maintenance",
+  "scheduledJobs": {
+    "state": "running",
+    "total": 5,
+    "failingCount": 1,
+    "failing": [
+      {"name": "daily-digest", "since": "2026-10-21T07:00:00Z", "failures": 2, "lastRunAt": "2026-10-22T07:00:00Z"}
+    ]
+  }
 }
 ```
 
@@ -47,6 +55,42 @@ Every report is `POST /v1/activity` with this JSON body:
 | `activeSessions` | Open web UI connections (authenticated WebSocket clients of `/ws`). Telegram, Slack and hosted channel streams are not client connections and are not counted. |
 | `nextScheduledAt` | When the next scheduled task that will actually run is due, in UTC (RFC 3339, whole seconds). `null` when nothing is scheduled. The cron service forecasts it. Jobs whose gates would skip the run are left out; source runners and pending session wakeups are included, except a source whose buffer only the running instance writes (the hosted GitHub source, the channel drains `<channel>:observed`) while nothing delivered waits in it: nothing is added to that buffer while the machine is parked, so its scheduled run is not counted then. The internal `cleanup` and `wakeup_sweep` jobs never count. See [Cron](cron.md). |
 | `nextScheduledName` | That task's name: the job id, `source:<name>`, or `wakeup:<first 8 characters of the session id>`. Any character outside `[A-Za-z0-9._:-]` becomes `_`, and the name is cut at 64 characters: the socket refuses a whole report whose name breaks that rule. `null` together with `nextScheduledAt`. |
+| `scheduledJobs` | How the scheduled jobs do (see [The summary of the scheduled jobs](#the-summary-of-the-scheduled-jobs)). Absent until it was read once, as when the first read failed. |
+
+### The summary of the scheduled jobs
+
+`scheduledJobs` lets the platform tell a scheduler that does not run, and jobs
+that keep failing, from an agent with nothing to do. It holds no error text.
+
+| Field | Meaning |
+|-------|---------|
+| `state` | `running` while the cron service runs. `failed` when it did not start (the gateway logs "Cron service failed to start") or does not run: then `nextScheduledAt` is `null` too, which alone looks like an agent without jobs. |
+| `total` | The enabled jobs that the forecast counts: agent jobs, workflow jobs and source runners. The internal `cleanup` and `wakeup_sweep` jobs never count. `0` with `failed`. |
+| `failingCount` | Every failing job, also those that `failing` leaves out. |
+| `failing` | At most 16 failing jobs, the one failing longest first, then by name. |
+| `failing[].name` | The job id, or `source:<name>`, in the form of `nextScheduledName`. |
+| `failing[].since` | When the first failed run of the current streak started, in UTC (RFC 3339, whole seconds). |
+| `failing[].failures` | Failed runs in a row. |
+| `failing[].lastRunAt` | When the latest failed run started, in UTC. |
+
+When a job fails:
+
+- **Agent job:** its latest finished run failed. The streak is the failed runs
+  after its latest successful one in the [run history](cron.md). A missed run
+  and a run that is still going neither count nor end a streak. The history
+  keeps 14 days of runs, so a longer streak counts from its oldest run kept.
+- **Source runner:** its circuit breaker counts failures. A source that backs
+  off logs the runs it skips as successful runs that found nothing, so the
+  history cannot tell. The breaker lives in memory: after a restart, a streak
+  counts from its first failure since then.
+- **Workflow job:** never reported as failing. Its run history says only that
+  the run was launched.
+
+The summary is read again when a job or source run ends, when the schedule
+changes, and with each periodic report, and kept between them, so the reports
+for turns and clients never read the database. A read is bounded at five
+seconds. A read that fails or times out keeps the last summary, and is logged
+like the other failures.
 
 A report is sent:
 
@@ -131,13 +175,15 @@ fails, even by timing out, is retried before the lease runs out.
 
 If the cron forecast fails, the last known next task is reported again.
 
-A socket that does not know `nextScheduledName` refuses the field with a 400,
-and with it the whole report. On a 400 the report is sent once more without
-the name. If that is taken, every later report leaves the name out until the
-gateway restarts, and one INFO line says so ("activity socket does not accept
-task names; reporting times only"). If it is refused as well, the name was not
-the reason. Each later report is then sent once, without the name, until the
-socket takes one, and the report after that has the name again.
+A socket that does not know `nextScheduledName` refuses unknown fields with a
+400, and with them the whole report. Such a socket does not know
+`scheduledJobs` either, which came later. On a 400 the report is sent once
+more without both. If that is taken, every later report leaves both out until
+the gateway restarts, and one INFO line says so ("activity socket does not
+accept task names; reporting times only, without the summary of the scheduled
+jobs"). If it is refused as well, they were not the reason. Each later report
+is then sent once, without both, until the socket takes one, and the report
+after that has them again.
 
 ## Switching it off
 
@@ -158,7 +204,9 @@ platform:
 A platform that wants these reports serves HTTP/1.1 on a Unix socket that the
 Nerve process can open:
 
-- `POST /v1/activity`: the body above. It replaces the previous report.
+- `POST /v1/activity`: the body above. It replaces the previous report. A
+  socket that ignores the fields it does not know keeps working when a later
+  release adds one.
 - `POST /v1/leases`: body `{"name", "ttlSeconds"}`. It creates or renews the
   lease. Lease names match `[A-Za-z0-9._-]{1,64}`.
 - `DELETE /v1/leases/<name>`: releases the lease. `404` counts as released.
