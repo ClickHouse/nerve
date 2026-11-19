@@ -1497,7 +1497,23 @@ _EARLIER_TASK_PLANNER_STEPS = (
     "4. Call plan_propose(task_id, content) with your plan\n\n"
     "If all tasks have plans or none are actionable, say so and stop.\n\n"
 )
+# The first Loom wording of memory-maintenance, which a system.yaml written
+# under Loom holds. It names the tool loom_namespace_validate, which Loom's
+# default tool list does not carry from Loom 1.2.0. Here it becomes the memU
+# prompt, and under Loom the scheduler runs the Loom wording of that prompt
+# (``_reword_for_loom`` in nerve.cron.service).
+_FIRST_LOOM_MEMORY_MAINTENANCE = (
+    "You are running a daily memory check on Loom. Work completely silently — do not output any text, only think.\n\n"
+    "1. Call loom_namespace_validate for your home namespace (read-only). It reports errors and warnings, each with sample memory keys and a `detail` naming the operation that fixes it.\n"
+    "2. For a finding on a key in your home namespace: fix it as its `detail` says when that is one of your Loom tools — a stale or wrong value with loom_memory_update under the same key, never a second copy.\n"
+    "3. Leave conflicts to their owners (Loom's review queue) and everything in team or org namespaces alone: shared memories are read-only for you.\n"
+    "4. Do not delete memories as cleanup: Loom merges duplicates itself, and a wrong fact is corrected, not deleted.\n"
+    "5. Save nothing about this run. Notify only when a finding needs the human (an error that keeps coming back, a conflict you cannot judge), once, with the keys involved.\n"
+)
 _SUPERSEDED_CRON_VALUES: dict[str, dict[str, tuple[str, ...]]] = {
+    "memory-maintenance": {
+        "prompt": (_FIRST_LOOM_MEMORY_MAINTENANCE,),
+    },
     "skill-extractor": {
         "schedule": ("0 */12 * * *",),
         "description": (

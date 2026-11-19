@@ -11,6 +11,7 @@ carries, and the ``nerve-dev`` skill's source map, now mention Loom.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from pathlib import Path
@@ -127,6 +128,30 @@ def test_the_loom_section_says_to_leave_the_memory_type_unset() -> None:
     section = loom_prompts.SYSTEM_PROMPT_SECTION
     assert "Leave `memory_type` unset" in section
     assert "typed `episodic` or `profile` out of search" in section
+
+
+def test_each_loom_op_call_puts_the_op_arguments_under_arguments() -> None:
+    """``loom_op`` takes the dotted op name as ``op``, the op's arguments as
+    ``arguments`` and a help search as ``query`` (``route`` in Loom's
+    ``server/transport/mcp_op.py``). It gives the op no argument that is
+    beside ``op``."""
+    decoder = json.JSONDecoder()
+    calls = []
+    for text in (
+        loom_prompts.SYSTEM_PROMPT_SECTION, loom_prompts._TOOLS_MEMORY[1], loom_prompts.MAINTENANCE_PROMPT,
+    ):
+        for match in re.finditer(r'\{"op": ', text):
+            try:
+                calls.append(decoder.raw_decode(text, match.start())[0])
+            except json.JSONDecodeError:
+                continue  # the pattern {"op": "<name>", "arguments": {...}}
+    assert calls == [
+        {"op": "memory.related", "arguments": {"memory_key": "<key>"}},
+        {"op": "help", "query": "<words>"},
+        {"op": "help"},
+        {"op": "namespace.validate"},
+    ]
+    assert '`{"op": "<name>", "arguments": {...}}`' in loom_prompts._TOOLS_MEMORY[1]
 
 
 def test_without_loom_tools_the_prompt_says_memory_cannot_be_used(tmp_path: Path) -> None:
@@ -320,6 +345,34 @@ def test_a_system_yaml_from_before_the_switch_runs_in_loom_wording() -> None:
     assert by_id["task-planner"].prompt == memu["task-planner"]["prompt"]
     assert edited.prompt == "My own tidy-up."
     assert loom_wording_of_shipped_job("memory-maintenance", "Tidy up.", "") is None
+
+
+def test_a_system_yaml_with_the_first_loom_wording_runs_the_current_one(tmp_path: Path) -> None:
+    """A system.yaml written under Loom holds the Loom wording of that
+    release. The first one named the tool loom_namespace_validate, which
+    Loom's default tool list does not carry from Loom 1.2.0."""
+    from types import SimpleNamespace
+
+    from nerve.cron.service import CronService
+    from nerve.setup_writer import _FIRST_LOOM_MEMORY_MAINTENANCE
+
+    assert "loom_namespace_validate" in _FIRST_LOOM_MEMORY_MAINTENANCE
+    assert "loom_namespace_validate" not in loom_prompts.MAINTENANCE_PROMPT
+    jobs = [
+        dict(job, prompt=_FIRST_LOOM_MEMORY_MAINTENANCE)
+        for job in _jobs("loom").values() if job["id"] == "memory-maintenance"
+    ]
+    (tmp_path / "system.yaml").write_text(yaml.safe_dump({"jobs": jobs}), encoding="utf-8")
+    service = SimpleNamespace(
+        config=SimpleNamespace(
+            cron=SimpleNamespace(system_file=tmp_path / "system.yaml", jobs_file=tmp_path / "jobs.yaml"),
+            memory=SimpleNamespace(backend="loom"),
+        ),
+        _rejected_job_ids=[],
+    )
+    (loaded,) = CronService._load_merged_jobs(service)
+    assert loaded.prompt == loom_prompts.MAINTENANCE_PROMPT
+    assert loaded.description == loom_prompts.MAINTENANCE_DESCRIPTION
 
 
 def test_an_install_with_every_job_in_jobs_yaml_is_reworded_too(tmp_path: Path) -> None:

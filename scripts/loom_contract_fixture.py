@@ -21,11 +21,13 @@ Only what Nerve uses is written: the ops in LOOM_CALLS, the request fields
 Nerve may send plus the ones Loom requires (a field with a fixed set of
 values lists only the ones Nerve sends), the result fields Nerve reads
 (an object or list of objects without its fields, unless Nerve reads them),
-and the tools the agent-facing wording names
-(``nerve.memory.loom_prompts.tool_names``). It fails, writing nothing, when
-Nerve calls an op Loom does not have or does not serve on MCP, names a field
-or a value Loom does not know, or tells agents about a tool Loom does not
-list by default.
+the tools the agent-facing wording names
+(``nerve.memory.loom_prompts.tool_names``) and the ops it names for
+``loom_op`` (``nerve.memory.loom_prompts.op_names``). It fails, writing
+nothing, when Nerve calls an op Loom does not have or does not serve on MCP,
+names a field or a value Loom does not know, tells agents about a tool Loom
+does not list by default, or names for ``loom_op`` an op that ``loom_op``
+does not run.
 """
 
 from __future__ import annotations
@@ -51,7 +53,7 @@ META_TOOLS = (LOOM_OP, "loom_activate")
 
 sys.path.insert(0, str(ROOT))
 from nerve.memory.loom import LOOM_CALLS
-from nerve.memory.loom_prompts import tool_names
+from nerve.memory.loom_prompts import op_names, tool_names
 
 
 def read_source(loom: Path, path: str, ref: str | None) -> str:
@@ -251,6 +253,7 @@ def listed_tools(sets: dict[str, frozenset[str]]) -> set[str]:
 
 def build(
     ops_source: str, toolsets_source: str, named: set[str] | None = None,
+    named_ops: set[str] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     schemas = Schemas(ops_source)
     sets = frozensets(toolsets_source, ("_MCP_CORE_OPS", "_MCP_HIDDEN_OPS", "SYNTHETIC_TOOL_OPS"))
@@ -298,12 +301,25 @@ def build(
                 errors.append(f"Loom lists no tool {name}")
         elif name not in listed:
             errors.append(f"Loom does not list {name} by default")
+    named_ops = op_names() if named_ops is None else named_ops
+    # loom_op runs every op that MCP does not keep off (Loom's mcp_op.py).
+    runs = set(schemas.ops) - sets["_MCP_HIDDEN_OPS"]
+    for name in sorted(named_ops):
+        if name.endswith(".*"):
+            if not any(op.startswith(name[:-1]) for op in runs):
+                errors.append(f"loom_op runs no op {name}")
+        elif name not in schemas.ops:
+            errors.append(f"Loom has no op {name}")
+        elif name not in runs:
+            errors.append(f"Loom keeps {name} off MCP: loom_op does not run it")
     fixture = {
         "generated_by": "scripts/loom_contract_fixture.py",
         "from": [OPS_FILE, TOOLSETS_FILE],
         "ops": ops,
         # Each one listed by Loom's default toolset when this was written.
         "tools_named_in_prompts": sorted(named),
+        # Each one run by loom_op when this was written.
+        "ops_named_in_prompts": sorted(named_ops),
     }
     return fixture, errors
 
