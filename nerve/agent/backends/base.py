@@ -269,6 +269,16 @@ class AgentBackend(Protocol):
         """
         ...
 
+    def cost_counter_start(self, native_id: str, cwd: str) -> float:
+        """The value at which the cost counter of a new client starts when
+        the client resumes the conversation *native_id* or forks from it.
+
+        Optional, and only for backends with ``cost_is_cumulative``: the
+        engine takes a backend without it to start every counter at zero.
+        May read files, so the engine calls it in a thread.
+        """
+        ...
+
     def excluded_tools(self) -> set[str]:
         """Nerve-registry tool names NOT to expose for this backend.
 

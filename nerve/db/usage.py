@@ -576,24 +576,29 @@ def compute_turn_cost(
     """Derive this turn's cost from the SDK's cumulative cost counter.
 
     The Claude Agent SDK reports ``ResultMessage.total_cost_usd`` as a
-    *cumulative* total per CLI client process. The caller persists the
-    last seen cumulative value (``_sdk_cumulative_cost`` in session
-    metadata) and passes it as ``prev_cumulative``; the normal per-turn
-    cost is the delta between the two.
+    *cumulative* total. A CLI process that starts a new conversation
+    counts from zero. A process that resumes a conversation, or forks
+    from it, counts from the total that the conversation's last process
+    saved when it ended normally. The caller persists the last seen
+    cumulative value (``_sdk_cumulative_cost`` in session metadata),
+    adjusts it to the start of the new counter when it creates a client
+    (``AgentEngine._set_cost_baseline``), and passes it as
+    ``prev_cumulative``; the normal per-turn cost is the delta between
+    the two.
 
     Two counter failure modes are handled explicitly (this logic has
-    produced two accounting incidents — v024 fixed over-counting when
-    the cumulative was treated as per-turn; the reset handling below
-    fixes under-counting):
+    produced three accounting incidents: v024 fixed over-counting when
+    the cumulative was treated as per-turn; the handling below fixed
+    under-counting; a baseline of zero for every new client over-counted
+    once a process that resumed a conversation counted from its saved
+    total):
 
-    * **Counter reset** — every client recycle (idle sweep, oneshot
-      cron teardown, ``nerve restart``, model switch) starts a fresh
-      CLI process whose cumulative begins near zero, i.e. *below* the
-      persisted high-water mark. A naive ``max(delta, 0)`` clamp
-      records $0 for the first turn on the new client — typically the
-      most expensive turn, since it replays the resumed context. The
-      new process's cumulative IS its spend so far, so attribute it to
-      this turn instead.
+    * **Counter below the baseline** — the new process did not count
+      from the value the caller expected (the saved total could not be
+      read, or the runtime did not use it). A naive ``max(delta, 0)``
+      clamp records $0 for the first turn on the new client — typically
+      the most expensive turn, since it replays the resumed context.
+      Attribute the new cumulative to this turn instead.
 
     * **Zero with traffic** — the counter reports no spend while the
       turn moved real tokens (stuck counter, provider that doesn't
@@ -604,7 +609,7 @@ def compute_turn_cost(
 
     - ``"sdk_delta"`` — normal cumulative delta (also covers genuinely
       free/tiny turns, which legitimately stay at ~0);
-    - ``"sdk_reset"`` — counter went backwards, new cumulative used;
+    - ``"sdk_reset"`` — counter below the baseline, new cumulative used;
     - ``"estimate"`` — SDK reported no cost at all;
     - ``"estimate_backstop"`` — SDK cost was zero-ish despite real
       token traffic, token-based estimate used.

@@ -2045,11 +2045,21 @@ class AgentEngine:
             )
             await self.db.update_session_fields(session_id, {"model": resolved_model})
 
-            # A brand-new runtime process starts its cumulative cost counter
-            # at zero — zero the persisted baseline so the first turn's
-            # delta is exact (claude-only; codex reports per-turn cost).
+            # The cost counter of a new runtime process starts at zero for a
+            # new conversation. For a conversation that the process resumes
+            # or forks from, it starts at the cost that the runtime saved
+            # for that conversation. Store the baseline for that start, so
+            # that the first turn's delta does not hold the cost of earlier
+            # turns again (claude-only; codex reports per-turn cost).
             if backend.capabilities.cost_is_cumulative:
-                await self._reset_cost_baseline(session_id)
+                await self._set_cost_baseline(
+                    session_id,
+                    await self._cost_counter_start(
+                        backend, fork_from if is_fork else sdk_resume_id,
+                        session_cwd,
+                    ),
+                    same_conversation=bool(sdk_resume_id) and not is_fork,
+                )
 
             logger.info(
                 "Created persistent %s client for session %s%s",
@@ -2146,13 +2156,49 @@ class AgentEngine:
             "status": "ok" if bullets else "unavailable",
         })
 
-    async def _reset_cost_baseline(self, session_id: str) -> None:
-        """Zero the persisted SDK cumulative-cost baseline for a session.
+    async def _cost_counter_start(
+        self, backend: AgentBackend, native_id: str | None, cwd: str,
+    ) -> float:
+        """Return the value at which the cost counter of a new client
+        starts: zero for a new conversation, and what the backend reports
+        for the conversation *native_id* that the client resumes or forks
+        from (``AgentBackend.cost_counter_start``).
 
-        Called right after a new CLI client is created: the fresh process
-        reports ``total_cost_usd`` cumulatively from zero, so the stored
-        high-water mark from the previous client must not be diffed
-        against it (see compute_turn_cost in nerve.db.usage).
+        Accounting must never break a turn, so a failure is logged and the
+        counter is taken to start at zero.
+        """
+        read = getattr(backend, "cost_counter_start", None)
+        if not native_id or read is None:
+            return 0.0
+        try:
+            start = await asyncio.to_thread(read, native_id, cwd)
+        except Exception as e:
+            logger.warning(
+                "Failed to read the cost counter start of %s: %s",
+                native_id[:12], e,
+            )
+            return 0.0
+        if isinstance(start, bool) or not isinstance(start, (int, float)):
+            return 0.0
+        return float(start) if start > 0 and start != float("inf") else 0.0
+
+    async def _set_cost_baseline(
+        self, session_id: str, start: float, *, same_conversation: bool = False,
+    ) -> None:
+        """Store the SDK cumulative-cost baseline for a session.
+
+        Called right after a new CLI client is created, with the value
+        *start* at which the new process starts ``total_cost_usd``. The
+        first turn's cost is the difference to the baseline (see
+        compute_turn_cost in nerve.db.usage).
+
+        The baseline is *start*. A client that resumes the session's own
+        conversation (*same_conversation*) keeps a stored value that is
+        lower: the previous process then spent after the last result that
+        the engine recorded (a turn that was stopped, for example), and
+        that spend goes to the next turn, as it does within one process.
+        A stored value that is higher is not kept: the previous process
+        was killed and did not save its total.
 
         Re-reads the session row so concurrent metadata writers are not
         clobbered; accounting must never break a turn, so failures are
@@ -2163,12 +2209,17 @@ class AgentEngine:
             if not session:
                 return
             meta = json.loads(session.get("metadata") or "{}")
-            if meta.get("_sdk_cumulative_cost"):
-                meta["_sdk_cumulative_cost"] = 0
+            stored = meta.get("_sdk_cumulative_cost") or 0
+            baseline = (
+                min(stored, start) if same_conversation and stored > 0
+                else start
+            )
+            if stored != baseline:
+                meta["_sdk_cumulative_cost"] = baseline
                 await self.db.update_session_metadata(session_id, meta)
         except Exception as e:
             logger.warning(
-                "Failed to reset cost baseline for %s: %s", session_id, e,
+                "Failed to set cost baseline for %s: %s", session_id, e,
             )
 
     async def _discard_client(
@@ -4025,12 +4076,13 @@ class AgentEngine:
             # Calculate per-turn cost. Semantics depend on the backend
             # (cost_is_cumulative capability):
             #
-            # * Claude: the SDK's total_cost_usd is *cumulative* per CLI
-            #   client process, NOT per-invocation.  We track the last
-            #   known cumulative value in session metadata and compute the
-            #   delta for this turn.  The counter resets whenever the
-            #   client is recycled — compute_turn_cost detects the reset
-            #   and attributes the new cumulative to this turn.
+            # * Claude: the SDK's total_cost_usd is *cumulative*, NOT
+            #   per-invocation.  We track the last known cumulative value
+            #   in session metadata and compute the delta for this turn.
+            #   A new client sets that value to where its counter starts
+            #   (_get_or_create_client).  If the counter is below it all
+            #   the same, compute_turn_cost attributes the new cumulative
+            #   to this turn.
             # * Codex: the backend returns THIS turn's nullable billed cost,
             #   explicit cost basis, and (for ChatGPT auth) a separate
             #   API-equivalent estimate. Cumulative bookkeeping stays untouched.
@@ -4050,8 +4102,8 @@ class AgentEngine:
                 )
                 if cost_source == "sdk_reset":
                     logger.info(
-                        "SDK cost counter reset for %s (%.4f < %.4f) — client "
-                        "recycle; attributing new cumulative to this turn",
+                        "SDK cost counter of %s is below its baseline "
+                        "(%.4f < %.4f); attributing new cumulative to this turn",
                         session_id, sdk_cost, prev_cumulative,
                     )
                 elif cost_source == "estimate_backstop":
