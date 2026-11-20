@@ -410,13 +410,18 @@ def validate_thread_item(record: SourceRecordPayload) -> None:
     Every key of :data:`THREAD_ITEM_KEYS` holds one non-blank value, each
     key of :data:`THREAD_ITEM_VALUES` that is present holds one of its
     values, and ``number`` is a positive number. ``review_state`` is present
-    on a review and only there; ``title`` may be absent. Other keys are not
-    checked.
+    on a review and only there; ``title`` may be absent. No value holds a
+    control character or a line or paragraph separator: the message puts
+    the values on fixed lines, and a line break in a title, which anyone who
+    can open an issue writes, would add a false line. Other keys are not
+    checked otherwise.
     """
     metadata: dict[str, str] = {}
     for entry in record.metadata:
         if entry.key in metadata or entry.values:
             malformed(f"thread item metadata {entry.key!r} is repeated or a list")
+        if any(unicodedata.category(c) in ("Cc", "Zl", "Zp") for c in entry.value):
+            malformed(f"thread item metadata {entry.key!r} holds a control character or a line break")
         metadata[entry.key] = entry.value
     missing = [key for key in THREAD_ITEM_KEYS if not metadata.get(key, "").strip()]
     if missing:

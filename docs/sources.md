@@ -204,7 +204,8 @@ running. Nerve reads them over the hosted channel streams.
   the author and `allow_repos` and `deny_repos` to its repository; it has no
   reason, so the reason and CI branch lists are not checked for it. Nerve
   shows what the gateway sent and decides nothing from it. A record without
-  these keys and values is refused on its own.
+  these keys and values, or with a control character or a line break in a
+  value, is refused on its own.
 - **The credential is the switch.** The gateway polls GitHub for an agent only
   while a GitHub credential is connected to that agent and Nerve subscribes,
   which it does while `enabled` is true. Your operator can therefore set

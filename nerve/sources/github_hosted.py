@@ -68,11 +68,11 @@ _ITEM_WORDS = {
 _RELATION_WORDS = {
     "self": "the agent itself",
     "member": "member of the organization",
-    "team": "member of the agent's team",
+    "team": "member of a team the agent listens to",
     "collaborator": "collaborator on the repository",
     "app": "a GitHub App",
-    "agent": "another agent",
-    "listed": "on the agent's list of people",
+    "agent": "another agent of the organization",
+    "listed": "listed by the organization's administrators",
     "outside": "outside the organization",
 }
 
@@ -210,7 +210,7 @@ def thread_item_content(metadata: dict[str, Any], text: str) -> str:
     lines = [
         f"Repository: {metadata.get('repo_name', '')}",
         f"Thread: {subject} #{metadata.get('number', '')}",
-        f"Title: {title}" if title else "Title: not shown",
+        f"Title: {title}" if title else "Title: (not shown)",
         f"State: {metadata.get('state', '')}",
         f"Item: {kind}",
         f"Author: {author}, {relation}" if relation else f"Author: {author}",
