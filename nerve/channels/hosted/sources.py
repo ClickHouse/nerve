@@ -94,15 +94,18 @@ def subscriptions_for(config: NerveConfig, providers: Iterable[str]) -> Subscrip
     lists a repository, and an agent without one sends the same frame as
     before the watch existed.
 
-    The notifications go with a ``github_thread_items`` entry, which says
-    that Nerve accepts a record of each comment, review and description of a
-    thread. A gateway that does not know the provider ignores the entry.
+    While ``sync.github.thread_items`` is on, the notifications go with a
+    ``github_thread_items`` entry, which says that Nerve accepts a record of
+    each comment, review and description of a thread. A gateway that does not
+    know the provider ignores the entry. With the setting off the entry is
+    left out, and the gateway keeps sending one record per thread.
     """
     providers = set(providers)
     sources: list[SourceSubscription] = []
     if GITHUB in providers and config.sync.github.enabled:
         sources.append(github_subscription(config.sync.github))
-        sources.append(SourceSubscription(provider=THREAD_ITEMS_PROVIDER))
+        if config.sync.github.thread_items:
+            sources.append(SourceSubscription(provider=THREAD_ITEMS_PROVIDER))
     if GITHUB_REPOS in providers and config.sync.github_repos.enabled:
         watch = github_repos_subscription(config.sync.github_repos)
         if watch is not None:

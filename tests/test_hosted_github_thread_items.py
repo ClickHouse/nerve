@@ -195,6 +195,19 @@ class TestSubscriptionEntry:
         assert subscriptions.sources[1] == SourceSubscription(provider="github_thread_items")
         subscriptions.validate()
 
+    def test_the_setting_off_leaves_the_entry_out(self):
+        on = subscriptions_for(hosted_config(), ["github"])
+        off = subscriptions_for(hosted_config(thread_items=False), ["github"])
+
+        assert off.sources == on.sources[:1]
+        assert [source.provider for source in off.sources] == ["github"]
+
+    def test_the_setting_is_on_unless_the_config_turns_it_off(self):
+        config = NerveConfig.from_dict({"sync": {"github": {"mode": "hosted", "thread_items": "false"}}})
+
+        assert config.sync.github.thread_items is False
+        assert NerveConfig().sync.github.thread_items is True
+
     @pytest.mark.parametrize("source", [
         SourceSubscription(provider="github_thread_items", filters=SourceFilters(deny_actors=("someone",))),
         SourceSubscription(provider="github_thread_items", pr_watch=True),
