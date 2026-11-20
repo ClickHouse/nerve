@@ -692,6 +692,26 @@ async def test_deny_authors_are_case_insensitive_globs_and_drop_before_anything_
     assert [record.metadata["author"] for record in result.records] == ["alice", "bob", "carol"]
 
 
+@pytest.mark.asyncio
+async def test_a_denied_author_that_ends_in_bot_names_a_github_app():
+    """With bots included, the Apps that the list names are left out by login."""
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], include_bots=True, deny_authors=["Noisy-App[bot]"])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [
+        pull(1, created=1, author="noisy-app[bot]", kind="Bot"),
+        pull(2, created=2, author="lint[bot]", kind="Bot"),
+        pull(3, created=3, author="noisy-appt"),
+    ]
+
+    result = await src.fetch(cursor)
+
+    assert [record.metadata["author"] for record in result.records] == ["lint[bot]", "noisy-appt"]
+    settings = GitHubReposSyncConfig(include_bots=True, deny_authors=["Noisy-App[bot]"])
+    kept, dropped = github_repos_inbox_filter(settings).partition(result.records)
+    assert (kept, dropped) == (result.records, [])
+
+
 def test_the_inbox_filter_drops_what_the_settings_drop():
     """The second net, for records the gateway delivered before a reload."""
     settings = GitHubReposSyncConfig(types=["pull_request", "release"], deny_authors=["noisy-*"])

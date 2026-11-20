@@ -353,7 +353,7 @@ sync:
 | `github_repos.include_bots` | bool | `false` | Also report the pull requests and issues that a GitHub App (`user.type` `Bot`) or an account whose login ends in `[bot]` opened. A release is reported whoever published it: release automation (`github-actions[bot]`, a release bot) is the normal case. `author_kind` still says `bot` on such a release |
 | `github_repos.include_drafts` | bool | `true` | `false`: a new draft pull request is held and reported when it is marked ready for review (event `ready`), never as `opened`; one closed while it is a draft is never reported |
 | `github_repos.updates` | bool | `false` | Also report, for each pull request this source reported, a new head commit (`updated`), ready for review (`ready`), and its merge (`merged`) or close (`closed`), after which it is no longer followed |
-| `github_repos.deny_authors` | list | `[]` | Case-insensitive globs on the author's login, with the [guardrail](#guardrails-inbox-filtering) rules; what they match is never reported, releases included. `[...]` is a character class (`*[bot]` matches every login ending in `b`, `o` or `t`); bot pull requests and issues are dropped by `include_bots` already |
+| `github_repos.deny_authors` | list | `[]` | Case-insensitive globs on the author's login, with the rules of the [actor guardrail](#github-actor-guardrail); what they match is never reported, releases included. A pattern that ends in `[bot]` names a GitHub App (`some-ci[bot]` is that App, `*[bot]` every App), so with `include_bots: true` the list leaves out the Apps it names; without it, bot pull requests and issues are dropped already |
 
 Events (the record's `Event:` line and `event` metadata):
 
@@ -763,6 +763,10 @@ sync:
 allowlist. A non-empty `allow_actors` is **fail-closed**: a notification with no
 identifiable actor (e.g. enrichment failed) is dropped. With `allow_actors` empty (the
 default), all actors pass — behavior is unchanged. The repo and actor rules AND together.
+
+A pattern that ends in `[bot]` names a GitHub App by its login. That ending is matched as
+written, not as a character class of one letter: `some-ci[bot]` matches that App and never
+`some-cit`. A class anywhere else in a pattern stays a class.
 
 Assignments are worth calling out. An `assign` notification names the assignee but not the
 assigner, and carries no comment text, so the assigner is fetched from the thread's event

@@ -34,7 +34,8 @@ anything is reported or remembered, a pull request or an issue is dropped
 whose author is a GitHub App or a ``[bot]`` account (unless
 ``include_bots``; a release is reported whoever published it, release
 automation being the normal case), and any item whose author's login
-matches a ``deny_authors`` glob (the guardrail rules).
+matches a ``deny_authors`` glob (the rules of the actor guardrail: a
+pattern that ends in ``[bot]`` names a GitHub App).
 
 The cursor is JSON: per repository, for each listing its newest
 ``updated_at`` (``published_at`` for releases), when it was read, and the keys
@@ -151,7 +152,7 @@ def github_repos_inbox_filter(settings: GitHubReposSyncConfig) -> InboxFilter:
     rules = [
         # A repository the watch no longer names: its records already on the way.
         FieldRule(field="repo_name", allow=list(settings.repos or [])),
-        FieldRule(field="author", deny=list(settings.deny_authors or [])),
+        FieldRule(field="author", deny=list(settings.deny_authors or []), logins=True),
         FieldRule(
             field="subject_type",
             allow=[SUBJECT_TYPES[kind] for kind in settings.types or () if kind in SUBJECT_TYPES],
@@ -733,7 +734,7 @@ class GitHubReposSource(Source):
 
     def _denied(self, login: str) -> bool:
         """Whether *login* matches a ``deny_authors`` glob."""
-        return bool(self._deny_authors) and matches_any(login, self._deny_authors)
+        return bool(self._deny_authors) and matches_any(login, self._deny_authors, logins=True)
 
     def _wanted(self, author: tuple[str, str]) -> bool:
         """Whether a pull request or an issue of this author may be reported:

@@ -2197,7 +2197,7 @@ reload:
 | `sync.github_repos.include_bots` | bool | `false` | Also report the pull requests and issues that a GitHub App or an account whose login ends in `[bot]` opened. A release is reported whoever published it (release automation such as `github-actions[bot]` is the normal case) |
 | `sync.github_repos.include_drafts` | bool | `true` | `false`: a draft pull request is reported when it is marked ready for review (event `ready`), not when it is opened |
 | `sync.github_repos.updates` | bool | `false` | Also report a new head commit, ready for review, and the merge or close of each pull request the watch reported |
-| `sync.github_repos.deny_authors` | list | `[]` | Case-insensitive globs on the author's login, with the guardrail rules; what they match is never reported, releases included |
+| `sync.github_repos.deny_authors` | list | `[]` | Case-insensitive globs on the author's login, with the rules of the actor guardrail (a pattern that ends in `[bot]` names a GitHub App); what they match is never reported, releases included |
 
 `cron.delivery_debounce_seconds` (int, default `60`) spaces the job runs that a
 hosted delivery starts; a negative value reads as `0`, and a value above `600`
