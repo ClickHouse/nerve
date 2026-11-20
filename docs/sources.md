@@ -185,6 +185,26 @@ running. Nerve reads them over the hosted channel streams.
   `allow_repos` and `deny_repos` apply to it, at the gateway and here; the
   actor, reason and CI branch lists are not checked for it (see
   [Pull request activity records](#github-pull-request-activity-records)).
+  A gateway that supports it also delivers `github_thread_item` records: one
+  for each comment, review, review comment or description of a thread, with
+  its author. Nerve says that it accepts them with a
+  `{"provider": "github_thread_items", "filters": {}}` entry next to the
+  notifications in its subscriptions, sent whenever `enabled` is true; a
+  gateway that does not know the entry ignores it. Such a record carries
+  `repo_name`, `repo_url`, `subject_type` (`Issue` or `PullRequest`),
+  `subject_url`, `number`, `state`, `title` (absent when the gateway withholds
+  it), `item_kind` (`body`, `comment`, `review` or `review_comment`),
+  `item_id`, `item_url`, `author`, `author_kind` (`human` or `bot`),
+  `author_relation` (`self`, `member`, `team`, `collaborator`, `app`, `agent`,
+  `listed` or `outside`), `mentions_agent` (a boolean here) and, on a review,
+  `review_state`. Its message starts with fixed lines that show these values
+  (the repository, the thread, the item, the author with their relation in
+  words, whether it mentions the agent, and the links), then the item's text.
+  Its `actors` are its author, so `allow_actors` and `deny_actors` apply to
+  the author and `allow_repos` and `deny_repos` to its repository; it has no
+  reason, so the reason and CI branch lists are not checked for it. Nerve
+  shows what the gateway sent and decides nothing from it. A record without
+  these keys and values is refused on its own.
 - **The credential is the switch.** The gateway polls GitHub for an agent only
   while a GitHub credential is connected to that agent and Nerve subscribes,
   which it does while `enabled` is true. Your operator can therefore set

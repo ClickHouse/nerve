@@ -72,6 +72,29 @@ REPO_WATCH_PROVIDER = "github_repos"
 # The provider of the mail that members send to the agent. Its subscription
 # names only the provider, with empty filters.
 EMAIL_PROVIDER = "email"
+# The provider that says the agent accepts one record of each comment, review
+# and description of a GitHub thread (:data:`THREAD_ITEM_RECORD_TYPE`). Its
+# subscription names only the provider, with empty filters, as for email.
+THREAD_ITEMS_PROVIDER = "github_thread_items"
+# The record type of such an item. It arrives from the ``github`` provider.
+THREAD_ITEM_RECORD_TYPE = "github_thread_item"
+# The closed values of a thread item's metadata, by key.
+THREAD_ITEM_VALUES: dict[str, tuple[str, ...]] = {
+    "subject_type": ("Issue", "PullRequest"),
+    "author_kind": ("human", "bot"),
+    "item_kind": ("body", "comment", "review", "review_comment"),
+    "author_relation": (
+        "self", "member", "team", "collaborator", "app", "agent", "listed", "outside",
+    ),
+    "mentions_agent": ("true", "false"),
+    "review_state": ("APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"),
+}
+# The metadata keys that every thread item carries with a value. A review
+# also carries ``review_state``; ``title`` is optional.
+THREAD_ITEM_KEYS = (
+    "repo_name", "repo_url", "subject_type", "subject_url", "number", "state", "author",
+    "author_kind", "item_kind", "item_id", "item_url", "author_relation", "mentions_agent",
+)
 # Such a subscription names 1 to this many repositories, each once.
 MAX_REPO_WATCHES = 50
 # What a watched repository may report.
@@ -379,6 +402,32 @@ class SourceRecordPayload:
             reject(RejectionReason.LIMIT_EXCEEDED, "source record ID or type exceeds the identifier limit")
         if max(byte_length(self.summary), byte_length(self.content)) > MAX_TEXT_BYTES:
             reject(RejectionReason.LIMIT_EXCEEDED, "source record text exceeds the text limit")
+
+
+def validate_thread_item(record: SourceRecordPayload) -> None:
+    """Check the metadata of a :data:`THREAD_ITEM_RECORD_TYPE` record.
+
+    Every key of :data:`THREAD_ITEM_KEYS` holds one non-blank value, each
+    key of :data:`THREAD_ITEM_VALUES` that is present holds one of its
+    values, and ``number`` is a positive number. ``review_state`` is present
+    on a review and only there; ``title`` may be absent. Other keys are not
+    checked.
+    """
+    metadata: dict[str, str] = {}
+    for entry in record.metadata:
+        if entry.key in metadata or entry.values:
+            malformed(f"thread item metadata {entry.key!r} is repeated or a list")
+        metadata[entry.key] = entry.value
+    missing = [key for key in THREAD_ITEM_KEYS if not metadata.get(key, "").strip()]
+    if missing:
+        malformed(f"thread item has no {', '.join(missing)}")
+    for key, allowed in THREAD_ITEM_VALUES.items():
+        if key in metadata:
+            _one_of(f"thread item {key}", metadata[key], allowed)
+    if re.fullmatch(r"[1-9][0-9]*", metadata["number"]) is None:
+        malformed("thread item number is not a positive number")
+    if ("review_state" in metadata) != (metadata["item_kind"] == "review"):
+        malformed("thread item has a review state without being a review, or a review without one")
 
 
 @_record
@@ -877,7 +926,8 @@ class SourceSubscription:
     ``pr_watch`` or ``inbox``. Nerve sends it only while the repository watch
     is switched on, so every other frame is unchanged.
 
-    The ``email`` subscription carries only its provider and empty filters.
+    The ``email`` and ``github_thread_items`` subscriptions carry only their
+    provider and empty filters.
     """
 
     provider: str = ""
@@ -904,8 +954,8 @@ class Subscriptions:
         The version, the number of sources, each provider name and that no
         provider appears twice, each inbox, the bounds of every filter list,
         the watched repositories, which only ``github_repos`` names (see
-        :func:`_validate_repo_watches`), and that an ``email`` subscription
-        carries nothing but its provider.
+        :func:`_validate_repo_watches`), and that an ``email`` or a
+        ``github_thread_items`` subscription carries nothing but its provider.
         """
         if self.version != SUBSCRIPTIONS_VERSION:
             reject(RejectionReason.VERSION_UNSUPPORTED, f"unknown subscriptions version {self.version!r}")
@@ -930,10 +980,10 @@ class Subscriptions:
                 _validate_repo_watches(source)
             elif source.repos:
                 malformed(f"only a {REPO_WATCH_PROVIDER} subscription names repositories")
-            if source.provider == EMAIL_PROVIDER and (
+            if source.provider in (EMAIL_PROVIDER, THREAD_ITEMS_PROVIDER) and (
                 any(source.filters.pattern_lists().values()) or source.pr_watch or source.inbox
             ):
-                malformed(f"an {EMAIL_PROVIDER} subscription carries filters, pr_watch or an inbox")
+                malformed(f"the {source.provider} subscription carries filters, pr_watch or an inbox")
 
     def without_filters(self) -> Subscriptions:
         """The same sources with no filter patterns.

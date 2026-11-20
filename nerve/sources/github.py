@@ -65,6 +65,11 @@ _CI_BRANCH_RE = re.compile(r"\bfor (?P<branch>\S+) branch$")
 # are the reviewers and commenters.
 PR_ACTIVITY_RECORD_TYPE = "github_pr_activity"
 
+# The record of one comment, review or description of a thread, with its
+# author, which the channel gateway delivers in hosted mode. It names no
+# reason and no CI branch, and its ``actors`` are its author.
+THREAD_ITEM_RECORD_TYPE = "github_thread_item"
+
 # Reasons whose record also carries the comments posted since the readers of
 # the inbox last read a record of the thread (see GitHubSource._look_start).
 _NEW_COMMENT_REASONS = ("mention", "assign", "review_requested", "team_mention")
@@ -276,11 +281,16 @@ def github_inbox_filter(settings: GitHubSyncConfig) -> InboxFilter:
     actors are the reviewers and commenters: the actor, reason and CI branch
     rules, written for notifications, would drop every such record.
 
+    A ``github_thread_item`` record meets the repo and actor rules: its
+    ``actors`` are the item's author. It has no reason, so the reason rule
+    and the CI branch rule are not checked for it.
+
     The polling source and the hosted one share this filter, and hosted mode
     publishes the same patterns to the gateway, which applies them the same
     way.
     """
     own_pull_requests = (PR_ACTIVITY_RECORD_TYPE,)
+    no_reason = (PR_ACTIVITY_RECORD_TYPE, THREAD_ITEM_RECORD_TYPE)
     return InboxFilter(rules=[
         FieldRule(field="repo_name", allow=settings.allow_repos, deny=settings.deny_repos),
         FieldRule(
@@ -289,11 +299,11 @@ def github_inbox_filter(settings: GitHubSyncConfig) -> InboxFilter:
         ),
         FieldRule(
             field="reason", allow=settings.allow_reasons, deny=settings.deny_reasons,
-            exempt_record_types=own_pull_requests,
+            exempt_record_types=no_reason,
         ),
         FieldRule(
             field="ci_branch", deny=settings.deny_ci_branches,
-            exempt_record_types=own_pull_requests,
+            exempt_record_types=no_reason,
         ),
     ])
 

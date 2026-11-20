@@ -81,6 +81,8 @@ from tests.test_hosted_channel import hosted_config as slack_hosted_config
 from tests.test_hosted_channel_config import HOSTED
 
 GITHUB_DENY = {"deny_repos": ["owner/noisy"], "deny_reasons": ["subscribed"]}
+# The entry that goes with the notifications: Nerve accepts thread items.
+THREAD_ITEMS = {"provider": "github_thread_items", "filters": {}}
 
 
 def hosted_github(**settings: Any) -> GitHubSyncConfig:
@@ -416,6 +418,7 @@ class TestSubscriptionsBuilder:
                 ),
                 pr_watch=False,
             ),
+            SourceSubscription(provider="github_thread_items"),
         ))
 
     def test_a_switched_off_source_subscribes_to_nothing(self):
@@ -431,10 +434,12 @@ class TestSubscriptionsBuilder:
             return dumps(subscriptions_for(config, ["github"]))
 
         assert frame() == frame(inbox="participating") == (
-            '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true}]}'
+            '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true},'
+            '{"provider":"github_thread_items","filters":{}}]}'
         )
         assert frame(inbox="all") == (
-            '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true,"inbox":"all"}]}'
+            '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true,"inbox":"all"},'
+            '{"provider":"github_thread_items","filters":{}}]}'
         )
 
     def test_an_allow_list_the_gateway_cannot_take_is_published_empty(self, caplog):
@@ -464,7 +469,7 @@ class TestSubscriptionsBuilder:
     def test_the_frame_is_unchanged_unless_the_repository_watch_is_on_and_lists_a_repository(self):
         """An older gateway refuses the repos member and closes the stream,
         Slack included: every agent that does not watch a repository sends
-        the very bytes it sent before."""
+        the bytes it sends without the watch."""
         def frame(**watch: Any) -> str:
             config = NerveConfig()
             config.sync.github = hosted_github()
@@ -473,7 +478,10 @@ class TestSubscriptionsBuilder:
             subscriptions.validate()
             return dumps(subscriptions)
 
-        unchanged = '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true}]}'
+        unchanged = (
+            '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true},'
+            '{"provider":"github_thread_items","filters":{}}]}'
+        )
         assert frame() == unchanged
         assert frame(repos=["acme/widgets"], updates=True) == unchanged
         assert frame(enabled=True) == unchanged
@@ -482,6 +490,7 @@ class TestSubscriptionsBuilder:
             deny_authors=["noisy-*"],
         ) == (
             '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true},'
+            '{"provider":"github_thread_items","filters":{}},'
             '{"provider":"github_repos","filters":{},"repos":['
             '{"name":"acme/widgets","types":["pull_request","issue"],"include_bots":false,'
             '"include_drafts":false,"updates":false,"deny_authors":["noisy-*"]},'
@@ -929,7 +938,7 @@ class TestStreams:
             "provider": "github",
             "filters": {"deny_repos": ["owner/noisy"], "deny_reasons": ["subscribed"]},
             "pr_watch": True,
-        }]}
+        }, THREAD_ITEMS]}
         await hosted.gateway.wait_for(lambda: bool(stream.sent("inbox_read")))
         kinds = [frame["kind"] for frame in stream.frames if frame["kind"] != "heartbeat"]
         assert kinds[:3] == ["negotiation", "subscriptions", "inbox_read"]
@@ -1187,7 +1196,7 @@ class TestStreams:
 
         [subscriptions] = await hosted.subscriptions()
 
-        assert subscriptions["sources"] == [{"provider": "github", "filters": {}, "pr_watch": True}]
+        assert subscriptions["sources"] == [{"provider": "github", "filters": {}, "pr_watch": True}, THREAD_ITEMS]
         assert stream.close_code is None
 
     async def test_subscriptions_refused_even_without_patterns_are_not_sent(self, hosted, monkeypatch, caplog):
@@ -1217,7 +1226,7 @@ class TestStreams:
 
         await stream.nudge("observe")
 
-        assert subscriptions["sources"][1] == {"provider": "github_repos", "filters": {}, "repos": [{
+        assert subscriptions["sources"][2] == {"provider": "github_repos", "filters": {}, "repos": [{
             "name": "acme/widgets", "types": ["pull_request"], "include_bots": False,
             "include_drafts": True, "updates": True, "deny_authors": [],
         }]}
@@ -1285,14 +1294,14 @@ class TestStreams:
             sources, providers = await reload(enabled=True, repos=["acme/widgets"])
             await hosted.subscriptions(2)
             assert "source:github_repos" in sources["sources"]
-            assert providers == ["github", "github_repos"]
+            assert providers == ["github", "github_thread_items", "github_repos"]
             (runner,) = [r for r in cron._source_runners if r.job_id == "source:github_repos"]
             assert isinstance(runner.source, HostedGitHubSource) and runner.source.push_fed is True
 
             sources, providers = await reload(enabled=False, repos=["acme/widgets"])
             await hosted.subscriptions(3)
             assert sources["removed"] == ["source:github_repos"]
-            assert providers == ["github"]
+            assert providers == ["github", "github_thread_items"]
         finally:
             cron.scheduler.shutdown(wait=False)
 
@@ -1306,9 +1315,9 @@ class TestStreams:
 
         [subscriptions] = await hosted.subscriptions()
 
-        assert subscriptions["sources"][0] == {"provider": "github", "filters": {}, "pr_watch": True}
-        assert subscriptions["sources"][1]["repos"][0]["deny_authors"] == []
-        assert subscriptions["sources"][1]["repos"][0]["name"] == "acme/widgets"
+        assert subscriptions["sources"][:2] == [{"provider": "github", "filters": {}, "pr_watch": True}, THREAD_ITEMS]
+        assert subscriptions["sources"][2]["repos"][0]["deny_authors"] == []
+        assert subscriptions["sources"][2]["repos"][0]["name"] == "acme/widgets"
         assert stream.close_code is None
 
     async def test_a_switched_off_source_subscribes_to_nothing_and_keeps_what_arrives(self, hosted):
