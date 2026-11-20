@@ -196,8 +196,8 @@ class TurnCompleted:
     """Terminal event of a turn — always emitted exactly once per turn.
 
     ``total_cost_usd`` semantics depend on the backend's
-    ``cost_is_cumulative`` capability: Claude reports a process-cumulative
-    figure (the engine diffs it); Codex reports THIS turn's nullable billed
+    ``cost_is_cumulative`` capability: Claude reports a cumulative figure
+    (the engine diffs it); Codex reports THIS turn's nullable billed
     cost plus a separate basis/API-equivalent estimate when applicable.
     """
 
