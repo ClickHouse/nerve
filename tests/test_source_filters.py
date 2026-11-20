@@ -132,6 +132,36 @@ def test_the_list_vector_shared_with_the_gateway():
     assert FieldRule(field="actors", deny=["codecov"]).passes(record) is False
 
 
+# In a rule over GitHub logins a pattern that ends in "[bot]" names a GitHub
+# App: the ending matches as written, and a class anywhere else stays a class.
+@pytest.mark.parametrize(("pattern", "login", "matched"), [
+    ("some-ci[bot]", "Some-CI[bot]", True),
+    ("some-ci[bot]", "some-cit", False),
+    ("*[bot]", "robot", False),
+    ("[bot]x", "ox", True),
+    ("some-ci[[]bot]", "some-ci[bot]", True),
+])
+def test_the_login_vectors_shared_with_the_gateway(pattern, login, matched):
+    record = _rec(actors=[login])
+    assert FieldRule(field="actors", allow=[pattern], logins=True).passes(record) is matched
+    assert FieldRule(field="actors", deny=[pattern], logins=True).passes(record) is not matched
+
+
+def test_a_final_bot_class_stays_a_class_outside_the_login_rules():
+    # The vector shared with the gateway: a repository pattern keeps every class.
+    assert FieldRule(field="repo_name", allow=["owner/x[bot]"]).passes(_rec("owner/xo")) is True
+    assert FieldRule(field="repo_name", deny=["owner/x[bot]"]).passes(_rec("owner/xo")) is False
+
+
+def test_the_github_actor_guardrail_names_an_app_by_its_login():
+    flt = github_inbox_filter(GitHubSyncConfig(deny_actors=["Some-CI[bot]"]))
+    assert flt.passes(_rec(actors=["alice", "some-ci[bot]"])) is False
+    assert flt.passes(_rec(actors=["alice", "some-cit"])) is True
+    only_apps = github_inbox_filter(GitHubSyncConfig(allow_actors=["*[bot]"]))
+    assert only_apps.passes(_rec(actors=["lint[bot]"])) is True
+    assert only_apps.passes(_rec(actors=["robot"])) is False
+
+
 def test_inbox_filter_inactive_partition_is_passthrough():
     flt = InboxFilter()
     records = [_rec("a/b"), _rec("c/d")]

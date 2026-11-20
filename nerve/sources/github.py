@@ -285,7 +285,7 @@ def github_inbox_filter(settings: GitHubSyncConfig) -> InboxFilter:
         FieldRule(field="repo_name", allow=settings.allow_repos, deny=settings.deny_repos),
         FieldRule(
             field="actors", allow=settings.allow_actors, deny=settings.deny_actors,
-            exempt_record_types=own_pull_requests,
+            exempt_record_types=own_pull_requests, logins=True,
         ),
         FieldRule(
             field="reason", allow=settings.allow_reasons, deny=settings.deny_reasons,

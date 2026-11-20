@@ -28,7 +28,8 @@ A record is kept only if it passes **every** rule (logical AND).
 Matching is case-insensitive and supports shell-style globs
 (``ClickHouse/*``). List-valued metadata (e.g. Gmail ``labels``) matches if
 *any* element matches. Non-string scalars (e.g. Telegram ``chat_id``) are
-coerced to ``str`` before matching.
+coerced to ``str`` before matching. In a rule over GitHub logins a pattern
+that ends in ``[bot]`` names a GitHub App: see :func:`matches_any`.
 """
 
 from __future__ import annotations
@@ -50,16 +51,43 @@ def _norm(value: object) -> str:
     return str(value).strip().lower()
 
 
-def matches_any(value: object, patterns: list[str]) -> bool:
+# The login of a GitHub App ends in this, and the glob that matches it as
+# written: "[[]" is a class that holds only "[", and the "]" after "bot" is
+# an ordinary character.
+_BOT_SUFFIX = "[bot]"
+_BOT_SUFFIX_GLOB = "[[]bot]"
+
+
+def _login_pattern(pattern: object) -> str:
+    """Normalize a pattern of a list of GitHub logins.
+
+    As :func:`_norm`, and a final ``[bot]`` is taken as written. As a glob
+    it is a character class, one of ``b``, ``o`` and ``t``, which matches no
+    App's login: ``some-ci[bot]`` would match ``some-cit``. A class anywhere
+    else in the pattern stays a class.
+    """
+    norm = _norm(pattern)
+    if norm.endswith(_BOT_SUFFIX):
+        return norm[: -len(_BOT_SUFFIX)] + _BOT_SUFFIX_GLOB
+    return norm
+
+
+def matches_any(value: object, patterns: list[str], *, logins: bool = False) -> bool:
     """Case-insensitive shell-glob match of *value* against any pattern.
 
     The guardrail rules, for a source that applies them itself (the GitHub
     Repos source's ``deny_authors``): both sides are stripped and lowered,
     then matched with :func:`fnmatch.fnmatchcase`, so ``[...]`` is a
     character class.
+
+    With *logins* the patterns are those of a list of GitHub logins, where a
+    pattern that ends in ``[bot]`` names a GitHub App: that ending matches
+    as written, so ``some-ci[bot]`` matches that App alone and ``*[bot]``
+    every App.
     """
     norm_value = _norm(value)
-    return any(fnmatch.fnmatchcase(norm_value, _norm(p)) for p in patterns)
+    normalize = _login_pattern if logins else _norm
+    return any(fnmatch.fnmatchcase(norm_value, normalize(p)) for p in patterns)
 
 
 @dataclass
@@ -74,12 +102,15 @@ class FieldRule:
             (takes precedence over ``allow``).
         exempt_record_types: Record types the rule does not apply to; a
             record of one of them passes the rule without being matched.
+        logins: The field holds GitHub logins, so a pattern that ends in
+            ``[bot]`` names a GitHub App (see :func:`matches_any`).
     """
 
     field: str
     allow: list[str] = dataclasses.field(default_factory=list)
     deny: list[str] = dataclasses.field(default_factory=list)
     exempt_record_types: tuple[str, ...] = ()
+    logins: bool = False
 
     @property
     def active(self) -> bool:
@@ -108,14 +139,14 @@ class FieldRule:
         values = self._values(record)
 
         # deny wins — drop on any deny match.
-        if self.deny and any(matches_any(v, self.deny) for v in values):
+        if self.deny and any(matches_any(v, self.deny, logins=self.logins) for v in values):
             return False
 
         # allow gate — when set, require a match. An absent field fails closed.
         if self.allow:
             if not values:
                 return False
-            return any(matches_any(v, self.allow) for v in values)
+            return any(matches_any(v, self.allow, logins=self.logins) for v in values)
 
         return True
 
