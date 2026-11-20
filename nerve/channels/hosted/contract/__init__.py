@@ -12,6 +12,8 @@ from nerve.channels.hosted.contract.model import (
     MAX_TRANSFER_BYTES,
     PROTOCOL_VERSION,
     SUBSCRIPTIONS_VERSION,
+    THREAD_ITEM_RECORD_TYPE,
+    THREAD_ITEMS_PROVIDER,
     AuthorReference,
     Capabilities,
     ConnectionBehaviour,
@@ -43,6 +45,7 @@ from nerve.channels.hosted.contract.model import (
     encode_envelope,
     validate_inbox_read_result,
     validate_operation_result,
+    validate_thread_item,
 )
 from nerve.channels.hosted.contract.wire import Rejected, RejectionReason
 
@@ -53,6 +56,8 @@ __all__ = [
     "MAX_TRANSFER_BYTES",
     "PROTOCOL_VERSION",
     "SUBSCRIPTIONS_VERSION",
+    "THREAD_ITEMS_PROVIDER",
+    "THREAD_ITEM_RECORD_TYPE",
     "AuthorReference",
     "Capabilities",
     "ConnectionBehaviour",
@@ -86,4 +91,5 @@ __all__ = [
     "encode_envelope",
     "validate_inbox_read_result",
     "validate_operation_result",
+    "validate_thread_item",
 ]

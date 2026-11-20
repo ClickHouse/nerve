@@ -418,7 +418,7 @@ class TestSubscriptionsFrame:
 
             [subscriptions] = await harness.subscriptions()
 
-            assert [source["provider"] for source in subscriptions["sources"]] == ["github", "email"]
+            assert [source["provider"] for source in subscriptions["sources"]] == ["github", "github_thread_items", "email"]
             assert subscriptions["sources"][-1] == {"provider": "email", "filters": {}}
         finally:
             await stop(harness)
