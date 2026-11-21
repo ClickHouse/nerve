@@ -3650,10 +3650,14 @@ _CODEX_SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
 
 # $/1M tokens; cached input bills at the discounted rate. Config values
 # under codex.pricing REPLACE entries per model key (dict deep-merge).
-# GPT-6 Astra's long-context tier (requests above 272K input tokens bill
-# 2x input / 1.5x output) is not modelled: the app-server reports usage
-# per turn, not per request, so the threshold cannot be attributed.
+# The long-context tier (requests above 272K input tokens bill 2x input /
+# 1.5x output) is not modelled: the app-server reports usage per turn,
+# not per request, so the threshold cannot be attributed.
 _DEFAULT_CODEX_PRICING: dict[str, dict[str, float]] = {
+    "gpt-6.2-astra":  {"input": 8.0,  "cached_input": 0.4,  "output": 40.0},
+    "gpt-6.2-sol":    {"input": 2.0,  "cached_input": 0.1,  "output": 10.0},
+    "gpt-6.1-terra":  {"input": 1.0,  "cached_input": 0.05, "output": 5.0},
+    "gpt-6-luna":     {"input": 0.1,  "cached_input": 0.01, "output": 0.5},
     "gpt-6-astra":    {"input": 10.0, "cached_input": 1.0,  "output": 50.0},
     "gpt-5.6-sol":    {"input": 5.0,  "cached_input": 0.5,  "output": 30.0},
     "gpt-5.6-terra":  {"input": 2.5,  "cached_input": 0.25, "output": 15.0},
@@ -3663,13 +3667,13 @@ _DEFAULT_CODEX_PRICING: dict[str, dict[str, float]] = {
 # The OpenAI models of the composer's model menu when ``codex.models`` is
 # unset: the newest model of each tier, largest first. Update it when a tier
 # gets a new model. A model shows only when the account's catalog serves it,
-# hidden entries included: GPT-6 Astra is hidden upstream on purpose
-# (API-key accounts; codex-cli 0.153.1+).
+# hidden entries included. The catalog serves GPT-6.2 only to codex-cli
+# 0.166.0 or newer, so an older CLI shows the other tiers.
 _DEFAULT_CODEX_MODELS: tuple[str, ...] = (
-    "gpt-6-astra",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
+    "gpt-6.2-astra",
+    "gpt-6.2-sol",
+    "gpt-6.1-terra",
+    "gpt-6-luna",
 )
 
 
@@ -3758,7 +3762,7 @@ class CodexConfig:
 
     bin_path: str = "codex"                 # PATH-resolved codex binary
     min_version: str = "0.153.1"            # inclusive tested protocol range
-    max_version: str = "0.165.0"            # exclusive
+    max_version: str = "0.172.0"            # exclusive
     home_dir: str = field(default_factory=lambda: str(paths.nerve_path("codex")))  # isolated CODEX_HOME (auth/config/sessions)
     model: str = "gpt-5.6-sol"
     cron_model: str = ""                    # empty → model
@@ -3836,7 +3840,7 @@ class CodexConfig:
         return cls(
             bin_path=str(d.get("bin_path", "codex")),
             min_version=str(d.get("min_version", "0.153.1")),
-            max_version=str(d.get("max_version", "0.165.0")),
+            max_version=str(d.get("max_version", "0.172.0")),
             home_dir=_setting_str(
                 d.get("home_dir"), str(paths.nerve_path("codex"))
             ),

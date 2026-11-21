@@ -22,7 +22,8 @@ from pathlib import Path
 import pytest
 
 from nerve.agent.backends import (
-    BackendDeps, ForkSourceMissingError, SessionSpec, TransportDiedError,
+    BackendDeps, BackendError, ForkSourceMissingError, SessionSpec,
+    TransportDiedError,
 )
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.codex import CodexBackend
@@ -96,6 +97,24 @@ def _mode(monkeypatch, mode: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(("version", "accepted"), [
+    ("0.153.0", False),
+    ("0.153.1", True),
+    ("0.164.0", True),
+    ("0.171.0", True),
+    ("0.172.0", False),
+])
+async def test_default_codex_version_range(tmp_path, monkeypatch, version, accepted):
+    monkeypatch.setenv("FAKE_CODEX_VERSION", version)
+    backend = CodexBackend(_deps(_config(tmp_path)))
+    if accepted:
+        assert await backend._check_cli_version() == f"codex-cli {version}"
+    else:
+        with pytest.raises(BackendError, match=r">=0\.153\.1, <0\.172\.0"):
+            await backend._check_cli_version()
+
+
+@pytest.mark.asyncio
 async def test_basic_turn_streams_and_completes(tmp_path, monkeypatch):
     _mode(monkeypatch, "basic")
     cfg = _config(tmp_path)
@@ -140,12 +159,15 @@ async def test_basic_turn_streams_and_completes(tmp_path, monkeypatch):
 @pytest.mark.asyncio
 async def test_hidden_catalog_models_are_opt_in(tmp_path, monkeypatch):
     """GPT-6 Astra is hidden upstream (``model/list`` needs includeHidden):
-    it is offered only through ``codex.models`` (the default names it),
-    while every catalog entry, hidden or not, stays a legal session model.
-    The menu never sees the other hidden entries, and it keeps the order
-    of ``codex.models``."""
+    it is offered only through ``codex.models`` (named here), while every
+    catalog entry, hidden or not, stays a legal session model. The menu
+    never sees the other hidden entries, and it keeps the order of
+    ``codex.models``."""
     _mode(monkeypatch, "account_api_key")
-    cfg = _config(tmp_path, auth="api_key", api_key="sk-fake")
+    cfg = _config(
+        tmp_path, auth="api_key", api_key="sk-fake",
+        models=["gpt-6-astra", "gpt-5.6-sol"],
+    )
     backend = CodexBackend(_deps(cfg))
     status = await backend.preflight(force=True)
     assert status["available"] is True

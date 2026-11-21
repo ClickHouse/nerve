@@ -1032,13 +1032,13 @@ agent:
   cron_backend: null       # null → backend; new cron/hook sessions only
 
 codex:                     # active when a codex backend is selected
-  bin_path: codex          # tested: >= 0.153.1 and < 0.165.0
+  bin_path: codex          # tested: >= 0.153.1 and < 0.172.0
   min_version: 0.153.1
-  max_version: 0.165.0
+  max_version: 0.172.0
   home_dir: ~/.nerve/codex # isolated CODEX_HOME (auth, config, sessions)
   model: gpt-5.6-sol
   cron_model: null         # null → model
-  models: [gpt-6-astra, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna]  # the model menu, in order; each shows when the account serves it
+  models: [gpt-6.2-astra, gpt-6.2-sol, gpt-6.1-terra, gpt-6-luna]  # the model menu, in order; each shows when the account serves it
   auth: chatgpt            # chatgpt | api_key
   api_key: null            # config.local.yaml; or api_key_env: OPENAI_API_KEY
   base_url: ""             # OpenAI-compatible Responses endpoint; empty → Codex's own provider
@@ -1048,8 +1048,8 @@ codex:                     # active when a codex backend is selected
   tool_timeout_sec: 3600        # nerve MCP calls may block on ask_user
   turn_idle_timeout_seconds: null  # null → agent.cli_idle_timeout_seconds
   pricing:                      # $/1M tokens — cost is None for unlisted models
-    gpt-5.6-sol: {input: 5.0, cached_input: 0.5, output: 30.0}
-    gpt-6-astra: {input: 10.0, cached_input: 1.0, output: 50.0}  # >272K-token requests bill more; not modelled
+    gpt-6.2-sol: {input: 2.0, cached_input: 0.1, output: 10.0}
+    gpt-6.2-astra: {input: 8.0, cached_input: 0.4, output: 40.0}  # >272K-token requests bill more; not modelled
   extra_config: {}              # arbitrary codex -c key=value passthrough
   ultracode:                    # optional managed third-party orchestrator
     enabled: false
@@ -1069,7 +1069,8 @@ codex:                     # active when a codex backend is selected
 order. The menu shows a model only when the Codex catalog of the account
 serves it, hidden entries included. `codex.model` is put first when the list
 does not name it. Every model in the list is also accepted as a session
-model. Unset: the newest model of each tier. `[]`: only `codex.model`.
+model. Unset: the newest model of each tier; the catalog serves GPT-6.2
+only to codex-cli 0.166.0 or newer. `[]`: only `codex.model`.
 `nerve codex doctor` lists the catalog models that the list does not name.
 
 `codex.ultracode.dashboard` exposes run journals in Nerve's authenticated UI.
