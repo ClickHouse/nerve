@@ -22,7 +22,8 @@ from pathlib import Path
 import pytest
 
 from nerve.agent.backends import (
-    BackendDeps, ForkSourceMissingError, SessionSpec, TransportDiedError,
+    BackendDeps, BackendError, ForkSourceMissingError, SessionSpec,
+    TransportDiedError,
 )
 from nerve.agent.backends import events as ev
 from nerve.agent.backends.codex import CodexBackend
@@ -93,6 +94,24 @@ async def _collect_turn(client) -> list:
 
 def _mode(monkeypatch, mode: str) -> None:
     monkeypatch.setenv("FAKE_CODEX_MODE", mode)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("version", "accepted"), [
+    ("0.153.0", False),
+    ("0.153.1", True),
+    ("0.164.0", True),
+    ("0.169.0", True),
+    ("0.170.0", False),
+])
+async def test_supported_codex_version_range(tmp_path, monkeypatch, version, accepted):
+    monkeypatch.setenv("FAKE_CODEX_VERSION", version)
+    backend = CodexBackend(_deps(_config(tmp_path)))
+    if accepted:
+        assert await backend._check_cli_version() == f"codex-cli {version}"
+    else:
+        with pytest.raises(BackendError, match=r">=0\.153\.1, <0\.170\.0"):
+            await backend._check_cli_version()
 
 
 @pytest.mark.asyncio
