@@ -75,9 +75,19 @@ EMAIL_PROVIDER = "email"
 # Such a subscription names 1 to this many repositories, each once.
 MAX_REPO_WATCHES = 50
 # What a watched repository may report.
-REPO_WATCH_TYPES = ("pull_request", "issue", "release")
+REPO_WATCH_TYPES = ("pull_request", "issue", "release", "commit")
+# The type that reports the new commits of a repository's branches: only a
+# repository with it names branches, and a gateway that does not know the
+# type refuses the whole subscription.
+REPO_WATCH_COMMIT = "commit"
 # A repository as GitHub names it: owner/name.
 _REPO_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_.-]{1,100}")
+# A watched repository names at most this many branches, each a name of this
+# shape, and its own name and a branch's have at most this many bytes
+# together: the event ID of a commit record names both.
+MAX_REPO_WATCH_BRANCHES = 8
+MAX_REPO_WATCH_BRANCH_KEY_BYTES = 194
+_REPO_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,120}")
 # A provider name is a lowercase token of at most this many bytes.
 MAX_PROVIDER_BYTES = 64
 _PROVIDER_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-.")
@@ -140,6 +150,23 @@ def valid_repo_name(name: str) -> bool:
     not ``.`` or ``..``.
     """
     return _REPO_NAME.fullmatch(name) is not None and name.split("/", 1)[1] not in (".", "..")
+
+
+def valid_repo_branch(repo: str, branch: str) -> bool:
+    """Whether the gateway takes *branch* as a watched branch of *repo*.
+
+    A letter or a digit, then up to 120 letters, digits, ``_``, ``.``, ``/``
+    and ``-``, without ``..``, not starting with ``refs/`` (a branch is named
+    without its ref prefix) and not ending in ``.lock``, and no longer with
+    the repository's name than :data:`MAX_REPO_WATCH_BRANCH_KEY_BYTES`.
+    """
+    return (
+        _REPO_BRANCH.fullmatch(branch) is not None
+        and ".." not in branch
+        and not branch.startswith("refs/")
+        and not branch.endswith(".lock")
+        and byte_length(repo) + byte_length(branch) <= MAX_REPO_WATCH_BRANCH_KEY_BYTES
+    )
 
 
 def valid_provider(provider: str) -> bool:
@@ -851,7 +878,14 @@ class RepoWatch:
     glob never is. Without ``include_drafts`` a draft pull
     request is reported when it becomes ready for review, and with
     ``updates`` a reported pull request is reported again when its head
-    commit, its draft state or its state changes. Every member is sent.
+    commit, its draft state or its state changes. Every one of these members
+    is sent.
+
+    ``branches`` are the branches whose new commits a repository with the
+    ``commit`` type reports; without them it reports its default branch.
+    Each is the name of a branch, without its ref prefix. It is sent only
+    when it names a branch, so the frame of a repository without one is the
+    same as before the member existed.
     """
 
     name: str = ""
@@ -860,6 +894,7 @@ class RepoWatch:
     include_drafts: bool = False
     updates: bool = False
     deny_authors: tuple[str, ...] = ()
+    branches: tuple[str, ...] = omit_empty(())
 
 
 @_record
@@ -970,7 +1005,9 @@ def _validate_repo_watches(source: SourceSubscription) -> None:
     ``owner/repo`` name (:func:`valid_repo_name`) and each once, ignoring
     case; every one reports one or more of :data:`REPO_WATCH_TYPES`, each
     once, and has at most :data:`MAX_SUBSCRIPTION_PATTERNS` ``deny_authors``
-    that a filter list would take. It carries no filters, ``pr_watch`` or
+    that a filter list would take, and at most
+    :data:`MAX_REPO_WATCH_BRANCHES` branches, each once and each one that
+    :func:`valid_repo_branch` takes. It carries no filters, ``pr_watch`` or
     ``inbox``.
     """
     if any(source.filters.pattern_lists().values()) or source.pr_watch or source.inbox:
@@ -1001,6 +1038,12 @@ def _validate_repo_watches(source: SourceSubscription) -> None:
                 "a watched repository's deny_authors pattern is empty, too long, or has a "
                 "control character"
             )
+        if len(repo.branches) > MAX_REPO_WATCH_BRANCHES:
+            reject(RejectionReason.LIMIT_EXCEEDED, "a watched repository names too many branches")
+        if len(set(repo.branches)) < len(repo.branches) or not all(
+            valid_repo_branch(repo.name, branch) for branch in repo.branches
+        ):
+            malformed("a watched repository names a branch twice, or one the gateway does not take")
 
 
 # ---------------------------------------------------------------------- #

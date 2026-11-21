@@ -260,7 +260,10 @@ _INBOXES = {
     "all": "the account's whole notification inbox (inbox `all`)",
 }
 #: How the repository watch names each of its types.
-_WATCHED_TYPES = {"pull_request": "pull requests", "issue": "issues", "release": "releases"}
+_WATCHED_TYPES = {
+    "pull_request": "pull requests", "issue": "issues", "release": "releases",
+    "commit": "branch commits",
+}
 
 
 def _github_sync_text(config: Any) -> str:
