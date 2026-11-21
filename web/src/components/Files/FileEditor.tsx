@@ -11,11 +11,12 @@ interface FileEditorProps {
   // locked instance. The save is offered nowhere it would come back a 403.
   readOnly?: boolean;
   saving: boolean;
+  saveError?: string | null;
   onContentChange: (content: string) => void;
   onSave: () => void;
 }
 
-export function FileEditor({ path, content, modified, readOnly, saving, onContentChange, onSave }: FileEditorProps) {
+export function FileEditor({ path, content, modified, readOnly, saving, saveError, onContentChange, onSave }: FileEditorProps) {
   const [mode, setMode] = useState<'edit' | 'preview'>('edit');
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -63,6 +64,12 @@ export function FileEditor({ path, content, modified, readOnly, saving, onConten
           )}
         </div>
       </div>
+
+      {saveError && (
+        <div role="alert" className="px-3 py-2 text-sm text-red-600 border-b border-border-subtle">
+          {saveError}
+        </div>
+      )}
 
       {/* Content */}
       {mode === 'edit' ? (

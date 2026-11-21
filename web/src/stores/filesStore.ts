@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
+import { ApiError } from '../api/hosted';
 import { buildFileTree, type FileNode } from '../utils/fileTree';
 
 interface OpenFile {
@@ -9,6 +10,8 @@ interface OpenFile {
   originalContent: string;
   modified: boolean;
   readOnly: boolean;
+  revision: string;
+  saveError: string | null;
 }
 
 interface FilesState {
@@ -47,17 +50,35 @@ export const useFilesStore = create<FilesState>((set, get) => ({
     const existing = get().openFiles.find(f => f.path === path);
     if (existing) {
       set({ activeFile: path });
+      // A clean cached tab may have changed while another agent was writing.
+      // Refresh it on re-selection, but never replace local edits or a tab
+      // that changed during the asynchronous read.
+      if (!existing.modified && !get().saving) {
+        try {
+          const { content, revision, read_only } = await api.readMemoryFile(path);
+          set(state => ({
+            openFiles: state.openFiles.map(tab =>
+              tab.path === path && !tab.modified && tab.revision === existing.revision && !state.saving
+                ? { ...tab, content, originalContent: content, revision,
+                    readOnly: !!read_only, saveError: null }
+                : tab
+            ),
+          }));
+        } catch (e) {
+          console.error('Failed to refresh file:', e);
+        }
+      }
       return;
     }
 
     set({ loading: true });
     try {
-      const { content, read_only } = await api.readMemoryFile(path);
+      const { content, revision, read_only } = await api.readMemoryFile(path);
       const name = path.split('/').pop() || path;
       set(s => ({
         openFiles: [...s.openFiles, {
           path, name, content, originalContent: content, modified: false,
-          readOnly: !!read_only,
+          readOnly: !!read_only, revision, saveError: null,
         }],
         activeFile: path,
         loading: false,
@@ -69,6 +90,8 @@ export const useFilesStore = create<FilesState>((set, get) => ({
   },
 
   closeFile: (path: string) => {
+    // A pending save must not commit its response to a newly opened tab.
+    if (get().saving) return;
     set(s => {
       const openFiles = s.openFiles.filter(f => f.path !== path);
       let activeFile = s.activeFile;
@@ -79,7 +102,9 @@ export const useFilesStore = create<FilesState>((set, get) => ({
     });
   },
 
-  setActiveFile: (path: string) => set({ activeFile: path }),
+  // Tab selection must take the same refresh path as tree selection. A
+  // clean cached tab may be stale after an agent edits it while inactive.
+  setActiveFile: (path: string) => { void get().openFile(path); },
 
   updateContent: (path: string, content: string) => {
     set(s => ({
@@ -93,20 +118,30 @@ export const useFilesStore = create<FilesState>((set, get) => ({
 
   saveFile: async (path: string) => {
     const file = get().openFiles.find(f => f.path === path);
-    if (!file) return;
+    if (!file || get().saving) return;
 
     set({ saving: true });
     try {
-      await api.writeMemoryFile(path, file.content);
+      const result = await api.writeMemoryFile(path, file.content, file.revision);
       set(s => ({
         openFiles: s.openFiles.map(f =>
-          f.path === path ? { ...f, originalContent: file.content, modified: false } : f
+          f.path === path
+            ? { ...f, originalContent: file.content,
+                modified: f.content !== file.content, revision: result.revision, saveError: null }
+            : f
         ),
         saving: false,
       }));
     } catch (e) {
       console.error('Failed to save file:', e);
-      set({ saving: false });
+      set(s => ({
+        openFiles: s.openFiles.map(f => f.path === path
+          ? { ...f, saveError: e instanceof ApiError && e.status === 409
+              ? 'This file changed on disk. Your edits were not saved. Copy your changes before reloading.'
+              : 'Save failed. Your edits are still here; try again.' }
+          : f),
+        saving: false,
+      }));
     }
   },
 }));
