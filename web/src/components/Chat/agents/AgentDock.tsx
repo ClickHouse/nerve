@@ -16,8 +16,9 @@ const ANNOUNCE_NAMES = 3;
 /**
  * One line above the composer while the session has agent records: how many
  * run, how many need attention, how many are done, and what the most recently
- * active one is doing. The whole line opens the Agents panel and puts focus
- * in its list. Absent when the session has no records.
+ * active one is doing. The whole line toggles the Agents panel: it opens it
+ * with focus in its list, or hides it when the Agents tab is already showing.
+ * Absent when the session has no records.
  *
  * A polite live region announces agents that settle ("build-chart finished"),
  * throttled to one message per 5 s.
@@ -43,7 +44,7 @@ export function AgentDock({ sessionId }: { sessionId: string }) {
             type="button"
             aria-expanded={panelOpen}
             aria-controls="agents-panel"
-            onClick={() => useChatStore.getState().openAgentsPanel(true)}
+            onClick={() => useChatStore.getState().toggleAgentsPanel()}
             className="w-full flex items-center gap-3 h-8 px-3 rounded-lg border border-border-subtle bg-surface text-xs text-text-muted tabular-nums text-left cursor-pointer transition-colors hover:bg-surface-hover hover:text-text-secondary"
           >
             {line.running > 0 && (
