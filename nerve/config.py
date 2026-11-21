@@ -2248,14 +2248,38 @@ class GitHubEventsSyncConfig:
 
 # What the GitHub Repos source can report from a repository (see
 # GitHubReposSyncConfig.types), and what it reports when nothing is said.
-GITHUB_REPOS_TYPES: tuple[str, ...] = ("pull_request", "issue", "release")
+GITHUB_REPOS_TYPES: tuple[str, ...] = ("pull_request", "issue", "release", "commit")
 GITHUB_REPOS_DEFAULT_TYPES: tuple[str, ...] = ("pull_request", "issue")
 # The most repositories the source follows; the channel gateway's bound too.
 GITHUB_REPOS_MAX_REPOS = 50
+# The most branches of one repository whose commits the source follows, and
+# the most bytes that a repository's name and a branch's name have together
+# (the id of a commit record names both). The channel gateway's bounds too.
+GITHUB_REPOS_MAX_BRANCHES = 8
+GITHUB_REPOS_MAX_BRANCH_KEY_BYTES = 194
+# A branch whose commits the source can follow: a letter or a digit, then up
+# to 120 letters, digits, "_", ".", "/" and "-". The channel gateway checks
+# the same.
+_GITHUB_BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,120}")
 # A repository as GitHub names it: an owner of 1 to 39 letters, digits and
 # hyphens that starts with a letter or a digit, then a name of 1 to 100
 # letters, digits, ".", "_" and "-". The channel gateway checks the same.
 _GITHUB_REPO_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}")
+
+
+def github_repos_branch_ok(repo: str, branch: str) -> bool:
+    """Whether the GitHub Repos source can follow the commits of *branch* of *repo*.
+
+    The name has the shape of :data:`_GITHUB_BRANCH_NAME_RE`, no ``..`` and no
+    ``.lock`` at its end, and with the repository's name it stays within
+    :data:`GITHUB_REPOS_MAX_BRANCH_KEY_BYTES`.
+    """
+    return (
+        _GITHUB_BRANCH_NAME_RE.fullmatch(branch) is not None
+        and ".." not in branch
+        and not branch.endswith(".lock")
+        and len(repo.encode()) + len(branch.encode()) <= GITHUB_REPOS_MAX_BRANCH_KEY_BYTES
+    )
 
 
 def _switched_on(value: object) -> bool:
@@ -2350,6 +2374,73 @@ def _github_repos_types(value: object) -> list[str]:
     return [kind for kind in GITHUB_REPOS_TYPES if kind in chosen]
 
 
+def _github_repos_branches(
+    value: object, repos: list[str], *, enabled: bool,
+) -> dict[str, list[str]]:
+    """``sync.github_repos.branches``: the branches to follow, by repository.
+
+    A mapping of a repository of ``repos`` (GitHub's names ignore case) to one
+    branch or a list of branches. It is returned under the names that *repos*
+    spells. While the watch is on (*enabled*), anything else refuses to load:
+    a value that is no mapping, a repository that ``repos`` does not list or
+    that the mapping names twice, a branch that
+    :func:`github_repos_branch_ok` refuses or that is named twice, and more
+    than :data:`GITHUB_REPOS_MAX_BRANCHES` branches. While it is off, those
+    are logged in one warning and left out.
+    """
+    if value is None or value == "":
+        return {}
+    problems: list[str] = []
+
+    def refuse(problem: str) -> None:
+        if enabled:
+            raise ValueError(f"sync.github_repos.branches {problem}")
+        problems.append(problem)
+
+    branches: dict[str, list[str]] = {}
+    if not isinstance(value, dict):
+        refuse(f"must map owner/repo names to their branches, got {str(value)!r}")
+        value = {}
+    watched = {name.lower(): name for name in repos}
+    for key, entry in value.items():
+        repo = watched.get(str(key or "").strip().lower())
+        if repo is None:
+            refuse(f"names {str(key)!r}, which sync.github_repos.repos does not list")
+            continue
+        if repo in branches:
+            refuse(f"names {repo!r} twice")
+            continue
+        names = [
+            name for name in (
+                str(item or "").strip()
+                for item in (entry if isinstance(entry, (list, tuple)) else [entry])
+            ) if name
+        ]
+        bad = [name for name in names if not github_repos_branch_ok(repo, name)]
+        if bad:
+            refuse(
+                f"of {repo!r} must be branch names of letters, digits, '_', '.', '/' and '-' "
+                "that start with a letter or a digit, without '..' and not ending in '.lock', "
+                f"at most {GITHUB_REPOS_MAX_BRANCH_KEY_BYTES} bytes together with the "
+                f"repository's name, got {bad[0]!r}"
+            )
+        elif len(set(names)) < len(names):
+            refuse(f"of {repo!r} name a branch twice")
+        elif len(names) > GITHUB_REPOS_MAX_BRANCHES:
+            refuse(
+                f"of {repo!r} must name at most {GITHUB_REPOS_MAX_BRANCHES} branches, "
+                f"got {len(names)}"
+            )
+        else:
+            branches[repo] = names
+    if problems:
+        logger.warning(
+            "sync.github_repos is switched off, and its branches would refuse to load once "
+            "it is switched on: sync.github_repos.branches %s", "; ".join(problems),
+        )
+    return {repo: names for repo, names in branches.items() if names}
+
+
 @dataclass
 class GitHubReposSyncConfig:
     """Config for the GitHub Repos source: repositories the agent follows.
@@ -2357,7 +2448,8 @@ class GitHubReposSyncConfig:
     Unlike ``github`` (notifications) and ``github_events`` (your own
     activity), this source watches an explicit set of repositories that the
     account need not take part in, and reports new pull requests, issues and
-    releases there (``types``). ``repos`` is required: an empty list makes the
+    releases there, and the new commits of its branches (``types``,
+    ``branches``). ``repos`` is required: an empty list makes the
     source a no-op. With ``sync.github.mode: hosted`` the channel gateway
     polls the repositories for the agent, as it polls the notifications;
     otherwise this process polls them with the gh CLI. All of it follows a
@@ -2369,9 +2461,16 @@ class GitHubReposSyncConfig:
     # watch is on, anything else refuses to load (while it is off, a
     # warning). Required; empty = no-op.
     repos: list[str] = field(default_factory=list)
-    # What is reported: pull_request, issue, release (GITHUB_REPOS_TYPES).
-    # An unknown type or an empty list refuses to load.
+    # What is reported: pull_request, issue, release, commit
+    # (GITHUB_REPOS_TYPES). An unknown type or an empty list refuses to load.
     types: list[str] = field(default_factory=lambda: list(GITHUB_REPOS_DEFAULT_TYPES))
+    # With the commit type: the branches whose new commits are reported, by
+    # repository (a name of repos; case does not matter). A repository
+    # without an entry reports its default branch. At most
+    # GITHUB_REPOS_MAX_BRANCHES each; while the watch is on, a name that
+    # github_repos_branch_ok refuses, or a repository that repos does not
+    # list, refuses to load.
+    branches: dict[str, list[str]] = field(default_factory=dict)
     # Also report the pull requests and issues that a GitHub App or a "[bot]"
     # account opened. A release is reported whoever published it.
     include_bots: bool = False
@@ -2390,16 +2489,25 @@ class GitHubReposSyncConfig:
     prompt_hint: str = ""
     model: str = ""
 
+    def branches_of(self, repo: str) -> list[str]:
+        """The branches of *repo* that ``branches`` names; none: its default branch."""
+        wanted = repo.strip().lower()
+        for name, names in (self.branches or {}).items():
+            if str(name).strip().lower() == wanted:
+                return [str(branch) for branch in names or ()]
+        return []
+
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> GitHubReposSyncConfig:
+        enabled = _switched_on(d.get("enabled", False))
+        repos = _github_repos_names(d.get("repos"), enabled=enabled)
         return cls(
             enabled=d.get("enabled", False),
             schedule=d.get("schedule", "*/15 * * * *"),
-            repos=_github_repos_names(
-                d.get("repos"), enabled=_switched_on(d.get("enabled", False)),
-            ),
+            repos=repos,
             types=_github_repos_types(d.get("types")),
+            branches=_github_repos_branches(d.get("branches"), repos, enabled=enabled),
             include_bots=d.get("include_bots", False),
             include_drafts=d.get("include_drafts", True),
             updates=d.get("updates", False),

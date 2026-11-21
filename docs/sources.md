@@ -313,7 +313,9 @@ on the `github_pr_activity` gate.
 Repositories that the agent follows although its GitHub account takes no part
 in them: the new pull requests, issues and releases there arrive as
 `github_repos` records, and with `updates: true` so does each new commit,
-ready for review, merge or close of a pull request it reported. It
+ready for review, merge or close of a pull request it reported. With the
+`commit` type it also reports the [new commits on a branch](#new-commits-on-a-branch),
+one record per branch. It
 is the self-service form of GitHub's "Custom watch", which has no API. Nothing
 is set on the GitHub account (no watch, no e-mail), and it does not depend on
 `sync.github.inbox`. What the account itself takes part in (mentions, review
@@ -325,11 +327,12 @@ notifications, and in hosted mode through `pr_watch`.
   - `pull_request`: `GET /repos/{repo}/pulls?state=all&sort=updated&direction=desc&per_page=100`
   - `issue`: `GET /repos/{repo}/issues?state=all&sort=updated&direction=desc&per_page=100`. The issues endpoint lists the pull requests too; they are skipped
   - `release`: `GET /repos/{repo}/releases?per_page=30`. Draft releases are skipped, prereleases are not
+  - `commit`: `GET /repos/{repo}/commits?sha={branch}&per_page=100`, one request per branch that `branches` names for the repository. A repository without an entry in `branches` reports its default branch, which `GET /repos/{repo}` names at every run
 - **One page each:** a repository with more than 100 pull requests (or issues) changed between two runs loses the oldest of those changes. `batch_size` does not cap this source
-- **Cursor:** JSON. Per repository and listing: the newest `updated_at` listed (`published_at` for releases), when the listing was read, and the numbers (release ids) of the items created in that newest second. Per repository, the pull requests it follows: a held draft (`include_drafts: false`) and, with `updates`, a reported pull request while it is open, as head commit, draft and held. At most 1,000 per repository; the one listed longest ago is forgotten first
+- **Cursor:** JSON. Per repository and listing: the newest `updated_at` listed (`published_at` for releases), when the listing was read, and the numbers (release ids) of the items created in that newest second. Per repository, the pull requests it follows: a held draft (`include_drafts: false`) and, with `updates`, a reported pull request while it is open, as head commit, draft and held. At most 1,000 per repository; the one listed longest ago is forgotten first. And per repository, the head commit of each branch whose commits it follows
 - **First run:** the baseline. Each listing's cursor is set and nothing is reported, so switching the source on does not fill the inbox with history; a repository or a type added later takes its own baseline, and one removed is forgotten. An item is new when it was created (a release: published) after the last listing: later than the listing's cursor, or in the cursor's own second and not listed then, since GitHub's times have a resolution of one second. So an older pull request that changes later is never reported as new, and an item is reported once
 - **No backfill beyond a day:** nothing older than a day is backfilled, and the last day is. A check more than a day after the last one (a daily schedule, which always comes a moment past the day; a weekday schedule after the weekend; the watch switched off for longer; a long outage) reads the listing as of a day and an hour ago: it reports the items of the last day, with an hour of grace for the scheduler's delay (an item created moments after the last check is not lost), within the one page, and nothing older, and the pull requests it follows stay followed. So switching the watch off and on in poll mode resumes where it left within the day, and beyond it reports the last day's items
-- **Failures:** a listing that fails (a repository that does not exist or that the `gh` login cannot read, a rate limit) keeps its cursor and is read again on the next run; the other listings still report. A run in which every listing fails fails, and the source's health shows it
+- **Failures:** a listing that fails (a repository that does not exist or that the `gh` login cannot read, a branch that does not exist, a rate limit) keeps its cursor and is read again on the next run; the other listings still report. A run in which every listing fails fails, and the source's health shows it
 - **Upgrades:** the cursor of the earlier version of this source, one timestamp, becomes the cursor of every listing (one more than a day old reports the last day), so nothing is repeated or skipped; a buffer position left by the hosted mode is no cursor (a new baseline). The earlier version took any `repos` value: one that the watch now refuses (a URL such as `https://github.com/acme/widgets`, a trailing slash, `owner/repo/x`, the same repository twice, more than 50) only logs a warning while the watch is off, and refuses the config once it is on
 - **Default schedule:** `*/15 * * * *` (every 15 min); in hosted mode the fallback cadence of the drain
 - **Disabled by default**
@@ -339,17 +342,20 @@ sync:
   github_repos:
     enabled: true
     repos: ["acme/widgets", "other-org/other-repo"]
-    types: [pull_request, issue]    # pull_request | issue | release
+    types: [pull_request, issue]    # pull_request | issue | release | commit
     include_bots: false             # PRs and issues a GitHub App or a [bot] account opened
     include_drafts: true            # false: a draft is reported when it is ready for review
     updates: false                  # true: commits, ready, merge and close of reported PRs
     deny_authors: []                # case-insensitive globs on the author's login
+    # branches:                     # with the commit type: the branches to follow, by repository
+    #   acme/widgets: [main, release/1.2]   # no entry: the repository's default branch
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `github_repos.repos` | list | `[]` | `owner/repo` names as GitHub writes them, each once (case does not matter), at most 50. While the watch is on, a name GitHub would not take, the same repository twice, or more than 50 refuses to load; while it is off, a warning names them. Empty = the source does nothing |
-| `github_repos.types` | list | `[pull_request, issue]` | What is reported: `pull_request`, `issue`, `release`. Case does not matter; an unknown type, or an empty list, refuses to load |
+| `github_repos.types` | list | `[pull_request, issue]` | What is reported: `pull_request`, `issue`, `release`, `commit` (the [new commits on a branch](#new-commits-on-a-branch)). Case does not matter; an unknown type, or an empty list, refuses to load |
+| `github_repos.branches` | map | `{}` | With the `commit` type: the branches whose new commits are reported, as `owner/repo: [branch, …]` for a repository of `repos` (case does not matter; one branch may be written as a string), at most 8 each. A repository without an entry reports its default branch. A branch name starts with a letter or a digit and goes on with letters, digits, `_`, `.`, `/` and `-`, up to 121 characters, without `..` and not ending in `.lock`; the repository's name and the branch have at most 194 bytes together. While the watch is on, another name, a branch named twice, more than 8, or a repository that `repos` does not list refuses to load; while it is off, a warning names them. Without the `commit` type it is not read |
 | `github_repos.include_bots` | bool | `false` | Also report the pull requests and issues that a GitHub App (`user.type` `Bot`) or an account whose login ends in `[bot]` opened. A release is reported whoever published it: release automation (`github-actions[bot]`, a release bot) is the normal case. `author_kind` still says `bot` on such a release |
 | `github_repos.include_drafts` | bool | `true` | `false`: a new draft pull request is held and reported when it is marked ready for review (event `ready`), never as `opened`; one closed while it is a draft is never reported |
 | `github_repos.updates` | bool | `false` | Also report, for each pull request this source reported, a new head commit (`updated`), ready for review (`ready`), and its merge (`merged`) or close (`closed`), after which it is no longer followed |
@@ -365,6 +371,7 @@ Events (the record's `Event:` line and `event` metadata):
 | `merged` | `updates`: a reported pull request was merged | `<repo>#<number>:merged:merged` | `merged_at` |
 | `closed` | `updates`: a reported pull request was closed without a merge | `<repo>#<number>:closed:closed` | `closed_at` |
 | `released` | A release was published since the last run | `<repo>#:released:<release id>` | `published_at` |
+| `pushed` | `commit` type: the head of a followed branch is another commit than at the last run | `<repo>@<branch>:pushed:<head sha>` | The time of the run |
 
 A pull request gives one record per run: `merged` or `closed`, else `ready`,
 else `updated`; back to draft gives none, and one seen for the first time is
@@ -403,6 +410,59 @@ inbox guardrail applies them again to what arrives (`repo_name` against
 `types`), which catches the records delivered before a reload changed them.
 Everything here follows a reload.
 
+#### New commits on a branch
+
+With `commit` among the `types`, the watch follows branches: those that
+`branches` names for a repository, or the repository's default branch. It is
+made for work that should start when a branch moves, such as a build or a
+test run: a cron job [gated on the source's unread records](cron.md#messages)
+runs when there are new commits and stays idle otherwise.
+
+- **One record per branch and run, never one per commit.** The first run of a
+  branch only stores its head. From then on, a run that finds another head
+  reports one `pushed` record for the branch, however many commits arrived
+  and however long after the last run: the day's limit above is for pull
+  requests, issues and releases, not for branches.
+- **Which commits it lists.** The branch's listing shows its newest 100
+  commits, the head first. The new commits are those that it shows before
+  the head of the last run (`before_sha`); `commit_count` is their number,
+  and `commits` lists the newest 50 of them.
+- **`truncated`.** `true` when `commits` does not list exactly the new
+  commits: there are more than 50, or the listing does not show `before_sha`
+  at all, because the branch moved by more than 100 commits or a push rewrote
+  it. In the second case `commit_count` is empty and `commits` holds the
+  branch's newest commits. `subject_url` compares the two heads on GitHub
+  either way.
+- **No author filters.** One record can hold commits of many authors, so
+  neither `include_bots` nor `deny_authors` judges it, and its metadata has
+  no `author`.
+- **A branch that cannot be read** (it does not exist, or the repository has
+  no commit yet) fails its listing alone and keeps its head; see Failures
+  above. A default branch whose name is outside the shape of `branches` is
+  not followed, with a warning.
+
+The record's summary is `[acme/widgets] 3 new commits on main`, or
+`[acme/widgets] main moved to 5c4d3e2f1a0b` when it cannot count them. Its
+content has the lines `Repository:`, `Type: Commit`, `Event: pushed`,
+`Branch:`, `Commits:` (the count, when there is one), `Head:`, `Before:` and
+`URL:`, then the commits, one line each: the commit and the first line of its
+message, cut to 120 characters. A record that is `truncated` ends with
+`[... not every new commit is listed]`. Its metadata, the same in both modes:
+
+| Key | Value |
+|-----|-------|
+| `repo_name` | `owner/repo`, as configured |
+| `event` | `pushed` |
+| `subject_type` | `Commit` |
+| `branch` | The branch |
+| `head_sha` | The branch's head |
+| `before_sha` | Its head at the last run |
+| `commit_count` | The number of new commits as a decimal string; empty when the listing does not show `before_sha` |
+| `commits` | A list of up to 50 commits, the newest first, each `<sha> <first line of the message>` |
+| `truncated` | `true` or `false`, as above |
+| `subject_url` | `https://github.com/<owner>/<repo>/compare/<before_sha>...<head_sha>` |
+| `repo_url` | `https://github.com/<owner>/<repo>`, as configured |
+
 #### Hosted repository watch
 
 GitHub is hosted as a whole: with `sync.github.mode: hosted` the channel
@@ -418,7 +478,8 @@ machine for them.
   paused while the others keep being polled.
 - **What is published.** Nerve sends the gateway a `github_repos`
   subscription: each repository with `types`, `include_bots`,
-  `include_drafts`, `updates` and `deny_authors`, when a stream opens and again
+  `include_drafts`, `updates` and `deny_authors`, and with the `commit` type
+  the `branches` that the settings name for it, when a stream opens and again
   on every reload, only while `enabled` is true and `repos` lists a
   repository. Switching it off and reloading tells the gateway to stop. A
   `deny_authors` list the gateway cannot take (more than 256 patterns, or a
@@ -433,6 +494,20 @@ machine for them.
   closes the stream, hosted Slack traffic included. Update the gateway before
   an agent switches the watch on in hosted mode. An agent that does not
   switch it on sends the same subscription as before, so it is unaffected.
+- **The gateway must know the `commit` type.** Nerve cannot ask the gateway
+  which types it knows. A gateway older than the `commit` type refuses a
+  subscription that names it: it closes the stream, hosted Slack traffic
+  included, each time the agent connects, until the gateway is updated or
+  `commit` is taken out of `types`. So name `commit` on a hosted agent only
+  once its gateway knows the type. An agent whose `types` do not name
+  `commit` sends the same subscription as before, whatever `branches` says.
+- **Commits in hosted mode.** The gateway follows the branches as described
+  under [New commits on a branch](#new-commits-on-a-branch), with these
+  differences: a branch that GitHub does not find rests for an hour before
+  the gateway asks again, while the repository's other branches and listings
+  go on; and the gateway reads a repository's default branch at least once an
+  hour, not at every poll, so a default branch that changes is followed, from
+  its head, within the hour.
 - **Same source, same name.** The records go to their own local buffer, and
   the `source:github_repos` runner drains it, as the `github` runner drains
   the notifications (see [Hosted GitHub source](#hosted-github-source)): it

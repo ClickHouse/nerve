@@ -1,7 +1,8 @@
 """The GitHub Repos source in poll mode: what is new in repositories the agent follows.
 
 A fake ``gh api`` serves the pulls, issues and releases listings of a few
-repositories, newest change first as GitHub does; each test lists once for the
+repositories, and the commits of their branches, newest change first as GitHub
+does; each test lists once for the
 baseline, changes the repositories, and lists again. The records are pinned to
 the shape the channel gateway builds for the hosted mode (same id, type,
 summary, content, timestamp and metadata), so that the guardrails, the gates
@@ -11,10 +12,12 @@ and the agent see the same thing in both modes.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import re
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -114,20 +117,56 @@ def release(
     }
 
 
+def sha(number: int) -> str:
+    """The commit of a number: 40 characters, as GitHub names a commit."""
+    return f"{number:040x}"
+
+
+def commit(number: int, message: str | None = None) -> dict[str, Any]:
+    """A commit as the commits listing of a branch returns it."""
+    person = {"name": "Alice Example", "date": at(-5)}
+    return {
+        "sha": sha(number),
+        "commit": {
+            "message": f"Commit {number}" if message is None else message,
+            "author": person, "committer": person,
+        },
+        "author": user(),
+        "html_url": f"https://github.com/{REPO}/commit/{sha(number)}",
+    }
+
+
+def history(head: int) -> list[dict[str, Any]]:
+    """The commits of a branch whose head is *head*, down to 1, the head first."""
+    return [commit(number) for number in range(head, 0, -1)]
+
+
 class FakeGitHub:
     """``gh api`` over a few repositories' listings; records every endpoint asked for."""
 
     _ENDPOINT = re.compile(r"repos/([^/]+/[^/?]+)/(pulls|issues|releases)\?(.*)")
+    _COMMITS = re.compile(r"repos/([^/]+/[^/?]+)/commits\?sha=([^&]+)&per_page=100")
+    _REPOSITORY = re.compile(r"repos/([^/]+/[^/?]+)")
 
     def __init__(self) -> None:
         self.pulls: dict[str, list[dict]] = {}
         self.issues: dict[str, list[dict]] = {}
         self.releases: dict[str, list[dict]] = {}
+        # The commits of each branch, the head first, by (repository, branch),
+        # and the default branch of each repository.
+        self.commits: dict[tuple[str, str], list[dict]] = {}
+        self.default_branch: dict[str, str] = {}
         self.calls: list[str] = []
         self.failing: set[str] = set()
 
     async def gh_api_get(self, endpoint: str, timeout: float = 30) -> Any:
         self.calls.append(endpoint)
+        if (commits := self._COMMITS.fullmatch(endpoint)) is not None:
+            if commits.groups() not in self.commits:
+                raise RuntimeError("gh: Not Found (HTTP 404)")
+            return copy.deepcopy(self.commits[commits.groups()][:100])
+        if (repository := self._REPOSITORY.fullmatch(endpoint)) is not None:
+            return {"full_name": repository[1], "default_branch": self.default_branch[repository[1]]}
         repo, listing, _ = self._ENDPOINT.fullmatch(endpoint).groups()
         if f"{repo} {listing}" in self.failing:
             raise RuntimeError("gh: Not Found (HTTP 404)")
@@ -662,9 +701,267 @@ def _source_record_event(record: SourceRecord):
             id=record.id, record_type=record.record_type, summary=record.summary,
             content=record.content,
             timestamp=datetime.fromisoformat(record.timestamp),
-            metadata=tuple(MetadataEntry(key=key, value=value) for key, value in record.metadata.items()),
+            metadata=tuple(_metadata_entry(key, value) for key, value in record.metadata.items()),
         ),
     )
+
+
+def _metadata_entry(key: str, value: Any) -> MetadataEntry:
+    """A metadata member as the gateway sends it: a list in ``values``, a flag as text."""
+    if isinstance(value, list):
+        return MetadataEntry(key=key, values=tuple(value))
+    if isinstance(value, bool):
+        return MetadataEntry(key=key, value="true" if value else "false")
+    return MetadataEntry(key=key, value=value)
+
+
+# ---------------------------------------------------------------------- #
+#  Commits of a branch                                                    #
+# ---------------------------------------------------------------------- #
+
+MAIN = (REPO, "main")
+
+
+def commits_source(fake: FakeGitHub, **settings: Any) -> GitHubReposSource:
+    """A source that follows the commits of main of the repository, unless *settings* say otherwise."""
+    settings.setdefault("types", ["commit"])
+    settings.setdefault("branches", {REPO: ["main"]})
+    return source(fake, **settings)
+
+
+@pytest.mark.asyncio
+async def test_the_first_listing_of_a_branch_only_stores_its_head():
+    fake = FakeGitHub()
+    fake.commits[MAIN] = history(3)
+    src = commits_source(fake)
+
+    first = await src.fetch(None)
+
+    assert first.records == []
+    assert cursor_of(first) == {"v": 1, "repos": {REPO: {"branches": {"main": sha(3)}}}}
+    assert fake.calls == [f"repos/{REPO}/commits?sha=main&per_page=100"]
+    again = await src.fetch(first.next_cursor)
+    assert (again.records, again.next_cursor) == ([], first.next_cursor)
+
+
+@pytest.mark.asyncio
+async def test_a_head_that_moved_gives_one_record_as_the_gateway_builds_it():
+    """One record for the branch, whatever the number of commits, with the
+    time of the listing; the same head gives no second record."""
+    fake = FakeGitHub()
+    fake.commits[MAIN] = history(2)
+    src = commits_source(fake)
+    cursor = await baseline(src)
+    fake.commits[MAIN] = history(5)
+
+    result = await src.fetch(cursor)
+
+    compare = f"https://github.com/{REPO}/compare/{sha(2)}...{sha(5)}"
+    assert result.records == [SourceRecord(
+        id=f"{REPO}@main:pushed:{sha(5)}",
+        source="github_repos",
+        record_type="github_repo_activity",
+        summary=f"[{REPO}] 3 new commits on main",
+        content=(
+            f"Repository: {REPO}\nType: Commit\nEvent: pushed\nBranch: main\nCommits: 3\n"
+            f"Head: {sha(5)}\nBefore: {sha(2)}\nURL: {compare}\n\n--- Commits ---\n"
+            f"- {sha(5)} Commit 5\n- {sha(4)} Commit 4\n- {sha(3)} Commit 3"
+        ),
+        timestamp=STAMP,
+        metadata={
+            "repo_name": REPO, "event": "pushed", "subject_type": "Commit", "branch": "main",
+            "head_sha": sha(5), "before_sha": sha(2), "commit_count": "3",
+            "commits": [f"{sha(5)} Commit 5", f"{sha(4)} Commit 4", f"{sha(3)} Commit 3"],
+            "truncated": False, "subject_url": compare, "repo_url": f"https://github.com/{REPO}",
+        },
+    )]
+    assert list(result.records[0].metadata) == [
+        "repo_name", "event", "subject_type", "branch", "head_sha", "before_sha", "commit_count",
+        "commits", "truncated", "subject_url", "repo_url",
+    ]
+    assert cursor_of(result)["repos"][REPO]["branches"] == {"main": sha(5)}
+    assert (await src.fetch(result.next_cursor)).records == []
+    fake.commits[MAIN] = history(6)
+    (one,) = (await src.fetch(result.next_cursor)).records
+    assert (one.summary, one.metadata["before_sha"]) == (f"[{REPO}] 1 new commit on main", sha(5))
+
+
+# A copy of the channel contract's sample of the new commits of a branch. It
+# must stay byte for byte the same as the contract's
+# ``testdata/events/github_repo_commits.json``.
+COMMITS_SAMPLE = Path(__file__).parent / "fixtures" / "channel_contract" / "github_repo_commits.json"
+COMMITS_SAMPLE_SHA256 = "e654ca9601d02ed86f0140a66467536f8ad89cd297b388d5da0e5d005c4baaf0"
+
+
+@pytest.mark.asyncio
+async def test_the_record_is_the_one_of_the_contract_sample():
+    """The gateway writes the contract's sample for two commits on main. This
+    source builds the same record from the same listing, and the hosted source
+    reads the sample into that record."""
+    from nerve.channels.hosted.contract.model import Event
+    from nerve.channels.hosted.contract.wire import decode_record
+
+    assert hashlib.sha256(COMMITS_SAMPLE.read_bytes()).hexdigest() == COMMITS_SAMPLE_SHA256
+    event = decode_record(Event, json.loads(COMMITS_SAMPLE.read_text(encoding="utf-8")))
+    earlier = {**commit(0, "Earlier work"), "sha": "89abcdef0123456789abcdef0123456789abcdef"}
+    fake = FakeGitHub()
+    fake.commits[MAIN] = [earlier]
+    src = commits_source(fake, clock=lambda: datetime(2026, 9, 16, 10, 35, 0, 987_000, tzinfo=UTC))
+    cursor = await baseline(src)
+    fake.commits[MAIN] = [
+        {**commit(0, "Cache rendered widgets\n\nRenders each widget once and keeps it."),
+         "sha": "5c4d3e2f1a0b99887766554433221100ffeeddcc"},
+        {**commit(0, "Add the widget cache interface"), "sha": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"},
+        earlier,
+    ]
+
+    (record,) = (await src.fetch(cursor)).records
+
+    assert record == record_from_buffer(buffered_record(event), source="github_repos")
+    assert record == record_from_buffer(buffered_record(_source_record_event(record)), source="github_repos")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("before", "head", "count", "listed", "truncated", "summary"), [
+    (history(10), 60, "50", 50, False, "50 new commits on main"),
+    (history(10), 61, "51", 50, True, "51 new commits on main"),
+    (history(1), 100, "99", 50, True, "99 new commits on main"),
+    # More commits than the listing's page: it does not show the earlier head.
+    (history(1), 101, "", 50, True, f"main moved to {sha(101)[:12]}"),
+    # A rewritten branch does not hold the earlier head any more.
+    ([commit(900)], 3, "", 3, True, f"main moved to {sha(3)[:12]}"),
+])
+async def test_a_record_says_when_it_does_not_list_every_new_commit(
+    before, head, count, listed, truncated, summary,
+):
+    fake = FakeGitHub()
+    fake.commits[MAIN] = before
+    src = commits_source(fake)
+    cursor = await baseline(src)
+    fake.commits[MAIN] = history(head)
+
+    (record,) = (await src.fetch(cursor)).records
+
+    metadata = record.metadata
+    assert (metadata["commit_count"], len(metadata["commits"]), metadata["truncated"]) == (count, listed, truncated)
+    assert (metadata["commits"][0], metadata["before_sha"]) == (f"{sha(head)} Commit {head}", before[0]["sha"])
+    assert record.summary == f"[{REPO}] {summary}"
+    assert metadata["subject_url"] == f"https://github.com/{REPO}/compare/{before[0]['sha']}...{sha(head)}"
+    assert record.content.endswith("\n[... not every new commit is listed]") is truncated
+    assert ("\nCommits: " in record.content) is bool(count)
+    assert record.content.count("\n- ") == listed
+
+
+@pytest.mark.asyncio
+async def test_each_branch_is_reported_and_takes_its_own_baseline():
+    """Two branches that moved give two records in one run. A branch named
+    later starts from its head, and one no longer named is forgotten."""
+    fake = FakeGitHub()
+    fake.commits[MAIN], fake.commits[(REPO, "release/1.2")] = history(4), history(2)
+    src = commits_source(fake, branches={"Acme/Widgets": ["main", "release/1.2"]})
+    cursor = await baseline(src)
+    assert fake.calls == [f"repos/{REPO}/commits?sha={branch}&per_page=100" for branch in ("main", "release/1.2")]
+    fake.commits[MAIN], fake.commits[(REPO, "release/1.2")] = history(6), history(3)
+
+    result = await src.fetch(cursor)
+
+    assert [record.id for record in result.records] == [
+        f"{REPO}@main:pushed:{sha(6)}", f"{REPO}@release/1.2:pushed:{sha(3)}",
+    ]
+    fake.commits[(REPO, "next")] = history(9)
+    fake.commits[(REPO, "release/1.2")] = history(5)
+    later = await commits_source(fake, branches={REPO: ["release/1.2", "next"]}).fetch(result.next_cursor)
+    assert [record.id for record in later.records] == [f"{REPO}@release/1.2:pushed:{sha(5)}"]
+    assert cursor_of(later)["repos"][REPO]["branches"] == {"release/1.2": sha(5), "next": sha(9)}
+
+
+@pytest.mark.asyncio
+async def test_without_branches_the_default_branch_is_followed(caplog):
+    """The repository names its default branch at every run. When it is
+    another one, that branch starts from its head and the earlier one is
+    forgotten; one with a name that the source cannot follow reports nothing."""
+    fake = FakeGitHub()
+    fake.default_branch[REPO] = "trunk"
+    fake.commits[(REPO, "trunk")] = history(2)
+    src = commits_source(fake, branches={})
+    cursor = await baseline(src)
+    assert fake.calls == [f"repos/{REPO}", f"repos/{REPO}/commits?sha=trunk&per_page=100"]
+    fake.commits[(REPO, "trunk")] = history(3)
+
+    result = await src.fetch(cursor)
+
+    assert [record.id for record in result.records] == [f"{REPO}@trunk:pushed:{sha(3)}"]
+    fake.default_branch[REPO], fake.commits[MAIN] = "main", history(7)
+    moved = await src.fetch(result.next_cursor)
+    assert (moved.records, cursor_of(moved)["repos"][REPO]["branches"]) == ([], {"main": sha(7)})
+    fake.default_branch[REPO] = "feature+x"
+    with caplog.at_level(logging.WARNING, logger="nerve.sources.github_repos"):
+        unfollowed = await src.fetch(moved.next_cursor)
+    assert (unfollowed.records, cursor_of(unfollowed)["repos"][REPO]) == ([], {})
+    assert "the default branch of acme/widgets has a name that the source cannot follow" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_a_branch_that_cannot_be_listed_keeps_its_head_and_the_others_report(caplog):
+    """A branch that GitHub does not find fails its listing alone: its head
+    stays in the cursor, and its commits report once it is back."""
+    fake = FakeGitHub()
+    fake.commits[MAIN], fake.commits[(REPO, "gone")] = history(4), history(2)
+    src = commits_source(fake, branches={REPO: ["gone", "main"]})
+    cursor = await baseline(src)
+    del fake.commits[(REPO, "gone")]
+    fake.commits[MAIN] = history(5)
+
+    with caplog.at_level(logging.WARNING, logger="nerve.sources.github_repos"):
+        result = await src.fetch(cursor)
+
+    assert [record.id for record in result.records] == [f"{REPO}@main:pushed:{sha(5)}"]
+    assert cursor_of(result)["repos"][REPO]["branches"] == {"gone": sha(2), "main": sha(5)}
+    assert "1 of 2 listings failed and keep their cursor, e.g. acme/widgets commits of gone" in caplog.text
+    fake.commits[(REPO, "gone")] = history(3)
+    back = await src.fetch(result.next_cursor)
+    assert [record.id for record in back.records] == [f"{REPO}@gone:pushed:{sha(3)}"]
+    del fake.commits[MAIN], fake.commits[(REPO, "gone")]
+    with pytest.raises(RuntimeError, match=r"every GitHub listing failed \(2\)"):
+        await src.fetch(back.next_cursor)
+
+
+@pytest.mark.parametrize(("message", "subject"), [
+    ("Fix the retry test", " Fix the retry test"),
+    ("Fix the retry test\n\nIt waited for the wrong event.", " Fix the retry test"),
+    ("Fix the retry test\r\nMore", " Fix the retry test"),
+    ("  Fix\tthe\x07retry test  ", " Fix the retry test"),
+    ("", ""),
+    ("\nBody alone", ""),
+    ("   \nBody", ""),
+    ("a" * 125, " " + "a" * 120),
+    ("a" * 119 + " tail", " " + "a" * 119),
+    # The entry is cut to 256 bytes, at a character.
+    ("ü" * 125, " " + "ü" * 107),
+])
+def test_a_commit_is_listed_with_the_first_line_of_its_message(message, subject):
+    """The rules of the gateway's record: control characters as spaces, no
+    spaces around the line, 120 characters, and the entry within 256 bytes."""
+    assert module._commit_entry(commit(7, message)) == sha(7) + subject
+
+
+def test_a_record_without_an_earlier_head_counts_no_commit():
+    """The contract's record for an unknown earlier head. The source itself
+    reports only after it stored a head."""
+    record = module.commits_record(REPO, "main", "", history(2), NOW)
+
+    assert (record.metadata["before_sha"], record.metadata["commit_count"], record.metadata["truncated"]) == ("", "", True)
+    assert record.metadata["subject_url"] == f"https://github.com/{REPO}/commits/main"
+    assert "Before: " not in record.content
+
+
+def test_the_inbox_filter_keeps_commit_records_only_with_the_commit_type():
+    """A commit record has no author: neither deny_authors nor include_bots judges it."""
+    record = module.commits_record(REPO, "main", sha(1), history(2), NOW)
+
+    watching = GitHubReposSyncConfig(repos=[REPO], types=["commit"], deny_authors=["*"])
+    assert github_repos_inbox_filter(watching).passes(record)
+    assert not github_repos_inbox_filter(GitHubReposSyncConfig(repos=[REPO])).passes(record)
 
 
 # ---------------------------------------------------------------------- #
@@ -1041,8 +1338,9 @@ def test_the_registry_hands_the_settings_to_the_polling_source():
     from nerve.sources.registry import build_source_runners
 
     config = NerveConfig.from_dict({"sync": {"github_repos": {
-        "enabled": True, "repos": [REPO], "types": ["release"], "include_bots": True,
+        "enabled": True, "repos": [REPO], "types": ["release", "commit"], "include_bots": True,
         "include_drafts": False, "updates": True, "deny_authors": ["noisy-*"],
+        "branches": {"ACME/Widgets": ["main", "release/1.2"]},
     }}})
 
     (runner,) = [r for r in build_source_runners(config, db=None) if r.job_id == "source:github_repos"]
@@ -1052,6 +1350,7 @@ def test_the_registry_hands_the_settings_to_the_polling_source():
     assert (src._repos, src._types, src._include_bots, src._include_drafts, src._updates, src._deny_authors) == (
         [REPO], ("release",), True, False, True, ["noisy-*"],
     )
+    assert (src._commits, src._branches) == (True, {REPO: ["main", "release/1.2"]})
     assert [rule.field for rule in runner.inbox_filter.rules if rule.active] == [
         "repo_name", "author", "subject_type",
     ]

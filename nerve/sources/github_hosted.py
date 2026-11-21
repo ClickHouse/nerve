@@ -25,8 +25,8 @@ Buffered payload (one row per record)::
                 "timestamp": RFC 3339,
                 "metadata": [{"key", "value", "values"}, ...]}}
 
-Metadata values arrive as strings. ``actors`` and ``changes`` are lists, and
-``unread`` becomes a boolean.
+Metadata values arrive as strings. ``actors``, ``changes`` and ``commits``
+are lists, and ``unread`` and ``truncated`` become booleans.
 """
 
 from __future__ import annotations
@@ -49,8 +49,8 @@ BUFFER_CHANNEL = "github"
 # and source name is the provider's name.
 PROVIDERS = ("github", "github_repos")
 # Metadata keys whose value is a list of strings, and those that are flags.
-_LIST_KEYS = frozenset({"actors", "changes"})
-_FLAG_KEYS = frozenset({"unread"})
+_LIST_KEYS = frozenset({"actors", "changes", "commits"})
+_FLAG_KEYS = frozenset({"unread", "truncated"})
 
 
 class HostedGitHubSource(Source):

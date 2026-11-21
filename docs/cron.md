@@ -266,6 +266,41 @@ run_if:
     consumer: inbox
 ```
 
+A job that should run when a branch has new commits needs nothing more than
+this gate. Let the [repository watch](sources.md#new-commits-on-a-branch)
+report the branch's commits, and gate the job on that source's unread records:
+
+```yaml
+# config.yaml
+sync:
+  github_repos:
+    enabled: true
+    repos: [acme/widgets]
+    types: [commit]
+    branches:
+      acme/widgets: [main]
+```
+
+```yaml
+jobs:
+  - id: on-new-commits
+    schedule: "*/10 * * * *"
+    prompt: >
+      Read the new records with poll_source(source="github_repos",
+      consumer="on-new-commits"). Each one lists the new commits of a branch.
+      Then ...
+    run_if:
+      - type: messages
+        sources: [github_repos]
+        consumer: on-new-commits
+```
+
+The job stays idle while the branch does not move. The watch reports one
+record per branch however many commits arrive, so one push starts one run,
+and reading the records with `poll_source` under the gate's `consumer` marks
+them read. The gate looks at the source as a whole: when the watch also
+reports pull requests or issues, those records satisfy it too.
+
 Without `sources`, the gate checks the sources on which the consumer has a
 cursor. A consumer that reads every source with `poll_all_sources` gets a cursor
 on a new source before the source's first run, so the gate sees the first records
