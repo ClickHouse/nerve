@@ -566,6 +566,8 @@ class CodexBackend:
     def build_env(self, spec: SessionSpec) -> dict[str, str]:
         env = _inherited_env()
         env["CODEX_HOME"] = self._home_dir()
+        # The Nerve session this process serves, for commands it runs.
+        env["NERVE_SESSION_ID"] = spec.session_id
         env.update(self.endpoint_env(spec.inference_principal))
         # Session-bound bearer token for the nerve MCP endpoint —
         # referenced from the MCP config via bearer_token_env_var so the
