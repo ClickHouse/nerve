@@ -571,7 +571,7 @@ function MessageDetail() {
             {Object.entries(msg.metadata).map(([k, v]) => (
               <span key={k} className="text-xs px-1.5 py-0.5 bg-surface border border-border-subtle rounded">
                 <span className="text-text-dim">{k}:</span>{' '}
-                <span className="text-text-muted">{metadataValueText(v)}</span>
+                <span className="text-text-muted">{metadataValueText(k, v)}</span>
               </span>
             ))}
           </div>

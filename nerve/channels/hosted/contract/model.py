@@ -156,12 +156,14 @@ def valid_repo_branch(repo: str, branch: str) -> bool:
     """Whether the gateway takes *branch* as a watched branch of *repo*.
 
     A letter or a digit, then up to 120 letters, digits, ``_``, ``.``, ``/``
-    and ``-``, without ``..`` and not ending in ``.lock``, and no longer with
+    and ``-``, without ``..``, not starting with ``refs/`` (a branch is named
+    without its ref prefix) and not ending in ``.lock``, and no longer with
     the repository's name than :data:`MAX_REPO_WATCH_BRANCH_KEY_BYTES`.
     """
     return (
         _REPO_BRANCH.fullmatch(branch) is not None
         and ".." not in branch
+        and not branch.startswith("refs/")
         and not branch.endswith(".lock")
         and byte_length(repo) + byte_length(branch) <= MAX_REPO_WATCH_BRANCH_KEY_BYTES
     )
@@ -880,9 +882,10 @@ class RepoWatch:
     is sent.
 
     ``branches`` are the branches whose new commits a repository with the
-    ``commit`` type reports; without them it reports its default branch. It
-    is sent only when it names a branch, so the frame of a repository
-    without one is the same as before the member existed.
+    ``commit`` type reports; without them it reports its default branch.
+    Each is the name of a branch, without its ref prefix. It is sent only
+    when it names a branch, so the frame of a repository without one is the
+    same as before the member existed.
     """
 
     name: str = ""

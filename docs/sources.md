@@ -327,7 +327,7 @@ notifications, and in hosted mode through `pr_watch`.
   - `pull_request`: `GET /repos/{repo}/pulls?state=all&sort=updated&direction=desc&per_page=100`
   - `issue`: `GET /repos/{repo}/issues?state=all&sort=updated&direction=desc&per_page=100`. The issues endpoint lists the pull requests too; they are skipped
   - `release`: `GET /repos/{repo}/releases?per_page=30`. Draft releases are skipped, prereleases are not
-  - `commit`: `GET /repos/{repo}/commits?sha={branch}&per_page=100`, one request per branch that `branches` names for the repository. A repository without an entry in `branches` reports its default branch, which `GET /repos/{repo}` names at every run
+  - `commit`: `GET /repos/{repo}/commits?sha=refs/heads/{branch}&per_page=100`, one request per branch that `branches` names for the repository. The request names the branch's ref, so a tag or a commit that has the same name is never read in its place. A repository without an entry in `branches` reports its default branch, which `GET /repos/{repo}` names at every run
 - **One page each:** a repository with more than 100 pull requests (or issues) changed between two runs loses the oldest of those changes. `batch_size` does not cap this source
 - **Cursor:** JSON. Per repository and listing: the newest `updated_at` listed (`published_at` for releases), when the listing was read, and the numbers (release ids) of the items created in that newest second. Per repository, the pull requests it follows: a held draft (`include_drafts: false`) and, with `updates`, a reported pull request while it is open, as head commit, draft and held. At most 1,000 per repository; the one listed longest ago is forgotten first. And per repository, the head commit of each branch whose commits it follows
 - **First run:** the baseline. Each listing's cursor is set and nothing is reported, so switching the source on does not fill the inbox with history; a repository or a type added later takes its own baseline, and one removed is forgotten. An item is new when it was created (a release: published) after the last listing: later than the listing's cursor, or in the cursor's own second and not listed then, since GitHub's times have a resolution of one second. So an older pull request that changes later is never reported as new, and an item is reported once
@@ -355,7 +355,7 @@ sync:
 |-------|------|---------|-------------|
 | `github_repos.repos` | list | `[]` | `owner/repo` names as GitHub writes them, each once (case does not matter), at most 50. While the watch is on, a name GitHub would not take, the same repository twice, or more than 50 refuses to load; while it is off, a warning names them. Empty = the source does nothing |
 | `github_repos.types` | list | `[pull_request, issue]` | What is reported: `pull_request`, `issue`, `release`, `commit` (the [new commits on a branch](#new-commits-on-a-branch)). Case does not matter; an unknown type, or an empty list, refuses to load |
-| `github_repos.branches` | map | `{}` | With the `commit` type: the branches whose new commits are reported, as `owner/repo: [branch, …]` for a repository of `repos` (case does not matter; one branch may be written as a string), at most 8 each. A repository without an entry reports its default branch. A branch name starts with a letter or a digit and goes on with letters, digits, `_`, `.`, `/` and `-`, up to 121 characters, without `..` and not ending in `.lock`; the repository's name and the branch have at most 194 bytes together. While the watch is on, another name, a branch named twice, more than 8, or a repository that `repos` does not list refuses to load; while it is off, a warning names them. Without the `commit` type it is not read |
+| `github_repos.branches` | map | `{}` | With the `commit` type: the branches whose new commits are reported, as `owner/repo: [branch, …]` for a repository of `repos` (case does not matter; one branch may be written as a string), at most 8 each. A repository without an entry, or with an empty one, reports its default branch. An entry is the name of a branch, such as `main` or `release/1.2`, and not a ref: it starts with a letter or a digit and goes on with letters, digits, `_`, `.`, `/` and `-`, up to 121 characters, without `..`, not starting with `refs/` and not ending in `.lock`; the repository's name and the branch have at most 194 bytes together. Write a name that YAML reads as something else in quotes: an unquoted `1.10` is the number `1.1`, and `no`, `off` and `0` are no names. [New commits on a branch](#new-commits-on-a-branch) lists what refuses to load. Without the `commit` type the setting is not read: a value that is left there is ignored, with one warning |
 | `github_repos.include_bots` | bool | `false` | Also report the pull requests and issues that a GitHub App (`user.type` `Bot`) or an account whose login ends in `[bot]` opened. A release is reported whoever published it: release automation (`github-actions[bot]`, a release bot) is the normal case. `author_kind` still says `bot` on such a release |
 | `github_repos.include_drafts` | bool | `true` | `false`: a new draft pull request is held and reported when it is marked ready for review (event `ready`), never as `opened`; one closed while it is a draft is never reported |
 | `github_repos.updates` | bool | `false` | Also report, for each pull request this source reported, a new head commit (`updated`), ready for review (`ready`), and its merge (`merged`) or close (`closed`), after which it is no longer followed |
@@ -371,7 +371,7 @@ Events (the record's `Event:` line and `event` metadata):
 | `merged` | `updates`: a reported pull request was merged | `<repo>#<number>:merged:merged` | `merged_at` |
 | `closed` | `updates`: a reported pull request was closed without a merge | `<repo>#<number>:closed:closed` | `closed_at` |
 | `released` | A release was published since the last run | `<repo>#:released:<release id>` | `published_at` |
-| `pushed` | `commit` type: the head of a followed branch is another commit than at the last run | `<repo>@<branch>:pushed:<head sha>` | The time of the run |
+| `pushed` | `commit` type: the head of a followed branch is another commit than at the last run | `<repo>@<branch>:pushed:<before>..<head>`, with the first 12 characters of the two commits | The time of the run |
 
 A pull request gives one record per run: `merged` or `closed`, else `ready`,
 else `updated`; back to draft gives none, and one seen for the first time is
@@ -423,16 +423,31 @@ runs when there are new commits and stays idle otherwise.
   reports one `pushed` record for the branch, however many commits arrived
   and however long after the last run: the day's limit above is for pull
   requests, issues and releases, not for branches.
-- **Which commits it lists.** The branch's listing shows its newest 100
-  commits, the head first. The new commits are those that it shows before
-  the head of the last run (`before_sha`); `commit_count` is their number,
-  and `commits` lists the newest 50 of them.
-- **`truncated`.** `true` when `commits` does not list exactly the new
-  commits: there are more than 50, or the listing does not show `before_sha`
-  at all, because the branch moved by more than 100 commits or a push rewrote
-  it. In the second case `commit_count` is empty and `commits` holds the
-  branch's newest commits. `subject_url` compares the two heads on GitHub
-  either way.
+- **Which commits it lists.** The watch reads the first 100 commits of the
+  branch's listing on GitHub, the head first. `commits` are the newest
+  commits of that listing above the head of the last run (`before_sha`), up
+  to 50 of them, and `commit_count` counts the commits of the listing above
+  `before_sha`, listed or not.
+- **Merges.** GitHub lists by commit date, not by ancestry. Across a merge
+  the listing interleaves the commits of the merged branches by their dates,
+  so a commit that the merge brought in can be listed below `before_sha`:
+  `commits` and `commit_count` are not always the exact set of the new
+  commits. `subject_url`, the comparison of the two heads on GitHub, is.
+- **`truncated`.** `true` when `before_sha` is not among the listed commits,
+  after 100 or more new commits or a push that rewrote the branch: then
+  `commit_count` is empty and `commits` holds the branch's newest commits.
+  Also `true` when `commit_count` is more than the 50 commits that `commits`
+  lists. Otherwise `false`.
+- **The record's ID names both heads**,
+  `<repo>@<branch>:pushed:<before>..<head>` with the first 12 characters of
+  `before_sha` and of `head_sha`. So a branch that returns to an earlier
+  head, as after a push that was taken back, gives a record of its own, and
+  only the same move again, between the same two commits, has the ID of an
+  earlier record.
+- **Branches only.** A name in `branches` is followed as the branch of that
+  name: a tag or a commit that has the same name is never read in its place,
+  and without such a branch the listing fails as for a branch that does not
+  exist.
 - **No author filters.** One record can hold commits of many authors, so
   neither `include_bots` nor `deny_authors` judges it, and its metadata has
   no `author`.
@@ -441,13 +456,36 @@ runs when there are new commits and stays idle otherwise.
   above. A default branch whose name is outside the shape of `branches` is
   not followed, with a warning.
 
+With the `commit` type, and while the watch is on, `branches` refuses to load
+when it holds any of these:
+
+- a value that is not a map of repositories to their branches, such as
+  `branches: [main]` or `branches: []`. To name no branch, leave the setting
+  out or write `branches: {}`
+- a repository that `repos` does not list, or the same repository twice
+  (names ignore case)
+- a branch that is not a string: what YAML makes of an unquoted `1.10`, `no`,
+  `off`, `yes`, `on`, `0` or a date, and an empty item of a list. The message
+  says to quote it: `"1.10"`
+- a branch name of another shape than the settings table gives, or one that
+  starts with `refs/`: write `main`, not `refs/heads/main`
+- the same branch twice, or more than 8 branches for one repository
+- a repository's name and a branch that have more than 194 bytes together
+
+A blank name is left out. While the watch is off, one warning names what
+would refuse and those entries are left out, so the config loads. Without the
+`commit` type nothing of `branches` is checked.
+
 The record's summary is `[acme/widgets] 3 new commits on main`, or
 `[acme/widgets] main moved to 5c4d3e2f1a0b` when it cannot count them. Its
 content has the lines `Repository:`, `Type: Commit`, `Event: pushed`,
 `Branch:`, `Commits:` (the count, when there is one), `Head:`, `Before:` and
 `URL:`, then the commits, one line each: the commit and the first line of its
-message, cut to 120 characters. A record that is `truncated` ends with
-`[... not every new commit is listed]`. Its metadata, the same in both modes:
+message, cut to 120 characters, with a space in the place of each control
+character, of the line and the paragraph separator (U+2028, U+2029) and of
+each bidirectional control (U+202A to U+202E, U+2066 to U+2069). A record
+that is `truncated` ends with `[... not every new commit is listed]`. Its
+metadata, the same in both modes:
 
 | Key | Value |
 |-----|-------|
@@ -457,8 +495,8 @@ message, cut to 120 characters. A record that is `truncated` ends with
 | `branch` | The branch |
 | `head_sha` | The branch's head |
 | `before_sha` | Its head at the last run |
-| `commit_count` | The number of new commits as a decimal string; empty when the listing does not show `before_sha` |
-| `commits` | A list of up to 50 commits, the newest first, each `<sha> <first line of the message>` |
+| `commit_count` | The number of commits that the listing shows above `before_sha`, as a decimal string; empty when the listing does not show `before_sha` |
+| `commits` | A list of the newest of them, up to 50, in the listing's order, each `<sha> <first line of the message>` |
 | `truncated` | `true` or `false`, as above |
 | `subject_url` | `https://github.com/<owner>/<repo>/compare/<before_sha>...<head_sha>` |
 | `repo_url` | `https://github.com/<owner>/<repo>`, as configured |
@@ -505,9 +543,11 @@ machine for them.
   under [New commits on a branch](#new-commits-on-a-branch), with these
   differences: a branch that GitHub does not find rests for an hour before
   the gateway asks again, while the repository's other branches and listings
-  go on; and the gateway reads a repository's default branch at least once an
-  hour, not at every poll, so a default branch that changes is followed, from
-  its head, within the hour.
+  go on, and a repository that GitHub does not find is paused as a whole, as
+  for the other types; a branch whose listing fails, as while GitHub has an
+  outage, rests for a few minutes; and the gateway reads a repository's
+  default branch at least once an hour, not at every poll, so a default
+  branch that changes is followed, from its head, within the hour.
 - **Same source, same name.** The records go to their own local buffer, and
   the `source:github_repos` runner drains it, as the `github` runner drains
   the notifications (see [Hosted GitHub source](#hosted-github-source)): it

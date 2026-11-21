@@ -2258,9 +2258,11 @@ GITHUB_REPOS_MAX_REPOS = 50
 GITHUB_REPOS_MAX_BRANCHES = 8
 GITHUB_REPOS_MAX_BRANCH_KEY_BYTES = 194
 # A branch whose commits the source can follow: a letter or a digit, then up
-# to 120 letters, digits, "_", ".", "/" and "-". The channel gateway checks
-# the same.
+# to 120 letters, digits, "_", ".", "/" and "-". It is the branch's name and
+# not a ref, so it does not start with "refs/": the source asks GitHub for
+# refs/heads/<branch>. The channel gateway checks the same.
 _GITHUB_BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,120}")
+_GITHUB_REF_PREFIX = "refs/"
 # A repository as GitHub names it: an owner of 1 to 39 letters, digits and
 # hyphens that starts with a letter or a digit, then a name of 1 to 100
 # letters, digits, ".", "_" and "-". The channel gateway checks the same.
@@ -2272,12 +2274,15 @@ def github_repos_branch_ok(repo: str, branch: str) -> bool:
 
     The name has the shape of :data:`_GITHUB_BRANCH_NAME_RE`, no ``..`` and no
     ``.lock`` at its end, and with the repository's name it stays within
-    :data:`GITHUB_REPOS_MAX_BRANCH_KEY_BYTES`.
+    :data:`GITHUB_REPOS_MAX_BRANCH_KEY_BYTES`. A name that starts with
+    ``refs/`` is refused: a branch is named without its ref prefix, so that
+    ``main`` and ``refs/heads/main`` cannot both be followed.
     """
     return (
         _GITHUB_BRANCH_NAME_RE.fullmatch(branch) is not None
         and ".." not in branch
         and not branch.endswith(".lock")
+        and not branch.startswith(_GITHUB_REF_PREFIX)
         and len(repo.encode()) + len(branch.encode()) <= GITHUB_REPOS_MAX_BRANCH_KEY_BYTES
     )
 
@@ -2375,20 +2380,34 @@ def _github_repos_types(value: object) -> list[str]:
 
 
 def _github_repos_branches(
-    value: object, repos: list[str], *, enabled: bool,
+    value: object, repos: list[str], *, enabled: bool, commits: bool,
 ) -> dict[str, list[str]]:
     """``sync.github_repos.branches``: the branches to follow, by repository.
 
+    The setting is read only with the ``commit`` type (*commits*). Without
+    it, a value that names something is ignored, with one warning.
+
     A mapping of a repository of ``repos`` (GitHub's names ignore case) to one
-    branch or a list of branches. It is returned under the names that *repos*
-    spells. While the watch is on (*enabled*), anything else refuses to load:
-    a value that is no mapping, a repository that ``repos`` does not list or
-    that the mapping names twice, a branch that
-    :func:`github_repos_branch_ok` refuses or that is named twice, and more
-    than :data:`GITHUB_REPOS_MAX_BRANCHES` branches. While it is off, those
-    are logged in one warning and left out.
+    branch or a list of branches, each a string; a blank one is left out, and
+    a repository without a value names none. It is returned under the names
+    that *repos* spells. While the watch is on (*enabled*), anything else
+    refuses to load: a value that is no mapping, a repository that ``repos``
+    does not list or that the mapping names twice, a branch that is not a
+    string, that :func:`github_repos_branch_ok` refuses, or that is named
+    twice, and more than :data:`GITHUB_REPOS_MAX_BRANCHES` branches. A branch
+    that is not a string is one that YAML read as something else, and the
+    message says to quote it: an unquoted ``1.10`` is the number ``1.1``, and
+    ``no``, ``off`` and ``0`` are values that are no names. While the watch is
+    off, those are logged in one warning and left out.
     """
     if value is None or value == "":
+        return {}
+    if not commits:
+        if value:
+            logger.warning(
+                "sync.github_repos.branches is set, and sync.github_repos.types does not name "
+                "commit: the branches are not read",
+            )
         return {}
     problems: list[str] = []
 
@@ -2410,19 +2429,26 @@ def _github_repos_branches(
         if repo in branches:
             refuse(f"names {repo!r} twice")
             continue
-        names = [
-            name for name in (
-                str(item or "").strip()
-                for item in (entry if isinstance(entry, (list, tuple)) else [entry])
-            ) if name
-        ]
+        # A repository without a value names no branch, as an empty list does.
+        items = (
+            list(entry) if isinstance(entry, (list, tuple)) else [] if entry is None else [entry]
+        )
+        unquoted = [item for item in items if not isinstance(item, str)]
+        if unquoted:
+            refuse(
+                f"of {repo!r} must name each branch as a string, got {unquoted[0]!r}: put the "
+                "name in quotes, since YAML reads an unquoted 1.10 as the number 1.1, and an "
+                "unquoted no, off or 0 as a value that is no name"
+            )
+            continue
+        names = [name for name in (item.strip() for item in items) if name]
         bad = [name for name in names if not github_repos_branch_ok(repo, name)]
         if bad:
             refuse(
                 f"of {repo!r} must be branch names of letters, digits, '_', '.', '/' and '-' "
-                "that start with a letter or a digit, without '..' and not ending in '.lock', "
-                f"at most {GITHUB_REPOS_MAX_BRANCH_KEY_BYTES} bytes together with the "
-                f"repository's name, got {bad[0]!r}"
+                "that start with a letter or a digit, without '..', not starting with 'refs/' "
+                f"and not ending in '.lock', at most {GITHUB_REPOS_MAX_BRANCH_KEY_BYTES} bytes "
+                f"together with the repository's name, got {bad[0]!r}"
             )
         elif len(set(names)) < len(names):
             refuse(f"of {repo!r} name a branch twice")
@@ -2467,9 +2493,10 @@ class GitHubReposSyncConfig:
     # With the commit type: the branches whose new commits are reported, by
     # repository (a name of repos; case does not matter). A repository
     # without an entry reports its default branch. At most
-    # GITHUB_REPOS_MAX_BRANCHES each; while the watch is on, a name that
-    # github_repos_branch_ok refuses, or a repository that repos does not
-    # list, refuses to load.
+    # GITHUB_REPOS_MAX_BRANCHES each; while the watch is on, a name that is
+    # not a string or that github_repos_branch_ok refuses, or a repository
+    # that repos does not list, refuses to load. Without the commit type the
+    # setting is not read, and a value there is ignored with a warning.
     branches: dict[str, list[str]] = field(default_factory=dict)
     # Also report the pull requests and issues that a GitHub App or a "[bot]"
     # account opened. A release is reported whoever published it.
@@ -2502,12 +2529,15 @@ class GitHubReposSyncConfig:
     def from_dict(cls, d: dict) -> GitHubReposSyncConfig:
         enabled = _switched_on(d.get("enabled", False))
         repos = _github_repos_names(d.get("repos"), enabled=enabled)
+        types = _github_repos_types(d.get("types"))
         return cls(
             enabled=d.get("enabled", False),
             schedule=d.get("schedule", "*/15 * * * *"),
             repos=repos,
-            types=_github_repos_types(d.get("types")),
-            branches=_github_repos_branches(d.get("branches"), repos, enabled=enabled),
+            types=types,
+            branches=_github_repos_branches(
+                d.get("branches"), repos, enabled=enabled, commits="commit" in types,
+            ),
             include_bots=d.get("include_bots", False),
             include_drafts=d.get("include_drafts", True),
             updates=d.get("updates", False),

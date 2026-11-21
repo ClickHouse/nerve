@@ -368,7 +368,10 @@ sync:
                                    # (hosted: commit only once the gateway
                                    # knows the type, see docs/sources.md)
     # branches:                    # commit type: the branches to follow, by
-    #   acme/widgets: [main]       # repository; no entry = its default branch
+    #   acme/widgets: [main]       # repository; no entry = its default branch.
+                                   # A branch's name, not a ref (main, not
+                                   # refs/heads/main); quote a name that YAML
+                                   # reads as something else: "1.10"
     # include_bots: false          # also PRs and issues a GitHub App or a [bot]
                                    # opened; releases arrive whoever published them
     # include_drafts: true         # false: a draft PR is reported when it is

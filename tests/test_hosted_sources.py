@@ -15,7 +15,7 @@ import json
 import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -265,21 +265,47 @@ class TestSettings:
 
     def test_the_branches_of_the_commit_type_are_read(self):
         """A repository's branches go by its name as repos spells it; one
-        branch may be written as a string, and blanks are dropped."""
+        branch may be written as a string, blanks are dropped, and a
+        repository without a value names none."""
         watch = NerveConfig.from_dict({"sync": {"github_repos": {
-            "enabled": True, "repos": ["acme/widgets", "Other-Org/tool", "acme/gadgets"],
+            "enabled": True, "repos": ["acme/widgets", "Other-Org/tool", "acme/gadgets", "acme/gears"],
             "types": ["commit", "issue"],
-            "branches": {"ACME/Widgets": [" main ", "release/1.2", ""], "other-org/tool": "trunk", "acme/gadgets": []},
+            "branches": {
+                "ACME/Widgets": [" main ", "release/1.2", "", "1.10"], "other-org/tool": "trunk",
+                "acme/gadgets": [], "acme/gears": None,
+            },
         }}}).sync.github_repos
 
         assert watch.types == ["issue", "commit"]
-        assert watch.branches == {"acme/widgets": ["main", "release/1.2"], "Other-Org/tool": ["trunk"]}
-        assert (watch.branches_of("Acme/Widgets"), watch.branches_of("acme/gadgets")) == (["main", "release/1.2"], [])
-        assert GitHubReposSyncConfig.from_dict({"branches": None}).branches == {}
+        assert watch.branches == {"acme/widgets": ["main", "release/1.2", "1.10"], "Other-Org/tool": ["trunk"]}
+        assert (watch.branches_of("Acme/Widgets"), watch.branches_of("acme/gadgets"), watch.branches_of("acme/gears")) == (
+            ["main", "release/1.2", "1.10"], [], [],
+        )
+        assert GitHubReposSyncConfig.from_dict({"types": ["commit"], "branches": None}).branches == {}
         assert validate_config_keys({"sync": {"github_repos": {"branches": {"acme/widgets": ["main"]}}}}) == []
+
+    # What the message says about a branch that YAML read as something else.
+    QUOTE_IT = (
+        ": put the name in quotes, since YAML reads an unquoted 1.10 as the number 1.1, and an "
+        "unquoted no, off or 0 as a value that is no name"
+    )
 
     @pytest.mark.parametrize(("branches", "message"), [
         (["main"], "must map owner/repo names to their branches, got \"['main']\""),
+        ([], "must map owner/repo names to their branches, got '[]'"),
+        ("main", "must map owner/repo names to their branches, got 'main'"),
+        # A name with its ref prefix: main and refs/heads/main are one branch.
+        ({"acme/widgets": ["refs/heads/main"]}, "got 'refs/heads/main'"),
+        ({"acme/widgets": ["main", "refs/heads/main"]}, "got 'refs/heads/main'"),
+        ({"acme/widgets": "refs/tags/v1.2.0"}, "got 'refs/tags/v1.2.0'"),
+        # What YAML makes of an unquoted 1.10, no, off, 0, an empty item and a date.
+        ({"acme/widgets": [1.1]}, "of 'acme/widgets' must name each branch as a string, got 1.1" + QUOTE_IT),
+        ({"acme/widgets": ["main", False]}, "of 'acme/widgets' must name each branch as a string, got False" + QUOTE_IT),
+        ({"acme/widgets": False}, "of 'acme/widgets' must name each branch as a string, got False" + QUOTE_IT),
+        ({"acme/widgets": [0]}, "of 'acme/widgets' must name each branch as a string, got 0" + QUOTE_IT),
+        ({"acme/widgets": ["main", None]}, "of 'acme/widgets' must name each branch as a string, got None" + QUOTE_IT),
+        ({"acme/widgets": [date(2026, 1, 2)]}, "got datetime.date(2026, 1, 2)" + QUOTE_IT),
+        ({"acme/widgets": [["main"]]}, "got ['main']" + QUOTE_IT),
         ({"acme/other": ["main"]}, "names 'acme/other', which sync.github_repos.repos does not list"),
         ({"acme/widgets": ["main"], "ACME/Widgets": ["next"]}, "names 'acme/widgets' twice"),
         ({"acme/widgets": ["main", "main"]}, "of 'acme/widgets' name a branch twice"),
@@ -291,6 +317,7 @@ class TestSettings:
         ({"acme/widgets": ["b" * 122]}, f"got '{'b' * 122}'"),
         ({"acme/widgets": ["b" * 121]}, None),
         ({"acme/widgets": [f"b{n}" for n in range(8)]}, None),
+        ({"acme/widgets": ["refs", "refsx/main", "feature/refs/heads", "v1.2.0", "1.10", "no", "0"]}, None),
     ])
     def test_branches_the_gateway_would_refuse_refuse_to_load(self, branches, message, caplog):
         """While the watch is on. While it is off they are left out with a warning."""
@@ -308,15 +335,43 @@ class TestSettings:
             assert GitHubReposSyncConfig.from_dict(settings).branches in ({}, {"acme/widgets": ["main"]})
         assert "its branches would refuse to load once it is switched on" in caplog.text
 
+    @pytest.mark.parametrize("branches", [
+        {"acme/widgets": ["main"]},
+        # What the commit type would refuse.
+        ["main"], {"acme/other": ["main"]}, {"acme/widgets": ["refs/heads/main", 1.1, "a..b"]}, "main",
+    ])
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_branches_are_read_only_with_the_commit_type(self, branches, enabled, caplog):
+        """Without the commit type the setting is not read: a value that is
+        left there loads whatever it holds, with one warning, and names no
+        branch. An empty one says nothing."""
+        settings = {"enabled": enabled, "repos": ["acme/widgets"], "types": ["issue", "release"]}
+
+        with caplog.at_level(logging.WARNING, logger="nerve.config"):
+            watch = GitHubReposSyncConfig.from_dict({**settings, "branches": branches})
+
+        assert (watch.branches, watch.branches_of("acme/widgets")) == ({}, [])
+        assert [record.getMessage() for record in caplog.records] == [
+            "sync.github_repos.branches is set, and sync.github_repos.types does not name commit: "
+            "the branches are not read",
+        ]
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="nerve.config"):
+            for empty in (None, "", {}, []):
+                assert GitHubReposSyncConfig.from_dict({**settings, "branches": empty}).branches == {}
+            assert GitHubReposSyncConfig.from_dict(settings).branches == {}
+        assert caplog.records == []
+
     def test_a_repository_and_a_branch_fit_the_id_of_a_commit_record_together(self):
         """The gateway's bound: 194 bytes for both names."""
         repo = "o" * 39 + "/" + "r" * 100
+        settings = {"enabled": True, "repos": [repo], "types": ["commit"]}
 
-        fits = GitHubReposSyncConfig.from_dict({"enabled": True, "repos": [repo], "branches": {repo: ["b" * 54]}})
+        fits = GitHubReposSyncConfig.from_dict({**settings, "branches": {repo: ["b" * 54]}})
 
         assert fits.branches == {repo: ["b" * 54]}
         with pytest.raises(ValueError, match="at most 194 bytes together with the repository's name"):
-            GitHubReposSyncConfig.from_dict({"enabled": True, "repos": [repo], "branches": {repo: ["b" * 55]}})
+            GitHubReposSyncConfig.from_dict({**settings, "branches": {repo: ["b" * 55]}})
 
     def test_fifty_repositories_load(self):
         repos = [f"acme/repo-{n}" for n in range(50)]
@@ -621,6 +676,12 @@ class TestSubscriptionsBuilder:
             enabled=True, repos=["acme/gadgets"], types=["commit"], branches={"acme/gadgets": ["a..b"]},
         )
         assert github_repos_subscription(only_commits) is None
+        # A branch is named without its ref prefix.
+        by_ref = GitHubReposSyncConfig(
+            enabled=True, repos=["acme/gadgets"], types=["commit"],
+            branches={"acme/gadgets": ["main", "refs/heads/main", "refs/tags/v1.2.0"]},
+        )
+        assert github_repos_subscription(by_ref).repos[0].branches == ("main",)
 
     def test_the_repository_watch_goes_without_the_notifications_and_never_in_poll_mode(self):
         watch = GitHubReposSyncConfig(

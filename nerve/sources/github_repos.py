@@ -18,9 +18,11 @@ One request per repository and type, the most recently changed first:
 * ``issue``: ``GET /repos/{repo}/issues?state=all&sort=updated&direction=desc&per_page=100``;
   the issues endpoint lists the pull requests too, and they are skipped
 * ``release``: ``GET /repos/{repo}/releases?per_page=30``; drafts are skipped
-* ``commit``: ``GET /repos/{repo}/commits?sha={branch}&per_page=100`` for each
-  branch that ``branches`` names for the repository, or for its default
-  branch, which ``GET /repos/{repo}`` names
+* ``commit``: ``GET /repos/{repo}/commits?sha=refs/heads/{branch}&per_page=100``
+  for each branch that ``branches`` names for the repository, or for its
+  default branch, which ``GET /repos/{repo}`` names. The request names the
+  branch's ref, so a tag or a commit of the same name is never read in its
+  place
 
 Events (the record's ``Event:`` line and ``event`` metadata):
 
@@ -34,7 +36,7 @@ Events (the record's ``Event:`` line and ``event`` metadata):
 * ``released``: a release published since the last listing
 * ``pushed``: the head of a branch is another commit than at the last
   listing. One record per branch and run, with the commits that the listing
-  shows before the earlier head, never one record per commit
+  shows above the earlier head, never one record per commit
 
 Comments, reviews and labels move ``updated_at`` and report nothing. Before
 anything is reported or remembered, a pull request or an issue is dropped
@@ -141,17 +143,24 @@ _LISTINGS: dict[str, tuple[str, str]] = {
 _DEFAULT_TYPES = ("pull_request", "issue")
 
 # The type that reports the new commits of a repository's branches, and the
-# listing of one branch: its newest commits, the head first.
+# listing of one branch: its newest commits, the head first. The listing is
+# asked for the branch's ref, so that GitHub never reads a tag, a commit or
+# the head of a pull request of the same name in its place.
 _COMMIT_TYPE = "commit"
-_COMMITS_ENDPOINT = "repos/{repo}/commits?sha={branch}&per_page=100"
+_COMMITS_ENDPOINT = "repos/{repo}/commits?sha=refs/heads/{branch}&per_page=100"
 # A commit record lists at most this many commits, each as the commit and
 # the first line of its message, cut to this many characters, the entry to
 # this many bytes: the bounds of the record that the gateway builds.
 MAX_RECORD_COMMITS = 50
 _MAX_COMMIT_SUBJECT_CHARS = 120
 _MAX_COMMIT_ENTRY_BYTES = 256
-# The head commit's characters in the summary of a record that counts none.
+# The characters of a commit that a record's id keeps of each of its two
+# heads, and its summary of the head when the record counts no commit.
 _SHORT_COMMIT_CHARS = 12
+# The characters that a commit's line shows as a space, besides the control
+# characters: the line and the paragraph separator, and the bidirectional
+# controls, which change the order in which a reader sees the text after them.
+_SPACED_CHARS = frozenset("\u2028\u2029\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
 # Ends the commits of a record that does not list every new one.
 _TRUNCATED_COMMITS = "[... not every new commit is listed]"
 
@@ -632,8 +641,9 @@ def _commit_entry(item: dict[str, Any]) -> str:
     """A commit as a record lists it: the commit, a space, and the first line
     of its message.
 
-    The line has its control characters as spaces, no spaces around it, and
-    at most :data:`_MAX_COMMIT_SUBJECT_CHARS` characters; the entry is cut to
+    The line has a space in the place of each control character and of each
+    of :data:`_SPACED_CHARS`, no spaces around it, and at most
+    :data:`_MAX_COMMIT_SUBJECT_CHARS` characters; the entry is cut to
     :data:`_MAX_COMMIT_ENTRY_BYTES` bytes and ends in no space, so a commit
     without a message is the commit alone.
     """
@@ -641,7 +651,8 @@ def _commit_entry(item: dict[str, Any]) -> str:
     message = commit.get("message") if isinstance(commit, dict) else None
     subject = (message if isinstance(message, str) else "").split("\n", 1)[0]
     subject = "".join(
-        " " if unicodedata.category(character) == "Cc" else character for character in subject
+        " " if character in _SPACED_CHARS or unicodedata.category(character) == "Cc" else character
+        for character in subject
     ).strip(" ")[:_MAX_COMMIT_SUBJECT_CHARS]
     entry = f"{item.get('sha')} {subject}".encode(errors="replace")[:_MAX_COMMIT_ENTRY_BYTES]
     return entry.decode(errors="ignore").rstrip(" ")
@@ -653,14 +664,18 @@ def commits_record(
     """The record of the new commits of *branch*, whose head was *before* at
     the last listing.
 
-    *items* is the branch's listing, its head first. The new commits are
-    those that it shows before *before*, and the record lists the newest
-    :data:`MAX_RECORD_COMMITS` of them. When the listing does not show
-    *before* (the branch moved by more commits than the listing's page, or
-    was rewritten), or *before* is empty, the record lists the branch's newest
-    commits and counts none. ``truncated`` says that the record does not list
-    exactly the new commits. The record's time is *now*: the listing does not
-    say when a commit reached the branch.
+    *items* is the branch's listing, its head first, in GitHub's order: by
+    commit date, not by ancestry. The record counts the commits that the
+    listing shows above *before* and lists the newest
+    :data:`MAX_RECORD_COMMITS` of them; across a merge they are not always
+    the exact set of the new commits, and the record's URL compares the two
+    heads. When the listing does not show *before* (100 or more new commits,
+    or a rewritten branch), or *before* is empty, the record lists the
+    branch's newest commits and counts none. ``truncated`` says that, or that
+    the record lists fewer commits than it counts. The record's id names both
+    heads, so a branch that returns to an earlier head has a record of its
+    own. The record's time is *now*: the listing does not say when a commit
+    reached the branch.
     """
     head = str(items[0].get("sha"))
     shas = [item.get("sha") for item in items]
@@ -689,7 +704,10 @@ def commits_record(
         _TRUNCATED_COMMITS if truncated else None,
     ]
     return SourceRecord(
-        id=f"{repo}@{branch}:pushed:{head}",
+        id=(
+            f"{repo}@{branch}:pushed:"
+            f"{before[:_SHORT_COMMIT_CHARS]}..{head[:_SHORT_COMMIT_CHARS]}"
+        ),
         source=SOURCE_NAME,
         record_type=RECORD_TYPE,
         summary=f"[{repo}] {summary}",

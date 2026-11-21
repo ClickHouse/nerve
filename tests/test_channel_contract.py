@@ -880,6 +880,8 @@ class TestRepositoryWatch:
         repo_watch(watched("a/b", types=("pull_request", "issue", "release", "commit"))).validate()
         repo_watch(watched(types=("commit",), branches=("main", "release/1.2", "b" * 121))).validate()
         repo_watch(watched(types=("commit",), branches=tuple(f"b{n}" for n in range(8)))).validate()
+        # A branch may have the name of a tag, and refs in its name.
+        repo_watch(watched(types=("commit",), branches=("v1.2.0", "refs", "refsx/main", "feature/refs/heads"))).validate()
         # The repository's name and a branch's: 194 bytes together.
         repo_watch(watched("o" * 39 + "/" + "r" * 100, types=("commit",), branches=("b" * 54,))).validate()
 
@@ -913,6 +915,11 @@ class TestRepositoryWatch:
         (repo_watch(watched(types=("commit",), branches=("-main",))), "malformed_frame"),
         (repo_watch(watched(types=("commit",), branches=("a..b",))), "malformed_frame"),
         (repo_watch(watched(types=("commit",), branches=("main.lock",))), "malformed_frame"),
+        # A branch is named without its ref prefix, and no other ref is one.
+        (repo_watch(watched(types=("commit",), branches=("refs/heads/main",))), "malformed_frame"),
+        (repo_watch(watched(types=("commit",), branches=("main", "refs/heads/main"))), "malformed_frame"),
+        (repo_watch(watched(types=("commit",), branches=("refs/tags/v1.2.0",))), "malformed_frame"),
+        (repo_watch(watched(types=("commit",), branches=("refs/pull/1/head",))), "malformed_frame"),
         (repo_watch(watched(types=("commit",), branches=("b" * 122,))), "malformed_frame"),
         (repo_watch(watched("o" * 39 + "/" + "r" * 100, types=("commit",), branches=("b" * 55,))), "malformed_frame"),
         (repo_watch(watched(branches=("my branch",))), "malformed_frame"),
