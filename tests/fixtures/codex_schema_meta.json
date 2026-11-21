@@ -1,8 +1,8 @@
 {
-  "codex_cli_version": "0.164.0",
+  "codex_cli_version": "0.171.0",
   "generated_with": "codex app-server generate-json-schema",
-  "verified_date": "2026-10-23",
-  "canonical_v2_schema_sha256": "25febad0b85cbf3de2b841abfb716c5843e0b7d20fce7cfa40eb03c0d4214d17",
+  "verified_date": "2026-11-20",
+  "canonical_v2_schema_sha256": "e9d095b3f320b5a0b9ef6f89eee3bc1aafde377c94adfcf4abede31340e842bd",
   "required_methods": [
     "initialize",
     "account/read",
@@ -14,5 +14,5 @@
     "turn/start",
     "turn/interrupt"
   ],
-  "notes": "Canonical JSON hash is stable across generator output ordering. Regenerate with scripts/check_codex_schema.py when changing the tested CLI range. 0.155.1 -> 0.164.0: 32 definitions added, 49 changed. Removed: thread/rollback (ThreadRollbackParams, ThreadRollbackResponse), ConfigRequirements.windowsSandboxPrivateDesktop, ModelProviderCapabilitiesReadResponse.namespaceTools; nerve uses none of them. Every method and notification nerve uses is still present. Changes in shapes nerve uses are additive or optional: UserInput image takes url or fileId (nerve sends url), new optional TurnStartParams.parentTurnId/rootTurnId/disabledPluginIds, Turn.rootTurnId, McpServerStatus.httpOrigin/serverCapabilities/toolListMeta, ThreadItem mcpToolCall.mcpAppUi, subAgentActivity.model/reasoningEffort, imageGeneration result or fileId, new notifications thread/readState/changed, thread/prediction/updated, account/gatewayOAuth/changed."
+  "notes": "Canonical JSON hash is stable across generator output ordering. Regenerate with scripts/check_codex_schema.py when changing the tested CLI range. 0.164.0 -> 0.171.0: 46 definitions added, 40 changed, none removed. New client methods account/securitySetup/read, modelProvider/config/write, modelProvider/default/set and modelProvider/list; new notifications thread/search/partial and thread/section/changed; server-initiated requests unchanged (with --experimental, currentTime/read is gone; nerve does not handle it). Every method and notification nerve uses is still present. TurnStartParams, ThreadStartParams, ThreadResumeParams and the model/list entries are unchanged; the changes in other shapes nerve uses are additive or optional: ThreadForkParams.attachToSource, ModelListParams.modelProvider, Account.workspaceName and a gcp account type, new CodexErrorInfo values (cyberPolicy unchanged), InitializeCapabilities.requiredHumanApproval, ItemCompletedNotification.contentTokenCount, ThreadUsage.nativeUsageUsdMicros. Audio user input takes url or fileId; nerve sends none."
 }
