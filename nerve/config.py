@@ -1645,6 +1645,119 @@ class ChannelSourceConfig:
         )
 
 
+#: What ``telegram.topics.auto.close_on`` may name.
+AUTO_TOPIC_CLOSE_EVENTS = ("archive", "delete", "cron_done")
+
+
+@dataclass
+class TelegramAutoTopicsConfig:
+    """Give sessions a Telegram topic of their own without being asked.
+
+    With ``enabled``, a session whose source is in ``sources`` and whose id
+    matches none of the ``exclude`` patterns (``fnmatch``) gets a topic in the
+    home chat (``notifications.telegram_chat_id``, else the first allowed
+    user's DM) when its first turn starts after the switch went on. Each
+    session gets at most one: a topic someone deleted is not opened again.
+    Sessions that already have a Telegram topic, or came from Telegram, are
+    left alone.
+
+    The topic is let go of on the events in ``close_on``: ``archive``,
+    ``delete``, and ``cron_done`` (a one-run cron session whose run ended).
+    Telegram closes topics only in forum supergroups; in a private chat
+    ``private_chat_close`` picks between ``unbind`` (post a note and leave the
+    topic) and ``delete`` (the topic and its messages go). Only topics this
+    opened are closed this way.
+
+    ``mirror_turns`` posts each finished turn that did not come from Telegram
+    (the message, then the answer) into the topic, since a turn typed in the
+    web UI otherwise never reaches Telegram.
+    """
+
+    enabled: bool = False
+    sources: list[str] = field(default_factory=lambda: ["web", "cron", "hook"])
+    exclude: list[str] = field(default_factory=list)
+    close_on: list[str] = field(default_factory=lambda: list(AUTO_TOPIC_CLOSE_EVENTS))
+    private_chat_close: str = "unbind"   # "unbind" | "delete"
+    mirror_turns: bool = False
+    # Longer answers are cut, with a pointer to the web UI.
+    mirror_max_chars: int = 12_000
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: Any) -> TelegramAutoTopicsConfig:
+        if isinstance(d, bool):  # `auto: true` turns it on with the defaults
+            return cls(enabled=d)
+        if not isinstance(d, dict):
+            return cls()
+
+        def _names(key: str, default: list[str]) -> list[str]:
+            raw = d.get(key, default)
+            if raw is None:
+                return []
+            if isinstance(raw, str):
+                raw = [raw]
+            return [str(v).strip() for v in raw if str(v).strip()]
+
+        # Warned about, not refused: an unknown event never matches, and any
+        # private_chat_close but "delete" unbinds (the safe one).
+        close_on = _names("close_on", list(AUTO_TOPIC_CLOSE_EVENTS))
+        unknown = [e for e in close_on if e not in AUTO_TOPIC_CLOSE_EVENTS]
+        if unknown:
+            logger.warning(
+                "telegram.topics.auto.close_on: unknown event(s) %s are ignored; use %s",
+                unknown, list(AUTO_TOPIC_CLOSE_EVENTS),
+            )
+        private_close = str(d.get("private_chat_close", "unbind")).strip().lower()
+        if private_close not in ("unbind", "delete"):
+            logger.warning(
+                "telegram.topics.auto.private_chat_close %r: use 'unbind' or 'delete'; "
+                "unbinding", private_close,
+            )
+        return cls(
+            enabled=d.get("enabled", False),
+            sources=_names("sources", ["web", "cron", "hook"]),
+            exclude=_names("exclude", []),
+            close_on=close_on,
+            private_chat_close=private_close,
+            mirror_turns=d.get("mirror_turns", False),
+            mirror_max_chars=d.get("mirror_max_chars", 12_000),
+        )
+
+
+@dataclass
+class TelegramTopicsConfig:
+    """Forum topics as sessions: one topic is one session.
+
+    Telegram sends topic messages only from a forum supergroup, or from a
+    private chat once BotFather has topics on for the bot, so that is where
+    the real opt-in lives. ``enabled`` is the kill switch: off, every topic
+    message is treated as a message to the chat itself, as before.
+    """
+
+    enabled: bool = True
+    # /new and the /sessions "New session" button, used in the chat itself,
+    # open a new topic for the new session when the chat has topics.
+    new_session_creates_topic: bool = True
+    # Name a topic the bot opened after its session's generated title.
+    auto_rename: bool = True
+    # Topics for sessions that never asked for one; see TelegramAutoTopicsConfig.
+    auto: TelegramAutoTopicsConfig = field(default_factory=TelegramAutoTopicsConfig)
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: Any) -> TelegramTopicsConfig:
+        if isinstance(d, bool):  # `topics: false` switches the block off whole
+            return cls(enabled=d)
+        if not isinstance(d, dict):
+            return cls()
+        return cls(
+            enabled=d.get("enabled", True),
+            new_session_creates_topic=d.get("new_session_creates_topic", True),
+            auto_rename=d.get("auto_rename", True),
+            auto=TelegramAutoTopicsConfig.from_dict(d.get("auto", {})),
+        )
+
+
 @dataclass
 class TelegramConfig:
     enabled: bool = True
@@ -1668,6 +1781,12 @@ class TelegramConfig:
     reply_routes_to_origin_session: bool = True
     # Chats whose traffic feeds the inbox — see ChannelSourceConfig.
     source: ChannelSourceConfig = field(default_factory=ChannelSourceConfig)
+    # Forum topics as sessions — see TelegramTopicsConfig.
+    topics: TelegramTopicsConfig = field(default_factory=TelegramTopicsConfig)
+    # Send answers and plain notifications as rich messages (Bot API 10.1):
+    # headings, tables, task lists and code blocks render, and one message
+    # holds 32,768 characters. A message Telegram refuses goes out as HTML.
+    rich_messages: bool = True
 
     @classmethod
     @_coerced
@@ -1717,6 +1836,8 @@ class TelegramConfig:
             source=ChannelSourceConfig.from_dict(
                 d.get("source", {}), subject="chats",
             ).outside_hosted_mode("chats"),
+            topics=TelegramTopicsConfig.from_dict(d.get("topics", {})),
+            rich_messages=d.get("rich_messages", True),
         )
 
 
@@ -3306,6 +3427,9 @@ class NotificationsConfig:
     # Per channel, ``all`` (the default) or ``important``: see :meth:`wants`.
     levels: dict[str, str] = field(default_factory=dict)
     telegram_chat_id: int | None = None       # Target chat; falls back to first allowed_user
+    # A topic in that chat for the pushes, e.g. a "System" topic. A session
+    # that lives in a topic of its own gets its pushes there instead.
+    telegram_thread_id: int | None = None
     # Opt-in, default off = backward compatible. When true AND telegram_chat_id
     # is a non-private group/supergroup, that chat is DELIVERY-ONLY: notifications
     # are still sent there, but inbound messages never start an agent turn. Leave
@@ -3349,6 +3473,7 @@ class NotificationsConfig:
             channels=d.get("channels", ["web", "telegram", "slack"]),
             levels=_notification_levels(d.get("levels")),
             telegram_chat_id=d.get("telegram_chat_id"),
+            telegram_thread_id=d.get("telegram_thread_id"),
             delivery_only_sink=d.get("delivery_only_sink", False),
             slack_channel_id=str(d.get("slack_channel_id") or ""),
             default_expiry_hours=d.get("default_expiry_hours", 48),

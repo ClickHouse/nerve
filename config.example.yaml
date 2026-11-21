@@ -152,6 +152,13 @@ telegram:
   dm_policy: pairing
   # allowed_users: [123456789]   # users allowed to use the bot (or pair instead)
   stream_mode: partial           # "partial" (edit messages) or "full" (wait for complete)
+  # rich_messages: true          # answers as rich messages: tables, headings, 32k chars
+  # One forum topic = one session, in forum groups and in private chats where
+  # BotFather has topics on for the bot. The chat itself keeps working as before.
+  # topics:
+  #   enabled: true
+  #   new_session_creates_topic: true   # /new in the chat opens a topic for it
+  #   auto_rename: true                 # name "New session" topics after the session
   #
   # Feed the source inbox from watched group chats, reaching it as the source
   # "telegram:observed". This grant is independent of allowed_users: a sender
@@ -172,8 +179,12 @@ telegram:
 # By default they go to the owner's DM. Point telegram_chat_id at a dedicated group
 # to collect them there instead; enable delivery_only_sink to make that group one-way
 # (inbound messages and reactions there never start an agent turn). Default: off.
+# telegram_thread_id picks one topic of that group, e.g. a "System" topic; then
+# only that topic is one-way. A session that lives in a topic of its own gets its
+# notifications in that topic instead.
 # notifications:
 #   telegram_chat_id: -1000000000000
+#   telegram_thread_id: 7
 #   delivery_only_sink: false
 
 slack:

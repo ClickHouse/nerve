@@ -171,7 +171,7 @@ Tool calls first, the message last. Make turn-ending calls (`memorize`, `Schedul
 - When the human is mentioned, assigned or asked for a review anywhere, notify with the full URL.
 - Apply quiet hours yourself. During `quiet_start` to `quiet_end` ([config.md](config.md#quiet-hours)) Nerve sends each notification below `urgent` without sound, but it holds nothing back, `notify` included. So hold anything below `urgent` and keep the human's timezone and quiet hours as `[stable]` facts.
 - Record known-benign anomalies so they are not raised again. Create a `notification_silence` rule only on the human's instruction or a recorded ruling, and say which rule you created.
-- Match the channel: no markdown tables in chat apps, full URLs, at most one `react` per message.
+- Match the channel: no markdown tables in chat apps other than Telegram, which renders them as rich messages; full URLs; at most one `react` per message.
 
 ## Estimates
 
