@@ -1006,8 +1006,14 @@ class NotificationService:
 
     async def handle_dismiss(
         self, notification_id: str, *, actor: Actor | None = None,
+        settled: str | None = None, settled_line: str | None = None,
     ) -> bool:
         """Dismiss a pending notification.
+
+        ``settled`` names how an approval's target was settled somewhere
+        else (``approved``, ``declined``…): the cards then say
+        ``settled_line`` instead of "Dismissed without an answer", and the
+        audit event is ``approval-settled`` with that outcome.
 
         ``actor`` is the person who dismissed it, recorded in
         ``dismissed_by_actor_id``. Every dismissal sends a
@@ -1059,19 +1065,23 @@ class NotificationService:
                 "dismissal broadcast failed for %s: %s", notification_id, exc,
             )
 
+        line = settled_line if settled and settled_line else _DISMISSED_LINE
         if kind in ("question", "approval"):
-            await self._edit_telegram_closed(notif, _DISMISSED_LINE)
-            await self._edit_slack_closed(notif, _DISMISSED_LINE)
+            await self._edit_telegram_closed(notif, line)
+            await self._edit_slack_closed(notif, line)
 
         if kind == "approval":
-            await self._append_approval_audit({
-                "event": "approval-dismissed",
+            event: dict[str, Any] = {
+                "event": "approval-settled" if settled else "approval-dismissed",
                 "notification_id": notification_id,
                 "target_kind": notif.get("target_kind") or "",
                 "target_id": notif.get("target_id") or "",
                 "redelivery_count": notif.get("redelivery_count") or 0,
                 "dismissed_by_actor_id": actor_id_of(actor),
-            })
+            }
+            if settled:
+                event["outcome"] = settled
+            await self._append_approval_audit(event)
 
         if takes_note:
             self._dispatch_into_session(

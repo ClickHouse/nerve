@@ -63,6 +63,7 @@ from nerve.agent.cache_policy import resolve_cache_ttl
 from nerve.agent.interactive import (
     InteractiveToolHandler,
     defer_idle_timeout,
+    file_github_approval,
     register_handler,
     unregister_handler,
     get_handler,
@@ -320,6 +321,11 @@ def _is_empty_result(event: TurnCompleted) -> bool:
 # Turn queue (see docs/agents.md, "The turn queue").
 _QUEUE_PREVIEW_CHARS = 200
 _INTERNAL_QUEUE_LABELS = {"wakeup": "Scheduled wakeup", "cron": "Scheduled run"}
+
+# Session sources a person answers in: GitHub-write approvals there are also
+# sent as an approval notification, to every notification channel. Cron, hook
+# and workflow sessions have no person, so their GitHub writes are declined.
+_PERSON_SOURCES = frozenset({"web", "telegram", "slack", "api", "wakeup"})
 _RECENT_IDS_KEPT = 64
 _CLIENT_MSG_TTL_SECONDS = 600.0
 
@@ -1838,6 +1844,12 @@ class AgentEngine:
                 interactive_capable=is_interactive,
             )
             self._wire_interaction_hooks(session_id, handler)
+            if source in _PERSON_SOURCES or source == getattr(
+                getattr(self.config, "slack", None), "source", None,
+            ):
+                # GitHub writes also ask outside the web UI
+                # (nerve/agent/github_gate.py).
+                handler.approval_relay = self._github_approval_relay(session_id)
             register_handler(session_id, handler)
 
             # Render the system prompt (engine-owned: identity files,
@@ -2375,7 +2387,31 @@ class AgentEngine:
     def _end_turn(self, session_id: str, outcome: TurnOutcome) -> TurnOutcome:
         for watch in self._turn_watches.get(session_id, ()):
             watch.outcome = outcome
+        hub = get_handler(session_id)
+        if hub is not None:
+            hub.end_turn()
         return outcome
+
+    def _github_approval_relay(self, session_id: str):
+        """The hub's ``approval_relay`` for *session_id*: files the GitHub
+        write as an approval notification (``propose_action``, target kind
+        ``github-write``), which goes to every notification channel
+        (Telegram, Slack, hosted channels, web push) and is answered once.
+        Skipped while the person has the web card in front of them: a web
+        client watches the session and the turn came from the web UI."""
+        async def relay(interaction_id: str, payload: dict):
+            service = getattr(self, "notification_service", None)
+            if service is None:
+                return None
+            hub = get_handler(session_id)
+            if (
+                hub is not None and hub.interactive_capable
+                and hub.turn_source in (None, "web", "api", "wakeup")
+                and broadcaster.has_listeners(session_id)
+            ):
+                return None
+            return await file_github_approval(service, session_id, interaction_id, payload)
+        return relay
 
     async def _run_stop_listeners(
         self, session_id: str, attribution: Attribution,
@@ -4766,6 +4802,17 @@ class AgentEngine:
                     # client on a fresh transcript re-renders the preamble.
                     turn_input = _with_session_preamble(turn_input)
                     try:
+                        # The GitHub write gate reads the person's own
+                        # message of this turn (re-set per attempt: a retry
+                        # registers a new hub).
+                        _hub = get_handler(session_id)
+                        if _hub is not None:
+                            _hub.begin_turn(
+                                user_message
+                                if actor is not None and actor.is_human and not internal
+                                else None,
+                                source,
+                            )
                         await client.start_turn(turn_input)
                     except TransportDiedError as _qerr:
                         if _attempt > 0:

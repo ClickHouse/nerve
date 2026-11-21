@@ -175,6 +175,48 @@ the model never sees it during an earlier turn.
 | `x` `x` | Stop the focused agent (press twice) |
 | `Esc` (in the panel) | Back to the message box (never stops the turn) |
 
+## GitHub writes
+
+With `agent.github_write_gate: true` (off by default), a shell command that
+pushes, posts or changes something on GitHub waits for the person
+(`nerve/agent/github_gate.py`, Claude sessions). The web UI shows
+an "Agent wants to write to GitHub" card with the command. The same request
+goes out as an approval notification with Approve / Decline buttons, to every
+channel in `notifications.channels` (Telegram, Slack, hosted channels, web
+push), and the first answer anywhere settles it (target kind
+`github-write`). The notification is skipped while a web client watches the
+session and the turn came from the web UI. When the write is settled another
+way (the web card, a stop), its cards close and say how it was settled. A session that only a channel
+can reach (Slack, Telegram) and whose notification reached no channel is
+declined at once. No answer within an hour declines it.
+
+It runs without a card when:
+
+- the person's message that started the turn starts with "push" or "post"
+  (after an optional "yes", "ok", "go"), is at most 80 characters, asks no
+  question and has no "don't", "not", "never", "no" or "without". "push"
+  covers pushes, "post" covers new issues and PRs, comments, reviews and
+  reactions (an API write to any other endpoint always asks). A Telegram reply counts only the person's own text;
+- it is a CI rerun (`gh run rerun`, `POST …/actions/runs/{id}/rerun`,
+  `…/rerun-failed-jobs`, `…/actions/jobs/{id}/rerun`), as a cron job that
+  reruns failed CI does.
+
+Force pushes, branch and ref deletions, merges, closes, repository and
+settings changes always ask. Sessions without a person (cron, hooks,
+workflow runs) are refused; background sub-agents too, since the CLI never
+asks for them.
+
+GraphQL (`gh api graphql`) writes only through a `mutation`. An inline query asks only when it holds one (comments and strings don't count). As for REST, only the comment, review, reaction and create mutations (`addComment`, `addPullRequestReview`, `submitPullRequestReview`, `addReaction`, `createIssue`, `createPullRequest` and their kin) count as a post; any other mutation (`mergePullRequest`, `closeIssue`, `deleteRef`, `updateRepository`, `createCommitOnBranch`…), a fragment spread, or a document the gate can't read always asks. A query in a file (`-F query=@file`, `--input file`, or `-` for stdin) passes the command check, and the `gh` wrapper reads it where the command runs: a mutation there, or a file it can't read, is refused unless approved.
+
+Writes inside a script are caught by `git` and `gh` wrappers that come first
+on the runtime's PATH (`~/.nerve/github-gate/bin`). They let a write through
+only when the command that ran them was approved: the gate exports
+`NERVE_GITHUB_APPROVAL` into it. A script that writes starts with
+`NERVE_GITHUB_WRITE=1` so the gate asks before it runs. The gate is a guard
+against mistakes; the agent runs as the same user as the wrappers.
+
+The gate is off by default: `agent.github_write_gate: true` turns it on.
+
 ## Configuration
 
 `agent.subagents` in `config.yaml` (see [config.md](config.md#agent)):

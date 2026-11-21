@@ -49,8 +49,9 @@ export function ApprovalCard() {
     ? (item.changes as ChangeEntry[])
     : [];
 
-  const title =
-    kind === 'command_approval' ? 'Agent wants to run a command'
+  // A GitHub write (nerve/agent/github_gate.py) names itself.
+  const title = (typeof input.title === 'string' && input.title) ? input.title
+    : kind === 'command_approval' ? 'Agent wants to run a command'
     : kind === 'file_approval' ? 'Agent wants to change files'
     : 'Agent requests elevated permissions';
 

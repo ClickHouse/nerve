@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Coroutine
@@ -47,6 +48,14 @@ APPROVAL_KINDS = frozenset({
     "file_approval",
     "permission_approval",
 })
+
+# The ``tool_name`` of a GitHub-write approval (nerve/agent/github_gate.py).
+GITHUB_WRITE_TOOL = "GitHubWrite"
+UNREACHABLE_MESSAGE = (
+    "This command writes to GitHub and needs the person's approval, but nobody "
+    "can approve it from this session (no web UI and no notification channel). "
+    "Ask them with the notify or ask_user tool and let them run it from a chat."
+)
 
 # Tools that modify files — trigger pre-execution snapshot
 FILE_MODIFY_TOOLS = frozenset({
@@ -143,6 +152,43 @@ class InteractiveToolHandler:
         # after its ``interaction`` event, and writes a summary of it in the
         # background. Called synchronously: it must not block the pause.
         self.on_plan_pending: Callable[[str, dict], None] | None = None
+        # Set by the engine for sessions a person can answer in: posts a
+        # GitHub-write approval where the person sees it outside the web UI
+        # (Telegram). ``relay(interaction_id, payload)`` runs once the
+        # ``interaction`` event went out and returns an async
+        # ``finish(outcome)`` that reports "approved", "declined" or
+        # "expired" back there, or None when it posted nothing.
+        self.approval_relay: (
+            Callable[[str, dict[str, Any]], Coroutine[Any, Any, Callable[[str], Coroutine[Any, Any, None]] | None]]
+            | None
+        ) = None
+        # The turn that runs now (set by the engine): the person's message
+        # that started it (None for an autonomous turn or a system message)
+        # and the channel it came from. The GitHub write gate reads them.
+        self.turn_message: str | None = None
+        self.turn_source: str | None = None
+        self._turn_started: float | None = None
+
+    # -- the running turn ----------------------------------------------- #
+
+    def begin_turn(self, message: str | None, source: str | None) -> None:
+        """A turn starts. *message* is the person's own message, or None."""
+        self.turn_message = message
+        self.turn_source = source
+        self._turn_started = time.monotonic()
+
+    def end_turn(self) -> None:
+        self.turn_message = None
+        self.turn_source = None
+        self._turn_started = None
+
+    def turn_person_message(self, max_age: float = 4 * 3600) -> str | None:
+        """The person's message of the running turn, while it is recent."""
+        if self.turn_message is None or self._turn_started is None:
+            return None
+        if time.monotonic() - self._turn_started > max_age:
+            return None
+        return self.turn_message
 
     # -- snapshot bookkeeping ------------------------------------------- #
 
@@ -244,6 +290,26 @@ class InteractiveToolHandler:
             )
         return await self._pause(kind, payload, kind)
 
+    async def request_github_approval(
+        self, payload: dict[str, Any],
+    ) -> InteractionOutcome:
+        """Pause a shell command that writes to GitHub until the person
+        approves it (see nerve/agent/github_gate.py).
+
+        Shown as a ``command_approval`` card in the web UI, and posted by
+        :attr:`approval_relay` (Telegram) where the engine set one. A
+        session with neither (cron, hooks) is declined at once.
+        """
+        if not self.interactive_capable and self.approval_relay is None:
+            logger.info(
+                "Session %s: GitHub write declined (no person to ask here)",
+                self.session_id,
+            )
+            return InteractionOutcome(denied=True, message=UNREACHABLE_MESSAGE)
+        return await self._pause(
+            GITHUB_WRITE_TOOL, payload, "command_approval", relay=self.approval_relay,
+        )
+
     async def _pause(
         self,
         tool_name: str,
@@ -251,11 +317,14 @@ class InteractiveToolHandler:
         interaction_type: str,
         timeout: float | None = None,
         agent: dict | None = None,
+        relay: Callable[..., Coroutine[Any, Any, Any]] | None = None,
     ) -> InteractionOutcome:
         """Broadcast to the UI, wait for the user's response.
 
         ``agent`` names the sub-agent that asked (``None``: the
-        orchestrator)."""
+        orchestrator). ``relay`` also posts the pause outside the web UI
+        (see :attr:`approval_relay`); on a channel without the web UI, a
+        relay that posts nothing ends the pause at once, declined."""
         interaction_id = str(uuid4())
         pending = PendingInteraction(
             interaction_id=interaction_id,
@@ -286,7 +355,24 @@ class InteractiveToolHandler:
             self.session_id, tool_name, interaction_id[:8],
         )
 
+        finish: Callable[[str], Coroutine[Any, Any, None]] | None = None
+        outcome_label = "expired"
         try:
+            if relay is not None:
+                try:
+                    finish = await relay(interaction_id, tool_input)
+                except Exception:  # noqa: BLE001 — the web card still stands
+                    logger.warning(
+                        "Session %s: approval relay failed for %s",
+                        self.session_id, interaction_id[:8], exc_info=True,
+                    )
+                if finish is None and not self.interactive_capable:
+                    outcome_label = "unreachable"
+                    logger.info(
+                        "Session %s: nobody can answer %s here; declined",
+                        self.session_id, interaction_id[:8],
+                    )
+                    return InteractionOutcome(denied=True, message=UNREACHABLE_MESSAGE)
             try:
                 wait_timeout = INTERACTION_TIMEOUT if timeout is None else max(0.1, timeout)
                 await asyncio.wait_for(pending.event.wait(), timeout=wait_timeout)
@@ -304,6 +390,7 @@ class InteractiveToolHandler:
                     ),
                 )
             except asyncio.CancelledError:
+                outcome_label = "cancelled"
                 logger.info(
                     "Session %s: interaction %s cancelled",
                     self.session_id, interaction_id[:8],
@@ -314,6 +401,9 @@ class InteractiveToolHandler:
                 )
 
             if pending.denied:
+                outcome_label = (
+                    "cancelled" if pending.deny_message == "Session stopped." else "declined"
+                )
                 logger.info(
                     "Session %s: %s denied by user", self.session_id, tool_name,
                 )
@@ -322,8 +412,17 @@ class InteractiveToolHandler:
                     message=pending.deny_message or "Declined by user.",
                 )
 
+            outcome_label = "approved"
             return InteractionOutcome(result=pending.result)
         finally:
+            if finish is not None:
+                try:
+                    await finish(outcome_label)
+                except Exception:  # noqa: BLE001 — reporting back is best effort
+                    logger.debug(
+                        "approval relay finish failed for %s", interaction_id[:8],
+                        exc_info=True,
+                    )
             # Always drop the pending entry and refresh the waiting indicator,
             # regardless of how the wait resolved (answered, denied, timeout,
             # cancelled). has_pending then reflects any remaining interaction.
@@ -458,6 +557,130 @@ def unregister_handler(session_id: str) -> None:
 def get_handler(session_id: str) -> InteractiveToolHandler | None:
     """Get the handler for a session."""
     return _handlers.get(session_id)
+
+
+# The ``target_kind`` of the approval notification a GitHub write files
+# (``NotificationService.propose_action``); its target id is the interaction.
+GITHUB_WRITE_KIND = "github-write"
+_GITHUB_WRITE_OPTIONS = [
+    {"label": "Approve", "value": "approve"},
+    {"label": "Decline", "value": "decline"},
+]
+# What a card says when the write was settled somewhere else.
+_SETTLED_LINES = {
+    "approved": "✅ Approved in another place",
+    "declined": "❌ Declined in another place",
+    "expired": "⏰ Expired unanswered",
+    "cancelled": "🔕 Cancelled",
+    "unreachable": "🔕 Cancelled",
+}
+# An approval waits this long (interactions time out after an hour too).
+_GITHUB_WRITE_EXPIRY_HOURS = 1
+
+
+def _github_write_text(payload: dict[str, Any]) -> tuple[str, str]:
+    """The approval notification's title and Markdown body."""
+    command = str((payload.get("item") or {}).get("command") or "")
+    if len(command) > 2500:
+        command = command[:2500] + "…"
+    reason = str(payload.get("reason") or "")[:600]
+    fence = "````" if "```" in command else "```"
+    body = f"{fence}\n{command}\n{fence}" + (f"\n{reason}" if reason else "")
+    return "🔐 GitHub write needs your OK", body
+
+
+async def file_github_approval(
+    service: Any, session_id: str, interaction_id: str, payload: dict[str, Any],
+) -> Callable[[str], Coroutine[Any, Any, None]] | None:
+    """File a GitHub write as an approval notification, for every channel.
+
+    The answer comes back through the ``github-write`` dispatcher, which
+    resolves the pending interaction. Returns the relay's ``finish``: it
+    closes a card that is still pending once the interaction ended another
+    way (the web card, expiry, a stop). Returns None when no channel
+    outside the web UI took the card, so a session nobody watches in the
+    web UI is declined at once rather than waiting an hour.
+    """
+    title, body = _github_write_text(payload)
+    result = await service.propose_action(
+        session_id, GITHUB_WRITE_KIND, interaction_id, title, body,
+        options=_GITHUB_WRITE_OPTIONS, priority="high",
+        expiry_hours=_GITHUB_WRITE_EXPIRY_HOURS,
+    )
+    notification_id = result["notification_id"]
+    row = await service.db.get_notification(notification_id) or {}
+    try:
+        import json
+
+        delivered = json.loads(row.get("channels_delivered") or "[]")
+    except (TypeError, ValueError):
+        delivered = []
+    reached = [c for c in delivered if c != "web"]
+
+    async def finish(outcome: str) -> None:
+        current = await service.db.get_notification(notification_id)
+        if current and current.get("status") == "pending":
+            await service.handle_dismiss(
+                notification_id, settled=outcome,
+                settled_line=_SETTLED_LINES.get(outcome, _SETTLED_LINES["cancelled"]),
+            )
+
+    if not reached:
+        await finish("unreachable")
+        return None
+    return finish
+
+
+async def _dispatch_github_write(
+    notification: dict[str, Any],
+    target_id: str,
+    decision: str,
+    config: Any,
+    *,
+    actor: Any,
+) -> Any:
+    """An answer to a GitHub-write approval card, from any channel."""
+    from nerve.notifications import handlers as notification_handlers
+
+    approve = decision == "approve"
+    session_id = answer_github_approval(target_id, approve)
+    return notification_handlers.DispatchResult(
+        ok=session_id is not None,
+        audit_event={
+            "event": "approval-acted",
+            "notification_id": notification.get("id"),
+            "target_kind": GITHUB_WRITE_KIND,
+            "target_id": target_id,
+            "decision": decision,
+            "ok": session_id is not None,
+            **({} if session_id else {"error": "no session waits on this approval"}),
+        },
+    )
+
+
+def _register_github_write_dispatcher() -> None:
+    from nerve.notifications import handlers as notification_handlers
+
+    notification_handlers.register(GITHUB_WRITE_KIND, _dispatch_github_write)
+
+
+_register_github_write_dispatcher()
+
+
+def answer_github_approval(interaction_id: str, approve: bool) -> str | None:
+    """Approve or decline a pending GitHub-write approval from outside the
+    web UI (a Telegram button). Returns the session id, or None when no
+    session waits on it (answered already, expired, or another kind)."""
+    for session_id, handler in list(_handlers.items()):
+        pending = handler._pending.get(interaction_id)
+        if pending is None or pending.tool_name != GITHUB_WRITE_TOOL:
+            continue
+        if approve:
+            handler.resolve(interaction_id, None)
+        else:
+            handler.deny(interaction_id, "Declined by user.")
+        return session_id
+    return None
 
 
 def get_awaiting_ids() -> set[str]:
