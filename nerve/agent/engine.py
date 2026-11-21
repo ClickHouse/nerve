@@ -60,6 +60,7 @@ from nerve.agent.backends import (
 )
 from nerve.agent.backends.events import TurnStatus
 from nerve.agent.cache_policy import resolve_cache_ttl
+from nerve.agent.effort import session_effort
 from nerve.agent.interactive import (
     InteractiveToolHandler,
     defer_idle_timeout,
@@ -543,6 +544,11 @@ class AgentEngine:
         self._metadata_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
+        # The session's effort pick (``metadata["effort"]``; None = Default)
+        # each live client was built with. The CLI fixes ``--effort`` at
+        # connect time like the model, so a changed pick recreates the
+        # client (see _get_or_create_client).
+        self._session_efforts: dict[str, str | None] = {}
         # Last model *observed* serving each session (from
         # AssistantMessage.model). The API may silently serve a different
         # model than requested — e.g. a capacity fallback from a frontier
@@ -1625,11 +1631,23 @@ class AgentEngine:
                 or self.config.workspace
             )
 
+            # The session's own effort pick (None = Default). Read from the
+            # row each time, like the model, so a change made between turns
+            # (PATCH /api/sessions) reaches the next client build.
+            requested_effort = session_effort(session)
+
             if client is not None:
                 # The row is the truth for the chat's Daybreak switch: a live
                 # client that missed a change takes it before its next turn.
                 await self._apply_daybreak(client, session_meta)
                 bound_model = self._session_models.get(session_id)
+                model_switch = (
+                    bound_model is not None and bound_model != requested_model
+                )
+                effort_switch = (
+                    session_id in self._session_efforts
+                    and self._session_efforts[session_id] != requested_effort
+                )
                 # Health check: verify the underlying subprocess is alive
                 if not client.is_alive():
                     logger.warning(
@@ -1638,21 +1656,28 @@ class AgentEngine:
                     )
                     reason = "process_exit"
                 elif (
-                    bound_model is not None and bound_model != requested_model
+                    (model_switch or effort_switch)
                     and self.agents.has_live(session_id)
                 ):
-                    # A model switch recreates the runtime, and every
-                    # background agent dies with it: keep the bound client
-                    # (and its model) while agents run. The API refuses the
-                    # switch too (409 live_background_agents).
+                    # A model or effort switch recreates the runtime, and
+                    # every background agent dies with it: keep the bound
+                    # client (and its model and effort) while agents run.
+                    # The API refuses the switch too (409
+                    # live_background_agents).
                     logger.warning(
-                        "Session %s: model change %s → %s deferred: %d "
-                        "background agent(s) still running on this runtime",
-                        session_id, bound_model, requested_model,
+                        "Session %s: %s deferred: %d background agent(s) "
+                        "still running on this runtime",
+                        session_id,
+                        (
+                            f"model change {bound_model} → {requested_model}"
+                            if model_switch else
+                            f"effort change {self._session_efforts.get(session_id)}"
+                            f" → {requested_effort}"
+                        ),
                         self.agents.live_count(session_id),
                     )
                     return client
-                elif bound_model is not None and bound_model != requested_model:
+                elif model_switch:
                     # Model switched mid-session (e.g. the composer's picker
                     # moved to a different model). Clients bind their model
                     # at connect time, so tear down and recreate below.
@@ -1665,6 +1690,18 @@ class AgentEngine:
                     # the first message on the new model doesn't fire a
                     # model_change event for a change the user asked for.
                     self._observed_models.pop(session_id, None)
+                elif effort_switch:
+                    # The session's effort pick changed between turns. The
+                    # runtime takes its effort at connect time (Claude:
+                    # --effort; the SDK can't change it on a live CLI), so
+                    # tear down and recreate below; resume keeps the
+                    # conversation.
+                    logger.info(
+                        "Session %s effort changed (%s → %s), recreating client",
+                        session_id, self._session_efforts.get(session_id) or "default",
+                        requested_effort or "default",
+                    )
+                    reason = "effort_switch"
                 elif self._mcp_catalog_rebuild_due(
                     session_id, client, backend, sdk_resume_id, session_cwd,
                 ):
@@ -1675,6 +1712,7 @@ class AgentEngine:
                 self.sessions.remove_client(session_id, reason=reason)
                 self._session_backends.pop(session_id, None)
                 self._session_models.pop(session_id, None)
+                self._session_efforts.pop(session_id, None)
                 unregister_handler(session_id)
                 await self._safe_disconnect(client)
                 client = None
@@ -1912,13 +1950,26 @@ class AgentEngine:
             # or a newer one (see _mcp_catalog_rebuild_due).
             self._client_mcp_revisions[session_id] = self._mcp_catalog_revision
 
+            async def _observe_effort_cb(sid: str, details: dict) -> None:
+                # What the runtime reports a turn or a sub-agent runs at:
+                # recorded once per agent (and once for the main loop) per
+                # client, so the session's events show whether sub-agents
+                # inherited the session's effort. State of the runtime, so
+                # unattributed.
+                await self.db.log_session_event(sid, "effort_observed", details)
+
             spec = SessionSpec(
                 session_id=session_id,
                 source=source,
                 model=requested_model,
-                effort=effort_override or self._base_effort_for_source(
-                    source, self.config.agent.effort,
-                    self.config.agent.cron_effort,
+                # A per-run override (workflow runs, a cron job's own effort)
+                # first, then the session's pick, then the source default.
+                effort=(
+                    effort_override or requested_effort
+                    or self._base_effort_for_source(
+                        source, self.config.agent.effort,
+                        self.config.agent.cron_effort,
+                    )
                 ),
                 system_prompt=system_prompt,
                 cwd=session_cwd,
@@ -1928,6 +1979,7 @@ class AgentEngine:
                 interactive=handler,
                 snapshot=self._save_file_snapshot,
                 record_wakeup=_record_wakeup_cb,
+                observe_effort=_observe_effort_cb,
                 cache_ttl=cache_ttl,
                 max_turns=self.config.agent.max_turns,
                 idle_timeout=float(self.config.agent.cli_idle_timeout_seconds),
@@ -2034,6 +2086,7 @@ class AgentEngine:
             # Record connected_at and the resolved model
             resolved_model = getattr(client, "model", "") or requested_model
             self._session_models[session_id] = resolved_model
+            self._session_efforts[session_id] = requested_effort
             now = datetime.now(timezone.utc).isoformat()
             connected_at = session.get("connected_at") if session and sdk_resume_id else now
             await self.sessions.mark_active(
@@ -2249,6 +2302,7 @@ class AgentEngine:
         client = self.sessions.remove_client(session_id, reason=reason)
         self._session_backends.pop(session_id, None)
         self._session_models.pop(session_id, None)
+        self._session_efforts.pop(session_id, None)
         self._client_mcp_revisions.pop(session_id, None)
         unregister_handler(session_id)
 

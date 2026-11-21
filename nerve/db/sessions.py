@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 
+from nerve.agent.effort import METADATA_KEY as EFFORT_METADATA_KEY
+from nerve.agent.effort import effort_from_metadata
 from nerve.identity import (
     CAUSE_FROM_ACTOR,
     UNATTRIBUTED,
@@ -492,6 +494,12 @@ class SessionStore:
         Both updates run in one transaction (the column sync is inlined —
         calling :meth:`update_session_fields` here would deadlock on the
         non-reentrant write lock).
+
+        The session's effort pick (``metadata["effort"]``) is not this
+        method's to change: :meth:`set_session_effort` owns it. The stored
+        value is kept whatever ``metadata`` says, so a caller that read the
+        metadata before an effort change and writes its copy back afterwards
+        cannot undo the change.
         """
         col_sync: dict[str, str | None] = {}
         if "sdk_session_id" in metadata:
@@ -500,9 +508,19 @@ class SessionStore:
             col_sync["connected_at"] = metadata["connected_at"]
         built = self._build_session_fields_update(session_id, col_sync)
         async with self._atomic():
+            async with self.db.execute(
+                "SELECT metadata FROM sessions WHERE id = ?", (session_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            stored_effort = effort_from_metadata(row["metadata"] if row else None)
+            out = {
+                k: v for k, v in metadata.items() if k != EFFORT_METADATA_KEY
+            }
+            if stored_effort is not None:
+                out[EFFORT_METADATA_KEY] = stored_effort
             await self.db.execute(
                 "UPDATE sessions SET metadata = ? WHERE id = ?",
-                (json.dumps(metadata), session_id),
+                (json.dumps(out), session_id),
             )
             if built is not None:
                 await self.db.execute(*built)
@@ -634,6 +652,58 @@ class SessionStore:
                 )
                 written.append(event_type)
         return written
+
+    async def set_session_effort(
+        self,
+        session_id: str,
+        effort: str | None,
+        *,
+        attribution: Attribution = UNATTRIBUTED,
+    ) -> bool:
+        """Set the session's effort pick, or clear it with ``None`` (Default).
+
+        The only writer of ``metadata["effort"]`` (``update_session_metadata``
+        keeps the stored value). ``effort`` must already be a valid level or
+        ``None`` (see :func:`nerve.agent.effort.normalize_effort`). In the
+        same transaction a change records an ``effort_changed`` session event
+        with ``attribution``; its details hold the new value and the
+        ``previous`` one, ``None`` standing for Default.
+
+        Returns whether the stored value changed. An unknown session returns
+        ``False`` and writes nothing.
+        """
+        async with self._atomic():
+            async with self.db.execute(
+                "SELECT metadata FROM sessions WHERE id = ?", (session_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return False
+            try:
+                meta = json.loads(row["metadata"] or "{}")
+            except (TypeError, ValueError):
+                meta = {}
+            if not isinstance(meta, dict):
+                meta = {}
+            previous = effort_from_metadata(meta)
+            if previous == effort:
+                return False
+            if effort is None:
+                meta.pop(EFFORT_METADATA_KEY, None)
+            else:
+                meta[EFFORT_METADATA_KEY] = effort
+            await self.db.execute(
+                "UPDATE sessions SET metadata = ? WHERE id = ?",
+                (json.dumps(meta), session_id),
+            )
+            await self.db.execute(
+                _SESSION_EVENT_SQL,
+                _session_event_params(
+                    session_id, "effort_changed",
+                    {"effort": effort, "previous": previous}, attribution,
+                ),
+            )
+        return True
 
     async def change_session_status(
         self,

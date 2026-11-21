@@ -156,9 +156,9 @@ the model never sees it during an earlier turn.
 - The next turn after such an ending carries one reminder for the
   orchestrator listing the agents that ended outside its control; it is not
   stored in the history.
-- A runtime with live agents is never reaped for idleness, and a model switch
-  waits until they finish (`PATCH /api/sessions/{id}` answers `409
-  live_background_agents`).
+- A runtime with live agents is never reaped for idleness, and a model or
+  effort switch waits until they finish (`PATCH /api/sessions/{id}` answers
+  `409 live_background_agents`).
 - Archiving a session with live agents is refused (`skipped` with the reason
   `background agents running`) unless forced (`?force=true`); the web UI asks
   first. Automatic cleanup skips such sessions. Deleting a session deletes its
@@ -174,6 +174,31 @@ the model never sees it during an earlier turn.
 | `Enter` | Open the agent's tab |
 | `x` `x` | Stop the focused agent (press twice) |
 | `Esc` (in the panel) | Back to the message box (never stops the turn) |
+
+## Effort
+
+A session can run at its own reasoning effort, picked in the composer next
+to the model (or `effort` on `POST`/`PATCH /api/sessions/{id}`); Default is
+`agent.effort`. Nerve passes it to the session's runtime when the runtime
+starts (Claude: `--effort`), and changing it restarts the runtime on the next
+turn. The agents the runtime starts take their effort from the CLI, in this
+order:
+
+1. `CLAUDE_CODE_EFFORT_LEVEL` in the runtime's environment (Nerve sets none);
+2. the `effort` the call asks for (`Agent`'s `effort`, a workflow
+   `agent({effort})`), or the agent definition's;
+3. the effort of the agent that started it (nested agents);
+4. **the session's effort**;
+5. the model's default.
+
+The CLI then caps the level to what the agent's model supports. So a skill
+that asks for a lower effort for one agent gets it, and everything else runs
+at the session's effort. Anthropic can also lower an inherited level for
+`Agent` sub-agents from their side; to see what actually happened, the
+session's events record the effort the runtime reports, once per agent and
+once for the main loop per runtime: `effort_observed` with `agent_id`
+(`null` for the main loop), `agent_type` and `effort`
+(`GET /api/sessions/{id}/events`).
 
 ## Configuration
 

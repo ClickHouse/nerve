@@ -38,6 +38,9 @@ vi.mock('../api/client', () => ({
     stopSession: vi.fn(),
     createSession: vi.fn(),
     getSessionTasks: vi.fn(async () => ({ tasks: [] })),
+
+    updateSession: vi.fn(),
+    getModels: vi.fn(),
   },
   apiErrorCode: () => null,
   // chatStore reads these authStore dependencies when it stamps optimistic rows.
@@ -1162,5 +1165,130 @@ describe('a new chat from a session that does not exist', () => {
     const { virtualSession, drafts } = useChatStore.getState();
     expect(drafts[SID]).toBe('kept here');
     expect(drafts[virtualSession!.id] ?? '').toBe('');
+  });
+});
+
+describe('per-chat effort', () => {
+  const NOW = '2026-11-05T12:00:00Z';
+  const row = (id: string, effort: string | null) =>
+    ({ id, title: id, source: 'web', updated_at: NOW, model: 'model-a', effort }) as never;
+  const models = { default: 'model-a', models: [{ id: 'model-a', provider: 'anthropic', backend: 'claude' }], ollama: { enabled: false, routable: false, available: false } };
+  let errorSpy: { mockRestore: () => void } = { mockRestore: () => {} };
+
+  beforeEach(() => {
+    localStorage.clear();
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    useChatStore.setState({
+      sessions: [], archivedSessions: null, systemSessions: null, drafts: {},
+      virtualSession: null, activeSession: '', newChatBackend: null, backendDefault: null,
+      newChatModels: {}, newChatReviewLoop: null, newChatEffort: null,
+      effortDefault: null, effortLevels: {},
+    });
+  });
+
+  afterEach(() => errorSpy.mockRestore());
+
+  it('reads the default and the per-model levels from GET /api/models', async () => {
+    vi.mocked(api.getModels).mockResolvedValueOnce({
+      ...models, effort_default: 'max', effort_levels: { 'model-a': ['low', 'medium', 'high'], llama3: [] },
+    });
+
+    await useChatStore.getState().loadModels();
+
+    expect(useChatStore.getState().effortDefault).toBe('max');
+    expect(useChatStore.getState().effortLevels).toEqual({ 'model-a': ['low', 'medium', 'high'], llama3: [] });
+  });
+
+  it('tolerates an older backend that sends no effort fields', async () => {
+    useChatStore.setState({ effortDefault: 'high', effortLevels: { x: ['low'] } });
+    vi.mocked(api.getModels).mockResolvedValueOnce(models);
+
+    await useChatStore.getState().loadModels();
+
+    expect(useChatStore.getState().effortDefault).toBeNull();
+    expect(useChatStore.getState().effortLevels).toEqual({});
+  });
+
+  it("sends the new chat's effort at creation, then clears the pick", async () => {
+    useChatStore.setState({
+      virtualSession: { id: 'v-1', title: '', source: 'web', status: 'created', updated_at: NOW, is_running: false },
+      activeSession: 'v-1', newChatEffort: 'medium',
+    });
+    vi.mocked(api.createSession).mockResolvedValueOnce({ id: 'real-1', title: 'New chat', source: 'web', model: 'model-a', effort: 'medium' });
+
+    const id = await useChatStore.getState().ensureRealSession();
+
+    expect(id).toBe('real-1');
+    expect(api.createSession).toHaveBeenCalledWith(undefined, null, undefined, null, undefined, false, 'medium');
+    expect(useChatStore.getState().newChatEffort).toBeNull();
+    expect(useChatStore.getState().sessions[0]).toMatchObject({ id: 'real-1', effort: 'medium' });
+  });
+
+  it('sends no effort when the new chat keeps the default', async () => {
+    useChatStore.setState({
+      virtualSession: { id: 'v-2', title: '', source: 'web', status: 'created', updated_at: NOW, is_running: false },
+      activeSession: 'v-2',
+    });
+    vi.mocked(api.createSession).mockResolvedValueOnce({ id: 'real-2', title: 'New chat', source: 'web', effort: null });
+
+    await useChatStore.getState().ensureRealSession();
+
+    expect(vi.mocked(api.createSession).mock.calls[0][6]).toBeUndefined();
+  });
+
+  it('forgets the pick when the new chat is discarded', () => {
+    useChatStore.setState({
+      virtualSession: { id: 'v-3', title: '', source: 'web', status: 'created', updated_at: NOW, is_running: false },
+      activeSession: 'other', newChatEffort: 'low',
+    });
+
+    useChatStore.getState().discardVirtualSession();
+
+    expect(useChatStore.getState().newChatEffort).toBeNull();
+  });
+
+  it('re-points the row at once, then PATCHes it', async () => {
+    useChatStore.setState({ sessions: [row('s1', null), row('s2', 'low')] });
+    let resolve: (v: unknown) => void = () => {};
+    vi.mocked(api.updateSession).mockReturnValueOnce(new Promise((r) => { resolve = r; }));
+
+    const pending = useChatStore.getState().setSessionEffort('s1', 'high');
+    // Optimistic: the picker and the badge show it before the server answers.
+    expect(useChatStore.getState().sessions.map(s => s.effort)).toEqual(['high', 'low']);
+    resolve({});
+    await pending;
+
+    expect(api.updateSession).toHaveBeenCalledWith('s1', { effort: 'high' });
+    expect(useChatStore.getState().sessions.map(s => s.effort)).toEqual(['high', 'low']);
+  });
+
+  it('sends null to go back to the default', async () => {
+    useChatStore.setState({ sessions: [row('s1', 'medium')] });
+    vi.mocked(api.updateSession).mockResolvedValueOnce({});
+
+    await useChatStore.getState().setSessionEffort('s1', null);
+
+    expect(api.updateSession).toHaveBeenCalledWith('s1', { effort: null });
+    expect(useChatStore.getState().sessions[0].effort).toBeNull();
+  });
+
+  it('reverts when the server refuses the change', async () => {
+    useChatStore.setState({ sessions: [row('s1', 'medium')] });
+    vi.mocked(api.updateSession).mockRejectedValueOnce(new Error('409: live_background_agents'));
+
+    await useChatStore.getState().setSessionEffort('s1', 'max');
+
+    expect(useChatStore.getState().sessions[0].effort).toBe('medium');
+  });
+
+  it('re-points a row that sits in the archived or system group', async () => {
+    useChatStore.setState({ sessions: [], archivedSessions: [row('a1', null)], systemSessions: [row('c1', 'low')] });
+    vi.mocked(api.updateSession).mockResolvedValueOnce({}).mockResolvedValueOnce({});
+
+    await useChatStore.getState().setSessionEffort('a1', 'xhigh');
+    await useChatStore.getState().setSessionEffort('c1', null);
+
+    expect(useChatStore.getState().archivedSessions?.[0].effort).toBe('xhigh');
+    expect(useChatStore.getState().systemSessions?.[0].effort).toBeNull();
   });
 });

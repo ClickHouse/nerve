@@ -348,6 +348,16 @@ interface ChatState {
   // session's switch lives on its row (sessions[].codex_daybreak) and is
   // changed via setSessionDaybreak.
   newChatDaybreak: boolean;
+  // Composer effort picker: the server's interactive default effort and the
+  // levels each model accepts, from GET /api/models (`[]` = effort doesn't
+  // apply to that model; a model absent from the map takes all levels).
+  effortDefault: string | null;
+  effortLevels: Record<string, string[]>;
+  // Effort picked for the CURRENT virtual (unsent) chat; null = the server's
+  // default. Bound at session materialization and reset after, like
+  // newChatModels. Real sessions keep theirs on the row (sessions[].effort),
+  // changed via setSessionEffort.
+  newChatEffort: string | null;
 
   loadSessions: () => Promise<void>;
   switchSession: (id: string) => Promise<void>;
@@ -441,6 +451,10 @@ interface ChatState {
   /** Turn Daybreak on or off for ONE existing Codex session. The row takes
    *  the server's answer; a refusal shows as an error line in the chat. */
   setSessionDaybreak: (sessionId: string, enabled: boolean) => Promise<void>;
+  /** Set the effort for the current virtual chat (null → server default). */
+  setNewChatEffort: (effort: string | null) => void;
+  /** Re-point ONE existing session's effort (null → server default). */
+  setSessionEffort: (sessionId: string, effort: string | null) => Promise<void>;
   /** Stop the turn (agents keep running where the runtime allows it). */
   stopSession: () => Promise<void>;
   handleWSMessage: (msg: WSMessage) => void;
@@ -572,6 +586,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   newChatReviewLoop: null,
   newChatModels: {},
   newChatDaybreak: false,
+  effortDefault: null,
+  effortLevels: {},
+  newChatEffort: null,
 
   addQuote: (text: string, action: QuoteAction) => {
     const id = `q${++_quoteId}`;
@@ -1086,8 +1103,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const pickedModel = get().newChatModels[effBackend] ?? undefined;
     // The composer's Daybreak switch, dropped when the model has no program.
     const daybreak = newChatHasDaybreak(get(), get().newChatBackend, pickedModel);
+    // Same for the effort pick: the session row carries it from creation.
+    const pickedEffort = get().newChatEffort ?? undefined;
     const real: Session = await api.createSession(
-      undefined, get().newChatBackend, rlCwd, rlPayload, pickedModel, daybreak,
+      undefined, get().newChatBackend, rlCwd, rlPayload, pickedModel, daybreak, pickedEffort,
     );
     set((state) => {
       const drafts = { ...state.drafts };
@@ -1109,6 +1128,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         newChatBackend: null,  // bound into the created session; reset for the next chat
         newChatModels: {},     // ditto — the pick now lives on the session row
         newChatDaybreak: false,   // ditto — the switch now lives on the session row
+        newChatEffort: null,   // ditto
         newChatReviewLoop: null,  // ditto — the loop (if any) is now running server-side
         drafts,
         // POST /api/sessions returns a partial row (no updated_at); fill the
@@ -1127,7 +1147,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   discardVirtualSession: () => {
     const vs = get().virtualSession;
     if (!vs) return;
-    set({ newChatBackend: null, newChatModels: {}, newChatDaybreak: false, newChatReviewLoop: null });
+    set({ newChatBackend: null, newChatModels: {}, newChatDaybreak: false, newChatEffort: null, newChatReviewLoop: null });
     removeDraft(vs.id);
     clearVirtualSession();
     set((s) => {
@@ -1445,6 +1465,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
           backendOptions: res.backends?.options ?? [],
           backendDefault: res.backends?.default ?? null,
           newChatModels,
+          // An older backend sends neither: no default label, every level open.
+          effortDefault: res.effort_default ?? null,
+          effortLevels: res.effort_levels ?? {},
         };
       });
     } catch (e) {
@@ -1500,6 +1523,35 @@ export const useChatStore = create<ChatState>((set, get) => ({
     } catch (e) {
       console.error('Failed to update Daybreak:', e);
       set((state) => chatNote(state, sessionId, `Error: ${errorDetail(e, 'Daybreak could not be changed.')}`));
+    }
+  },
+
+  setNewChatEffort: (effort: string | null) => set({ newChatEffort: effort }),
+
+  setSessionEffort: async (sessionId: string, effort: string | null) => {
+    // Optimistic, like setSessionModel: the picker and header badge read the
+    // row's effort, so re-point it now and revert if the server refuses the
+    // change (409 while agents run, 400 for a level it doesn't know). The
+    // row can sit in the feed or a lazy archived/system group, so all three
+    // lists are re-pointed.
+    const state0 = get();
+    const prev = [
+      ...state0.sessions, ...(state0.archivedSessions ?? []), ...(state0.systemSessions ?? []),
+    ].find(s => s.id === sessionId)?.effort ?? null;
+    const repoint = (e: string | null) => set((state) => {
+      const apply = (list: Session[]) => list.map(s => s.id === sessionId ? { ...s, effort: e } : s);
+      return {
+        sessions: apply(state.sessions),
+        ...(state.archivedSessions ? { archivedSessions: apply(state.archivedSessions) } : {}),
+        ...(state.systemSessions ? { systemSessions: apply(state.systemSessions) } : {}),
+      };
+    });
+    repoint(effort);
+    try {
+      await api.updateSession(sessionId, { effort });
+    } catch (e) {
+      console.error('Failed to update session effort:', e);
+      repoint(prev);
     }
   },
 
@@ -1634,8 +1686,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     };
     // Run later ALWAYS mints a brand-new session — it must never write the
     // deferred prompt into the current chat (fresh, virtual, or existing).
-    // If a composer model/backend pick is in flight for a new chat, carry it
-    // onto the created row so the header badge is right from the first render.
+    // If a composer model/backend/effort pick is in flight for a new chat,
+    // carry it onto the created row so the header badge is right from the
+    // first render.
     // Bind before the requests so the optimistic row uses the same actor as the
     // server even if the tab signs out or changes account while they run.
     const sender = bindSender();
@@ -1649,8 +1702,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // (this backend and model) offers Daybreak.
     const daybreak = !!vs && get().activeSession === vs.id
       && newChatHasDaybreak(get(), effBackend, pickedModel);
+    // The effort pick belongs to the new chat being composed: carry it only
+    // when that chat is the one on screen.
+    const pickedEffort = vs && get().activeSession === vs.id
+      ? get().newChatEffort
+      : null;
     const real: Session = await api.createSession(
-      undefined, effBackend, undefined, null, pickedModel, daybreak,
+      undefined, effBackend, undefined, null, pickedModel, daybreak, pickedEffort,
     );
     // If auth changed, keep the server row but do not show it in this tab.
     if (!sender.stillCurrent()) return;
@@ -1672,6 +1730,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         newChatBackend: null,
         newChatModels: {},
         newChatDaybreak: false,
+        newChatEffort: null,
         newChatReviewLoop: null,
         drafts,
         streamingBlocks: [],

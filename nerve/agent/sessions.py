@@ -21,6 +21,8 @@ from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Any, Awaitable, Callable, Literal
 
+from nerve.agent.effort import METADATA_KEY as EFFORT_METADATA_KEY
+from nerve.agent.effort import session_effort
 from nerve.db import Database
 from nerve.identity import (
     CAUSE_FROM_ACTOR,
@@ -75,8 +77,9 @@ class SessionStatus(StrEnum):
 # Why a session's runtime client went away (``remove_client``). The agent
 # registry maps it to the end reason of the agents that ran on the client.
 ClientGoneReason = Literal[
-    "process_exit", "process_ended", "model_switch", "force_stop", "archived",
-    "deleted", "hung_runtime", "idle_reap", "gateway_restart",
+    "process_exit", "process_ended", "model_switch", "effort_switch",
+    "force_stop", "archived", "deleted", "hung_runtime", "idle_reap",
+    "gateway_restart",
 ]
 # What ``interrupt_turn`` did.
 InterruptOutcome = Literal["stopped", "not_running", "not_stopped", "killed"]
@@ -844,11 +847,16 @@ class SessionManager:
 
         fork_id = f"fork-{str(uuid.uuid4())[:8]}"
         fork_title = title or f"Fork of {parent.get('title', source_session_id)}"
+        # The fork runs like its source: same backend, model, cwd and effort.
+        parent_effort = session_effort(parent)
 
         session = await self._create_session(
             fork_id,
             title=fork_title,
             source=source or parent.get("source", "web"),
+            metadata=(
+                {EFFORT_METADATA_KEY: parent_effort} if parent_effort else None
+            ),
             parent_session_id=source_session_id,
             forked_from_message=at_message_id,
             backend=parent.get("backend") or "claude",
