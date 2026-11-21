@@ -79,7 +79,7 @@ memU deduplicates at two levels:
 
 1. **Content hash** — When a new memory's normalized text matches an existing one exactly, it increments `reinforcement_count` on the original instead of creating a duplicate.
 
-2. **Semantic similarity** — When no exact hash match exists, cosine similarity is checked against all items of the same memory type. If the top match exceeds the configured threshold (default 0.85), the existing item is reinforced instead of creating a near-duplicate. This prevents items saying the same thing with different wording from proliferating.
+2. **Semantic similarity** — When no exact hash match exists, cosine similarity is checked against all items of the same memory type. If the top match exceeds the threshold (`memory.semantic_dedup_threshold`: 0.85 by default, 0.96 with `embedder: local` unless set) and both texts carry the same numbers, IDs and dates, the existing item is reinforced instead of creating a near-duplicate. This prevents items saying the same thing with different wording from proliferating, without merging "3 failures" into "4 failures" or one PR into its sibling cherry-pick. The local threshold is higher because bge-small rates related facts closer than OpenAI's model does: on 5.8K real memories the median item's nearest neighbour is at 0.854, so 0.85 would merge half of all new facts.
 
 Reinforced items rank higher in search results via salience-aware ranking: `similarity × log(reinforcement + 1) × recency_decay`.
 
@@ -88,9 +88,41 @@ Reinforced items rank higher in search results via salience-aware ranking: `simi
 memU uses two or three LLM profiles depending on configuration:
 - **Chat** — Anthropic API for recall routing (claude-sonnet-5-5)
 - **Fast** — Anthropic API for fact extraction and categorization (claude-haiku-5-5)
-- **Embedding** *(optional)* — OpenAI text-embedding-3-small for vector search. Only active when `openai_api_key` is set.
+- **Embedding** *(optional)* — where vectors come from, set by `memory.embedder`: a local fastembed model (`local`, see [Local embeddings](#local-embeddings)) or OpenAI text-embedding-3-small (`openai`, with `openai_api_key`). Unset, it is OpenAI when `openai_api_key` is set and none otherwise. Nerve's hybrid recall and the background embedding of stored rows run when `memory.embedder` is set, or with `extraction: none` on whichever embedder is in effect; otherwise, unset, recall works as before.
 
-When no OpenAI key is configured, memU uses **LLM-based recall** instead of vector search — the Chat profile ranks memories directly, requiring no embeddings. This uses more Anthropic API tokens per recall but removes the OpenAI dependency entirely.
+With an embedder, recall is a [hybrid search](#hybrid-recall) with no model call. Without one, memU uses **LLM-based recall** — the Fast profile ranks every item of the top categories in one prompt, requiring no embeddings. That costs Anthropic tokens on every recall and fails once those categories outgrow the model's context; a failure is reported as one, not as an empty memory.
+
+### Local embeddings
+
+`memory.embedder: local` runs the embedding model inside Nerve with [fastembed](https://github.com/qdrant/fastembed) (ONNX Runtime on the CPU): no API key, and no memory text leaves the machine. fastembed is an optional extra, since ONNX Runtime has no wheel for Intel macOS or macOS before 14: install it with `uv sync --extra local-embeddings`. Without it, config validation refuses `embedder: local`. The Docker image installs no extras, so in a container `embedder: local` is refused until fastembed is installed into it (for example `uv sync --extra local-embeddings` in a derived image). `memory.local_model` picks the model, with the same aliases as Loom's local embedder: `bge-small` (`BAAI/bge-small-en-v1.5`, 384-d, the default), `bge-base` (`BAAI/bge-base-en-v1.5`, 768-d) or `minilm` (`sentence-transformers/all-MiniLM-L6-v2`, 384-d). The first start downloads the model into `~/.nerve/models/fastembed` (65 MB for bge-small); later starts read it from there.
+
+- **Rows without a vector** — everything stored before an embedder was set — get one in a background pass at startup. Measured on 14 Apple cores: 5.8K memories in under 20 s. The pass writes `embedding_json` only, so `memory_records_by_date(updated=true)` does not report the rows as changed. The `embedder` section of `GET /api/memory/memu/health` shows its progress, and `database.items_with_embeddings` how many rows have a vector.
+- **Memory:** bge-small adds ~170 MB for the loaded model plus ~30 MB of ONNX working memory (texts are embedded in batches of 4, shortest first, on half the CPUs, at most 8 threads).
+- **Switching models** changes the vector space. The pass records the model in memU's database (`nerve_memu_meta`) and re-embeds every row when it changes; with `local`, a row of another width is re-embedded as well.
+
+### Hybrid recall
+
+With an embedder, `memory_recall` (and the startup recall) skips memU's retrieve workflow and searches the stored rows directly; recall takes a few milliseconds.
+
+1. **Vector leg** — the question's vector against every item's (the persistent `_VectorIndex`).
+2. **Keyword leg** — the question's words against an FTS5 table of item summaries (`memu_items_fts`, kept in step with the items table by triggers), ranked by BM25. Common words and generic verbs are left out, and each word is quoted, so IDs like `#4100` or `0c1d2e3f` match as written.
+3. **Fusion** — reciprocal rank fusion of the legs, then two mild tie-breakers from memU's salience: reinforced facts gain up to ~25 %, recent ones up to ~33 % over years-old ones.
+
+memU writes facts about "the user", while a question names them ("what makes Alice angry"); searched as written, the name pulls up rows that merely state it. Recall learns the user's name from rows that state it twice ("The user's name is …"), searches such a question a second time with the name written as "the user", and leaves the name out of the keyword leg. Category breadcrumbs are ranked by the categories' vectors.
+
+### Memory without a model
+
+`memory.extraction: none` (with an embedder, so recall works without a model either) turns memory into storage and search only: nothing in memory calls a language model, so with `embedder: local` no memory text leaves the machine. The agent still runs on its own model; what it writes with `memorize` is the distilled fact.
+
+- **`memorize`** stores the fact as written: one item of the given type, embedded, linked to the category whose vector is closest. A near-identical fact of the same type is reinforced instead (the semantic dedup above). An event's date comes from the tool's optional `date` (`YYYY-MM-DD`), else from its own words ("On November 3, 2026", "Nov 3", ISO dates, "today", "yesterday"), else today; other types stay timeless.
+- **Conversations** — at session close, rotation and in the sweep — are stored as the transcript itself, in `conversation` chunks of about 1,500 characters (about a screen), each dated by its first message in the configured timezone. The conversation's resource keeps its first user message as its caption.
+- **Workspace files** are stored as `document` chunks.
+- **Recall** labels a chunk with where it is from (`(2026-11-03 14:19, session 3f9a1c07) …`, or the file name) and gives chunks at most 30 % of an answer, more only when the facts run out.
+- **`conversation_history`** lists the facts dated in the range plus one line per session that day (start time, session id, first message); the chunks themselves are left out. `memory_records_by_date` and the web UI's Facts and Timeline tabs list facts only.
+- **`memory_update`, `memory_delete`** write directly, without memU's model-written category summaries; summaries stay as they are, and `category_update` still edits them.
+- **No fallback to a model:** memU's chat profiles get a client that refuses every call, and the event-date resolver and the knowledge filter are off.
+
+`memory.skip_sessions` (session-id globs, any extraction mode) keeps sessions out of memory altogether — for example `cron:nightly-report*` for a cron job whose runs are routine. A skipped conversation counts as handled, so the sweep does not offer it again.
 
 Config in `<workspace>/config/settings.yaml`:
 ```yaml
@@ -98,7 +130,11 @@ memory:
   recall_model: claude-sonnet-5-5         # recall routing
   memorize_model: claude-sonnet-5-5       # writing memories back
   fast_model: claude-haiku-5-5            # extraction & categorization
-  # embed_model: text-embedding-3-small   # only needed with openai_api_key
+  embedder: local                         # local | openai | none (unset: openai with a key, else none)
+  local_model: bge-small                  # bge-small | bge-base | minilm (embedder: local)
+  extraction: none                        # llm (default) | none: no model anywhere in memory
+  skip_sessions: ["cron:nightly-report*"]       # never indexed
+  # embed_model: text-embedding-3-small   # only for embedder: openai
   categories: [...]  # see Categories section above
 ```
 
@@ -128,10 +164,10 @@ This uses the `anthropic` Python SDK directly (not the OpenAI-compatible endpoin
 
 ### Performance Optimizations
 
-- **Vector cache** *(with OpenAI key)* — All item and category embeddings are preloaded into memory at startup, eliminating repeated SQLite JSON parsing (~2s per search saved)
+- **Vector cache** *(with an embedder)* — All item and category embeddings are preloaded into memory at startup, eliminating repeated SQLite JSON parsing (~2s per search saved)
 - **Fast model** — Extraction and category summary updates use Haiku instead of Sonnet
 - **Disabled pipeline steps** — Route intention, sufficiency checks, and resource retrieval are disabled in the retrieve pipeline (saves 3+ LLM calls per recall)
-- **Category embedding reuse** *(with OpenAI key)* — Category ranking uses stored embeddings instead of re-embedding summaries on every recall
+- **Category embedding reuse** *(with an embedder)* — Category ranking uses stored embeddings instead of re-embedding summaries on every recall
 - **LLM-based fallback** — When no embedding provider is configured, retrieval and memorization work without embeddings; semantic deduplication falls back to content-hash only
 - **Client warmup** — Anthropic LLM clients are pinged during startup to force HTTP/2 connection establishment (avoids a cold-start hang on the first memorize call)
 - **Memorize timeout** — Each memorize call is capped at 300s; if it hangs, it is cancelled, LLM clients are evicted (cache cleared + HTTP transport closed), a fresh client is created, and one retry is attempted

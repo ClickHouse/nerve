@@ -330,6 +330,11 @@ MEMORIZE_SCHEMA = {
             "description": "profile (stable personal facts), event (specific occurrences with a date), knowledge (objective factual info), behavior (recurring patterns/routines). Default: knowledge",
             "default": "knowledge",
         },
+        "date": {
+            "type": "string",
+            "description": "For an event: the day it happened, YYYY-MM-DD. Optional; without it the date is read from the content, else today",
+            "default": "",
+        },
     },
     "required": ["content"],
 }
