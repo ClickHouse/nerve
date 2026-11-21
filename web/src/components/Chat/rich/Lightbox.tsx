@@ -3,7 +3,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode,
 } from 'react';
 import { IconButton, Modal } from '../../ui';
-import { X, ZoomIn, ZoomOut } from '../../ui/icons';
+import { ChevronLeft, ChevronRight, X, ZoomIn, ZoomOut } from '../../ui/icons';
 import { ensureViewBox, type Size } from './export';
 
 const MIN_ZOOM = 0.1;
@@ -77,9 +77,17 @@ export interface LightboxProps {
   /** The block's language, shown beside the title. */
   label?: string;
   /** The picture as SVG markup: a renderer's export, or the svg drawn in the chat. */
-  markup: string;
+  markup?: string;
+  /** Or a raster image's URL, shown in an <img>. */
+  src?: string;
   /** The picture's size at 1:1, in CSS pixels. */
   size: Size;
+  /** `fit-down`: open scaled to fit when the picture is larger than the window, else at 1:1. */
+  initialView?: 'actual' | 'fit-down';
+  /** Step through a set of pictures: the position, and what the buttons and keys do. */
+  nav?: { index: number; count: number; onPrev: () => void; onNext: () => void };
+  /** Extra toolbar controls, before Close (Open original, Download). */
+  actions?: ReactNode;
 }
 
 /**
@@ -91,7 +99,8 @@ export interface LightboxProps {
 export function Lightbox({ open, onClose, ...view }: LightboxProps) {
   return (
     <Modal open={open} onClose={onClose} size="full" ariaLabel={view.title}>
-      <LightboxView onClose={onClose} {...view} />
+      {/* A new picture starts from its own view; the dialog, and focus in it, stay. */}
+      <LightboxView key={view.src ?? view.markup} onClose={onClose} {...view} />
     </Modal>
   );
 }
@@ -110,7 +119,9 @@ function ViewButton({ label, onClick, children }: { label: string; onClick: () =
   );
 }
 
-function LightboxView({ onClose, title, label, markup, size }: Omit<LightboxProps, 'open'>) {
+function LightboxView({
+  onClose, title, label, markup = '', src, size, initialView = 'actual', nav, actions,
+}: Omit<LightboxProps, 'open'>) {
   const [view, setView] = useState<View>(ONE_TO_ONE);
   const [dragging, setDragging] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
@@ -123,7 +134,7 @@ function LightboxView({ onClose, title, label, markup, size }: Omit<LightboxProp
   // <style> cannot collide with the same picture still drawn in the chat.
   useLayoutEffect(() => {
     const host = hostRef.current;
-    if (!host) return;
+    if (!host || src) return;
     const root: ShadowRoot | HTMLElement = host.shadowRoot
       ?? (typeof host.attachShadow === 'function' ? host.attachShadow({ mode: 'open' }) : host);
     // Markup a renderer produced from a source it has already made safe —
@@ -139,7 +150,16 @@ function LightboxView({ onClose, title, label, markup, size }: Omit<LightboxProp
     return () => {
       root.innerHTML = '';
     };
-  }, [markup, size]);
+  }, [markup, size, src]);
+
+  // A screenshot larger than the window opens whole, not at its top-left corner.
+  useLayoutEffect(() => {
+    if (initialView !== 'fit-down') return;
+    const rect = viewportRef.current?.getBoundingClientRect();
+    if (!rect || !rect.width || !rect.height) return;
+    const fitted = fitView(rect, size);
+    if (fitted.zoom < 1) setView(fitted);
+  }, [initialView, size]);
 
   // Wheel zoom needs preventDefault, which React's passive wheel listener cannot do.
   useEffect(() => {
@@ -175,6 +195,11 @@ function LightboxView({ onClose, title, label, markup, size }: Omit<LightboxProp
   const actualSize = () => setView(ONE_TO_ONE);
   const fit = () => setView(fitView(viewportBox(), size));
   const pan = (dx: number, dy: number) => setView(v => ({ ...v, x: v.x + dx, y: v.y + dy }));
+  // Double-click switches between 1:1 and fit.
+  const toggleFit = () => {
+    if (view.zoom === 1 && view.x === 0 && view.y === 0) fit();
+    else actualSize();
+  };
 
   const onKeyDown = (e: ReactKeyboardEvent) => {
     if (e.ctrlKey || e.metaKey || e.altKey) return;
@@ -183,6 +208,8 @@ function LightboxView({ onClose, title, label, markup, size }: Omit<LightboxProp
       case '+': case '=': zoomBy(ZOOM_STEP); break;
       case '-': case '_': zoomBy(1 / ZOOM_STEP); break;
       case '0': actualSize(); break;
+      case 'PageUp': case 'p': if (!nav) return; nav.onPrev(); break;
+      case 'PageDown': case 'n': if (!nav) return; nav.onNext(); break;
       // Arrows move the view over the picture, as scrolling would.
       case 'ArrowLeft': pan(step, 0); break;
       case 'ArrowRight': pan(-step, 0); break;
@@ -236,6 +263,17 @@ function LightboxView({ onClose, title, label, markup, size }: Omit<LightboxProp
           {title}
           {label && <span className="ml-2 font-mono text-xs font-normal text-text-faint">{label}</span>}
         </h2>
+        {nav && nav.count > 1 && (
+          <div role="group" aria-label="Pictures" className="flex items-center gap-0.5 mr-2">
+            <IconButton label="Previous picture" onClick={nav.onPrev}>
+              <ChevronLeft size={16} />
+            </IconButton>
+            <span className="text-xs tabular-nums text-text-muted">{nav.index + 1} / {nav.count}</span>
+            <IconButton label="Next picture" onClick={nav.onNext}>
+              <ChevronRight size={16} />
+            </IconButton>
+          </div>
+        )}
         <span className="hidden md:inline mr-2 text-2xs text-text-faint">Scroll to zoom · drag to move</span>
         <div role="group" aria-label="Zoom" className="flex items-center gap-0.5">
           <IconButton label="Zoom out" onClick={() => zoomBy(1 / ZOOM_STEP)}>
@@ -251,6 +289,7 @@ function LightboxView({ onClose, title, label, markup, size }: Omit<LightboxProp
           <ViewButton label="Fit to window" onClick={fit}>Fit</ViewButton>
         </div>
         <span aria-hidden="true" className="mx-1 h-5 w-px bg-border" />
+        {actions}
         <IconButton label="Close dialog" onClick={onClose}>
           <X size={18} />
         </IconButton>
@@ -267,6 +306,7 @@ function LightboxView({ onClose, title, label, markup, size }: Omit<LightboxProp
         onPointerMove={onPointerMove}
         onPointerUp={onPointerEnd}
         onPointerCancel={onPointerEnd}
+        onDoubleClick={toggleFit}
       >
         <div
           className="rich-lightbox-content"
@@ -278,11 +318,23 @@ function LightboxView({ onClose, title, label, markup, size }: Omit<LightboxProp
             transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})`,
           }}
         >
-          <div ref={hostRef} />
+          {src ? (
+            <img
+              src={src}
+              alt=""
+              draggable={false}
+              className="block max-w-none select-none"
+              // Zoomed in, a screenshot's pixels stay crisp instead of blurring.
+              style={{ width: size.width, height: size.height, imageRendering: view.zoom >= 2 ? 'pixelated' : 'auto' }}
+            />
+          ) : (
+            <div ref={hostRef} />
+          )}
         </div>
       </div>
       <p id={hintId} className="sr-only">
         Drag or use the arrow keys to move the picture; plus and minus zoom, 0 shows it at actual size.
+        {nav && nav.count > 1 ? ' N and P, or Page Down and Page Up, show the next and previous picture.' : ''}
       </p>
     </div>
   );

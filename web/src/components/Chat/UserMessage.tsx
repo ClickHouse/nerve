@@ -4,6 +4,7 @@ import { ActorLabel } from './ActorLabel';
 import { Download, FileText } from '../ui/icons';
 import { authUrl } from '../../api/hosted';
 import { formatMessageTime } from '../../utils/messageTime';
+import { imageLinkProps } from '../../utils/imageLinks';
 
 export function UserMessage({ message, actions, showActor = false }: {
   message: ChatMessage;
@@ -38,9 +39,7 @@ export function UserMessage({ message, actions, showActor = false }: {
                 {images.map((img, idx) => (
                   <a
                     key={idx}
-                    href={authUrl(img.url)}
-                    target="_blank"
-                    rel="noopener noreferrer"
+                    {...imageLinkProps(img.url, img.filename)}
                     className="block rounded-lg overflow-hidden border border-border hover:border-accent/50 transition-colors"
                   >
                     <img

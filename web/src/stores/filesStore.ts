@@ -1,6 +1,6 @@
 import { create } from 'zustand';
-import { api } from '../api/client';
-import { buildFileTree, type FileNode } from '../utils/fileTree';
+import { api, type ReadOnlyReason } from '../api/client';
+import { toFileNode, type DirListing } from '../utils/fileTree';
 
 interface OpenFile {
   path: string;
@@ -9,16 +9,26 @@ interface OpenFile {
   originalContent: string;
   modified: boolean;
   readOnly: boolean;
+  readOnlyReason?: ReadOnlyReason;
+  /** Not shown as text: binary, or over `files.max_file_bytes`. */
+  unreadable?: 'binary' | 'too_large';
+  size?: number;
 }
 
 interface FilesState {
-  tree: FileNode[];
+  /** Loaded directories by workspace path; `''` is the root. */
+  dirs: Record<string, DirListing>;
+  /** Directories whose last listing failed, by path. */
+  dirErrors: Record<string, string>;
   openFiles: OpenFile[];
   activeFile: string | null;
   loading: boolean;
   saving: boolean;
 
+  /** Reload the root and forget every other loaded directory. */
   loadTree: () => Promise<void>;
+  /** Load one directory, once; `force` reloads it. */
+  loadDir: (path: string, force?: boolean) => Promise<void>;
   openFile: (path: string) => Promise<void>;
   closeFile: (path: string) => void;
   setActiveFile: (path: string) => void;
@@ -27,19 +37,40 @@ interface FilesState {
 }
 
 export const useFilesStore = create<FilesState>((set, get) => ({
-  tree: [],
+  dirs: {},
+  dirErrors: {},
   openFiles: [],
   activeFile: null,
   loading: false,
   saving: false,
 
   loadTree: async () => {
+    set({ dirs: {}, dirErrors: {} });
+    await get().loadDir('', true);
+  },
+
+  loadDir: async (path: string, force = false) => {
+    if (!force && get().dirs[path]) return;
     try {
-      const { files } = await api.listMemoryFiles();
-      const tree = buildFileTree(files);
-      set({ tree });
+      const listing = await api.listWorkspaceDir(path);
+      set(s => {
+        const dirErrors = { ...s.dirErrors };
+        delete dirErrors[path];
+        return {
+          dirs: {
+            ...s.dirs,
+            [path]: {
+              entries: listing.entries.map(toFileNode),
+              total: listing.total,
+              truncated: listing.truncated,
+            },
+          },
+          dirErrors,
+        };
+      });
     } catch (e) {
-      console.error('Failed to load file tree:', e);
+      console.error('Failed to load directory:', e);
+      set(s => ({ dirErrors: { ...s.dirErrors, [path]: 'Failed to load' } }));
     }
   },
 
@@ -52,12 +83,18 @@ export const useFilesStore = create<FilesState>((set, get) => ({
 
     set({ loading: true });
     try {
-      const { content, read_only } = await api.readMemoryFile(path);
+      const file = await api.readWorkspaceFile(path);
       const name = path.split('/').pop() || path;
+      const unreadable = file.binary ? 'binary' as const
+        : file.too_large ? 'too_large' as const : undefined;
       set(s => ({
         openFiles: [...s.openFiles, {
-          path, name, content, originalContent: content, modified: false,
-          readOnly: !!read_only,
+          path, name, content: file.content, originalContent: file.content, modified: false,
+          // A file shown as a notice has no text to save.
+          readOnly: !!file.read_only || !!unreadable,
+          readOnlyReason: file.read_only_reason,
+          unreadable,
+          size: file.size,
         }],
         activeFile: path,
         loading: false,
@@ -84,7 +121,7 @@ export const useFilesStore = create<FilesState>((set, get) => ({
   updateContent: (path: string, content: string) => {
     set(s => ({
       openFiles: s.openFiles.map(f =>
-        f.path === path
+        f.path === path && !f.readOnly
           ? { ...f, content, modified: content !== f.originalContent }
           : f
       ),
@@ -93,7 +130,8 @@ export const useFilesStore = create<FilesState>((set, get) => ({
 
   saveFile: async (path: string) => {
     const file = get().openFiles.find(f => f.path === path);
-    if (!file) return;
+    // Only memory markdown has a write route; everything else is read-only.
+    if (!file || file.readOnly) return;
 
     set({ saving: true });
     try {

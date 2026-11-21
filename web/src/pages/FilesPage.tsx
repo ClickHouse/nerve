@@ -3,7 +3,7 @@ import { useFilesStore } from '../stores/filesStore';
 import { FileTree } from '../components/Files/FileTree';
 import { EditorTabBar } from '../components/Files/EditorTabBar';
 import { FileEditor } from '../components/Files/FileEditor';
-import { FolderOpen, X } from '../components/ui/icons';
+import { FolderOpen, RefreshCw, X } from '../components/ui/icons';
 import { IconButton } from '../components/ui';
 import { PageHeader } from '../components/ui/PageHeader';
 import { PaneToggle } from '../components/ui/PaneToggle';
@@ -11,10 +11,12 @@ import { Drawer } from '../components/ui/Drawer';
 import { useIsMobile } from '../hooks/useMediaQuery';
 
 /** The "Workspace" heading and the file tree under it. */
-function TreePane({ inDrawer = false, onClose, children }: {
+function TreePane({ inDrawer = false, onClose, onRefresh, children }: {
   inDrawer?: boolean;
   /** Drawer mode only: the visible close control in the heading row. */
   onClose?: () => void;
+  /** Reload the tree from the root, collapsing nothing already open. */
+  onRefresh: () => void;
   children: ReactNode;
 }) {
   return (
@@ -25,8 +27,11 @@ function TreePane({ inDrawer = false, onClose, children }: {
       <div className="flex items-center gap-2 p-3 border-b border-border-subtle">
         <FolderOpen size={16} className="text-accent" />
         <span className="text-sm font-medium text-text-muted">Workspace</span>
+        <IconButton label="Refresh file list" size="xs" onClick={onRefresh} className="ml-auto">
+          <RefreshCw size={13} />
+        </IconButton>
         {onClose && (
-          <IconButton label="Close file list" size="xs" onClick={onClose} className="ml-auto">
+          <IconButton label="Close file list" size="xs" onClick={onClose}>
             <X size={14} />
           </IconButton>
         )}
@@ -40,8 +45,8 @@ function TreePane({ inDrawer = false, onClose, children }: {
 
 export function FilesPage() {
   const {
-    tree, openFiles, activeFile, loading, saving,
-    loadTree, openFile, closeFile, setActiveFile, updateContent, saveFile,
+    dirs, dirErrors, openFiles, activeFile, loading, saving,
+    loadTree, loadDir, openFile, closeFile, setActiveFile, updateContent, saveFile,
   } = useFilesStore();
 
   useEffect(() => { loadTree(); }, []);
@@ -71,6 +76,14 @@ export function FilesPage() {
 
   const currentFile = openFiles.find(f => f.path === activeFile);
 
+  // Reload every directory already loaded, so an expanded folder keeps its
+  // place. Directories that vanished drop out with their parent's listing.
+  const refresh = () => {
+    const loaded = Object.keys(dirs);
+    loadDir('', true);
+    loaded.filter(p => p !== '').forEach(p => loadDir(p, true));
+  };
+
   return (
     <div className="h-full flex flex-col">
       {isMobile && (
@@ -83,13 +96,19 @@ export function FilesPage() {
       <div className="flex-1 flex min-h-0">
         {isMobile ? (
           <Drawer open={treeOpen} onClose={() => setTreeOpen(false)} side="left" label="Workspace files">
-            <TreePane inDrawer onClose={() => setTreeOpen(false)}>
-              <FileTree tree={tree} selectedPath={activeFile} onSelect={openFromDrawer} />
+            <TreePane inDrawer onClose={() => setTreeOpen(false)} onRefresh={refresh}>
+              <FileTree
+                dirs={dirs} dirErrors={dirErrors} selectedPath={activeFile}
+                onSelect={openFromDrawer} onExpand={(p) => loadDir(p)}
+              />
             </TreePane>
           </Drawer>
         ) : (
-          <TreePane>
-            <FileTree tree={tree} selectedPath={activeFile} onSelect={openFile} />
+          <TreePane onRefresh={refresh}>
+            <FileTree
+              dirs={dirs} dirErrors={dirErrors} selectedPath={activeFile}
+              onSelect={openFile} onExpand={(p) => loadDir(p)}
+            />
           </TreePane>
         )}
 
@@ -108,13 +127,16 @@ export function FilesPage() {
               content={currentFile.content}
               modified={currentFile.modified}
               readOnly={currentFile.readOnly}
+              readOnlyReason={currentFile.readOnlyReason}
+              unreadable={currentFile.unreadable}
+              size={currentFile.size}
               saving={saving}
               onContentChange={(c) => updateContent(currentFile.path, c)}
               onSave={() => saveFile(currentFile.path)}
             />
           ) : (
             <div className="flex-1 flex items-center justify-center text-text-faint">
-              {loading ? 'Loading...' : 'Select a file to edit'}
+              {loading ? 'Loading...' : 'Select a file to open'}
             </div>
           )}
         </div>
