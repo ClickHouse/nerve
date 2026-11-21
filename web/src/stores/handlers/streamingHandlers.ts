@@ -380,7 +380,19 @@ export function handleDone(
   const state = get();
   const doneUpdate: Record<string, unknown> = {
     agentStatus: { state: 'idle' },
+    // The billed figures below replace the turn's estimate.
+    liveUsage: null,
   };
+  if (msg.agents_cost_base != null) doneUpdate.agentsCostBase = msg.agents_cost_base;
+  if (msg.session_cost_usd != null) {
+    // The session's new billed total, before the session list reloads.
+    const cost = msg.session_cost_usd;
+    const withCost = <T extends { id: string; total_cost_usd?: number }>(rows: T[] | null): T[] | null =>
+      rows && rows.map(r => (r.id === msg.session_id ? { ...r, total_cost_usd: cost } : r));
+    doneUpdate.sessions = withCost(state.sessions) ?? state.sessions;
+    if (state.archivedSessions) doneUpdate.archivedSessions = withCost(state.archivedSessions);
+    if (state.systemSessions) doneUpdate.systemSessions = withCost(state.systemSessions);
+  }
   if (msg.usage) {
     const cc = (msg.usage as { cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number } }).cache_creation;
     doneUpdate.contextUsage = {
@@ -419,6 +431,18 @@ export function handleDone(
   get().loadSessions();
 }
 
+/** The running turn's cost estimate, at each model call's start and end. */
+export function handleUsageUpdate(
+  msg: Extract<WSMessage, { type: 'usage_update' }>,
+  _get: Get,
+  set: Set,
+): void {
+  // The envelope's own fields are not part of the estimate.
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { type: _type, session_id: _sid, ...live } = msg;
+  set({ liveUsage: live });
+}
+
 export function handleStopped(
   _msg: Extract<WSMessage, { type: 'stopped' }>,
   get: Get,
@@ -444,6 +468,7 @@ export function handleStopped(
     streamingBlocks: [],
     isStreaming: false,
     agentStatus: { state: 'idle' },
+    liveUsage: null,
   }));
   finalizeRunningPanels(get);
   get().loadSessions();
@@ -459,5 +484,6 @@ export function handleError(
     streamingBlocks: [],
     isStreaming: false,
     agentStatus: { state: 'idle' },
+    liveUsage: null,
   }));
 }

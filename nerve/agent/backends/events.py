@@ -163,6 +163,26 @@ class SubagentUsage:
 
 
 @dataclass
+class CallUsage:
+    """Token usage of one main-chain model call, as it becomes known mid-turn.
+
+    Claude, with partial messages on: once at the call's ``message_start``
+    (input, cache read and cache write exact; output the start value,
+    ``final=False``) and once at its ``message_delta`` (the call's final
+    usage, ``final=True``). With partial messages off: from the call's
+    frames, ``final=False`` only (frames carry the start value of output).
+    A later event for the same ``message_id`` replaces the earlier one.
+    Feeds the live cost estimate (``usage_update``); the billed cost still
+    comes from :class:`TurnCompleted`.
+    """
+
+    message_id: str | None
+    model: str | None
+    usage: dict[str, Any]
+    final: bool = False
+
+
+@dataclass
 class ModelObserved:
     """The serving model was observed/changed mid-stream.
 
@@ -227,6 +247,7 @@ AgentEvent = (
     | ToolOutputDelta
     | SubagentStarted
     | SubagentUsage
+    | CallUsage
     | ModelObserved
     | SystemEvent
     | TurnCompleted

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import { useShallow } from 'zustand/react/shallow';
 import { TASKS_PANEL_ID, useChatStore } from '../stores/chatStore';
+import { useAgentStore } from '../stores/agentStore';
 import { SessionSidebar } from '../components/Chat/SessionSidebar';
 import { MessageList } from '../components/Chat/MessageList';
 import { ChatInput } from '../components/Chat/ChatInput';
@@ -67,7 +68,7 @@ function ChatPageView() {
   const {
     sessions, archivedSessions, systemSessions, activeSession, virtualSession, messages,
     isStreaming, loading,
-    agentStatus, contextUsage, backendStatus, currentTodos, currentCCTasks,
+    agentStatus, contextUsage, liveUsage, agentsCostBase, backendStatus, currentTodos, currentCCTasks,
     sidebarCollapsed, mobileSidebarOpen, panelVisible,
     modifiedFiles, modifiedFilesCount, sessionTasks,
     backendDefault, newChatBackend,
@@ -84,6 +85,8 @@ function ChatPageView() {
     loading: s.loading,
     agentStatus: s.agentStatus,
     contextUsage: s.contextUsage,
+    liveUsage: s.liveUsage,
+    agentsCostBase: s.agentsCostBase,
     backendStatus: s.backendStatus,
     currentTodos: s.currentTodos,
     currentCCTasks: s.currentCCTasks,
@@ -120,6 +123,9 @@ function ChatPageView() {
     listedSessionRow || !activeSession || virtualSession?.id === activeSession ? null : activeSession,
   );
   const activeSessionRow = listedSessionRow ?? fetchedSessionRow ?? undefined;
+  // The agents' estimated cost so far (agent roster summary), for the
+  // header's cost between turns.
+  const agentsCostUsd = useAgentStore(s => (s.sessionId === activeSession ? s.summary.cost_usd : null));
 
   // Forks of THIS chat keyed by their anchor message — MessageList marks the
   // divergence points with a pill. Memoized so the memo'd list doesn't
@@ -504,14 +510,17 @@ function ChatPageView() {
                   <span className="tabular-nums">{taskCount}</span>
                 </Button>
               )}
-              {contextUsage && activeSession && (
+              {(contextUsage || liveUsage) && activeSession && (
                 <ContextBar
                   key={`context-${activeSession}`}
                   usage={contextUsage}
+                  live={liveUsage}
                   sessionId={activeSession}
                   backend={activeSessionRow?.backend ?? 'claude'}
                   busy={isStreaming}
                   sessionCostUsd={activeSessionRow?.total_cost_usd}
+                  agentsCostUsd={agentsCostUsd}
+                  agentsCostBase={agentsCostBase}
                 />
               )}
               {langfuseUrl && !sessionMissing && (

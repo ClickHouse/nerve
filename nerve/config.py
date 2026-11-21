@@ -1310,6 +1310,12 @@ class AgentConfig:
     # grants the permission. Set False to restore the CLI default (background
     # sub-agent writes denied; build/write agents must then run in foreground).
     background_agent_permissions: bool = True
+    # Live cost during a turn: the Claude CLI's partial messages give each
+    # main-chain model call's usage at its start and end, and the engine
+    # sends the UI a running estimate (usage_update) per call. False: no
+    # partial messages; the estimate then has only the input side, from the
+    # calls' frames, until the turn ends.
+    live_usage: bool = True
     # Agent teams (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS). The CLI gates the
     # `SendMessage` tool behind this flag, and without it the Agent tool still
     # advertises SendMessage in its own description and in every spawn result
@@ -1373,6 +1379,7 @@ class AgentConfig:
                 d.get("cli_max_message_bytes", 64 * 1024 * 1024)
             ),
             background_agent_permissions=d.get("background_agent_permissions", True),
+            live_usage=d.get("live_usage", True),
             agent_teams=d.get("agent_teams", True),
             prompt_rewrite=PromptRewriteConfig.from_dict(d.get("prompt_rewrite") or {}),
             subagents=SubagentsConfig.from_dict(d.get("subagents") or {}),

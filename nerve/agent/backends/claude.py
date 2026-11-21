@@ -49,6 +49,7 @@ from claude_agent_sdk.types import (
     PermissionResult,
     PermissionResultAllow,
     PermissionResultDeny,
+    StreamEvent,
     ToolPermissionContext,
 )
 
@@ -458,6 +459,49 @@ def lockdown_denial(tool_name: str, tool_input: dict[str, Any]) -> str | None:
 
 
 # ------------------------------------------------------------------ #
+#  Live usage: per-call usage from the CLI's partial messages        #
+# ------------------------------------------------------------------ #
+
+def _live_usage_on(config: Any) -> bool:
+    """``agent.live_usage`` (minimal test configs lack it: off)."""
+    return bool(getattr(getattr(config, "agent", None), "live_usage", False))
+
+
+def call_usage_from_stream(
+    message: Any, open_call: list[str | None],
+) -> list[ev.AgentEvent]:
+    """A raw stream event → :class:`~ev.CallUsage`, for the main chain only.
+
+    ``open_call`` is the client's ``[message id, model]`` of the call that
+    the last ``message_start`` opened: a ``message_delta`` names no message,
+    so it is the call's. Every other event (text and tool-input chunks, block
+    starts and stops, sub-agents' events) gives nothing.
+    """
+    if getattr(message, "parent_tool_use_id", None) is not None:
+        return []
+    event = getattr(message, "event", None)
+    if not isinstance(event, dict):
+        return []
+    kind = event.get("type")
+    if kind == "message_start":
+        started = event.get("message") or {}
+        open_call[0] = started.get("id")
+        open_call[1] = started.get("model")
+        usage = started.get("usage")
+        final = False
+    elif kind == "message_delta":
+        usage = event.get("usage")
+        final = True
+    else:
+        return []
+    if not isinstance(usage, dict) or not usage:
+        return []
+    return [ev.CallUsage(
+        message_id=open_call[0], model=open_call[1], usage=dict(usage), final=final,
+    )]
+
+
+# ------------------------------------------------------------------ #
 #  can_use_tool adapter                                                #
 # ------------------------------------------------------------------ #
 
@@ -829,6 +873,11 @@ class ClaudeBackend:
             # fatal to the turn the moment a Read returns a screenshot — see
             # AgentConfig.cli_max_message_bytes.
             max_buffer_size=config.agent.cli_max_message_bytes,
+            # Live cost (agent.live_usage): the raw stream events carry each
+            # main-chain call's usage at message_start and message_delta.
+            # ClaudeClient keeps those two and drops the rest (~240 per 1,000
+            # output tokens) with one type check.
+            include_partial_messages=_live_usage_on(config),
             # No allowed_tools — can_use_tool handles permissions.
             # External MCP server tools are discovered at connection time,
             # so we can't enumerate them upfront.
@@ -1398,6 +1447,10 @@ class ClaudeClient(AgentClient):
     _mcp_lookup: asyncio.Task | None = None
     _mcp_lookup_names: set[str] | None = None
     _mcp_status_retry_at: float = 0.0
+    _options: Any = None
+    # [message id, model] of the main-chain call the last message_start
+    # opened (live cost; see call_usage_from_stream).
+    _open_call: list[str | None] | None = None
 
     def __init__(
         self, spec: SessionSpec, options: ClaudeAgentOptions, *,
@@ -1643,6 +1696,11 @@ class ClaudeClient(AgentClient):
         msg_sid = getattr(message, "session_id", None)
         if msg_sid:
             self._native_session_id = msg_sid
+        if isinstance(message, StreamEvent):
+            # Partial messages (agent.live_usage): only the usage matters.
+            if self._open_call is None:
+                self._open_call = [None, None]
+            return call_usage_from_stream(message, self._open_call)
         # Track the last MAIN-CHAIN transcript entry uuid (assistant text /
         # tool_use and user tool_result rows both count — a turn ending on
         # an end-turn tool closes on a user entry). Sidechain (subagent)
@@ -1658,6 +1716,21 @@ class ClaudeClient(AgentClient):
             for event in events:
                 if isinstance(event, ev.TurnCompleted):
                     event.native_turn_id = self._last_entry_uuid
+        if (
+            self._options is not None
+            and not getattr(self._options, "include_partial_messages", False)
+            and isinstance(message, AssistantMessage)
+            and getattr(message, "parent_tool_use_id", None) is None
+            and isinstance(getattr(message, "usage", None), dict)
+            and message.usage
+        ):
+            # No stream events: a call's frames carry its usage at the start
+            # (output is the start value), so the estimate has the input side.
+            events.append(ev.CallUsage(
+                message_id=getattr(message, "message_id", None),
+                model=getattr(message, "model", None),
+                usage=dict(message.usage),
+            ))
         return events
 
     @property

@@ -150,3 +150,43 @@ describe('ContextBar', () => {
     expect(trigger()).toHaveFocus();
   });
 });
+
+describe('ContextBar live cost', () => {
+  const live = {
+    usage: { input_tokens: 2, output_tokens: 3, cache_read_input_tokens: 100_000, cache_creation_input_tokens: 5_000 },
+    context_tokens: 105_002, max_context_tokens: 1_048_576, calls: 1,
+    turn_cost_usd: 0.045, agents_cost_usd: 0, session_cost_usd: 10.045,
+  };
+
+  it('shows the billed session cost next to the context size', () => {
+    renderBar({ sessionCostUsd: 3.1 });
+    expect(screen.getByLabelText('Session cost: $3.10')).toHaveTextContent('$3.10');
+  });
+
+  it('shows the running estimate during the first turn, with no usage yet', async () => {
+    getContext.mockResolvedValue(LIVE);
+    const user = renderBar({ usage: null, live, sessionCostUsd: 10, busy: true });
+    expect(trigger()).toHaveAccessibleName('Context window: 105.0k of 1.0M tokens');
+    expect(screen.getByLabelText('Session cost: about $10.04')).toHaveTextContent('~$10.04');
+    await user.click(trigger());
+    await screen.findByRole('list', { name: 'Context by category' });
+    expect(within(popover()).getByText('This turn so far')).toBeInTheDocument();
+    expect(within(popover()).getByText('This turn, 1 call')).toBeInTheDocument();
+    expect(within(popover()).getByText('Session (live)').nextSibling).toHaveTextContent('~$10.04');
+    // The meter keeps the latest call's context, not the breakdown loaded after the last turn.
+    expect(trigger()).toHaveAccessibleName('Context window: 105.0k of 1.0M tokens');
+  });
+
+  it('adds what the agents spent since the last turn', async () => {
+    getContext.mockResolvedValue(LIVE);
+    const user = renderBar({ sessionCostUsd: 3, agentsCostUsd: 5.5, agentsCostBase: 5 });
+    expect(screen.getByLabelText('Session cost: about $3.50')).toHaveTextContent('~$3.50');
+    await user.click(trigger());
+    expect(within(popover()).getByText('Agents since the last turn').nextSibling).toHaveTextContent('~$0.50');
+  });
+
+  it('shows nothing without usage', () => {
+    const { container } = render(<ContextBar usage={null} sessionId="s-1" backend="claude" busy={false} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+});

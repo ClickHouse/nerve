@@ -289,3 +289,48 @@ describe('context usage', () => {
     expect(useChatStore.getState().contextUsage).toMatchObject({ context_tokens: 17862, max_context_tokens: 200000 });
   });
 });
+
+describe('live cost', () => {
+  const live = {
+    usage: { input_tokens: 2, output_tokens: 400, cache_read_input_tokens: 100_000, cache_creation_input_tokens: 5_000 },
+    context_tokens: 105_002, max_context_tokens: 1_048_576, calls: 2,
+    turn_cost_usd: 0.06, agents_cost_usd: 0.5, session_cost_usd: 10.56,
+  };
+
+  it('keeps the latest usage_update of the turn', () => {
+    send({ type: 'usage_update', session_id: 's1', ...live });
+    expect(useChatStore.getState().liveUsage).toEqual(live);
+    send({ type: 'usage_update', session_id: 's1', ...live, calls: 3, session_cost_usd: 11 });
+    expect(useChatStore.getState().liveUsage).toMatchObject({ calls: 3, session_cost_usd: 11 });
+  });
+
+  it('ignores another session\'s estimate', () => {
+    useChatStore.setState({ liveUsage: null });
+    send({ type: 'usage_update', session_id: 'other', ...live });
+    expect(useChatStore.getState().liveUsage).toBeNull();
+  });
+
+  it('done swaps the estimate for the billed total and the exact context', () => {
+    useChatStore.setState({
+      liveUsage: live, agentsCostBase: null,
+      sessions: [{ id: 's1', title: 't', total_cost_usd: 10 } as never, { id: 's2', title: 'u', total_cost_usd: 1 } as never],
+    });
+    send({
+      type: 'done', session_id: 's1',
+      usage: { input_tokens: 4, output_tokens: 1300, cache_read_input_tokens: 220_000, cache_creation_input_tokens: 10_000 },
+      max_context_tokens: 1_048_576, num_turns: 2, context_tokens: 125_002,
+      session_cost_usd: 11.5, agents_cost_base: 2.75,
+    });
+    const s = useChatStore.getState();
+    expect(s.liveUsage).toBeNull();
+    expect(s.agentsCostBase).toBe(2.75);
+    expect(s.contextUsage?.context_tokens).toBe(125_002);
+    expect(s.sessions.map(r => r.total_cost_usd)).toEqual([11.5, 1]);
+  });
+
+  it('a stopped turn leaves no estimate', () => {
+    useChatStore.setState({ liveUsage: live });
+    send({ type: 'stopped', session_id: 's1' } as WSMessage);
+    expect(useChatStore.getState().liveUsage).toBeNull();
+  });
+});
