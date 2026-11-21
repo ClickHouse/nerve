@@ -84,7 +84,37 @@ _SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
 _RESULT_MAX = 4000
 _ERROR_MAX = 2000
 
+# Characters of the result shown in the "finished" notification.
+_SNIPPET_MAX = 300
+
 _SESSION_PREFIX = "workflow:"
+
+
+def _result_snippet(result_text: str, final_message: dict | None) -> str:
+    """The part of a run's result that the "finished" notification shows.
+
+    The start of the final message's last non-empty text block, which is
+    normally the text after the run's last tool call. The full result starts
+    with the progress messages that the agent sent while it worked, and
+    those would fill the preview. The start of the full result is the
+    fallback when the final message has no such block, or when that block is
+    not part of the recorded result.
+    """
+    source = result_text
+    blocks = (final_message or {}).get("blocks")
+    for block in reversed(blocks if isinstance(blocks, list) else []):
+        if not isinstance(block, dict) or block.get("type") != "text":
+            continue
+        text = str(block.get("content") or "")
+        if not text.strip():
+            continue
+        if text in result_text:
+            source = text
+        break
+    snippet = " ".join(source.split())
+    if len(snippet) > _SNIPPET_MAX:
+        snippet = snippet[:_SNIPPET_MAX] + "…"
+    return snippet
 
 
 class WorkflowRunError(ValueError):
@@ -633,19 +663,15 @@ class WorkflowRunService:
 
             await self._refresh_spend(run_id, final=True)
             result_text = response or ""
-            if waited_bg:
+            final_message = None
+            if waited_bg or not self._is_quiet(run):
+                final_message = await self._final_assistant_message(session_id, run_id)
+            if waited_bg and final_message is not None:
                 # A background-orchestrating run's final text lands in the
                 # follow-up auto-turn, NOT in engine.run's return (which
                 # holds only the pre-background text). The session's newest
                 # assistant message is the authoritative final output.
-                try:
-                    messages = await self.db.get_messages(session_id, limit=50)
-                    for msg in reversed(messages):
-                        if msg.get("role") == "assistant" and str(msg.get("content") or "").strip():
-                            result_text = str(msg["content"])
-                            break
-                except Exception:  # noqa: BLE001 — fall back to turn text
-                    logger.exception("post-background result read failed for %s", run_id)
+                result_text = str(final_message["content"])
             flipped = await self.db.transition_workflow_run(
                 run_id, "done", expect=("running",),
                 result=result_text[-_RESULT_MAX:],
@@ -657,9 +683,7 @@ class WorkflowRunService:
                 spent = (fresh or {}).get("spent_usd") or 0.0
                 budget = (fresh or {}).get("budget_usd")
                 budget_txt = f" of ${budget:.2f} budget" if budget else ""
-                snippet = " ".join(result_text.split())
-                if len(snippet) > 300:
-                    snippet = snippet[:300] + "…"
+                snippet = _result_snippet(result_text, final_message)
                 if not self._is_quiet(run):
                     await self._notify(
                         f"Workflow run {run_id} finished",
@@ -1061,6 +1085,18 @@ class WorkflowRunService:
             tmp.replace(path)
         except OSError:
             logger.warning("run.json write failed for %s", run.get("id"))
+
+    async def _final_assistant_message(self, session_id: str, run_id: str) -> dict | None:
+        """The run session's newest assistant message with text, or None."""
+        try:
+            messages = await self.db.get_messages(session_id, limit=50)
+        except Exception:  # noqa: BLE001 — callers fall back to the turn text
+            logger.exception("final message read failed for %s", run_id)
+            return None
+        for msg in reversed(messages):
+            if msg.get("role") == "assistant" and str(msg.get("content") or "").strip():
+                return msg
+        return None
 
     def _write_result(self, run: dict, text: str) -> None:
         journal_dir = run.get("journal_dir")

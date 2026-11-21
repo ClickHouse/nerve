@@ -75,11 +75,14 @@ pending ──▶ running ──▶ done
 - At most `workflows.max_concurrent_runs` execute at once; excess runs queue
   in `pending` (costing nothing) and dispatch oldest-first as slots free.
 - `done` stores the final message (last 4 KB in the DB row, full text in
-  `result.md`) and notifies with spend vs budget. `failed` stores the error
-  and notifies at high priority. A run also ends `failed` when its last agent
-  turn failed or was interrupted (max turns, an API error, an abort, a crashed
-  runtime); for a run that waits on background work, that is the last turn
-  that ended before the run settled.
+  `result.md`) and notifies with spend vs budget. The notification shows the
+  first 300 characters of the final message's last text block (normally the
+  text after the run's last tool call), so the progress messages before it do
+  not fill the preview. Without such a block, it shows the start of the result.
+  `failed` stores the error and notifies at high priority. A run also ends
+  `failed` when its last agent turn failed or was interrupted (max turns, an
+  API error, an abort, a crashed runtime); for a run that waits on background
+  work, that is the last turn that ended before the run settled.
 - Stopping the run's session directly (web Stop button, `stop_session`) lands
   the run in `killed` with reason "session stopped". Killing via the run API
   is idempotent on already-terminal runs.
