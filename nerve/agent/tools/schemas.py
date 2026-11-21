@@ -1078,6 +1078,28 @@ SEND_CHANNEL_MESSAGE_SCHEMA = {
     "required": ["channel", "target", "text"],
 }
 
+SEND_IMAGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "file_path": {
+            "type": "string",
+            "description": "Absolute path to a local image file to send. Provide either file_path or url, not both.",
+            "default": "",
+        },
+        "url": {
+            "type": "string",
+            "description": "URL of a remote image to send. Provide either url or file_path, not both.",
+            "default": "",
+        },
+        "caption": {
+            "type": "string",
+            "description": "Optional caption text displayed below the image. Supports markdown.",
+            "default": "",
+        },
+    },
+    "required": [],
+}
+
 # ----- MCP admin tools -----
 
 NERVE_API_SCHEMA = {
