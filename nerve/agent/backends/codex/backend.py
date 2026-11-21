@@ -760,13 +760,19 @@ class CodexBackend:
         elif url:
             out.append(f"{base}.url={_toml_str(url)}")
             headers = getattr(srv, "headers", None) or {}
-            for k in headers:
+            header_env = []
+            for header in headers:
                 env_name = cls._mcp_secret_env_name(
-                    str(srv.name), str(k), "HTTP",
+                    str(srv.name), str(header), "HTTP",
                 )
+                header_env.append(
+                    f"{_toml_str(str(header))}={_toml_str(env_name)}"
+                )
+            if header_env:
+                # Codex ignores quoted header names in dotted-key overrides.
+                # A single inline table preserves every HTTP header mapping.
                 out.append(
-                    f'{base}.env_http_headers.{_toml_str(str(k))}='
-                    f'{_toml_str(env_name)}'
+                    f"{base}.env_http_headers={{{', '.join(header_env)}}}"
                 )
         else:
             raise ValueError("no command or url")
