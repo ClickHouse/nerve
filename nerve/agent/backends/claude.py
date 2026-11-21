@@ -1850,6 +1850,33 @@ class ClaudeClient(AgentClient):
             raise BackendError(detail or f"the tool call failed ({code})")
         return answer
 
+    async def reconnect_failed_mcp_servers(self) -> dict[str, str]:
+        """Reconnect the MCP servers this client's CLI reports as failed.
+
+        The CLI connects its MCP servers once, at start. A server that timed
+        out then stays failed for the life of the process, so a config reload
+        alone never revives it here. Returns ``{server: outcome}`` for each
+        failed server: ``"reconnected"`` or ``"failed: <reason>"``. Servers
+        that are connected, pending or disabled are left alone. A status
+        query that fails yields ``{}``.
+        """
+        try:
+            status = await self._sdk.get_mcp_status()
+        except Exception as e:
+            logger.warning("get_mcp_status failed: %s", e)
+            return {}
+        out: dict[str, str] = {}
+        for srv in status.get("mcpServers", []):
+            name = srv.get("name")
+            if not name or srv.get("status") != "failed":
+                continue
+            try:
+                await self._sdk.reconnect_mcp_server(name)
+                out[name] = "reconnected"
+            except Exception as e:
+                out[name] = f"failed: {e}"
+        return out
+
     def is_alive(self) -> bool:
         transport = getattr(self._sdk, "_transport", None)
         if not transport:

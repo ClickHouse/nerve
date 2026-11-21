@@ -101,9 +101,16 @@ async def mcp_reload_handler(ctx: ToolContext, args: dict) -> ToolResult:
     try:
         servers = await ctx.engine.reload_mcp_config()
         names = ["nerve (built-in)"] + [s.name for s in servers]
-        return ToolResult.text(
-            f"MCP config reloaded. {len(names)} server(s): {', '.join(names)}"
-        )
+        msg = f"MCP config reloaded. {len(names)} server(s): {', '.join(names)}"
+        client = ctx.engine.sessions.get_client(ctx.session_id)
+        reconnect = getattr(client, "reconnect_failed_mcp_servers", None)
+        if reconnect is not None:
+            results = await reconnect()
+            if results:
+                msg += "\nReconnect of failed servers in this session: " + ", ".join(
+                    f"{n}: {r}" for n, r in results.items()
+                )
+        return ToolResult.text(msg)
     except Exception as e:
         logger.error("mcp_reload failed: %s", e)
         return ToolResult.text(f"Reload failed: {e}")
@@ -125,7 +132,8 @@ MCP_RELOAD_SPEC = ToolSpec(
     description=(
         "Reload MCP server configuration from config files. "
         "Use after editing config.yaml to pick up new or changed external MCP servers. "
-        "New sessions will use the updated config; existing sessions keep their current connections."
+        "New sessions will use the updated config. This session keeps the server list it started with, "
+        "but servers that failed to connect at its start are reconnected."
     ),
     input_schema=MCP_RELOAD_SCHEMA,
     handler=mcp_reload_handler,
