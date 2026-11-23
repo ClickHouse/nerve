@@ -356,7 +356,9 @@ sync:
                                    # failures on your own PR branches, drop
                                    # default-branch syncs and scheduled runs.
   # Repositories you follow without taking part in them: new PRs, issues and
-  # releases there. Nothing is set on the GitHub account. With
+  # releases there, and with the commit type the new commits on a branch (one
+  # record per branch; useful to gate a job on new commits, see docs/cron.md
+  # "messages"). Nothing is set on the GitHub account. With
   # sync.github.mode: hosted the channel gateway polls them too (it must know
   # the repository watch). Nothing older than a day is backfilled: a check
   # more than a day after the last (a daily schedule, an outage) reports the
@@ -366,7 +368,14 @@ sync:
     enabled: false
     schedule: "*/15 * * * *"       # poll mode; hosted: the fallback drain
     repos: []                      # Required: ["acme/widgets"], each once, at most 50
-    # types: [pull_request, issue] # pull_request | issue | release
+    # types: [pull_request, issue] # pull_request | issue | release | commit
+                                   # (hosted: commit only once the gateway
+                                   # knows the type, see docs/sources.md)
+    # branches:                    # commit type: the branches to follow, by
+    #   acme/widgets: [main]       # repository; no entry = its default branch.
+                                   # A branch's name, not a ref (main, not
+                                   # refs/heads/main); quote a name that YAML
+                                   # reads as something else: "1.10"
     # include_bots: false          # also PRs and issues a GitHub App or a [bot]
                                    # opened; releases arrive whoever published them
     # include_drafts: true         # false: a draft PR is reported when it is

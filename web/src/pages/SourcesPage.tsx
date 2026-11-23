@@ -11,6 +11,7 @@ import { Badge, Button, Checkbox, IconButton, type BadgeTone } from '../componen
 import { useSourcesStore, type SourceOverviewEntry } from '../stores/sourcesStore';
 import { MessageContent } from '../components/Sources/MessageContent';
 import { sourceLabel } from '../utils/sourceLabel';
+import { metadataValueText } from '../utils/sourceMetadata';
 
 // --- Helpers ---
 
@@ -570,7 +571,7 @@ function MessageDetail() {
             {Object.entries(msg.metadata).map(([k, v]) => (
               <span key={k} className="text-xs px-1.5 py-0.5 bg-surface border border-border-subtle rounded">
                 <span className="text-text-dim">{k}:</span>{' '}
-                <span className="text-text-muted">{typeof v === 'object' ? JSON.stringify(v) : String(v)}</span>
+                <span className="text-text-muted">{metadataValueText(k, v)}</span>
               </span>
             ))}
           </div>

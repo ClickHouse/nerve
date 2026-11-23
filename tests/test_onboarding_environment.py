@@ -334,6 +334,20 @@ class TestConnections:
             "also new commits, ready for review, merges and closes of the pull requests it reported"
         )
 
+    def test_the_repository_watch_line_names_the_commits_of_branches(self, tmp_path):
+        config_dir, ws = _install(tmp_path)
+        merge_settings_paths(ws, {
+            "sync.github_repos.enabled": True,
+            "sync.github_repos.repos": ["acme/widgets"],
+            "sync.github_repos.types": ["commit", "issue"],
+        })
+
+        lines = _lines(env.gather(load_config(config_dir), ws).section)
+
+        assert lines["GitHub repository watch"] == (
+            "on (polled here with `gh`): new issues and branch commits in `acme/widgets`"
+        )
+
     def test_a_repository_watch_without_repositories_says_so(self, tmp_path):
         config_dir, ws = _install(tmp_path)
         merge_settings_paths(ws, {"sync.github_repos.enabled": True, "sync.github_repos.types": ["release"]})

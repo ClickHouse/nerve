@@ -237,7 +237,8 @@ def build_source_runners(
         ))
         logger.info("Registered source: github_events (batch=%d, repos=%s)", gh_events.batch_size, gh_events.repos or "all")
 
-    # GitHub Repos (repositories the agent follows: new PRs, issues, releases).
+    # GitHub Repos (repositories the agent follows: new PRs, issues, releases,
+    # and the new commits of their branches).
     # GitHub is hosted as a whole: with sync.github.mode hosted the gateway
     # polls these repositories too, and the runner drains what it delivered.
     gh_repos = config.sync.github_repos
@@ -260,6 +261,7 @@ def build_source_runners(
             source = GitHubReposSource(config={
                 "repos": gh_repos.repos,
                 "types": gh_repos.types,
+                "branches": gh_repos.branches,
                 "include_bots": gh_repos.include_bots,
                 "include_drafts": gh_repos.include_drafts,
                 "updates": gh_repos.updates,
@@ -276,12 +278,12 @@ def build_source_runners(
             inbox_filter=github_repos_inbox_filter(gh_repos),
         ))
         logger.info(
-            "Registered source: %s (batch=%d, repos=%s, types=%s, include_bots=%s, "
-            "include_drafts=%s, updates=%s, deny_authors=%s)",
+            "Registered source: %s (batch=%d, repos=%s, types=%s, branches=%s, "
+            "include_bots=%s, include_drafts=%s, updates=%s, deny_authors=%s)",
             "github_repos (hosted)" if repos_hosted else "github_repos",
             gh_repos.batch_size, gh_repos.repos or "none", gh_repos.types,
-            gh_repos.include_bots, gh_repos.include_drafts, gh_repos.updates,
-            gh_repos.deny_authors or [],
+            gh_repos.branches or "default", gh_repos.include_bots, gh_repos.include_drafts,
+            gh_repos.updates, gh_repos.deny_authors or [],
         )
 
     # Channel source drains. Not a poll: the channel transport already

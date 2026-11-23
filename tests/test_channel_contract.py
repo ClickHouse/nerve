@@ -877,7 +877,20 @@ class TestRepositoryWatch:
                 for n in range(50)
             )),
         )).validate()
-        repo_watch(watched("a/b", types=("pull_request", "issue", "release"))).validate()
+        repo_watch(watched("a/b", types=("pull_request", "issue", "release", "commit"))).validate()
+        repo_watch(watched(types=("commit",), branches=("main", "release/1.2", "b" * 121))).validate()
+        repo_watch(watched(types=("commit",), branches=tuple(f"b{n}" for n in range(8)))).validate()
+        # A branch may have the name of a tag, and refs in its name.
+        repo_watch(watched(types=("commit",), branches=("v1.2.0", "refs", "refsx/main", "feature/refs/heads"))).validate()
+        # The repository's name and a branch's: 194 bytes together.
+        repo_watch(watched("o" * 39 + "/" + "r" * 100, types=("commit",), branches=("b" * 54,))).validate()
+
+    def test_branches_are_sent_only_when_a_repository_names_one(self):
+        """A repository without branches is sent as before the member existed."""
+        assert '"branches"' not in dumps(repo_watch(watched(types=("commit",))))
+        assert dumps(repo_watch(watched(types=("commit",), branches=("main", "next")))).endswith(
+            '"deny_authors":[],"branches":["main","next"]}]}]}'
+        )
 
     @pytest.mark.parametrize(("subscriptions", "expected"), [
         (Subscriptions(version="1", sources=(SourceSubscription(provider="github_repos"),)), "malformed_frame"),
@@ -896,6 +909,20 @@ class TestRepositoryWatch:
         (repo_watch(watched(deny_authors=("x" * 257,))), "malformed_frame"),
         (repo_watch(watched(deny_authors=("",))), "malformed_frame"),
         (repo_watch(watched(deny_authors=("tab\there",))), "malformed_frame"),
+        (repo_watch(watched(types=("commit",), branches=tuple(f"b{n}" for n in range(9)))), "limit_exceeded"),
+        (repo_watch(watched(types=("commit",), branches=("main", "main"))), "malformed_frame"),
+        (repo_watch(watched(types=("commit",), branches=("",))), "malformed_frame"),
+        (repo_watch(watched(types=("commit",), branches=("-main",))), "malformed_frame"),
+        (repo_watch(watched(types=("commit",), branches=("a..b",))), "malformed_frame"),
+        (repo_watch(watched(types=("commit",), branches=("main.lock",))), "malformed_frame"),
+        # A branch is named without its ref prefix, and no other ref is one.
+        (repo_watch(watched(types=("commit",), branches=("refs/heads/main",))), "malformed_frame"),
+        (repo_watch(watched(types=("commit",), branches=("main", "refs/heads/main"))), "malformed_frame"),
+        (repo_watch(watched(types=("commit",), branches=("refs/tags/v1.2.0",))), "malformed_frame"),
+        (repo_watch(watched(types=("commit",), branches=("refs/pull/1/head",))), "malformed_frame"),
+        (repo_watch(watched(types=("commit",), branches=("b" * 122,))), "malformed_frame"),
+        (repo_watch(watched("o" * 39 + "/" + "r" * 100, types=("commit",), branches=("b" * 55,))), "malformed_frame"),
+        (repo_watch(watched(branches=("my branch",))), "malformed_frame"),
         (repo_watch(filters=SourceFilters(deny_actors=("alice",))), "malformed_frame"),
         (repo_watch(pr_watch=True), "malformed_frame"),
         (repo_watch(inbox="all"), "malformed_frame"),

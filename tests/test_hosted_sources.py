@@ -11,10 +11,11 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import json
 import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -49,6 +50,7 @@ from nerve.channels.hosted.sources import (
     github_repos_subscription,
     github_subscription,
     hosted_sources,
+    repo_watch_types,
     subscriptions_for,
 )
 from nerve.channels.router import ChannelRouter
@@ -88,6 +90,10 @@ THREAD_ITEMS = {"provider": "github_thread_items", "filters": {}}
 def hosted_github(**settings: Any) -> GitHubSyncConfig:
     return GitHubSyncConfig(mode="hosted", **settings)
 
+
+# A copy of the channel contract's sample of the new commits of a branch
+# (tests/test_github_repos_source.py pins its bytes).
+COMMITS_SAMPLE = Path(__file__).parent / "fixtures" / "channel_contract" / "github_repo_commits.json"
 
 # The metadata of a github_repos record: every key, empty ones included.
 REPO_ACTIVITY_METADATA = {
@@ -227,9 +233,9 @@ class TestSettings:
 
     @pytest.mark.parametrize(("settings", "message"), [
         ({"types": ["pull_request", "commits"]},
-         "sync.github_repos.types must be one or more of ('pull_request', 'issue', 'release'), got 'commits'"),
+         "sync.github_repos.types must be one or more of ('pull_request', 'issue', 'release', 'commit'), got 'commits'"),
         ({"types": []},
-         "sync.github_repos.types must be one or more of ('pull_request', 'issue', 'release'), got none"),
+         "sync.github_repos.types must be one or more of ('pull_request', 'issue', 'release', 'commit'), got none"),
         ({"enabled": True, "repos": [f"acme/repo-{n}" for n in range(51)]},
          "sync.github_repos.repos must name at most 50 repositories, got 51"),
         ({"enabled": True, "repos": ["acme"]},
@@ -249,7 +255,7 @@ class TestSettings:
             "got \"{'acme': 'widgets'}\""
         )),
         ({"types": {"issue": True}}, (
-            "sync.github_repos.types must be one or more of ('pull_request', 'issue', 'release'), "
+            "sync.github_repos.types must be one or more of ('pull_request', 'issue', 'release', 'commit'), "
             "got \"{'issue': true}\""
         )),
     ])
@@ -258,6 +264,116 @@ class TestSettings:
             NerveConfig.from_dict({"sync": {"github_repos": settings}})
 
         assert str(refused.value) == message
+
+    def test_the_branches_of_the_commit_type_are_read(self):
+        """A repository's branches go by its name as repos spells it; one
+        branch may be written as a string, blanks are dropped, and a
+        repository without a value names none."""
+        watch = NerveConfig.from_dict({"sync": {"github_repos": {
+            "enabled": True, "repos": ["acme/widgets", "Other-Org/tool", "acme/gadgets", "acme/gears"],
+            "types": ["commit", "issue"],
+            "branches": {
+                "ACME/Widgets": [" main ", "release/1.2", "", "1.10"], "other-org/tool": "trunk",
+                "acme/gadgets": [], "acme/gears": None,
+            },
+        }}}).sync.github_repos
+
+        assert watch.types == ["issue", "commit"]
+        assert watch.branches == {"acme/widgets": ["main", "release/1.2", "1.10"], "Other-Org/tool": ["trunk"]}
+        assert (watch.branches_of("Acme/Widgets"), watch.branches_of("acme/gadgets"), watch.branches_of("acme/gears")) == (
+            ["main", "release/1.2", "1.10"], [], [],
+        )
+        assert GitHubReposSyncConfig.from_dict({"types": ["commit"], "branches": None}).branches == {}
+        assert validate_config_keys({"sync": {"github_repos": {"branches": {"acme/widgets": ["main"]}}}}) == []
+
+    # What the message says about a branch that YAML read as something else.
+    QUOTE_IT = (
+        ": put the name in quotes, since YAML reads an unquoted 1.10 as the number 1.1, and an "
+        "unquoted no, off or 0 as a value that is no name"
+    )
+
+    @pytest.mark.parametrize(("branches", "message"), [
+        (["main"], "must map owner/repo names to their branches, got \"['main']\""),
+        ([], "must map owner/repo names to their branches, got '[]'"),
+        ("main", "must map owner/repo names to their branches, got 'main'"),
+        # A name with its ref prefix: main and refs/heads/main are one branch.
+        ({"acme/widgets": ["refs/heads/main"]}, "got 'refs/heads/main'"),
+        ({"acme/widgets": ["main", "refs/heads/main"]}, "got 'refs/heads/main'"),
+        ({"acme/widgets": "refs/tags/v1.2.0"}, "got 'refs/tags/v1.2.0'"),
+        # What YAML makes of an unquoted 1.10, no, off, 0, an empty item and a date.
+        ({"acme/widgets": [1.1]}, "of 'acme/widgets' must name each branch as a string, got 1.1" + QUOTE_IT),
+        ({"acme/widgets": ["main", False]}, "of 'acme/widgets' must name each branch as a string, got False" + QUOTE_IT),
+        ({"acme/widgets": False}, "of 'acme/widgets' must name each branch as a string, got False" + QUOTE_IT),
+        ({"acme/widgets": [0]}, "of 'acme/widgets' must name each branch as a string, got 0" + QUOTE_IT),
+        ({"acme/widgets": ["main", None]}, "of 'acme/widgets' must name each branch as a string, got None" + QUOTE_IT),
+        ({"acme/widgets": [date(2026, 1, 2)]}, "got datetime.date(2026, 1, 2)" + QUOTE_IT),
+        ({"acme/widgets": [["main"]]}, "got ['main']" + QUOTE_IT),
+        ({"acme/other": ["main"]}, "names 'acme/other', which sync.github_repos.repos does not list"),
+        ({"acme/widgets": ["main"], "ACME/Widgets": ["next"]}, "names 'acme/widgets' twice"),
+        ({"acme/widgets": ["main", "main"]}, "of 'acme/widgets' name a branch twice"),
+        ({"acme/widgets": [f"b{n}" for n in range(9)]}, "of 'acme/widgets' must name at most 8 branches, got 9"),
+        ({"acme/widgets": ["-main"]}, "got '-main'"),
+        ({"acme/widgets": ["my branch"]}, "got 'my branch'"),
+        ({"acme/widgets": ["a..b"]}, "got 'a..b'"),
+        ({"acme/widgets": ["main.lock"]}, "got 'main.lock'"),
+        ({"acme/widgets": ["b" * 122]}, f"got '{'b' * 122}'"),
+        ({"acme/widgets": ["b" * 121]}, None),
+        ({"acme/widgets": [f"b{n}" for n in range(8)]}, None),
+        ({"acme/widgets": ["refs", "refsx/main", "feature/refs/heads", "v1.2.0", "1.10", "no", "0"]}, None),
+    ])
+    def test_branches_the_gateway_would_refuse_refuse_to_load(self, branches, message, caplog):
+        """While the watch is on. While it is off they are left out with a warning."""
+        settings = {"repos": ["acme/widgets"], "types": ["commit"], "branches": branches}
+        if message is None:
+            assert GitHubReposSyncConfig.from_dict({"enabled": True, **settings}).branches == branches
+            return
+
+        with pytest.raises(ValueError) as refused:
+            GitHubReposSyncConfig.from_dict({"enabled": True, **settings})
+
+        assert str(refused.value).startswith("sync.github_repos.branches ")
+        assert str(refused.value).endswith(message)
+        with caplog.at_level(logging.WARNING, logger="nerve.config"):
+            assert GitHubReposSyncConfig.from_dict(settings).branches in ({}, {"acme/widgets": ["main"]})
+        assert "its branches would refuse to load once it is switched on" in caplog.text
+
+    @pytest.mark.parametrize("branches", [
+        {"acme/widgets": ["main"]},
+        # What the commit type would refuse.
+        ["main"], {"acme/other": ["main"]}, {"acme/widgets": ["refs/heads/main", 1.1, "a..b"]}, "main",
+    ])
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_branches_are_read_only_with_the_commit_type(self, branches, enabled, caplog):
+        """Without the commit type the setting is not read: a value that is
+        left there loads whatever it holds, with one warning, and names no
+        branch. An empty one says nothing."""
+        settings = {"enabled": enabled, "repos": ["acme/widgets"], "types": ["issue", "release"]}
+
+        with caplog.at_level(logging.WARNING, logger="nerve.config"):
+            watch = GitHubReposSyncConfig.from_dict({**settings, "branches": branches})
+
+        assert (watch.branches, watch.branches_of("acme/widgets")) == ({}, [])
+        assert [record.getMessage() for record in caplog.records] == [
+            "sync.github_repos.branches is set, and sync.github_repos.types does not name commit: "
+            "the branches are not read",
+        ]
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="nerve.config"):
+            for empty in (None, "", {}, []):
+                assert GitHubReposSyncConfig.from_dict({**settings, "branches": empty}).branches == {}
+            assert GitHubReposSyncConfig.from_dict(settings).branches == {}
+        assert caplog.records == []
+
+    def test_a_repository_and_a_branch_fit_the_id_of_a_commit_record_together(self):
+        """The gateway's bound: 194 bytes for both names."""
+        repo = "o" * 39 + "/" + "r" * 100
+        settings = {"enabled": True, "repos": [repo], "types": ["commit"]}
+
+        fits = GitHubReposSyncConfig.from_dict({**settings, "branches": {repo: ["b" * 54]}})
+
+        assert fits.branches == {repo: ["b" * 54]}
+        with pytest.raises(ValueError, match="at most 194 bytes together with the repository's name"):
+            GitHubReposSyncConfig.from_dict({**settings, "branches": {repo: ["b" * 55]}})
 
     def test_fifty_repositories_load(self):
         repos = [f"acme/repo-{n}" for n in range(50)]
@@ -498,6 +614,119 @@ class TestSubscriptionsBuilder:
             '"include_drafts":false,"updates":false,"deny_authors":["noisy-*"]}]}]}'
         )
 
+    def test_the_frame_is_unchanged_unless_the_watch_asks_for_commits(self):
+        """A gateway that does not know the commit type refuses the type and
+        the branches member, and closes the stream. So an agent that does not
+        ask for commits sends the very bytes it sent before, whatever its
+        branches setting says, and only the commit type adds to the frame."""
+        def frame(**watch: Any) -> str:
+            config = NerveConfig()
+            config.sync.github = hosted_github(enabled=False)
+            config.sync.github_repos = GitHubReposSyncConfig(
+                enabled=True, repos=["acme/widgets", "other-org/tool"], **watch,
+            )
+            subscriptions = subscriptions_for(config, hosted_sources(config))
+            subscriptions.validate()
+            return dumps(subscriptions)
+
+        def repo(name: str, types: str, more: str = "") -> str:
+            return (
+                f'{{"name":"{name}","types":[{types}],"include_bots":false,"include_drafts":true,'
+                f'"updates":false,"deny_authors":[]{more}}}'
+            )
+
+        def sources(*repos: str) -> str:
+            return (
+                '{"version":"1","sources":[{"provider":"github_repos","filters":{},"repos":['
+                + ",".join(repos) + "]}]}"
+            )
+
+        before = '"pull_request","issue"'
+        unchanged = sources(repo("acme/widgets", before), repo("other-org/tool", before))
+        assert frame() == unchanged
+        assert frame(branches={"acme/widgets": ["main"]}) == unchanged
+        assert frame(types=["issue", "commit"], branches={"ACME/Widgets": ["main", "release/1.2"]}) == sources(
+            repo("acme/widgets", '"issue","commit"', ',"branches":["main","release/1.2"]'),
+            # Without branches the gateway follows the default branch.
+            repo("other-org/tool", '"issue","commit"'),
+        )
+
+    def test_the_commit_type_and_the_thread_item_entry_do_not_touch_each_other(self):
+        """The entry that says that Nerve accepts thread items goes with the
+        notifications, and the commit type with the repository watch. One
+        frame holds both, each as it is alone: the watch of an agent that does
+        not ask for commits is the same bytes with and without the entry, and
+        the entry is the same bytes with and without the commit type."""
+        def frame(*, thread_items: bool, **watch: Any) -> str:
+            config = NerveConfig()
+            config.sync.github = hosted_github(enabled=True, thread_items=thread_items)
+            config.sync.github_repos = GitHubReposSyncConfig(enabled=True, repos=["acme/widgets"], **watch)
+            subscriptions = subscriptions_for(config, hosted_sources(config))
+            subscriptions.validate()
+            return dumps(subscriptions)
+
+        notifications = '{"provider":"github","filters":{},"pr_watch":true}'
+        items = '{"provider":"github_thread_items","filters":{}}'
+
+        def watch(types: str, more: str = "") -> str:
+            return (
+                '{"provider":"github_repos","filters":{},"repos":[{"name":"acme/widgets",'
+                f'"types":[{types}],"include_bots":false,"include_drafts":true,"updates":false,'
+                f'"deny_authors":[]{more}}}]}}'
+            )
+
+        def sources(*entries: str) -> str:
+            return '{"version":"1","sources":[' + ",".join(entries) + "]}"
+
+        before, commits = watch('"pull_request","issue"'), watch('"issue","commit"', ',"branches":["main"]')
+        asks = {"types": ["issue", "commit"], "branches": {"acme/widgets": ["main"]}}
+        assert frame(thread_items=True) == sources(notifications, items, before)
+        assert frame(thread_items=False) == sources(notifications, before)
+        assert frame(thread_items=True, branches={"acme/widgets": ["main"]}) == sources(notifications, items, before)
+        assert frame(thread_items=True, **asks) == sources(notifications, items, commits)
+        assert frame(thread_items=False, **asks) == sources(notifications, commits)
+
+    def test_the_types_that_are_published_are_chosen_in_one_place(self):
+        settings = GitHubReposSyncConfig(types=["commit", "Release", "release", "discussion"])
+
+        assert repo_watch_types(settings) == ("release", "commit")
+        assert github_repos_subscription(
+            GitHubReposSyncConfig(enabled=True, repos=["a/b"], types=["commit"]),
+        ).repos[0].types == ("commit",)
+
+    def test_branches_the_gateway_would_refuse_are_not_published(self, caplog):
+        """The config refuses to load them; a setting built in code loses
+        them. A repository whose branches are all lost does not report the
+        commits of its default branch in their place."""
+        settings = GitHubReposSyncConfig(
+            enabled=True, repos=["acme/widgets", "acme/gadgets", "acme/gears"], types=["issue", "commit"],
+            branches={
+                "acme/widgets": ["main", "a..b", "main", *(f"b{n}" for n in range(9))],
+                "acme/gadgets": ["not a branch"],
+            },
+        )
+
+        with caplog.at_level(logging.WARNING):
+            watch = github_repos_subscription(settings)
+
+        assert [(repo.name, repo.types, repo.branches) for repo in watch.repos] == [
+            ("acme/widgets", ("issue", "commit"), ("main", *(f"b{n}" for n in range(7)))),
+            ("acme/gadgets", ("issue",), ()),
+            ("acme/gears", ("issue", "commit"), ()),
+        ]
+        assert "sync.github_repos.branches of acme/widgets: the gateway is sent 8 of 12 branches" in caplog.text
+        Subscriptions(version="1", sources=(watch,)).validate()
+        only_commits = GitHubReposSyncConfig(
+            enabled=True, repos=["acme/gadgets"], types=["commit"], branches={"acme/gadgets": ["a..b"]},
+        )
+        assert github_repos_subscription(only_commits) is None
+        # A branch is named without its ref prefix.
+        by_ref = GitHubReposSyncConfig(
+            enabled=True, repos=["acme/gadgets"], types=["commit"],
+            branches={"acme/gadgets": ["main", "refs/heads/main", "refs/tags/v1.2.0"]},
+        )
+        assert github_repos_subscription(by_ref).repos[0].branches == ("main",)
+
     def test_the_repository_watch_goes_without_the_notifications_and_never_in_poll_mode(self):
         watch = GitHubReposSyncConfig(
             enabled=True, repos=["acme/widgets"], types=["release"], include_bots=True, updates=True,
@@ -659,6 +888,34 @@ class TestBufferedRecords:
         }
         base.update(record)
         return {"record": base}
+
+    @pytest.mark.parametrize("thread_items", [True, False])
+    def test_a_commit_record_and_a_thread_item_are_read_and_judged_each_by_its_own_source(self, thread_items):
+        """The two samples of the contract through the hosted reader: the
+        commits arrive as a list and truncated as a flag, and a thread item's
+        mentions_agent as a flag. The repository watch's guardrail keeps the
+        commit record only while types names commit, whatever
+        sync.github.thread_items says, and the notifications' guardrail keeps
+        the thread item whatever the watch reports."""
+        from nerve.sources.github import github_inbox_filter
+        from nerve.sources.github_repos import github_repos_inbox_filter
+
+        def read(sample: Path, source: str) -> Any:
+            event = json.loads(sample.read_text(encoding="utf-8"))
+            return record_from_buffer(buffered_record(decoded(event)), source=source)
+
+        commits = read(COMMITS_SAMPLE, "github_repos")
+        item = read(COMMITS_SAMPLE.parent / "github_thread_item.json", "github")
+
+        assert (commits.record_type, item.record_type) == ("github_repo_activity", "github_thread_item")
+        assert (len(commits.metadata["commits"]), commits.metadata["truncated"]) == (2, False)
+        assert isinstance(item.metadata["mentions_agent"], bool) and "truncated" not in item.metadata
+        assert "mentions_agent" not in commits.metadata and "actors" not in commits.metadata
+        notifications = hosted_github(enabled=True, thread_items=thread_items)
+        for types, kept in ((["commit"], True), (["pull_request", "issue", "release"], False)):
+            watch = GitHubReposSyncConfig(enabled=True, repos=["acme/widgets"], types=types)
+            assert github_repos_inbox_filter(watch).passes(commits) is kept
+            assert github_inbox_filter(notifications).passes(item)
 
     def test_a_payload_maps_to_the_polling_sources_record_shape(self):
         record = record_from_buffer(self.payload())
@@ -1241,6 +1498,44 @@ class TestStreams:
         assert stored["record_type"] == "github_repo_activity"
         assert stored["summary"] == "[acme/widgets] New PR #12: Add a widget cache"
         assert stored["metadata"] == REPO_ACTIVITY_METADATA
+
+    async def test_the_commits_of_a_branch_are_asked_for_and_their_record_reaches_the_inbox(self, hosted):
+        """The contract's sample of the new commits of a branch, as the
+        gateway delivers it: the commits arrive as a list and truncated as a
+        flag, and the guardrail keeps the record because the watch asks for
+        commits."""
+        hosted.config.sync.github_repos = GitHubReposSyncConfig(
+            enabled=True, repos=["acme/widgets"], types=["commit"], branches={"acme/widgets": ["main"]},
+        )
+        sample = json.loads(COMMITS_SAMPLE.read_text(encoding="utf-8"))
+        stream = await hosted.stream()
+        [subscriptions] = await hosted.subscriptions()
+        inbox_id = hosted.gateway.store(sample)
+
+        await stream.nudge("observe")
+
+        # The entry for thread items goes with the notifications, and stays as
+        # it is next to a watch that asks for commits.
+        assert [source["provider"] for source in subscriptions["sources"]] == [
+            "github", "github_thread_items", "github_repos",
+        ]
+        assert subscriptions["sources"][1] == THREAD_ITEMS
+        assert subscriptions["sources"][2] == {"provider": "github_repos", "filters": {}, "repos": [{
+            "name": "acme/widgets", "types": ["commit"], "include_bots": False, "include_drafts": True,
+            "updates": False, "deny_authors": [], "branches": ["main"],
+        }]}
+        assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
+        (runner,) = [
+            r for r in build_source_runners(hosted.config, hosted.db) if r.job_id == "source:github_repos"
+        ]
+        assert (await runner.run()).records_ingested == 1
+        stored = await hosted.db.get_source_message("github_repos", sample["record"]["id"])
+        assert stored["summary"] == "[acme/widgets] 2 new commits on main"
+        assert stored["metadata"]["commits"] == [
+            "5c4d3e2f1a0b99887766554433221100ffeeddcc Cache rendered widgets",
+            "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d Add the widget cache interface",
+        ]
+        assert (stored["metadata"]["truncated"], stored["metadata"]["subject_type"]) == (False, "Commit")
 
     async def test_the_repository_watch_guardrail_drops_what_the_settings_drop(self, hosted):
         """Records the gateway took before a reload changed the settings. The

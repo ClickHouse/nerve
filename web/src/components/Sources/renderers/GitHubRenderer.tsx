@@ -14,6 +14,8 @@ export function GitHubRenderer({ content, metadata, summary: _summary }: Props) 
   const subjectUrl = metadata?.subject_url || '';
   const subjectType = metadata?.subject_type || '';
   const reason = metadata?.reason || '';
+  // The branch of a repository watch's commit record.
+  const branch = metadata?.branch || '';
 
   return (
     <div>
@@ -27,6 +29,7 @@ export function GitHubRenderer({ content, metadata, summary: _summary }: Props) 
                 `text-hue-purple` mark above it. */}
             {subjectType && <Badge tone="purple">{subjectType}</Badge>}
             {reason && <Badge>{reason}</Badge>}
+            {branch && <Badge>{branch}</Badge>}
           </div>
           {subjectUrl && (
             <a href={subjectUrl} target="_blank" rel="noopener noreferrer"

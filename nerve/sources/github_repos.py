@@ -4,7 +4,8 @@ Where the ``github`` source surfaces notifications involving *you* and the
 ``github_events`` source captures *your own* actions, this source watches a
 configured set of repositories (``sync.github_repos.repos``) that the account
 need not take part in, and reports new pull requests, issues and releases
-there (``types``). Nothing is set on the GitHub account: no watch, no e-mail.
+there, and the new commits of its branches (``types``). Nothing is set on the
+GitHub account: no watch, no e-mail.
 
 This module is the poll mode: the gh CLI, on the source's schedule. With
 ``sync.github.mode: hosted`` the channel gateway polls the same listings for
@@ -17,6 +18,11 @@ One request per repository and type, the most recently changed first:
 * ``issue``: ``GET /repos/{repo}/issues?state=all&sort=updated&direction=desc&per_page=100``;
   the issues endpoint lists the pull requests too, and they are skipped
 * ``release``: ``GET /repos/{repo}/releases?per_page=30``; drafts are skipped
+* ``commit``: ``GET /repos/{repo}/commits?sha=refs/heads/{branch}&per_page=100``
+  for each branch that ``branches`` names for the repository, or for its
+  default branch, which ``GET /repos/{repo}`` names. The request names the
+  branch's ref, so a tag or a commit of the same name is never read in its
+  place
 
 Events (the record's ``Event:`` line and ``event`` metadata):
 
@@ -28,6 +34,9 @@ Events (the record's ``Event:`` line and ``event`` metadata):
   merge, or a close without one, of a pull request already reported. One
   record per pull request and run: merged or closed, else ready, else updated
 * ``released``: a release published since the last listing
+* ``pushed``: the head of a branch is another commit than at the last
+  listing. One record per branch and run, with the commits that the listing
+  shows above the earlier head, never one record per commit
 
 Comments, reviews and labels move ``updated_at`` and report nothing. Before
 anything is reported or remembered, a pull request or an issue is dropped
@@ -35,17 +44,20 @@ whose author is a GitHub App or a ``[bot]`` account (unless
 ``include_bots``; a release is reported whoever published it, release
 automation being the normal case), and any item whose author's login
 matches a ``deny_authors`` glob (the rules of the actor guardrail: a
-pattern that ends in ``[bot]`` names a GitHub App).
+pattern that ends in ``[bot]`` names a GitHub App). Neither filter judges
+the commits of a branch: one record can hold commits of many authors.
 
 The cursor is JSON: per repository, for each listing its newest
 ``updated_at`` (``published_at`` for releases), when it was read, and the keys
 of the items created in that newest second; and the fingerprints of the pull
 requests it follows (``[head commit, draft, held]``), a held draft or, with
-``updates``, a reported pull request that is still open::
+``updates``, a reported pull request that is still open; and the head commit
+of each branch whose commits it follows::
 
     {"v": 1, "repos": {"acme/widgets": {"pulls": {"since": "2026-10-27T10:05:00Z",
      "listed_at": "2026-10-27T10:20:00Z", "at": ["12"]},
-     "prs": {"12": ["0123456789ab", false, false]}}}}
+     "prs": {"12": ["0123456789ab", false, false]},
+     "branches": {"main": "5c4d3e2f1a0b99887766554433221100ffeeddcc"}}}}
 
 An item is new when it was created (published) after the last listing: later
 than its cursor, or in the cursor's own second and not listed then, since
@@ -54,6 +66,9 @@ GitHub's times have a resolution of one second. At most
 listed longest ago is forgotten first. A listing without a cursor is the
 baseline: its cursor is set and nothing is reported, so switching the source
 on, or adding a repository or a type, does not fill the inbox with history.
+A branch without a head in the cursor takes its baseline the same way: its
+head is stored and nothing is reported, and from then on a head that moved is
+reported however long after.
 Nothing older than a day is backfilled: a listing last read more than a day
 ago (:data:`STALE_AFTER`; a daily schedule, a long outage, the source switched
 off for longer) is read as of a day and an hour ago (:data:`STALE_GRACE`, for
@@ -72,11 +87,13 @@ import asyncio
 import contextlib
 import json
 import logging
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
+from nerve.config import github_repos_branch_ok
 from nerve.sources.base import Source
 from nerve.sources.filters import FieldRule, InboxFilter, matches_any
 from nerve.sources.models import FetchResult, SourceRecord
@@ -125,8 +142,32 @@ _LISTINGS: dict[str, tuple[str, str]] = {
 }
 _DEFAULT_TYPES = ("pull_request", "issue")
 
+# The type that reports the new commits of a repository's branches, and the
+# listing of one branch: its newest commits, the head first. The listing is
+# asked for the branch's ref, so that GitHub never reads a tag, a commit or
+# the head of a pull request of the same name in its place.
+_COMMIT_TYPE = "commit"
+_COMMITS_ENDPOINT = "repos/{repo}/commits?sha=refs/heads/{branch}&per_page=100"
+# A commit record lists at most this many commits, each as the commit and
+# the first line of its message, cut to this many characters, the entry to
+# this many bytes: the bounds of the record that the gateway builds.
+MAX_RECORD_COMMITS = 50
+_MAX_COMMIT_SUBJECT_CHARS = 120
+_MAX_COMMIT_ENTRY_BYTES = 256
+# The characters of a commit that a record's id keeps of each of its two
+# heads, and its summary of the head when the record counts no commit.
+_SHORT_COMMIT_CHARS = 12
+# The characters that a commit's line shows as a space, besides the control
+# characters: the line and the paragraph separator, and the bidirectional
+# controls, which change the order in which a reader sees the text after them.
+_SPACED_CHARS = frozenset("\u2028\u2029\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
+# Ends the commits of a record that does not list every new one.
+_TRUNCATED_COMMITS = "[... not every new commit is listed]"
+
 # The record's subject_type for each type.
-SUBJECT_TYPES = {"pull_request": "PullRequest", "issue": "Issue", "release": "Release"}
+SUBJECT_TYPES = {
+    "pull_request": "PullRequest", "issue": "Issue", "release": "Release", "commit": "Commit",
+}
 
 
 @dataclass
@@ -198,13 +239,15 @@ class _Listing:
 class _RepoState:
     """What the cursor remembers of one repository.
 
-    Its listings by name (``pulls``, ``issues``, ``releases``), and in ``prs``
+    Its listings by name (``pulls``, ``issues``, ``releases``), in ``prs``
     the pull requests it follows: number → ``[head commit, draft, held]``, in
-    the order in which they were last listed.
+    the order in which they were last listed, and in ``branches`` the head
+    commit of each branch whose commits it follows.
     """
 
     listings: dict[str, _Listing] = field(default_factory=dict)
     prs: dict[str, list[Any]] = field(default_factory=dict)
+    branches: dict[str, str] = field(default_factory=dict)
 
     def follow(self, number: str, head_sha: str, *, draft: bool, held: bool) -> None:
         """Remember a pull request, as the one listed last."""
@@ -215,6 +258,8 @@ class _RepoState:
         out: dict[str, Any] = {name: listing.as_json() for name, listing in self.listings.items()}
         if self.prs:
             out["prs"] = self.prs
+        if self.branches:
+            out["branches"] = self.branches
         return out
 
 
@@ -279,6 +324,10 @@ def _read_cursor(cursor: str | None) -> tuple[dict[str, _RepoState], str | None]
                 and isinstance(entry[2], bool)
             ):
                 state.prs[str(number)] = entry
+        branches = raw.get("branches")
+        for branch, head in (branches.items() if isinstance(branches, dict) else ()):
+            if isinstance(head, str) and head:
+                state.branches[str(branch)] = head
         states[repo] = state
     return states, None
 
@@ -588,6 +637,100 @@ def release_record(repo: str, item: dict[str, Any]) -> SourceRecord:
     )
 
 
+def _commit_entry(item: dict[str, Any]) -> str:
+    """A commit as a record lists it: the commit, a space, and the first line
+    of its message.
+
+    The line has a space in the place of each control character and of each
+    of :data:`_SPACED_CHARS`, no spaces around it, and at most
+    :data:`_MAX_COMMIT_SUBJECT_CHARS` characters; the entry is cut to
+    :data:`_MAX_COMMIT_ENTRY_BYTES` bytes and ends in no space, so a commit
+    without a message is the commit alone.
+    """
+    commit = item.get("commit")
+    message = commit.get("message") if isinstance(commit, dict) else None
+    subject = (message if isinstance(message, str) else "").split("\n", 1)[0]
+    subject = "".join(
+        " " if character in _SPACED_CHARS or unicodedata.category(character) == "Cc" else character
+        for character in subject
+    ).strip(" ")[:_MAX_COMMIT_SUBJECT_CHARS]
+    entry = f"{item.get('sha')} {subject}".encode(errors="replace")[:_MAX_COMMIT_ENTRY_BYTES]
+    return entry.decode(errors="ignore").rstrip(" ")
+
+
+def commits_record(
+    repo: str, branch: str, before: str, items: list[dict[str, Any]], now: datetime,
+) -> SourceRecord:
+    """The record of the new commits of *branch*, whose head was *before* at
+    the last listing.
+
+    *items* is the branch's listing, its head first, in GitHub's order: by
+    commit date, not by ancestry. The record counts the commits that the
+    listing shows above *before* and lists the newest
+    :data:`MAX_RECORD_COMMITS` of them; across a merge they are not always
+    the exact set of the new commits, and the record's URL compares the two
+    heads. When the listing does not show *before* (100 or more new commits,
+    or a rewritten branch), or *before* is empty, the record lists the
+    branch's newest commits and counts none. ``truncated`` says that, or that
+    the record lists fewer commits than it counts. The record's id names both
+    heads, so a branch that returns to an earlier head has a record of its
+    own. The record's time is *now*: the listing does not say when a commit
+    reached the branch.
+    """
+    head = str(items[0].get("sha"))
+    shas = [item.get("sha") for item in items]
+    found = shas.index(before) if before and before in shas else -1
+    fresh, count = (items[:found], str(found)) if found >= 0 else (items, "")
+    truncated = not count or len(fresh) > MAX_RECORD_COMMITS
+    commits = [_commit_entry(item) for item in fresh[:MAX_RECORD_COMMITS] if item.get("sha")]
+    url = (
+        f"https://github.com/{repo}/compare/{before}...{head}" if before
+        else f"https://github.com/{repo}/commits/{branch}"
+    )
+    if not count:
+        summary = f"{branch} moved to {head[:_SHORT_COMMIT_CHARS]}"
+    else:
+        summary = f"{count} new commit{'' if count == '1' else 's'} on {branch}"
+    content = [
+        f"Repository: {repo}",
+        f"Type: {SUBJECT_TYPES[_COMMIT_TYPE]}",
+        "Event: pushed",
+        f"Branch: {branch}",
+        f"Commits: {count}" if count else None,
+        f"Head: {head}",
+        f"Before: {before}" if before else None,
+        f"URL: {url}",
+        "\n--- Commits ---\n- " + "\n- ".join(commits),
+        _TRUNCATED_COMMITS if truncated else None,
+    ]
+    return SourceRecord(
+        id=(
+            f"{repo}@{branch}:pushed:"
+            f"{before[:_SHORT_COMMIT_CHARS]}..{head[:_SHORT_COMMIT_CHARS]}"
+        ),
+        source=SOURCE_NAME,
+        record_type=RECORD_TYPE,
+        summary=f"[{repo}] {summary}",
+        content="\n".join(line for line in content if line),
+        timestamp=_stamp(now),
+        # The keys, values and order that the gateway sends for the commits of
+        # a branch, as the hosted source reads them: a list, and a flag.
+        metadata={
+            "repo_name": repo,
+            "event": "pushed",
+            "subject_type": SUBJECT_TYPES[_COMMIT_TYPE],
+            "branch": branch,
+            "head_sha": head,
+            "before_sha": before,
+            "commit_count": count,
+            "commits": commits,
+            "truncated": truncated,
+            "subject_url": url,
+            "repo_url": f"https://github.com/{repo}",
+        },
+    )
+
+
 def _common_lines(item: dict[str, Any]) -> list[str | None]:
     """The labels, the times and the URL of a pull request or an issue."""
     labels = [
@@ -611,8 +754,8 @@ class GitHubReposSource(Source):
     """Reports what is new in a configured set of repositories, with the gh CLI.
 
     *config* holds the ``sync.github_repos`` settings: ``repos``, ``types``,
-    ``include_bots``, ``include_drafts``, ``updates`` and ``deny_authors``;
-    a setting left out takes its default.
+    ``branches``, ``include_bots``, ``include_drafts``, ``updates`` and
+    ``deny_authors``; a setting left out takes its default.
     """
 
     source_name = SOURCE_NAME
@@ -631,6 +774,14 @@ class GitHubReposSource(Source):
         elif isinstance(chosen, str):
             chosen = [chosen]
         self._types = tuple(kind for kind in _LISTINGS if kind in chosen)
+        # The commits of branches: of those that ``branches`` names for a
+        # repository (names ignore case), else of its default branch.
+        self._commits = _COMMIT_TYPE in chosen
+        branches = self._config.get("branches")
+        self._branches: dict[str, list[str]] = {
+            str(repo).strip().lower(): [str(branch) for branch in names or ()]
+            for repo, names in (branches.items() if isinstance(branches, dict) else ())
+        }
         self._include_bots = bool(self._config.get("include_bots", False))
         self._include_drafts = bool(self._config.get("include_drafts", True))
         self._updates = bool(self._config.get("updates", False))
@@ -645,7 +796,7 @@ class GitHubReposSource(Source):
         not cap this source. A listing that fails is left for the next run
         with its cursor; when every listing fails, the run fails.
         """
-        if not self._repos or not self._types:
+        if not self._repos or not (self._types or self._commits):
             logger.warning("github_repos: no repos or no types configured — nothing to fetch")
             return FetchResult(records=[], next_cursor=cursor)
 
@@ -654,12 +805,19 @@ class GitHubReposSource(Source):
         listings = [
             (repo, kind, *_LISTINGS[kind]) for repo in self._repos for kind in self._types
         ]
+        # The branches to list: None stands for a repository's default branch.
+        watched = [
+            (repo, branch) for repo in self._repos
+            for branch in (self._branches.get(repo.lower()) or [None])
+        ] if self._commits else []
         sem = asyncio.Semaphore(_MAX_CONCURRENT_FETCHES)
         results = await asyncio.gather(
             *(self._list(endpoint.format(repo=repo), sem) for repo, _, _, endpoint in listings),
+            *(self._branch(repo, branch, sem) for repo, branch in watched),
             return_exceptions=True,
         )
         listed = {(repo, kind): result for (repo, kind, _, _), result in zip(listings, results)}
+        branches = list(zip(watched, results[len(listings):]))
 
         records: list[SourceRecord] = []
         failures: list[str] = []
@@ -700,18 +858,29 @@ class GitHubReposSource(Source):
                     records += self._issues(repo, result, previous, state, now)
                 else:
                     records += self._releases(repo, result, previous, state, now)
+            for (watching, branch), result in branches:
+                if watching != repo:
+                    continue
+                if isinstance(result, BaseException):
+                    failures.append(f"{repo} commits of {branch or 'the default branch'}: {result}")
+                    # A branch that could not be listed keeps its head; without
+                    # the default branch's name, so does every branch.
+                    kept = old.branches if branch is None else {branch: old.branches.get(branch)}
+                    state.branches.update({name: head for name, head in kept.items() if head})
+                elif result is not None:
+                    records += self._commits_of(repo, *result, old, state, now)
             while len(state.prs) > MAX_FINGERPRINTS:
                 state.prs.pop(next(iter(state.prs)))
             next_states[repo] = state
 
         if failures:
-            if len(failures) == len(listings):
+            if len(failures) == len(listings) + len(branches):
                 raise RuntimeError(
                     f"every GitHub listing failed ({len(failures)}), e.g. {failures[0]}"
                 )
             logger.warning(
                 "github_repos: %d of %d listings failed and keep their cursor, e.g. %s",
-                len(failures), len(listings), failures[0],
+                len(failures), len(listings) + len(branches), failures[0],
             )
         # Oldest first, for a natural reading order in the inbox.
         latest = datetime.max.replace(tzinfo=UTC)
@@ -842,6 +1011,56 @@ class GitHubReposSource(Source):
             and scan.is_new(item)
             and not self._denied(_author(item.get("author"))[0])
         ]
+
+    def _commits_of(
+        self, repo: str, branch: str, items: list[dict[str, Any]], old: _RepoState,
+        state: _RepoState, now: datetime,
+    ) -> list[SourceRecord]:
+        """The record of a branch whose head moved since the last listing.
+
+        The first listing of a branch only stores its head, and a listing
+        without a commit keeps the head that the cursor had.
+        """
+        before = old.branches.get(branch, "")
+        if not items:
+            if before:
+                state.branches[branch] = before
+            return []
+        head = items[0]["sha"]
+        state.branches[branch] = head
+        if not before or before == head:
+            return []
+        return [commits_record(repo, branch, before, items, now)]
+
+    async def _branch(
+        self, repo: str, branch: str | None, sem: asyncio.Semaphore,
+    ) -> tuple[str, list[dict[str, Any]]] | None:
+        """The name of a branch of *repo* and its newest commits, the head first.
+
+        *branch* ``None`` is the repository's default branch, as the
+        repository names it now. ``None`` for a default branch that the source
+        cannot follow (:func:`nerve.config.github_repos_branch_ok`). Raises
+        when the repository or the listing cannot be read.
+        """
+        if branch is None:
+            async with sem:
+                found = await self._gh_api_get(f"repos/{repo}")
+            branch = found.get("default_branch") if isinstance(found, dict) else None
+            if not isinstance(branch, str) or not branch:
+                raise TypeError(f"gh api repos/{repo} named no default branch")
+            if not github_repos_branch_ok(repo, branch):
+                logger.warning(
+                    "github_repos: the default branch of %s has a name that the source cannot "
+                    "follow; its commits are not reported", repo,
+                )
+                return None
+        endpoint = _COMMITS_ENDPOINT.format(repo=repo, branch=branch)
+        items = await self._list(endpoint, sem)
+        if not all(isinstance(item, dict) for item in items) or (
+            items and not (isinstance(items[0].get("sha"), str) and items[0]["sha"])
+        ):
+            raise TypeError(f"gh api {endpoint} did not return commits")
+        return branch, items
 
     async def _list(self, endpoint: str, sem: asyncio.Semaphore) -> list[Any]:
         """One listing; raises when it cannot be read."""
