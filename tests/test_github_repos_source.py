@@ -802,7 +802,7 @@ async def test_a_head_that_moved_gives_one_record_as_the_gateway_builds_it():
 # must stay byte for byte the same as the contract's
 # ``testdata/events/github_repo_commits.json``.
 COMMITS_SAMPLE = Path(__file__).parent / "fixtures" / "channel_contract" / "github_repo_commits.json"
-COMMITS_SAMPLE_SHA256 = "4a51f8aea447c42bf5ab07d0ff875e92bc582c706b40cd929db1ce9971801521"
+COMMITS_SAMPLE_SHA256 = "84bb74bd0ad1d562466b85b14c3372e55e75586a8fa834f1d186d10911e577ea"
 
 
 @pytest.mark.asyncio

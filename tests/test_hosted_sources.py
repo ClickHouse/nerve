@@ -83,6 +83,8 @@ from tests.test_hosted_channel import hosted_config as slack_hosted_config
 from tests.test_hosted_channel_config import HOSTED
 
 GITHUB_DENY = {"deny_repos": ["owner/noisy"], "deny_reasons": ["subscribed"]}
+# The entry that goes with the notifications: Nerve accepts thread items.
+THREAD_ITEMS = {"provider": "github_thread_items", "filters": {}}
 
 
 def hosted_github(**settings: Any) -> GitHubSyncConfig:
@@ -532,6 +534,7 @@ class TestSubscriptionsBuilder:
                 ),
                 pr_watch=False,
             ),
+            SourceSubscription(provider="github_thread_items"),
         ))
 
     def test_a_switched_off_source_subscribes_to_nothing(self):
@@ -547,10 +550,12 @@ class TestSubscriptionsBuilder:
             return dumps(subscriptions_for(config, ["github"]))
 
         assert frame() == frame(inbox="participating") == (
-            '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true}]}'
+            '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true},'
+            '{"provider":"github_thread_items","filters":{}}]}'
         )
         assert frame(inbox="all") == (
-            '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true,"inbox":"all"}]}'
+            '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true,"inbox":"all"},'
+            '{"provider":"github_thread_items","filters":{}}]}'
         )
 
     def test_an_allow_list_the_gateway_cannot_take_is_published_empty(self, caplog):
@@ -580,7 +585,7 @@ class TestSubscriptionsBuilder:
     def test_the_frame_is_unchanged_unless_the_repository_watch_is_on_and_lists_a_repository(self):
         """An older gateway refuses the repos member and closes the stream,
         Slack included: every agent that does not watch a repository sends
-        the very bytes it sent before."""
+        the bytes it sends without the watch."""
         def frame(**watch: Any) -> str:
             config = NerveConfig()
             config.sync.github = hosted_github()
@@ -589,7 +594,10 @@ class TestSubscriptionsBuilder:
             subscriptions.validate()
             return dumps(subscriptions)
 
-        unchanged = '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true}]}'
+        unchanged = (
+            '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true},'
+            '{"provider":"github_thread_items","filters":{}}]}'
+        )
         assert frame() == unchanged
         assert frame(repos=["acme/widgets"], updates=True) == unchanged
         assert frame(enabled=True) == unchanged
@@ -598,6 +606,7 @@ class TestSubscriptionsBuilder:
             deny_authors=["noisy-*"],
         ) == (
             '{"version":"1","sources":[{"provider":"github","filters":{},"pr_watch":true},'
+            '{"provider":"github_thread_items","filters":{}},'
             '{"provider":"github_repos","filters":{},"repos":['
             '{"name":"acme/widgets","types":["pull_request","issue"],"include_bots":false,'
             '"include_drafts":false,"updates":false,"deny_authors":["noisy-*"]},'
@@ -641,6 +650,41 @@ class TestSubscriptionsBuilder:
             # Without branches the gateway follows the default branch.
             repo("other-org/tool", '"issue","commit"'),
         )
+
+    def test_the_commit_type_and_the_thread_item_entry_do_not_touch_each_other(self):
+        """The entry that says that Nerve accepts thread items goes with the
+        notifications, and the commit type with the repository watch. One
+        frame holds both, each as it is alone: the watch of an agent that does
+        not ask for commits is the same bytes with and without the entry, and
+        the entry is the same bytes with and without the commit type."""
+        def frame(*, thread_items: bool, **watch: Any) -> str:
+            config = NerveConfig()
+            config.sync.github = hosted_github(enabled=True, thread_items=thread_items)
+            config.sync.github_repos = GitHubReposSyncConfig(enabled=True, repos=["acme/widgets"], **watch)
+            subscriptions = subscriptions_for(config, hosted_sources(config))
+            subscriptions.validate()
+            return dumps(subscriptions)
+
+        notifications = '{"provider":"github","filters":{},"pr_watch":true}'
+        items = '{"provider":"github_thread_items","filters":{}}'
+
+        def watch(types: str, more: str = "") -> str:
+            return (
+                '{"provider":"github_repos","filters":{},"repos":[{"name":"acme/widgets",'
+                f'"types":[{types}],"include_bots":false,"include_drafts":true,"updates":false,'
+                f'"deny_authors":[]{more}}}]}}'
+            )
+
+        def sources(*entries: str) -> str:
+            return '{"version":"1","sources":[' + ",".join(entries) + "]}"
+
+        before, commits = watch('"pull_request","issue"'), watch('"issue","commit"', ',"branches":["main"]')
+        asks = {"types": ["issue", "commit"], "branches": {"acme/widgets": ["main"]}}
+        assert frame(thread_items=True) == sources(notifications, items, before)
+        assert frame(thread_items=False) == sources(notifications, before)
+        assert frame(thread_items=True, branches={"acme/widgets": ["main"]}) == sources(notifications, items, before)
+        assert frame(thread_items=True, **asks) == sources(notifications, items, commits)
+        assert frame(thread_items=False, **asks) == sources(notifications, commits)
 
     def test_the_types_that_are_published_are_chosen_in_one_place(self):
         settings = GitHubReposSyncConfig(types=["commit", "Release", "release", "discussion"])
@@ -844,6 +888,34 @@ class TestBufferedRecords:
         }
         base.update(record)
         return {"record": base}
+
+    @pytest.mark.parametrize("thread_items", [True, False])
+    def test_a_commit_record_and_a_thread_item_are_read_and_judged_each_by_its_own_source(self, thread_items):
+        """The two samples of the contract through the hosted reader: the
+        commits arrive as a list and truncated as a flag, and a thread item's
+        mentions_agent as a flag. The repository watch's guardrail keeps the
+        commit record only while types names commit, whatever
+        sync.github.thread_items says, and the notifications' guardrail keeps
+        the thread item whatever the watch reports."""
+        from nerve.sources.github import github_inbox_filter
+        from nerve.sources.github_repos import github_repos_inbox_filter
+
+        def read(sample: Path, source: str) -> Any:
+            event = json.loads(sample.read_text(encoding="utf-8"))
+            return record_from_buffer(buffered_record(decoded(event)), source=source)
+
+        commits = read(COMMITS_SAMPLE, "github_repos")
+        item = read(COMMITS_SAMPLE.parent / "github_thread_item.json", "github")
+
+        assert (commits.record_type, item.record_type) == ("github_repo_activity", "github_thread_item")
+        assert (len(commits.metadata["commits"]), commits.metadata["truncated"]) == (2, False)
+        assert isinstance(item.metadata["mentions_agent"], bool) and "truncated" not in item.metadata
+        assert "mentions_agent" not in commits.metadata and "actors" not in commits.metadata
+        notifications = hosted_github(enabled=True, thread_items=thread_items)
+        for types, kept in ((["commit"], True), (["pull_request", "issue", "release"], False)):
+            watch = GitHubReposSyncConfig(enabled=True, repos=["acme/widgets"], types=types)
+            assert github_repos_inbox_filter(watch).passes(commits) is kept
+            assert github_inbox_filter(notifications).passes(item)
 
     def test_a_payload_maps_to_the_polling_sources_record_shape(self):
         record = record_from_buffer(self.payload())
@@ -1123,7 +1195,7 @@ class TestStreams:
             "provider": "github",
             "filters": {"deny_repos": ["owner/noisy"], "deny_reasons": ["subscribed"]},
             "pr_watch": True,
-        }]}
+        }, THREAD_ITEMS]}
         await hosted.gateway.wait_for(lambda: bool(stream.sent("inbox_read")))
         kinds = [frame["kind"] for frame in stream.frames if frame["kind"] != "heartbeat"]
         assert kinds[:3] == ["negotiation", "subscriptions", "inbox_read"]
@@ -1381,7 +1453,7 @@ class TestStreams:
 
         [subscriptions] = await hosted.subscriptions()
 
-        assert subscriptions["sources"] == [{"provider": "github", "filters": {}, "pr_watch": True}]
+        assert subscriptions["sources"] == [{"provider": "github", "filters": {}, "pr_watch": True}, THREAD_ITEMS]
         assert stream.close_code is None
 
     async def test_subscriptions_refused_even_without_patterns_are_not_sent(self, hosted, monkeypatch, caplog):
@@ -1411,7 +1483,7 @@ class TestStreams:
 
         await stream.nudge("observe")
 
-        assert subscriptions["sources"][1] == {"provider": "github_repos", "filters": {}, "repos": [{
+        assert subscriptions["sources"][2] == {"provider": "github_repos", "filters": {}, "repos": [{
             "name": "acme/widgets", "types": ["pull_request"], "include_bots": False,
             "include_drafts": True, "updates": True, "deny_authors": [],
         }]}
@@ -1442,10 +1514,16 @@ class TestStreams:
 
         await stream.nudge("observe")
 
-        assert subscriptions["sources"][1]["repos"] == [{
+        # The entry for thread items goes with the notifications, and stays as
+        # it is next to a watch that asks for commits.
+        assert [source["provider"] for source in subscriptions["sources"]] == [
+            "github", "github_thread_items", "github_repos",
+        ]
+        assert subscriptions["sources"][1] == THREAD_ITEMS
+        assert subscriptions["sources"][2] == {"provider": "github_repos", "filters": {}, "repos": [{
             "name": "acme/widgets", "types": ["commit"], "include_bots": False, "include_drafts": True,
             "updates": False, "deny_authors": [], "branches": ["main"],
-        }]
+        }]}
         assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
         (runner,) = [
             r for r in build_source_runners(hosted.config, hosted.db) if r.job_id == "source:github_repos"
@@ -1511,14 +1589,14 @@ class TestStreams:
             sources, providers = await reload(enabled=True, repos=["acme/widgets"])
             await hosted.subscriptions(2)
             assert "source:github_repos" in sources["sources"]
-            assert providers == ["github", "github_repos"]
+            assert providers == ["github", "github_thread_items", "github_repos"]
             (runner,) = [r for r in cron._source_runners if r.job_id == "source:github_repos"]
             assert isinstance(runner.source, HostedGitHubSource) and runner.source.push_fed is True
 
             sources, providers = await reload(enabled=False, repos=["acme/widgets"])
             await hosted.subscriptions(3)
             assert sources["removed"] == ["source:github_repos"]
-            assert providers == ["github"]
+            assert providers == ["github", "github_thread_items"]
         finally:
             cron.scheduler.shutdown(wait=False)
 
@@ -1532,9 +1610,9 @@ class TestStreams:
 
         [subscriptions] = await hosted.subscriptions()
 
-        assert subscriptions["sources"][0] == {"provider": "github", "filters": {}, "pr_watch": True}
-        assert subscriptions["sources"][1]["repos"][0]["deny_authors"] == []
-        assert subscriptions["sources"][1]["repos"][0]["name"] == "acme/widgets"
+        assert subscriptions["sources"][:2] == [{"provider": "github", "filters": {}, "pr_watch": True}, THREAD_ITEMS]
+        assert subscriptions["sources"][2]["repos"][0]["deny_authors"] == []
+        assert subscriptions["sources"][2]["repos"][0]["name"] == "acme/widgets"
         assert stream.close_code is None
 
     async def test_a_switched_off_source_subscribes_to_nothing_and_keeps_what_arrives(self, hosted):

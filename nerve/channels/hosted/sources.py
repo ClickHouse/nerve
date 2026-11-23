@@ -33,11 +33,14 @@ from typing import TYPE_CHECKING, Any
 from nerve.channels.hosted.contract import (
     EVENT_KIND_SOURCE_RECORD,
     SUBSCRIPTIONS_VERSION,
+    THREAD_ITEM_RECORD_TYPE,
+    THREAD_ITEMS_PROVIDER,
     Event,
     RepoWatch,
     SourceFilters,
     SourceSubscription,
     Subscriptions,
+    validate_thread_item,
 )
 from nerve.channels.hosted.contract.model import (
     MAX_REPO_WATCH_BRANCHES,
@@ -52,7 +55,7 @@ from nerve.channels.hosted.contract.model import (
     valid_repo_branch,
     valid_repo_name,
 )
-from nerve.channels.hosted.contract.wire import format_time
+from nerve.channels.hosted.contract.wire import Rejected, format_time
 from nerve.channels.hosted.intake import Disposition
 
 if TYPE_CHECKING:
@@ -93,11 +96,19 @@ def subscriptions_for(config: NerveConfig, providers: Iterable[str]) -> Subscrip
     the ``github_repos`` subscription is sent only while the watch is on and
     lists a repository, and an agent without one sends the same frame as
     before the watch existed.
+
+    While ``sync.github.thread_items`` is on, the notifications go with a
+    ``github_thread_items`` entry, which says that Nerve accepts a record of
+    each comment, review and description of a thread. A gateway that does not
+    know the provider ignores the entry. With the setting off the entry is
+    left out, and the gateway keeps sending one record per thread.
     """
     providers = set(providers)
     sources: list[SourceSubscription] = []
     if GITHUB in providers and config.sync.github.enabled:
         sources.append(github_subscription(config.sync.github))
+        if config.sync.github.thread_items:
+            sources.append(SourceSubscription(provider=THREAD_ITEMS_PROVIDER))
     if GITHUB_REPOS in providers and config.sync.github_repos.enabled:
         watch = github_repos_subscription(config.sync.github_repos)
         if watch is not None:
@@ -350,6 +361,14 @@ class HostedSourceConsumer:
             return Disposition.rejected(
                 "admission_rejected", f"{event.kind} ({purpose}) is not a {self._provider} source record",
             )
+        # The message of a thread item is built from its metadata, so an item
+        # without the keys and values of the contract is refused on its own,
+        # and the stream goes on.
+        if event.record.record_type == THREAD_ITEM_RECORD_TYPE:
+            try:
+                validate_thread_item(event.record)
+            except Rejected as error:
+                return Disposition.rejected("admission_rejected", error.detail)
         config = self._config()
         try:
             await self._db.insert_channel_observation(

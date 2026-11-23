@@ -26,7 +26,13 @@ Buffered payload (one row per record)::
                 "metadata": [{"key", "value", "values"}, ...]}}
 
 Metadata values arrive as strings. ``actors``, ``changes`` and ``commits``
-are lists, and ``unread`` and ``truncated`` become booleans.
+are lists, and ``unread``, ``truncated`` and ``mentions_agent`` become
+booleans.
+
+A ``github_thread_item`` record (one comment, review or description of a
+thread, with its author) gets a few fixed lines before its text that say
+where it was written and by whom (:func:`thread_item_content`), and its
+author as its ``actors``, so the actor guardrail applies to the author.
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ import logging
 from typing import TYPE_CHECKING, Any
 
 from nerve.sources.base import Source
+from nerve.sources.github import THREAD_ITEM_RECORD_TYPE
 from nerve.sources.models import FetchResult, SourceRecord
 
 if TYPE_CHECKING:
@@ -50,7 +57,25 @@ BUFFER_CHANNEL = "github"
 PROVIDERS = ("github", "github_repos")
 # Metadata keys whose value is a list of strings, and those that are flags.
 _LIST_KEYS = frozenset({"actors", "changes", "commits"})
-_FLAG_KEYS = frozenset({"unread", "truncated"})
+_FLAG_KEYS = frozenset({"unread", "truncated", "mentions_agent"})
+
+# How a thread item's message names its thread, its kind and its author's
+# relation to the agent (the gateway's ``author_relation``).
+_SUBJECT_WORDS = {"Issue": "issue", "PullRequest": "pull request"}
+_ITEM_WORDS = {
+    "body": "description", "comment": "comment", "review": "review",
+    "review_comment": "review comment",
+}
+_RELATION_WORDS = {
+    "self": "the agent itself",
+    "member": "member of the organization",
+    "team": "member of a team the agent listens to",
+    "collaborator": "collaborator on the repository",
+    "app": "a GitHub App",
+    "agent": "another agent of the organization",
+    "listed": "listed by the organization's administrators",
+    "outside": "outside the organization",
+}
 
 
 class HostedGitHubSource(Source):
@@ -148,16 +173,53 @@ def record_from_buffer(payload: dict[str, Any], source: str = SOURCE_NAME) -> So
     if not all(isinstance(value, str) and value for value in (record_id, record_type, summary)):
         return None
     content = record.get("content")
+    content = content if isinstance(content, str) else ""
     timestamp = record.get("timestamp")
+    metadata = _metadata(record.get("metadata"))
+    if record_type == THREAD_ITEM_RECORD_TYPE:
+        author = metadata.get("author")
+        metadata["actors"] = [author] if isinstance(author, str) and author else []
+        content = thread_item_content(metadata, content)
     return SourceRecord(
         id=record_id,
         source=source,
         record_type=record_type,
         summary=summary,
-        content=content if isinstance(content, str) else "",
+        content=content,
         timestamp=timestamp if isinstance(timestamp, str) else "",
-        metadata=_metadata(record.get("metadata")),
+        metadata=metadata,
     )
+
+
+def thread_item_content(metadata: dict[str, Any], text: str) -> str:
+    """The message of a thread item: fixed lines about the item, then its *text*.
+
+    The lines show what the gateway sent: the repository, the thread, its
+    state, the item's kind, the author with their relation to the agent,
+    whether the item mentions the agent, and the links. A thread whose title
+    the gateway withheld says so.
+    """
+    subject = _SUBJECT_WORDS.get(metadata.get("subject_type", ""), "thread")
+    kind = _ITEM_WORDS.get(metadata.get("item_kind", ""), "item")
+    if metadata.get("review_state"):
+        kind = f"{kind} ({metadata['review_state']})"
+    author = metadata.get("author", "") or "unknown"
+    if metadata.get("author_kind") == "bot":
+        author = f"{author} (bot)"
+    relation = _RELATION_WORDS.get(metadata.get("author_relation", ""))
+    title = metadata.get("title", "")
+    lines = [
+        f"Repository: {metadata.get('repo_name', '')}",
+        f"Thread: {subject} #{metadata.get('number', '')}",
+        f"Title: {title}" if title else "Title: (not shown)",
+        f"State: {metadata.get('state', '')}",
+        f"Item: {kind}",
+        f"Author: {author}, {relation}" if relation else f"Author: {author}",
+        f"Mentions the agent: {'yes' if metadata.get('mentions_agent') else 'no'}",
+        f"Item URL: {metadata.get('item_url', '')}",
+        f"Thread URL: {metadata.get('subject_url', '')}",
+    ]
+    return "\n".join(lines) + (f"\n\n{text}" if text else "")
 
 
 def _metadata(entries: object) -> dict[str, Any]:
