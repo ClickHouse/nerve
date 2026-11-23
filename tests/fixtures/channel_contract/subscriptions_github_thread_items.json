@@ -1,0 +1,21 @@
+{
+  "version": "1",
+  "kind": "subscriptions",
+  "request_id": "n-27",
+  "payload": {
+    "subscriptions": {
+      "version": "1",
+      "sources": [
+        {
+          "provider": "github",
+          "filters": {},
+          "pr_watch": true
+        },
+        {
+          "provider": "github_thread_items",
+          "filters": {}
+        }
+      ]
+    }
+  }
+}

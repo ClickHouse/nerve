@@ -185,6 +185,37 @@ running. Nerve reads them over the hosted channel streams.
   `allow_repos` and `deny_repos` apply to it, at the gateway and here; the
   actor, reason and CI branch lists are not checked for it (see
   [Pull request activity records](#github-pull-request-activity-records)).
+  A gateway that supports it also delivers `github_thread_item` records: one
+  for each comment, review, review comment or description of a thread, with
+  its author. Nerve says that it accepts them with a
+  `{"provider": "github_thread_items", "filters": {}}` entry next to the
+  notifications in its subscriptions, sent while `enabled` and `thread_items`
+  are true; a gateway that does not know the entry ignores it. With
+  `thread_items: false` the entry is left out, and the gateway keeps sending
+  one record per thread. Items add no thread to the inbox: they come only
+  from issue and pull request threads whose notification passes the published
+  filters, and a gateway that sends them sends each new comment, review and
+  description as its own record and leaves that text out of the thread's
+  notification record. Such a record carries
+  `repo_name`, `repo_url`, `subject_type` (`Issue` or `PullRequest`),
+  `subject_url`, `number`, `state`, `title` (absent when the gateway withholds
+  it), `item_kind` (`body`, `comment`, `review` or `review_comment`),
+  `item_id`, `item_url`, `author`, `author_kind` (`human` or `bot`),
+  `author_relation` (`self`, `member`, `team`, `collaborator`, `app`, `agent`,
+  `listed` or `outside`), `mentions_agent` (a boolean here) and, on a review,
+  `review_state`. Its message starts with fixed lines that show these values
+  (the repository, the thread, the item, the author with their relation in
+  words, whether it mentions the agent, and the links), then the item's text.
+  Its `actors` are its author, so `allow_actors` and `deny_actors` apply to
+  the author and `allow_repos` and `deny_repos` to its repository. The reason
+  lists bound items as they bound notifications, but at the gateway: it judges
+  the thread by `allow_reasons` and `deny_reasons` with the reason of the
+  notification that brought the items, before it writes them. The record
+  itself has no reason, so the guardrail here does not check the reason and CI
+  branch lists for it again. Nerve shows what the gateway sent and decides
+  nothing from it. A record without
+  these keys and values, or with a control character or a line break in a
+  value, is refused on its own.
 - **The credential is the switch.** The gateway polls GitHub for an agent only
   while a GitHub credential is connected to that agent and Nerve subscribes,
   which it does while `enabled` is true. Your operator can therefore set
@@ -207,7 +238,8 @@ running. Nerve reads them over the hosted channel streams.
 - **The filters are published from this config.** Nerve sends the gateway the
   guardrail patterns of `sync.github` (`allow_repos`, `deny_repos`,
   `allow_actors`, `deny_actors`, `allow_reasons`, `deny_reasons`,
-  `deny_ci_branches`), `pr_watch` and `inbox` whenever a stream opens and again
+  `deny_ci_branches`), `pr_watch` and `inbox`, and the `github_thread_items`
+  entry while `thread_items` is true, whenever a stream opens and again
   on every reload. The gateway keeps the newest set and applies it before it
   stores a record, so a record that the filters drop never reaches this agent and is
   never a reason to start it. The guardrail still runs here too. A list that the
@@ -218,8 +250,10 @@ running. Nerve reads them over the hosted channel streams.
   a blank allow pattern matches only an empty value, which GitHub never gives a
   repo, an actor or a reason. If the whole subscription is still larger than
   the gateway's frame limit, it goes with no patterns at all, and the guardrail
-  here does all the filtering. With `enabled: false` Nerve tells the gateway
-  that it takes no notifications, and with no
+  here does all the filtering. A `github_thread_item` record carries no reason,
+  so a reason list is applied to it only at the gateway: a reason list that the
+  gateway did not get in full does not bound items. With `enabled: false` Nerve
+  tells the gateway that it takes no notifications, and with no
   [repository watch](#hosted-repository-watch) either, that it subscribes to
   nothing.
 - **The gateway must know the subscriptions.** A gateway that predates hosted
@@ -649,6 +683,7 @@ sync:
     enabled: true
     mode: poll                    # poll = gh CLI here; hosted = the channel gateway polls (restart-only)
     pr_watch: true                # Hosted mode: also a record when one of your open PRs changes
+    thread_items: true            # Hosted mode: one record per comment, review and description where the gateway offers them
     inbox: participating          # participating = threads you take part in; all = the whole inbox (see "GitHub reason guardrail")
     schedule: "*/15 * * * *"
     batch_size: 30
@@ -804,6 +839,10 @@ That denylist is the compact way to say *"only threads that are mine or that cal
 name"* — it keeps `author`, `mention`, `team_mention`, `assign`, `review_requested` and
 `ci_activity`. Prefer `deny_reasons` over `allow_reasons`: the allowlist is fail-closed, so
 a reason GitHub adds later would be silently dropped.
+
+In hosted mode the reason lists also bound `github_thread_item` records: the gateway
+applies them to a thread, with the reason of its notification, before it writes the
+thread's items (see [Hosted GitHub source](#hosted-github-source)).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|

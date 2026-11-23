@@ -2170,6 +2170,11 @@ class GitHubSyncConfig:
     # pull requests and deliver a record when one changes (state, head
     # commit, review, CI, or a comment).
     pr_watch: bool = True
+    # Hosted mode only: tell the gateway that Nerve takes one record for each
+    # comment, review and description of a thread (github_thread_item), where
+    # the gateway offers them. false keeps the one record per thread. Follows
+    # a reload.
+    thread_items: bool = True
     # Which notification threads are listed, in both modes.
     # "participating": only the threads the account takes part in (GitHub's
     # participating=true), such as mentions, assignments and review requests.
@@ -2198,6 +2203,7 @@ class GitHubSyncConfig:
         return cls(
             mode=mode,
             pr_watch=d.get("pr_watch", True),
+            thread_items=d.get("thread_items", True),
             inbox=inbox,
             enabled=d.get("enabled", True),
             schedule=d.get("schedule", "*/15 * * * *"),
