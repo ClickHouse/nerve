@@ -917,6 +917,27 @@ class TestBufferedRecords:
             assert github_repos_inbox_filter(watch).passes(commits) is kept
             assert github_inbox_filter(notifications).passes(item)
 
+    @pytest.mark.parametrize("event", ["closed", "reopened"])
+    def test_the_repository_watch_names_no_event_so_a_reopened_pull_request_is_read(self, event):
+        """A close, whose ID ends in its time, and the reopening that ends it,
+        whose ID ends in the same time, as the gateway delivers them: the
+        contract's check, the hosted reader and the watch's guardrail take a
+        record whatever its event."""
+        from nerve.sources.github_repos import github_repos_inbox_filter
+
+        record_id = f"acme/widgets#12:{event}:2026-10-27T10:04:00Z"
+        delivery = repo_activity_event(record_id=record_id, event=event)
+        summary = f"[acme/widgets] PR #12 {event}: Add a widget cache"
+        content = f"Repository: acme/widgets\nType: PullRequest\nEvent: {event}\nPR: #12 Add a widget cache"
+        delivery["record"].update(summary=summary, content=content)
+
+        record = record_from_buffer(buffered_record(decoded(delivery)), source="github_repos")
+
+        assert (record.id, record.metadata["event"]) == (record_id, event)
+        assert (record.summary, record.content) == (summary, content)
+        watch = GitHubReposSyncConfig(enabled=True, repos=["acme/widgets"], types=["pull_request"], updates=True)
+        assert github_repos_inbox_filter(watch).passes(record)
+
     def test_a_payload_maps_to_the_polling_sources_record_shape(self):
         record = record_from_buffer(self.payload())
 

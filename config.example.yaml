@@ -380,8 +380,8 @@ sync:
                                    # opened; releases arrive whoever published them
     # include_drafts: true         # false: a draft PR is reported when it is
                                    # ready for review (event "ready")
-    # updates: false               # true: also new commits, ready, merge and
-                                   # close of the PRs it reported
+    # updates: false               # true: also new commits, ready, merge,
+                                   # close and reopening of the PRs it reported
     # deny_authors: []             # case-insensitive globs on the author login
     batch_size: 50
 

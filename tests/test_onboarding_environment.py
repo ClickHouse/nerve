@@ -331,7 +331,7 @@ class TestConnections:
 
         assert lines["GitHub repository watch"] == (
             "on (the channel gateway polls): new pull requests, issues and releases in `acme/widgets`; "
-            "also new commits, ready for review, merges and closes of the pull requests it reported"
+            "also new commits, ready for review, merges, closes and reopenings of the pull requests it reported"
         )
 
     def test_the_repository_watch_line_names_the_commits_of_branches(self, tmp_path):

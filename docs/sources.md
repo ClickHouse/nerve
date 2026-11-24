@@ -347,9 +347,9 @@ on the `github_pr_activity` gate.
 Repositories that the agent follows although its GitHub account takes no part
 in them: the new pull requests, issues and releases there arrive as
 `github_repos` records, and with `updates: true` so does each new commit,
-ready for review, merge or close of a pull request it reported. With the
-`commit` type it also reports the [new commits on a branch](#new-commits-on-a-branch),
-one record per branch. It
+ready for review, merge, close or reopening of a pull request it reported.
+With the `commit` type it also reports the
+[new commits on a branch](#new-commits-on-a-branch), one record per branch. It
 is the self-service form of GitHub's "Custom watch", which has no API. Nothing
 is set on the GitHub account (no watch, no e-mail), and it does not depend on
 `sync.github.inbox`. What the account itself takes part in (mentions, review
@@ -363,11 +363,11 @@ notifications, and in hosted mode through `pr_watch`.
   - `release`: `GET /repos/{repo}/releases?per_page=30`. Draft releases are skipped, prereleases are not
   - `commit`: `GET /repos/{repo}/commits?sha=refs/heads/{branch}&per_page=100`, one request per branch that `branches` names for the repository. The request names the branch's ref, so a tag or a commit that has the same name is never read in its place. A repository without an entry in `branches` reports its default branch, which `GET /repos/{repo}` names at every run
 - **One page each:** a repository with more than 100 pull requests (or issues) changed between two runs loses the oldest of those changes. `batch_size` does not cap this source
-- **Cursor:** JSON. Per repository and listing: the newest `updated_at` listed (`published_at` for releases), when the listing was read, and the numbers (release ids) of the items created in that newest second. Per repository, the pull requests it follows: a held draft (`include_drafts: false`) and, with `updates`, a reported pull request while it is open, as head commit, draft and held. At most 1,000 per repository; the one listed longest ago is forgotten first. And per repository, the head commit of each branch whose commits it follows
+- **Cursor:** JSON. Per repository and listing: the newest `updated_at` listed (`published_at` for releases), when the listing was read, and the numbers (release ids) of the items created in that newest second. Per repository, the pull requests it follows: a held draft (`include_drafts: false`) and, with `updates`, a reported pull request until it is merged, as head commit, draft and held. One that is closed without a merge stays followed for 30 days after its close, so that its reopening is reported: its entry also holds the time of the close (`closed_at`), and it is forgotten 30 days after that time. At most 1,000 per repository; beyond that the closed ones are forgotten before the others, and of each the one listed longest ago first. And per repository, the head commit of each branch whose commits it follows
 - **First run:** the baseline. Each listing's cursor is set and nothing is reported, so switching the source on does not fill the inbox with history; a repository or a type added later takes its own baseline, and one removed is forgotten. An item is new when it was created (a release: published) after the last listing: later than the listing's cursor, or in the cursor's own second and not listed then, since GitHub's times have a resolution of one second. So an older pull request that changes later is never reported as new, and an item is reported once
-- **No backfill beyond a day:** nothing older than a day is backfilled, and the last day is. A check more than a day after the last one (a daily schedule, which always comes a moment past the day; a weekday schedule after the weekend; the watch switched off for longer; a long outage) reads the listing as of a day and an hour ago: it reports the items of the last day, with an hour of grace for the scheduler's delay (an item created moments after the last check is not lost), within the one page, and nothing older, and the pull requests it follows stay followed. So switching the watch off and on in poll mode resumes where it left within the day, and beyond it reports the last day's items
-- **Failures:** a listing that fails (a repository that does not exist or that the `gh` login cannot read, a branch that does not exist, a rate limit) keeps its cursor and is read again on the next run; the other listings still report. A run in which every listing fails fails, and the source's health shows it
-- **Upgrades:** the cursor of the earlier version of this source, one timestamp, becomes the cursor of every listing (one more than a day old reports the last day), so nothing is repeated or skipped; a buffer position left by the hosted mode is no cursor (a new baseline). The earlier version took any `repos` value: one that the watch now refuses (a URL such as `https://github.com/acme/widgets`, a trailing slash, `owner/repo/x`, the same repository twice, more than 50) only logs a warning while the watch is off, and refuses the config once it is on
+- **No backfill beyond a day:** nothing older than a day is backfilled, and the last day is. A check more than a day after the last one (a daily schedule, which always comes a moment past the day; a weekday schedule after the weekend; the watch switched off for longer; a long outage) reads the listing as of a day and an hour ago: it reports the items of the last day, with an hour of grace for the scheduler's delay (an item created moments after the last check is not lost), within the one page, and nothing older, and the pull requests it follows stay followed. One thing older than that is judged, in every run: a pull request that the watch keeps as closed, when the listing shows it open, merged, or closed by another close than the one that the watch keeps. One that the watch reported then reports `reopened` or `merged`, however long ago that was, because the watch said that it is closed: a weekday schedule reports on Monday a pull request that was reopened on Friday afternoon. A held draft was never reported, so listed open it is held again or reports `ready`, and merged it is forgotten without a record. One that was reopened and closed again reports nothing, and the watch keeps the later close, so that the 30 days and the ID of the next reopening come from the close that is true. The listing must show the pull request as of the kept close or later: an item whose `updated_at` is before that close comes from a listing that lags behind, and is not judged. One that is still closed by the kept close is not judged again. Switching the watch off and on in poll mode resumes where it left within the day, and beyond it reports the last day's items
+- **Failures:** a listing that fails (a repository that does not exist or that the `gh` login cannot read, a branch that does not exist, a rate limit) keeps its cursor and is read again on the next run; the other listings still report. A run that could not read a repository's pulls listing forgets none of that repository's closed pull requests by their age, since it cannot know whether one was reopened; the limit of 1,000 applies in every run. A run in which every listing fails fails, and the source's health shows it
+- **Upgrades:** the cursor of the earlier version of this source, one timestamp, becomes the cursor of every listing (one more than a day old reports the last day), so nothing is repeated or skipped; a buffer position left by the hosted mode is no cursor (a new baseline). The earlier version took any `repos` value: one that the watch now refuses (a URL such as `https://github.com/acme/widgets`, a trailing slash, `owner/repo/x`, the same repository twice, more than 50) only logs a warning while the watch is off, and refuses the config once it is on. With `updates: true` or `include_drafts: false`, see [Closed and reopened pull requests](#closed-and-reopened-pull-requests) for the `reopened` event, the ID of a `closed` record, and the cursor after an upgrade or a rollback
 - **Default schedule:** `*/15 * * * *` (every 15 min); in hosted mode the fallback cadence of the drain
 - **Disabled by default**
 
@@ -379,7 +379,7 @@ sync:
     types: [pull_request, issue]    # pull_request | issue | release | commit
     include_bots: false             # PRs and issues a GitHub App or a [bot] account opened
     include_drafts: true            # false: a draft is reported when it is ready for review
-    updates: false                  # true: commits, ready, merge and close of reported PRs
+    updates: false                  # true: commits, ready, merge, close and reopening of reported PRs
     deny_authors: []                # case-insensitive globs on the author's login
     # branches:                     # with the commit type: the branches to follow, by repository
     #   acme/widgets: [main, release/1.2]   # no entry: the repository's default branch
@@ -391,8 +391,8 @@ sync:
 | `github_repos.types` | list | `[pull_request, issue]` | What is reported: `pull_request`, `issue`, `release`, `commit` (the [new commits on a branch](#new-commits-on-a-branch)). Case does not matter; an unknown type, or an empty list, refuses to load |
 | `github_repos.branches` | map | `{}` | With the `commit` type: the branches whose new commits are reported, as `owner/repo: [branch, …]` for a repository of `repos` (case does not matter; one branch may be written as a string), at most 8 each. A repository without an entry, or with an empty one, reports its default branch. An entry is the name of a branch, such as `main` or `release/1.2`, and not a ref: it starts with a letter or a digit and goes on with letters, digits, `_`, `.`, `/` and `-`, up to 121 characters, without `..`, not starting with `refs/` and not ending in `.lock`; the repository's name and the branch have at most 194 bytes together. Write a name that YAML reads as something else in quotes: an unquoted `1.10` is the number `1.1`, and `no`, `off` and `0` are no names. [New commits on a branch](#new-commits-on-a-branch) lists what refuses to load. Without the `commit` type the setting is not read: a value that is left there is ignored, with one warning |
 | `github_repos.include_bots` | bool | `false` | Also report the pull requests and issues that a GitHub App (`user.type` `Bot`) or an account whose login ends in `[bot]` opened. A release is reported whoever published it: release automation (`github-actions[bot]`, a release bot) is the normal case. `author_kind` still says `bot` on such a release |
-| `github_repos.include_drafts` | bool | `true` | `false`: a new draft pull request is held and reported when it is marked ready for review (event `ready`), never as `opened`; one closed while it is a draft is never reported |
-| `github_repos.updates` | bool | `false` | Also report, for each pull request this source reported, a new head commit (`updated`), ready for review (`ready`), and its merge (`merged`) or close (`closed`), after which it is no longer followed |
+| `github_repos.include_drafts` | bool | `true` | `false`: a new draft pull request is held and reported when it is marked ready for review (event `ready`), never as `opened`. A held draft that is closed is not reported and stays held for 30 days after its close: reopened in that time, it is reported when it is ready for review. One that is merged before the watch sees it ready is never reported |
+| `github_repos.updates` | bool | `false` | Also report, for each pull request this source reported, a new head commit (`updated`), ready for review (`ready`), its close without a merge (`closed`), its reopening after such a close (`reopened`), and its merge (`merged`), after which it is no longer followed. A pull request that is closed without a merge is followed again when it is reopened within 30 days of its close |
 | `github_repos.deny_authors` | list | `[]` | Case-insensitive globs on the author's login, with the rules of the [actor guardrail](#github-actor-guardrail); what they match is never reported, releases included. A pattern that ends in `[bot]` names a GitHub App (`some-ci[bot]` is that App, `*[bot]` every App), so with `include_bots: true` the list leaves out the Apps it names; without it, bot pull requests and issues are dropped already |
 
 Events (the record's `Event:` line and `event` metadata):
@@ -403,15 +403,24 @@ Events (the record's `Event:` line and `event` metadata):
 | `ready` | A held draft (`include_drafts: false`) was marked ready for review; with `updates`, so was a reported draft | `<repo>#<number>:ready:<head sha>` | `updated_at` |
 | `updated` | `updates`: a reported pull request has a new head commit | `<repo>#<number>:updated:<head sha>` | `updated_at` |
 | `merged` | `updates`: a reported pull request was merged | `<repo>#<number>:merged:merged` | `merged_at` |
-| `closed` | `updates`: a reported pull request was closed without a merge | `<repo>#<number>:closed:closed` | `closed_at` |
+| `closed` | `updates`: a reported pull request was closed without a merge | `<repo>#<number>:closed:<closed_at>`; the word `closed` in the place of a time that GitHub does not give | `closed_at` |
+| `reopened` | `updates`: a reported pull request that was closed without a merge is open again | `<repo>#<number>:reopened:<closed_at>`, with the time of the close that the reopening ends | `updated_at` |
 | `released` | A release was published since the last run | `<repo>#:released:<release id>` | `published_at` |
 | `pushed` | `commit` type: the head of a followed branch is another commit than at the last run | `<repo>@<branch>:pushed:<before>..<head>`, with the first 12 characters of the two commits | The time of the run |
 
-A pull request gives one record per run: `merged` or `closed`, else `ready`,
-else `updated`; back to draft gives none, and one seen for the first time is
-`opened` whatever its state. Comments, reviews and labels move `updated_at` and
-report nothing; issues report only `opened`. An event has one record ID, so a
-listing read twice stores it once.
+A pull request gives one record per run: `merged` or `closed`, else
+`reopened`, else `ready`, else `updated`; back to draft gives none, and one
+seen for the first time is `opened` whatever its state. Comments, reviews and
+labels move `updated_at` and report nothing; issues report only `opened`.
+[Closed and reopened pull requests](#closed-and-reopened-pull-requests) says
+what follows a close.
+
+An event has one record ID, which does not depend on when the listing is
+read. A listing that is read again from the same cursor, as after a run whose
+records were not stored, gives an item that did not change in between the
+same ID, and its record is stored once. A comment in between changes no ID. A
+push in between changes the ID of `updated` and `ready`, which the head
+commit names.
 
 The record (type `github_repo_activity`) is built the same way in both modes.
 Its summary is, for example, `[acme/widgets] New PR #12: Add a widget cache`,
@@ -429,7 +438,7 @@ the same in both modes:
 |-----|-------|
 | `repo_name` | `owner/repo`, as configured |
 | `number` | The pull request or issue number as a decimal string; empty for a release |
-| `event` | `opened`, `ready`, `updated`, `merged`, `closed` or `released` |
+| `event` | `opened`, `ready`, `updated`, `merged`, `closed`, `reopened` or `released` |
 | `subject_type` | `PullRequest`, `Issue` or `Release` |
 | `author` | The login that opened the item or published the release |
 | `author_kind` | `bot` (a GitHub App, or a login ending in `[bot]`) or `human` |
@@ -443,6 +452,77 @@ inbox guardrail applies them again to what arrives (`repo_name` against
 `include_bots` for pull requests and issues, `subject_type` against
 `types`), which catches the records delivered before a reload changed them.
 Everything here follows a reload.
+
+#### Closed and reopened pull requests
+
+With `updates`, a reported pull request that is closed without a merge stays
+followed, so it is followed again when it is reopened within 30 days of its
+close, and the reopening is reported. The 30 days count from the close: a
+comment on the closed pull request does not move them. The first run after
+the 30 days that reads the pulls listing, and whose listing does not show the
+pull request open again, forgets it, and says in the log how many closed pull
+requests of the repository it forgot. Reopened after that, it reports
+nothing.
+
+- **The `reopened` record.** It says that a reported pull request, which the
+  watch last saw closed, is open again. Its summary is
+  `[acme/widgets] PR #12 reopened: Add a widget cache`. It is built like the
+  other pull request records, with the head commit and the draft state of the
+  listing that shows the pull request open, and it is the only record of that
+  run for the pull request: commits that came with the reopening give no
+  `updated`, and ready for review gives no `ready`. After it the pull request
+  is followed as before.
+- **Jobs that decide by `event`.** A cron job or a prompt that decides by the
+  `event` of a record needs a rule for `reopened`. `closed` is not the last
+  record of a pull request: `reopened` can follow it, and then `updated`,
+  `ready`, `closed` or `merged` as before. `merged` can also follow `closed`
+  directly, when the pull request is reopened and merged between two runs or
+  in a gap. In its run `reopened` stands in for `updated` and `ready`: the
+  head commit is in `head_sha`, and whether the pull request is a draft is in
+  the `Draft:` line of the content, not in the metadata.
+- **More than one close.** A pull request can be closed and reopened more
+  than once. The ID of a `closed` record ends in the time of the close, and so
+  does the ID of the `reopened` record that ends that close, so each close
+  and each reopening is a record of its own. The ID of a reopening does not
+  depend on when the watch sees it, so a listing that is read again gives the
+  same ID. A comment on a closed pull request reports nothing.
+- **Between two runs.** A pull request that is closed and reopened between two
+  runs reports neither. A closed one that is reopened and closed again reports
+  nothing, and the watch keeps the later close; one that is reopened and
+  merged reports `merged`.
+- **First seen closed.** A new pull request that is closed when the watch
+  first sees it is `opened` and stays followed the same way. One that is
+  merged then is `opened` and not followed.
+- **Held drafts.** A held draft (`include_drafts: false`) that is closed stays
+  held for the 30 days, with or without `updates`, and reports nothing.
+  Reopened as a draft it is held again; it is reported, as `ready`, when it is
+  open and ready for review.
+- **After a gap, or a listing that failed.** A run that comes more than a day
+  after the last one still reports a reopening from before that day, or the
+  merge of a pull request that was reopened and merged before it, and it
+  keeps the later close of one that was reopened and closed again. Such a
+  record carries the time of its event (`updated_at` for `reopened` and
+  `ready`, `merged_at` for `merged`), which can be days or weeks back. An
+  item whose `updated_at` is before the close that the watch keeps is not
+  judged: that listing lags behind the one that showed the close. A run that
+  could not read the pulls listing forgets no closed pull request by its age.
+  See "No backfill beyond a day" and "Failures" above.
+- **Upgrade and rollback.** The records change without a change of the
+  settings. With `updates: true`, `reopened` arrives, and the ID of a
+  `closed` record ends in the time of the close,
+  `acme/widgets#12:closed:2026-10-27T10:04:00Z`, where it ended in the word
+  `closed`, `acme/widgets#12:closed:closed`; the reopening that ends that
+  close is `acme/widgets#12:reopened:2026-10-27T10:04:00Z`. So an ID holds
+  the colons of a time. With `include_drafts: false`, with or without
+  `updates`, a held draft that was closed and reopened reports `ready`, where
+  it was forgotten at its close. The pull requests that were closed before
+  the upgrade stay unfollowed, and their reopening reports nothing. A version
+  without `reopened` that reads the cursor drops the closed pull requests
+  from it and follows the open ones as before.
+- **Hosted mode.** The gateway builds the records, so `reopened` and the
+  `closed` ID that ends in the time of the close arrive when the gateway has
+  this rule, whatever the version of Nerve. What is said here about the
+  cursor is about poll mode.
 
 #### New commits on a branch
 
@@ -582,6 +662,10 @@ machine for them.
   outage, rests for a few minutes; and the gateway reads a repository's
   default branch at least once an hour, not at every poll, so a default
   branch that changes is followed, from its head, within the hour.
+- **Reopened pull requests in hosted mode.** The gateway builds the records,
+  so the `reopened` event and the `closed` ID that ends in the time of the
+  close arrive when the gateway has that rule, whatever the version of
+  Nerve. See [Closed and reopened pull requests](#closed-and-reopened-pull-requests).
 - **Same source, same name.** The records go to their own local buffer, and
   the `source:github_repos` runner drains it, as the `github` runner drains
   the notifications (see [Hosted GitHub source](#hosted-github-source)): it
@@ -827,7 +911,7 @@ sync:
     types: [pull_request, issue]  # pull_request | issue | release
     include_bots: false           # Also PRs and issues a GitHub App or a [bot] account opened
     include_drafts: true          # false: a draft PR is reported when it is ready for review
-    updates: false                # true: also commits, ready, merge and close of reported PRs
+    updates: false                # true: also commits, ready, merge, close and reopening of reported PRs
     deny_authors: []              # Globs on the author's login; never reported
     batch_size: 50
     condense: false
