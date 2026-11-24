@@ -46,6 +46,7 @@ describe('groupToolBursts', () => {
 
   it.each([
     'mcp__nerve__ask_user', 'AskUserQuestion', 'mcp__nerve__ask_form', 'ExitPlanMode', 'mcp__nerve__send_file',
+    'mcp__nerve__send_image',
     'mcp__nerve__plan_propose', 'mcp__nerve__plan_update',
   ])('never puts %s in a burst', (tool) => {
     const items = groupToolBursts([call('Bash'), call('Read'), call(tool), call('Bash')], NO_REPEATS);

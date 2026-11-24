@@ -1,5 +1,5 @@
 """Notification tool handlers — notify, ask_user, propose_action, react,
-send_sticker, send_file, send_channel_message.
+send_sticker, send_file, send_image, send_channel_message.
 
 Most of these need ``ctx.session_id`` so the channel router can deliver to
 the correct chat (web, Telegram). The session_id arrives via
@@ -21,9 +21,11 @@ slip past, e.g. workspace ``/srv/ws`` would accept ``/srv/ws-evil/secret.txt``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
+import shutil
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -37,6 +39,7 @@ from nerve.agent.tools.schemas import (
     REACT_SCHEMA,
     SEND_CHANNEL_MESSAGE_SCHEMA,
     SEND_FILE_SCHEMA,
+    SEND_IMAGE_SCHEMA,
     SEND_STICKER_SCHEMA,
 )
 
@@ -533,6 +536,133 @@ async def send_channel_message_handler(ctx: ToolContext, args: dict) -> ToolResu
     )
 
 
+# The images the web UI shows from a send_image call, by extension, and the
+# largest it copies. The same types and limit as a chat upload.
+_WEB_IMAGE_TYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".gif": "image/gif", ".webp": "image/webp",
+}
+_WEB_IMAGE_MAX_BYTES = 20 * 1024 * 1024
+
+
+async def _snapshot_for_web(ctx: ToolContext, path: Path) -> str | None:
+    """Copy a sent image into the session's uploads; return its URL, or None.
+
+    The web UI shows the copy, not the file: an image sent from ``tmp/`` and
+    deleted later still shows when the chat is read again, and the session's
+    uploads go when the session does. Any session can be read in the web UI,
+    whichever channel it runs on, so every sent image is copied.
+    """
+    media_type = _WEB_IMAGE_TYPES.get(path.suffix.lower())
+    if media_type is None or ctx.db is None:
+        return None
+    from nerve.gateway.routes.files import session_upload_dir
+
+    upload_dir = session_upload_dir(ctx.session_id)
+    if upload_dir is None:
+        return None
+    try:
+        size = path.stat().st_size
+        if size > _WEB_IMAGE_MAX_BYTES:
+            return None
+        file_id = uuid.uuid4().hex[:16]
+        disk_path = upload_dir / f"{file_id}_{path.name}"
+
+        def _copy() -> None:
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, disk_path)
+
+        await asyncio.to_thread(_copy)
+        await ctx.db.save_uploaded_file(
+            file_id=file_id, session_id=ctx.session_id, filename=path.name,
+            media_type=media_type, file_type="image", file_size=size,
+            disk_path=str(disk_path),
+        )
+    except Exception as e:
+        logger.warning("send_image: could not keep a copy for the web UI: %s", e)
+        return None
+    return f"/api/files/uploads/{file_id}"
+
+
+async def send_image_handler(ctx: ToolContext, args: dict) -> ToolResult:
+    """Send an image inline via the channel router.
+
+    Accepts either a local *file_path* (workspace-contained) or a remote
+    *url*.  An optional *caption* is forwarded to the channel.
+
+    A local image is also copied into the session's uploads, and the result
+    names the copy on a ``web_url:`` line, which the web UI's card shows.
+    """
+    file_path = args.get("file_path", "")
+    url = args.get("url", "")
+    caption = args.get("caption", "")
+
+    if not file_path and not url:
+        return ToolResult.text("Error: provide either file_path or url.")
+    if file_path and url:
+        return ToolResult.text("Error: provide file_path or url, not both.")
+    if url and not url.lower().startswith(("https://", "http://")):
+        return ToolResult.text("Error: url must be an http(s) URL.")
+
+    # Workspace containment for local files
+    web_url = None
+    if file_path:
+        resolved = Path(file_path).resolve()
+        if not resolved.is_file():
+            return ToolResult.text(f"Error: file not found: {file_path}")
+        if ctx.workspace:
+            try:
+                resolved.relative_to(ctx.workspace.resolve())
+            except ValueError:
+                return ToolResult.text("Error: file must be within the workspace.")
+        file_path = str(resolved)
+        web_url = await _snapshot_for_web(ctx, resolved)
+
+    delivered = False
+    as_file = False
+    active_channel = None
+    if ctx.engine is not None:
+        try:
+            active_channel = ctx.engine.get_active_channel(ctx.session_id)
+            delivered = await ctx.engine.router.send_image(
+                ctx.session_id,
+                file_path=file_path,
+                url=url,
+                caption=caption,
+                channel=active_channel,
+            )
+            if not delivered and file_path and active_channel not in (None, "web"):
+                # The channel can't show it inline (Slack, a hosted channel)
+                # or refused it (a Telegram photo over 10 MB): send the file.
+                as_file = delivered = await ctx.engine.router.send_file(
+                    ctx.session_id, file_path, channel=active_channel,
+                )
+        except Exception as e:
+            logger.error("send_image dispatch failed: %s", e)
+            delivered = False
+
+    source = Path(file_path).name if file_path else url
+    suffix = f"\nweb_url: {web_url}" if web_url else ""
+    if delivered:
+        how = "Image sent as a file" if as_file else "Image sent"
+        return ToolResult.text(f"{how}: {source}{suffix}")
+    if active_channel not in (None, "web"):
+        # The person is on that channel and got nothing: say so.
+        return ToolResult.text(
+            f"Error: the image could not be delivered on {active_channel}: {source}."
+            + (" The web UI shows it." if web_url else " Try send_file, or share a link.")
+            + suffix,
+        )
+    if web_url:
+        # No channel took it (a cron run, say), but the web UI shows the copy.
+        return ToolResult.text(f"Image shown in the web UI only: {source}{suffix}")
+
+    return ToolResult.text(
+        "Image delivery not available on this channel. "
+        "Try send_file as a fallback, or open the web panel."
+    )
+
+
 NOTIFY_SPEC = ToolSpec(
     name="notify",
     description=(
@@ -641,6 +771,19 @@ SEND_CHANNEL_MESSAGE_SPEC = ToolSpec(
 )
 
 
+SEND_IMAGE_SPEC = ToolSpec(
+    name="send_image",
+    description=(
+        "Send an image to the user displayed inline in the chat. "
+        "On Telegram the image is delivered as a photo (not a document attachment). "
+        "Provide either a local file_path or a remote url, plus an optional caption. "
+        "Use this when you want to share a picture, screenshot, chart, or any visual content."
+    ),
+    input_schema=SEND_IMAGE_SCHEMA,
+    handler=send_image_handler,
+)
+
+
 NOTIFICATION_SPECS = [
     NOTIFY_SPEC,
     ASK_USER_SPEC,
@@ -650,4 +793,5 @@ NOTIFICATION_SPECS = [
     SEND_STICKER_SPEC,
     SEND_FILE_SPEC,
     SEND_CHANNEL_MESSAGE_SPEC,
+    SEND_IMAGE_SPEC,
 ]
