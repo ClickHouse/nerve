@@ -1,7 +1,7 @@
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError } from '../../api/hosted';
+import { ApiError, useHostedStore } from '../../api/hosted';
 import { useBrowserAlertStore } from '../../stores/browserAlertStore';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { stubBrowser } from '../../test/browserAlertFixtures';
@@ -43,6 +43,7 @@ beforeEach(() => {
 afterEach(() => {
   unstubPushBrowser();
   vi.unstubAllGlobals();
+  useHostedStore.setState({ mode: 'local' });
 });
 
 describe('Push in the This browser row', () => {
@@ -134,5 +135,33 @@ describe('Push in the This browser row', () => {
     renderRow();
     expect(screen.getByText('On iPhone and iPad, add the panel to the Home Screen to get notifications.')).toBeInTheDocument();
     expect(screen.queryByRole('switch')).not.toBeInTheDocument();
+  });
+});
+
+describe('Push in hosted mode', () => {
+  beforeEach(() => useHostedStore.setState({ mode: 'external' }));
+
+  it('says that push is not available when the gateway has no push routes', async () => {
+    stubBrowser({ permission: 'granted' });
+    stubPushBrowser();
+    api.pushDevices.mockRejectedValue(new ApiError(404, '{"reason": "not_found", "requestId": "r-1"}'));
+    renderRow();
+
+    expect(await screen.findByText('Push notifications are not available for this agent.')).toBeInTheDocument();
+    expect(screen.queryByRole('switch', { name: 'Alerts when no tab is open' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('lists another browser without a last notification line', async () => {
+    stubBrowser({ permission: 'granted' });
+    stubPushBrowser();
+    serverHas(device({
+      id: 'b7', endpoint: undefined, endpoint_digest: 'other-digest', user_agent: PHONE, last_success_at: undefined,
+    }));
+    renderRow();
+
+    const list = await screen.findByRole('list', { name: 'Your other devices' });
+    expect(within(list).getByText(/^Added /)).toBeInTheDocument();
+    expect(within(list).queryByText(/notification/)).not.toBeInTheDocument();
   });
 });

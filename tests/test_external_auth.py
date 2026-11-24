@@ -760,6 +760,16 @@ class TestRoutes:
         assert "/api/accounts" in paths_in_use
         assert "/api/setup/claim" in paths_in_use
 
+    def test_the_platform_delivers_push_so_only_the_manifest_route_is_registered(self, external):
+        paths_in_use = _route_paths(server.create_app())
+        assert not any(path.startswith("/api/push") for path in paths_in_use)
+        assert "/api/manifest.webmanifest" in paths_in_use
+
+    def test_local_mode_registers_the_push_routes(self):
+        paths_in_use = _route_paths(server.create_app())
+        assert {"/api/push/subscriptions", "/api/push/subscriptions/{subscription_id}"} <= paths_in_use
+        assert "/api/manifest.webmanifest" in paths_in_use
+
     @pytest.mark.asyncio
     async def test_login_answers_404(self, install):
         async with _client(server.create_app()) as client:

@@ -9,7 +9,10 @@ import type {
 import type { PullRequestResult } from '../types/github';
 import type { McpAppResource, McpAppTool, McpAppsConfig, McpCallToolResult } from '../types/mcpApps';
 import type { NotificationSettingValues, NotificationSettings, NotificationTestResult } from './settings';
-import type { PushDevice, PushDevices, PushSubscriptionBody } from './push';
+import {
+  gatewayDeletePushDevice, gatewayPushDevices, gatewaySavePushDevice,
+  type PushDevice, type PushDevices, type PushSubscriptionBody,
+} from './push';
 
 const API_BASE = '/api';
 
@@ -1369,12 +1372,18 @@ export const api = {
   testSettingsNotifications: () =>
     request<NotificationTestResult>('/settings/notifications/test', { method: 'POST', body: '{}' }),
 
-  // Web Push: the browsers of the signed-in person.
-  pushDevices: () => request<PushDevices>('/push/subscriptions'),
-  savePushDevice: (body: PushSubscriptionBody) =>
-    request<PushDevice>('/push/subscriptions', { method: 'POST', body: JSON.stringify(body) }),
-  deletePushDevice: (id: number) =>
-    request<{ deleted: boolean }>(`/push/subscriptions/${id}`, { method: 'DELETE' }),
+  // Web Push: the browsers of the signed-in person. In hosted mode the
+  // platform delivers Web Push and the gateway keeps the browsers.
+  pushDevices: (): Promise<PushDevices> => (isHosted()
+    ? gatewayPushDevices()
+    : request<PushDevices>('/push/subscriptions')),
+  savePushDevice: (body: PushSubscriptionBody): Promise<PushDevice> => (isHosted()
+    ? gatewaySavePushDevice(body)
+    : request<PushDevice>('/push/subscriptions', { method: 'POST', body: JSON.stringify(body) })),
+  deletePushDevice: async (id: number | string): Promise<void> => {
+    if (isHosted()) return gatewayDeletePushDevice(id);
+    await request<{ deleted: boolean }>(`/push/subscriptions/${id}`, { method: 'DELETE' });
+  },
 
   restartSystem: () =>
     request<RestartResponse>('/system/restart', { method: 'POST', body: '{}' }),

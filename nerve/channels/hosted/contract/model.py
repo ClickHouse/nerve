@@ -72,6 +72,20 @@ REPO_WATCH_PROVIDER = "github_repos"
 # The provider of the mail that members send to the agent. Its subscription
 # names only the provider, with empty filters.
 EMAIL_PROVIDER = "email"
+# The provider of the platform's own connection. It advertises only
+# ``platform_notify`` (:class:`PlatformNotifyOperation`): in external mode the
+# platform delivers Web Push for the agent.
+PLATFORM_PROVIDER = "platform"
+PLATFORM_NOTIFY = "platform_notify"
+# The bounds of a ``platform_notify`` payload that the gateway enforces.
+MAX_PLATFORM_NOTIFICATION_ID_BYTES = 64
+MAX_PLATFORM_TOKEN_BYTES = 32
+MAX_PLATFORM_TITLE_BYTES = 1024
+MAX_PLATFORM_BODY_BYTES = 4096
+MAX_PLATFORM_AGENT_NAME_BYTES = 256
+_PLATFORM_NOTIFICATION_ID = re.compile(rf"[A-Za-z0-9._:-]{{1,{MAX_PLATFORM_NOTIFICATION_ID_BYTES}}}")
+# The type and the priority of a ``platform_notify``: a lowercase token.
+_PLATFORM_TOKEN = re.compile(rf"[a-z][a-z0-9_]{{0,{MAX_PLATFORM_TOKEN_BYTES - 1}}}")
 # The provider that says the agent accepts one record of each comment, review
 # and description of a GitHub thread (:data:`THREAD_ITEM_RECORD_TYPE`). Its
 # subscription names only the provider, with empty filters, as for email.
@@ -133,6 +147,13 @@ def byte_length(value: str) -> int:
         return len(value.encode("utf-8"))
     except UnicodeEncodeError:
         return MAX_FRAME_BYTES + 1
+
+
+def valid_platform_token(value: str) -> bool:
+    """Whether the gateway takes *value* as the type or the priority of a
+    ``platform_notify``: a lowercase letter, then lowercase letters, digits
+    and ``_``, at most :data:`MAX_PLATFORM_TOKEN_BYTES` in total."""
+    return _PLATFORM_TOKEN.fullmatch(value) is not None
 
 
 def _one_of(name: str, value: str, allowed: tuple[str, ...]) -> None:
@@ -822,6 +843,45 @@ class TypingOperation:
 
 
 @_record
+class PlatformNotifyOperation:
+    """One notification that the platform delivers to the members' browsers.
+
+    The gateway finds the browsers of the members that want the
+    notification, builds the push that a browser shows, and sends it. It
+    applies the display limits itself. ``type`` and ``priority`` are open
+    tokens: the gateway accepts a value that it does not know, and counts it
+    as not important. ``title`` can be empty and is always sent; the gateway
+    then shows the agent name alone. ``None`` is a missing or null title,
+    which the gateway refuses. ``silent`` is left out when false.
+    """
+
+    notification_id: str = ""
+    type: str = ""
+    title: str | None = None
+    body: str = omit_empty()
+    priority: str = ""
+    silent: bool = omit_empty(False)
+    agent_name: str = omit_empty()
+
+    def validate(self) -> None:
+        """Check the bounds of each member, as the gateway does."""
+        if _PLATFORM_NOTIFICATION_ID.fullmatch(self.notification_id) is None:
+            malformed("platform notification ID is not 1 to 64 characters of A-Z a-z 0-9 . _ : -")
+        for name, token in (("type", self.type), ("priority", self.priority)):
+            if not valid_platform_token(token):
+                malformed(f"platform notification {name} is not a lowercase token")
+        if self.title is None:
+            malformed("platform notification has no title")
+        for name, value, maximum in (
+            ("title", self.title, MAX_PLATFORM_TITLE_BYTES),
+            ("body", self.body, MAX_PLATFORM_BODY_BYTES),
+            ("agent name", self.agent_name, MAX_PLATFORM_AGENT_NAME_BYTES),
+        ):
+            if byte_length(value) > maximum:
+                reject(RejectionReason.LIMIT_EXCEEDED, f"platform notification {name} is too long")
+
+
+@_record
 class Operation:
     """A bounded provider action; ``kind`` names the payload member."""
 
@@ -836,6 +896,7 @@ class Operation:
     file_read: FileReadOperation | None = omit_empty(None)
     file_send: FileSendOperation | None = omit_empty(None)
     typing: TypingOperation | None = omit_empty(None)
+    platform_notify: PlatformNotifyOperation | None = omit_empty(None)
 
 
 @_record
@@ -869,6 +930,8 @@ def validate_operation_result(operation: Operation, result: OperationResult) -> 
         malformed("successful send has no message target")
     if operation.kind == "notify":
         _validate_notify_target(result.target)
+    if operation.kind == PLATFORM_NOTIFY and result.target is not None:
+        malformed("successful platform notify carries a message target")
     if operation.kind == "file_read" and result.transfer is None:
         malformed("successful file read has no transfer")
 

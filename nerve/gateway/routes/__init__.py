@@ -11,6 +11,7 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from nerve.gateway.auth import is_external_mode
+from nerve.notifications import webpush
 from nerve.gateway.routes._deps import (
     get_deps,
     init_deps,
@@ -64,8 +65,10 @@ def register_all_routes() -> APIRouter:
     """Assemble and return the combined API router.
 
     In external mode, the gateway manages people, so the local account routes
-    and the first-account claim are not registered. The setup checklist is
-    registered in both modes: any signed-in person may run setup.
+    and the first-account claim are not registered. The platform delivers Web
+    Push, so the push subscription routes are not registered either; the app
+    manifest is. The setup checklist is registered in both modes: any
+    signed-in person may run setup.
     """
     local_accounts = not is_external_mode()
     router = APIRouter()
@@ -91,7 +94,9 @@ def register_all_routes() -> APIRouter:
     router.include_router(cron.router)
     router.include_router(sources.router)
     router.include_router(notifications.router)
-    router.include_router(push.router)
+    router.include_router(push.manifest_router)
+    if not webpush.platform_sends():
+        router.include_router(push.router)
     router.include_router(files.router)
     router.include_router(github.router)
     router.include_router(external_agents.router)

@@ -1601,6 +1601,12 @@ When the control plane sets no notification channel, the gateway refuses the
 card, and Nerve logs one INFO line for each card. Any other failure logs one
 warning.
 
+In external mode the gateway can also advertise a connection of the provider
+`platform` with the `platform_notify` operation. The platform delivers Web
+Push for the agent, and Nerve hands each notification over on that
+connection (see [Web Push](#web-push)). This connection serves no chat
+channel and does not change the choice of the `notify` connection.
+
 A button press answers the notification only in the conversation where it
 was delivered, and the card then shows the answer without buttons. A press
 that answers nothing, for example a second press, gets a short notice and
@@ -2074,9 +2080,12 @@ to the session in the web UI.
 The fan-out also sends each item as a push notification (channel `webpush`)
 to the browsers where a person turned push on. `notifications.channels` does
 not list it, and `notifications.levels.webpush: important` limits all
-browsers. The instance must reach the push services of the browsers; on Nerve
-Cloud that works only for agents in open internet mode. How push works, the
-VAPID key and the hosts: [web-ui.md](web-ui.md#push-notifications).
+browsers. In local mode the instance must reach the push services of the
+browsers. In external mode (`NERVE_AUTH_MODE=external`) the platform delivers
+Web Push: the instance needs no key, no subscription routes and no access to
+a push service, and hands each item over on a [hosted channel](#hosted-mode)
+connection (see [api.md](api.md#web-push)). How push works, the VAPID key and
+the hosts: [web-ui.md](web-ui.md#push-notifications).
 
 ## Quiet Hours
 

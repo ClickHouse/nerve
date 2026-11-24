@@ -26,6 +26,9 @@ export function PushSwitch() {
     ? push.turnOn(alerts.level).then(() => alerts.refresh())
     : push.turnOff());
 
+  if (!push.available) {
+    return <p className="text-xs text-text-dim">Push notifications are not available for this agent.</p>;
+  }
   if (!pushSupported()) {
     return needsHomeScreen()
       ? <p className="text-xs text-text-dim">On iPhone and iPad, add the panel to the Home Screen to get notifications.</p>
@@ -83,6 +86,8 @@ export function OtherDevices() {
 
 function deviceDetail(device: PushDevice): string {
   const added = new Date(device.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  // In hosted mode the gateway does not report the last notification.
+  if (device.last_success_at === undefined) return `Added ${added}`;
   const last = device.last_success_at
     ? `Last notification ${formatRelativeTime(device.last_success_at)}`
     : 'No notification yet';
