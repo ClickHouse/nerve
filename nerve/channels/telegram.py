@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import collections
+import functools
 import html as _html
 import logging
 import re
@@ -17,13 +18,16 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, TYPE_CHECKING
+from typing import Any, Awaitable, Callable, NamedTuple, TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
-from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message, Update
 from telegram.constants import ChatAction, ParseMode
+from telegram.error import EndPointNotFound, RetryAfter
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, MessageReactionHandler, filters
 
 from nerve.agent.engine import NotAcceptingTurnsError
@@ -44,6 +48,8 @@ from nerve.channels.base import (
 )
 from nerve.channels.observation import ObservationPolicy
 from nerve.channels.router import turn_stop_note
+from nerve.channels.session_events import TurnFinished, TurnStarted
+from nerve.channels.telegram_auto_topics import AutoTopics
 from nerve.config import NerveConfig
 
 if TYPE_CHECKING:
@@ -61,8 +67,34 @@ REPLY_UNRESOLVED_MSG = (
     "Reply with /new <your message> to start a new session with it quoted, "
     "or send the message without replying to reach the active session."
 )
+# A rich message's limit (Bot API 10.1), in characters of its text
+RICH_MSG_LEN = 32768
+# Blocks in one rich message, as _line_weights counts them: lines outside
+# code, and one per code block. Telegram's cap is 500 blocks, and a list item
+# is two of them (the item and its paragraph).
+_RICH_MAX_BLOCKS = 200
+# Read/write timeout for sending a rich message: up to 32 KB to parse
+_RICH_TIMEOUT = 20.0
 # Minimum interval between message edits (seconds) to avoid rate limits
 EDIT_INTERVAL = 1.5
+# Chats whose last streaming edit time is remembered (see _claim_chat_edit)
+_EDIT_CLOCK_MAX = 500
+# The longest Telegram's "retry after" that a final send waits out
+_SEND_RETRY_MAX_WAIT = 30.0
+# A forum's General topic. Telegram refuses it as a message_thread_id, and
+# Nerve treats it as the chat itself.
+GENERAL_TOPIC_ID = 1
+# The name of a topic that /new opens without a title, until the session's
+# generated title replaces it
+NEW_TOPIC_NAME = "New session"
+# Telegram's limit for a topic name
+_TOPIC_NAME_MAX = 128
+# What Telegram's errors say (lower-cased) about a topic that is gone, and
+# about closing a topic that is closed already
+_TOPIC_GONE_ERRORS = ("thread not found", "topic_id_invalid", "topic_deleted")
+_TOPIC_UNCHANGED_ERRORS = ("topic_not_modified",)
+# Messages in a "Send transcript" document, newest kept when a session has more
+_TRANSCRIPT_MAX_MESSAGES = 10_000
 # Watchdog: check every 30s, log heartbeat every ~5 min
 WATCHDOG_INTERVAL = 30
 WATCHDOG_HEARTBEAT_EVERY = 10
@@ -89,6 +121,92 @@ elif sys.platform == "darwin":
     )
 else:
     _TCP_KEEPALIVE_OPTS = ((socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),)
+
+
+def format_target(chat_id: int | str, thread_id: int | None = None) -> str:
+    """The channel target for a chat, or for one topic in it.
+
+    ``"<chat>"`` for a chat or its General topic, ``"<chat>:<thread>"`` for a
+    topic. Chat ids never contain ``:``, so the split in :func:`parse_target`
+    is unambiguous, negative group ids included.
+    """
+    return f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id)
+
+
+def parse_target(target: str) -> tuple[int, int | None]:
+    """Split a channel target into ``(chat_id, thread_id)``; no topic is ``None``."""
+    chat, sep, thread = str(target).partition(":")
+    return int(chat), (int(thread) if sep else None)
+
+
+def _topic_name(text: str | None) -> str:
+    """A topic name Telegram accepts: one line of 1 to 128 characters."""
+    name = " ".join(str(text or "").split())
+    if len(name) > _TOPIC_NAME_MAX:
+        name = name[:_TOPIC_NAME_MAX - 1].rstrip() + "…"
+    return name or NEW_TOPIC_NAME
+
+
+def _in_thread(thread_id: int | None) -> dict[str, int]:
+    """The ``message_thread_id`` keyword for a topic, and none for the chat itself."""
+    return {"message_thread_id": thread_id} if thread_id is not None else {}
+
+
+def _retry_after_seconds(exc: RetryAfter) -> float:
+    """Telegram's advised wait, in seconds (an int or a timedelta, by PTB version)."""
+    wait = exc.retry_after
+    return float(wait.total_seconds() if hasattr(wait, "total_seconds") else wait)
+
+
+@dataclass(frozen=True)
+class _Address:
+    """Where a Telegram update came from: a chat, and a topic in it or ``None``."""
+
+    chat_id: int
+    thread_id: int | None = None
+
+    @property
+    def target(self) -> str:
+        return format_target(self.chat_id, self.thread_id)
+
+    @property
+    def channel_key(self) -> str:
+        return f"telegram:{self.target}"
+
+
+def _address_of_key(channel_key: str) -> _Address | None:
+    """The address behind a ``telegram:<target>`` channel key, else ``None``."""
+    prefix, _, target = channel_key.partition(":")
+    if prefix != "telegram" or not target:
+        return None
+    try:
+        return _Address(*parse_target(target))
+    except ValueError:
+        return None
+
+
+def _error_says(exc: BaseException, phrases: tuple[str, ...]) -> bool:
+    """Whether Telegram's error *exc* contains one of *phrases* (lower case)."""
+    text = str(exc).lower()
+    return any(phrase in text for phrase in phrases)
+
+
+class SessionTopic(NamedTuple):
+    """What :meth:`TelegramChannel.open_session_topic` did."""
+
+    channel_key: str | None  # ``telegram:<chat>:<thread>``; None when it failed
+    opened: bool = False     # a topic opened now, not the one the session had
+    error: str = ""          # why it failed, in words a person can read
+    retry_after: float | None = None  # seconds Telegram asked to wait, if rate limited
+
+
+class ClosedTopic(NamedTuple):
+    """A topic :meth:`TelegramChannel.close_session_topic` let go of."""
+
+    channel_key: str
+    # "closed"; "left_open" in a private chat, where Telegram cannot close a
+    # topic; "gone" when the topic had been deleted already
+    outcome: str
 
 
 def _md_to_tg_html(text: str) -> str:
@@ -151,6 +269,343 @@ def _md_to_tg_html(text: str) -> str:
     return text
 
 
+# ---------------------------------------------------------------------- #
+#  Markdown blocks: splitting and rich messages                            #
+# ---------------------------------------------------------------------- #
+
+# A code fence's opening line: up to three spaces, then ``` or ~~~ and an
+# optional info string (the language).
+_FENCE_OPEN_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
+# A table's delimiter row, such as "|:---|---:|" or "--- | ---".
+_TABLE_DELIM_RE = re.compile(r"^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
+_HEADING_RE = re.compile(r"^ {0,3}#{1,6}(\s|$)")
+_RULE_RE = re.compile(r"^ {0,3}([-*_=])(\s*\1){2,}\s*$")
+# An inline code span: a run of backticks, its text, the same run again.
+_CODE_SPAN_RE = re.compile(r"(`+)(.+?)\1")
+# HTML tags a rich message renders and an answer may use on purpose. Telegram
+# drops anything else that looks like a tag ("Vec<String>" shows as "Vec"),
+# so every other "<" is escaped.
+_RICH_TAGS = (
+    "a", "b", "blockquote", "br", "code", "del", "details", "em", "i", "ins",
+    "pre", "s", "strike", "strong", "sub", "summary", "sup", "tg-spoiler", "u",
+)
+_RICH_TAG_RE = re.compile(
+    r"</?(?:%s)(?=[\s>/])" % "|".join(map(re.escape, _RICH_TAGS)), re.IGNORECASE,
+)
+_AUTOLINK_RE = re.compile(r"<(?:https?|mailto|tg):[^\s<>]*>", re.IGNORECASE)
+
+
+def _is_table_delim(line: str) -> bool:
+    """Whether *line* is a table's delimiter row ("---" alone is a rule, not one)."""
+    return "|" in line and bool(_TABLE_DELIM_RE.match(line))
+
+
+def _closes_fence(line: str, closer: str) -> bool:
+    """Whether *line* closes a fence opened with *closer* (e.g. ``` or ~~~~)."""
+    marker = closer.strip()
+    stripped = line.strip()
+    return (
+        len(line) - len(line.lstrip(" ")) <= 3
+        and len(stripped) >= len(marker)
+        and set(stripped) == {marker[0]}
+    )
+
+
+# Where a line sits relative to code fences (see _fence_marks)
+_OUTSIDE, _OPENS, _INSIDE = 0, 1, 2
+
+
+def _fence_marks(lines: list[str]) -> list[int]:
+    """For each line: outside code, opening a fence, or inside one (its closer too)."""
+    marks: list[int] = []
+    closer: str | None = None
+    for line in lines:
+        if closer is None:
+            m = _FENCE_OPEN_RE.match(line)
+            if m and not (m.group(2)[0] == "`" and "`" in m.group(3)):
+                closer = m.group(1) + m.group(2)
+                marks.append(_OPENS)
+                continue
+            marks.append(_OUTSIDE)
+        else:
+            marks.append(_INSIDE)
+            if _closes_fence(line, closer):
+                closer = None
+    return marks
+
+
+def _code_lines(lines: list[str]) -> list[bool]:
+    """For each line, whether it belongs to a code fence (its markers included)."""
+    return [mark != _OUTSIDE for mark in _fence_marks(lines)]
+
+
+def _line_weights(lines: list[str]) -> list[int]:
+    """What each line adds to a rich message's block count.
+
+    A line outside code adds one, a code block one however long it is. A
+    list item is a second block (its paragraph), which the cap leaves room
+    for.
+    """
+    return [
+        1 if mark == _OPENS else 0 if mark == _INSIDE else int(bool(line.strip()))
+        for line, mark in zip(lines, _fence_marks(lines))
+    ]
+
+
+def _weight(text: str) -> int:
+    return sum(_line_weights(text.split("\n")))
+
+
+def _markdown_blocks(text: str) -> list[str]:
+    """Markdown cut at blank lines, with each code fence kept whole."""
+    lines = text.split("\n")
+    blocks: list[str] = []
+    current: list[str] = []
+    for line, code in zip(lines, _code_lines(lines)):
+        if not code and not line.strip():
+            if current:
+                blocks.append("\n".join(current))
+                current = []
+            continue
+        current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
+
+
+def _fits(text: str, limit: int, max_blocks: int) -> bool:
+    return len(text) <= limit and (not max_blocks or _weight(text) <= max_blocks)
+
+
+def _fit_block(block: str, limit: int, max_blocks: int) -> list[str]:
+    """One block as pieces that fit, cut at line ends.
+
+    A cut inside a code fence closes the fence and reopens it, language and
+    all, at the top of the next piece, so each piece renders on its own. A
+    line longer than a piece is cut too.
+    """
+    if _fits(block, limit, max_blocks):
+        return [block]
+    source = block.split("\n")
+    pieces: list[str] = []
+    lines: list[str] = []
+    used = 0
+    weight = 0
+    opener: str | None = None  # the open fence's first line
+    closer = ""
+    for line, line_weight in zip(source, _line_weights(source)):
+        reserve = len(closer) + 1 if opener is not None else 0
+        width = max(1, limit - reserve - (len(opener) + 1 if opener else 0) - 1)
+        for seg in [line[i:i + width] for i in range(0, len(line), width)] or [""]:
+            full = used + len(seg) + 1 + reserve > limit or (
+                max_blocks and weight + line_weight > max_blocks
+            )
+            if lines and full:
+                if opener is not None:
+                    lines.append(closer)
+                pieces.append("\n".join(lines))
+                lines = [opener] if opener is not None else []
+                used = sum(len(kept) + 1 for kept in lines)
+                weight = 1 if opener is not None else 0
+            lines.append(seg)
+            used += len(seg) + 1
+            weight += line_weight
+        if opener is None:
+            m = _FENCE_OPEN_RE.match(line)
+            if m:
+                opener, closer = line, m.group(1) + m.group(2)
+        elif _closes_fence(line, closer):
+            opener, closer = None, ""
+    if lines:
+        pieces.append("\n".join(lines))
+    return pieces
+
+
+def _split_markdown(text: str, limit: int, max_blocks: int = 0) -> list[str]:
+    """Markdown in parts of at most *limit* characters, cut between blocks.
+
+    A part ends at a blank line and never inside a code fence; a block too
+    long for one part is cut by :func:`_fit_block`. *max_blocks*, when set,
+    also caps a part's block count as :func:`_line_weights` reckons it.
+    Blank-line runs between blocks come out as a single blank line.
+    """
+    if not text:
+        return []
+    if _fits(text, limit, max_blocks):
+        return [text]
+    parts: list[str] = []
+    current: list[str] = []
+    size = 0
+    blocks = 0
+    for block in _markdown_blocks(text):
+        for piece in _fit_block(block, limit, max_blocks):
+            piece_blocks = _weight(piece) if max_blocks else 0
+            if current and (
+                size + 2 + len(piece) > limit
+                or (max_blocks and blocks + piece_blocks > max_blocks)
+            ):
+                parts.append("\n\n".join(current))
+                current, size, blocks = [], 0, 0
+            if current:
+                size += 2
+            current.append(piece)
+            size += len(piece)
+            blocks += piece_blocks
+    if current:
+        parts.append("\n\n".join(current))
+    return parts
+
+
+def _escape_rich_text(text: str) -> str:
+    """Escape what a rich message would misread in text outside code.
+
+    ``$`` would open a formula ("$5 and $10" turns into one), and a ``<``
+    that starts no tag Telegram renders would make the text after it vanish.
+    A character the text already escapes with a backslash is left alone.
+    """
+    out: list[str] = []
+    escaped = False
+    for i, ch in enumerate(text):
+        if escaped:
+            out.append(ch)
+            escaped = False
+        elif ch == "\\":
+            out.append(ch)
+            escaped = True
+        elif ch == "$":
+            out.append("\\$")
+        elif ch == "<" and not (
+            _RICH_TAG_RE.match(text, i) or _AUTOLINK_RE.match(text, i)
+        ):
+            out.append("&lt;")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _escape_rich_line(line: str) -> str:
+    """:func:`_escape_rich_text` for one line, leaving its code spans alone."""
+    out: list[str] = []
+    pos = 0
+    for m in _CODE_SPAN_RE.finditer(line):
+        out.append(_escape_rich_text(line[pos:m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(_escape_rich_text(line[pos:]))
+    return "".join(out)
+
+
+def _rich_markdown(text: str) -> str:
+    """An answer's Markdown, ready for a rich message.
+
+    Rich messages parse GitHub-flavoured Markdown, which differs from how a
+    Telegram message shows text in two ways that matter to an answer: a
+    single newline joins two lines into one paragraph, and some characters
+    are markup (see :func:`_escape_rich_text`). So each line break inside a
+    paragraph becomes a hard break, and those characters are escaped. Code
+    fences and code spans stay exactly as written, and so do tables. A table
+    gets a blank line before and after it, because without one Telegram reads
+    it as part of the paragraph next to it.
+    """
+    lines = text.split("\n")
+    code = _code_lines(lines)
+    count = len(lines)
+    out: list[str] = []
+    in_table = False
+    piped_table = False  # the table's rows start with "|"
+    for i, line in enumerate(lines):
+        if code[i]:
+            out.append(line)
+            continue
+        if not line.strip():
+            in_table = False
+            out.append(line)
+            continue
+        nxt = lines[i + 1] if i + 1 < count else ""
+        nxt_code = code[i + 1] if i + 1 < count else True
+        if _is_table_delim(line):
+            in_table = True
+            piped_table = line.lstrip().startswith("|")
+        table_next = (
+            not in_table
+            and i + 2 < count
+            and not code[i + 1] and not code[i + 2]
+            and "|" in nxt
+            and _is_table_delim(lines[i + 2])
+        )
+        line = _escape_rich_line(line)
+        table_line = (
+            in_table or line.lstrip().startswith("|") or _is_table_delim(nxt)
+        )
+        if (
+            nxt.strip()
+            and not nxt_code
+            and not table_line
+            and not table_next
+            and not nxt.lstrip().startswith("|")
+            and not _HEADING_RE.match(line)
+            and not _RULE_RE.match(line)
+            and not line.endswith(("  ", "\\"))
+        ):
+            line += "  "
+        out.append(line)
+        if table_next:
+            out.append("")
+        elif (
+            in_table and piped_table and nxt.strip() and not nxt_code
+            and not nxt.lstrip().startswith("|")
+        ):
+            out.append("")
+            in_table = False
+    return "\n".join(out)
+
+
+def _rich_inline_text(node: Any) -> str:
+    """The plain text of a rich message's inline content."""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, list):
+        return "".join(_rich_inline_text(part) for part in node)
+    if isinstance(node, dict):
+        if "expression" in node:
+            return str(node["expression"])
+        return _rich_inline_text(node.get("text", ""))
+    return ""
+
+
+def _rich_block_lines(blocks: Any) -> list[str]:
+    """The plain-text lines of a list of rich message blocks."""
+    lines: list[str] = []
+    for block in blocks if isinstance(blocks, list) else ():
+        if not isinstance(block, dict):
+            continue
+        if "summary" in block:
+            lines.append(_rich_inline_text(block["summary"]))
+        if "text" in block or "expression" in block:
+            lines.append(_rich_inline_text(block))
+        for row in block.get("cells") or ():
+            if isinstance(row, list):
+                lines.append(" | ".join(_rich_inline_text(cell) for cell in row))
+        for item in block.get("items") or ():
+            if isinstance(item, dict):
+                lines.extend(_rich_block_lines(item.get("blocks")))
+        lines.extend(_rich_block_lines(block.get("blocks")))
+    return [line for line in lines if line]
+
+
+def _rich_plain_text(message: Any) -> str:
+    """The text of a rich message, or ``""`` for any other message.
+
+    A rich message carries no ``text``: python-telegram-bot keeps the parsed
+    blocks under ``api_kwargs["rich_message"]``, as a field it does not know.
+    """
+    extra = getattr(message, "api_kwargs", None)
+    rich = extra.get("rich_message") if isinstance(extra, Mapping) else None
+    if not isinstance(rich, Mapping):
+        return ""
+    return "\n".join(_rich_block_lines(rich.get("blocks")))
+
+
 def _format_forward_context(message: Any) -> str:
     """Extract forward origin info from a Telegram message.
 
@@ -197,6 +652,25 @@ def _format_forward_context(message: Any) -> str:
     return "[Forwarded message]"
 
 
+def _reply_of(message: Any) -> Any:
+    """The message that *message* replies to, or ``None``.
+
+    In a topic, Telegram sets ``reply_to_message`` on every message to the
+    service message that created the topic (its id is the thread id),
+    whether or not the user replied to anything. That is not a reply.
+    """
+    reply = getattr(message, "reply_to_message", None)
+    if reply is None:
+        return None
+    if getattr(message, "is_topic_message", None) is True and (
+        getattr(reply, "forum_topic_created", None) is not None
+        or getattr(reply, "message_id", None)
+        == getattr(message, "message_thread_id", None)
+    ):
+        return None
+    return reply
+
+
 def _format_reply_context(message: Any) -> str:
     """Extract reply-to context and quote from a Telegram message.
 
@@ -206,7 +680,7 @@ def _format_reply_context(message: Any) -> str:
 
     Returns empty string if the message is not a reply.
     """
-    reply = getattr(message, "reply_to_message", None)
+    reply = _reply_of(message)
     if not reply:
         return ""
 
@@ -222,7 +696,11 @@ def _format_reply_context(message: Any) -> str:
         sender = "user"
 
     # Original message text
-    original = getattr(reply, "text", None) or getattr(reply, "caption", None) or ""
+    original = (
+        getattr(reply, "text", None)
+        or getattr(reply, "caption", None)
+        or _rich_plain_text(reply)
+    )
     if original:
         display = original if len(original) <= 500 else original[:500] + "…"
         parts.append(f'[Reply to {sender}: "{display}"]')
@@ -280,8 +758,13 @@ def build_sessions_view(
     offset: int = 0,
     has_prev: bool = False,
     has_next: bool = False,
+    topic_buttons: bool = False,
 ) -> "tuple[str, InlineKeyboardMarkup]":
     """Render the /sessions inline keyboard (pure, sync — unit-testable).
+
+    With ``topic_buttons`` (the list was asked for in a chat with topics,
+    outside any topic) each row also offers ``↗ Topic`` (``sesstopic:<id>``),
+    which opens that session in a topic of its own.
 
     One tap-to-switch button per session (the current one marked ✓), with the
     session id carried in ``callback_data`` as ``sess:<id>`` — so switching
@@ -300,9 +783,11 @@ def build_sessions_view(
         # ids are short, but guard defensively so a button always round-trips.
         if sid is None or len(cb.encode("utf-8")) > 64:
             continue
-        rows.append(
-            [InlineKeyboardButton(_session_label(s, current_id), callback_data=cb)]
-        )
+        row = [InlineKeyboardButton(_session_label(s, current_id), callback_data=cb)]
+        topic_cb = f"sesstopic:{sid}"
+        if topic_buttons and len(topic_cb.encode("utf-8")) <= 64:
+            row.append(InlineKeyboardButton("↗ Topic", callback_data=topic_cb))
+        rows.append(row)
     shown = len(rows)
 
     # Pager row — only the arrows that lead somewhere, so no tap is a dead end.
@@ -345,6 +830,8 @@ def build_sessions_view(
         if offset or has_next:
             text += f"\nPage {offset // _SESSIONS_PAGE_SIZE + 1}"
         text += "\n➕ New session keeps the current one running."
+        if topic_buttons:
+            text += "\n↗ Topic opens a session in a topic of its own."
         text += "\n⭐ = kept alive (never auto-closed); /star or /unstar the current session."
     elif has_prev:
         text = "No more sessions — tap ⬅️ Prev to go back."
@@ -524,6 +1011,33 @@ _PLAN_STATUS_EMOJI = {
     "superseded": "🗂",
     "failed": "⚠️",
 }
+
+
+def build_session_transcript(
+    session: dict, messages: list[dict], tzname: str | None,
+) -> str:
+    """The session's conversation as one Markdown document (oldest first).
+
+    Telegram cannot move messages into a topic, so a session opened in a new
+    topic offers this instead of replaying its history message by message.
+    """
+    tz = _safe_zone(tzname)
+    sid = session.get("id") or ""
+    lines = [f"# {session.get('title') or sid}", "", f"Session `{sid}`", ""]
+    for m in messages:
+        who = {"user": "You", "assistant": "Assistant"}.get(m.get("role") or "")
+        content = (m.get("content") or "").strip()
+        if not who or not content:
+            continue
+        day, hm = _fmt_local(m.get("created_at") or "", tz)
+        lines += [f"## {who} · {day} {hm}", "", content, ""]
+    return "\n".join(lines)
+
+
+def _transcript_filename(session: dict) -> str:
+    """``<title>.md``, safe on any file system; the id when there is no title."""
+    stem = re.sub(r"[^\w.-]+", "-", session.get("title") or "").strip("-.")
+    return f"{stem[:60] or session.get('id') or 'session'}.md"
 
 
 def _tg_len(text: str) -> int:
@@ -737,11 +1251,29 @@ class TelegramChannel(BaseChannel):
         # Media group (album) collection: group_id -> list of updates
         self._media_groups: dict[str, list[Update]] = {}
         self._media_group_tasks: dict[str, asyncio.Task] = {}
-        # Message cache for reaction context: message_id -> (chat_id, text_snippet)
-        self._message_cache: collections.OrderedDict[int, tuple[int, str]] = (
+        # Message cache for reaction context:
+        # (chat_id, message_id) -> (thread_id, text_snippet). A reaction update
+        # carries no topic, so the topic a reaction belongs to comes from here.
+        self._message_cache: collections.OrderedDict[
+            tuple[int, int], tuple[int | None, str]
+        ] = collections.OrderedDict()
+        self._message_cache_max = 200
+        # First-message binding of a topic to its session: channel_key -> lock.
+        # Updates run concurrently, so two quick messages in a new topic would
+        # otherwise each create a session.
+        self._topic_locks: dict[str, asyncio.Lock] = {}
+        # Opening a session's topic in a chat: "<chat>:<session>" -> lock, so
+        # two calls at once (a retried request, a tap and a call) open one.
+        self._open_topic_locks: dict[str, asyncio.Lock] = {}
+        # Topics for sessions that never asked for one (telegram.topics.auto).
+        self._auto_topics = AutoTopics(self)
+        # Streaming edit budget per chat: chat_id -> monotonic ts of last edit
+        self._last_chat_edit: collections.OrderedDict[int, float] = (
             collections.OrderedDict()
         )
-        self._message_cache_max = 200
+        # Set when the Bot API server has no sendRichMessage (an older
+        # self-hosted one): answers go out as HTML until restart.
+        self._rich_unavailable = False
         # Rate limiter for replies to unauthorized users: user_id -> monotonic ts
         self._unauth_reply_times: dict[int, float] = {}
         # /plans revise flow: (chat_id, prompt_message_id) ->
@@ -881,6 +1413,12 @@ class TelegramChannel(BaseChannel):
             "reply", self._source_routed_command(self._handle_reply),
         ))
         app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+        app.add_handler(MessageHandler(
+            filters.StatusUpdate.FORUM_TOPIC_CREATED
+            | filters.StatusUpdate.FORUM_TOPIC_EDITED
+            | filters.StatusUpdate.FORUM_TOPIC_CLOSED,
+            self._handle_topic_service,
+        ))
         app.add_handler(MessageHandler(
             filters.TEXT | filters.PHOTO | filters.COMMAND | filters.Sticker.ALL | filters.Document.ALL,
             self._handle_message,
@@ -1119,34 +1657,156 @@ class TelegramChannel(BaseChannel):
     # ------------------------------------------------------------------ #
 
     async def send(self, message: OutboundMessage) -> None:
-        """Send a message to a Telegram chat."""
+        """Send a message to a Telegram chat, or to a topic in it.
+
+        With ``telegram.rich_messages`` on, the text goes out as rich
+        messages of up to 32,768 characters, and a part Telegram refuses is
+        sent as HTML instead. Otherwise it goes out as HTML messages of up to
+        4,096 characters. Either way a long text is cut between blocks.
+        """
         if self._app is None:
             return
-        chat_id = int(message.target)
-        text = message.text
-        # Split long messages
-        for i in range(0, len(text), MAX_MSG_LEN):
-            chunk = text[i:i + MAX_MSG_LEN]
-            html_chunk = _md_to_tg_html(chunk)
-            try:
-                sent = await self._app.bot.send_message(
-                    chat_id=chat_id,
-                    text=html_chunk,
-                    parse_mode=ParseMode.HTML,
-                )
-            except Exception:
-                sent = await self._app.bot.send_message(
-                    chat_id=chat_id,
-                    text=chunk,
-                )
-            self._cache_message(sent.message_id, chat_id, chunk)
-            await self._record_reply_route(sent.message_id, chat_id, message.session_id)
+        chat_id, thread_id = parse_target(message.target)
+        session_id = message.session_id
+        if not self._rich_on():
+            await self._send_html(chat_id, thread_id, message.text, session_id)
+            return
+        for part in _split_markdown(message.text, RICH_MSG_LEN, _RICH_MAX_BLOCKS):
+            sent = await self._send_rich(chat_id, thread_id, part)
+            if sent is None:
+                await self._send_html(chat_id, thread_id, part, session_id)
+            else:
+                self._cache_message(sent.message_id, chat_id, part, thread_id)
+                await self._record_reply_route(sent.message_id, chat_id, session_id)
+
+    @staticmethod
+    async def _with_retry(send: Callable[[], Awaitable[Any]]) -> Any:
+        """Run *send*, and once more after Telegram's advised wait if it is rate limited.
+
+        Topics put several sessions in one chat, and they share its rate
+        limit. A final answer is worth one wait, rather than leaving the
+        half-streamed placeholder.
+        """
+        try:
+            return await send()
+        except RetryAfter as exc:
+            wait = _retry_after_seconds(exc)
+            if wait > _SEND_RETRY_MAX_WAIT:
+                raise
+            await asyncio.sleep(wait)
+            return await send()
+
+    async def _send_html(
+        self, chat_id: int, thread_id: int | None, text: str,
+        session_id: str | None = None,
+    ) -> None:
+        """Send Markdown *text* as HTML messages of up to 4,096 characters, cut between blocks.
+
+        Each message records a reply route to *session_id* (see ``_record_reply_route``).
+        """
+        for chunk in _split_markdown(text, MAX_MSG_LEN):
+            sent = await self._with_retry(
+                functools.partial(self._send_chunk, chat_id, thread_id, chunk),
+            )
+            self._cache_message(sent.message_id, chat_id, chunk, thread_id)
+            await self._record_reply_route(sent.message_id, chat_id, session_id)
+
+    def _rich_on(self) -> bool:
+        """Whether text goes out as rich messages (Bot API 10.1)."""
+        return self.config.telegram.rich_messages and not self._rich_unavailable
+
+    async def _send_rich(
+        self, chat_id: int, thread_id: int | None, text: str,
+        *, silent: bool = False, link_preview: Any = None,
+    ) -> Any | None:
+        """Send Markdown *text* as one rich message; ``None`` means send it as HTML.
+
+        ``None`` when rich messages are off, the text is empty or over the
+        limit, or Telegram refuses it. A Bot API server without
+        ``sendRichMessage`` (an older self-hosted one) turns them off until
+        restart. A rate limit that outlasts one wait is raised: the HTML
+        path would hit it too.
+        """
+        if not self._rich_on() or not text.strip() or len(text) > RICH_MSG_LEN:
+            return None
+        params: dict[str, Any] = {
+            "chat_id": chat_id,
+            "rich_message": {"markdown": _rich_markdown(text)},
+            **_in_thread(thread_id),
+        }
+        if silent:
+            params["disable_notification"] = True
+        if link_preview is not None:
+            # A notification's choice (NotificationService._telegram_link_preview).
+            params["link_preview_options"] = link_preview.to_dict()
+        try:
+            return await self._with_retry(functools.partial(
+                self._app.bot.do_api_request,
+                "sendRichMessage",
+                api_kwargs=params,
+                return_type=Message,
+                read_timeout=_RICH_TIMEOUT,
+                write_timeout=_RICH_TIMEOUT,
+            ))
+        except RetryAfter:
+            raise
+        except EndPointNotFound as exc:
+            self._rich_unavailable = True
+            logger.warning(
+                "The Bot API server has no sendRichMessage (%s); "
+                "sending HTML until restart", exc,
+            )
+        except Exception as exc:
+            logger.info(
+                "Telegram refused a rich message in chat %s, sending HTML: %s",
+                chat_id, exc,
+            )
+        return None
+
+    async def send_rich_notification(
+        self, chat_id: int, thread_id: int | None, text: str,
+        *, silent: bool = False, link_preview: Any = None,
+    ) -> Any | None:
+        """A notification as one rich message; ``None`` means send it as HTML.
+
+        Only for a card that nothing edits later. Buttons, the "Open plan"
+        view and the expiry note all edit the card's text, and a rich
+        message has none.
+        """
+        if self._app is None:
+            return None
+        try:
+            return await self._send_rich(
+                chat_id, thread_id, text, silent=silent, link_preview=link_preview,
+            )
+        except RetryAfter:
+            return None  # the HTML path waits it out or fails, as before
+
+    async def _send_chunk(
+        self, chat_id: int, thread_id: int | None, chunk: str,
+    ) -> Any:
+        """Send one chunk as HTML, or as plain text if Telegram rejects the HTML."""
+        try:
+            return await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=_md_to_tg_html(chunk),
+                parse_mode=ParseMode.HTML,
+                **_in_thread(thread_id),
+            )
+        except RetryAfter:
+            raise
+        except Exception:
+            return await self._app.bot.send_message(
+                chat_id=chat_id,
+                text=chunk,
+                **_in_thread(thread_id),
+            )
 
     def format_response(self, text: str) -> str:
         """Return text unchanged.
 
         Long messages must NOT be truncated here: send() already splits text into
-        MAX_MSG_LEN-sized chunks and delivers them as sequential messages. Truncating
+        parts that fit and delivers them as sequential messages. Truncating
         first (the old behaviour) defeated that chunking and dropped the tail of long
         replies with a "... (truncated)" marker.
         """
@@ -1160,9 +1820,28 @@ class TelegramChannel(BaseChannel):
         """Send a placeholder message for streaming. Returns message_id."""
         if self._app is None:
             return None
-        chat_id = int(target)
-        msg = await self._app.bot.send_message(chat_id=chat_id, text="⏳")
+        chat_id, thread_id = parse_target(target)
+        msg = await self._app.bot.send_message(
+            chat_id=chat_id, text="⏳", **_in_thread(thread_id),
+        )
         return str(msg.message_id)
+
+    def _claim_chat_edit(self, chat_id: int) -> bool:
+        """Whether a droppable streaming edit may go out for this chat now.
+
+        Telegram rate limits a chat, not a topic. With topics, several
+        sessions can stream into one chat at once, each adapter editing at
+        its own interval, and together they would exceed the limit. A 429
+        costs more than a dropped edit: the next token brings another.
+        """
+        now = time.monotonic()
+        if now - self._last_chat_edit.get(chat_id, 0.0) < EDIT_INTERVAL:
+            return False
+        self._last_chat_edit[chat_id] = now
+        self._last_chat_edit.move_to_end(chat_id)
+        while len(self._last_chat_edit) > _EDIT_CLOCK_MAX:
+            self._last_chat_edit.popitem(last=False)
+        return True
 
     async def edit_message(
         self, target: str, message_id: str, text: str,
@@ -1170,13 +1849,14 @@ class TelegramChannel(BaseChannel):
     ) -> None:
         """Edit a previously sent message (for streaming updates).
 
-        Telegram limits edits per chat and one chat is one session here, so
-        the caller's per-adapter interval already covers it and ``throttle``
-        needs no extra shedding.
+        ``throttle`` marks an edit that can be dropped. Those share one
+        budget per chat (see :meth:`_claim_chat_edit`).
         """
         if self._app is None:
             return
-        chat_id = int(target)
+        chat_id, thread_id = parse_target(target)
+        if throttle and not self._claim_chat_edit(chat_id):
+            return
         html_text = _md_to_tg_html(text)
         try:
             await self._app.bot.edit_message_text(
@@ -1200,15 +1880,16 @@ class TelegramChannel(BaseChannel):
             except Exception:
                 pass
         # Update cache with the latest text (streaming overwrites placeholder)
-        self._cache_message(int(message_id), int(target), text)
+        self._cache_message(int(message_id), chat_id, text, thread_id)
 
     async def delete_message(self, target: str, message_id: str) -> None:
         """Delete a previously sent message."""
         if self._app is None:
             return
+        chat_id, _ = parse_target(target)
         try:
             await self._app.bot.delete_message(
-                chat_id=int(target), message_id=int(message_id),
+                chat_id=chat_id, message_id=int(message_id),
             )
         except Exception as exc:
             logger.warning("delete_message failed: %s", exc)
@@ -1217,9 +1898,11 @@ class TelegramChannel(BaseChannel):
         """Show typing indicator."""
         if self._app is None:
             return
+        chat_id, thread_id = parse_target(target)
         await self._app.bot.send_chat_action(
-            chat_id=int(target),
+            chat_id=chat_id,
             action=ChatAction.TYPING,
+            **_in_thread(thread_id),
         )
 
     # ------------------------------------------------------------------ #
@@ -1230,8 +1913,9 @@ class TelegramChannel(BaseChannel):
         """Set an emoji reaction on a Telegram message."""
         if self._app is None:
             return
+        chat_id, _ = parse_target(target)
         await self._app.bot.set_message_reaction(
-            chat_id=int(target),
+            chat_id=chat_id,
             message_id=message_id,
             reaction=[emoji],
         )
@@ -1244,9 +1928,11 @@ class TelegramChannel(BaseChannel):
         """Send a sticker to a Telegram chat by file_id."""
         if self._app is None:
             return
+        chat_id, thread_id = parse_target(target)
         await self._app.bot.send_sticker(
-            chat_id=int(target),
+            chat_id=chat_id,
             sticker=sticker,
+            **_in_thread(thread_id),
         )
 
     # ------------------------------------------------------------------ #
@@ -1269,11 +1955,12 @@ class TelegramChannel(BaseChannel):
         if not path.is_file():
             return False
         try:
-            chat_id = int(target)
+            chat_id, thread_id = parse_target(target)
             sent = await self._app.bot.send_document(
                 chat_id=chat_id,
                 document=path,
                 filename=path.name,
+                **_in_thread(thread_id),
             )
             if session_id and sent is not None:
                 await self._record_reply_route(sent.message_id, chat_id, session_id)
@@ -1286,14 +1973,23 @@ class TelegramChannel(BaseChannel):
     #  Message cache (for reaction context)                                #
     # ------------------------------------------------------------------ #
 
-    def _cache_message(self, message_id: int, chat_id: int, text: str) -> None:
-        """Store a message snippet in the LRU cache for reaction lookups."""
+    def _cache_message(
+        self, message_id: int, chat_id: int, text: str,
+        thread_id: int | None = None,
+    ) -> None:
+        """Store a message snippet in the LRU cache for reaction lookups.
+
+        Message ids are unique within a chat only, so the key carries the
+        chat. The topic rides in the value: a reaction update does not say
+        which topic its message is in.
+        """
         snippet = text[:200] if text else ""
         if not snippet:
             return
-        self._message_cache[message_id] = (chat_id, snippet)
+        key = (int(chat_id), int(message_id))
+        self._message_cache[key] = (thread_id, snippet)
         # Move to end (most recent) and evict oldest if over limit
-        self._message_cache.move_to_end(message_id)
+        self._message_cache.move_to_end(key)
         while len(self._message_cache) > self._message_cache_max:
             self._message_cache.popitem(last=False)
 
@@ -1413,6 +2109,518 @@ class TelegramChannel(BaseChannel):
         if routed_session:
             return routed_session
         return await self.router.get_active_session(channel_key, source="telegram")
+
+    # ------------------------------------------------------------------ #
+    #  Topics: one forum topic is one session                              #
+    # ------------------------------------------------------------------ #
+
+    def _topics_enabled(self) -> bool:
+        return self.config.telegram.topics.enabled
+
+    def _topic_of(self, message: Any) -> int | None:
+        """The topic a message was posted in, or ``None`` for the chat itself.
+
+        Only ``is_topic_message`` marks a topic. In a plain group a reply
+        carries ``message_thread_id`` too (the id of the message it replies
+        to), and reading that as a topic would split the group into a
+        session per reply chain. The General topic is the chat itself. With
+        ``telegram.topics.enabled`` off, every message belongs to the chat.
+        """
+        if message is None or getattr(message, "is_topic_message", None) is not True:
+            return None
+        thread_id = getattr(message, "message_thread_id", None)
+        if type(thread_id) is not int or thread_id == GENERAL_TOPIC_ID:
+            return None
+        return thread_id if self._topics_enabled() else None
+
+    @staticmethod
+    def _raw_topic(message: Any) -> int | None:
+        """The topic *message* sits in, whatever ``telegram.topics`` says.
+
+        Where a card or command physically is: notification deliveries are
+        recorded with the target they went to, and a sink topic is one-way
+        even with topics-as-sessions switched off.
+        """
+        thread_id = getattr(message, "message_thread_id", None)
+        if (
+            getattr(message, "is_topic_message", None) is not True
+            or type(thread_id) is not int
+            or thread_id == GENERAL_TOPIC_ID
+        ):
+            return None
+        return thread_id
+
+    def _answer_target(self, chat_id: int, message: Any) -> str:
+        """The delivery target that an answer typed or tapped in *message* matches."""
+        return format_target(chat_id, self._raw_topic(message))
+
+    def _address_of(self, chat_id: int, message: Any) -> _Address:
+        """The address of *message*, posted in the chat *chat_id*."""
+        return _Address(chat_id, self._topic_of(message))
+
+    def _address(self, update: Update) -> _Address:
+        """The chat and topic that a message or command update came from."""
+        return self._address_of(update.effective_chat.id, update.message)
+
+    def _bot_has_dm_topics(self) -> bool:
+        """Whether BotFather has topics on for the bot's private chats.
+
+        Read from the ``getMe`` result cached at start-up, so a change in
+        BotFather needs a restart to show here.
+        """
+        try:
+            return self._app.bot.bot.has_topics_enabled is True
+        except Exception:  # noqa: BLE001 — no application, or getMe not run yet
+            return False
+
+    def _chat_may_have_topics(self, chat: Any) -> bool:
+        """Whether a message in *chat* can sit in a topic: a forum, or a DM with topics on."""
+        if getattr(chat, "is_forum", None) is True:
+            capable = True
+        elif getattr(chat, "type", None) == "private":
+            capable = self._bot_has_dm_topics()
+        else:
+            return False
+        return capable and self._topics_enabled()
+
+    async def _session_for(
+        self, address: _Address, message: Any = None,
+    ) -> str | None:
+        """The session a topic is bound to, binding a new one on first use.
+
+        ``None`` for the chat itself: the router picks that session as it
+        always has, idle rollover included. A topic never rolls over. It
+        stays bound until ``/new``, ``/session`` or ``/sessions`` rebinds it,
+        or its session is archived. A new session takes the topic's name when
+        *message* shows it.
+        """
+        if address.thread_id is None:
+            return None
+        return await self._bind_topic(address, title=self._topic_title_of(message))
+
+    async def _bind_topic(self, topic: _Address, title: str | None = None) -> str:
+        """The session bound to *topic*, or a new one titled *title*, bound now."""
+        key = topic.channel_key
+        lock = self._topic_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            session_id = await self.router.get_last_session(key)
+            if session_id is None:
+                session_id = await self.router.create_session(
+                    key, title=title, source="telegram",
+                )
+                logger.info("Telegram topic %s bound to new session %s", key, session_id)
+            return session_id
+
+    def _bot_id(self) -> int | None:
+        try:
+            return self._app.bot.id
+        except Exception:  # noqa: BLE001 — no application, or getMe not run yet
+            return None
+
+    def _topic_title_of(self, message: Any) -> str | None:
+        """The name a person gave the topic *message* is in, if Telegram shows it.
+
+        Every message in a topic carries the topic's creation message as its
+        ``reply_to_message``. A topic the bot opened is skipped: its name is a
+        placeholder or the session's own title already.
+        """
+        root = getattr(message, "reply_to_message", None)
+        created = getattr(root, "forum_topic_created", None)
+        if created is None:
+            return None
+        author = getattr(root, "from_user", None)
+        if author is not None and author.id == self._bot_id():
+            return None
+        return getattr(created, "name", None) or None
+
+    def _creates_topics(self, chat: Any) -> bool:
+        """Whether a new session started in *chat* gets a topic of its own."""
+        return (
+            self.config.telegram.topics.new_session_creates_topic
+            and self._chat_may_have_topics(chat)
+        )
+
+    async def _open_topic(self, chat_id: int, name: str | None) -> tuple[int | None, str]:
+        """Create a topic; ``(thread_id, "")``, or ``(None, why Telegram refused)``.
+
+        A rate limit is raised instead, for a caller that can wait it out.
+        """
+        try:
+            topic = await self._app.bot.create_forum_topic(
+                chat_id=chat_id, name=_topic_name(name),
+            )
+        except RetryAfter:
+            raise
+        except Exception as exc:
+            logger.info("Telegram refused a topic in chat %s: %s", chat_id, exc)
+            return None, str(exc) or type(exc).__name__
+        return topic.message_thread_id, ""
+
+    async def _start_in_new_topic(
+        self, chat_id: int, title: str | None,
+    ) -> tuple[_Address | None, str | None, str]:
+        """Open a topic for a new session: ``(topic, session_id, "")``, or
+        ``(None, None, why not)``.
+
+        The chat's own session is left alone: the new session lives in the topic.
+        """
+        try:
+            thread_id, error = await self._open_topic(chat_id, title)
+        except RetryAfter as exc:  # the session starts in the chat instead
+            thread_id, error = None, str(exc)
+        if thread_id is None:
+            return None, None, error
+        topic = _Address(chat_id, thread_id)
+        session_id = await self._bind_topic(topic, title=title)
+        welcome = f"New session: {session_id}" + (f" — {title}" if title else "")
+        try:
+            await self._app.bot.send_message(
+                chat_id=chat_id, text=welcome, message_thread_id=thread_id,
+            )
+        except Exception as exc:  # the topic and its session exist either way
+            logger.info("Could not greet %s: %s", topic.channel_key, exc)
+        return topic, session_id, ""
+
+    async def _post_session_card(self, topic: _Address, session: dict) -> bool:
+        """Post the session's catch-up card into *topic*; False if Telegram refuses.
+
+        Telegram cannot move history into a topic, so the card shows the last
+        messages and offers the whole conversation as a document. A rate
+        limit is raised, since it says nothing about whether the topic exists.
+        """
+        sid = session["id"]
+        messages = await self.router.get_session_messages(sid, limit=_TAIL_WINDOW)
+        total = await self.router.count_session_messages(sid)
+        text, markup = build_session_tail_view(
+            session, messages, total, _TAIL_WINDOW, self.config.timezone,
+        )
+        rows = [list(row) for row in markup.inline_keyboard]
+        if total:
+            rows.append([InlineKeyboardButton(
+                "📄 Send transcript", callback_data=f"sesstx:{sid}",
+            )])
+        try:
+            await self._app.bot.send_message(
+                chat_id=topic.chat_id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(rows),
+                **_in_thread(topic.thread_id),
+            )
+        except RetryAfter:
+            raise
+        except Exception as exc:
+            logger.info("Could not post into %s: %s", topic.channel_key, exc)
+            return False
+        return True
+
+    def _home_chat(self) -> int | None:
+        """The chat a session gets its topic in when no chat is named.
+
+        The notification chat, else the first allowed user's DM: the chat
+        the notification service delivers to (``_resolve_telegram_chat_id``).
+        """
+        chat_id = self.config.notifications.telegram_chat_id
+        if chat_id:
+            return int(chat_id)
+        allowed = self.config.telegram.allowed_users
+        return int(allowed[0]) if allowed else None
+
+    async def open_session_topic(
+        self, session_id: str, title: str | None = None, chat_id: int | None = None,
+    ) -> SessionTopic:
+        """Show a session in a topic of its own, opening one if it has none there.
+
+        The ``↗ Topic`` button, ``POST /api/sessions/{id}/telegram-topic`` and
+        the ``session_open_topic`` tool all come here. The chat is *chat_id*,
+        else :meth:`_home_chat`, so a session that never touched Telegram (a
+        web one, or one an API call started) gets a topic too. A new topic is
+        named *title*, else after the session, and starts with the session's
+        catch-up card.
+
+        Idempotent per chat: a session that has a topic there already gets
+        its card posted in it again, and a topic that was deleted is
+        replaced. A chat that was itself on the session lets go of it, and
+        its next message starts a new session, so one session never has two
+        windows in the same chat.
+        """
+        if self._app is None:
+            return SessionTopic(None, error="Telegram is not running")
+        if not self._topics_enabled():
+            return SessionTopic(None, error="Telegram topics are off (telegram.topics.enabled)")
+        chat = chat_id if chat_id is not None else self._home_chat()
+        if chat is None:
+            return SessionTopic(None, error=(
+                "No chat to open a topic in: set notifications.telegram_chat_id "
+                "or telegram.allowed_users"
+            ))
+        session = await self.router.get_session(session_id)
+        if not session or session.get("status") == "archived":
+            return SessionTopic(None, error="That session is no longer available")
+        if session.get("source") == "external":
+            # An MCP client's own session: Nerve runs no turns there, so
+            # nothing could answer a message in its topic.
+            return SessionTopic(None, error="An external client's session cannot live in a topic")
+        lock = self._open_topic_locks.setdefault(f"{chat}:{session_id}", asyncio.Lock())
+        try:
+            async with lock:
+                return await self._show_in_topic(chat, session, title)
+        except RetryAfter as exc:
+            wait = _retry_after_seconds(exc)
+            return SessionTopic(
+                None, error=f"Telegram is rate limiting this chat; retry in {wait:.0f} s",
+                retry_after=wait,
+            )
+
+    async def _show_in_topic(
+        self, chat_id: int, session: dict, title: str | None,
+    ) -> SessionTopic:
+        """:meth:`open_session_topic` once its checks pass; a rate limit is raised."""
+        session_id = session["id"]
+        for key in await self.router.channel_keys_for_session(session_id):
+            topic = _address_of_key(key)
+            if topic is None or topic.chat_id != chat_id or topic.thread_id is None:
+                continue
+            if await self._post_session_card(topic, session):
+                return SessionTopic(key)
+            await self.router.forget_channel(key)  # the topic is gone
+        thread_id, error = await self._open_topic(
+            chat_id, title or session.get("title") or f"Session {session_id}",
+        )
+        if thread_id is None:
+            return SessionTopic(None, error=f"Couldn't open a topic: {error}")
+        topic = _Address(chat_id, thread_id)
+        await self.router.switch_session(topic.channel_key, session_id)
+        root_key = _Address(chat_id).channel_key
+        if await self.router.get_last_session(root_key) == session_id:
+            await self.router.forget_channel(root_key)
+        try:
+            await self._post_session_card(topic, session)
+        except RetryAfter:  # the topic is open and bound; only its card is missing
+            logger.info("Rate limited: %s opened without its card", topic.channel_key)
+        return SessionTopic(topic.channel_key, opened=True)
+
+    async def _open_in_topic(self, query: Any, session_id: str) -> None:
+        """The ``↗ Topic`` button: :meth:`open_session_topic` in the chat it was tapped in."""
+        result = await self.open_session_topic(session_id, chat_id=query.message.chat.id)
+        if result.channel_key is None:
+            await query.answer(_fit_text(result.error, _TOAST_MAX_LEN), show_alert=True)
+        elif result.opened:
+            await query.answer("Opened in a new topic")
+        else:
+            await query.answer("It is open in a topic already. Posted it there.")
+
+    async def close_session_topic(
+        self, session_id: str, note: str | None = None,
+    ) -> tuple[list[ClosedTopic], str]:
+        """Let go of a session's topics: post *note* in each, unbind it, close it.
+
+        For ``DELETE /api/sessions/{id}/telegram-topic`` and the
+        ``session_close_topic`` tool. The session itself goes on: it is not
+        stopped or archived. Each topic is unbound before it is closed, so
+        the ``forum_topic_closed`` update that may follow finds no session
+        to stop. A topic closed already counts as closed, and one deleted
+        already is only unbound.
+
+        Telegram closes topics in forums only. In a private chat the topic
+        stays open and unbound, and a message in it starts a new session.
+
+        Returns the topics let go of, and what went wrong with the others
+        (``""`` if nothing): a note that did not post, or a close Telegram
+        refused. Such a topic keeps its session.
+        """
+        if self._app is None:
+            return [], "Telegram is not running"
+        done: list[ClosedTopic] = []
+        errors: list[str] = []
+        for key in await self.router.channel_keys_for_session(session_id):
+            topic = _address_of_key(key)
+            if topic is None or topic.thread_id is None:
+                continue  # the chat itself, or another channel
+            # The binding lock: a message arriving meanwhile waits rather
+            # than binding the topic to a new session.
+            async with self._topic_locks.setdefault(key, asyncio.Lock()):
+                outcome, error = await self._close_topic(topic, session_id, note)
+            if error:
+                errors.append(error)
+            else:
+                done.append(ClosedTopic(key, outcome))
+        return done, "; ".join(errors)
+
+    async def _close_topic(
+        self, topic: _Address, session_id: str, note: str | None,
+    ) -> tuple[str, str]:
+        """Post *note* in *topic*, unbind it, close it: ``(outcome, "")`` or ``("", why not)``."""
+        key = topic.channel_key
+        if note and note.strip():
+            try:
+                await self.send(OutboundMessage(
+                    target=topic.target, text=note, session_id=session_id,
+                ))
+            except Exception as exc:
+                if not _error_says(exc, _TOPIC_GONE_ERRORS):
+                    return "", f"Couldn't post the note in {key}: {exc}"
+                await self.router.forget_channel(key)
+                return "gone", ""
+        await self.router.forget_channel(key)
+        if topic.chat_id > 0:  # a private chat: Telegram has no closing there
+            return "left_open", ""
+        try:
+            await self._app.bot.close_forum_topic(
+                chat_id=topic.chat_id, message_thread_id=topic.thread_id,
+            )
+        except Exception as exc:
+            if _error_says(exc, _TOPIC_UNCHANGED_ERRORS):
+                return "closed", ""
+            if _error_says(exc, _TOPIC_GONE_ERRORS):
+                return "gone", ""
+            await self.router.switch_session(key, session_id)  # still open: keep it
+            return "", f"Couldn't close {key}: {exc}"
+        return "closed", ""
+
+    @property
+    def is_running(self) -> bool:
+        """Whether the bot is up (``start`` ran and ``stop`` has not)."""
+        return self._app is not None and not self._stopping
+
+    async def post_in_topic(self, channel_key: str, session_id: str, text: str) -> bool:
+        """Post *text* (markdown) in the topic of *channel_key*; False if it did not go.
+
+        A topic found deleted is unbound from the session.
+        """
+        topic = _address_of_key(channel_key)
+        if self._app is None or topic is None or topic.thread_id is None:
+            return False
+        try:
+            await self.send(OutboundMessage(
+                target=topic.target, text=self.format_response(text), session_id=session_id,
+            ))
+        except Exception as exc:
+            if _error_says(exc, _TOPIC_GONE_ERRORS):
+                await self.router.forget_channel(channel_key)
+            else:
+                logger.warning("Could not post in %s: %s", channel_key, exc)
+            return False
+        return True
+
+    async def let_go_of_topic(
+        self, channel_key: str, session_id: str, note: str | None,
+        *, delete_in_private: bool = False,
+    ) -> tuple[str, str]:
+        """Let go of one topic of a session: ``(outcome, "")`` or ``("", why not)``.
+
+        What :meth:`close_session_topic` does for each topic, for a single
+        one: note, unbind, close. With *delete_in_private*, a topic in a
+        private chat (where Telegram cannot close one) is deleted instead,
+        messages and all, and the note is skipped.
+        """
+        topic = _address_of_key(channel_key)
+        if self._app is None:
+            return "", "Telegram is not running"
+        if topic is None or topic.thread_id is None:
+            return "", f"{channel_key} is not a topic"
+        async with self._topic_locks.setdefault(channel_key, asyncio.Lock()):
+            if delete_in_private and topic.chat_id > 0:
+                await self.router.forget_channel(channel_key)
+                try:
+                    await self._app.bot.delete_forum_topic(
+                        chat_id=topic.chat_id, message_thread_id=topic.thread_id,
+                    )
+                except Exception as exc:
+                    if _error_says(exc, _TOPIC_GONE_ERRORS):
+                        return "gone", ""
+                    await self.router.switch_session(channel_key, session_id)
+                    return "", f"Couldn't delete {channel_key}: {exc}"
+                return "deleted", ""
+            return await self._close_topic(topic, session_id, note)
+
+    def on_turn_started(self, event: TurnStarted) -> None:
+        self._auto_topics.turn_started(event)
+
+    def on_turn_finished(self, event: TurnFinished) -> None:
+        self._auto_topics.turn_finished(event)
+
+    async def on_session_ending(self, session_id: str, reason: str) -> None:
+        await self._auto_topics.session_ending(session_id, reason)
+
+    async def _send_transcript(self, query: Any, session_id: str) -> None:
+        """The ``📄 Send transcript`` button: the whole conversation as a ``.md`` file."""
+        session = await self.router.get_session(session_id)
+        if not session:
+            await query.answer("That session is no longer available", show_alert=True)
+            return
+        messages = await self.router.get_session_messages(
+            session_id, limit=_TRANSCRIPT_MAX_MESSAGES,
+        )
+        document = build_session_transcript(session, messages, self.config.timezone)
+        address = self._address_of(query.message.chat.id, query.message)
+        await query.answer("Sending the transcript")
+        try:
+            await self._app.bot.send_document(
+                chat_id=address.chat_id,
+                document=document.encode("utf-8"),
+                filename=_transcript_filename(session),
+                **_in_thread(address.thread_id),
+            )
+        except Exception as exc:
+            logger.warning("Could not send the transcript of %s: %s", session_id, exc)
+
+    async def _handle_topic_service(self, update: Update, context: Any) -> None:
+        """Keep sessions in step with the topics people create, rename and close.
+
+        Created: the topic gets a session at once, titled with the topic's
+        name. Renamed: the session takes the new name. Closed: the session is
+        stopped. A change the bot made itself is skipped, because the code
+        that made it has done the binding already.
+        """
+        self._touch()
+        message, chat, user = update.message, update.effective_chat, update.effective_user
+        if message is None or chat is None or user is None:
+            return
+        if user.id == self._bot_id() or not self._is_authorized(user.id):
+            return
+        thread_id = message.message_thread_id
+        if type(thread_id) is not int or thread_id == GENERAL_TOPIC_ID:
+            return
+        if self._is_delivery_only_sink(chat, thread_id) or not self._topics_enabled():
+            return
+        topic = _Address(chat.id, thread_id)
+        if message.forum_topic_created is not None:
+            await self._bind_topic(topic, title=message.forum_topic_created.name or None)
+            return
+        session_id = await self.router.get_last_session(topic.channel_key)
+        if session_id is None:
+            return
+        if message.forum_topic_edited is not None:
+            if message.forum_topic_edited.name:
+                await self.router.set_session_title(
+                    session_id, message.forum_topic_edited.name,
+                )
+        elif message.forum_topic_closed is not None:
+            await self.router.stop_session(session_id)
+
+    async def on_session_titled(self, session_id: str, title: str) -> None:
+        """Name the session's topics after its generated title.
+
+        A session gets a generated title only when it had none, and every
+        topic a person named gave its session that name, so this renames
+        topics the bot opened as "New session" and leaves names people chose.
+        """
+        topics = self.config.telegram.topics
+        if self._app is None or not topics.enabled or not topics.auto_rename:
+            return
+        for key in await self.router.channel_keys_for_session(session_id):
+            topic = _address_of_key(key)
+            if topic is None or topic.thread_id is None:
+                continue
+            try:
+                await self._app.bot.edit_forum_topic(
+                    chat_id=topic.chat_id,
+                    message_thread_id=topic.thread_id,
+                    name=_topic_name(title),
+                )
+            except Exception as exc:
+                logger.info("Could not rename topic %s: %s", key, exc)
 
     # ------------------------------------------------------------------ #
     #  Auth                                                                #
@@ -1618,13 +2826,17 @@ class TelegramChannel(BaseChannel):
         self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
-        chat_id = update.effective_chat.id
-        channel_key = f"telegram:{chat_id}"
+        address = self._address(update)
+        channel_key = address.channel_key
 
         args = context.args
         if not args:
-            # Show current session
-            current = await self.router.get_active_session(channel_key, source="telegram")
+            # Show current session. A topic shows the session it is bound to
+            # (binding one if it has none); the chat applies the idle rollover.
+            current = (
+                await self._session_for(address, update.message)
+                or await self.router.get_active_session(channel_key, source="telegram")
+            )
             await update.message.reply_text(
                 f"Current session: `{current}`", parse_mode=ParseMode.MARKDOWN,
             )
@@ -1640,7 +2852,7 @@ class TelegramChannel(BaseChannel):
             await update.message.reply_text(str(e))
 
     async def _sessions_view_for(
-        self, channel_key: str, offset: int = 0,
+        self, channel_key: str, offset: int = 0, *, chat: Any = None,
     ) -> "tuple[str, InlineKeyboardMarkup]":
         """Build the inline-keyboard sessions view for a channel.
 
@@ -1650,7 +2862,8 @@ class TelegramChannel(BaseChannel):
         store pins the current session first with starred (kept-alive) ones
         ahead of the rest, so an idle starred session is never buried. Filtering
         and ordering happen in SQL; we fetch one extra row to learn whether a
-        further page exists.
+        further page exists. Asked for in a *chat* with topics, outside any
+        topic, each session can also be opened in a topic of its own.
         """
         offset = max(0, offset)
         current = await self.router.get_last_session(channel_key)
@@ -1658,9 +2871,17 @@ class TelegramChannel(BaseChannel):
             limit=_SESSIONS_PAGE_SIZE + 1, offset=offset, current_id=current,
         )
         has_next = len(page) > _SESSIONS_PAGE_SIZE
+        address = _address_of_key(channel_key)
+        topic_buttons = (
+            chat is not None
+            and address is not None
+            and address.thread_id is None
+            and self._chat_may_have_topics(chat)
+        )
         return build_sessions_view(
             page[:_SESSIONS_PAGE_SIZE], current,
             offset=offset, has_prev=offset > 0, has_next=has_next,
+            topic_buttons=topic_buttons,
         )
 
     async def _handle_sessions(self, update: Update, context: Any) -> None:
@@ -1672,8 +2893,10 @@ class TelegramChannel(BaseChannel):
         self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
-        channel_key = f"telegram:{update.effective_chat.id}"
-        text, markup = await self._sessions_view_for(channel_key)
+        channel_key = self._address(update).channel_key
+        text, markup = await self._sessions_view_for(
+            channel_key, chat=update.effective_chat,
+        )
         await update.message.reply_text(text, reply_markup=markup)
 
     # ------------------------------------------------------------------ #
@@ -1962,7 +3185,7 @@ class TelegramChannel(BaseChannel):
         self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
-        channel_key = f"telegram:{update.effective_chat.id}"
+        channel_key = self._address(update).channel_key
         current = await self.router.get_last_session(channel_key)
         if not current:
             await update.message.reply_text("No active session to star.")
@@ -1988,12 +3211,39 @@ class TelegramChannel(BaseChannel):
         through the same pipeline as a plain message but with the new session
         forced as the target. A reply's routing is bypassed, so this is how to
         answer a message without continuing the session it came from.
+
+        Inside a topic this rebinds that topic only; the chat and every other
+        topic keep their sessions. In the chat itself, when it has topics, the
+        new session opens in a new topic instead, and the chat's session is
+        left running.
         """
         self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
-        chat_id = update.effective_chat.id
-        channel_key = f"telegram:{chat_id}"
+        address = self._address(update)
+        channel_key = address.channel_key
+        # Taken from the raw text rather than ``context.args``, which is
+        # whitespace-split and would flatten a multi-line message. No title:
+        # the engine names the session from its first exchange.
+        parts = (update.message.text or "").split(maxsplit=1)
+        first_message = parts[1] if len(parts) > 1 else ""
+
+        if address.thread_id is None and self._creates_topics(update.effective_chat):
+            topic, session_id, error = await self._start_in_new_topic(address.chat_id, None)
+            if topic is not None and session_id:
+                await update.message.reply_text(
+                    f"New session `{session_id}` is in the topic "
+                    f"“{_topic_name(None)}”.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                if first_message:
+                    await self._deliver_message(
+                        update, first_message, session_id=session_id, address=topic,
+                    )
+                return
+            await update.message.reply_text(
+                f"Couldn't open a topic ({error}), so the new session is here."
+            )
 
         # Stop the current session before creating a new one
         prev = await self.router.get_last_session(channel_key)
@@ -2005,11 +3255,6 @@ class TelegramChannel(BaseChannel):
                     parse_mode=ParseMode.MARKDOWN,
                 )
 
-        # Taken from the raw text rather than ``context.args``, which is
-        # whitespace-split and would flatten a multi-line message. No title:
-        # the engine names the session from its first exchange.
-        parts = (update.message.text or "").split(maxsplit=1)
-        first_message = parts[1] if len(parts) > 1 else ""
         session_id = await self.router.create_session(channel_key, source="telegram")
         await update.message.reply_text(
             f"New session: `{session_id}`", parse_mode=ParseMode.MARKDOWN,
@@ -2022,8 +3267,7 @@ class TelegramChannel(BaseChannel):
         self._touch()
         if not self._is_authorized(update.effective_user.id):
             return
-        chat_id = update.effective_chat.id
-        channel_key = f"telegram:{chat_id}"
+        channel_key = self._address(update).channel_key
 
         session_id = await self.router.get_last_session(channel_key)
         if not session_id:
@@ -2275,7 +3519,7 @@ class TelegramChannel(BaseChannel):
 
         return extract_zip(bytes(data), meta_line)
 
-    def _is_delivery_only_sink(self, chat: Any) -> bool:
+    def _is_delivery_only_sink(self, chat: Any, thread_id: int | None = None) -> bool:
         """True when ``chat`` is an opted-in group/supergroup notification sink.
 
         ``notifications.telegram_chat_id`` can be pointed at a dedicated group
@@ -2290,12 +3534,23 @@ class TelegramChannel(BaseChannel):
         private chat) stays interactive regardless. Inline-button callbacks are
         handled separately, so questions/approvals delivered here stay
         answerable.
+
+        With ``notifications.telegram_thread_id`` the sink is one topic, and
+        only that topic is one-way: the rest of the group stays interactive.
+        ``thread_id`` is the topic the update came from.
         """
         notif = self.config.notifications
         if not getattr(notif, "delivery_only_sink", False):
             return False
         notif_chat = notif.telegram_chat_id
-        return bool(notif_chat) and chat.id == notif_chat and chat.type in ("group", "supergroup")
+        if not (
+            bool(notif_chat)
+            and chat.id == notif_chat
+            and chat.type in ("group", "supergroup")
+        ):
+            return False
+        sink_thread = getattr(notif, "telegram_thread_id", None)
+        return sink_thread is None or sink_thread == thread_id
     @property
     def observation(self) -> ObservationPolicy:
         """The source grant, rebuilt per read so reloads apply at once."""
@@ -2399,6 +3654,18 @@ class TelegramChannel(BaseChannel):
             return
 
         sent_at = message.date or datetime.now(timezone.utc)
+        metadata = {
+            "chat_type": chat.type or "",
+            "reply_to_message_id": (
+                str(_reply_of(message).message_id)
+                if _reply_of(message)
+                else ""
+            ),
+        }
+        # The inbox groups a forum by chat, as before; the topic is a detail.
+        thread_id = self._topic_of(message)
+        if thread_id is not None:
+            metadata["thread_id"] = str(thread_id)
         observed = ObservedMessage(
             channel_name="telegram",
             channel_key=f"telegram:{chat.id}",
@@ -2409,14 +3676,7 @@ class TelegramChannel(BaseChannel):
             timestamp=sent_at.isoformat(),
             conversation_title=chat.title or chat.username or "",
             sender_name=user.username or user.full_name or "",
-            metadata={
-                "chat_type": chat.type or "",
-                "reply_to_message_id": (
-                    str(message.reply_to_message.message_id)
-                    if message.reply_to_message
-                    else ""
-                ),
-            },
+            metadata=metadata,
         )
         await self.router.observe(
             observed,
@@ -2452,7 +3712,9 @@ class TelegramChannel(BaseChannel):
 
         # Delivery-only notification sink: never start an agent turn on a
         # message that arrives in the notifications group (a one-way channel).
-        if self._is_delivery_only_sink(update.effective_chat):
+        if self._is_delivery_only_sink(
+            update.effective_chat, self._raw_topic(update.message),
+        ):
             logger.info(
                 "Ignoring inbound message in delivery-only notification chat %s",
                 update.effective_chat.id,
@@ -2475,6 +3737,7 @@ class TelegramChannel(BaseChannel):
 
     async def _deliver_message(
         self, update: Update, text: str, *, session_id: str | None = None,
+        address: _Address | None = None,
     ) -> None:
         """Turn one inbound message into an agent turn.
 
@@ -2484,12 +3747,17 @@ class TelegramChannel(BaseChannel):
         passes the session it just created, so the message gets there even as
         a reply — no routing lookup, no rejection. Otherwise a reply routes to
         the session that produced the replied-to message when routing is on,
-        and anything else lands in the chat's active session.
+        and anything else lands in the chat's active session. ``address``
+        overrides where the message is taken to come from: ``/new <text>`` in a
+        chat with topics passes the topic it just opened.
         """
-        chat_id = update.effective_chat.id
+        address = address or self._address(update)
+        chat_id = address.chat_id
 
         # Cache for reaction lookups (raw text, before reply-context prefix)
-        self._cache_message(update.message.message_id, chat_id, text)
+        self._cache_message(
+            update.message.message_id, chat_id, text, address.thread_id,
+        )
 
         # Prepend forward origin (if forwarded message)
         forward_context = _format_forward_context(update.message)
@@ -2522,7 +3790,7 @@ class TelegramChannel(BaseChannel):
             images.extend(doc_contents)
 
         # Extract attachments from replied-to message (images, documents, PDFs)
-        reply_msg = getattr(update.message, "reply_to_message", None)
+        reply_msg = _reply_of(update.message)
         if reply_msg:
             reply_image = await self._extract_image(reply_msg)
             if reply_image:
@@ -2553,9 +3821,13 @@ class TelegramChannel(BaseChannel):
         # target skips the lookup altogether: a reply the user sent as
         # /new <text> must never be refused on its way to the session they
         # just asked for.
-        channel_key = f"telegram:{chat_id}"
+        channel_key = address.channel_key
         target_session: str | None = session_id
-        if target_session is None and self._reply_routing_enabled():
+        if target_session is None and address.thread_id is not None:
+            # A topic is bound to one session: every message in it, a reply
+            # included, goes there (see _session_for).
+            target_session = await self._session_for(address, update.message)
+        elif target_session is None and self._reply_routing_enabled():
             # Route a reply to the session that produced the replied-to message
             # (and make it active). An unresolvable reply is rejected with a
             # no-LLM nudge rather than mis-routed into the active session.
@@ -2587,7 +3859,7 @@ class TelegramChannel(BaseChannel):
         msg = InboundMessage(
             channel_name="telegram",
             channel_key=channel_key,
-            sender_id=str(chat_id),
+            sender_id=address.target,
             text=text,
             session_id=target_session,
             metadata=metadata,
@@ -2660,25 +3932,47 @@ class TelegramChannel(BaseChannel):
 
         emoji_str = " ".join(emojis)
 
-        # Look up original message text from cache
-        cached = self._message_cache.get(message_id)
+        # Look up original message text from cache. A reaction update names
+        # no topic, so the cache is also where the reaction's topic comes from.
+        thread_id: int | None = None
+        cached = self._message_cache.get((chat_id, message_id))
         if cached:
-            _, original_text = cached
+            thread_id, original_text = cached
+            # A one-way sink topic takes no reactions either; the check above
+            # covered a sink that is the whole chat.
+            if self._is_delivery_only_sink(reaction_update.chat, thread_id):
+                logger.info(
+                    "Ignoring reaction in the delivery-only notification topic "
+                    "%s of chat %s", thread_id, chat_id,
+                )
+                return
+            if thread_id is not None and not self._topics_enabled():
+                thread_id = None
             text = f'[Reaction: {emoji_str} on message: "{original_text}"]'
+        elif self._chat_may_have_topics(reaction_update.chat):
+            # The message may sit in any topic. Routing the reaction to the
+            # chat would hand it to a session that never saw the message.
+            logger.info(
+                "Ignoring a reaction in chat %s: message %d is not cached, "
+                "so its topic is unknown", chat_id, message_id,
+            )
+            return
         else:
             text = f"[Reaction: {emoji_str}]"
 
         logger.info("Telegram reaction from %s: %s (msg %d)", chat_id, emoji_str, message_id)
 
+        address = _Address(chat_id, thread_id)
         msg = InboundMessage(
             channel_name="telegram",
-            channel_key=f"telegram:{chat_id}",
-            sender_id=str(chat_id),
+            channel_key=address.channel_key,
+            sender_id=address.target,
             text=text,
             metadata={},
         )
 
         try:
+            msg.session_id = await self._session_for(address)
             await self.router.handle_message(msg)
         except NotAcceptingTurnsError:
             # The stream adapter already sent the engine's error event.
@@ -2714,7 +4008,8 @@ class TelegramChannel(BaseChannel):
         if not updates:
             return
 
-        chat_id = updates[0].effective_chat.id
+        address = self._address(updates[0])
+        chat_id = address.chat_id
 
         # Caption is usually on the first message only
         text = ""
@@ -2742,7 +4037,7 @@ class TelegramChannel(BaseChannel):
                 images.append(image)
 
         # Extract attachments from replied-to message (images, documents, PDFs)
-        reply_msg = getattr(updates[0].message, "reply_to_message", None)
+        reply_msg = _reply_of(updates[0].message)
         if reply_msg:
             reply_image = await self._extract_image(reply_msg)
             if reply_image:
@@ -2769,9 +4064,13 @@ class TelegramChannel(BaseChannel):
         # Reply routing (telegram.reply_routes_to_origin_session, on by default).
         # When off, a reply is context-only and lands in the active session
         # (session_id stays None), exactly like a plain message.
-        channel_key = f"telegram:{chat_id}"
+        channel_key = address.channel_key
         target_session: str | None = None
-        if self._reply_routing_enabled():
+        if address.thread_id is not None:
+            # A topic is bound to one session: every message in it, a reply
+            # included, goes there (see _session_for).
+            target_session = await self._session_for(address, updates[0].message)
+        elif self._reply_routing_enabled():
             # Route a reply to the session that produced the replied-to message
             # (and make it active). An unresolvable reply is rejected with a
             # no-LLM nudge rather than mis-routed into the active session.
@@ -2803,7 +4102,7 @@ class TelegramChannel(BaseChannel):
         msg = InboundMessage(
             channel_name="telegram",
             channel_key=channel_key,
-            sender_id=str(chat_id),
+            sender_id=address.target,
             text=text,
             session_id=target_session,
             metadata=metadata,
@@ -2860,8 +4159,12 @@ class TelegramChannel(BaseChannel):
         window = max(1, min(window, _TAIL_MAX))
         session = await self.router.get_session(session_id)
         if not session:
-            channel_key = f"telegram:{query.message.chat.id}"
-            text, markup = await self._sessions_view_for(channel_key)
+            channel_key = self._address_of(
+                query.message.chat.id, query.message,
+            ).channel_key
+            text, markup = await self._sessions_view_for(
+                channel_key, chat=query.message.chat,
+            )
             await self._safe_edit(query, text, markup)
             return
         messages = await self.router.get_session_messages(session_id, limit=window)
@@ -2877,9 +4180,12 @@ class TelegramChannel(BaseChannel):
         callback_data forms:
           ``sess:list``           — (re)show the session switch list (first page)
           ``sess:page:<offset>``  — show the switch list at a pagination offset
-          ``sess:new``            — create a fresh session (current keeps running)
+          ``sess:new``            — create a fresh session (current keeps running);
+                                    in a chat with topics, in a new topic
           ``sess:<id>``           — switch routing to <id>, then show its history
           ``sesstail:<id>:<win>`` — widen the catch-up window (informational only)
+          ``sesstopic:<id>``      — open <id> in a topic of its own
+          ``sesstx:<id>``         — send <id>'s whole conversation as a document
 
         After a switch/create the card is replaced by that session's recent
         history (native order, oldest→newest) so the user can catch up — which
@@ -2889,12 +4195,24 @@ class TelegramChannel(BaseChannel):
         if not query.message:
             await query.answer()
             return
-        channel_key = f"telegram:{query.message.chat.id}"
+        # The card sits in the topic it was asked for in, so a tap there
+        # switches that topic only.
+        chat = query.message.chat
+        address = self._address_of(chat.id, query.message)
+        channel_key = address.channel_key
         data = query.data
+
+        if data.startswith("sesstopic:"):
+            await self._open_in_topic(query, data.split(":", 1)[1])
+            return
+
+        if data.startswith("sesstx:"):
+            await self._send_transcript(query, data.split(":", 1)[1])
+            return
 
         if data == "sess:list":
             await query.answer()
-            text, markup = await self._sessions_view_for(channel_key)
+            text, markup = await self._sessions_view_for(channel_key, chat=chat)
             await self._safe_edit(query, text, markup)
             return
 
@@ -2904,9 +4222,23 @@ class TelegramChannel(BaseChannel):
             except (IndexError, ValueError):
                 page_offset = 0
             await query.answer()
-            text, markup = await self._sessions_view_for(channel_key, page_offset)
+            text, markup = await self._sessions_view_for(
+                channel_key, page_offset, chat=chat,
+            )
             await self._safe_edit(query, text, markup)
             return
+
+        topic_error = ""
+        if (
+            data == "sess:new"
+            and address.thread_id is None
+            and self._creates_topics(chat)
+        ):
+            _, session_id, topic_error = await self._start_in_new_topic(chat.id, None)
+            if session_id:
+                await query.answer("Started a new session in a new topic")
+                return
+            # Telegram refused the topic: start the session here instead.
 
         if data.startswith("sesstail:"):
             parts = data.split(":")
@@ -2927,7 +4259,13 @@ class TelegramChannel(BaseChannel):
                 sid = await self.router.create_session(
                     channel_key, source="telegram",
                 )
-                await query.answer("Started a new session")
+                if topic_error:
+                    await query.answer(_fit_text(
+                        f"Couldn't open a topic ({topic_error}), "
+                        "so the new session is here.", _TOAST_MAX_LEN,
+                    ), show_alert=True)
+                else:
+                    await query.answer("Started a new session")
             else:
                 await self.router.switch_session(channel_key, target)
                 await query.answer("Switched")
@@ -2935,7 +4273,7 @@ class TelegramChannel(BaseChannel):
             await query.answer(
                 "That session is no longer available", show_alert=True,
             )
-            text, markup = await self._sessions_view_for(channel_key)
+            text, markup = await self._sessions_view_for(channel_key, chat=chat)
             await self._safe_edit(query, text, markup)
             return
         await self._edit_session_tail(query, sid, _TAIL_WINDOW)
@@ -2952,10 +4290,7 @@ class TelegramChannel(BaseChannel):
             return
 
         # /sessions inline keyboard: switch/create/list + history buttons.
-        if (
-            query.data.startswith("sess:")
-            or query.data.startswith("sesstail:")
-        ):
+        if query.data.startswith(("sess:", "sesstail:", "sesstopic:", "sesstx:")):
             await self._handle_session_button(query)
             return
 
@@ -2989,7 +4324,7 @@ class TelegramChannel(BaseChannel):
                 notification_id,
                 answer,
                 channel="telegram",
-                target=str(update.effective_chat.id),
+                target=self._answer_target(update.effective_chat.id, query.message),
                 actor=str(query.from_user.id),
             )
         except NotAcceptingTurnsError as exc:
@@ -3067,7 +4402,7 @@ class TelegramChannel(BaseChannel):
             result = await self._notification_service.answer_latest_question(
                 answer_text,
                 channel="telegram",
-                target=str(update.effective_chat.id),
+                target=self._answer_target(update.effective_chat.id, update.message),
                 actor=str(update.effective_user.id),
             )
         except NotAcceptingTurnsError as exc:
@@ -3097,7 +4432,8 @@ class TelegramChannel(BaseChannel):
         reply_to = getattr(message, "reply_to_message", None)
         if reply_to is None or not text or self._notification_service is None:
             return False
-        target = str(update.effective_chat.id)
+        # A card in a topic is recorded under the topic's target.
+        target = self._address(update).target
         notif = await self.router.engine.db.find_notification_for_delivery(
             "telegram", target, str(reply_to.message_id),
         )

@@ -305,13 +305,19 @@ def config_excluded_tools(config: Any) -> set[str]:
     other: they serve memU, and with ``memory.backend: loom`` the agent
     uses Loom's own tools from the MCP gateway's catalog instead.
     ``widget_state`` reads what the web chat's widgets saved, and without
-    the sandbox that draws widgets there is no widget.
+    the sandbox that draws widgets there is no widget. The topic tools need
+    a Telegram bot with ``telegram.topics.enabled`` on.
     """
     excluded: set[str] = set()
     if not config.outbound_channels:
         excluded.add("send_channel_message")
     if not widgets_drawn(config):
         excluded.add(WIDGET_STATE_TOOL)
+    telegram = config.telegram
+    if not (telegram.enabled and telegram.bot_token and telegram.topics.enabled):
+        from nerve.agent.tools.handlers.session_topics import SESSION_TOPIC_SPECS
+
+        excluded.update(spec.name for spec in SESSION_TOPIC_SPECS)
     if config.memory.backend == "loom":
         from nerve.agent.tools.handlers.memory import MEMORY_SPECS
 

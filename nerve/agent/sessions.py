@@ -169,6 +169,10 @@ class SessionManager:
         # session_id -> one reason per archive or delete in progress
         # (see :meth:`closing`).
         self._closing: dict[str, list[str]] = {}
+        # Called with the session id after an archive changed the status, in
+        # the background (``AgentEngine.session_ending``: channels let go of
+        # the session's topics).
+        self._on_archived: Any | None = None
 
     # ------------------------------------------------------------------ #
     #  Lifecycle: Create / Get                                             #
@@ -1167,6 +1171,15 @@ class SessionManager:
                 await self.on_archived(session_id)
             except Exception as e:
                 logger.warning("Archive of %s: on_archived failed: %s", session_id, e)
+        if self._on_archived:
+            # Channels let go of the session's topics, in the background: a
+            # slow Telegram must not hold up the archive.
+            async def _archived_bg(sid: str = session_id) -> None:
+                try:
+                    await self._on_archived(sid)
+                except Exception as e:
+                    logger.warning("Archive hook for %s failed: %s", sid, e)
+            asyncio.create_task(_archived_bg())
 
     async def _resolve_descendants(self, root_id: str) -> list[str]:
         """Every session in ``root_id``'s subtree, discovery order (root first).

@@ -24,7 +24,7 @@ and migration splits a legacy `config.yaml` on the same table:
 | Layer | Gets |
 |-------|------|
 | `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `gateway.public_url`, `proxy`, `docker`, `telegram.enabled`, `slack.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `mcp_apps`, `workflows.runs_dir` |
-| `settings.yaml` | `timezone`, `gateway.host`/`port`/`loop`, `provider.type`/`aws_region` (incl. the region-scoped Bedrock model IDs), `agent.*`, `memory.*`, `sessions.*`, `sync.*`, the rest of `workflows.*` (the budget caps and cadence), `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode` |
+| `settings.yaml` | `timezone`, `gateway.host`/`port`/`loop`, `provider.type`/`aws_region` (incl. the region-scoped Bedrock model IDs), `agent.*`, `memory.*`, `sessions.*`, `sync.*`, the rest of `workflows.*` (the budget caps and cadence), `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode`/`topics.*` |
 
 The test is whether the value would be wrong on another machine: filesystem
 paths, credential handles, whose mailboxes this person syncs, which agent
@@ -256,7 +256,7 @@ A reload is always explicit. Two things cause one:
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
-| `telegram.dm_policy`, `.stream_mode`, `.reply_routes_to_origin_session` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; toggling `reply_routes_to_origin_session` takes effect on the next message, and applies to replies to earlier messages too (routes are recorded while it is off); `allowed_users` does not follow it (see the restart table) |
+| `telegram.dm_policy`, `.stream_mode`, `.reply_routes_to_origin_session`, `.topics.*` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; toggling `reply_routes_to_origin_session` takes effect on the next message, and applies to replies to earlier messages too (routes are recorded while it is off); `allowed_users` does not follow it (see the restart table) |
 | `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source and the events of the other hosted providers included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
 | `email.enabled` | ✅ read per event. The reload publishes the subscriptions to the gateway again, which then takes or refuses new mail. When no stream sends them, the reload reports `subscriptions` with a "not sent yet" note, which is not an error: the next stream that connects sends them before Nerve reads from it. The email channel must exist: usable `channels.hosted` settings at startup give it. Without usable settings the reload repeats the startup warning under `email`; with usable settings and no email channel it says that a restart is needed (see [Email](#email)) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
@@ -1354,6 +1354,184 @@ carry text. A `.png` or `.ico` has to be committed by a human.
 | `telegram.allowed_users` | list[int] | `[]` | User IDs allowed to use the bot in private and group chats |
 | `telegram.stream_mode` | string | `partial` | `partial` (edit msgs) or `full` |
 | `telegram.reply_routes_to_origin_session` | bool | `true` | A reply routes to the session that produced the replied-to message (and makes it active); a reply that cannot be tied to a live session is refused with a hint. `/new <message>` is the escape hatch: it starts a fresh session with that message, reply or not. `false` restores the old behaviour: a reply is context-only and lands in the active session. The message→session map is stored in the database (`channel_reply_routes`, kept 90 days) whether the flag is on or off, so it survives a restart and turning the flag back on covers earlier messages. Either way, a reply to a pending `ask_user` card answers the question, like `/reply` |
+| `telegram.rich_messages` | bool | `true` | Send answers and plain notifications as rich messages, so headings, tables, task lists and code blocks render, and one message holds 32,768 characters (see [Rich messages](#rich-messages)). `false` sends HTML messages of up to 4,096 characters, as before |
+| `telegram.topics.enabled` | bool | `true` | One forum topic is one session (see [Topics](#topics)). `false` treats every topic message as a message to the chat, as before |
+| `telegram.topics.new_session_creates_topic` | bool | `true` | `/new` and the `/sessions` ➕ button, used in the chat itself, open the new session in a new topic when the chat has topics |
+| `telegram.topics.auto_rename` | bool | `true` | Rename a topic the bot opened as "New session" after its session's generated title |
+
+### Topics
+
+In a chat with topics, each topic is its own session. A message in a topic
+goes to that topic's session, and the reply, the streamed preview, files,
+stickers and reactions come back to the same topic. The chat itself (for a
+forum, its General topic) keeps working as before: one session at a time,
+with the idle rollover of `sessions.sticky_period_minutes`.
+
+Telegram decides where topics exist, so that is where you turn them on:
+
+- **Group:** a forum supergroup (group settings → Topics). The bot needs to
+  see the messages: make it an admin, or disable privacy mode with BotFather.
+- **Private chat:** turn on topics for the bot in its BotFather settings
+  (Telegram added topics in private chats in Bot API 9.3, and topics that a
+  bot creates there in 9.4). Restart Nerve after changing it: the bot reads
+  the setting once, at start, to know it may open topics in private chats.
+
+For the bot to open, rename and follow topics in a group, make it an admin
+with the *Manage Topics* right.
+
+A topic stays bound to its session. It does not roll over to a fresh session
+after a quiet spell, because a topic that silently forgot its conversation
+would defeat the point. Inside a topic, `/new [message]` starts a new session
+for that topic only (text after `/new` is its first message), `/session <id>` and the `/sessions` buttons bind the topic
+to another session, and `/stop` and `/star` act on the topic's session. Other
+topics and the chat itself are unaffected. If the topic's session is archived,
+the next message in the topic starts a new one.
+
+`telegram.reply_routes_to_origin_session` applies to the chat itself, not to
+topics: in a topic, a reply goes to the topic's session like any other
+message there. Replies to a pending `ask_user` card still answer it.
+
+New sessions get topics of their own. In the chat itself (not inside a
+topic), `/new [message]` and the `/sessions` ➕ button open a new topic with a
+new session, and the chat's current session keeps running. Text after `/new`
+is the new session's first message, sent in the new topic. The topic is
+called "New session" until the session's generated title replaces it. If Telegram refuses the topic (the group is not a forum, or the bot lacks
+*Manage Topics*), the new session starts in the chat as before, and the reply
+says why.
+
+Topics people make follow the same rules. Creating a topic gives it a session
+at once, titled with the topic's name; renaming the topic retitles the
+session, and closing it stops the session. Only a session without a title
+gets a generated one, so a topic someone named keeps its name.
+
+In the chat itself, `/sessions` also offers **↗ Topic** next to each session.
+It opens the session in a new topic named after it, or brings up the topic it
+already has. If the chat was on that session, it moves to the topic, and the
+chat's next message starts a new session. Telegram cannot move messages into
+a topic, so the topic starts with the session's catch-up card: the last
+messages, and a **📄 Send transcript** button that sends the whole conversation
+as one Markdown file. The agent in the topic has the session's full history.
+Nothing changes on upgrade: existing sessions get a topic only when you open
+one this way.
+
+Code can do the same for any session, one that never touched Telegram
+included: `POST /api/sessions/{id}/telegram-topic` and the agent tool
+`session_open_topic` open it in a topic of the notification chat
+(`notifications.telegram_chat_id`, else the first allowed user's DM). The
+API route takes an optional `chat_id`; the agent tool has none, so an agent
+never picks the chat.
+`DELETE` on the same path and `session_close_topic` post a last note, close
+the topic and unbind it, and leave the session running. Telegram closes
+topics only in forums, so in a private chat the topic is unbound and stays
+open. The tools are offered when Telegram has a bot token and `topics` is on.
+See [the API](api.md#post-apisessionsidtelegram-topic).
+
+Notifications follow the session. A push from a session that lives in a topic
+(`notify`, a question, an approval) is delivered into that topic, without the
+"Session:" footer, and is answered there: a button on the card, or `/reply`
+typed in the topic. Pushes from other sessions go to the
+[notification sink](#notification-sink) as before. Output that a session
+produces after its turn has ended, when a background job finishes, does not
+reach Telegram, except in a topic that `topics.auto` opened with
+`mirror_turns` on (below).
+
+#### Topics for every session (`telegram.topics.auto`)
+
+With `telegram.topics.auto.enabled`, Nerve gives sessions a topic without
+being asked. When a turn of an eligible session starts, the session gets a
+topic in the notification chat (`notifications.telegram_chat_id`, else the
+first allowed user's DM), named after it and renamed once its title is
+generated. Only sessions that run a turn after the switch is on get one;
+nothing is backfilled. Each session gets at most one this way: a topic that
+was deleted or let go of is not opened again, and a session that is on
+Telegram already (it came from there, or someone opened its topic) is left
+alone.
+
+```yaml
+telegram:
+  topics:
+    auto:
+      enabled: true
+      sources: [web, cron, hook]       # session sources that get a topic
+      exclude: ["cron:nightly-report:*"]     # fnmatch on the session id
+      close_on: [archive, delete, cron_done]
+      private_chat_close: unbind       # or: delete
+      mirror_turns: true
+```
+
+The topic is let go of on the events in `close_on`: the session is archived
+(by hand, in a cascade, or by the cleanup after
+`sessions.archive_after_days`), deleted, or, for a cron run's own session
+(`cron:<job>:<run>`), its run ended and no background work is left. The topic
+gets a last note, is unbound, and is closed in a forum. In a private chat
+Telegram cannot close a topic: `unbind` leaves it with the note, and `delete`
+deletes it with its messages. Topics opened by hand are not touched.
+
+A turn typed in the web UI does not reach Telegram on its own. With
+`mirror_turns`, each finished turn that did not come from Telegram is posted in
+the session's topic: the message, quoted, then the final answer (cut at
+`mirror_max_chars`, default 12,000). Background continuations are posted too.
+Tool calls and the streamed preview are not. A push from the session goes into
+its topic, as for any session that lives in one, so with `cron` in `sources` a
+job's alerts arrive in its run's topic rather than in the chat.
+
+| Key | Default | |
+|-----|---------|--|
+| `enabled` | `false` | The switch. `auto: true` is short for it. |
+| `sources` | `[web, cron, hook]` | Session sources that get a topic. Telegram, Slack, workflow and external sessions are never in it by default. |
+| `exclude` | `[]` | `fnmatch` patterns on the session id that get none, e.g. `cron:nightly-report:*`. |
+| `close_on` | `[archive, delete, cron_done]` | When to let go of the topic. |
+| `private_chat_close` | `unbind` | `unbind` or `delete`, for a private chat. |
+| `mirror_turns` | `false` | Post finished turns that did not come from Telegram. |
+| `mirror_max_chars` | `12000` | Longest answer mirrored. |
+
+All of it is read per turn, so it follows `nerve reload`.
+
+Telegram does not say which topic a reaction's message is in, so Nerve looks
+the message up in its recent-message cache (the last 200 messages). A reaction
+to a message that is no longer cached, in a chat that has topics, is ignored
+rather than sent to a session that never saw the message.
+
+Streaming edits share one budget per chat, because Telegram rate limits the
+chat rather than the topic. With several topics answering at once, the
+previews update less often, and the final answers are unaffected.
+
+### Rich messages
+
+With `telegram.rich_messages` on (the default), final answers and plain
+notifications go out as rich messages (Bot API 10.1). Headings, tables, task
+lists, code blocks with their language, quotes, collapsible
+`<details>` sections and footnotes render, and one message holds 32,768
+characters. A longer answer is split between blocks. A code block too long for
+one message is closed at the cut and reopened, with its language, in the next.
+
+The streaming preview stays a plain message that is edited in place, and the
+final answer replaces it. Cards with buttons stay HTML: answering a question,
+"Open plan" and the expiry note all edit the card's text, and a rich message
+has no text to edit. So do the `/sessions` views and the catch-up card.
+
+Rich messages read GitHub-flavoured Markdown, which differs from a chat
+message in a few places, so Nerve adjusts the text first:
+
+- A single line break would join two lines into one paragraph. It becomes a
+  hard break, so lines stay apart as written.
+- `$` would start a formula ("$5 and $10" would turn into one), so it is
+  escaped. Formulas therefore do not render.
+- Telegram drops a tag it does not render, so `std::vector<int>` would show
+  as `std::vector`. A `<` that does not start one of the tags an answer may
+  use on purpose (`<details>`, `<summary>`, `<u>`, `<sub>`, `<sup>`,
+  `<tg-spoiler>`, `<blockquote>` and the like) or a `<https://…>` link is
+  escaped.
+- A table gets a blank line before and after it.
+
+Code blocks and inline code are sent exactly as written.
+
+If Telegram refuses a rich message, for example a table with more than 20
+columns, that message goes out as HTML of up to 4,096 characters per message,
+as before. A Bot API server without `sendRichMessage` (an older self-hosted
+one) turns rich messages off until Nerve restarts. How a Telegram app older
+than Bot API 10.1 shows a rich message is untested; set
+`rich_messages: false` if someone using the bot cannot update theirs.
 
 ### Notification sink
 
@@ -1363,6 +1541,7 @@ or to `notifications.telegram_chat_id` when set (e.g. a dedicated group).
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `notifications.telegram_chat_id` | int | - | Chat that receives pushes instead of the owner's DM — e.g. a dedicated notification group |
+| `notifications.telegram_thread_id` | int | - | A topic in that chat for the pushes, e.g. a "System" topic (the number at the end of the topic's link). With `delivery_only_sink`, only this topic is one-way |
 | `notifications.delivery_only_sink` | bool | `false` | When the sink is a group/supergroup, make it one-way: inbound messages and reactions there never start an agent turn. Off by default (backward-compatible); inline-button answers and `/reply` still work. |
 
 ### Pairing

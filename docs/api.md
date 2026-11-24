@@ -1265,6 +1265,39 @@ answers `409` with `{"detail": "...", "reason": "archived"}`.
 Response: { "archived": true, "archived_ids": ["a1b2c3d4"], "skipped": [{ "id": "e5f6a7b8", "reason": "background agents running" }] }
 ```
 
+#### `POST /api/sessions/{id}/telegram-topic`
+Show a session in a Telegram topic of its own, as the **↗ Topic** button
+does, for any session, a web one included. The topic opens in `chat_id`,
+else in the notification chat (`notifications.telegram_chat_id`, else the
+first of `telegram.allowed_users`), is named `title`, else after the
+session, and starts with the session's catch-up card. Idempotent: a session
+with a topic in that chat already gets its card posted there, and `opened`
+is `false`. If the chat itself was on the session, it lets go, and its next
+message starts a new session. The body is optional. 404 for an unknown
+session, 503 when Telegram is not running, 429 with `Retry-After` when
+Telegram rate limits the chat, 400 otherwise (topics off, archived session,
+Telegram refused the topic).
+
+```json
+Request:  { "title": "INC-1234", "chat_id": -1001234567890 }
+Response: { "channel_key": "telegram:-1001234567890:501", "opened": true }
+```
+
+#### `DELETE /api/sessions/{id}/telegram-topic`
+Post an optional `note` in each of the session's topics, unbind the topic
+from the session, and close it. The session is not stopped or archived.
+Telegram closes topics only in forums: in a private chat the topic is
+unbound and stays open (`left_open`), and a message in it starts a new
+session. A topic deleted already is only unbound (`gone`). A session with
+no topic gives an empty list. If a note does not post or Telegram refuses
+the close, that topic stays bound and the response is 400, with `detail`
+and the topics that were let go of.
+
+```json
+Request:  { "note": "Resolved: no action needed." }
+Response: { "closed": true, "topics": [{ "channel_key": "telegram:-1001234567890:501", "outcome": "closed" }] }
+```
+
 #### `GET /api/sessions/{id}/events?limit=50`
 Get session lifecycle event log (newest first).
 

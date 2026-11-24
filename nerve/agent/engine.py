@@ -997,6 +997,13 @@ class AgentEngine:
 
         # Wire up memorize callback so SessionManager can trigger memU indexing
         self.sessions._on_memorize = self._memorize_session
+        # Imported here: nerve.channels imports the engine (a top-level
+        # import would be circular).
+        from nerve.channels.session_events import SESSION_ARCHIVED
+
+        self.sessions._on_archived = (
+            lambda sid: self.session_ending(sid, SESSION_ARCHIVED)
+        )
 
         # The agent registry: settle records a crash left live (their runtime
         # died with the last process), then start its writer, emitter and
@@ -4444,6 +4451,7 @@ class AgentEngine:
             broadcaster.mark_turn_open(session_id)
             # Notify all connected clients that this session started running
             await self._broadcast_session_running(session_id, True)
+            self._emit_turn_started(session_id, source, channel, internal)
             try:
                 if compact:
                     return await self._compact_inner(session_id, channel)
@@ -5005,6 +5013,11 @@ class AgentEngine:
         # Codex collab agents end with the turn: one that got no result is
         # never coming back (it would otherwise hold the session "busy").
         self.agents.settle_turn_scoped(session_id)
+        self._emit_turn_finished(
+            session_id, source, channel,
+            user_message=None if internal else user_message,
+            st=st, autonomous=False,
+        )
 
         return TurnResult(st.full_response_text, outcome)
 
@@ -5156,6 +5169,11 @@ class AgentEngine:
                         persist_message=visible,
                     )
                     turns += 1
+                    if visible:
+                        self._emit_turn_finished(
+                            session_id, source, channel,
+                            user_message=None, st=st, autonomous=True,
+                        )
                 # Nothing at all — dropped; the finally backstop ships a
                 # synthetic done if framing opened.
             st, framed = None, False
@@ -5687,6 +5705,58 @@ class AgentEngine:
     #  Idle client sweep                                                   #
     # ------------------------------------------------------------------ #
 
+    def _emit_turn_started(
+        self, session_id: str, source: str, channel: str | None, internal: bool,
+    ) -> None:
+        """Tell the channels a turn started (see ``BaseChannel.on_turn_started``)."""
+        router = getattr(self, "_router", None)  # engines built with __new__ have none
+        if router is None:
+            return
+        from nerve.channels.session_events import TurnStarted
+
+        try:
+            router.turn_started(TurnStarted(
+                session_id=session_id, source=source, channel=channel,
+                internal=internal,
+            ))
+        except Exception as e:  # never let a channel hook touch the turn
+            logger.warning("turn_started hook failed for %s: %s", session_id, e)
+
+    def _emit_turn_finished(
+        self, session_id: str, source: str, channel: str | None, *,
+        user_message: str | None, st: _TurnState, autonomous: bool,
+    ) -> None:
+        """Tell the channels a turn finished (see ``BaseChannel.on_turn_finished``)."""
+        router = getattr(self, "_router", None)
+        if router is None:
+            return
+        from nerve.channels.session_events import TurnFinished
+
+        try:
+            router.turn_finished(TurnFinished(
+                session_id=session_id, source=source, channel=channel,
+                user_message=user_message, text=st.full_response_text or "",
+                status=st.status, autonomous=autonomous,
+                work_pending=self._has_live_background_tasks(session_id),
+            ))
+        except Exception as e:
+            logger.warning("turn_finished hook failed for %s: %s", session_id, e)
+
+    async def session_ending(self, session_id: str, reason: str) -> None:
+        """Tell the channels a session is being archived or deleted.
+
+        A delete awaits this before the rows go (the channels' bindings go
+        with them); an archive runs it in the background after the archive.
+        Never raises.
+        """
+        router = getattr(self, "_router", None)
+        if router is None:
+            return
+        try:
+            await router.session_ending(session_id, reason)
+        except Exception as e:
+            logger.warning("session_ending hook failed for %s: %s", session_id, e)
+
     def _has_live_background_tasks(self, session_id: str) -> bool:
         """Whether *session_id* has a background task still running.
 
@@ -5803,6 +5873,11 @@ class AgentEngine:
                     "Generated title for session %s: %s",
                     session_id, title,
                 )
+                # Channels that name things after the session (a Telegram
+                # topic) hear it here; the broadcast reaches listeners of
+                # this session only.
+                if self._router is not None:
+                    await self._router.session_titled(session_id, title)
         except Exception as e:
             logger.warning("Failed to generate session title: %s", e)
 

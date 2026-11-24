@@ -1303,6 +1303,37 @@ class NotificationService:
         logger.warning("No telegram_chat_id configured for notifications")
         return None
 
+    def _resolve_telegram_target(self) -> str | None:
+        """The configured sink as a channel target: the chat, or a topic in it."""
+        from nerve.channels.telegram import format_target
+
+        chat_id = self._resolve_telegram_chat_id()
+        if not chat_id:
+            return None
+        return format_target(chat_id, self.config.notifications.telegram_thread_id)
+
+    async def _telegram_topic_of(self, session_id: str) -> str | None:
+        """The topic a session lives in, as a channel target, or ``None``.
+
+        A session bound to a Telegram topic gets its pushes there, next to
+        the conversation they are about, rather than in the sink.
+        """
+        if not session_id or not self.config.telegram.topics.enabled:
+            return None
+        for key in await self.db.get_channel_keys_for_session(session_id):
+            channel, _, target = key.partition(":")
+            if channel == "telegram" and ":" in target:
+                return target
+        return None
+
+    def _labels_session(self, target: str) -> bool:
+        """Whether a card sent to *target* names its session.
+
+        Inside the session's own topic the topic is the label. The sink,
+        a topic included, gathers every session's pushes, so it keeps it.
+        """
+        return ":" not in target or target == self._resolve_telegram_target()
+
     def _get_telegram_channel(self):
         """Get the TelegramChannel instance, or None if unavailable."""
         channel = self.engine.router.get_channel("telegram")
@@ -1343,6 +1374,7 @@ class NotificationService:
 
     async def _build_notification_text(
         self, session_id: str, title: str, body: str, priority: str,
+        *, label_session: bool = True,
     ) -> str:
         """Compose the chat message text for a notification.
 
@@ -1357,6 +1389,8 @@ class NotificationService:
         (:meth:`_session_link`) and the text before it leaves the link whole
         (:func:`nerve.links.link_stays_whole`). Otherwise it names the session
         by its ID.
+        ``label_session=False`` leaves the label out, for a card inside the
+        session's own topic.
         """
         priority_prefix = self.config.notifications.priority_prefixes.get(priority, "")
         if title:
@@ -1365,7 +1399,7 @@ class NotificationService:
                 text += f"\n\n{body}"
         else:
             text = body or ""
-        if self._should_show_session_label(session_id):
+        if label_session and self._should_show_session_label(session_id):
             text += "\n\nSession: "
             link = await self._session_link(session_id)
             text += link if link and link_stays_whole(text, link) else session_id
@@ -1415,11 +1449,59 @@ class NotificationService:
             logger.warning("Telegram bot not available for notification %s", notification_id)
             return None
 
-        chat_id = self._resolve_telegram_chat_id()
-        if not chat_id:
-            return None
+        from nerve.channels.telegram import _TOPIC_GONE_ERRORS, _error_says
 
-        text = await self._build_notification_text(session_id, title, body, priority)
+        topic = await self._telegram_topic_of(session_id)
+        sink = self._resolve_telegram_target()
+        if topic and topic != sink:
+            try:
+                return await self._send_telegram_to(
+                    topic, bot, notification_id, notif_type, session_id, title,
+                    body, priority, options, silent, option_labels, plan_id,
+                )
+            except Exception as exc:
+                if not _error_says(exc, _TOPIC_GONE_ERRORS):
+                    raise
+                # A person deleted the session's topic. Unbind it, so later
+                # pushes stop trying it, and deliver this one to the sink.
+                logger.info(
+                    "Telegram topic %s of session %s is gone; unbound it, "
+                    "notification %s goes to the notification chat",
+                    topic, session_id, notification_id,
+                )
+                router = getattr(self.engine, "router", None)
+                if router is not None and hasattr(router, "forget_channel"):
+                    await router.forget_channel(f"telegram:{topic}")
+        if not sink:
+            return None
+        return await self._send_telegram_to(
+            sink, bot, notification_id, notif_type, session_id, title,
+            body, priority, options, silent, option_labels, plan_id,
+        )
+
+    async def _send_telegram_to(
+        self,
+        target: str,
+        bot: object,
+        notification_id: str,
+        notif_type: str,
+        session_id: str,
+        title: str,
+        body: str,
+        priority: str,
+        options: list[str] | None,
+        silent: bool,
+        option_labels: dict[str, str] | None,
+        plan_id: str | None,
+    ) -> str | None:
+        """Send one notification card to *target* (a chat, or a topic in it)."""
+        from nerve.channels.telegram import parse_target
+        chat_id, thread_id = parse_target(target)
+
+        text = await self._build_notification_text(
+            session_id, title, body, priority,
+            label_session=self._labels_session(target),
+        )
         link_preview = self._telegram_link_preview(session_id, title, body, text)
 
         if notif_type in ("question", "approval") and options:
@@ -1438,6 +1520,7 @@ class NotificationService:
             msg_id = await self._send_telegram_inline(
                 chat_id, notification_id, text, button_labels, silent=silent,
                 link_preview=link_preview,
+                thread_id=thread_id,
             )
         else:
             markup = None
@@ -1447,10 +1530,23 @@ class NotificationService:
                 markup = InlineKeyboardMarkup(
                     [[InlineKeyboardButton("Open plan", callback_data=callback_data)]]
                 )
-            msg = await self._send_telegram_html(
-                bot, chat_id, text, reply_markup=markup, silent=silent,
-                link_preview=link_preview,
-            )
+            from nerve.channels.telegram import TelegramChannel
+
+            msg = None
+            channel = self._get_telegram_channel()
+            if markup is None and isinstance(channel, TelegramChannel):
+                # A plain card can be a rich message. One with a button
+                # cannot: "Open plan" edits the card's text in place.
+                msg = await channel.send_rich_notification(
+                    chat_id, thread_id, text, silent=silent,
+                    link_preview=link_preview,
+                )
+            if msg is None:
+                msg = await self._send_telegram_html(
+                    bot, chat_id, text, reply_markup=markup, silent=silent,
+                    link_preview=link_preview,
+                    thread_id=thread_id,
+                )
             msg_id = str(msg.message_id)
 
         # Cache for reaction context lookups, and record the reply route so a
@@ -1459,12 +1555,14 @@ class NotificationService:
         if msg_id:
             channel = self._get_telegram_channel()
             if channel:
-                channel._cache_message(int(msg_id), chat_id, text)
+                channel._cache_message(int(msg_id), chat_id, text, thread_id)
                 await channel._record_reply_route(int(msg_id), chat_id, session_id)
+            # The target names the topic too, so /reply and a button tap
+            # answer the card only where it was delivered.
             await self.db.record_notification_delivery(
                 notification_id,
                 "telegram",
-                target=str(chat_id),
+                target=target,
                 message_id=str(msg_id),
             )
 
@@ -1479,6 +1577,7 @@ class NotificationService:
         reply_markup: object | None = None,
         silent: bool = False,
         link_preview: object | None = None,
+        thread_id: int | None = None,
     ) -> object:
         """Send a message with markdown→HTML conversion and plain-text fallback.
 
@@ -1486,7 +1585,7 @@ class NotificationService:
         message (:meth:`_telegram_link_preview`); ``None`` leaves Telegram's
         default.
         """
-        from nerve.channels.telegram import _md_to_tg_html
+        from nerve.channels.telegram import _in_thread, _md_to_tg_html
         from telegram.constants import ParseMode
 
         preview = {"link_preview_options": link_preview} if link_preview is not None else {}
@@ -1498,6 +1597,7 @@ class NotificationService:
                 reply_markup=reply_markup,
                 disable_notification=silent,
                 **preview,
+                **_in_thread(thread_id),
             )
         except Exception:
             return await bot.send_message(
@@ -1505,6 +1605,7 @@ class NotificationService:
                 reply_markup=reply_markup,
                 disable_notification=silent,
                 **preview,
+                **_in_thread(thread_id),
             )
 
     async def _send_telegram_inline(
@@ -1515,6 +1616,7 @@ class NotificationService:
         options: list[str | tuple[str, str]],
         silent: bool = False,
         link_preview: object | None = None,
+        thread_id: int | None = None,
     ) -> str | None:
         """Send Telegram message with inline keyboard buttons.
 
@@ -1552,6 +1654,7 @@ class NotificationService:
         msg = await self._send_telegram_html(
             bot, chat_id, text, reply_markup=keyboard, silent=silent,
             link_preview=link_preview,
+            thread_id=thread_id,
         )
 
         await self.db.update_notification(
@@ -1962,14 +2065,17 @@ class NotificationService:
         bot = self._get_telegram_bot()
         if not bot:
             return
-        chat_id = target or self._resolve_telegram_chat_id()
-        if not chat_id:
+        target = target or self._resolve_telegram_target()
+        if not target:
             return
+        from nerve.channels.telegram import parse_target
+        chat_id, _ = parse_target(target)
 
         title = notif.get("title") or ""
         body = notif.get("body") or ""
         text = await self._build_notification_text(
             notif["session_id"], title, body, notif.get("priority") or "normal",
+            label_session=self._labels_session(target),
         )
         # An edit sets the preview again, so it gets the choice of the delivery.
         link_preview = self._telegram_link_preview(notif["session_id"], title, body, text)
@@ -1981,14 +2087,14 @@ class NotificationService:
 
         try:
             await bot.edit_message_text(
-                chat_id=int(chat_id), message_id=int(message_id),
+                chat_id=chat_id, message_id=int(message_id),
                 text=_md_to_tg_html(text), parse_mode=ParseMode.HTML,
                 **preview,
             )
         except Exception:
             try:
                 await bot.edit_message_text(
-                    chat_id=int(chat_id), message_id=int(message_id),
+                    chat_id=chat_id, message_id=int(message_id),
                     text=text,
                     **preview,
                 )

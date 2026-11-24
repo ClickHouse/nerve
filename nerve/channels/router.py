@@ -30,6 +30,7 @@ from nerve.channels.base import (
     OutboundMessage,
     OutboundRefused,
 )
+from nerve.channels.session_events import TurnFinished, TurnStarted
 from nerve.channels.stream_adapter import StreamAdapter
 from nerve.db.observations import DEFAULT_MAX_ROWS
 from nerve.gateway.auth import is_external_mode
@@ -625,6 +626,77 @@ class ChannelRouter:
         return await self.engine.sessions.list_interactive_sessions(
             limit=limit, offset=offset, current_id=current_id,
         )
+
+    async def channel_keys_for_session(self, session_id: str) -> list[str]:
+        """The channel keys routed to a session, most recently used first."""
+        return await self.engine.db.get_channel_keys_for_session(session_id)
+
+    async def forget_channel(self, channel_key: str) -> None:
+        """Unmap a channel key, so its next message starts a new session."""
+        await self.engine.db.delete_channel_session(channel_key)
+
+    async def set_session_title(self, session_id: str, title: str) -> None:
+        """Retitle a session from a channel, e.g. after a Telegram topic rename."""
+        await self.engine.db.update_session_title(
+            session_id, title, attribution=UNATTRIBUTED, reason="channel",
+        )
+        await broadcaster.broadcast(session_id, {
+            "type": "session_updated",
+            "session_id": session_id,
+            "title": title,
+        })
+
+    async def session_titled(self, session_id: str, title: str) -> None:
+        """Tell every channel that a session got its generated title."""
+        for channel in list(self._channels.values()):
+            try:
+                await channel.on_session_titled(session_id, title)
+            except Exception as exc:
+                logger.warning(
+                    "%s could not act on the title of session %s: %s",
+                    channel.name, session_id, exc,
+                )
+
+    def turn_started(self, event: TurnStarted) -> None:
+        """Tell every channel a turn started. Never raises, never blocks."""
+        for channel in list(self._channels.values()):
+            try:
+                channel.on_turn_started(event)
+            except Exception as exc:
+                logger.warning(
+                    "%s could not act on a turn of %s starting: %s",
+                    channel.name, event.session_id, exc,
+                )
+
+    def turn_finished(self, event: TurnFinished) -> None:
+        """Tell every channel a turn finished. Never raises, never blocks."""
+        for channel in list(self._channels.values()):
+            try:
+                channel.on_turn_finished(event)
+            except Exception as exc:
+                logger.warning(
+                    "%s could not act on a turn of %s finishing: %s",
+                    channel.name, event.session_id, exc,
+                )
+
+    async def session_ending(
+        self, session_id: str, reason: str, timeout: float = 15.0,
+    ) -> None:
+        """Tell every channel a session is being archived or deleted.
+
+        Each channel gets ``timeout`` seconds; one that fails or hangs is
+        logged and skipped, so a Telegram outage cannot hold up a delete.
+        """
+        for channel in list(self._channels.values()):
+            try:
+                await asyncio.wait_for(
+                    channel.on_session_ending(session_id, reason), timeout,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "%s could not act on session %s being %s: %r",
+                    channel.name, session_id, reason, exc,
+                )
 
     async def list_conversation_sessions(
         self, channel_key: str, limit: int = 20,

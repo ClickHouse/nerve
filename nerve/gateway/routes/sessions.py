@@ -5,16 +5,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from nerve.agent.backends.base import BackendError
 from nerve.agent.backends.codex import daybreak
 from nerve.agent.interactive import get_awaiting_ids
+from nerve.channels.session_events import SESSION_DELETED
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
@@ -108,6 +112,19 @@ class SessionCreateRequest(BaseModel):
     # Optional review loop attached at creation: this session becomes the
     # loop's observer (milestones land here; cwd is the shared workspace).
     review_loop: ReviewLoopRequest | None = None
+
+
+class TelegramTopicOpenRequest(BaseModel):
+    # The topic's name; the session's title when empty
+    title: str | None = Field(None, max_length=128)
+    # The chat to open it in; the notification chat, else the first
+    # allowed user's DM, when empty
+    chat_id: int | None = None
+
+
+class TelegramTopicCloseRequest(BaseModel):
+    # A last message posted in the topic before it closes
+    note: str | None = Field(None, max_length=32768)
 
 
 class ForkRequest(BaseModel):
@@ -810,6 +827,9 @@ _DELETE_BUSY_DETAIL = (
 async def _delete_with_engine(engine, db, session_id: str, actor: Actor) -> None:
     """Delete a session that has no turn work: its client, agent records,
     rows and uploads; memorize it from a snapshot; expire its questions."""
+    # Channels let go of the session first: its topic bindings go with
+    # the rows. Bounded and never raising (AgentEngine.session_ending).
+    await engine.session_ending(session_id, SESSION_DELETED)
     # Disconnect client
     client = engine.sessions.remove_client(session_id, reason="deleted")
     if client:
@@ -1093,6 +1113,79 @@ async def unarchive_session(session_id: str, actor: Actor = Depends(require_auth
         return {"unarchived": True}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+def _telegram_channel(deps) -> Any | None:
+    """The Telegram channel when it is running, else ``None``."""
+    engine = deps.engine
+    channel = engine.channel("telegram") if engine is not None and hasattr(engine, "channel") else None
+    if channel is None or getattr(channel, "_app", None) is None:
+        return None
+    return channel
+
+
+@router.post("/api/sessions/{session_id}/telegram-topic")
+async def open_telegram_topic(
+    session_id: str,
+    req: TelegramTopicOpenRequest | None = None,
+    actor: Actor = Depends(require_auth),
+):
+    """Show a session in a Telegram topic of its own, opening one if needed.
+
+    Idempotent: a session with a topic in the chat already gets its card
+    posted there, and ``opened`` is false. See
+    :meth:`nerve.channels.telegram.TelegramChannel.open_session_topic`.
+    """
+    deps = get_deps()
+    if not await deps.db.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    channel = _telegram_channel(deps)
+    if channel is None:
+        raise HTTPException(status_code=503, detail="Telegram is not running")
+    req = req or TelegramTopicOpenRequest()
+    result = await channel.open_session_topic(
+        session_id, title=req.title or None, chat_id=req.chat_id,
+    )
+    if result.retry_after is not None:
+        raise HTTPException(
+            status_code=429, detail=result.error,
+            headers={"Retry-After": str(math.ceil(result.retry_after))},
+        )
+    if result.channel_key is None:
+        raise HTTPException(status_code=400, detail=result.error)
+    return {"channel_key": result.channel_key, "opened": result.opened}
+
+
+@router.delete("/api/sessions/{session_id}/telegram-topic")
+async def close_telegram_topic(
+    session_id: str,
+    req: TelegramTopicCloseRequest | None = None,
+    actor: Actor = Depends(require_auth),
+):
+    """Post an optional note in the session's topics, close them and unbind them.
+
+    The session is not stopped or archived. ``topics`` lists each topic let
+    go of with its outcome: ``closed``, ``left_open`` (a private chat, where
+    Telegram cannot close topics) or ``gone`` (deleted already). A session
+    with no topic gives an empty list. See
+    :meth:`nerve.channels.telegram.TelegramChannel.close_session_topic`.
+    """
+    deps = get_deps()
+    if not await deps.db.get_session(session_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    channel = _telegram_channel(deps)
+    if channel is None:
+        raise HTTPException(status_code=503, detail="Telegram is not running")
+    topics, error = await channel.close_session_topic(
+        session_id, note=req.note if req else None,
+    )
+    body = {
+        "closed": not error,
+        "topics": [{"channel_key": t.channel_key, "outcome": t.outcome} for t in topics],
+    }
+    if error:
+        return JSONResponse(status_code=400, content={"detail": error, **body})
+    return body
 
 
 @router.get("/api/sessions/{session_id}/events")
