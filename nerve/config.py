@@ -1190,6 +1190,12 @@ class SubagentsConfig:
         )
 
 
+#: The environment variable that names the launcher of the Claude CLI when no
+#: settings layer names ``agent.cli_launcher``: a service unit can set it for
+#: the machine without a line in a settings file.
+CLI_LAUNCHER_ENV = "NERVE_AGENT_CLI_LAUNCHER"
+
+
 @dataclass
 class AgentConfig:
     # Agent backend for NEW sessions: "claude" (Claude Agent SDK) or
@@ -1299,6 +1305,17 @@ class AgentConfig:
     # 1.3 MB line.  The CLI caps one image at 5 MiB of base64 (~10.5 MB per
     # line worst case); 64 MiB leaves headroom for document blocks.
     cli_max_message_bytes: int = 64 * 1024 * 1024
+    # A program that starts the Claude CLI in Nerve's place (an absolute path;
+    # empty = Nerve starts the CLI itself).  Nerve runs it with the CLI's
+    # arguments and names the CLI in NERVE_AGENT_CLI_PATH; the program ends by
+    # replacing itself with that CLI (``exec "$NERVE_AGENT_CLI_PATH" "$@"``),
+    # so the CLI keeps the process ID and the pipes Nerve talks to.  It is the
+    # place to put the agent's commands, which the CLI starts, apart from
+    # Nerve itself: under a memory limit, a lower CPU priority or a process
+    # group of their own (docs/config.md, "A launcher for the agent CLI").
+    # When no settings layer names it, NERVE_AGENT_CLI_LAUNCHER does.  Read at
+    # every start of a CLI.
+    cli_launcher: str = ""
     # When True, background sub-agents (the Agent tool with run_in_background, or
     # background Bash) get the SAME auto-approved tool permissions as foreground
     # agents, via a PreToolUse hook that pre-approves all non-interactive tools.
@@ -1371,6 +1388,11 @@ class AgentConfig:
             cli_idle_timeout_seconds=d.get("cli_idle_timeout_seconds", 900),
             cli_max_message_bytes=int(
                 d.get("cli_max_message_bytes", 64 * 1024 * 1024)
+            ),
+            # A blank value is unset: the environment's launcher then applies.
+            cli_launcher=(
+                _setting_str(d.get("cli_launcher"))
+                or _setting_str(os.environ.get(CLI_LAUNCHER_ENV))
             ),
             background_agent_permissions=d.get("background_agent_permissions", True),
             agent_teams=d.get("agent_teams", True),
