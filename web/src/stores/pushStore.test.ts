@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { ApiError } from '../api/hosted';
+import { ApiError, useHostedStore } from '../api/hosted';
+import { endpointDigest } from '../utils/webPush';
 import {
   ENDPOINT, OTHER_KEY, PUBLIC_KEY, device, fakeSubscription, stubPushBrowser, unstubPushBrowser,
 } from '../test/pushFixtures';
@@ -29,6 +30,7 @@ beforeEach(() => {
 afterEach(() => {
   unstubPushBrowser();
   vi.unstubAllGlobals();
+  useHostedStore.setState({ mode: 'local' });
 });
 
 describe('pushStore', () => {
@@ -134,5 +136,88 @@ describe('pushStore', () => {
     api.deletePushDevice.mockRejectedValueOnce(new ApiError(404, '{"detail": "This browser does not get push notifications."}'));
     await store().remove(3);
     expect(store().error).toBe('This browser does not get push notifications.');
+  });
+});
+
+describe('pushStore in hosted mode', () => {
+  const hosted = (digest: string, id = 'a1b2') => device({ id, endpoint: undefined, endpoint_digest: digest, last_success_at: undefined });
+
+  beforeEach(() => useHostedStore.setState({ mode: 'external' }));
+
+  it('finds this browser by the digest of its endpoint', async () => {
+    stubBrowser({ permission: 'granted' });
+    stubPushBrowser({ subscription: fakeSubscription() });
+    const mine = hosted(await endpointDigest(ENDPOINT), 'mine');
+    api.pushDevices.mockResolvedValue({ public_key: PUBLIC_KEY, subscriptions: [hosted('other-digest', 'other'), mine] });
+
+    await store().load();
+
+    expect(thisDevice(store())).toBe(mine);
+    await store().turnOff();
+    expect(api.deletePushDevice).toHaveBeenCalledWith('mine');
+  });
+
+  it('finds no browser when no digest matches', async () => {
+    stubBrowser({ permission: 'granted' });
+    stubPushBrowser({ subscription: fakeSubscription() });
+    api.pushDevices.mockResolvedValue({ public_key: PUBLIC_KEY, subscriptions: [hosted('other-digest')] });
+
+    await store().load();
+
+    expect(store().endpoint).toBe(ENDPOINT);
+    expect(thisDevice(store())).toBeUndefined();
+  });
+
+  it('says that push is not available, with no error, when the gateway has no push routes', async () => {
+    stubPushBrowser();
+    api.pushDevices.mockRejectedValue(new ApiError(404, '{"reason": "not_found", "requestId": "r-1"}'));
+
+    await store().load();
+
+    expect(store().available).toBe(false);
+    expect(store().error).toBeNull();
+  });
+
+  it('names the limit of browsers, and no gateway body in another error', async () => {
+    stubBrowser({ permission: 'granted' });
+    stubPushBrowser();
+    api.pushDevices.mockResolvedValue({ public_key: PUBLIC_KEY, subscriptions: [] });
+    api.savePushDevice.mockRejectedValueOnce(new ApiError(409, '{"reason": "subscription_limit", "requestId": "r-1"}'));
+
+    expect(await store().turnOn('important')).toBe(false);
+    expect(store().error).toBe('Push is on in the maximum number of browsers already. Remove one first.');
+
+    api.savePushDevice.mockRejectedValueOnce(new ApiError(400, '{"reason": "invalid_request", "requestId": "r-2"}'));
+    expect(await store().turnOn('important')).toBe(false);
+    expect(store().error).toBe('Could not change push notifications for this browser.');
+  });
+
+  it('sends only the endpoint, the keys and the level', async () => {
+    stubBrowser({ permission: 'granted' });
+    stubPushBrowser();
+    api.pushDevices.mockResolvedValue({ public_key: PUBLIC_KEY, subscriptions: [] });
+
+    await store().turnOn('all');
+
+    expect(api.savePushDevice).toHaveBeenCalledWith({
+      endpoint: ENDPOINT, keys: { p256dh: 'p256dh-key', auth: 'auth-key' }, level: 'all',
+    });
+  });
+
+  it('shows an error for another failure', async () => {
+    stubPushBrowser();
+    api.pushDevices.mockRejectedValue(new ApiError(503, '{"reason": "unavailable", "requestId": "r-1"}'));
+
+    await store().load();
+
+    expect(store().available).toBe(true);
+    expect(store().error).toBe('Could not load your devices.');
+  });
+});
+
+describe('endpointDigest', () => {
+  it('is SHA-256 of the endpoint in base64url without padding', async () => {
+    // SHA-256 of "abc" (FIPS 180-2 test vector).
+    expect(await endpointDigest('abc')).toBe('ungWv48Bz-pBQUDeXa4iI7ADYaOWF3qctBD_YfIAFa0');
   });
 });

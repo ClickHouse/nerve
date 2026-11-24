@@ -854,7 +854,9 @@ Sends one `high` "Test notification" through the normal fan-out (so a
 channel at `important` gets it too) and answers
 `{notification_id, silenced, results: [{channel, delivered}]}`, one result
 for each channel in `notifications.channels`, and one for `webpush` when a
-browser has push on (`delivered`: a push service took it). `silenced` is true
+browser has push on (`delivered`: a push service took it). In external mode
+the `webpush` result is always there, and `delivered` says whether the
+platform took the notification for push. `silenced` is true
 when a silence rule matched, so only the panel shows it.
 
 ### Notifications
@@ -910,6 +912,19 @@ The installable panel and its push notifications (see
 [config.md](config.md#web-push)). The subscription routes need a signed-in
 person (a system or MCP token is `403`), and a person sees and removes only
 their own browsers.
+
+The subscription routes exist in local mode only. In external mode the
+platform delivers Web Push: Nerve registers only the manifest route, and the
+panel uses the gateway's routes below `/_nerve/push/`. Nerve does not create,
+read or use a VAPID key or push subscriptions for Web Push, and sends no push. For each notification that `notifications.levels.webpush`
+lets through, the fan-out sends the `platform_notify` operation on a hosted
+channel connection that advertises it. The operation holds the notification
+id, type, title (at most 120 characters), the first 3 lines of the body that
+are not blank (at most 180 characters), priority, the silent flag after quiet
+hours, and the agent name. The fan-out does not wait for a stream and does
+not retry. When the gateway takes the operation, the notification counts as
+delivered to `webpush`; with no such connection, or another outcome, it does
+not.
 
 #### `GET /api/manifest.webmanifest`
 

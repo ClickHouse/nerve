@@ -1,21 +1,30 @@
 import { create } from 'zustand';
 import { api } from '../api/client';
-import { ApiError } from '../api/hosted';
+import { ApiError, isHosted } from '../api/hosted';
 import type { PushDevice } from '../api/push';
 import type { NotificationLevel } from '../api/settings';
 import {
-  base64UrlBytes, browserSubscription, madeWithKey, pushSupported, registerWorker,
+  base64UrlBytes, browserSubscription, endpointDigest, madeWithKey, pushSupported, registerWorker,
 } from '../utils/webPush';
 import { errorDetail } from './accountStore';
 
 const LOAD_FAILED = 'Could not load your devices.';
 const CHANGE_FAILED = 'Could not change push notifications for this browser.';
+/** The reason of the gateway when the person has push on in its maximum of browsers. */
+const SUBSCRIPTION_LIMIT = 'subscription_limit';
+const TOO_MANY = 'Push is on in the maximum number of browsers already. Remove one first.';
+/** The reason of the gateway when it has no push routes for this agent. */
+const NOT_FOUND = 'not_found';
 
 export interface PushState {
   /** The browsers of this person that get push notifications. */
   devices: PushDevice[];
   /** The endpoint of this browser's subscription, when it uses the instance's current key. */
   endpoint: string | null;
+  /** SHA-256 of `endpoint` (base64url), in hosted mode only: the gateway lists browsers by it. */
+  endpointDigest: string | null;
+  /** False when the gateway offers no push for this agent (hosted mode). */
+  available: boolean;
   publicKey: string | null;
   busy: boolean;
   error: string | null;
@@ -26,16 +35,32 @@ export interface PushState {
   /** Saves the level of this browser when push is on here. False when the save failed. */
   setLevel: (level: NotificationLevel) => Promise<boolean>;
   /** Turns push off for another browser of this person. */
-  remove: (id: number) => Promise<boolean>;
+  remove: (id: number | string) => Promise<boolean>;
 }
 
-/** The server's row of this browser, when push is on here. */
-export function thisDevice(state: Pick<PushState, 'devices' | 'endpoint'>): PushDevice | undefined {
-  return state.endpoint ? state.devices.find((d) => d.endpoint === state.endpoint) : undefined;
+/**
+ * The server's row of this browser, when push is on here. A local row names
+ * its endpoint; a row of the gateway names only the digest of its endpoint.
+ */
+export function thisDevice(
+  state: Pick<PushState, 'devices' | 'endpoint' | 'endpointDigest'>,
+): PushDevice | undefined {
+  if (!state.endpoint) return undefined;
+  return state.devices.find((d) => (d.endpoint !== undefined
+    ? d.endpoint === state.endpoint
+    : d.endpoint_digest !== undefined && d.endpoint_digest === state.endpointDigest));
+}
+
+/** The gateway has no push routes for this agent, for example with push switched off. */
+function notOffered(e: unknown): boolean {
+  return isHosted() && e instanceof ApiError && e.status === 404 && e.reason === NOT_FOUND;
 }
 
 function failure(e: unknown): string {
-  return e instanceof ApiError ? errorDetail(e, CHANGE_FAILED) : CHANGE_FAILED;
+  if (!(e instanceof ApiError)) return CHANGE_FAILED;
+  // A gateway error body has a reason code and no text for people.
+  if (e.reason === SUBSCRIPTION_LIMIT) return TOO_MANY;
+  return e.reason === null ? errorDetail(e, CHANGE_FAILED) : CHANGE_FAILED;
 }
 
 async function save(subscription: PushSubscription, level: NotificationLevel): Promise<void> {
@@ -69,6 +94,8 @@ export const usePushStore = create<PushState>((set, get) => {
   return {
     devices: [],
     endpoint: null,
+    endpointDigest: null,
+    available: true,
     publicKey: null,
     busy: false,
     error: null,
@@ -78,8 +105,15 @@ export const usePushStore = create<PushState>((set, get) => {
           api.pushDevices(), browserSubscription(),
         ]);
         const current = subscription && madeWithKey(subscription, public_key) ? subscription.endpoint : null;
-        set({ devices: subscriptions, publicKey: public_key, endpoint: current });
-      } catch {
+        const digest = current && isHosted() ? await endpointDigest(current) : null;
+        set({
+          devices: subscriptions, publicKey: public_key, endpoint: current, endpointDigest: digest, available: true,
+        });
+      } catch (e) {
+        if (notOffered(e)) {
+          set({ devices: [], endpoint: null, endpointDigest: null, available: false, error: null });
+          return;
+        }
         set({ error: LOAD_FAILED });
       }
     },

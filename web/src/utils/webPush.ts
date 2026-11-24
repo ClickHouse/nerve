@@ -52,6 +52,15 @@ export function base64UrlBytes(text: string): Uint8Array<ArrayBuffer> {
   return Uint8Array.from(binary, (c) => c.charCodeAt(0));
 }
 
+/**
+ * SHA-256 of a push endpoint, base64url without padding. The gateway lists
+ * the browsers of a person by this digest, never by their endpoints.
+ */
+export async function endpointDigest(endpoint: string): Promise<string> {
+  const hash = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(endpoint)));
+  return btoa(String.fromCharCode(...hash)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
 /** The browser made the subscription with this VAPID public key (base64url). */
 export function madeWithKey(subscription: PushSubscription, publicKey: string): boolean {
   const used = subscription.options.applicationServerKey;

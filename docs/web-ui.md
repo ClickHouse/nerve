@@ -467,6 +467,16 @@ removes each one.
   configuration file. A backup without secrets has no key, so after a restore
   each browser must turn push on again. When a push service answers `404` or
   `410`, the browser dropped the subscription, and Nerve deletes it.
+- **External mode:** the platform delivers Web Push, so the instance needs no
+  VAPID key, no subscription routes and no access to a push service. The
+  panel uses the gateway's routes below `/_nerve/push/` with the session
+  cookie. The gateway keeps the browsers of each person and decides at send
+  time who gets a push. It lists a browser by the SHA-256 digest of its
+  endpoint, never by the endpoint, and the panel finds "this browser" by that
+  digest. It does not report the last notification. Nerve hands each item
+  over to the platform (see [api.md](api.md#web-push)). When the gateway
+  offers no push for the agent, the row says that push notifications are
+  not available.
 - **Install:** the panel has a web app manifest (`/api/manifest.webmanifest`)
   with the agent's name and Nerve's app icon, so a browser can install it as an
   app. `apple-touch-icon.png` is the Home Screen icon on iPhone and iPad. Push
@@ -475,13 +485,12 @@ removes each one.
   has no fetch handler, so every page comes from the server.
 - **Limits:** HTTPS only (and `localhost`). On iPhone and iPad, push works
   only after "Add to Home Screen" (iOS 16.4 or later), and a Safari tab says
-  so. The instance must reach `fcm.googleapis.com` (Chrome and most Chromium
-  browsers), `updates.push.services.mozilla.com` (Firefox),
+  so. In local mode the instance must reach `fcm.googleapis.com` (Chrome and
+  most Chromium browsers), `updates.push.services.mozilla.com` (Firefox),
   `*.push.apple.com` (Safari) and `*.notify.windows.com` (Edge). On Nerve
-  Cloud, an agent in restricted internet mode cannot reach them, so Web Push
-  works only for agents in open mode, and each agent has its own address, so
-  a device turns push on for each agent. With several people on one agent,
-  each person with push on gets every notification. No answer buttons.
+  Cloud each agent has its own address, so a device turns push on for each
+  agent. With several people on one agent, each person with push on gets
+  every notification. No answer buttons.
 
 ### Accounts
 

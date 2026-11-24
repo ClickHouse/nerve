@@ -1,0 +1,26 @@
+{
+  "version": "1",
+  "kind": "capabilities",
+  "request_id": "g-7",
+  "connection_id": "2ddc77d6-2244-4fd9-baa4-e1de2ca9e220",
+  "payload": {
+    "capabilities": {
+      "self": {
+        "id": "nerve-platform",
+        "kind": "app",
+        "display_name": "Nerve Cloud"
+      },
+      "operations": [
+        "platform_notify"
+      ],
+      "limits": {
+        "in_flight_operations": 16,
+        "operation_deadline_millis": 10000,
+        "text_characters": 4000,
+        "edit_interval_millis": 0,
+        "file_bytes": 0
+      },
+      "provider": "platform"
+    }
+  }
+}

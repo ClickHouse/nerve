@@ -48,7 +48,7 @@ from nerve.gateway.routes.setup import (
 )
 from nerve.identity import Actor
 from nerve.notifications.quiet_hours import minutes_of_day
-from nerve.notifications.webpush import PUSH_CHANNEL
+from nerve.notifications.webpush import PUSH_CHANNEL, platform_sends
 from nerve.setup_writer import merge_machine_paths, merge_private_paths, merge_settings_paths
 
 logger = logging.getLogger(__name__)
@@ -385,7 +385,9 @@ async def put_notifications(
 async def test_notifications(actor: Actor = Depends(require_person)):
     """Send one test notification through the normal fan-out, and say for
     each listed channel whether it took it, and for Web Push (when a browser
-    has it on) whether a push service took it."""
+    has it on) whether a push service took it. In external mode the
+    ``webpush`` result is always there and says whether the platform took
+    the notification for push."""
     ctx = await _context(actor)
     _require_claimed(ctx)
     deps = get_deps()
@@ -398,7 +400,7 @@ async def test_notifications(actor: Actor = Depends(require_person)):
     row = await deps.db.get_notification(notification_id) or {}
     delivered = set(json.loads(row.get("channels_delivered") or "[]"))
     channels = ctx.config.notifications.delivery_channels()
-    if await deps.db.list_push_subscriptions():
+    if platform_sends() or await deps.db.list_push_subscriptions():
         channels = [*channels, PUSH_CHANNEL]
     return {
         "notification_id": notification_id,

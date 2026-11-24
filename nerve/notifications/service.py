@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 from nerve.identity import actor_id_of, attribution_for
 from nerve.links import link_stays_whole, markdown_link, session_url, without_code
 from nerve.notifications import handlers as _handlers
-from nerve.notifications import webpush
+from nerve.notifications import platform_push, webpush
 from nerve.notifications.date_render import render_iso_dates
 from nerve.notifications.quiet_hours import deliver_silently
 
@@ -1119,7 +1119,9 @@ class NotificationService:
 
         Without ``channels`` the configured list goes out, with the panel
         in it (:meth:`NotificationsConfig.delivery_channels`), and Web Push
-        to the browsers that turned it on (:func:`webpush.deliver`). A channel whose
+        to the browsers that turned it on (:func:`webpush.deliver`). In
+        external mode the platform delivers Web Push, and the notification
+        is handed over to it (:func:`platform_push.hand_over`). A channel whose
         ``notifications.levels`` entry is ``important`` skips an item below
         that level (:meth:`NotificationsConfig.wants`).
 
@@ -1171,11 +1173,18 @@ class NotificationService:
                         return None
                     return "slack"
                 elif channel_name == webpush.PUSH_CHANNEL:
-                    pushed = await webpush.deliver(
-                        self.db, self.config, notification_id=notification_id,
-                        notif_type=notif_type, title=title, body=body,
-                        priority=priority, silent=silent,
-                    )
+                    if webpush.platform_sends():
+                        pushed = await platform_push.hand_over(
+                            self.engine.get_channel_runtime("hosted"), self.config,
+                            notification_id=notification_id, notif_type=notif_type,
+                            title=title, body=body, priority=priority, silent=silent,
+                        )
+                    else:
+                        pushed = await webpush.deliver(
+                            self.db, self.config, notification_id=notification_id,
+                            notif_type=notif_type, title=title, body=body,
+                            priority=priority, silent=silent,
+                        )
                     return webpush.PUSH_CHANNEL if pushed else None
                 else:
                     logger.warning(

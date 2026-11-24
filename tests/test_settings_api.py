@@ -301,6 +301,39 @@ class TestSendTest:
             response = await http.post(f"{URL}/test")
         assert response.json()["results"][-1] == {"channel": "webpush", "delivered": True}
 
+    @pytest.mark.parametrize("taken", [True, False])
+    async def test_in_external_mode_web_push_says_whether_the_platform_took_the_test(
+        self, inst, monkeypatch, taken,
+    ):
+        from nerve.notifications import platform_push, webpush
+
+        async def no_subscriptions(*args, **kwargs):
+            raise AssertionError("external mode read the push subscriptions")
+
+        handed: list[str] = []
+
+        async def hand_over(runtime, config, *, notification_id, **kwargs):
+            handed.append(notification_id)
+            return taken
+
+        monkeypatch.setattr(webpush, "platform_sends", lambda: True)
+        monkeypatch.setattr(settings_routes, "platform_sends", lambda: True)
+        monkeypatch.setattr(platform_push, "hand_over", hand_over)
+        monkeypatch.setattr(inst.db, "list_push_subscriptions", no_subscriptions)
+        engine = MagicMock()
+        service = NotificationService(get_config(), inst.db, engine)
+        monkeypatch.setattr(service, "_deliver_web", AsyncMock())
+        monkeypatch.setattr(service, "_deliver_telegram", AsyncMock(return_value=None))
+        monkeypatch.setattr(service, "_deliver_slack", AsyncMock(return_value=None))
+        monkeypatch.setattr(deps_module, "_deps", deps_module.RouteDeps(
+            engine=engine, db=inst.db, notification_service=service,
+        ))
+        async with inst.client() as http:
+            response = await http.post(f"{URL}/test")
+        body = response.json()
+        assert handed == [body["notification_id"]]
+        assert body["results"][-1] == {"channel": "webpush", "delivered": taken}
+
     async def test_without_a_notification_service_the_test_is_refused(self, inst):
         async with inst.client() as http:
             response = await http.post(f"{URL}/test")
