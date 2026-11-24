@@ -295,7 +295,10 @@ def _github_repos_text(config: Any) -> str:
     how = "the channel gateway polls" if config.sync.github.mode == "hosted" else "polled here with `gh`"
     text = f"on ({how}): new {what} in {_names(repos)}"
     if watch.updates:
-        text += "; also new commits, ready for review, merges and closes of the pull requests it reported"
+        text += (
+            "; also new commits, ready for review, merges, closes and reopenings "
+            "of the pull requests it reported"
+        )
     return text
 
 

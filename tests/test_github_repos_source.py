@@ -49,10 +49,13 @@ def user(login: str = "alice", kind: str = "User") -> dict[str, Any]:
 def pull(
     number: int, *, created: int = 0, updated: int | None = None, author: str = "alice",
     kind: str = "User", draft: bool = False, state: str = "open", merged: int | None = None,
-    sha: str = SHA_A, title: str | None = None, body: str = "", labels: tuple[str, ...] = (),
-    repo: str = REPO,
+    closed: int | None = None, sha: str = SHA_A, title: str | None = None, body: str = "",
+    labels: tuple[str, ...] = (), repo: str = REPO,
 ) -> dict[str, Any]:
-    """A pull request as the pulls listing returns it."""
+    """A pull request as the pulls listing returns it. One whose state is
+    closed was closed at *closed*, or else when it was merged or last updated."""
+    if closed is None:
+        closed = merged if merged is not None else updated or created
     return {
         "number": number,
         "title": title or f"Pull request {number}",
@@ -60,7 +63,7 @@ def pull(
         "state": state,
         "draft": draft,
         "merged_at": at(merged) if merged is not None else None,
-        "closed_at": at(merged if merged is not None else updated or created) if state == "closed" else None,
+        "closed_at": at(closed) if state == "closed" else None,
         "created_at": at(created),
         "updated_at": at(created if updated is None else updated),
         "head": {"sha": sha, "ref": "feature", "label": f"{author}:feature"},
@@ -191,6 +194,11 @@ class FakeGitHub:
 # When the tests read the listings, unless a test moves the clock.
 NOW = START + timedelta(hours=1)
 STAMP = NOW.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def ago(**delta: int) -> str:
+    """A GitHub timestamp that long before ``NOW``."""
+    return (NOW - timedelta(**delta)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def source(fake: FakeGitHub, *, clock: Any = None, **settings: Any) -> GitHubReposSource:
@@ -1162,14 +1170,17 @@ async def test_without_drafts_a_draft_is_held_until_it_is_ready():
     assert cursor_of(held)["repos"][REPO]["prs"] == {
         "1": [SHA_A[:12], True, True], "2": [SHA_A[:12], True, True],
     }
-    # A push while it is a draft reports nothing; the other draft is closed.
+    # A push while it is a draft reports nothing; the other draft is closed,
+    # which reports nothing either, and it stays held, marked closed.
     fake.pulls[REPO] = [
         pull(1, created=1, updated=5, draft=True, sha=SHA_B),
         pull(2, created=2, updated=6, draft=True, state="closed"),
     ]
     pushed = await src.fetch(held.next_cursor)
     assert pushed.records == []
-    assert cursor_of(pushed)["repos"][REPO]["prs"] == {"1": [SHA_B[:12], True, True]}
+    assert cursor_of(pushed)["repos"][REPO]["prs"] == {
+        "1": [SHA_B[:12], True, True], "2": [SHA_A[:12], True, True, at(6)],
+    }
 
     fake.pulls[REPO][0] = pull(1, created=1, updated=9, draft=False, sha=SHA_B, title="Widget cache")
     ready = await src.fetch(pushed.next_cursor)
@@ -1179,9 +1190,81 @@ async def test_without_drafts_a_draft_is_held_until_it_is_ready():
     assert record.summary == "[acme/widgets] PR #1 ready for review: Widget cache"
     assert "Event: ready" in record.content and record.timestamp == at(9)
     assert record.metadata["event"] == "ready"
-    # Reported once; without updates nothing is followed any more.
-    assert "prs" not in cursor_of(ready)["repos"][REPO]
+    # Reported once; without updates it is not followed any more. The closed
+    # draft is still held.
+    assert cursor_of(ready)["repos"][REPO]["prs"] == {"2": [SHA_A[:12], True, True, at(6)]}
     assert (await src.fetch(ready.next_cursor)).records == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("updates", [False, True])
+async def test_a_held_draft_stays_held_through_a_close_until_it_is_open_and_ready(updates):
+    """A held draft that is closed without a merge reports nothing and stays
+    held, with or without updates, and so does a new draft that a listing
+    first shows closed. Reopened as a draft it is held again; reopened ready
+    for review it is reported, as ready: its first record. A held draft that
+    is merged is forgotten, and never reported."""
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], include_drafts=False, updates=updates)
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1, draft=True), pull(2, created=2, draft=True)]
+    held = await src.fetch(cursor)
+    # 1 is closed, and commented on a minute later. 2 is marked ready and
+    # merged. 3 and 4 are new drafts that are closed already; the listing
+    # shows a merge of 4, so it is not held.
+    ended = [
+        pull(2, created=2, updated=5, state="closed", merged=5),
+        pull(4, created=6, draft=True, state="closed", merged=6),
+    ]
+    fake.pulls[REPO] = [
+        pull(1, created=1, updated=5, draft=True, state="closed", closed=4),
+        pull(3, created=6, draft=True, state="closed"), *ended,
+    ]
+
+    closed = await src.fetch(held.next_cursor)
+
+    assert closed.records == []
+    # Each is held with the time of its close.
+    assert cursor_of(closed)["repos"][REPO]["prs"] == {
+        "1": [SHA_A[:12], True, True, at(4)], "3": [SHA_A[:12], True, True, at(6)],
+    }
+    # Both are reopened: 1 as a draft, with a new head, and 3 ready for review.
+    fake.pulls[REPO] = [pull(1, created=1, updated=8, draft=True, sha=SHA_B), pull(3, created=6, updated=9), *ended]
+    reopened = await src.fetch(closed.next_cursor)
+    assert [record.id for record in reopened.records] == [f"{REPO}#3:ready:{SHA_A}"]
+    followed = {"3": [SHA_A[:12], False, False]} if updates else {}
+    assert cursor_of(reopened)["repos"][REPO]["prs"] == {"1": [SHA_B[:12], True, True], **followed}
+
+    fake.pulls[REPO][0] = pull(1, created=1, updated=10, sha=SHA_B)
+    ready = await src.fetch(reopened.next_cursor)
+
+    assert [record.id for record in ready.records] == [f"{REPO}#1:ready:{SHA_B}"]
+    if updates:
+        followed["1"] = [SHA_B[:12], False, False]
+    assert cursor_of(ready)["repos"][REPO].get("prs", {}) == followed
+
+
+@pytest.mark.asyncio
+async def test_a_held_draft_that_is_closed_after_it_was_marked_ready_stays_held():
+    """Marked ready and closed since the last listing: the listing shows it
+    closed, and no draft. It was never reported, so its close is not either,
+    and it stays held. Listed open again and no draft, it is reported as
+    ready."""
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], include_drafts=False)
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1, draft=True)]
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=1, updated=4, state="closed", closed=3)]
+
+    closed = await src.fetch(cursor)
+
+    assert closed.records == []
+    assert cursor_of(closed)["repos"][REPO]["prs"] == {"1": [SHA_A[:12], False, True, at(3)]}
+    fake.pulls[REPO] = [pull(1, created=1, updated=6)]
+    reopened = await src.fetch(closed.next_cursor)
+    assert [record.id for record in reopened.records] == [f"{REPO}#1:ready:{SHA_A}"]
+    assert "prs" not in cursor_of(reopened)["repos"][REPO]
 
 
 @pytest.mark.asyncio
@@ -1240,14 +1323,225 @@ async def test_with_updates_a_close_without_a_merge_is_closed():
     cursor = await baseline(src)
     fake.pulls[REPO] = [pull(1, created=1, title="Widget cache")]
     cursor = (await src.fetch(cursor)).next_cursor
-    fake.pulls[REPO] = [pull(1, created=1, updated=8, state="closed", title="Widget cache")]
+    # Made a draft, pushed to and closed, and commented on a minute later: the
+    # listing shows the new head and both times.
+    fake.pulls[REPO] = [pull(
+        1, created=1, updated=8, state="closed", closed=7, draft=True, sha=SHA_B, title="Widget cache",
+    )]
 
-    [record] = (await src.fetch(cursor)).records
+    result = await src.fetch(cursor)
 
-    assert record.id == f"{REPO}#1:closed:closed"
+    [record] = result.records
+    # A pull request can close more than once, so the time of the close names
+    # it, and it is the record's time.
+    assert record.id == f"{REPO}#1:closed:{at(7)}"
     assert record.summary == "[acme/widgets] PR #1 closed: Widget cache"
-    assert record.timestamp == at(8)
+    assert record.timestamp == at(7)
     assert "State: closed" in record.content
+    # It stays followed, with the time of its close, and with the head and
+    # the draft state as listed.
+    assert cursor_of(result)["repos"][REPO]["prs"] == {"1": [SHA_B[:12], True, False, at(7)]}
+
+
+@pytest.mark.asyncio
+async def test_a_close_without_a_time_has_the_word_closed_in_its_id():
+    """GitHub gives every close a time. Without one the record is named
+    closed and dated by the update, and the pull request is not kept: there is
+    no close to count the thirty days from."""
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], updates=True)
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1)]
+    cursor = (await src.fetch(cursor)).next_cursor
+    timeless = pull(1, created=1, updated=8, state="closed")
+    timeless["closed_at"] = None
+    fake.pulls[REPO] = [timeless]
+
+    result = await src.fetch(cursor)
+
+    [record] = result.records
+    assert (record.id, record.timestamp) == (f"{REPO}#1:closed:closed", at(8))
+    assert "prs" not in cursor_of(result)["repos"][REPO]
+
+
+def test_a_reopened_record_needs_the_close_that_it_ends():
+    """The open pull request does not say when it was closed, so the record
+    cannot be named without the close that the cursor kept."""
+    item = pull(1, created=1, updated=5)
+
+    with pytest.raises(ValueError, match="needs the close"):
+        module.pull_request_record(REPO, item, "reopened")
+
+    assert module.pull_request_record(REPO, item, "reopened", close=at(3)).id == f"{REPO}#1:reopened:{at(3)}"
+
+
+@pytest.mark.asyncio
+async def test_a_closed_pull_request_stays_followed_and_its_reopening_is_reported():
+    """With updates, a reported pull request that is closed without a merge
+    stays in the cursor, with the time of its close. Listed open again it is
+    reported as reopened and is followed as before: its new heads and its
+    merge report. The time of a close names its record and the record of the
+    reopening that ends it, so each close and each reopening has an id of its
+    own. A comment reports nothing, on the closed pull request or after its
+    reopening."""
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], updates=True)
+    cursor = await baseline(src)
+    listed: dict[str, Any] = {"created": 2, "title": "Add a widget cache", "author": "bob"}
+    records: list[SourceRecord] = []
+
+    async def after(**changes: Any) -> tuple[list[str], list[Any] | None]:
+        """What is reported once the listing shows *changes*, and how the
+        cursor follows the pull request then."""
+        nonlocal cursor, records
+        listed.update(changes)
+        fake.pulls[REPO] = [pull(12, **listed)]
+        result = await src.fetch(cursor)
+        cursor, records = result.next_cursor, result.records
+        return [record.id for record in records], cursor_of(result)["repos"][REPO].get("prs", {}).get("12")
+
+    head_a, head_b, head_c = SHA_A[:12], SHA_B[:12], "c" * 12
+    assert await after() == ([f"{REPO}#12:opened:open"], [head_a, False, False])
+    assert await after(state="closed", updated=4, closed=4) == (
+        [f"{REPO}#12:closed:{at(4)}"], [head_a, False, False, at(4)],
+    )
+    # A comment on the closed pull request: its update time moves, its close does not.
+    assert await after(updated=6) == ([], [head_a, False, False, at(4)])
+    assert await after(state="open", updated=8) == ([f"{REPO}#12:reopened:{at(4)}"], [head_a, False, False])
+    [reopened] = records
+    assert await after(updated=10, sha=SHA_B) == ([f"{REPO}#12:updated:{SHA_B}"], [head_b, False, False])
+    assert await after(state="closed", updated=12, closed=12) == (
+        [f"{REPO}#12:closed:{at(12)}"], [head_b, False, False, at(12)],
+    )
+    # Reopened with a new head: one record, reopened, which carries the head.
+    assert await after(state="open", updated=14, sha="c" * 40) == (
+        [f"{REPO}#12:reopened:{at(12)}"], [head_c, False, False],
+    )
+    assert records[0].metadata["head_sha"] == "c" * 40
+    assert await after(updated=16) == ([], [head_c, False, False])
+    assert await after(state="closed", updated=18, closed=18, merged=18) == ([f"{REPO}#12:merged:merged"], None)
+    assert "prs" not in json.loads(cursor)["repos"][REPO]
+
+    # The first reopening, as the gateway builds it: named by the close that
+    # it ends, and dated by the update that shows the pull request open.
+    assert reopened.id == f"{REPO}#12:reopened:{at(4)}"
+    assert (reopened.source, reopened.record_type) == ("github_repos", "github_repo_activity")
+    assert reopened.summary == "[acme/widgets] PR #12 reopened: Add a widget cache"
+    assert reopened.content == (
+        "Repository: acme/widgets\n"
+        "Type: PullRequest\n"
+        "Event: reopened\n"
+        "PR: #12 Add a widget cache\n"
+        "Author: bob\n"
+        "State: open\n"
+        "Draft: false\n"
+        "Base ← head: main ← bob:feature\n"
+        "Created: 2026-10-27T10:02:00Z\n"
+        "Updated: 2026-10-27T10:08:00Z\n"
+        "URL: https://github.com/acme/widgets/pull/12"
+    )
+    assert reopened.timestamp == at(8)
+    assert list(reopened.metadata.items()) == [
+        ("repo_name", REPO), ("number", "12"), ("event", "reopened"), ("subject_type", "PullRequest"),
+        ("author", "bob"), ("author_kind", "human"), ("head_sha", SHA_A),
+        ("subject_url", "https://github.com/acme/widgets/pull/12"),
+        ("repo_url", "https://github.com/acme/widgets"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_draft_that_is_reopened_ready_for_review_gives_one_record():
+    """Reopened comes before ready and updated: the record carries the head
+    and the draft state as listed, and neither is reported later."""
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], updates=True)
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1, draft=True)]
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=1, updated=3, draft=True, state="closed")]
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=1, updated=5, sha=SHA_B)]
+
+    result = await src.fetch(cursor)
+
+    [record] = result.records
+    assert (record.id, record.timestamp) == (f"{REPO}#1:reopened:{at(3)}", at(5))
+    assert "Draft: false" in record.content and record.metadata["head_sha"] == SHA_B
+    assert cursor_of(result)["repos"][REPO]["prs"] == {"1": [SHA_B[:12], False, False]}
+    fake.pulls[REPO] = [pull(1, created=1, updated=6, sha=SHA_B)]
+    assert (await src.fetch(result.next_cursor)).records == []
+
+
+@pytest.mark.asyncio
+async def test_a_reopening_has_the_same_id_when_the_listing_is_read_again_after_a_comment():
+    """The close that it ends names the record, not the update time, which a
+    comment moves. So a run that starts again from the same cursor, because
+    its records were not stored, does not give the reopening a second id."""
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], updates=True)
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1)]
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=1, updated=3, state="closed")]
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=1, updated=5)]
+    [first] = (await src.fetch(cursor)).records
+    fake.pulls[REPO] = [pull(1, created=1, updated=7)]
+
+    [again] = (await src.fetch(cursor)).records
+
+    assert first.id == again.id == f"{REPO}#1:reopened:{at(3)}"
+    assert (first.timestamp, again.timestamp) == (at(5), at(7))
+
+
+@pytest.mark.asyncio
+async def test_a_closed_pull_request_that_is_reopened_and_ends_again_before_the_next_listing():
+    """One record per pull request and run. Reopened and merged since the
+    last listing: merged, and it is followed no longer. Reopened and closed
+    again: nothing, since its close is reported already; it stays followed,
+    with the later close, which names its next reopening."""
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], updates=True)
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=2), pull(2, created=2, sha=SHA_B)]
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [
+        pull(1, created=2, updated=4, state="closed"),
+        pull(2, created=2, updated=4, state="closed", sha=SHA_B),
+    ]
+    closed = await src.fetch(cursor)
+    assert [record.id for record in closed.records] == [f"{REPO}#1:closed:{at(4)}", f"{REPO}#2:closed:{at(4)}"]
+    fake.pulls[REPO] = [
+        pull(1, created=2, updated=6, state="closed", merged=6),
+        pull(2, created=2, updated=7, state="closed", closed=6, sha=SHA_B),
+    ]
+
+    result = await src.fetch(closed.next_cursor)
+
+    assert [record.id for record in result.records] == [f"{REPO}#1:merged:merged"]
+    assert cursor_of(result)["repos"][REPO]["prs"] == {"2": [SHA_B[:12], False, False, at(6)]}
+    fake.pulls[REPO][1] = pull(2, created=2, updated=9, sha=SHA_B)
+    reopened = await src.fetch(result.next_cursor)
+    assert [record.id for record in reopened.records] == [f"{REPO}#2:reopened:{at(6)}"]
+
+
+@pytest.mark.asyncio
+async def test_a_new_pull_request_first_seen_closed_is_opened_and_its_reopening_is_reported():
+    """It stays followed as one that was closed later, here a draft, with the
+    draft state as listed; one first seen merged does not (the next test)."""
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], updates=True)
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1, updated=3, draft=True, state="closed", closed=2)]
+
+    opened = await src.fetch(cursor)
+
+    [record] = opened.records
+    assert record.id == f"{REPO}#1:opened:open" and "State: closed" in record.content
+    assert cursor_of(opened)["repos"][REPO]["prs"] == {"1": [SHA_A[:12], True, False, at(2)]}
+    fake.pulls[REPO] = [pull(1, created=1, updated=4, draft=True)]
+    reopened = await src.fetch(opened.next_cursor)
+    assert [record.id for record in reopened.records] == [f"{REPO}#1:reopened:{at(2)}"]
 
 
 @pytest.mark.asyncio
@@ -1281,6 +1575,31 @@ async def test_without_updates_nothing_is_followed_and_turning_them_off_forgets(
 
 
 @pytest.mark.asyncio
+async def test_without_updates_a_closed_pull_request_is_not_kept():
+    """A reported pull request is followed only with updates, so without
+    them nothing is kept when it is closed, or first seen closed, and its
+    reopening reports nothing. Turning updates off forgets a closed one too."""
+    fake = FakeGitHub()
+    followed = source(fake, types=["pull_request"], updates=True)
+    cursor = await baseline(followed)
+    fake.pulls[REPO] = [pull(1, created=1)]
+    cursor = (await followed.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=1, updated=3, state="closed")]
+    cursor = (await followed.fetch(cursor)).next_cursor
+    assert json.loads(cursor)["repos"][REPO]["prs"] == {"1": [SHA_A[:12], False, False, at(3)]}
+    # 1 is reopened, and 2 is new and closed already.
+    fake.pulls[REPO] = [pull(1, created=1, updated=5), pull(2, created=6, state="closed")]
+    unfollowed = source(fake, types=["pull_request"])
+
+    result = await unfollowed.fetch(cursor)
+
+    assert [record.id for record in result.records] == [f"{REPO}#2:opened:open"]
+    assert "prs" not in cursor_of(result)["repos"][REPO]
+    fake.pulls[REPO] = [pull(1, created=1, updated=5), pull(2, created=6, updated=8)]
+    assert (await unfollowed.fetch(result.next_cursor)).records == []
+
+
+@pytest.mark.asyncio
 async def test_a_followed_pull_request_whose_author_is_denied_is_dropped_silently():
     fake = FakeGitHub()
     cursor = await baseline(source(fake, types=["pull_request"], updates=True))
@@ -1292,6 +1611,30 @@ async def test_a_followed_pull_request_whose_author_is_denied_is_dropped_silentl
 
     assert result.records == []
     assert "prs" not in cursor_of(result)["repos"][REPO]
+
+
+@pytest.mark.asyncio
+async def test_a_closed_pull_request_whose_author_is_denied_is_forgotten_and_its_reopening_reports_nothing():
+    """The author filters judge a pull request that is kept closed as they
+    judge any followed one: listed again, here reopened, while its author is
+    denied, it is forgotten without a record, and stays so when the author is
+    allowed again."""
+    fake = FakeGitHub()
+    followed = source(fake, types=["pull_request"], updates=True)
+    cursor = await baseline(followed)
+    fake.pulls[REPO] = [pull(1, created=1, author="alice")]
+    cursor = (await followed.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=1, updated=3, author="alice", state="closed")]
+    cursor = (await followed.fetch(cursor)).next_cursor
+    assert json.loads(cursor)["repos"][REPO]["prs"] == {"1": [SHA_A[:12], False, False, at(3)]}
+    fake.pulls[REPO] = [pull(1, created=1, updated=5, author="alice")]
+
+    result = await source(fake, types=["pull_request"], updates=True, deny_authors=["alice"]).fetch(cursor)
+
+    assert result.records == []
+    assert "prs" not in cursor_of(result)["repos"][REPO]
+    fake.pulls[REPO] = [pull(1, created=1, updated=7, author="alice", sha=SHA_B)]
+    assert (await followed.fetch(result.next_cursor)).records == []
 
 
 @pytest.mark.asyncio
@@ -1310,9 +1653,485 @@ async def test_at_most_so_many_pull_requests_are_followed_the_one_listed_longest
     assert list(cursor_of(result)["repos"][REPO]["prs"]) == ["1", "3"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("cap", "kept"), [
+    (3, ["1", "3", "4"]),  # one too many: the closed one that was listed longest ago
+    (2, ["1", "4"]),       # two: both closed ones, although 1 was listed before them
+    (1, ["4"]),            # three: then the open one that was listed longest ago
+])
+async def test_beyond_the_cap_the_closed_pull_requests_are_forgotten_before_the_others(monkeypatch, cap, kept):
+    monkeypatch.setattr(module, "MAX_FINGERPRINTS", cap)
+    # In the order in which they were last listed: 2 and 3 are closed.
+    followed = {
+        "1": [SHA_A[:12], False, False],
+        "2": [SHA_A[:12], False, False, at(2)],
+        "3": [SHA_A[:12], False, False, at(3)],
+        "4": [SHA_A[:12], False, False],
+    }
+    cursor = json.dumps({"v": 1, "repos": {REPO: {"pulls": read(at(4)), "prs": followed}}})
+
+    result = await source(FakeGitHub(), types=["pull_request"], updates=True).fetch(cursor)
+
+    assert list(cursor_of(result)["repos"][REPO]["prs"]) == kept
+
+
+@pytest.mark.asyncio
+async def test_a_closed_pull_request_whose_time_is_over_is_forgotten_before_the_cap_counts(monkeypatch):
+    """The cap counts what is left after the forgetting by age. 2 goes by its
+    age, so three are left and 1 stays, which is closed too and was listed
+    longest ago: the cap would take it first."""
+    monkeypatch.setattr(module, "MAX_FINGERPRINTS", 3)
+    followed = {
+        "1": [SHA_A[:12], False, False, ago(days=1)],
+        "2": [SHA_A[:12], False, False, ago(days=31)],
+        "3": [SHA_A[:12], False, False],
+        "4": [SHA_A[:12], False, False],
+    }
+    cursor = json.dumps({"v": 1, "repos": {REPO: {"pulls": read(at(0)), "prs": followed}}})
+
+    result = await source(FakeGitHub(), types=["pull_request"], updates=True).fetch(cursor)
+
+    assert list(cursor_of(result)["repos"][REPO]["prs"]) == ["1", "3", "4"]
+
+
+@pytest.mark.asyncio
+async def test_a_closed_pull_request_is_forgotten_thirty_days_after_its_close(caplog):
+    """The thirty days count from the close: a comment on the closed pull
+    request does not move them. The reopening of one that is forgotten
+    reports nothing, as that of a pull request that was never followed. The
+    run that forgets says so in the log, once."""
+    caplog.set_level(logging.INFO, logger="nerve.sources.github_repos")
+    forgets = (
+        "acme/widgets no longer follows 1 closed pull request whose 30 days after the close are over, "
+        "or whose close has no time"
+    )
+    fake = FakeGitHub()
+    now = [NOW]
+    src = source(fake, types=["pull_request"], updates=True, clock=lambda: now[0])
+    cursor = await baseline(src)
+
+    async def listed(minutes: int, item: dict[str, Any]) -> tuple[list[str], list[str]]:
+        """What a listing of *item*, read *minutes* after the start, reports and follows."""
+        nonlocal cursor
+        fake.pulls[REPO] = [item]
+        now[0] = START + timedelta(minutes=minutes)
+        result = await src.fetch(cursor)
+        cursor = result.next_cursor
+        return [record.id for record in result.records], list(cursor_of(result)["repos"][REPO].get("prs", {}))
+
+    await listed(62, pull(1, created=61))
+    assert await listed(65, pull(1, created=61, updated=64, state="closed")) == (
+        [f"{REPO}#1:closed:{at(64)}"], ["1"],
+    )
+    # Twenty days later, a comment on the closed pull request.
+    commented = pull(1, created=61, updated=64 + 20 * DAY, state="closed", closed=64)
+    assert await listed(65 + 20 * DAY, commented) == ([], ["1"])
+    # Thirty days after the close, to the minute, it is still followed.
+    assert await listed(64 + 30 * DAY, commented) == ([], ["1"])
+    assert forgets not in caplog.text
+    assert await listed(65 + 30 * DAY, commented) == ([], [])
+    assert caplog.text.count(forgets) == 1
+
+    assert await listed(70 + 30 * DAY, pull(1, created=61, updated=69 + 30 * DAY)) == ([], [])
+    assert caplog.text.count(forgets) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settings", [
+    {"repos": [REPO, OTHER], "types": ["pull_request"]},  # the other repository's listing is read
+    {"types": ["pull_request", "issue"]},                 # the repository's issues listing is read
+])
+async def test_a_run_that_cannot_read_the_pulls_listing_forgets_no_closed_pull_request(settings):
+    """Only a run that read the pulls listing forgets a closed pull request
+    by its age: a run whose listing failed cannot know whether it was
+    reopened. Here it was, within its thirty days; the next run that reads
+    the listing reports the reopening."""
+    fake = FakeGitHub()
+    now = [NOW]
+    src = source(fake, updates=True, clock=lambda: now[0], **settings)
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=61)]
+    now[0] = START + timedelta(minutes=62)
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=61, updated=64, state="closed")]
+    now[0] = START + timedelta(minutes=65)
+    cursor = (await src.fetch(cursor)).next_cursor
+    # Reopened half an hour before its thirty days end. The next run comes a
+    # quarter of an hour after them, and cannot read the listing.
+    fake.pulls[REPO] = [pull(1, created=61, updated=34 + 30 * DAY)]
+    fake.failing = {f"{REPO} pulls"}
+    now[0] = START + timedelta(minutes=79 + 30 * DAY)
+
+    failed = await src.fetch(cursor)
+
+    assert failed.records == []
+    assert cursor_of(failed)["repos"][REPO]["prs"] == {"1": [SHA_A[:12], False, False, at(64)]}
+    fake.failing = set()
+    now[0] = START + timedelta(minutes=94 + 30 * DAY)
+    result = await src.fetch(failed.next_cursor)
+    assert [record.id for record in result.records] == [f"{REPO}#1:reopened:{at(64)}"]
+    assert cursor_of(result)["repos"][REPO]["prs"] == {"1": [SHA_A[:12], False, False]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("days", [20, 28])
+async def test_a_closed_pull_request_that_was_reopened_early_in_a_gap_is_reported_after_it(days):
+    """A run on weekdays: the pull request is reopened on Friday, after that
+    day's run, and Monday's run reads the listing against the last day. The
+    listing shows the pull request open, so its reopening is reported, with
+    its own time, although it is older than that day. For one that was closed
+    twenty-eight days before Friday the thirty days are over on Monday: it is
+    reported and followed all the same."""
+    fake = FakeGitHub()
+    now = [NOW]
+    src = source(fake, types=["pull_request"], updates=True, clock=lambda: now[0])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=61)]
+    now[0] = START + timedelta(minutes=62)
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=61, updated=64, state="closed")]
+    now[0] = START + timedelta(minutes=65)
+    cursor = (await src.fetch(cursor)).next_cursor
+    friday = 65 + days * DAY
+    now[0] = START + timedelta(minutes=friday)
+    cursor = (await src.fetch(cursor)).next_cursor
+    # Reopened six hours after Friday's run.
+    fake.pulls[REPO] = [pull(1, created=61, updated=friday + 360)]
+    now[0] = START + timedelta(minutes=friday + 3 * DAY)
+
+    monday = await src.fetch(cursor)
+
+    [record] = monday.records
+    assert (record.id, record.timestamp) == (f"{REPO}#1:reopened:{at(64)}", at(friday + 360))
+    assert cursor_of(monday)["repos"][REPO]["prs"] == {"1": [SHA_A[:12], False, False]}
+    # It is followed as before: Tuesday's run reports a push of Monday.
+    fake.pulls[REPO] = [pull(1, created=61, updated=friday + 3 * DAY + 300, sha=SHA_B)]
+    now[0] = START + timedelta(minutes=friday + 4 * DAY)
+    tuesday = await src.fetch(monday.next_cursor)
+    assert [record.id for record in tuesday.records] == [f"{REPO}#1:updated:{SHA_B}"]
+
+
+@pytest.mark.asyncio
+async def test_after_a_gap_nothing_else_from_before_the_last_day_is_judged():
+    """A closed pull request that the listing shows past its close is the one
+    thing older than a day that a run after a gap judges. A followed pull
+    request that got a new head before the last day reports nothing, and a
+    pull request that was opened before it is not reported. A closed one that
+    only got a comment before it is not judged either: it is closed by the
+    close that the cursor keeps, and stays in its place in the cursor."""
+    fake = FakeGitHub()
+    now = [NOW]
+    src = source(fake, types=["pull_request"], updates=True, clock=lambda: now[0])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=61), pull(2, created=61), pull(4, created=61)]
+    now[0] = START + timedelta(minutes=62)
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [
+        pull(1, created=61, updated=64, state="closed"), pull(2, created=61),
+        pull(4, created=61, updated=64, state="closed"),
+    ]
+    now[0] = START + timedelta(minutes=65)
+    cursor = (await src.fetch(cursor)).next_cursor
+    assert list(json.loads(cursor)["repos"][REPO]["prs"]) == ["2", "1", "4"]
+    # Four days without a run. In the first hours 1 is reopened, 2 gets a new
+    # head, 3 is opened, and 4 gets a comment.
+    fake.pulls[REPO] = [
+        pull(1, created=61, updated=300), pull(2, created=61, updated=310, sha=SHA_B), pull(3, created=320),
+        pull(4, created=61, updated=330, state="closed", closed=64),
+    ]
+    now[0] = START + timedelta(minutes=65 + 4 * DAY)
+
+    result = await src.fetch(cursor)
+
+    assert [record.id for record in result.records] == [f"{REPO}#1:reopened:{at(64)}"]
+    # Only 1 was judged, and is the one listed last.
+    assert list(cursor_of(result)["repos"][REPO]["prs"].items()) == [
+        ("2", [SHA_A[:12], False, False]), ("4", [SHA_A[:12], False, False, at(64)]),
+        ("1", [SHA_A[:12], False, False]),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_closed_pull_request_that_was_closed_again_early_in_a_gap_keeps_the_later_close():
+    """Reopened and closed again while no run came: the listing shows it
+    closed by another close than the one that the cursor keeps, from before
+    the last day. Nothing is reported, and the cursor takes the later close,
+    which is the true one: the thirty days count from it, and it names the
+    next reopening."""
+    fake = FakeGitHub()
+    now = [NOW]
+    src = source(fake, types=["pull_request"], updates=True, clock=lambda: now[0])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=61)]
+    now[0] = START + timedelta(minutes=62)
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=61, updated=64, state="closed")]
+    now[0] = START + timedelta(minutes=65)
+    cursor = (await src.fetch(cursor)).next_cursor
+    # Thirty-one days without a run. On the twentieth it is reopened and closed again.
+    again = 64 + 20 * DAY
+    fake.pulls[REPO] = [pull(1, created=61, updated=again, state="closed")]
+    now[0] = START + timedelta(minutes=65 + 31 * DAY)
+
+    result = await src.fetch(cursor)
+
+    assert result.records == []
+    assert cursor_of(result)["repos"][REPO]["prs"] == {"1": [SHA_A[:12], False, False, at(again)]}
+    fake.pulls[REPO] = [pull(1, created=61, updated=70 + 31 * DAY)]
+    now[0] = START + timedelta(minutes=75 + 31 * DAY)
+    reopened = await src.fetch(result.next_cursor)
+    assert [record.id for record in reopened.records] == [f"{REPO}#1:reopened:{at(again)}"]
+
+
+@pytest.mark.asyncio
+async def test_a_listing_that_lags_behind_a_close_reports_no_reopening():
+    """A listing can show an earlier state than the listing before it. Here
+    it shows the pull request open, as it was a minute before the close that
+    the cursor keeps. That is no reopening: its update time is before that
+    close, so it is not judged. The reopening that comes later is reported."""
+    fake = FakeGitHub()
+    src = source(fake, types=["pull_request"], updates=True)
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=1)]
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=1, updated=5, state="closed")]
+    closed = await src.fetch(cursor)
+    assert [record.id for record in closed.records] == [f"{REPO}#1:closed:{at(5)}"]
+    fake.pulls[REPO] = [pull(1, created=1, updated=4)]
+
+    lagging = await src.fetch(closed.next_cursor)
+
+    assert lagging.records == []
+    assert cursor_of(lagging)["repos"][REPO]["prs"] == {"1": [SHA_A[:12], False, False, at(5)]}
+    fake.pulls[REPO] = [pull(1, created=1, updated=9)]
+    reopened = await src.fetch(lagging.next_cursor)
+    assert [record.id for record in reopened.records] == [f"{REPO}#1:reopened:{at(5)}"]
+
+
+@pytest.mark.asyncio
+async def test_an_entry_whose_close_has_no_time_is_not_judged_from_before_the_cursor():
+    """Without a time the close cannot be compared with the listing, so a
+    listing that shows the pull request open from before its cursor reports
+    nothing. Such an entry does not come from a run: the run that reports a
+    close without a time forgets it."""
+    fake = FakeGitHub()
+    fake.pulls[REPO] = [pull(1, created=5, updated=20)]
+    followed = {"1": [SHA_A[:12], False, False, "closed"]}
+    cursor = json.dumps({"v": 1, "repos": {REPO: {"pulls": read(at(50)), "prs": followed}}})
+
+    result = await source(fake, types=["pull_request"], updates=True).fetch(cursor)
+
+    assert result.records == []
+    assert "prs" not in cursor_of(result)["repos"][REPO]
+
+
+@pytest.mark.asyncio
+async def test_a_closed_pull_request_that_was_reopened_and_merged_early_in_a_gap_is_reported_as_merged():
+    """The listing shows it closed, with a merge from before the last day.
+    The watch said that it is closed, and that would stay its last record:
+    the run after the gap reports the merge, with its own time, and the pull
+    request is followed no longer."""
+    fake = FakeGitHub()
+    now = [NOW]
+    src = source(fake, types=["pull_request"], updates=True, clock=lambda: now[0])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=61)]
+    now[0] = START + timedelta(minutes=62)
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=61, updated=64, state="closed")]
+    now[0] = START + timedelta(minutes=65)
+    cursor = (await src.fetch(cursor)).next_cursor
+    # Four days without a run. Two days before the next one it is reopened and merged.
+    merged = 65 + 2 * DAY
+    fake.pulls[REPO] = [pull(1, created=61, updated=merged, state="closed", merged=merged)]
+    now[0] = START + timedelta(minutes=65 + 4 * DAY)
+
+    result = await src.fetch(cursor)
+
+    [record] = result.records
+    assert (record.id, record.timestamp) == (f"{REPO}#1:merged:merged", at(merged))
+    assert "prs" not in cursor_of(result)["repos"][REPO]
+
+
+@pytest.mark.asyncio
+async def test_a_merge_in_the_second_of_the_kept_close_is_judged_from_before_the_cursor():
+    """Reopened and merged in the second in which it was closed: the listing
+    shows the close that the cursor keeps, with a merge. It is merged all the
+    same, so it is judged, and the merge is reported."""
+    fake = FakeGitHub()
+    fake.pulls[REPO] = [pull(1, created=5, updated=10, state="closed", merged=10)]
+    followed = {"1": [SHA_A[:12], False, False, at(10)]}
+    cursor = json.dumps({"v": 1, "repos": {REPO: {"pulls": read(at(50)), "prs": followed}}})
+
+    result = await source(fake, types=["pull_request"], updates=True).fetch(cursor)
+
+    assert [(record.id, record.timestamp) for record in result.records] == [(f"{REPO}#1:merged:merged", at(10))]
+    assert "prs" not in cursor_of(result)["repos"][REPO]
+
+
+@pytest.mark.asyncio
+async def test_a_held_draft_that_was_reopened_ready_early_in_a_gap_is_reported_after_it():
+    """A held draft that is kept closed is judged the same way when a listing
+    shows it open, however old that is: no draft any more, it is reported as
+    ready, with its own time."""
+    fake = FakeGitHub()
+    now = [NOW]
+    src = source(fake, types=["pull_request"], include_drafts=False, clock=lambda: now[0])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=61, draft=True)]
+    now[0] = START + timedelta(minutes=62)
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=61, updated=64, draft=True, state="closed")]
+    now[0] = START + timedelta(minutes=65)
+    cursor = (await src.fetch(cursor)).next_cursor
+    assert json.loads(cursor)["repos"][REPO]["prs"] == {"1": [SHA_A[:12], True, True, at(64)]}
+    # Four days without a run. In the first hours it is reopened and marked ready.
+    fake.pulls[REPO] = [pull(1, created=61, updated=300)]
+    now[0] = START + timedelta(minutes=65 + 4 * DAY)
+
+    result = await src.fetch(cursor)
+
+    [record] = result.records
+    assert (record.id, record.timestamp) == (f"{REPO}#1:ready:{SHA_A}", at(300))
+    assert "prs" not in cursor_of(result)["repos"][REPO]
+
+
+@pytest.mark.asyncio
+async def test_the_cap_applies_in_a_run_that_cannot_read_the_pulls_listing(monkeypatch):
+    """The cap is about the size of the cursor, so it applies in every run,
+    and takes the closed pull request that was listed longest ago. Ages are
+    not judged in this run: with the listing read, 3 would go by its age and
+    2 would stay."""
+    monkeypatch.setattr(module, "MAX_FINGERPRINTS", 3)
+    followed = {
+        "1": [SHA_A[:12], False, False],
+        "2": [SHA_A[:12], False, False, ago(days=1)],
+        "3": [SHA_A[:12], False, False, ago(days=31)],
+        "4": [SHA_A[:12], False, False],
+    }
+    cursor = json.dumps({"v": 1, "repos": {REPO: {
+        "pulls": read(at(0)), "issues": read(at(0)), "prs": followed,
+    }}})
+    fake = FakeGitHub()
+    fake.failing = {f"{REPO} pulls"}
+
+    result = await source(fake, types=["pull_request", "issue"], updates=True).fetch(cursor)
+
+    assert list(cursor_of(result)["repos"][REPO]["prs"]) == ["1", "3", "4"]
+
+
+@pytest.mark.asyncio
+async def test_a_reopening_from_before_the_cursor_is_judged_in_every_run_and_before_what_changed(monkeypatch):
+    """Not only after a gap: a listing that was read a moment ago shows, from
+    before its cursor, a closed pull request open. It is reported. The items
+    are judged oldest first, so for the cap it was listed before the pull
+    request that changed since the cursor, and goes first."""
+    monkeypatch.setattr(module, "MAX_FINGERPRINTS", 1)
+    fake = FakeGitHub()
+    fake.pulls[REPO] = [pull(1, created=5, updated=20), pull(2, created=5, updated=55)]
+    followed = {"1": [SHA_A[:12], False, False, at(10)], "2": [SHA_A[:12], False, False]}
+    cursor = json.dumps({"v": 1, "repos": {REPO: {"pulls": read(at(50)), "prs": followed}}})
+
+    result = await source(fake, types=["pull_request"], updates=True).fetch(cursor)
+
+    assert [record.id for record in result.records] == [f"{REPO}#1:reopened:{at(10)}"]
+    assert list(cursor_of(result)["repos"][REPO]["prs"]) == ["2"]
+
+
+@pytest.mark.asyncio
+async def test_the_items_from_before_the_cursor_are_judged_oldest_first(monkeypatch):
+    """Two closed pull requests are open again, both from before the cursor.
+    2 was reopened first, so it was listed longest ago, and the cap takes it,
+    although the listing shows it after 1 and its number is the higher one."""
+    monkeypatch.setattr(module, "MAX_FINGERPRINTS", 1)
+    fake = FakeGitHub()
+    fake.pulls[REPO] = [pull(1, created=5, updated=30), pull(2, created=5, updated=20)]
+    followed = {"1": [SHA_A[:12], False, False, at(10)], "2": [SHA_A[:12], False, False, at(12)]}
+    cursor = json.dumps({"v": 1, "repos": {REPO: {"pulls": read(at(50)), "prs": followed}}})
+
+    result = await source(fake, types=["pull_request"], updates=True).fetch(cursor)
+
+    assert [record.id for record in result.records] == [
+        f"{REPO}#2:reopened:{at(12)}", f"{REPO}#1:reopened:{at(10)}",
+    ]
+    assert list(cursor_of(result)["repos"][REPO]["prs"]) == ["1"]
+
+
+@pytest.mark.asyncio
+async def test_a_closed_pull_request_that_a_run_lists_open_is_reported_however_long_ago_it_closed():
+    """The listing is read before anything is forgotten. A run that comes
+    more than thirty days after the close, and whose listing shows the pull
+    request open again, still reports the reopening and follows it."""
+    fake = FakeGitHub()
+    now = [NOW]
+    src = source(fake, types=["pull_request"], updates=True, clock=lambda: now[0])
+    cursor = await baseline(src)
+    fake.pulls[REPO] = [pull(1, created=61)]
+    now[0] = START + timedelta(minutes=62)
+    cursor = (await src.fetch(cursor)).next_cursor
+    fake.pulls[REPO] = [pull(1, created=61, updated=64, state="closed")]
+    now[0] = START + timedelta(minutes=65)
+    cursor = (await src.fetch(cursor)).next_cursor
+    # No run for thirty-one days. It is reopened an hour before the next one.
+    fake.pulls[REPO] = [pull(1, created=61, updated=5 + 31 * DAY)]
+    now[0] = START + timedelta(minutes=65 + 31 * DAY)
+
+    result = await src.fetch(cursor)
+
+    assert [record.id for record in result.records] == [f"{REPO}#1:reopened:{at(64)}"]
+    assert cursor_of(result)["repos"][REPO]["prs"] == {"1": [SHA_A[:12], False, False]}
+
+
+@pytest.mark.asyncio
+async def test_only_a_closed_pull_request_is_forgotten_after_a_time():
+    """Thirty days after the close, to the second, are not enough; a second
+    more is. A held draft that is closed goes the same way, a close without a
+    time counts as long ago, and an open pull request has no such time."""
+    followed = {
+        "1": [SHA_A[:12], False, False, ago(days=30)],
+        "2": [SHA_A[:12], False, False, ago(days=30, seconds=1)],
+        "3": [SHA_A[:12], True, True, ago(days=31)],
+        "4": [SHA_A[:12], False, False, "closed"],
+        "5": [SHA_A[:12], False, False],
+    }
+    cursor = json.dumps({"v": 1, "repos": {REPO: {"pulls": read(at(0)), "prs": followed}}})
+
+    result = await source(FakeGitHub(), types=["pull_request"], updates=True).fetch(cursor)
+
+    assert cursor_of(result)["repos"][REPO]["prs"] == {"1": followed["1"], "5": followed["5"]}
+
+
 # ---------------------------------------------------------------------- #
 #  Cursor upgrades and failures                                           #
 # ---------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_the_cursor_reads_a_followed_pull_request_with_and_without_the_close_of_a_closed_one():
+    """Three elements for an open pull request, and a fourth, the time of its
+    close, for one that is kept closed. An entry of another shape is not
+    followed."""
+    fake = FakeGitHub()
+    followed = {
+        "1": [SHA_A[:12], False, False],
+        "2": [SHA_A[:12], False, False, at(-5)],
+        "3": [SHA_A[:12], False, False, ""],
+        "4": [SHA_A[:12], False, False, None],
+        "5": [SHA_A[:12], False, False, 5],
+        "6": [SHA_A[:12], False, False, at(-5), at(-5)],
+        "7": [SHA_A[:12], False],
+    }
+    cursor = json.dumps({"v": 1, "repos": {REPO: {"pulls": read(at(-5)), "prs": followed}}})
+    src = source(fake, types=["pull_request"], updates=True)
+
+    result = await src.fetch(cursor)
+
+    assert result.records == []
+    assert cursor_of(result)["repos"][REPO]["prs"] == {"1": followed["1"], "2": followed["2"]}
+    # The one read as open has a new head, and the one read as closed is open.
+    fake.pulls[REPO] = [pull(1, created=-9, updated=3, sha=SHA_B), pull(2, created=-8, updated=4)]
+    changed = await src.fetch(result.next_cursor)
+    assert [record.id for record in changed.records] == [f"{REPO}#1:updated:{SHA_B}", f"{REPO}#2:reopened:{at(-5)}"]
 
 
 @pytest.mark.asyncio

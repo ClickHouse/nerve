@@ -2510,8 +2510,8 @@ class GitHubReposSyncConfig:
     # Report a draft pull request when it is opened. false: report it when it
     # is marked ready for review (event "ready") instead.
     include_drafts: bool = True
-    # Also report a new head commit, ready for review, merge and close of the
-    # pull requests already reported.
+    # Also report a new head commit, ready for review, merge, close and
+    # reopening of the pull requests already reported.
     updates: bool = False
     # Case-insensitive globs on the author's login; the guardrail rules
     # (deny wins). Dropped before anything is stored.
