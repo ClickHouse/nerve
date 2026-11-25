@@ -187,13 +187,22 @@ class Files {
     return this.types.get(path) ?? 'application/octet-stream';
   }
 
-  /** The bytes of `path`. Refused before the read when it would pass the limit. */
+  /**
+   * The bytes of `path`. Refused before the read when the described size
+   * would pass the limit, and after it when the bytes that arrived do.
+   */
   bytesOf(path: string): Promise<Uint8Array> {
     const known = this.loaded.get(path);
     if (known) return known;
-    this.bytes += this.sizes.get(path) ?? 0;
+    const described = this.sizes.get(path) ?? 0;
+    this.bytes += described;
     if (this.bytes > this.limit) throw new PreviewTooLarge(this.bytes, this.limit);
-    const reading = this.limited(() => this.read(path)).then(buffer => new Uint8Array(buffer));
+    const reading = this.limited(() => this.read(path)).then(buffer => {
+      // What arrived counts, not what the description said.
+      this.bytes += buffer.byteLength - described;
+      if (this.bytes > this.limit) throw new PreviewTooLarge(this.bytes, this.limit);
+      return new Uint8Array(buffer);
+    });
     this.loaded.set(path, reading);
     return reading;
   }

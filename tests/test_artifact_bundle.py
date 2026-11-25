@@ -209,6 +209,38 @@ class TestRefusals:
         monkeypatch.setattr(bundle_module, "MAX_SCANNED_ENTRIES", 3)
         assert _refused(ws, "decks/demo") is BundleRefusal.TOO_MANY_FILES
 
+    def test_a_large_folder_is_not_read_past_the_allowance(self, ws, monkeypatch):
+        """The walk takes at most the allowance plus one entry from the
+        directory iterator, and refuses then: it does not read and sort the
+        whole folder first."""
+        monkeypatch.setattr(bundle_module, "MAX_SCANNED_ENTRIES", 50)
+        real_scandir = os.scandir
+        taken = {"count": 0}
+
+        class Counting:
+            def __init__(self, path):
+                self.inner = real_scandir(path)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self.inner.close()
+
+            def __iter__(self):
+                for entry in self.inner:
+                    taken["count"] += 1
+                    yield entry
+
+        flat = ws / "flat"
+        flat.mkdir()
+        (flat / "index.html").write_text("x")
+        for i in range(500):
+            (flat / f"f{i:04}.png").write_bytes(b"")
+        monkeypatch.setattr(bundle_module.os, "scandir", Counting)
+        assert _refused(ws, "flat") is BundleRefusal.TOO_MANY_FILES
+        assert taken["count"] == 51
+
     def test_a_path_too_long(self, ws, monkeypatch):
         monkeypatch.setattr(bundle_module, "MAX_PATH_BYTES", 8)
         assert _refused(ws, "decks/demo") is BundleRefusal.PATH_TOO_LONG
@@ -260,6 +292,25 @@ class TestOpen:
         with pytest.raises(BundleError) as caught:
             read_bundle_file(b, "style.css")
         assert caught.value.code is BundleRefusal.SPECIAL_FILE
+
+    @pytest.mark.parametrize("change", ["grow", "same_size_restored_mtime", "replace"])
+    def test_refuses_a_file_that_is_not_the_described_one(self, ws, change):
+        b = describe_bundle(ws, "decks/demo")
+        css = ws / "decks" / "demo" / "style.css"
+        st = css.stat()
+        if change == "grow":
+            css.write_text("body{color:red}" * 1000)
+        elif change == "same_size_restored_mtime":
+            css.write_text("body{color:tan}")
+            os.utime(css, ns=(st.st_atime_ns, st.st_mtime_ns))
+        else:
+            other = css.with_name("other.tmp")
+            other.write_text("body{color:red}")
+            os.utime(other, ns=(st.st_atime_ns, st.st_mtime_ns))
+            os.replace(other, css)
+        with pytest.raises(BundleError) as caught:
+            read_bundle_file(b, "style.css")
+        assert caught.value.code is BundleRefusal.CHANGED
 
     def test_refuses_more_than_the_limit(self, ws):
         b = describe_bundle(ws, "decks/demo")

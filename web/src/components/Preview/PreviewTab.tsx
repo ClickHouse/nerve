@@ -40,6 +40,16 @@ function Updated({ at }: { at: number }) {
 }
 
 /** The sentence of a failed read, for the person. */
+/** How often one refresh starts again from a new description after a stale answer. */
+export const MAX_RESTARTS = 3;
+
+/** The file route's word that the files changed after the description the tab builds from. */
+function isStale(e: unknown): boolean {
+  return apiErrorDetail(e)?.code === 'stale_description';
+}
+
+const KEEPS_CHANGING = 'The files change while the preview is read. The tab tries again in a moment.';
+
 function problemText(e: unknown): string {
   if (e instanceof PreviewTooLarge) {
     return `This preview needs ${formatMiB(e.bytes)} of files or more. The limit is ${formatMiB(e.limit)}.`;
@@ -130,6 +140,7 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
     setBusy(true);
     try {
       let force = build;
+      let restarts = 0;
       for (;;) {
         again.current = 'no';
         try {
@@ -148,9 +159,16 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
           setProblem(null);
         } catch (e) {
           if (!alive.current) return;
-          shown.current = null;
-          setDoc(null);
-          setProblem(problemText(e));
+          // A file changed after the description: start again from a new one,
+          // a few times. A folder that changes all the time waits for the next poll.
+          if (isStale(e) && restarts < MAX_RESTARTS) {
+            restarts += 1;
+            again.current = 'build';
+          } else {
+            shown.current = null;
+            setDoc(null);
+            setProblem(isStale(e) ? KEEPS_CHANGING : problemText(e));
+          }
         }
         if (again.current === 'no') break;
         force = again.current === 'build';
@@ -253,16 +271,24 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
 
   return (
     <div className="flex flex-col flex-1 min-h-0">
-      <div className="flex items-center gap-2 px-3 py-2 border-b border-border-subtle bg-bg shrink-0">
-        <span className="font-mono text-xs text-text-secondary truncate min-w-0" title={shownPath}>{shownPath}</span>
-        {bundle && !problem && (
-          <>
-            <span aria-hidden="true" className="w-1.5 h-1.5 rounded-full bg-success shrink-0" />
-            <Updated at={bundle.modified} />
-          </>
-        )}
-        {busy && <Loader2 size={12} className="motion-safe:animate-spin text-text-faint shrink-0" aria-hidden="true" />}
-        <div className="ml-auto flex items-center gap-1 shrink-0">
+      {/* Two rows when the tab is narrow: the path and its time keep at
+          least 12rem, and the controls go to a row of their own. */}
+      <div
+        role="group"
+        aria-label="Preview header"
+        className="flex flex-wrap items-center gap-x-2 gap-y-1 px-3 py-2 border-b border-border-subtle bg-bg shrink-0"
+      >
+        <div className="flex items-center gap-2 min-w-0 flex-1 basis-48">
+          <span className="font-mono text-xs text-text-secondary truncate min-w-0" title={shownPath}>{shownPath}</span>
+          {bundle && !problem && (
+            <>
+              <span aria-hidden="true" className="w-1.5 h-1.5 rounded-full bg-success shrink-0" />
+              <Updated at={bundle.modified} />
+            </>
+          )}
+          {busy && <Loader2 size={12} className="motion-safe:animate-spin text-text-faint shrink-0" aria-hidden="true" />}
+        </div>
+        <div className="ml-auto flex flex-wrap items-center justify-end gap-1 min-w-0">
           {isDeck && (
             <div className="flex items-center gap-0.5 mr-1" role="group" aria-label="Slides">
               <IconButton label="Previous slide" size="xs" onClick={() => send({ type: 'slide', to: 'prev' })}>

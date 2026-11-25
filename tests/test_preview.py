@@ -267,6 +267,12 @@ BUNDLE = "/api/preview/bundle"
 FILE = "/api/preview/file"
 
 
+async def _file(api, path: str, file: str):
+    """A file read as the web UI makes it: for the description it just read."""
+    fingerprint = (await api.http.get(BUNDLE, params={"path": path})).json()["fingerprint"]
+    return await api.http.get(FILE, params={"path": path, "file": file, "fingerprint": fingerprint})
+
+
 @pytest.mark.asyncio
 class TestRoutes:
     async def test_the_description_of_a_bundle(self, api):
@@ -299,7 +305,7 @@ class TestRoutes:
         assert (r.status_code, r.json()["detail"]["code"]) == (404, "not_found")
 
     async def test_a_file_of_the_bundle(self, api):
-        r = await api.http.get(FILE, params={"path": "decks/demo", "file": "app.js"})
+        r = await _file(api, "decks/demo", "app.js")
         assert r.status_code == 200
         assert r.content == b"console.log(1)"
         assert r.headers["content-type"].startswith("text/javascript")
@@ -309,26 +315,26 @@ class TestRoutes:
         assert r.headers["cache-control"] == "no-store"
 
     async def test_the_entry_is_never_a_page_of_this_address(self, api):
-        r = await api.http.get(FILE, params={"path": "page.html", "file": "page.html"})
+        r = await _file(api, "page.html", "page.html")
         assert r.status_code == 200
         assert r.headers["content-disposition"] == "attachment"
         assert r.headers["content-security-policy"] == "sandbox; default-src 'none'"
 
     @pytest.mark.parametrize("file", [".secret", "../../notes.txt", "../page.html", "/etc/hosts", "", "missing.js"])
     async def test_only_files_of_the_description(self, api, file):
-        r = await api.http.get(FILE, params={"path": "decks/demo", "file": file})
+        r = await _file(api, "decks/demo", file)
         assert (r.status_code, r.json()["detail"]["code"]) == (404, "not_in_bundle")
 
     async def test_a_page_bundle_has_only_its_one_file(self, api):
         (api.workspace / "other.css").write_text("x")
-        r = await api.http.get(FILE, params={"path": "page.html", "file": "other.css"})
+        r = await _file(api, "page.html", "other.css")
         assert r.status_code == 404
 
     async def test_a_file_above_the_preview_limit(self, api, monkeypatch):
         from nerve.gateway.routes import preview
 
         monkeypatch.setattr(preview, "PREVIEW_MAX_BYTES", 4)
-        r = await api.http.get(FILE, params={"path": "decks/demo", "file": "app.js"})
+        r = await _file(api, "decks/demo", "app.js")
         assert (r.status_code, r.json()["detail"]["code"]) == (413, "too_large")
 
     async def test_while_off_the_routes_do_not_exist(self, api):
@@ -371,17 +377,46 @@ class TestDescriptionCache:
             assert r.status_code == 200
         assert walks == ["decks/demo"]
 
-    async def test_another_fingerprint_describes_the_bundle_again(self, api, monkeypatch):
+    @pytest.mark.parametrize("fingerprint", ["0" * 64, ""])
+    async def test_a_description_that_is_not_kept_is_stale_and_nothing_is_walked(self, api, monkeypatch, fingerprint):
         from nerve.gateway.routes import preview
 
         monkeypatch.setattr(preview, "descriptions", preview.DescriptionCache())
         await api.http.get(BUNDLE, params={"path": "decks/demo"})
+        walked: list[str] = []
+        monkeypatch.setattr(preview, "describe_bundle", lambda *a: walked.append("walk"))
+        r = await api.http.get(FILE, params={"path": "decks/demo", "file": "app.js", "fingerprint": fingerprint})
+        assert (r.status_code, r.json()["detail"]["code"]) == (409, "stale_description")
+        assert walked == []
+
+    async def test_two_states_of_one_path_are_kept_at_the_same_time(self, api, monkeypatch):
+        """Viewer A builds from the first state while viewer B reads the second."""
+        from nerve.gateway.routes import preview
+
+        monkeypatch.setattr(preview, "descriptions", preview.DescriptionCache())
+        first = (await api.http.get(BUNDLE, params={"path": "decks/demo"})).json()
         (api.workspace / "decks" / "demo" / "new.js").write_text("2")
-        r = await api.http.get(FILE, params={"path": "decks/demo", "file": "new.js", "fingerprint": "0" * 64})
-        assert (r.status_code, r.content) == (200, b"2")
-        # Without a fingerprint, too.
-        r = await api.http.get(FILE, params={"path": "decks/demo", "file": "new.js"})
+        second = (await api.http.get(BUNDLE, params={"path": "decks/demo"})).json()
+        assert first["fingerprint"] != second["fingerprint"]
+        r = await api.http.get(FILE, params={"path": "decks/demo", "file": "app.js", "fingerprint": first["fingerprint"]})
         assert r.status_code == 200
+        r = await api.http.get(FILE, params={"path": "decks/demo", "file": "new.js", "fingerprint": second["fingerprint"]})
+        assert (r.status_code, r.content) == (200, b"2")
+        # The first state does not have the new file.
+        r = await api.http.get(FILE, params={"path": "decks/demo", "file": "new.js", "fingerprint": first["fingerprint"]})
+        assert r.status_code == 404
+
+    async def test_a_file_that_changed_after_the_description_is_stale_not_served(self, api, monkeypatch):
+        """A tiny described file replaced by a large one is not served with the
+        new size: the preview limit holds for what is really sent."""
+        from nerve.gateway.routes import preview
+
+        monkeypatch.setattr(preview, "descriptions", preview.DescriptionCache())
+        body = (await api.http.get(BUNDLE, params={"path": "decks/demo"})).json()
+        (api.workspace / "decks" / "demo" / "app.js").write_bytes(b"x" * 100_000)
+        r = await api.http.get(FILE, params={"path": "decks/demo", "file": "app.js", "fingerprint": body["fingerprint"]})
+        assert (r.status_code, r.json()["detail"]["code"]) == (409, "stale_description")
+        assert len(r.content) < 1000
 
     async def test_a_kept_description_still_opens_without_following_a_link(self, api, monkeypatch, tmp_path):
         from nerve.gateway.routes import preview
@@ -404,10 +439,11 @@ class TestDescriptionCache:
         def bundle(name):
             return Bundle(workspace=Path("/ws"), path=name, root="", kind=BundleKind.PAGE, entry=name, files=())
         for name in ("a", "b", "c"):
-            cache.put("/ws", name, bundle(name))
-        assert cache.get("/ws", "a", bundle("a").fingerprint) is None
-        assert cache.get("/ws", "c", bundle("c").fingerprint) is not None
-        assert cache.get("/ws", "c", "other") is None
+            cache.put("/ws", "same/path", bundle(name))
+        assert cache.get("/ws", "same/path", bundle("a").fingerprint) is None
+        assert cache.get("/ws", "same/path", bundle("b").fingerprint) is not None
+        assert cache.get("/ws", "same/path", bundle("c").fingerprint) is not None
+        assert cache.get("/ws", "same/path", "other") is None
         now = preview.time.monotonic()
         monkeypatch.setattr(preview.time, "monotonic", lambda: now + 11)
-        assert cache.get("/ws", "c", bundle("c").fingerprint) is None
+        assert cache.get("/ws", "same/path", bundle("c").fingerprint) is None

@@ -61,7 +61,7 @@ test('a change by a shell command shows within a few seconds', async ({ page }, 
 test.describe('on a phone of 390 by 844', () => {
   test.use({ viewport: { width: 390, height: 844 } })
 
-  test('every control, the frame and the footer are on screen', async ({ page }, testInfo) => {
+  test('the header, the deck controls, the frame and the footer are on screen', async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== 'phone', 'the phone layout')
     await openPreview(page)
     const region = page.getByRole('region', { name: 'Preview' })
@@ -72,11 +72,31 @@ test.describe('on a phone of 390 by 844', () => {
       expect(box!.x + box!.width, name).toBeLessThanOrEqual(390)
       expect(box!.y + box!.height, name).toBeLessThanOrEqual(844)
     }
-    for (const name of ['Reload the preview', 'Show the source', 'Present', 'Close the panel']) {
+    // The page said it is a deck: the slide controls are there.
+    const slides = region.getByRole('group', { name: 'Slides' })
+    await expect(slides).toContainText('3 / 12')
+
+    const header = region.getByRole('group', { name: 'Preview header' })
+    const path = header.getByText('decks/demo/index.html')
+    await expect(path).toBeVisible()
+    const pathBox = await path.boundingBox()
+    await inView('path', pathBox)
+    expect(pathBox!.width, 'the path keeps its room').toBeGreaterThan(120)
+    for (const name of ['Previous slide', 'Next slide', 'Reload the preview', 'Show the source', 'Present', 'Close the panel']) {
       const control = region.getByRole('button', { name })
       await expect(control).toBeVisible()
       await inView(name, await control.boundingBox())
     }
+    await inView('slide count', await slides.boundingBox())
+    const overflow = await header.evaluate(el => {
+      const box = el as unknown as { scrollWidth: number; clientWidth: number }
+      return box.scrollWidth - box.clientWidth
+    })
+    expect(overflow, 'no horizontal overflow of the header').toBeLessThanOrEqual(0)
+
+    await region.getByRole('button', { name: 'Next slide' }).click()
+    await expect(slides).toContainText('4 / 12')
+
     const frame = page.locator('iframe[title="Preview"]')
     const frameBox = await frame.boundingBox()
     await inView('frame', frameBox)

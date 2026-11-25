@@ -68,7 +68,24 @@ def write_deck(deck: Path) -> None:
         ".slide{padding:32px}h1{color:#ff5}"
         'body{background-image:url("http://127.0.0.1:9/bg.png")}\n'
     )
-    (deck / "deck.js").write_text("document.getElementById('ran').textContent = 'script ran';\n")
+    # The page says it is a deck of 12 slides on slide 3, as the deck helper
+    # of a bundle does, and follows the slide messages of the tab.
+    (deck / "deck.js").write_text(
+        "document.getElementById('ran').textContent = 'script ran';\n"
+        "let slide = 3;\n"
+        "const say = (type) => parent.postMessage(\n"
+        "  { channel: 'nerve-artifact', v: 1, type, kind: 'deck', canPrint: false, slides: 12, slide }, '*');\n"
+        "say('ready');\n"
+        "addEventListener('message', (event) => {\n"
+        "  const m = event.data;\n"
+        "  if (!m || m.channel !== 'nerve-artifact') return;\n"
+        "  if (m.type === 'hello') say('ready');\n"
+        "  if (m.type === 'slide') {\n"
+        "    slide = m.to === 'next' ? Math.min(12, slide + 1) : m.to === 'prev' ? Math.max(1, slide - 1) : slide;\n"
+        "    say('slide');\n"
+        "  }\n"
+        "});\n"
+    )
     (deck / "logo.png").write_bytes(PIXEL_PNG)
     # Not a real font: the test checks that the address is inlined, not the glyphs.
     (deck / "deck.woff2").write_bytes(b"wOF2-sample")

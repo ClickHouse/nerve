@@ -23,6 +23,8 @@ const { usePreviewStore, resetPreviewConfig } = await import('../../stores/previ
 const { SidePanel } = await import('../Chat/SidePanel');
 const { openPreview, previewTabId, canPreview } = await import('./open');
 const { POLL_MS, agoText, fileEventNamesBundle } = await import('./live');
+const { MAX_RESTARTS } = await import('./PreviewTab');
+const { ApiError } = await import('../../api/hosted');
 const { MOBILE_QUERY } = await import('../../hooks/useMediaQuery');
 
 const PATH = 'decks/demo/index.html';
@@ -146,6 +148,28 @@ describe('the Preview tab', () => {
     act(() => usePreviewStore.getState().noteFileChange('/ws/other/file.html'));
     await settle();
     expect(getBundle()).toHaveBeenCalledTimes(2);
+  });
+
+  it('starts again from a new description when a file changed after the description', async () => {
+    const stale = new ApiError(409, JSON.stringify({ detail: { code: 'stale_description', message: 'changed' } }));
+    getFile().mockRejectedValueOnce(stale);
+    await openTab();
+    expect(getBundle()).toHaveBeenCalledTimes(2);
+    expect(getFile()).toHaveBeenCalledTimes(2);
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByTitle('Preview')).toBeInTheDocument();
+  });
+
+  it('stops after a few restarts for files that change all the time, and tries at the next poll', async () => {
+    const stale = new ApiError(409, JSON.stringify({ detail: { code: 'stale_description', message: 'changed' } }));
+    getFile().mockRejectedValue(stale);
+    await openTab();
+    expect(getBundle()).toHaveBeenCalledTimes(MAX_RESTARTS + 1);
+    expect(screen.getByRole('alert')).toHaveTextContent('The files change while the preview is read.');
+    getFile().mockImplementation(async () => encoder.encode(entry).slice().buffer);
+    await act(async () => { await vi.advanceTimersByTimeAsync(POLL_MS); });
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByTitle('Preview')).toBeInTheDocument();
   });
 
   it('does not poll while the panel is hidden', async () => {

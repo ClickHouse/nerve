@@ -2156,11 +2156,14 @@ Response: {
 The bytes of the file `file` (relative to the root of the bundle of `path`).
 Only a file of the description: any other is 404 `not_in_bundle`.
 `fingerprint` is the one of the description that the bundle route answered.
-The gateway keeps the newest description of a few paths for a minute; when
-the fingerprint is that of the kept one, it does not walk the bundle again.
-Otherwise (or without `fingerprint`) it describes the bundle once more. Each
-read still opens the file below the workspace without following a link on
-any name, and refuses a file that is not a regular file or is too large. A file
+The gateway keeps the 16 newest descriptions (by path and fingerprint, so
+two states of one path can be kept) for one minute each, and this route
+never walks the bundle. 409 `stale_description` when the description is not
+kept (or `fingerprint` is missing), or when the opened file is not the
+described one (its size, modification time, status change time, inode or
+device differ, or it changes during the read): read the bundle again. Each
+read opens the file below the workspace without following a link on any
+name, and refuses a file that is not a regular file. A file
 above the limit of one preview is 413 `too_large`. The answer has the type
 of the description and these headers, so that it is never a page of this
 address:

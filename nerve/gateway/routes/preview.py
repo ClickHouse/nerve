@@ -16,13 +16,16 @@ learns of it from ``GET /api/auth/me`` (``preview``). Until the gateway has
 decided at startup that it serves previews, the routes answer 404
 ``preview_disabled``.
 
-A file read does not walk the bundle again. The bundle route keeps the
-description it answered, for its path, in a small cache
-(``DescriptionCache``). The file route takes the fingerprint of that
-description and uses the kept description when it is the same; otherwise it
-describes the bundle once more. Each open still goes through
+A file read never walks the bundle. The bundle route keeps each
+description it answered in a small cache (``DescriptionCache``), by path
+and fingerprint, so two states of one path can be kept at the same time.
+The file route takes the fingerprint of the description that the web UI
+builds from. When that description is not kept (too old, pushed out, never
+answered), or when the file on disk is not the described file any more, the
+answer is 409 ``stale_description``: the web UI reads the description again
+and starts the build again. Each open goes through
 :func:`~nerve.artifacts.bundle.open_bundle_file`: no link followed on any
-name, a regular file, within the size limit.
+name, a regular file, the same size, times, inode and device as described.
 """
 
 from __future__ import annotations
@@ -85,31 +88,32 @@ def _refusal(e: BundleError) -> HTTPException:
 
 
 class DescriptionCache:
-    """The newest description of a few bundles, by workspace and path.
-
-    A description is kept for at most ``max_age`` seconds. It is used only
-    for a request that names its fingerprint, so a file read takes the
-    membership of the description that the web UI is building from.
-    """
+    """The descriptions that the bundle route answered last, by workspace,
+    path and fingerprint: at most ``size`` of them, each for at most
+    ``max_age`` seconds after it was answered. Two viewers that build from
+    two states of one path each find their own."""
 
     def __init__(self, size: int = 16, max_age: float = 60.0) -> None:
         self.size = size
         self.max_age = max_age
-        self._items: OrderedDict[tuple[str, str], tuple[float, Bundle]] = OrderedDict()
+        self._items: OrderedDict[tuple[str, str, str], tuple[float, Bundle]] = OrderedDict()
 
     def get(self, workspace: str, path: str, fingerprint: str) -> Bundle | None:
-        item = self._items.get((workspace, path))
+        key = (workspace, path, fingerprint)
+        item = self._items.get(key)
         if item is None:
             return None
         kept_at, bundle = item
-        if time.monotonic() - kept_at > self.max_age or bundle.fingerprint != fingerprint:
+        if time.monotonic() - kept_at > self.max_age:
+            del self._items[key]
             return None
-        self._items.move_to_end((workspace, path))
+        self._items.move_to_end(key)
         return bundle
 
     def put(self, workspace: str, path: str, bundle: Bundle) -> None:
-        self._items[(workspace, path)] = (time.monotonic(), bundle)
-        self._items.move_to_end((workspace, path))
+        key = (workspace, path, bundle.fingerprint)
+        self._items[key] = (time.monotonic(), bundle)
+        self._items.move_to_end(key)
         while len(self._items) > self.size:
             self._items.popitem(last=False)
 
@@ -127,9 +131,24 @@ async def _describe(path: str) -> Bundle:
     return bundle
 
 
-async def _kept_or_described(path: str, fingerprint: str) -> Bundle:
+STALE_DESCRIPTION = "stale_description"
+
+
+def _stale() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail={
+            "code": STALE_DESCRIPTION,
+            "message": "The files changed after the description. Read the description again.",
+        },
+    )
+
+
+def _kept(path: str, fingerprint: str) -> Bundle:
     kept = descriptions.get(str(get_config().workspace), path, fingerprint) if fingerprint else None
-    return kept if kept is not None else await _describe(path)
+    if kept is None:
+        raise _stale()
+    return kept
 
 
 def bundle_view(bundle: Bundle) -> dict[str, Any]:
@@ -157,12 +176,12 @@ async def preview_bundle(path: str = ""):
 
 @router.get("/api/preview/file")
 async def preview_file(path: str = "", file: str = "", fingerprint: str = ""):
-    """The bytes of the file ``file`` of the bundle of ``path``. Only a file
-    of the bundle's description, of at most ``PREVIEW_MAX_BYTES``.
-    ``fingerprint`` names the description that the bundle route answered;
-    when it is the kept one, the bundle is not described again."""
+    """The bytes of the file ``file`` of the bundle of ``path``, for the
+    description with ``fingerprint`` that the bundle route answered. Only a
+    file of that description, of at most ``PREVIEW_MAX_BYTES``, and only
+    while it is the described file: else 409 ``stale_description``."""
     _require_enabled()
-    bundle = await _kept_or_described(path, fingerprint)
+    bundle = _kept(path, fingerprint)
     found = bundle.file(file)
     if found is None:
         raise HTTPException(
@@ -175,9 +194,12 @@ async def preview_file(path: str = "", file: str = "", fingerprint: str = ""):
             detail={"code": "too_large", "message": f"The file is larger than {PREVIEW_MAX_BYTES // MIB} MiB."},
         )
     try:
-        data = await asyncio.to_thread(read_bundle_file, bundle, file, PREVIEW_MAX_BYTES)
+        # No more than the described size: a write during the read is a change too.
+        data = await asyncio.to_thread(read_bundle_file, bundle, file, found.size)
     except BundleError as e:
-        if e.code is BundleRefusal.FILE_TOO_LARGE:
-            raise HTTPException(status_code=413, detail={"code": "too_large", "message": e.message}) from None
+        if e.code in (BundleRefusal.CHANGED, BundleRefusal.FILE_TOO_LARGE):
+            raise _stale() from None
         raise _refusal(e) from None
+    if len(data) != found.size:
+        raise _stale()
     return Response(data, media_type=found.media_type, headers=FILE_HEADERS)

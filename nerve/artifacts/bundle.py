@@ -25,6 +25,7 @@ disk changes the fingerprint.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import os
 import stat
@@ -105,6 +106,8 @@ class BundleRefusal(StrEnum):
     FILE_TOO_LARGE = "file_too_large"
     TOO_MANY_FILES = "too_many_files"
     PATH_TOO_LONG = "path_too_long"
+    # The file on disk is not the file of the description any more.
+    CHANGED = "changed"
 
 
 class BundleError(Exception):
@@ -278,18 +281,21 @@ def _walk(folder: Path) -> tuple[BundleFile, ...]:
     pending: list[tuple[Path, str]] = [(folder, "")]
     while pending:
         directory, prefix = pending.pop()
+        # At most the entries that are left of the allowance, and one more
+        # to see that it is passed: a large folder is not read in full.
+        allowance = MAX_SCANNED_ENTRIES - scanned
         try:
             with os.scandir(directory) as it:
-                entries = sorted(it, key=lambda e: e.name)
+                taken = list(itertools.islice(it, allowance + 1))
         except OSError as e:
             raise BundleError(BundleRefusal.NOT_FOUND, f"A folder cannot be read ({e.strerror}).") from None
-        for entry in entries:
-            scanned += 1
-            if scanned > MAX_SCANNED_ENTRIES:
-                raise BundleError(
-                    BundleRefusal.TOO_MANY_FILES,
-                    f"The folder has more than {MAX_SCANNED_ENTRIES} entries.",
-                )
+        if len(taken) > allowance:
+            raise BundleError(
+                BundleRefusal.TOO_MANY_FILES,
+                f"The folder has more than {MAX_SCANNED_ENTRIES} entries.",
+            )
+        scanned += len(taken)
+        for entry in sorted(taken, key=lambda e: e.name):
             if entry.name.startswith("."):
                 continue
             _check_name(entry.name)
@@ -367,8 +373,14 @@ def open_bundle_file(bundle: Bundle, path: str) -> BinaryIO:
     followed. Raises :class:`BundleError` for a path that is not in the
     bundle, and for a file that is not a regular file when it is opened or
     that is larger than the file limit.
+
+    The opened file must be the file of the description: the same size,
+    modification time, status change time, inode and device as its
+    :class:`BundleFile`. Otherwise the code is ``BundleRefusal.CHANGED``,
+    and the caller describes the bundle again.
     """
-    if bundle.file(path) is None:
+    described = bundle.file(path)
+    if described is None:
         raise BundleError(BundleRefusal.NOT_FOUND, "The file is not part of the bundle.")
     names = [*(bundle.root.split("/") if bundle.root else []), *path.split("/")]
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
@@ -393,6 +405,9 @@ def open_bundle_file(bundle: Bundle, path: str) -> BinaryIO:
         if not stat.S_ISREG(st.st_mode):
             raise BundleError(BundleRefusal.SPECIAL_FILE, "The file is not a regular file.")
         _check_file_size(path, st.st_size)
+        opened = (st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino, st.st_dev)
+        if opened != (described.size, described.mtime_ns, described.ctime_ns, described.inode, described.device):
+            raise BundleError(BundleRefusal.CHANGED, f"The file {path!r} changed after the description.")
         os.set_blocking(file_fd, True)
         return os.fdopen(file_fd, "rb")
     except BaseException:

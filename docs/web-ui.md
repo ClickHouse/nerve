@@ -215,9 +215,15 @@ button of the panel. A page that says it is a deck gets slide controls
 the slides when the page has the keyboard. The footer says that the preview
 comes from the agent.
 
-The tab reads at most 4 files at the same time, and each file for the
-description it just read (`fingerprint`), so the gateway does not walk the
-bundle again for each file.
+The tab reads at most 4 files at the same time, each for the description
+it just read (`fingerprint`). The file route never walks the bundle: it
+serves a file only from a description that the gateway kept (the 16 newest,
+for one minute), and only while the file on disk is the described file
+(same size, times, inode and device). Otherwise it answers that the
+description is stale, and the tab reads the description again and starts
+the build again, at most 3 times; for files that change all the time it
+says so and tries again at the next poll. The 10 MiB limit counts the bytes
+that arrived.
 
 **Live update.** The tab reads the description of the bundle again when a
 `file_changed` event of the chat names a file of the bundle (for a folder:

@@ -267,4 +267,18 @@ describe('buildPreviewDocument', () => {
     expect(doc.querySelectorAll('img[src^="data:image/png"]')).toHaveLength(12);
     expect(most).toBe(MAX_PARALLEL_READS);
   });
+
+  it('counts the bytes that arrived, not the described size', async () => {
+    const { description } = bundle({
+      'index.html': '<html><body><img src="a.png"></body></html>',
+      'a.png': new Uint8Array(10),
+    });
+    // The file grew after the description: the read hands back much more.
+    const read = async (path: string) => (path === 'a.png'
+      ? new Uint8Array(5000).buffer
+      : new TextEncoder().encode('<html><body><img src="a.png"></body></html>').buffer);
+    const error = await buildPreviewDocument(description, read, 1000).catch(e => e);
+    expect(error).toBeInstanceOf(PreviewTooLarge);
+    expect((error as PreviewTooLarge).bytes).toBeGreaterThan(5000);
+  });
 });
