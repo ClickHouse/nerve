@@ -236,7 +236,8 @@ that, in characters: each use of a file and of a stylesheet counts (a file
 that the page uses many times counts each time), and the finished document
 text is checked once more, since the serializer escapes characters such as
 `&`. Each file is read once and each stylesheet is rewritten once; an
-import of a stylesheet that is being rewritten (a cycle) is left out. A
+import that closes a cycle (of a stylesheet that imports, directly or not,
+the one being rewritten) is left out, and a link of the page is always kept. A
 build that takes longer than 30 seconds ends. Above a limit, the tab says
 why; a state that was too large or too slow is built again when a file
 changes, or with Reload, not at each poll. Present needs full screen: when

@@ -382,6 +382,20 @@ describe('the builder over shapes of pages', () => {
   const link = (href: string) => `<link rel="stylesheet" href="${href}">`;
   const bytes = (n: number) => new Uint8Array(n);
 
+  /** The stylesheet links of a document, also inside templates at any depth, and how many have a data: address. */
+  function stylesheetLinks(html: string): { total: number; inlined: number } {
+    const links: Element[] = [];
+    const walk = (root: ParentNode) => {
+      links.push(...Array.from(root.querySelectorAll('link[rel=stylesheet]')));
+      for (const t of Array.from(root.querySelectorAll('template'))) walk((t as HTMLTemplateElement).content);
+    };
+    walk(parse(html));
+    return {
+      total: links.length,
+      inlined: links.filter(l => (l.getAttribute('href') ?? '').startsWith('data:text/css')).length,
+    };
+  }
+
   function chain(length: number): Record<string, string> {
     const sheets: Record<string, string> = {};
     for (let i = 0; i < length; i += 1) sheets[`s${i}.css`] = `@import "s${i + 1}.css"; .l${i}{color:red}`;
@@ -446,6 +460,32 @@ describe('the builder over shapes of pages', () => {
     {
       name: 'an entry near the size limit, full of escaped characters', expect: 'document',
       files: { 'index.html': page('', `<p>${'&'.repeat(95_000)}</p>`) },
+    },
+    {
+      name: 'one sheet linked from several templates', expect: 'ok',
+      files: { 'index.html': page('', '<template><link rel="stylesheet" href="w.css"><p>t</p></template>'.repeat(5)), 'w.css': 'p{color:red}' },
+      check: html => expect(stylesheetLinks(html)).toEqual({ total: 5, inlined: 5 }),
+    },
+    {
+      name: 'a sheet linked from the page and from a template', expect: 'ok',
+      files: { 'index.html': page(link('w.css'), `<template>${link('w.css')}</template>`), 'w.css': 'p{color:red}' },
+      check: html => expect(stylesheetLinks(html)).toEqual({ total: 2, inlined: 2 }),
+    },
+    {
+      name: 'nested templates', expect: 'ok',
+      files: {
+        'index.html': page('', `<template>${link('w.css')}<template>${link('w.css')}<template>${link('w.css')}</template></template></template>`),
+        'w.css': 'p{color:red}',
+      },
+      check: html => expect(stylesheetLinks(html)).toEqual({ total: 3, inlined: 3 }),
+    },
+    {
+      name: 'a cycle inside a template', expect: 'ok',
+      files: {
+        'index.html': page('', `<template>${link('a.css')}${link('b.css')}</template><template>${link('a.css')}</template>`),
+        'a.css': '@import "b.css"; a{}', 'b.css': '@import "a.css"; b{}',
+      },
+      check: html => expect(stylesheetLinks(html)).toEqual({ total: 3, inlined: 3 }),
     },
     { name: 'files past the limit', expect: 'files', files: { 'index.html': page('', '<img src="a.png"><img src="b.png">'), 'a.png': bytes(60_000), 'b.png': bytes(60_000) } },
   ];

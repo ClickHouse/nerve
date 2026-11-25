@@ -191,8 +191,6 @@ class Files {
   private readonly addresses = new Map<string, Promise<string>>();
   /** The `data:` address of each stylesheet after its rewrite: only finished ones. */
   readonly stylesheets = new Map<string, string>();
-  /** The stylesheets that are being rewritten now. */
-  readonly making = new Set<string>();
   /** The text that the build has made so far (DOCUMENT_BUDGET_FACTOR). */
   private made = 0;
   private readonly budget: number;
@@ -335,14 +333,16 @@ async function replaceAsync(
  * address removed. An imported stylesheet goes the same way, as a `data:`
  * stylesheet of its own.
  */
-async function rewriteCss(css: string, folder: string, files: Files, depth = 0): Promise<string> {
-  // One import after the other. An import of a stylesheet that is being
-  // made (a cycle) is dropped; nothing waits for another stylesheet.
+async function rewriteCss(
+  css: string, folder: string, files: Files, depth = 0, chain: ReadonlySet<string> = new Set(),
+): Promise<string> {
+  // One import after the other. `chain` holds the stylesheets whose rewrite
+  // led here: an import of one of them is a cycle, and is dropped.
   const imported = await replaceInOrder(css, CSS_IMPORT, async match => {
     const address = match[1] ?? match[2] ?? match[3] ?? match[4] ?? match[5] ?? '';
     const path = resolveAddress(address, folder, files.paths);
     if (path === null || path === 'data' || depth >= MAX_IMPORT_DEPTH) return '';
-    const url = await stylesheetUrl(path, files, depth + 1);
+    const url = await stylesheetUrl(path, files, depth + 1, chain);
     return url === null ? '' : `@import url("${url}")${match[6]};`;
   });
   const urls = await replaceAsync(imported, CSS_URL, async match => {
@@ -365,24 +365,25 @@ async function rewriteCss(css: string, folder: string, files: Files, depth = 0):
 
 /**
  * The `data:` address of the stylesheet `path` after its rewrite, for one
- * more use, or null while that stylesheet is being made (a cycle: the
- * caller drops the link or the import). Each stylesheet is rewritten once
- * per build, however often it is linked or imported, and counted for each
- * use. Only finished addresses are kept, so no call ever waits for another.
+ * more use, or null when `path` is in `chain` (the stylesheets whose rewrite
+ * led here: a cycle, and the caller drops the import). A link from the page
+ * has an empty chain, so it is never dropped.
+ *
+ * Only finished addresses are kept, and no call waits for another. The
+ * build rewrites stylesheets in order, so each is rewritten once; should two
+ * rewrites of one stylesheet still run at the same time, each makes its own
+ * (counted in the budget like any other text), and neither is dropped.
  */
-async function stylesheetUrl(path: string, files: Files, depth = 0): Promise<string | null> {
+async function stylesheetUrl(
+  path: string, files: Files, depth = 0, chain: ReadonlySet<string> = new Set(),
+): Promise<string | null> {
+  if (chain.has(path)) return null;
   const made = files.stylesheets.get(path);
   if (made !== undefined) return files.use(made);
-  if (files.making.has(path)) return null;
-  files.making.add(path);
-  try {
-    const css = await rewriteCss(await files.textOf(path), folderOf(path), files, depth);
-    const url = dataUrl('text/css', encoder.encode(css));
-    files.stylesheets.set(path, url);
-    return files.use(url);
-  } finally {
-    files.making.delete(path);
-  }
+  const css = await rewriteCss(await files.textOf(path), folderOf(path), files, depth, new Set([...chain, path]));
+  const url = dataUrl('text/css', encoder.encode(css));
+  if (!files.stylesheets.has(path)) files.stylesheets.set(path, url);
+  return files.use(url);
 }
 
 /** An attribute that names a file: the file as a `data:` address, or no attribute. */
@@ -495,10 +496,12 @@ async function inlineTree(root: ParentNode, folder: string, files: Files): Promi
     work.push(rewriteCss(element.getAttribute('style') ?? '', folder, files)
       .then(css => element.setAttribute('style', css)));
   }
-  for (const template of all('template')) {
-    work.push(inlineTree((template as HTMLTemplateElement).content, folder, files));
-  }
   await Promise.all(work);
+  // The content of each template after the rest, one after the other, as
+  // the page itself: its stylesheets then find the finished ones.
+  for (const template of all('template')) {
+    await inlineTree((template as HTMLTemplateElement).content, folder, files);
+  }
 }
 
 /** The head of Nerve's own that goes first into every preview document. */
