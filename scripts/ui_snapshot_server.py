@@ -26,10 +26,52 @@ def write_config(root: Path, port: int) -> Path:
         "agent": {"model_discovery": False},
         "sync": {"github": {"enabled": False}},
     }))
-    (config_dir / "config.yaml").write_text(json.dumps({"workspace": str(workspace)}))
+    # The Preview tab is on: it adds a button only to the Write call of
+    # snap-older, which no snapshot shows.
+    (config_dir / "config.yaml").write_text(json.dumps({
+        "workspace": str(workspace), "artifacts": {"preview": True},
+    }))
+    write_deck(workspace / "decks" / "demo")
+    (workspace / "decks" / "live.html").write_text('<!doctype html><h1 id="title">First version</h1>\n')
     # Without it `start -f` takes the directory for a fresh install and runs the setup wizard.
     (config_dir / "config.local.yaml").write_text("{}\n")
     return config_dir
+
+
+# A one-pixel PNG.
+PIXEL_PNG = bytes.fromhex(
+    "89504e470d0a1a0a0000000d4948445200000001000000010806000000"
+    "1f15c4890000000d49444154789c63f8cfc0f01f0005000201e221bc330000000049454e44ae426082"
+)
+
+
+def write_deck(deck: Path) -> None:
+    """A sample deck for the preview tests: a page with a local stylesheet,
+    script, image and font, and addresses of other hosts that must never be
+    asked for (port 9 of the loopback address answers nothing)."""
+    deck.mkdir(parents=True)
+    (deck / "index.html").write_text(
+        "<!doctype html><html><head>"
+        '<link rel="stylesheet" href="deck.css">'
+        '<link rel="stylesheet" href="http://127.0.0.1:9/remote.css">'
+        '<link rel="prerender" href="http://127.0.0.1:9/prerender">'
+        "</head><body>"
+        '<section class="slide"><h1 id="title">Quarterly review</h1>'
+        '<img id="logo" src="logo.png" alt="logo"><img src="http://127.0.0.1:9/remote.png" alt="">'
+        '<p id="ran">not run</p></section>'
+        '<script src="deck.js"></script>'
+        "</body></html>\n"
+    )
+    (deck / "deck.css").write_text(
+        '@font-face{font-family:Deck;src:url("deck.woff2") format("woff2")}'
+        "body{margin:0;background:#111;color:#eee;font-family:Deck,sans-serif}"
+        ".slide{padding:32px}h1{color:#ff5}"
+        'body{background-image:url("http://127.0.0.1:9/bg.png")}\n'
+    )
+    (deck / "deck.js").write_text("document.getElementById('ran').textContent = 'script ran';\n")
+    (deck / "logo.png").write_bytes(PIXEL_PNG)
+    # Not a real font: the test checks that the address is inlined, not the glyphs.
+    (deck / "deck.woff2").write_bytes(b"wOF2-sample")
 
 
 def minute(m: int) -> str:
@@ -95,6 +137,19 @@ async def seed(db_path: Path, workspace: Path) -> None:
         )
         await db.add_message("snap-older", "user", "Draft release notes from the merged PRs.",
                              created_at=minute(0), actor=user)
+        await db.add_message(
+            "snap-older", "assistant", "The deck is in decks/demo.",
+            blocks=[
+                {"type": "tool_call", "tool": "Write",
+                 "input": {"file_path": str(workspace / "decks" / "demo" / "index.html"), "content": "..."},
+                 "tool_use_id": "tu-deck", "result": "File written", "is_error": False},
+                {"type": "tool_call", "tool": "Write",
+                 "input": {"file_path": str(workspace / "decks" / "live.html"), "content": "..."},
+                 "tool_use_id": "tu-live", "result": "File written", "is_error": False},
+                {"type": "text", "content": "The deck is in decks/demo."},
+            ],
+            created_at=minute(1), actor=None,
+        )
 
         await db.upsert_task("task-snap-1", "memory/tasks/active/task-snap-1.md",
                              "Pin the clock in the date parser test", status="pending", tags="tests")

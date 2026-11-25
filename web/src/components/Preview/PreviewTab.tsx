@@ -79,7 +79,9 @@ function PreviewFrame({ html, onContent, onFail, hostRef }: {
     hostRef.current?.show(html);
   }, [html, hostRef]);
 
-  return <div ref={place} className="absolute inset-0" />;
+  // The keyboard guard makes this element `position: relative` for its veil,
+  // so it fills the stage by its size, not by `inset`.
+  return <div ref={place} className="h-full w-full" />;
 }
 
 export function PreviewTab({ tab }: { tab: PanelTab }) {
