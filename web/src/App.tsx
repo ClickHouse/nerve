@@ -42,6 +42,7 @@ import { SetupLanding } from './components/Setup/SetupLanding';
 import { ShortcutsModal } from './components/ShortcutsModal';
 import { useSetupStore } from './stores/setupStore';
 import { useMcpAppsStore } from './stores/mcpAppsStore';
+import { usePreviewStore } from './stores/previewStore';
 
 function App() {
   const {
@@ -75,6 +76,9 @@ function App() {
     // (MCP Apps). One read per page; off until it answers, and off on a
     // gateway without the feature.
     void useMcpAppsStore.getState().load();
+    // Whether the side panel offers a Preview tab: one read per page, off
+    // until it answers. In both auth modes.
+    void usePreviewStore.getState().load();
     return () => { unsub(); ws.disconnect(); };
   }, [live]);
 

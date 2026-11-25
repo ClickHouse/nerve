@@ -1,4 +1,9 @@
 import { useState, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useChatStore } from '../../stores/chatStore';
+import { usePreviewStore } from '../../stores/previewStore';
+import { canPreview } from '../Preview/open';
+import { PreviewButton } from '../Preview/PreviewButton';
 import { MarkdownContent } from '../Chat/MarkdownContent';
 import { Button, IconButton } from '../ui';
 import { Eye, Edit3, Lock, Save } from '../ui/icons';
@@ -15,8 +20,16 @@ interface FileEditorProps {
   onSave: () => void;
 }
 
+/** The Preview button of the Files page: the tab opens in the side panel of the open chat. */
+function ChatPreviewButton({ path, session }: { path: string; session: string }) {
+  const navigate = useNavigate();
+  return <PreviewButton path={path} onOpen={() => navigate(`/chat/${encodeURIComponent(session)}`)} />;
+}
+
 export function FileEditor({ path, content, modified, readOnly, saving, onContentChange, onSave }: FileEditorProps) {
   const [mode, setMode] = useState<'edit' | 'preview'>('edit');
+  const activeSession = useChatStore(s => s.activeSession);
+  const previewOn = usePreviewStore(s => s.enabled);
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 's') {
@@ -31,6 +44,8 @@ export function FileEditor({ path, content, modified, readOnly, saving, onConten
       <div className="flex items-center justify-between px-3 py-2 border-b border-border-subtle bg-bg shrink-0">
         <span className="text-sm text-text-dim font-mono">{path}</span>
         <div className="flex items-center gap-2">
+          {/* The Preview tab is in the side panel of the chat. */}
+          {activeSession && previewOn && canPreview(path) && <ChatPreviewButton path={path} session={activeSession} />}
           {/* A segmented pair. IconButton's required label gives each half an
               accessible name, and `active` is the accent tint the rest of the
               app uses for a current selection. `px-2.5` keeps the segments

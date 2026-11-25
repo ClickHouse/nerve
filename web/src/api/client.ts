@@ -8,6 +8,7 @@ import type {
 } from '../types/agents';
 import type { PullRequestResult } from '../types/github';
 import type { McpAppResource, McpAppTool, McpAppsConfig, McpCallToolResult } from '../types/mcpApps';
+import type { PreviewBundle, PreviewConfig } from '../types/preview';
 import type { NotificationSettingValues, NotificationSettings, NotificationTestResult } from './settings';
 import {
   gatewayDeletePushDevice, gatewayPushDevices, gatewaySavePushDevice,
@@ -1878,6 +1879,19 @@ export const api = {
   // session, the document of a view, the tools of its server, and the result
   // of a tool call that a view makes. Each call takes a deadline (`signal`).
   getMcpAppsConfig: (signal?: AbortSignal) => request<McpAppsConfig>('/mcp-apps/config', { signal }),
+
+  // The Preview tab: the switch, the description of the bundle of a
+  // workspace path, and the bytes of one file of that bundle.
+  getPreviewConfig: (signal?: AbortSignal) => request<PreviewConfig>('/preview/config', { signal }),
+  getPreviewBundle: (path: string, signal?: AbortSignal) =>
+    request<PreviewBundle>(`/preview/bundle?path=${encodeURIComponent(path)}`, { signal }),
+  /** The bytes of `file` (relative to the root of the bundle of `path`). */
+  getPreviewFile: async (path: string, file: string, signal?: AbortSignal): Promise<ArrayBuffer> => {
+    const res = await send(
+      `/preview/file?path=${encodeURIComponent(path)}&file=${encodeURIComponent(file)}`, { signal }, {},
+    );
+    return res.arrayBuffer();
+  },
   /** The document of the view at a `ui://` address of `server`. */
   getMcpAppResource: (sessionId: string, server: string, uri: string, signal?: AbortSignal) =>
     request<McpAppResource>(

@@ -103,9 +103,9 @@ On a phone (narrower than 768 px), a bar at the bottom replaces the nav rail: **
 In the chat, each run of tool calls and thinking between two text blocks of a message is one **tool burst**. A finished burst with a tool call and at least two blocks shows as one muted line that names the work, for example "Read 3 files, ran 4 commands, searched 2 times, edited 2 files" (reads and edits count distinct files; MCP tools count per server, "used 2 nerve tools"), with "1 failed" in red when calls failed. A click opens the rows. While a turn runs, its last burst stays open, so the newest calls show; it folds when text follows or the turn ends. Question cards (`ask_user`, AskUserQuestion, `ask_form`), the ExitPlanMode decision card, files that the agent sends (`send_file`) and the first card of a workflow run are never in a burst. Agent tabs and plan tabs show the rows without bursts.
 
 Tool calls are collapsed by default with specialized renderers:
-- **Edit** — Unified diff with red/green highlighting
+- **Edit** — Unified diff with red/green highlighting. With the Preview tab on, an edit of a file that has a preview (an HTML file or an image) has a **Preview** button (a screen icon) at the end of its row; see [Preview](#preview)
 - **Bash** — Terminal-styled with `$` prompt and output
-- **Read/Write** — File path prominent, line count, collapsible content
+- **Read/Write** — File path prominent, line count, collapsible content. A Write of a file that has a preview has the **Preview** button too
 - **Memory** (recall/memorize/history) — Parsed memory items with colored type badges (event, profile, knowledge, behavior)
 - **Tasks** (create/list/update/done) — Task cards with status badges
 - **Skills** (skill_list/get/create/update/read_reference/run_script) — Purple-themed cards. Load Skill shows skill name badge + line count; Create Skill shows name, description, and content preview; List Skills parses into individual skill cards; Update shows content diff preview.
@@ -114,7 +114,7 @@ Tool calls are collapsed by default with specialized renderers:
 - **AskUserQuestion** — Interactive question card with clickable options (radio for single-select, checkboxes for multi-select). Each question also offers **Other…**, which opens a "Your answer" field: the typed text (required once chosen) is that question's answer — it replaces the option in a single-select question and is appended to the chosen labels in a multi-select one. A card with one single-select question still answers on one click of an option. Multiple questions grouped in one card with a shared Submit button. Markdown previews on hover. When the agent is paused mid-turn (via `can_use_tool`), answers are sent through the interaction protocol (`answer_interaction` WebSocket message), injecting them into the SDK's `answers` field so the agent continues seamlessly. Once the question is no longer pending (answered here or in another tab, after a reload, or closed by a timeout), the card is read-only and shows the chosen answers; it never posts an answer as a chat message.
 - **ask_form** (Nerve's form tool, `mcp__nerve__ask_form`) — One card for up to six questions while the agent's tool call waits for the answers (up to an hour). The call's optional intro (Markdown, the agent's explanation of why it asks) shows above the card as chat text, and stays there after the card is answered and folds. In the card: an optional title, then each question with its label chip (`*` when required, or "Optional"), the question and the agent's reason in muted text. By kind: `choice` is option rows to pick one and `multi` option rows to pick any, each with **Other…** for the person's own words unless the agent turned it off (in `multi` the Other… text is one more answer); `text` is a two-row box that grows (Enter is a new line); `url` is checked to be http(s) with a host and no spaces; `list` is chips (a comma or Enter adds one, Backspace in the empty field removes the last, a paste splits at commas and line breaks, and leaving the field keeps the typed text); `repos` is chips like `list`, each `owner/name` (a pasted GitHub URL becomes `owner/name`; an invalid one is red with a hint and blocks Submit). Defaults are prefilled. **Submit** (or Cmd/Ctrl+Enter anywhere in the card) is enabled once every required question has an answer and nothing is invalid; Escape inside the card never stops the waiting turn. The answers go back through `answer_interaction` (`result: { answers }`), and the agent gets one line per question plus the same answers as JSON. The card answers only while its own form waits; after an answer here or in another tab, a timeout or a reload it is read-only. Answered cards fold, `ask_form` and AskUserQuestion alike: an answered or closed card shows one line per question, `LABEL → answer` (chips for a list, "—" for no answer); **Show questions** opens the full card, read-only, and **Hide** folds it again. Cards start folded, also after a reload, where the answers are read from the tool result; a card that still waits is shown in full. "Closed" means it ended without an answer (a timeout, the form was closed, or the session stopped).
 - **ask_user** (Nerve's question tool, `mcp__nerve__ask_user`): the question and its options, answerable in the chat while it waits. The card reads the question's notification, so the chat, the Notifications page and the toast show the same question with the same option list: one full-width row per option with a letter key (A, B, C). While focus is in the list, a letter or a digit 1 to 9 chooses that row. An option that ends in "(recommended)" shows first with a "Recommended" tag. The last row, **Other…**, opens a field for an answer in your own words (Enter sends, Escape closes the field). An approval (`propose_action`, on the Notifications page and in the toast) has no Other… row and says "Nothing happens until you choose."; a question does not, because the agent can continue without the answer. In an approval, Approve (green, ✓), Decline (red, ✕) and Snooze 24h (moon) show their icon in place of the letter, and the answer line shows that icon in place of `✓`. The letter keys also choose these rows. After an answer from any place (the chat, the Notifications page, the toast, Telegram, Slack), each place shows `✓ <answer>` with who answered, when, and through which channel; **Show options** opens the list, read-only. When the server refuses an answer, the card reads the question again and shows the answer from a different place, if there is one; if not, "Could not send the answer. Try again." shows under the options. While a question or an approval waits, **Dismiss** under the options in the chat and on the Notifications page ends it without an answer: the agent that asked a question gets a note, and the Telegram and Slack cards lose their buttons (see [api.md](api.md#post-apinotificationsiddismiss)). A question that expired shows "Expired without an answer"; one that was dismissed in any place shows "Dismissed without an answer". The toast shows all options and stays open until you answer or dismiss it; when the question is answered in another place, the toast shows the answer and closes after 5 seconds. A `notify` call shows as a "Notify" row.
-- **send_file** (`mcp__nerve__send_file`): an image file (PNG, JPEG, GIF, WebP, AVIF or SVG) shows in the chat, at most 320 px high, with its name and a download link below it. A click on the image opens it at full size, with a download card. Another file, or an image that does not load (for example, a file that was deleted later), shows as a download card. A call that sent nothing shows "Could not send `<name>`" and the reason, for example a file outside the workspace. The image comes from `GET /api/files/download`, the same as the download card.
+- **send_file** (`mcp__nerve__send_file`): an image file (PNG, JPEG, GIF, WebP, AVIF or SVG) shows in the chat, at most 320 px high, with its name and a download link below it. A click on the image opens it at full size, with a download card. Another file, or an image that does not load (for example, a file that was deleted later), shows as a download card. A call that sent nothing shows "Could not send `<name>`" and the reason, for example a file outside the workspace. The image comes from `GET /api/files/download`, the same as the download card. With the Preview tab on, a sent HTML file or image has the **Preview** button next to its card.
 - **EnterPlanMode** — A status line, "Entering plan mode…" while it runs and "Entered plan mode" when complete ("Plan mode declined" on an error), with no buttons: entering plan mode only restricts the agent, so no approval is involved (the Claude CLI switches the mode itself; if a CLI asks, the server allows it at once).
 - **ExitPlanMode** — The decision card. The agent pauses mid-turn until the person decides. The card shows an autogenerated summary, not the plan itself: up to six short bullets that the server writes with `agent.title_model` when the pause starts (the `plan_summary` event), with "Summarizing…" until they arrive and the plan's first heading and two lines when no summary can be made; the full plan (the interaction's `tool_input.plan`, which the CLI fills with the plan file's text) is in the side panel, which **Read the plan** opens. **Approve** lets the agent go on (it starts on the plan in the same turn) and closes the plan tab. **Request changes…** opens a required "What should change?" field; **Send** refuses the plan with that text, which reaches the agent verbatim: it stays in plan mode, revises the plan and asks again with a new card. **Edit**, offered when the pause carries the plan text, opens the side panel with the plan as a text field ("Edit the plan"); there **Apply edited plan** (enabled once the text changed) approves the person's text instead (`answer_interaction` with `result: { plan }`): the CLI saves it to the plan file and tells the agent the plan was approved with the person's edits. **Cancel** drops the edits. A decided card keeps its outcome line and a **Read the plan** link that opens that plan read-only (the edited text, for an edited approval). In the onboarding conversation the card is titled "Setup proposal" with **Apply setup**, **Change something…** and "Edit the setup proposal". After an approval, while that turn still runs, the card reads "Approved — applying…" ("Approved with your edits — applying…"; "Applying the setup…" in the onboarding conversation), then "Approved" or "Approved with your edits"; a change request reads "Changes requested" with the first line of the feedback, and an error that is not the person's feedback (a timeout, a stopped session, a CLI validation error) reads "Closed" with its reason.
 
@@ -170,7 +170,7 @@ Sub-agents and background tasks (shells, monitors, workflows) of the session; se
 - **Sidebar** — A session whose agents still run between turns stays in the Running group with a violet "parked" dot ("N agents running"; the count shows when two or more run).
 
 ### Side Panel
-Generic tabbed panel for the Agents roster, agent transcripts, plans, workflows, modified files and the session's tasks:
+Generic tabbed panel for the Agents roster, agent transcripts, plans, workflows, modified files, the session's tasks and previews ([Preview](#preview)):
 
 - **Tabbed interface** — Tab bar appears when multiple tabs exist. Each tab has its own labelled close button.
 - **Plan actions** — While `ExitPlanMode` waits, the plan tab's footer offers the same decision as the chat card, with the same labels, feedback field and Edit: Approve resolves the interaction and closes the tab (from either surface); Request changes… denies it with the person's text and keeps the tab, so the revised plan updates in place. With no `ExitPlanMode` waiting and no turn running, the footer's Approve sends "Looks good — implement it." as a message and closes the tab; the onboarding conversation has no such fallback, because its setup proposal is decided once, on its pause.
@@ -181,6 +181,100 @@ Generic tabbed panel for the Agents roster, agent transcripts, plans, workflows,
 - **Keyboard shortcut** — `Cmd/Ctrl + \` toggles panel visibility.
 - **Animated** — Panel slides in/out with a 200ms width transition matching the sidebar animation.
 - **Selection comments** — Select text in plan content to add/remove/improve/ask/note, same as in chat messages.
+
+### Preview
+With [`artifacts.preview`](config.md#artifacts) on, the side panel has a
+**Preview** tab. It shows the bundle of one workspace path, as a person would
+see the page: in local mode and in external mode.
+
+The bundle of a path (`nerve/artifacts/bundle.py`):
+
+- a folder: all regular files below it, with its `index.html` as the entry
+  (required);
+- a file named `index.html`: its folder, as above;
+- another `.html` file: that one file;
+- an image (PNG, JPEG, GIF, WebP, AVIF, SVG): that one file.
+
+A symbolic link or a special file in the path or in the folder refuses the
+bundle. Files and folders whose name starts with a dot are left out, and a
+path through one is refused. The workspace root is never a bundle, and every
+path stays inside the workspace. A file has at most 50 MiB, a folder at most
+1000 files. The tab shows the reason of a refusal.
+
+**Opening a preview.** The **Preview** button (a screen icon) is on an Edit
+or Write call of a file that has a preview, next to a file that the agent
+sent (`send_file`), and in the diff view of the Modified Files panel. On the
+Files page it is in the toolbar of an open file that has a preview, and opens
+the tab in the open chat. One tab for each path: a second open focuses it.
+
+**The header.** The path, "Updated … ago" (the newest change of a file of
+the bundle), **Reload the preview**, **Show the source** (`</>`, the text of
+the entry file), **Present** (the frame fills the screen) and the close
+button of the panel. A page that says it is a deck gets slide controls
+("3 / 12"); in Present the arrow keys, Page Up, Page Down, Home and End move
+the slides when the page has the keyboard. The footer says that the preview
+comes from the agent.
+
+**Live update.** The tab reads the description of the bundle again when a
+`file_changed` event of the chat names a file of the bundle (for a folder:
+any file below it), and each 2 seconds while the panel and the browser tab
+are visible: a file that a shell command writes sends no event. The tab draws
+the page again only when the fingerprint of the bundle changed (a file was
+added, removed or written). A deck goes back to the slide it was on.
+
+**How the page is made.** The tab reads the description of the bundle
+(`GET /api/preview/bundle`), then the files that the entry page uses
+(`GET /api/preview/file`), and makes one document of them in the browser.
+The entry page is parsed with the browser's own parser, which runs nothing
+and loads nothing. Each stylesheet, script, image, font, and each address in
+CSS that names a file of the bundle goes into the document as a `data:`
+address. Every other address (another host, a path from the root of a host,
+a file that is not in the bundle) is removed and never asked for, by the
+server or by the page. `<base>`, `<meta http-equiv>`, and links that load
+in the background (`prefetch`, `prerender`, `preconnect` and the like) are
+removed. The files of one preview have at most 10 MiB together; above that
+the tab says so and shows nothing. A bundle must use relative addresses for
+its own files.
+
+**Where it runs.** The document runs in the sandbox frame of
+[widgets](widgets.md) and [MCP Apps](mcp-apps.md#security-model): the frame
+of the sandbox document (`/mcp-app-sandbox.html`, with the policy that allows
+no origin, since a preview declares none), and inside it a frame that may
+only run scripts (`sandbox="allow-scripts"`: no `allow-same-origin`, no
+forms, no popups, no navigation of the page around it). The document has no
+origin: it reads no storage, no cookie and no DOM of the web UI. A policy
+that allows no network goes first into its head (`connect-src 'none'`, no
+host in any directive), on top of the policy of the sandbox document. The
+frame takes the keyboard only after a click in it, and a frame that sends
+messages without end is stopped, as for a widget.
+
+In external mode a gateway in front of Nerve signs in each request to the
+address with a session cookie. A request from the preview to Nerve's address
+counts as one of another site (the frame has no origin), so a cookie with
+`SameSite=Lax` or `Strict` does not go with it, and the policy lets the page
+make no such request at all. The one load that passes every policy in
+Chrome, a `<link rel="prerender">` that a script adds, is described in the
+[limits of widgets](widgets.md#limits): it can reach any address with a GET,
+and a GET to Nerve's address arrives signed in with the gateway's cookie.
+Nerve's GET routes change nothing, and the page sees no answer. MCP App
+views and widgets stay off in external mode; this switch does not turn them
+on.
+
+**Messages.** A page of the bundle can tell the tab what it is, with
+`postMessage` to its parent: objects with `channel: "nerve-artifact"` and
+`v: 1`. From the page: `{type: "ready", kind: "deck" | "table" | "markdown",
+canPrint, slides?, slide?}` at load and as the answer to `hello`, and
+`{type: "slide", slide, slides}` when the slide changes (slides count from
+1). From the tab: `{type: "hello"}`, `{type: "slide", to: "next" | "prev" |
+"first" | "last" | <number>}` and `{type: "present", on}`. The tab takes a
+message only from its own frame, checks each value, and uses none as markup
+or as an address. A page that sends no `ready` is a plain page.
+
+**Limits.** A page that loads files at run time (`fetch`, a module script
+that imports another file, a link to another page of the bundle) does not
+work in the preview: only what the entry page names goes into the document,
+and the frame has no network. Text files are read as UTF-8. `window.print()`
+and forms do nothing in the frame.
 
 ### Setup
 

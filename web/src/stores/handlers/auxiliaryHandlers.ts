@@ -1,5 +1,6 @@
 import type { WSMessage } from '../../api/websocket';
 import { reloadSessionsSoon } from '../helpers/sessionsReload';
+import { usePreviewStore } from '../previewStore';
 import type { Get, Set } from './types';
 
 // ------------------------------------------------------------------ //
@@ -58,6 +59,8 @@ export function handleFileChanged(
   _get: Get,
   set: Set,
 ): void {
+  // An open preview reads its bundle again when the path is one of its files.
+  usePreviewStore.getState().noteFileChange(msg.path);
   set(s => {
     const exists = s.modifiedFiles.some(f => f.path === msg.path);
     if (exists) {
