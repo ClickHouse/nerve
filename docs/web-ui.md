@@ -215,22 +215,31 @@ button of the panel. A page that says it is a deck gets slide controls
 the slides when the page has the keyboard. The footer says that the preview
 comes from the agent.
 
+The tab reads at most 4 files at the same time, and each file for the
+description it just read (`fingerprint`), so the gateway does not walk the
+bundle again for each file.
+
 **Live update.** The tab reads the description of the bundle again when a
 `file_changed` event of the chat names a file of the bundle (for a folder:
 any file below it), and each 2 seconds while the panel and the browser tab
 are visible: a file that a shell command writes sends no event. The tab draws
 the page again only when the fingerprint of the bundle changed (a file was
-added, removed or written). A deck goes back to the slide it was on.
+added, removed, written or replaced: the fingerprint has the size, the
+modification and status change times, and the identity of each file). A deck goes back to the slide it was on.
 
 **How the page is made.** The tab reads the description of the bundle
 (`GET /api/preview/bundle`), then the files that the entry page uses
 (`GET /api/preview/file`), and makes one document of them in the browser.
-The entry page is parsed with the browser's own parser, which runs nothing
-and loads nothing. Each stylesheet, script, image, font, and each address in
-CSS that names a file of the bundle goes into the document as a `data:`
-address. Every other address (another host, a path from the root of a host,
-a file that is not in the bundle) is removed and never asked for, by the
-server or by the page. `<base>`, `<meta http-equiv>`, and links that load
+The entry page is parsed with the browser's own parser (`DOMParser`), which
+runs no script. Parsing and building load nothing: measured in Chromium for
+each resource element and attribute, each kind of `<link>`, CSS `url()` and
+`@import`, `<base>` and `<meta http-equiv=refresh>`. Each stylesheet,
+script, image, font, and each address in CSS (`url()`, `@import`, the
+strings of `image-set()`) that names a file of the bundle goes into the
+document as a `data:` address. Another address (another host, a path from
+the root of a host, a file that is not in the bundle) is removed where the
+builder knows the construct. In every case it is never asked for: for any
+other construct, the policy of the frame allows no request. `<base>`, `<meta http-equiv>`, and links that load
 in the background (`prefetch`, `prerender`, `preconnect` and the like) are
 removed. The files of one preview have at most 10 MiB together; above that
 the tab says so and shows nothing. A bundle must use relative addresses for

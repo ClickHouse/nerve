@@ -2612,7 +2612,7 @@ artifacts:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `artifacts.preview` | bool | `false` | Show the Preview tab, and serve the preview routes and the sandbox document that a preview runs in (`/mcp-app-sandbox.html`, the document of MCP App views and widgets). A preview gets the policy that allows no origin. This key does not turn on MCP App views or widgets: they keep `mcp_apps.enabled`, and stay off in external mode. |
+| `artifacts.preview` | bool | `false` | Show the Preview tab (`GET /api/auth/me` then has `preview`), and serve the preview routes and the sandbox document that a preview runs in (`/mcp-app-sandbox.html`, the document of MCP App views and widgets). A preview gets the policy that allows no origin. This key does not turn on MCP App views or widgets: they keep `mcp_apps.enabled`, and stay off in external mode. |
 
 The key needs a restart (see
 [What still needs a restart](#what-still-needs-a-restart)). When the web UI

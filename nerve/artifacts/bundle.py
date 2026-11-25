@@ -125,6 +125,11 @@ class BundleFile:
     size: int
     media_type: str
     mtime_ns: int
+    # The status change time and the identity of the file on disk. With
+    # mtime they show a write that kept the size and set the old mtime again.
+    ctime_ns: int = 0
+    inode: int = 0
+    device: int = 0
 
 
 @dataclass(frozen=True)
@@ -159,9 +164,13 @@ class Bundle:
 
     @property
     def fingerprint(self) -> str:
-        """A value that changes when a file of the bundle is added, removed
-        or written, or when the entry changes."""
-        state = [self.kind, self.root, self.entry, [[f.path, f.size, f.mtime_ns] for f in self.files]]
+        """A value that changes when a file of the bundle is added, removed,
+        written or replaced, or when the entry changes (from the size, the
+        modification and status change times, the inode and the device)."""
+        state = [
+            self.kind, self.root, self.entry,
+            [[f.path, f.size, f.mtime_ns, f.ctime_ns, f.inode, f.device] for f in self.files],
+        ]
         return hashlib.sha256(json.dumps(state, ensure_ascii=False).encode("utf-8")).hexdigest()
 
     def file(self, path: str) -> BundleFile | None:
@@ -256,7 +265,10 @@ def _check_file_size(path: str, size: int) -> None:
 def _one_file(path: str, st: os.stat_result) -> BundleFile:
     _check_path_length(path)
     _check_file_size(path, st.st_size)
-    return BundleFile(path=path, size=st.st_size, media_type=media_type(path), mtime_ns=st.st_mtime_ns)
+    return BundleFile(
+        path=path, size=st.st_size, media_type=media_type(path), mtime_ns=st.st_mtime_ns,
+        ctime_ns=st.st_ctime_ns, inode=st.st_ino, device=st.st_dev,
+    )
 
 
 def _walk(folder: Path) -> tuple[BundleFile, ...]:

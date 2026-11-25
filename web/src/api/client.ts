@@ -8,7 +8,7 @@ import type {
 } from '../types/agents';
 import type { PullRequestResult } from '../types/github';
 import type { McpAppResource, McpAppTool, McpAppsConfig, McpCallToolResult } from '../types/mcpApps';
-import type { PreviewBundle, PreviewConfig } from '../types/preview';
+import type { PreviewBundle, ViewerPreview } from '../types/preview';
 import type { NotificationSettingValues, NotificationSettings, NotificationTestResult } from './settings';
 import {
   gatewayDeletePushDevice, gatewayPushDevices, gatewaySavePushDevice,
@@ -628,6 +628,8 @@ export interface ActorRef {
 export interface Viewer {
   actor: ActorRef;
   account: Account | null;
+  /** Only while the gateway serves the Preview tab. */
+  preview?: ViewerPreview;
 }
 
 /** One page of a lazily-loaded sidebar group (Archived / System). */
@@ -1880,15 +1882,21 @@ export const api = {
   // of a tool call that a view makes. Each call takes a deadline (`signal`).
   getMcpAppsConfig: (signal?: AbortSignal) => request<McpAppsConfig>('/mcp-apps/config', { signal }),
 
-  // The Preview tab: the switch, the description of the bundle of a
-  // workspace path, and the bytes of one file of that bundle.
-  getPreviewConfig: (signal?: AbortSignal) => request<PreviewConfig>('/preview/config', { signal }),
+  // The Preview tab (on when `GET /api/auth/me` has `preview`): the
+  // description of the bundle of a workspace path, and the bytes of one
+  // file of that bundle.
   getPreviewBundle: (path: string, signal?: AbortSignal) =>
     request<PreviewBundle>(`/preview/bundle?path=${encodeURIComponent(path)}`, { signal }),
-  /** The bytes of `file` (relative to the root of the bundle of `path`). */
-  getPreviewFile: async (path: string, file: string, signal?: AbortSignal): Promise<ArrayBuffer> => {
+  /**
+   * The bytes of `file` (relative to the root of the bundle of `path`).
+   * `fingerprint` names the description the file is read for: the server
+   * then does not describe the bundle again.
+   */
+  getPreviewFile: async (path: string, file: string, fingerprint: string, signal?: AbortSignal): Promise<ArrayBuffer> => {
     const res = await send(
-      `/preview/file?path=${encodeURIComponent(path)}&file=${encodeURIComponent(file)}`, { signal }, {},
+      `/preview/file?path=${encodeURIComponent(path)}&file=${encodeURIComponent(file)}`
+        + `&fingerprint=${encodeURIComponent(fingerprint)}`,
+      { signal }, {},
     );
     return res.arrayBuffer();
   },

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from nerve.config import get_config
 from nerve.gateway.auth import is_external_mode
 from nerve.notifications import webpush
 from nerve.gateway.routes._deps import (
@@ -93,7 +94,9 @@ def register_all_routes() -> APIRouter:
     router.include_router(mcp_apps.router)
     router.include_router(widget_state.router)
     router.include_router(memory.router)
-    router.include_router(preview.router)
+    # Only with artifacts.preview: with the switch off no preview route exists.
+    if get_config().artifacts_preview_active:
+        router.include_router(preview.router)
     router.include_router(diagnostics.router)
     router.include_router(cron.router)
     router.include_router(sources.router)

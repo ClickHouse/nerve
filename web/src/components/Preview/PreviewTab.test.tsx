@@ -117,6 +117,8 @@ describe('the Preview tab', () => {
     await openTab();
     expect(getBundle()).toHaveBeenCalledTimes(1);
     expect(getFile()).toHaveBeenCalledTimes(1);
+    // The file is read for the description that was just read.
+    expect(getFile()).toHaveBeenCalledWith(PATH, 'index.html', 'f1');
 
     // Nothing changed.
     await act(async () => { await vi.advanceTimersByTimeAsync(POLL_MS); });

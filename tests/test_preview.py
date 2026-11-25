@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
@@ -145,7 +146,8 @@ def main(document, monkeypatch):
     import nerve.gateway.server as server_mod
     from nerve.gateway.routes import _deps as deps_module
 
-    monkeypatch.setattr(cfgmod, "_config", NerveConfig(), raising=False)
+    # The preview router is registered from the configuration.
+    monkeypatch.setattr(cfgmod, "_config", _config(), raising=False)
     monkeypatch.setattr(server_mod, "WEB_DIST", document.parent)
 
     def serving(*, views: bool = False, preview: bool = False) -> None:
@@ -203,7 +205,31 @@ class TestTheDocument:
         main.serving(preview=True)
         main.client.app.dependency_overrides[require_auth] = lambda: None
         assert main.client.get("/api/mcp-apps/config").json() == {"enabled": False}
-        assert main.client.get("/api/preview/config").json()["enabled"] is True
+
+
+class TestRegistration:
+    """With the switch off no preview route exists, as on a Nerve without the feature."""
+
+    @staticmethod
+    def _answers(config: NerveConfig, monkeypatch) -> list:
+        import nerve.config as cfgmod
+        from nerve.gateway.auth import require_auth
+        from nerve.gateway.routes import register_all_routes
+
+        monkeypatch.setattr(cfgmod, "_config", config, raising=False)
+        app = FastAPI()
+        app.include_router(register_all_routes())
+        app.dependency_overrides[require_auth] = lambda: None
+        client = TestClient(app)
+        return [client.get(path).json() for path in ("/api/preview/bundle", "/api/preview/file")]
+
+    def test_off_registers_no_preview_route(self, monkeypatch):
+        assert self._answers(_config(preview=False), monkeypatch) == [{"detail": "Not Found"}] * 2
+
+    def test_on_registers_the_bundle_and_file_routes(self, monkeypatch):
+        """Registered, and off until the gateway has decided at startup that it serves previews."""
+        answers = self._answers(_config(), monkeypatch)
+        assert [a["detail"]["code"] for a in answers] == ["preview_disabled"] * 2
 
 
 # --------------------------------------------------------------------------- #
@@ -243,9 +269,6 @@ FILE = "/api/preview/file"
 
 @pytest.mark.asyncio
 class TestRoutes:
-    async def test_config(self, api):
-        assert (await api.http.get("/api/preview/config")).json() == {"enabled": True, "max_bytes": 10 * 1024 * 1024}
-
     async def test_the_description_of_a_bundle(self, api):
         r = await api.http.get(BUNDLE, params={"path": "decks/demo/index.html"})
         assert r.status_code == 200
@@ -315,7 +338,6 @@ class TestRoutes:
             await api.http.get(FILE, params={"path": "decks/demo", "file": "app.js"}),
         ):
             assert (r.status_code, r.json()["detail"]["code"]) == (404, "preview_disabled")
-        assert (await api.http.get("/api/preview/config")).json()["enabled"] is False
 
     async def test_every_route_needs_authentication(self, api):
         from nerve.gateway.auth import pin_jwt_secret, require_auth
@@ -323,8 +345,69 @@ class TestRoutes:
         pin_jwt_secret("a-signing-secret-for-this-test")
         api.app.dependency_overrides.pop(require_auth)
         for r in (
-            await api.http.get("/api/preview/config"),
             await api.http.get(BUNDLE, params={"path": "decks/demo"}),
             await api.http.get(FILE, params={"path": "decks/demo", "file": "app.js"}),
         ):
             assert r.status_code == 401
+
+
+@pytest.mark.asyncio
+class TestDescriptionCache:
+    async def test_file_reads_of_one_description_do_not_walk_the_bundle_again(self, api, monkeypatch):
+        from nerve.gateway.routes import preview
+
+        monkeypatch.setattr(preview, "descriptions", preview.DescriptionCache())
+        walks: list[str] = []
+        real = preview.describe_bundle
+
+        def counted(workspace, path):
+            walks.append(path)
+            return real(workspace, path)
+
+        monkeypatch.setattr(preview, "describe_bundle", counted)
+        body = (await api.http.get(BUNDLE, params={"path": "decks/demo"})).json()
+        for name in ("index.html", "app.js", "app.js"):
+            r = await api.http.get(FILE, params={"path": "decks/demo", "file": name, "fingerprint": body["fingerprint"]})
+            assert r.status_code == 200
+        assert walks == ["decks/demo"]
+
+    async def test_another_fingerprint_describes_the_bundle_again(self, api, monkeypatch):
+        from nerve.gateway.routes import preview
+
+        monkeypatch.setattr(preview, "descriptions", preview.DescriptionCache())
+        await api.http.get(BUNDLE, params={"path": "decks/demo"})
+        (api.workspace / "decks" / "demo" / "new.js").write_text("2")
+        r = await api.http.get(FILE, params={"path": "decks/demo", "file": "new.js", "fingerprint": "0" * 64})
+        assert (r.status_code, r.content) == (200, b"2")
+        # Without a fingerprint, too.
+        r = await api.http.get(FILE, params={"path": "decks/demo", "file": "new.js"})
+        assert r.status_code == 200
+
+    async def test_a_kept_description_still_opens_without_following_a_link(self, api, monkeypatch, tmp_path):
+        from nerve.gateway.routes import preview
+
+        monkeypatch.setattr(preview, "descriptions", preview.DescriptionCache())
+        body = (await api.http.get(BUNDLE, params={"path": "decks/demo"})).json()
+        (tmp_path / "secret.js").write_text("outside")
+        app_js = api.workspace / "decks" / "demo" / "app.js"
+        app_js.unlink()
+        app_js.symlink_to(tmp_path / "secret.js")
+        r = await api.http.get(FILE, params={"path": "decks/demo", "file": "app.js", "fingerprint": body["fingerprint"]})
+        assert r.status_code == 404
+        assert b"outside" not in r.content
+
+    def test_the_cache_is_bounded_and_ages(self, monkeypatch):
+        from nerve.artifacts.bundle import Bundle, BundleKind
+        from nerve.gateway.routes import preview
+
+        cache = preview.DescriptionCache(size=2, max_age=10)
+        def bundle(name):
+            return Bundle(workspace=Path("/ws"), path=name, root="", kind=BundleKind.PAGE, entry=name, files=())
+        for name in ("a", "b", "c"):
+            cache.put("/ws", name, bundle(name))
+        assert cache.get("/ws", "a", bundle("a").fingerprint) is None
+        assert cache.get("/ws", "c", bundle("c").fingerprint) is not None
+        assert cache.get("/ws", "c", "other") is None
+        now = preview.time.monotonic()
+        monkeypatch.setattr(preview.time, "monotonic", lambda: now + 11)
+        assert cache.get("/ws", "c", bundle("c").fingerprint) is None

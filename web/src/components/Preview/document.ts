@@ -5,15 +5,23 @@ import type { PreviewBundle } from '../../types/preview';
  * files of a bundle, that the sandbox frame shows.
  *
  * The entry page is parsed with the browser's own parser (`DOMParser`). A
- * document made that way is inert: it runs no script and loads nothing. Then
+ * document made that way has no browsing context: it runs no script. Then
  * each address of a resource in it (a script, a stylesheet, an image, a
  * font, an address in CSS) is looked up in the bundle:
  *
  * - a file of the bundle: its bytes go into the document, as a `data:`
- *   address. A stylesheet gets the same for the addresses in it.
+ *   address. A stylesheet gets the same for the addresses in it (`url()`,
+ *   `@import`, the strings of `image-set()`).
  * - anything else (an address of another host, an absolute path, a file
- *   that is not in the bundle): the address is removed. Nothing is ever
- *   asked of it, by the server or by the page.
+ *   that is not in the bundle): the address is removed, where this code
+ *   knows the construct. For every other construct (a CSS address in a
+ *   form not listed above, an address that a script makes) the policy of
+ *   the frame allows no request. So nothing is ever asked of such an
+ *   address, by the server or by the page.
+ *
+ * Parsing and building load nothing in the panel: measured in Chromium for
+ * every resource element and attribute, `<link>` of each kind, CSS
+ * `url()` and `@import`, `<base>` and `<meta http-equiv=refresh>`.
  *
  * Links that load a page in the background (`prefetch`, `prerender`,
  * `preconnect` and the like), `<base>`, and `<meta http-equiv>` are removed.
@@ -80,6 +88,8 @@ export interface PreviewDocument {
 
 /** How deep stylesheets may import each other. */
 const MAX_IMPORT_DEPTH = 8;
+/** How many files of the bundle are read at the same time. */
+export const MAX_PARALLEL_READS = 4;
 
 /** The `rel` values of a `<link>` that stay (with their address in the bundle). */
 const KEPT_LINKS = new Set(['stylesheet', 'icon', 'shortcut', 'apple-touch-icon', 'mask-icon']);
@@ -156,6 +166,9 @@ class Files {
   private readonly sizes = new Map<string, number>();
   private readonly types = new Map<string, string>();
   private readonly loaded = new Map<string, Promise<Uint8Array>>();
+  /** Reads that wait for one of the MAX_PARALLEL_READS places. */
+  private readonly waiting: Array<() => void> = [];
+  private reading = 0;
   readonly paths: ReadonlySet<string>;
   bytes = 0;
 
@@ -180,9 +193,21 @@ class Files {
     if (known) return known;
     this.bytes += this.sizes.get(path) ?? 0;
     if (this.bytes > this.limit) throw new PreviewTooLarge(this.bytes, this.limit);
-    const reading = this.read(path).then(buffer => new Uint8Array(buffer));
+    const reading = this.limited(() => this.read(path)).then(buffer => new Uint8Array(buffer));
     this.loaded.set(path, reading);
     return reading;
+  }
+
+  /** Run `task` when fewer than MAX_PARALLEL_READS reads run. */
+  private async limited<T>(task: () => Promise<T>): Promise<T> {
+    if (this.reading >= MAX_PARALLEL_READS) await new Promise<void>(go => this.waiting.push(go));
+    this.reading += 1;
+    try {
+      return await task();
+    } finally {
+      this.reading -= 1;
+      this.waiting.shift()?.();
+    }
   }
 
   async textOf(path: string): Promise<string> {
@@ -203,6 +228,10 @@ const NO_FILE = 'data:,';
 
 const CSS_IMPORT = /@import\s+(?:url\(\s*(?:"([^"]*)"|'([^']*)'|([^)\s]*))\s*\)|"([^"]*)"|'([^']*)')([^;]*);?/gi;
 const CSS_URL = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)'"\s]*))\s*\)/gi;
+/** `image-set()` and `-webkit-image-set()`, with at most one level of parentheses inside (a `url()`). */
+const CSS_IMAGE_SET = /((?:-webkit-)?image-set\()((?:[^()]|\([^()]*\))*)\)/gi;
+/** A string in CSS: the address form of `image-set()`. Group 1 is a `type(` in front (a type, not an address). */
+const CSS_STRING = /(type\(\s*)?(?:"([^"]*)"|'([^']*)')/gi;
 
 async function replaceAsync(
   text: string, pattern: RegExp, replace: (match: RegExpExecArray) => Promise<string>,
@@ -234,11 +263,21 @@ async function rewriteCss(
     const text = await rewriteCss(await files.textOf(path), folderOf(path), files, depth + 1, new Set([...seen, path]));
     return `@import url("${dataUrl('text/css', encoder.encode(text))}")${match[6]};`;
   });
-  return replaceAsync(imported, CSS_URL, async match => {
+  const urls = await replaceAsync(imported, CSS_URL, async match => {
     const address = match[1] ?? match[2] ?? match[3] ?? '';
     const path = resolveAddress(address, folder, files.paths);
     if (path === 'data') return match[0];
     return `url("${path === null ? NO_FILE : await files.dataUrlOf(path)}")`;
+  });
+  // The string form of an image set: `image-set("a.png" 1x, "b.png" 2x)`.
+  return replaceAsync(urls, CSS_IMAGE_SET, async match => {
+    const inner = await replaceAsync(match[2], CSS_STRING, async string => {
+      if (string[1] !== undefined) return string[0];
+      const path = resolveAddress(string[2] ?? string[3] ?? '', folder, files.paths);
+      if (path === 'data') return string[0];
+      return `"${path === null ? NO_FILE : await files.dataUrlOf(path)}"`;
+    });
+    return `${match[1]}${inner})`;
   });
 }
 

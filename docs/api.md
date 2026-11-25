@@ -101,6 +101,11 @@ Response: {
 the system principal's. The web UI compares message and session authors with
 `actor.id`.
 
+While the gateway serves the [Preview tab](#preview) (`artifacts.preview`),
+the answer also has `"preview": { "max_bytes": 10485760 }`: the most bytes
+that the files of one preview may have together. Without the switch the
+member is absent, and the web UI shows no preview.
+
 ### Accounts
 
 Every signed-in account can manage accounts. System credentials cannot. Account
@@ -2115,17 +2120,9 @@ Response: { "deleted": false }
 What the Preview tab of the web UI reads (see
 [Preview](web-ui.md#preview)). `path` is the path of a bundle: relative to
 the workspace, or an absolute path below it. Errors are
-`{"detail": {"code": "<code>", "message": "<sentence>"}}`. While
-`artifacts.preview` is off, the bundle and file routes answer 404
-`preview_disabled`.
-
-#### `GET /api/preview/config`
-Whether this instance shows the Preview tab, and the most bytes that the
-files of one preview may have together.
-
-```json
-Response: { "enabled": true, "max_bytes": 10485760 }
-```
+`{"detail": {"code": "<code>", "message": "<sentence>"}}`. The routes exist
+only with `artifacts.preview` on; the web UI learns of them from
+[`GET /api/auth/me`](#get-apiauthme).
 
 #### `GET /api/preview/bundle?path=<path>`
 The description of the bundle of `path`. `files[].path` is relative to the
@@ -2155,9 +2152,15 @@ Response: {
 `hidden`, `link`, `special_file`, `unsupported`, `no_entry`,
 `file_too_large`, `too_many_files`, `path_too_long`.
 
-#### `GET /api/preview/file?path=<path>&file=<file>`
+#### `GET /api/preview/file?path=<path>&file=<file>&fingerprint=<fingerprint>`
 The bytes of the file `file` (relative to the root of the bundle of `path`).
-Only a file of the description: any other is 404 `not_in_bundle`. A file
+Only a file of the description: any other is 404 `not_in_bundle`.
+`fingerprint` is the one of the description that the bundle route answered.
+The gateway keeps the newest description of a few paths for a minute; when
+the fingerprint is that of the kept one, it does not walk the bundle again.
+Otherwise (or without `fingerprint`) it describes the bundle once more. Each
+read still opens the file below the workspace without following a link on
+any name, and refuses a file that is not a regular file or is too large. A file
 above the limit of one preview is 413 `too_large`. The answer has the type
 of the description and these headers, so that it is never a page of this
 address:

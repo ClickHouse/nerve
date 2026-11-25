@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { PreviewBundle } from '../../types/preview';
-import { PREVIEW_POLICY, PreviewTooLarge, buildPreviewDocument, resolveAddress } from './document';
+import { MAX_PARALLEL_READS, PREVIEW_POLICY, PreviewTooLarge, buildPreviewDocument, resolveAddress } from './document';
 
 /**
  * The document of a preview, made from the files of a bundle. A fake read
@@ -223,5 +223,48 @@ describe('buildPreviewDocument', () => {
     const img = parse(result.html).querySelector('img')!;
     expect(img.getAttribute('src')).toMatch(/^data:image\/svg\+xml;charset=utf-8;base64,/);
     expect(img.getAttribute('alt')).toBe('logo.svg');
+  });
+
+  it('rewrites the strings of image-set() and -webkit-image-set(), local and remote', async () => {
+    const { description, read, asked } = bundle({
+      'index.html': '<html><head><link rel="stylesheet" href="a.css"></head>'
+        + '<body><div style="background-image:-webkit-image-set(\'img/b.png\' 1x, \'https://example.com/y.png\' 2x)"></div></body></html>',
+      'a.css': 'h1{background-image:image-set("img/b.png" 1x, "https://example.com/x.png" 2x, '
+        + 'url(img/b.png) 3x, "img/b.png" type("image/png"))}',
+      'img/b.png': new Uint8Array([7, 7]),
+    });
+    const doc = parse((await buildPreviewDocument(description, read, LIMIT)).html);
+    const css = decodeData(doc.querySelector('link')!.getAttribute('href')!);
+    expect(css).not.toContain('example.com');
+    expect(css).not.toContain('"img/b.png"');
+    expect(css.match(/data:image\/png;base64,Bwc=/g)).toHaveLength(3);
+    expect(css).toContain('"data:," 2x');
+    expect(css).toContain('type("image/png")');
+    const style = doc.querySelector('div')!.getAttribute('style')!;
+    expect(style).toMatch(/^background-image:-webkit-image-set\("data:image\/png;base64,Bwc=" 1x, "data:," 2x\)$/);
+    expect(asked.filter(p => p === 'img/b.png')).toHaveLength(1);
+  });
+
+  it('reads at most a few files at the same time', async () => {
+    const names = Array.from({ length: 12 }, (_, i) => `img/${i}.png`);
+    const files: Record<string, string | Uint8Array> = {
+      'index.html': `<html><body>${names.map(n => `<img src="${n}">`).join('')}</body></html>`,
+    };
+    for (const n of names) files[n] = new Uint8Array([1]);
+    const { description } = bundle(files);
+    let running = 0;
+    let most = 0;
+    const read = async (path: string) => {
+      running += 1;
+      most = Math.max(most, running);
+      await new Promise(r => setTimeout(r, 5));
+      running -= 1;
+      return (files[path] as Uint8Array | string) instanceof Uint8Array
+        ? (files[path] as Uint8Array).slice().buffer
+        : new TextEncoder().encode(files[path] as string).buffer;
+    };
+    const doc = parse((await buildPreviewDocument(description, read, LIMIT)).html);
+    expect(doc.querySelectorAll('img[src^="data:image/png"]')).toHaveLength(12);
+    expect(most).toBe(MAX_PARALLEL_READS);
   });
 });

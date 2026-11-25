@@ -91,6 +91,28 @@ class TestRules:
         os.utime(css, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000))
         assert describe_bundle(ws, "decks/demo").fingerprint != before
 
+    def test_the_fingerprint_changes_for_a_same_size_replacement_with_the_mtime_restored(self, ws):
+        """A copy that keeps the timestamps (``cp -p``, a build tool): same
+        size, same mtime, other bytes."""
+        css = ws / "decks" / "demo" / "style.css"
+        before = describe_bundle(ws, "decks/demo").fingerprint
+        st = css.stat()
+        replacement = ws / "decks" / "demo" / "style.tmp"
+        replacement.write_text("body{color:tan}")
+        assert replacement.stat().st_size == st.st_size
+        os.replace(replacement, css)
+        os.utime(css, ns=(st.st_atime_ns, st.st_mtime_ns))
+        assert css.stat().st_mtime_ns == st.st_mtime_ns
+        assert describe_bundle(ws, "decks/demo").fingerprint != before
+
+    def test_the_fingerprint_changes_for_a_same_size_write_in_place_with_the_mtime_restored(self, ws):
+        css = ws / "decks" / "demo" / "style.css"
+        before = describe_bundle(ws, "decks/demo").fingerprint
+        st = css.stat()
+        css.write_text("body{color:tan}")
+        os.utime(css, ns=(st.st_atime_ns, st.st_mtime_ns))
+        assert describe_bundle(ws, "decks/demo").fingerprint != before
+
     def test_the_fingerprint_changes_when_a_file_is_added(self, ws):
         before = describe_bundle(ws, "decks/demo").fingerprint
         (ws / "decks" / "demo" / "app.js").write_text("1")

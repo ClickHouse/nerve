@@ -218,6 +218,20 @@ describe('who the session belongs to', () => {
     expect(selfActorId()).toBe('actor-1');
   });
 
+  it('turns the Preview tab on only when the viewer says so', async () => {
+    const { usePreviewStore, resetPreviewConfig } = await import('./previewStore');
+    getToken.mockReturnValue('a-token');
+    api.authStatus.mockResolvedValue(status());
+    api.getViewer.mockResolvedValue(me());
+    await useAuthStore.getState().checkAuth();
+    expect(usePreviewStore.getState().enabled).toBe(false);
+
+    api.getViewer.mockResolvedValue({ ...me(), preview: { max_bytes: 4096 } });
+    await useAuthStore.getState().checkAuth();
+    expect(usePreviewStore.getState()).toMatchObject({ enabled: true, maxBytes: 4096 });
+    resetPreviewConfig();
+  });
+
   it('keeps the viewer when the session has no account', async () => {
     getToken.mockReturnValue('a-token');
     api.authStatus.mockResolvedValue(status());

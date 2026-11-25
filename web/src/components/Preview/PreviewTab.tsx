@@ -135,7 +135,9 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
           if (!alive.current) return;
           setBundle(next);
           if (force || next.fingerprint !== shown.current) {
-            const built = await buildPreviewDocument(next, file => api.getPreviewFile(path, file), maxBytes);
+            const built = await buildPreviewDocument(
+              next, file => api.getPreviewFile(path, file, next.fingerprint), maxBytes,
+            );
             if (!alive.current) return;
             shown.current = next.fingerprint;
             setDoc(built);

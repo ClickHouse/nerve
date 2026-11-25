@@ -1,10 +1,13 @@
 /**
- * The Preview tab: what `GET /api/preview/*` answers (`nerve/gateway/routes/preview.py`).
+ * The Preview tab: what `GET /api/preview/*` answers (`nerve/gateway/routes/preview.py`),
+ * and what `GET /api/auth/me` says of it.
  */
 
-/** `GET /api/preview/config`. */
-export interface PreviewConfig {
-  enabled: boolean;
+/**
+ * The `preview` member of `GET /api/auth/me`: there only while the gateway
+ * serves the Preview tab (`artifacts.preview`).
+ */
+export interface ViewerPreview {
   /** The most bytes that the files of one preview may have together. */
   max_bytes: number;
 }
