@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { PreviewBundle } from '../../types/preview';
-import { MAX_PARALLEL_READS, PREVIEW_POLICY, PreviewTooLarge, buildPreviewDocument, resolveAddress } from './document';
+import {
+  DOCUMENT_BUDGET_FACTOR, MAX_PARALLEL_READS, PREVIEW_POLICY, PreviewTooLarge, buildPreviewDocument, resolveAddress,
+  srcsetCandidates,
+} from './document';
 
 /**
  * The document of a preview, made from the files of a bundle. A fake read
@@ -280,5 +283,84 @@ describe('buildPreviewDocument', () => {
     const error = await buildPreviewDocument(description, read, 1000).catch(e => e);
     expect(error).toBeInstanceOf(PreviewTooLarge);
     expect((error as PreviewTooLarge).bytes).toBeGreaterThan(5000);
+  });
+
+  it('stops a build that would repeat one large file many times, before it makes the document', async () => {
+    const image = new Uint8Array(3000);
+    const slides = Array.from({ length: 50 }, () => '<img src="big.png">').join('');
+    const { description, read, asked } = bundle({ 'index.html': `<html><body>${slides}</body></html>`, 'big.png': image });
+    const limit = 10_000;
+    const error = await buildPreviewDocument(description, read, limit).catch(e => e);
+    expect(error).toBeInstanceOf(PreviewTooLarge);
+    expect((error as PreviewTooLarge).what).toBe('document');
+    expect((error as PreviewTooLarge).limit).toBe(limit * DOCUMENT_BUDGET_FACTOR);
+    // The file was read once.
+    expect(asked.filter(p => p === 'big.png')).toHaveLength(1);
+  });
+
+  it('makes the data address of a file once and uses it for each reference within the budget', async () => {
+    const { description, read, asked } = bundle({
+      'index.html': `<html><body>${'<img src="a.png">'.repeat(5)}</body></html>`,
+      'a.png': new Uint8Array([1, 2, 3]),
+    });
+    const doc = parse((await buildPreviewDocument(description, read, LIMIT)).html);
+    const sources = Array.from(doc.querySelectorAll('img')).map(img => img.getAttribute('src'));
+    expect(new Set(sources)).toEqual(new Set(['data:image/png;base64,AQID']));
+    expect(asked.filter(p => p === 'a.png')).toHaveLength(1);
+  });
+
+  it('reads each stylesheet once, however the imports branch', async () => {
+    // Each level imports the next one twice: without a cache 2^8 expansions.
+    const files: Record<string, string | Uint8Array> = {
+      'index.html': '<html><head><link rel="stylesheet" href="s0.css"></head><body></body></html>',
+    };
+    for (let i = 0; i < 8; i += 1) files[`s${i}.css`] = `@import "s${i + 1}.css"; @import url(s${i + 1}.css); .l${i}{color:red}`;
+    files['s8.css'] = '.end{color:blue}';
+    const { description } = bundle(files);
+    const reads: string[] = [];
+    const read = async (path: string) => {
+      reads.push(path);
+      const v = files[path];
+      return (typeof v === 'string' ? new TextEncoder().encode(v) : v).slice().buffer;
+    };
+    const result = await buildPreviewDocument(description, read, LIMIT);
+    expect(reads.filter(p => p.endsWith('.css')).sort()).toEqual(Object.keys(files).filter(p => p.endsWith('.css')).sort());
+    // What the nesting repeats in the text is
+    // counted in the document budget (next test).
+    expect(result.html.length).toBeLessThan(LIMIT * DOCUMENT_BUDGET_FACTOR);
+  });
+
+  it('counts branching imports in the document budget', async () => {
+    const files: Record<string, string | Uint8Array> = {
+      'index.html': '<html><head><link rel="stylesheet" href="s0.css"></head><body></body></html>',
+      'big.png': new Uint8Array(2000),
+    };
+    for (let i = 0; i < 6; i += 1) files[`s${i}.css`] = `@import "s${i + 1}.css"; @import "s${i + 1}.css"; a{background:url(big.png)}`;
+    files['s6.css'] = 'b{background:url(big.png)}';
+    const { description, read } = bundle(files);
+    const error = await buildPreviewDocument(description, read, 5000).catch(e => e);
+    expect(error).toBeInstanceOf(PreviewTooLarge);
+    expect((error as PreviewTooLarge).what).toBe('document');
+  });
+
+  it('keeps a data address in srcset whole', async () => {
+    const { description, read } = bundle({
+      'index.html': '<html><body><img srcset="data:image/png;base64,AAAA 1x, a.png 2x, https://example.com/c.png 3x"></body></html>',
+      'a.png': new Uint8Array([1, 2, 3]),
+    });
+    const doc = parse((await buildPreviewDocument(description, read, LIMIT)).html);
+    expect(doc.querySelector('img')!.getAttribute('srcset')).toBe('data:image/png;base64,AAAA 1x, data:image/png;base64,AQID 2x');
+  });
+});
+
+describe('srcsetCandidates', () => {
+  it.each([
+    ['a.png 1x, b.png 2x', [['a.png', '1x'], ['b.png', '2x']]],
+    ['data:image/png;base64,AA,BB 1x,c.png', [['data:image/png;base64,AA,BB', '1x'], ['c.png', '']]],
+    ['a.png, b.png 100w', [['a.png', ''], ['b.png', '100w']]],
+    ['  ,, a.png  ', [['a.png', '']]],
+    ['', []],
+  ])('reads %j', (value, expected) => {
+    expect(srcsetCandidates(value).map(c => [c.address, c.descriptor])).toEqual(expected);
   });
 });

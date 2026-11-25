@@ -57,17 +57,38 @@ export const PREVIEW_POLICY = [
   "form-action 'none'",
 ].join('; ');
 
-/** The files of the bundle that a preview put into its document were more than the limit. */
+/**
+ * The preview is larger than a limit: the files it reads (`files`, the
+ * source limit), or the text that the build makes of them (`document`, see
+ * DOCUMENT_BUDGET_FACTOR).
+ */
 export class PreviewTooLarge extends Error {
   readonly bytes: number;
   readonly limit: number;
+  readonly what: 'files' | 'document';
 
-  constructor(bytes: number, limit: number) {
-    super(`The files of this preview are larger than ${formatMiB(limit)}.`);
+  constructor(bytes: number, limit: number, what: 'files' | 'document' = 'files') {
+    super(what === 'files'
+      ? `The files of this preview are larger than ${formatMiB(limit)}.`
+      : `The document of this preview is larger than ${formatMiB(limit)}.`);
     this.bytes = bytes;
     this.limit = limit;
+    this.what = what;
   }
 }
+
+/**
+ * The text that one build may make, as a multiple of the source limit
+ * (characters: each one is one byte of base64 or ASCII markup). It counts
+ * the entry text and every address and stylesheet put into the document,
+ * once for each use. A file goes into the document as base64, 4/3 of its
+ * size; a file inside a stylesheet counts again inside the stylesheet's own
+ * base64 address. So a bundle at the source limit whose bytes are all used
+ * once, through one stylesheet, needs about 3.1 times the limit. With 4, a
+ * build stops before the panel makes and posts a document of more than
+ * about 40 MiB of text, whatever the page repeats.
+ */
+export const DOCUMENT_BUDGET_FACTOR = 4;
 
 /** A size in MiB, for a person. */
 export function formatMiB(bytes: number): string {
@@ -86,7 +107,7 @@ export interface PreviewDocument {
   bytes: number;
 }
 
-/** How deep stylesheets may import each other. */
+/** How deep stylesheets may import each other. Each stylesheet is expanded once (a cache), whatever the depth. */
 const MAX_IMPORT_DEPTH = 8;
 /** How many files of the bundle are read at the same time. */
 export const MAX_PARALLEL_READS = 4;
@@ -166,6 +187,13 @@ class Files {
   private readonly sizes = new Map<string, number>();
   private readonly types = new Map<string, string>();
   private readonly loaded = new Map<string, Promise<Uint8Array>>();
+  /** The `data:` address of each file, made once. */
+  private readonly addresses = new Map<string, Promise<string>>();
+  /** The `data:` address of each stylesheet after its rewrite, made once. */
+  readonly stylesheets = new Map<string, Promise<string>>();
+  /** The text that the build has made so far (DOCUMENT_BUDGET_FACTOR). */
+  private made = 0;
+  private readonly budget: number;
   /** Reads that wait for one of the MAX_PARALLEL_READS places. */
   private readonly waiting: Array<() => void> = [];
   private reading = 0;
@@ -176,6 +204,7 @@ class Files {
     this.bundle = bundle;
     this.read = read;
     this.limit = limit;
+    this.budget = limit * DOCUMENT_BUDGET_FACTOR;
     for (const file of bundle.files) {
       this.sizes.set(file.path, file.size);
       this.types.set(file.path, file.type);
@@ -223,8 +252,26 @@ class Files {
     return decoder.decode(await this.bytesOf(path));
   }
 
+  /** Count `chars` of text that goes into the document; refused past the budget. */
+  spend(chars: number): void {
+    this.made += chars;
+    if (this.made > this.budget) throw new PreviewTooLarge(this.made, this.budget, 'document');
+  }
+
+  /** `text`, counted for one more use in the document. */
+  use(text: string): string {
+    this.spend(text.length);
+    return text;
+  }
+
+  /** The `data:` address of `path` for one more use: made once, counted for each use. */
   async dataUrlOf(path: string): Promise<string> {
-    return dataUrl(this.type(path), await this.bytesOf(path));
+    let address = this.addresses.get(path);
+    if (!address) {
+      address = this.bytesOf(path).then(bytes => dataUrl(this.type(path), bytes));
+      this.addresses.set(path, address);
+    }
+    return this.use(await address);
   }
 
   get entry(): string {
@@ -241,6 +288,25 @@ const CSS_URL = /url\(\s*(?:"([^"]*)"|'([^']*)'|([^)'"\s]*))\s*\)/gi;
 const CSS_IMAGE_SET = /((?:-webkit-)?image-set\()((?:[^()]|\([^()]*\))*)\)/gi;
 /** A string in CSS: the address form of `image-set()`. Group 1 is a `type(` in front (a type, not an address). */
 const CSS_STRING = /(type\(\s*)?(?:"([^"]*)"|'([^']*)')/gi;
+
+/** As `replaceAsync`, one replacement after the other. */
+async function replaceInOrder(
+  text: string, pattern: RegExp, replace: (match: RegExpExecArray) => Promise<string>,
+): Promise<string> {
+  const matches: RegExpExecArray[] = [];
+  pattern.lastIndex = 0;
+  for (let match = pattern.exec(text); match; match = pattern.exec(text)) {
+    matches.push(match);
+    if (match[0].length === 0) pattern.lastIndex += 1;
+  }
+  let out = '';
+  let last = 0;
+  for (const match of matches) {
+    out += text.slice(last, match.index) + await replace(match);
+    last = match.index + match[0].length;
+  }
+  return out + text.slice(last);
+}
 
 async function replaceAsync(
   text: string, pattern: RegExp, replace: (match: RegExpExecArray) => Promise<string>,
@@ -265,18 +331,20 @@ async function replaceAsync(
 async function rewriteCss(
   css: string, folder: string, files: Files, depth = 0, seen: ReadonlySet<string> = new Set(),
 ): Promise<string> {
-  const imported = await replaceAsync(css, CSS_IMPORT, async match => {
+  // One import after the other: a stylesheet that is still being made is
+  // then always one of `seen`, so no import waits for itself.
+  const imported = await replaceInOrder(css, CSS_IMPORT, async match => {
     const address = match[1] ?? match[2] ?? match[3] ?? match[4] ?? match[5] ?? '';
     const path = resolveAddress(address, folder, files.paths);
     if (path === null || path === 'data' || depth >= MAX_IMPORT_DEPTH || seen.has(path)) return '';
-    const text = await rewriteCss(await files.textOf(path), folderOf(path), files, depth + 1, new Set([...seen, path]));
-    return `@import url("${dataUrl('text/css', encoder.encode(text))}")${match[6]};`;
+    const url = await stylesheetUrl(path, files, depth + 1, new Set([...seen, path]));
+    return `@import url("${url}")${match[6]};`;
   });
   const urls = await replaceAsync(imported, CSS_URL, async match => {
     const address = match[1] ?? match[2] ?? match[3] ?? '';
     const path = resolveAddress(address, folder, files.paths);
     if (path === 'data') return match[0];
-    return `url("${path === null ? NO_FILE : await files.dataUrlOf(path)}")`;
+    return `url("${path === null ? files.use(NO_FILE) : await files.dataUrlOf(path)}")`;
   });
   // The string form of an image set: `image-set("a.png" 1x, "b.png" 2x)`.
   return replaceAsync(urls, CSS_IMAGE_SET, async match => {
@@ -284,10 +352,28 @@ async function rewriteCss(
       if (string[1] !== undefined) return string[0];
       const path = resolveAddress(string[2] ?? string[3] ?? '', folder, files.paths);
       if (path === 'data') return string[0];
-      return `"${path === null ? NO_FILE : await files.dataUrlOf(path)}"`;
+      return `"${path === null ? files.use(NO_FILE) : await files.dataUrlOf(path)}"`;
     });
     return `${match[1]}${inner})`;
   });
+}
+
+/**
+ * The `data:` address of the stylesheet `path` after its rewrite, for one
+ * more use: each stylesheet is rewritten once per build, however often it
+ * is linked or imported, and counted for each use.
+ */
+async function stylesheetUrl(path: string, files: Files, depth = 0, seen: ReadonlySet<string> = new Set([path])): Promise<string> {
+  let made = files.stylesheets.get(path);
+  if (!made) {
+    made = (async () => {
+      const css = await rewriteCss(await files.textOf(path), folderOf(path), files, depth, seen);
+      return files.use(dataUrl('text/css', encoder.encode(css)));
+    })();
+    files.stylesheets.set(path, made);
+    return made;
+  }
+  return files.use(await made);
 }
 
 /** An attribute that names a file: the file as a `data:` address, or no attribute. */
@@ -298,12 +384,45 @@ async function inlineAttribute(element: Element, name: string, folder: string, f
   else element.setAttribute(name, await files.dataUrlOf(path));
 }
 
+/**
+ * The candidates of a `srcset`: an address (a run without spaces, so a
+ * `data:` address with its comma stays whole), then its descriptors up to
+ * the next comma. As in the HTML standard, commas at the end of an address
+ * are no part of it, and then the candidate has no descriptors.
+ */
+export function srcsetCandidates(value: string): Array<{ address: string; descriptor: string }> {
+  const out: Array<{ address: string; descriptor: string }> = [];
+  let i = 0;
+  while (i < value.length) {
+    while (i < value.length && /[\s,]/.test(value[i])) i += 1;
+    if (i >= value.length) break;
+    let end = i;
+    while (end < value.length && !/\s/.test(value[end])) end += 1;
+    let address = value.slice(i, end);
+    i = end;
+    let descriptor = '';
+    if (/,+$/.test(address)) {
+      address = address.replace(/,+$/, '');
+    } else {
+      let depth = 0;
+      const start = i;
+      while (i < value.length && (value[i] !== ',' || depth > 0)) {
+        if (value[i] === '(') depth += 1;
+        else if (value[i] === ')') depth = Math.max(0, depth - 1);
+        i += 1;
+      }
+      descriptor = value.slice(start, i).trim();
+    }
+    if (address) out.push({ address, descriptor });
+  }
+  return out;
+}
+
 /** A `srcset` with the candidates that are files of the bundle, as `data:` addresses. */
 async function inlineSrcset(element: Element, folder: string, files: Files): Promise<void> {
   const kept: string[] = [];
-  for (const candidate of (element.getAttribute('srcset') ?? '').split(',')) {
-    const [address, ...descriptor] = candidate.trim().split(/\s+/);
-    if (!address) continue;
+  for (const { address, descriptor: described } of srcsetCandidates(element.getAttribute('srcset') ?? '')) {
+    const descriptor = described ? [described] : [];
     const path = resolveAddress(address, folder, files.paths);
     if (path === null) continue;
     const url = path === 'data' ? address : await files.dataUrlOf(path);
@@ -333,9 +452,7 @@ async function inlineTree(root: ParentNode, folder: string, files: Files): Promi
       link.remove();
     } else if (path !== 'data') {
       work.push((async () => {
-        const url = rel.includes('stylesheet')
-          ? dataUrl('text/css', encoder.encode(await rewriteCss(await files.textOf(path), folderOf(path), files)))
-          : await files.dataUrlOf(path);
+        const url = rel.includes('stylesheet') ? await stylesheetUrl(path, files) : await files.dataUrlOf(path);
         link.setAttribute('href', url);
       })());
     }
@@ -416,7 +533,7 @@ export async function buildPreviewDocument(
   if (bundle.kind === 'image') {
     return { html: await imageDocument(files), source: null, bytes: files.bytes };
   }
-  const source = await files.textOf(bundle.entry);
+  const source = files.use(await files.textOf(bundle.entry));
   const doc = new DOMParser().parseFromString(source, 'text/html');
   doc.documentElement.removeAttribute('manifest');
   await inlineTree(doc, folderOf(bundle.entry), files);

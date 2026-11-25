@@ -217,13 +217,22 @@ comes from the agent.
 
 The tab reads at most 4 files at the same time, each for the description
 it just read (`fingerprint`). The file route never walks the bundle: it
-serves a file only from a description that the gateway kept (the 16 newest,
-for one minute), and only while the file on disk is the described file
+serves a file only from a description that the gateway kept (at most 16;
+one goes when it was not used for a minute, or when it is the one used least
+recently and a new one needs its place), and only while the file on disk is
+the described file
 (same size, times, inode and device). Otherwise it answers that the
 description is stale, and the tab reads the description again and starts
 the build again, at most 3 times; for files that change all the time it
-says so and tries again at the next poll. The 10 MiB limit counts the bytes
-that arrived.
+says so and tries again at the next poll. With more than 16 previews built
+at the same time, a build can lose its description and start again. The
+10 MiB limit counts the bytes that arrived. The document that the tab makes
+of them has a limit too: 4 times the source limit, counted for each use of
+a file (a file that the page uses many times counts each time, and so does
+a stylesheet that is imported more than once). Above it, the tab says that
+the preview is too large to show. Present needs full screen: when the
+browser does not allow it, the tab says so and the page is not told to
+present.
 
 **Live update.** The tab reads the description of the bundle again when a
 `file_changed` event of the chat names a file of the bundle (for a folder:

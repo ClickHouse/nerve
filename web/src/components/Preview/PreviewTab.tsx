@@ -48,11 +48,16 @@ function isStale(e: unknown): boolean {
   return apiErrorDetail(e)?.code === 'stale_description';
 }
 
+const NO_FULL_SCREEN = 'Present needs full screen, and this browser did not allow it.';
+
 const KEEPS_CHANGING = 'The files change while the preview is read. The tab tries again in a moment.';
 
 function problemText(e: unknown): string {
   if (e instanceof PreviewTooLarge) {
-    return `This preview needs ${formatMiB(e.bytes)} of files or more. The limit is ${formatMiB(e.limit)}.`;
+    return e.what === 'files'
+      ? `This preview needs ${formatMiB(e.bytes)} of files or more. The limit is ${formatMiB(e.limit)}.`
+      : `This preview is too large to show: its document would be more than ${formatMiB(e.limit)}`
+        + ' (a file that the page uses many times counts each time).';
   }
   const message = apiErrorDetail(e)?.message;
   if (typeof message === 'string' && message) return message;
@@ -111,6 +116,7 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
   const [frameKey, setFrameKey] = useState(0);
   const [content, setContent] = useState<ContentState | null>(null);
   const [presenting, setPresenting] = useState(false);
+  const [presentError, setPresentError] = useState<string | null>(null);
 
   const hostRef = useRef<PreviewHost | null>(null);
   const stageRef = useRef<HTMLDivElement>(null);
@@ -244,15 +250,18 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
     return () => document.removeEventListener('fullscreenchange', onChange);
   }, [send]);
 
+  // The page gets `present: on` only from `fullscreenchange`, when the
+  // stage really fills the screen. Without full screen it stays as it is.
   const present = () => {
     const stage = stageRef.current;
     if (!stage) return;
     setShowSource(false);
-    if (typeof stage.requestFullscreen === 'function') {
-      stage.requestFullscreen().catch(() => send({ type: 'present', on: true }));
-    } else {
-      send({ type: 'present', on: true });
+    setPresentError(null);
+    if (typeof stage.requestFullscreen !== 'function') {
+      setPresentError(NO_FULL_SCREEN);
+      return;
     }
+    stage.requestFullscreen().catch(() => setPresentError(NO_FULL_SCREEN));
     hostRef.current?.focus();
   };
 
@@ -325,6 +334,11 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
         </div>
       </div>
 
+      {presentError && (
+        <p role="status" className="px-3 py-1 text-xs text-error border-b border-border-subtle bg-bg shrink-0">
+          {presentError}
+        </p>
+      )}
       <div className="relative flex-1 min-h-0 bg-bg-sunken">
         {problem && (
           <div role="alert" className="absolute inset-0 flex flex-col items-center justify-center gap-3 p-6 text-center">

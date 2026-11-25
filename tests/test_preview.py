@@ -431,6 +431,24 @@ class TestDescriptionCache:
         assert r.status_code == 404
         assert b"outside" not in r.content
 
+    async def test_a_read_keeps_the_description_and_one_unused_for_the_lifetime_goes(self, api, monkeypatch):
+        """The lifetime is a time without use: a large build that reads a file
+        every few seconds keeps its description past one minute."""
+        from nerve.gateway.routes import preview
+
+        monkeypatch.setattr(preview, "descriptions", preview.DescriptionCache())
+        clock = {"now": 1000.0}
+        monkeypatch.setattr(preview.time, "monotonic", lambda: clock["now"])
+        body = (await api.http.get(BUNDLE, params={"path": "decks/demo"})).json()
+        params = {"path": "decks/demo", "file": "app.js", "fingerprint": body["fingerprint"]}
+        for _ in range(3):
+            clock["now"] += 59
+            assert (await api.http.get(FILE, params=params)).status_code == 200
+        # Three minutes after it was stored, and still kept. Then unused for the lifetime:
+        clock["now"] += 61
+        r = await api.http.get(FILE, params=params)
+        assert (r.status_code, r.json()["detail"]["code"]) == (409, "stale_description")
+
     def test_the_cache_is_bounded_and_ages(self, monkeypatch):
         from nerve.artifacts.bundle import Bundle, BundleKind
         from nerve.gateway.routes import preview

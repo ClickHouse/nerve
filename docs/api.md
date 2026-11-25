@@ -2156,9 +2156,10 @@ Response: {
 The bytes of the file `file` (relative to the root of the bundle of `path`).
 Only a file of the description: any other is 404 `not_in_bundle`.
 `fingerprint` is the one of the description that the bundle route answered.
-The gateway keeps the 16 newest descriptions (by path and fingerprint, so
-two states of one path can be kept) for one minute each, and this route
-never walks the bundle. 409 `stale_description` when the description is not
+The gateway keeps at most 16 descriptions (by path and fingerprint, so two
+states of one path can be kept). One goes when it was not used for one
+minute (a successful read here uses it), or when it is the one used least
+recently and a new one needs its place. This route never walks the bundle. 409 `stale_description` when the description is not
 kept (or `fingerprint` is missing), or when the opened file is not the
 described one (its size, modification time, status change time, inode or
 device differ, or it changes during the read): read the bundle again. Each

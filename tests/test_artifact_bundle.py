@@ -245,6 +245,9 @@ class TestRefusals:
         monkeypatch.setattr(bundle_module, "MAX_PATH_BYTES", 8)
         assert _refused(ws, "decks/demo") is BundleRefusal.PATH_TOO_LONG
 
+    def test_a_request_path_too_long(self, ws):
+        assert _refused(ws, "a/" * 3000 + "x.html") is BundleRefusal.PATH_TOO_LONG
+
     def test_a_name_with_a_backslash(self, ws):
         (ws / "decks" / "demo" / "a\\b.css").write_text("x")
         assert _refused(ws, "decks/demo") is BundleRefusal.INVALID_PATH

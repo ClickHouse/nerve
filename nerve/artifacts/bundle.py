@@ -40,6 +40,9 @@ MIB = 1024 * 1024
 MAX_FILE_BYTES = 50 * MIB
 MAX_FILES = 1000
 MAX_PATH_BYTES = 512
+# The longest path that a request may name (the path itself is checked
+# name by name; this bounds that work).
+MAX_REQUEST_PATH_BYTES = 4096
 # The folder entries that one description reads, left-out entries included.
 MAX_SCANNED_ENTRIES = 10_000
 
@@ -205,6 +208,8 @@ def _relative_parts(workspace: Path, workspace_real: Path, path: str) -> tuple[s
     read here."""
     if not isinstance(path, str) or not path.strip() or "\x00" in path:
         raise BundleError(BundleRefusal.INVALID_PATH, "The path is empty or not valid.")
+    if len(path.encode("utf-8", "surrogatepass")) > MAX_REQUEST_PATH_BYTES:
+        raise BundleError(BundleRefusal.PATH_TOO_LONG, "The path is too long.")
     if os.path.isabs(path):
         norm = Path(os.path.normpath(path))
         for base in (workspace, workspace_real):

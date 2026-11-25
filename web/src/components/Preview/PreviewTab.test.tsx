@@ -172,6 +172,26 @@ describe('the Preview tab', () => {
     expect(screen.getByTitle('Preview')).toBeInTheDocument();
   });
 
+  it.each([
+    ['absent', undefined],
+    ['refused', () => Promise.reject(new Error('denied'))],
+  ])('does not present when full screen is %s, and says so', async (_how, request) => {
+    const { PreviewHost } = await import('./host');
+    const sent = vi.spyOn(PreviewHost.prototype, 'send');
+    const original = HTMLElement.prototype.requestFullscreen;
+    Object.defineProperty(HTMLElement.prototype, 'requestFullscreen', { configurable: true, value: request });
+    try {
+      await openTab();
+      await userEvent.click(screen.getByRole('button', { name: 'Present' }));
+      await settle();
+      expect(screen.getByRole('status')).toHaveTextContent('Present needs full screen');
+      expect(sent.mock.calls.filter(([m]) => m.type === 'present')).toEqual([]);
+    } finally {
+      Object.defineProperty(HTMLElement.prototype, 'requestFullscreen', { configurable: true, value: original });
+      sent.mockRestore();
+    }
+  });
+
   it('does not poll while the panel is hidden', async () => {
     await openTab();
     act(() => useChatStore.setState({ panelVisible: false }));

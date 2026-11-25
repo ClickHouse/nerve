@@ -89,9 +89,12 @@ def _refusal(e: BundleError) -> HTTPException:
 
 class DescriptionCache:
     """The descriptions that the bundle route answered last, by workspace,
-    path and fingerprint: at most ``size`` of them, each for at most
-    ``max_age`` seconds after it was answered. Two viewers that build from
-    two states of one path each find their own."""
+    path and fingerprint: at most ``size`` of them. A description goes when
+    it was not used for ``max_age`` seconds (each successful file read uses
+    it again), or when a new one needs its place and it is the one used
+    least recently. Two viewers that build from two states of one path each
+    find their own. With more than ``size`` previews built at the same time
+    a build can lose its description and start again."""
 
     def __init__(self, size: int = 16, max_age: float = 60.0) -> None:
         self.size = size
@@ -109,6 +112,14 @@ class DescriptionCache:
             return None
         self._items.move_to_end(key)
         return bundle
+
+    def touch(self, workspace: str, path: str, fingerprint: str) -> None:
+        """The description was used: its ``max_age`` starts again."""
+        key = (workspace, path, fingerprint)
+        item = self._items.get(key)
+        if item is not None:
+            self._items[key] = (time.monotonic(), item[1])
+            self._items.move_to_end(key)
 
     def put(self, workspace: str, path: str, bundle: Bundle) -> None:
         key = (workspace, path, bundle.fingerprint)
@@ -202,4 +213,5 @@ async def preview_file(path: str = "", file: str = "", fingerprint: str = ""):
         raise _refusal(e) from None
     if len(data) != found.size:
         raise _stale()
+    descriptions.touch(str(get_config().workspace), path, fingerprint)
     return Response(data, media_type=found.media_type, headers=FILE_HEADERS)
