@@ -254,6 +254,8 @@ _MACHINE_LOCAL_PATHS = frozenset({
     # UI: decided for each box, where its web UI is built and its address is
     # known, not for every instance that shares the settings.
     "mcp_apps",
+    # The same for the Preview tab, which also runs in that sandbox frame.
+    "artifacts",
     # Only the journal location, not the rest of the section: the budget caps
     # and cadence are policy worth reviewing and sharing, while this is one
     # box's runtime directory. Publishing it would point every instance at a

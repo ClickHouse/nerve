@@ -43,6 +43,7 @@ _ERROR_PREFIX = "error: "
 _RESTART_ONLY_PATHS = (
     "agent.max_concurrent",
     "anthropic_base_url",
+    "artifacts",
     "auth.jwt_secret",
     "channels.hosted",
     "codex.home_dir",

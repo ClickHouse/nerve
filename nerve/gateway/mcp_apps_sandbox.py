@@ -286,7 +286,11 @@ class SandboxDocument:
             headers={**sandbox_headers(build_csp_header()), **headers},
         )
 
-    async def respond(self, request: Request, *, serving: bool) -> Response:
+    async def respond(self, request: Request, *, serving: bool, declared: bool = True) -> Response:
+        """The answer for one request. ``declared`` says whether the ``csp``
+        parameter counts: only while MCP App views are served. Without it
+        the document has the policy that allows no origin, whatever the
+        address says (a preview declares nothing)."""
         if not serving:
             return self._refusal("Not found", 404)
         if request.method not in ("GET", "HEAD"):
@@ -302,10 +306,8 @@ class SandboxDocument:
             self._missing_logged = True
             return self._refusal("The MCP Apps sandbox document is not built", 503)
         self._missing_logged = False
-        policy = build_csp_header(
-            _csp_param(request.scope.get("query_string") or b""),
-            own_hosts=own_hosts_of(request, self.host),
-        )
+        csp = _csp_param(request.scope.get("query_string") or b"") if declared else None
+        policy = build_csp_header(csp, own_hosts=own_hosts_of(request, self.host))
         logger.debug("MCP Apps sandbox document served with policy: %s", policy)
         return Response(body, media_type="text/html", headers=sandbox_headers(policy))
 
@@ -336,4 +338,30 @@ def serves_sandbox(config: Any, web_dist: Path) -> bool:
             document, _BUILD_HINT,
         )
     logger.info("MCP Apps is on: the sandbox document is served at %s", SANDBOX_PATH)
+    return True
+
+
+def serves_preview(config: Any, web_dist: Path) -> bool:
+    """Whether this gateway serves the sandbox document for the Preview tab
+    (``artifacts.preview``). Decided once, at startup.
+
+    In local mode and in external mode. A preview is a page that the agent
+    wrote, and it gets no more than a widget gets: the document with the
+    policy that allows no origin (a preview sends no ``csp``), and inside it
+    a frame without an origin and without network (see docs/web-ui.md). In
+    external mode a gateway in front signs in each request with a session
+    cookie. A request of the preview to this address would count as one of
+    another site: the frame has no origin, and the policy lets it make no
+    request. This switch does not turn on MCP App views or widgets: they
+    keep :func:`serves_sandbox`.
+    """
+    if not config.artifacts_preview_active:
+        return False
+    document = Path(web_dist) / SANDBOX_DOCUMENT
+    if not document.is_file():
+        logger.warning(
+            "Preview: the sandbox document %s is missing, so no preview can load; %s",
+            document, _BUILD_HINT,
+        )
+    logger.info("Preview is on: the sandbox document is served at %s", SANDBOX_PATH)
     return True

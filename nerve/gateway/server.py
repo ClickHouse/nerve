@@ -60,6 +60,7 @@ from nerve.gateway.mcp_apps_sandbox import (
     SANDBOX_DOCUMENT,
     SANDBOX_PATH,
     SandboxDocument,
+    serves_preview as _serves_preview_sandbox,
     serves_sandbox as _serves_mcp_apps_sandbox,
 )
 from nerve.gateway.routes import (
@@ -68,6 +69,7 @@ from nerve.gateway.routes import (
     set_external_agents_sync,
     set_mcp_apps_serving,
     set_notification_service,
+    set_preview_serving,
 )
 from nerve.mcp_server import build_manager as _build_mcp_manager, mount_deferred as _mount_mcp_deferred
 from nerve.mcp_server.loopback import McpLoopbackServer
@@ -631,6 +633,11 @@ async def lifespan(app: FastAPI):
         # then, and without it, the routes take the feature as off.
         if _serves_mcp_apps_sandbox(config, WEB_DIST):
             set_mcp_apps_serving(True)
+        # The Preview tab shows a page of the workspace in the same sandbox
+        # document, in local and in external mode (artifacts.preview). It
+        # turns on no view and no widget.
+        if _serves_preview_sandbox(config, WEB_DIST):
+            set_preview_serving(True)
 
         # Start Telegram bot if enabled. A channel must never take the gateway
         # down: ``TelegramChannel.start()`` runs ``Application.initialize()``,
@@ -1720,11 +1727,13 @@ def create_app() -> FastAPI:
             str(path), media_type=content_type, headers=FAVICON_RESPONSE_HEADERS,
         )
 
-    # The sandbox document of MCP Apps: third-party HTML runs in it, at a path
-    # of this address. Every answer for the path carries the policy that takes
-    # the document's origin away (see nerve/gateway/mcp_apps_sandbox.py), also
-    # the 404 while the feature is off and the answer to another method, so
-    # the path never holds a document with the origin of the web UI. No
+    # The sandbox document of MCP Apps and of the Preview tab: third-party
+    # HTML runs in it, at a path of this address. Every answer for the path
+    # carries the policy that takes the document's origin away (see
+    # nerve/gateway/mcp_apps_sandbox.py), also the 404 while both features are
+    # off and the answer to another method, so the path never holds a
+    # document with the origin of the web UI. The ``csp`` parameter of a view
+    # counts only while MCP Apps serves: a preview declares no origin. No
     # authentication, like the files of the web UI: the document is static
     # and holds nothing, and a frame's load carries no token. Registered ahead
     # of the SPA fallback, which never serves the file (see _bundle_file).
@@ -1737,7 +1746,10 @@ def create_app() -> FastAPI:
     )
     async def mcp_app_sandbox(request: Request):
         sandbox_document.host = get_config().gateway.host
-        return await sandbox_document.respond(request, serving=_mcp_apps_serving())
+        views = _mcp_apps_serving()
+        return await sandbox_document.respond(
+            request, serving=views or _preview_serving(), declared=views,
+        )
 
     # Every API path that no router claimed answers 404 JSON — registered
     # after all routers (route order decides) and ahead of the SPA fallback,
@@ -1808,7 +1820,8 @@ def _bundle_file(web_dist: Path, path: str) -> Path | None:
     return candidate
 
 
-# Sent with the documents of the web UI while MCP Apps is on.
+# Sent with the documents of the web UI while the sandbox document is served
+# (MCP Apps or the Preview tab).
 #
 # A view of an MCP App is third-party script in a frame of this address (the
 # sandbox document). If it could hold the web UI in a frame of its own, the
@@ -1817,10 +1830,11 @@ def _bundle_file(web_dist: Path, path: str) -> Path | None:
 # policy can be wrong; this header is the web UI's own word, and the browser
 # asks no one else: no page may frame it.
 #
-# Only with MCP Apps on. Nothing of Nerve's holds the web UI in a frame (the
-# one frame it uses, for an email's HTML, has its document written into it),
-# but a page of the person's own may, and without the feature that is none of
-# this header's business.
+# The same holds for a preview, which is a page that the agent wrote. Only
+# while the sandbox document is served. Nothing of Nerve's holds the web UI
+# in a frame (the one frame it uses, for an email's HTML, has its document
+# written into it), but a page of the person's own may, and without the
+# feature that is none of this header's business.
 WEB_UI_FRAMING_HEADERS: dict[str, str] = {
     "Content-Security-Policy": "frame-ancestors 'none'",
 }
@@ -1836,14 +1850,24 @@ def _mcp_apps_serving() -> bool:
         return False
 
 
+def _preview_serving() -> bool:
+    """True while this gateway serves the sandbox document for the Preview tab."""
+    from nerve.gateway.routes._deps import get_deps
+
+    try:
+        return bool(get_deps().preview_serving)
+    except RuntimeError:  # before startup: nothing is served to a preview yet
+        return False
+
+
 def _web_ui_headers(path: Path) -> dict[str, str] | None:
     """Headers for the file ``path`` of the web UI: ``WEB_UI_FRAMING_HEADERS``
-    for an HTML document while the gateway serves the sandbox document of
-    MCP Apps, else none. Only a document can be shown in a frame; the service
-    worker, the icons and the scripts get none."""
+    for an HTML document while the gateway serves the sandbox document (for
+    MCP Apps or for the Preview tab), else none. Only a document can be shown
+    in a frame; the service worker, the icons and the scripts get none."""
     if path.suffix.lower() not in (".html", ".htm"):
         return None
-    return WEB_UI_FRAMING_HEADERS if _mcp_apps_serving() else None
+    return WEB_UI_FRAMING_HEADERS if (_mcp_apps_serving() or _preview_serving()) else None
 
 
 def _serve_web_ui(app: FastAPI, web_dist: Path) -> None:

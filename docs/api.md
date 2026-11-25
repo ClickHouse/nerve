@@ -1935,7 +1935,8 @@ The sandbox document: the page of every view's and widget's frame (see
 authentication, like the files of the web UI: a frame's load carries no
 token, and the document is static and holds nothing. `csp` is the
 `_meta.ui.csp` of the view's resource, as the web UI passes it on; it is
-optional.
+optional. The gateway answers for this path while MCP Apps or the Preview
+tab is on; `csp` counts only while MCP Apps is on (a preview sends none).
 
 Every answer for this path carries the header that takes the document's
 origin away, also the ones that are not the document:
@@ -1959,8 +1960,8 @@ and is not on Nerve's own host.
 
 | Status | When |
 |--------|------|
-| 200 | `GET` or `HEAD`, the feature on |
-| 404 | The feature is off |
+| 200 | `GET` or `HEAD`, MCP Apps or the Preview tab on |
+| 404 | Both are off |
 | 405 | Another method (`Allow: GET, HEAD`) |
 | 503 | The web UI is not built: the document is missing |
 
@@ -2107,6 +2108,65 @@ there was something. 400 `bad_widget_id`; 404 `session_not_found`,
 ```json
 Response: { "deleted": true }
 Response: { "deleted": false }
+```
+
+### Preview
+
+What the Preview tab of the web UI reads (see
+[Preview](web-ui.md#preview)). `path` is the path of a bundle: relative to
+the workspace, or an absolute path below it. Errors are
+`{"detail": {"code": "<code>", "message": "<sentence>"}}`. While
+`artifacts.preview` is off, the bundle and file routes answer 404
+`preview_disabled`.
+
+#### `GET /api/preview/config`
+Whether this instance shows the Preview tab, and the most bytes that the
+files of one preview may have together.
+
+```json
+Response: { "enabled": true, "max_bytes": 10485760 }
+```
+
+#### `GET /api/preview/bundle?path=<path>`
+The description of the bundle of `path`. `files[].path` is relative to the
+root of the bundle, `type` comes from the file extension. `fingerprint`
+changes when a file of the bundle is added, removed or written. `modified`
+is the newest modification time of a file, in milliseconds since the epoch.
+
+```json
+Response: {
+  "path": "decks/demo/index.html",
+  "root": "decks/demo",
+  "root_path": "/home/alice/workspace/decks/demo",
+  "kind": "folder",
+  "entry": "index.html",
+  "files": [
+    { "path": "index.html", "size": 2048, "type": "text/html" },
+    { "path": "style.css", "size": 512, "type": "text/css" }
+  ],
+  "size": 2560,
+  "fingerprint": "<64 hexadecimal digits>",
+  "modified": 1767225600000
+}
+```
+
+`kind` is `folder`, `page` or `image`. A refused path: 403
+`outside_workspace`; 404 `not_found`; 422 `invalid_path`, `workspace_root`,
+`hidden`, `link`, `special_file`, `unsupported`, `no_entry`,
+`file_too_large`, `too_many_files`, `path_too_long`.
+
+#### `GET /api/preview/file?path=<path>&file=<file>`
+The bytes of the file `file` (relative to the root of the bundle of `path`).
+Only a file of the description: any other is 404 `not_in_bundle`. A file
+above the limit of one preview is 413 `too_large`. The answer has the type
+of the description and these headers, so that it is never a page of this
+address:
+
+```
+Content-Disposition: attachment
+Content-Security-Policy: sandbox; default-src 'none'
+X-Content-Type-Options: nosniff
+Cache-Control: no-store
 ```
 
 ### Memory Files

@@ -18,6 +18,7 @@ from nerve.gateway.routes._deps import (
     set_external_agents_sync,
     set_mcp_apps_serving,
     set_notification_service,
+    set_preview_serving,
 )
 from nerve.gateway.routes import (
     accounts,
@@ -34,6 +35,7 @@ from nerve.gateway.routes import (
     mcp_servers,
     mcp_apps,
     memory,
+    preview,
     diagnostics,
     cron,
     sources,
@@ -57,6 +59,7 @@ __all__ = [
     "set_notification_service",
     "set_external_agents_sync",
     "set_mcp_apps_serving",
+    "set_preview_serving",
     "get_deps",
 ]
 
@@ -90,6 +93,7 @@ def register_all_routes() -> APIRouter:
     router.include_router(mcp_apps.router)
     router.include_router(widget_state.router)
     router.include_router(memory.router)
+    router.include_router(preview.router)
     router.include_router(diagnostics.router)
     router.include_router(cron.router)
     router.include_router(sources.router)

@@ -268,7 +268,10 @@ Two deployments are outside this:
 
 - External mode, where a gateway in front of Nerve signs in every request to
   the address with a session cookie. Nerve keeps MCP Apps off there and logs
-  a warning at startup.
+  a warning at startup. The Preview tab (`artifacts.preview`) uses the same
+  sandbox document in external mode, without the `csp` parameter: a preview
+  declares no origin, and its document has a policy of its own that allows
+  no network. See [Preview](web-ui.md#preview).
 - A deployment that signs in with a `nerve_token` cookie. Nerve sets none,
   but the API accepts one when a request names no token itself. Do not
   enable MCP Apps there.

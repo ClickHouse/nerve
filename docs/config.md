@@ -23,7 +23,7 @@ and migration splits a legacy `config.yaml` on the same table:
 
 | Layer | Gets |
 |-------|------|
-| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `gateway.public_url`, `proxy`, `docker`, `telegram.enabled`, `slack.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `mcp_apps`, `workflows.runs_dir` |
+| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `gateway.public_url`, `proxy`, `docker`, `telegram.enabled`, `slack.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `mcp_apps`, `artifacts`, `workflows.runs_dir` |
 | `settings.yaml` | `timezone`, `gateway.host`/`port`/`loop`, `provider.type`/`aws_region` (incl. the region-scoped Bedrock model IDs), `agent.*`, `memory.*`, `sessions.*`, `sync.*`, the rest of `workflows.*` (the budget caps and cadence), `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode` |
 
 The test is whether the value would be wrong on another machine: filesystem
@@ -297,6 +297,7 @@ reload cannot inspect, and are documented here only.
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
 | `mcp_apps.*` | whether the gateway answers for the sandbox document, and whether the documents of its web UI refuse every frame, is settled once at startup. Until a restart, turning the feature on shows no view. Turning it off does take effect at once: new sessions are no longer told to host, and the web UI is told that the feature is off; the sandbox document itself stays answered until the restart, which harms nothing (it is static and holds nothing). See [MCP Apps](#mcp-apps) |
+| `artifacts.*` | whether the gateway answers for the sandbox document for previews, and whether the documents of its web UI refuse every frame, is settled once at startup. Until a restart, turning the Preview tab on or off changes nothing. See [Artifacts](#artifacts) |
 | `mcp_gateway_url` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
 | `slack.mode`, `channels.hosted.*` | the hosted channels, the email channel included, their stream endpoint, and their token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
 | `sync.github.mode` | the GitHub sources (`github` and the repository watch, `github_repos`), and in hosted mode the stream endpoint and the consumers of the gateway's records, are chosen at startup. Until a restart the sources keep the mode they started with, and so does the `github_pr_activity` gate. The filters, `pr_watch`, `thread_items`, `inbox` and `sync.github_repos` do follow a reload: in hosted mode the reload publishes them to the gateway again. To go back to `poll`, set `enabled: false` (and `sync.github_repos.enabled: false`) and reload first (see [sources.md](sources.md#hosted-github-source)) |
@@ -2593,6 +2594,38 @@ lockdown, state it in the tracked settings with a `${VAR}` reference:
 # workspace/config/settings.yaml
 mcp_apps:
   enabled: ${NERVE_MCP_APPS:-false}
+```
+
+## Artifacts
+
+Artifacts are static bundles of workspace files that a person sees. The
+Preview tab of the web chat shows the bundle of a workspace path in the side
+panel: an HTML file, a folder with an `index.html`, or an image (see
+[Preview](web-ui.md#preview)). Off by default. It works in local mode and in
+[external mode](#authentication-mode), and it does not need `mcp_apps`.
+
+```yaml
+# config.yaml
+artifacts:
+  preview: true
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `artifacts.preview` | bool | `false` | Show the Preview tab, and serve the preview routes and the sandbox document that a preview runs in (`/mcp-app-sandbox.html`, the document of MCP App views and widgets). A preview gets the policy that allows no origin. This key does not turn on MCP App views or widgets: they keep `mcp_apps.enabled`, and stay off in external mode. |
+
+The key needs a restart (see
+[What still needs a restart](#what-still-needs-a-restart)). When the web UI
+is not built, startup logs a warning and no preview can load until it is.
+
+Like `mcp_apps`, the section is decided for each machine, so it belongs in
+`config.yaml`. Under lockdown, and where the platform sets it, state it in
+the tracked settings with a `${VAR}` reference:
+
+```yaml
+# workspace/config/settings.yaml
+artifacts:
+  preview: ${NERVE_ARTIFACTS_PREVIEW:-false}
 ```
 
 ## Auth

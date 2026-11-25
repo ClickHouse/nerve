@@ -3720,6 +3720,26 @@ class McpAppsConfig:
 
 
 @dataclass
+class ArtifactsConfig:
+    """Artifacts: static bundles of workspace files that a person sees.
+
+    With ``preview`` on, the web chat has a Preview tab in its side panel. It
+    shows an HTML page, a folder with an ``index.html``, or an image of the
+    workspace, in the sandbox frame that widgets use, with no network. The
+    gateway serves the sandbox document for it, in local mode and in external
+    mode. MCP App views and widgets keep their own switch (``mcp_apps``).
+    Off by default; see docs/web-ui.md.
+    """
+
+    preview: bool = False
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> ArtifactsConfig:
+        return cls(preview=d.get("preview", False))
+
+
+@dataclass
 class ExternalAgentTargetConfig:
     """One configured external agent (Codex, Claude Code, ...).
 
@@ -4428,6 +4448,7 @@ class NerveConfig:
     xmemory: XmemoryConfig = field(default_factory=XmemoryConfig)
     mcp_endpoint: McpEndpointConfig = field(default_factory=McpEndpointConfig)
     mcp_apps: McpAppsConfig = field(default_factory=McpAppsConfig)
+    artifacts: ArtifactsConfig = field(default_factory=ArtifactsConfig)
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
     # Base URL of the MCP gateway, without a trailing "/". In external mode
     # Nerve takes its MCP servers only from the gateway's catalog and does not
@@ -4524,6 +4545,13 @@ class NerveConfig:
         gateway shows views is decided at its startup, in local mode only
         (:func:`nerve.gateway.mcp_apps_sandbox.serves_sandbox`)."""
         return bool(self.mcp_apps.enabled)
+
+    @property
+    def artifacts_preview_active(self) -> bool:
+        """True when the Preview tab is enabled in the configuration. The
+        gateway decides at its startup whether it serves the sandbox document
+        for previews (:func:`nerve.gateway.mcp_apps_sandbox.serves_preview`)."""
+        return bool(self.artifacts.preview)
 
     @property
     def outbound_channels(self) -> list[str]:
@@ -4924,6 +4952,7 @@ class NerveConfig:
             xmemory=XmemoryConfig.from_dict(d.get("xmemory", {})),
             mcp_endpoint=McpEndpointConfig.from_dict(d.get("mcp_endpoint", {})),
             mcp_apps=McpAppsConfig.from_dict(d.get("mcp_apps") or {}),
+            artifacts=ArtifactsConfig.from_dict(d.get("artifacts") or {}),
             mcp_servers=_parse_mcp_servers(d),
             mcp_gateway_url=_normalize_mcp_gateway_url(d.get("mcp_gateway_url")),
             external_agents=ExternalAgentsConfig.from_dict(d.get("external_agents", {})),
