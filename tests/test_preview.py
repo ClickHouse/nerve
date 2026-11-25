@@ -449,19 +449,27 @@ class TestDescriptionCache:
         r = await api.http.get(FILE, params=params)
         assert (r.status_code, r.json()["detail"]["code"]) == (409, "stale_description")
 
-    def test_the_cache_is_bounded_and_ages(self, monkeypatch):
-        from nerve.artifacts.bundle import Bundle, BundleKind
-        from nerve.gateway.routes import preview
 
-        cache = preview.DescriptionCache(size=2, max_age=10)
-        def bundle(name):
-            return Bundle(workspace=Path("/ws"), path=name, root="", kind=BundleKind.PAGE, entry=name, files=())
-        for name in ("a", "b", "c"):
-            cache.put("/ws", "same/path", bundle(name))
-        assert cache.get("/ws", "same/path", bundle("a").fingerprint) is None
-        assert cache.get("/ws", "same/path", bundle("b").fingerprint) is not None
-        assert cache.get("/ws", "same/path", bundle("c").fingerprint) is not None
-        assert cache.get("/ws", "same/path", "other") is None
-        now = preview.time.monotonic()
-        monkeypatch.setattr(preview.time, "monotonic", lambda: now + 11)
-        assert cache.get("/ws", "same/path", bundle("c").fingerprint) is None
+def test_the_cache_is_bounded_and_ages(monkeypatch):
+    from nerve.artifacts.bundle import Bundle, BundleKind
+    from nerve.gateway.routes import preview
+
+    assert preview.DescriptionCache().size == preview.MAX_KEPT_DESCRIPTIONS == 64
+
+    cache = preview.DescriptionCache(size=2, max_age=10)
+    def bundle(name):
+        return Bundle(workspace=Path("/ws"), path=name, root="", kind=BundleKind.PAGE, entry=name, files=())
+    for name in ("a", "b", "c"):
+        cache.put("/ws", "same/path", bundle(name))
+    assert cache.get("/ws", "same/path", bundle("a").fingerprint) is None
+    assert cache.get("/ws", "same/path", bundle("b").fingerprint) is not None
+    assert cache.get("/ws", "same/path", bundle("c").fingerprint) is not None
+    assert cache.get("/ws", "same/path", "other") is None
+    # Used least recently goes first: b was read after c.
+    assert cache.get("/ws", "same/path", bundle("b").fingerprint) is not None
+    cache.put("/ws", "same/path", bundle("d"))
+    assert cache.get("/ws", "same/path", bundle("c").fingerprint) is None
+    assert cache.get("/ws", "same/path", bundle("b").fingerprint) is not None
+    now = preview.time.monotonic()
+    monkeypatch.setattr(preview.time, "monotonic", lambda: now + 11)
+    assert cache.get("/ws", "same/path", bundle("b").fingerprint) is None

@@ -189,8 +189,10 @@ class Files {
   private readonly loaded = new Map<string, Promise<Uint8Array>>();
   /** The `data:` address of each file, made once. */
   private readonly addresses = new Map<string, Promise<string>>();
-  /** The `data:` address of each stylesheet after its rewrite, made once. */
-  readonly stylesheets = new Map<string, Promise<string>>();
+  /** The `data:` address of each stylesheet after its rewrite: only finished ones. */
+  readonly stylesheets = new Map<string, string>();
+  /** The stylesheets that are being rewritten now. */
+  readonly making = new Set<string>();
   /** The text that the build has made so far (DOCUMENT_BUDGET_FACTOR). */
   private made = 0;
   private readonly budget: number;
@@ -256,6 +258,11 @@ class Files {
   spend(chars: number): void {
     this.made += chars;
     if (this.made > this.budget) throw new PreviewTooLarge(this.made, this.budget, 'document');
+  }
+
+  /** Refuse a document of `chars` characters when it is longer than the budget. */
+  check(chars: number): void {
+    if (chars > this.budget) throw new PreviewTooLarge(chars, this.budget, 'document');
   }
 
   /** `text`, counted for one more use in the document. */
@@ -328,17 +335,15 @@ async function replaceAsync(
  * address removed. An imported stylesheet goes the same way, as a `data:`
  * stylesheet of its own.
  */
-async function rewriteCss(
-  css: string, folder: string, files: Files, depth = 0, seen: ReadonlySet<string> = new Set(),
-): Promise<string> {
-  // One import after the other: a stylesheet that is still being made is
-  // then always one of `seen`, so no import waits for itself.
+async function rewriteCss(css: string, folder: string, files: Files, depth = 0): Promise<string> {
+  // One import after the other. An import of a stylesheet that is being
+  // made (a cycle) is dropped; nothing waits for another stylesheet.
   const imported = await replaceInOrder(css, CSS_IMPORT, async match => {
     const address = match[1] ?? match[2] ?? match[3] ?? match[4] ?? match[5] ?? '';
     const path = resolveAddress(address, folder, files.paths);
-    if (path === null || path === 'data' || depth >= MAX_IMPORT_DEPTH || seen.has(path)) return '';
-    const url = await stylesheetUrl(path, files, depth + 1, new Set([...seen, path]));
-    return `@import url("${url}")${match[6]};`;
+    if (path === null || path === 'data' || depth >= MAX_IMPORT_DEPTH) return '';
+    const url = await stylesheetUrl(path, files, depth + 1);
+    return url === null ? '' : `@import url("${url}")${match[6]};`;
   });
   const urls = await replaceAsync(imported, CSS_URL, async match => {
     const address = match[1] ?? match[2] ?? match[3] ?? '';
@@ -360,20 +365,24 @@ async function rewriteCss(
 
 /**
  * The `data:` address of the stylesheet `path` after its rewrite, for one
- * more use: each stylesheet is rewritten once per build, however often it
- * is linked or imported, and counted for each use.
+ * more use, or null while that stylesheet is being made (a cycle: the
+ * caller drops the link or the import). Each stylesheet is rewritten once
+ * per build, however often it is linked or imported, and counted for each
+ * use. Only finished addresses are kept, so no call ever waits for another.
  */
-async function stylesheetUrl(path: string, files: Files, depth = 0, seen: ReadonlySet<string> = new Set([path])): Promise<string> {
-  let made = files.stylesheets.get(path);
-  if (!made) {
-    made = (async () => {
-      const css = await rewriteCss(await files.textOf(path), folderOf(path), files, depth, seen);
-      return files.use(dataUrl('text/css', encoder.encode(css)));
-    })();
-    files.stylesheets.set(path, made);
-    return made;
+async function stylesheetUrl(path: string, files: Files, depth = 0): Promise<string | null> {
+  const made = files.stylesheets.get(path);
+  if (made !== undefined) return files.use(made);
+  if (files.making.has(path)) return null;
+  files.making.add(path);
+  try {
+    const css = await rewriteCss(await files.textOf(path), folderOf(path), files, depth);
+    const url = dataUrl('text/css', encoder.encode(css));
+    files.stylesheets.set(path, url);
+    return files.use(url);
+  } finally {
+    files.making.delete(path);
   }
-  return files.use(await made);
 }
 
 /** An attribute that names a file: the file as a `data:` address, or no attribute. */
@@ -441,6 +450,7 @@ async function inlineTree(root: ParentNode, folder: string, files: Files): Promi
   for (const element of all(FRAME_ELEMENTS)) {
     for (const name of ['src', 'srcdoc', 'data']) element.removeAttribute(name);
   }
+  // Stylesheets first, one after the other (links and <style> elements).
   for (const link of all('link')) {
     const rel = (link.getAttribute('rel') ?? '').toLowerCase().split(/\s+/).filter(Boolean);
     if (rel.length === 0 || !rel.every(token => KEPT_LINKS.has(token))) {
@@ -451,11 +461,13 @@ async function inlineTree(root: ParentNode, folder: string, files: Files): Promi
     if (path === null) {
       link.remove();
     } else if (path !== 'data') {
-      work.push((async () => {
-        const url = rel.includes('stylesheet') ? await stylesheetUrl(path, files) : await files.dataUrlOf(path);
-        link.setAttribute('href', url);
-      })());
+      const url = rel.includes('stylesheet') ? await stylesheetUrl(path, files) : await files.dataUrlOf(path);
+      if (url === null) link.remove();
+      else link.setAttribute('href', url);
     }
+  }
+  for (const style of all('style')) {
+    style.textContent = await rewriteCss(style.textContent ?? '', folder, files);
   }
   for (const element of all(SOURCE_ELEMENTS)) {
     if (element.localName === 'script' && resolveAddress(element.getAttribute('src') ?? '', folder, files.paths) === null) {
@@ -479,9 +491,6 @@ async function inlineTree(root: ParentNode, folder: string, files: Files): Promi
       work.push(inlineAttribute(element, name, folder, files));
     }
   }
-  for (const style of all('style')) {
-    work.push(rewriteCss(style.textContent ?? '', folder, files).then(css => { style.textContent = css; }));
-  }
   for (const element of all('[style]')) {
     work.push(rewriteCss(element.getAttribute('style') ?? '', folder, files)
       .then(css => element.setAttribute('style', css)));
@@ -502,8 +511,15 @@ function addOwnHead(doc: Document): void {
   doc.head.prepend(charset, policy);
 }
 
-function serialize(doc: Document): string {
-  return `${doc.doctype ? '<!DOCTYPE html>' : ''}${doc.documentElement.outerHTML}`;
+/**
+ * The document as text, made once. Refused when it is longer than the
+ * budget: the serializer escapes characters (`&` becomes `&amp;`), so the
+ * text can be longer than what was counted.
+ */
+function serialize(doc: Document, files: Files): string {
+  const html = `${doc.doctype ? '<!DOCTYPE html>' : ''}${doc.documentElement.outerHTML}`;
+  files.check(html.length);
+  return html;
 }
 
 /** The document of an image bundle: the image, at most as large as the frame. */
@@ -518,17 +534,45 @@ async function imageDocument(files: Files): Promise<string> {
   img.setAttribute('src', await files.dataUrlOf(files.entry));
   doc.body.append(img);
   addOwnHead(doc);
-  return serialize(doc);
+  return serialize(doc, files);
+}
+
+/**
+ * The longest time one build may take. A last guard: every step of a build
+ * ends by itself, so a build that takes longer is a fault, and it must not
+ * leave the tab waiting.
+ */
+export const MAX_BUILD_MS = 30_000;
+
+/** A build took longer than `MAX_BUILD_MS`. */
+export class PreviewTimedOut extends Error {
+  constructor(ms: number) {
+    super(`The preview took longer than ${Math.round(ms / 1000)} s to build.`);
+  }
 }
 
 /**
  * The document of a preview of `bundle`. `read` gets the bytes of one file;
  * each file is read at most once, and none past `limit` bytes in all
- * (`PreviewTooLarge`).
+ * (`PreviewTooLarge`). The document text is at most `limit` times
+ * DOCUMENT_BUDGET_FACTOR (`PreviewTooLarge`, `what: 'document'`). A build
+ * that takes longer than `timeoutMs` ends with `PreviewTimedOut`.
  */
 export async function buildPreviewDocument(
-  bundle: PreviewBundle, read: ReadBundleFile, limit: number,
+  bundle: PreviewBundle, read: ReadBundleFile, limit: number, timeoutMs: number = MAX_BUILD_MS,
 ): Promise<PreviewDocument> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new PreviewTimedOut(timeoutMs)), timeoutMs);
+  });
+  try {
+    return await Promise.race([build(bundle, read, limit), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function build(bundle: PreviewBundle, read: ReadBundleFile, limit: number): Promise<PreviewDocument> {
   const files = new Files(bundle, read, limit);
   if (bundle.kind === 'image') {
     return { html: await imageDocument(files), source: null, bytes: files.bytes };
@@ -538,5 +582,5 @@ export async function buildPreviewDocument(
   doc.documentElement.removeAttribute('manifest');
   await inlineTree(doc, folderOf(bundle.entry), files);
   addOwnHead(doc);
-  return { html: serialize(doc), source, bytes: files.bytes };
+  return { html: serialize(doc, files), source, bytes: files.bytes };
 }

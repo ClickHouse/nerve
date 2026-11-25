@@ -217,21 +217,30 @@ comes from the agent.
 
 The tab reads at most 4 files at the same time, each for the description
 it just read (`fingerprint`). The file route never walks the bundle: it
-serves a file only from a description that the gateway kept (at most 16;
-one goes when it was not used for a minute, or when it is the one used least
-recently and a new one needs its place), and only while the file on disk is
-the described file
-(same size, times, inode and device). Otherwise it answers that the
-description is stale, and the tab reads the description again and starts
-the build again, at most 3 times; for files that change all the time it
-says so and tries again at the next poll. With more than 16 previews built
-at the same time, a build can lose its description and start again. The
-10 MiB limit counts the bytes that arrived. The document that the tab makes
-of them has a limit too: 4 times the source limit, counted for each use of
-a file (a file that the page uses many times counts each time, and so does
-a stylesheet that is imported more than once). Above it, the tab says that
-the preview is too large to show. Present needs full screen: when the
-browser does not allow it, the tab says so and the page is not told to
+serves a file only from a description that the gateway kept, and only
+while the file on disk is the described file (same size, times, inode and
+device). The gateway keeps at most 64 descriptions; one entry holds the
+path, size, type, times, inode and device of each file of one bundle state.
+One goes when it was not used for a minute (each file read uses it), or
+when it is the one used least recently and a new one needs its place.
+Otherwise the file route answers that the description is stale, and the
+tab reads the description again and starts the build again, at most 3
+times; for files that change all the time it says so and tries again at the
+next poll. When more than 64 other bundle states are described between two
+file reads of one build (many previews at the same time), that build starts
+again.
+
+Limits of one build: the files have at most 10 MiB, counted as the bytes
+that arrived. The document that the tab makes of them has at most 4 times
+that, in characters: each use of a file and of a stylesheet counts (a file
+that the page uses many times counts each time), and the finished document
+text is checked once more, since the serializer escapes characters such as
+`&`. Each file is read once and each stylesheet is rewritten once; an
+import of a stylesheet that is being rewritten (a cycle) is left out. A
+build that takes longer than 30 seconds ends. Above a limit, the tab says
+why; a state that was too large or too slow is built again when a file
+changes, or with Reload, not at each poll. Present needs full screen: when
+the browser does not allow it, the tab says so and the page is not told to
 present.
 
 **Live update.** The tab reads the description of the bundle again when a

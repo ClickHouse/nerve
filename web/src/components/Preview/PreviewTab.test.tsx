@@ -214,6 +214,15 @@ describe('the Preview tab', () => {
     await openTab();
     expect(screen.getByRole('alert')).toHaveTextContent(/This preview needs .+ of files or more\. The limit is .+ MiB\./);
     expect(getFile()).not.toHaveBeenCalled();
+    // The poll reads the description, and does not build the same state again.
+    await act(async () => { await vi.advanceTimersByTimeAsync(POLL_MS); });
+    expect(getBundle()).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('alert')).toHaveTextContent(/This preview needs/);
+    // A change (here: of the files and of the limit) builds again.
+    fingerprint = 'f2';
+    usePreviewStore.setState({ maxBytes: 10 * 1024 * 1024 });
+    await act(async () => { await vi.advanceTimersByTimeAsync(POLL_MS); });
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 });
 

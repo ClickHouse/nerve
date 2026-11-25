@@ -7,7 +7,7 @@ import type { PanelTab } from '../../types/chat';
 import type { PreviewBundle } from '../../types/preview';
 import { Button, IconButton } from '../ui';
 import { ChevronLeft, ChevronRight, CodeXml, Loader2, Lock, Play, RefreshCw, X } from '../ui/icons';
-import { buildPreviewDocument, formatMiB, PreviewTooLarge, type PreviewDocument } from './document';
+import { buildPreviewDocument, formatMiB, PreviewTimedOut, PreviewTooLarge, type PreviewDocument } from './document';
 import { PreviewHost } from './host';
 import { agoText, fileEventNamesBundle, POLL_MS } from './live';
 import type { ContentKind, ContentMessage, HostMessage } from './messages';
@@ -53,6 +53,9 @@ const NO_FULL_SCREEN = 'Present needs full screen, and this browser did not allo
 const KEEPS_CHANGING = 'The files change while the preview is read. The tab tries again in a moment.';
 
 function problemText(e: unknown): string {
+  if (e instanceof PreviewTimedOut) {
+    return `${e.message} It tries again when a file changes, or with Reload.`;
+  }
   if (e instanceof PreviewTooLarge) {
     return e.what === 'files'
       ? `This preview needs ${formatMiB(e.bytes)} of files or more. The limit is ${formatMiB(e.limit)}.`
@@ -122,6 +125,8 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
   const stageRef = useRef<HTMLDivElement>(null);
   /** The fingerprint of the document on screen. */
   const shown = useRef<string | null>(null);
+  /** The fingerprint whose build failed (too large, too slow): not built again by the poll. */
+  const failed = useRef<string | null>(null);
   const running = useRef(false);
   const again = useRef<'no' | 'read' | 'build'>('no');
   const alive = useRef(true);
@@ -149,20 +154,26 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
       let restarts = 0;
       for (;;) {
         again.current = 'no';
+        let attempt: string | null = null;
         try {
           const next = await api.getPreviewBundle(path);
           if (!alive.current) return;
           setBundle(next);
-          if (force || next.fingerprint !== shown.current) {
+          // A state whose build failed (too large, too slow) is built again
+          // only when it changes, or on Reload: the poll does not repeat it.
+          const failedBefore = !force && next.fingerprint === failed.current;
+          if (!failedBefore && (force || next.fingerprint !== shown.current)) {
+            attempt = next.fingerprint;
             const built = await buildPreviewDocument(
               next, file => api.getPreviewFile(path, file, next.fingerprint), maxBytes,
             );
             if (!alive.current) return;
             shown.current = next.fingerprint;
+            failed.current = null;
             setDoc(built);
             setContent(null);
           }
-          setProblem(null);
+          if (!failedBefore) setProblem(null);
         } catch (e) {
           if (!alive.current) return;
           // A file changed after the description: start again from a new one,
@@ -172,6 +183,7 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
             again.current = 'build';
           } else {
             shown.current = null;
+            failed.current = isStale(e) ? null : attempt;
             setDoc(null);
             setProblem(isStale(e) ? KEEPS_CHANGING : problemText(e));
           }

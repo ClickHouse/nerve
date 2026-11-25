@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import type { PreviewBundle } from '../../types/preview';
 import {
-  DOCUMENT_BUDGET_FACTOR, MAX_PARALLEL_READS, PREVIEW_POLICY, PreviewTooLarge, buildPreviewDocument, resolveAddress,
+  DOCUMENT_BUDGET_FACTOR, MAX_PARALLEL_READS, PREVIEW_POLICY, PreviewTimedOut, PreviewTooLarge, buildPreviewDocument,
+  resolveAddress,
   srcsetCandidates,
 } from './document';
 
@@ -362,5 +363,123 @@ describe('srcsetCandidates', () => {
     ['', []],
   ])('reads %j', (value, expected) => {
     expect(srcsetCandidates(value).map(c => [c.address, c.descriptor])).toEqual(expected);
+  });
+});
+
+/**
+ * Shapes of a page against the three properties every build must keep: it
+ * ends (resolves or rejects, within a short time), it stays within the
+ * document budget or is refused with the right kind of "too large", and it
+ * reads each file at most once.
+ */
+describe('the builder over shapes of pages', () => {
+  const SMALL_LIMIT = 100_000;
+  const ENDS_WITHIN_MS = 5_000;
+  type Expect = 'ok' | 'files' | 'document';
+  type Shape = { name: string; files: Record<string, string | Uint8Array>; expect: Expect; check?: (html: string, reads: Map<string, number>) => void };
+
+  const page = (head: string, body = '') => `<!doctype html><html><head>${head}</head><body>${body}</body></html>`;
+  const link = (href: string) => `<link rel="stylesheet" href="${href}">`;
+  const bytes = (n: number) => new Uint8Array(n);
+
+  function chain(length: number): Record<string, string> {
+    const sheets: Record<string, string> = {};
+    for (let i = 0; i < length; i += 1) sheets[`s${i}.css`] = `@import "s${i + 1}.css"; .l${i}{color:red}`;
+    sheets[`s${length}.css`] = '.end{color:blue}';
+    return sheets;
+  }
+
+  const many: Record<string, string | Uint8Array> = {};
+  for (let i = 0; i < 999; i += 1) many[`img/${i}.png`] = bytes(10);
+  many['index.html'] = page('', Object.keys(many).map(p => `<img src="${p}">`).join(''));
+
+  const shapes: Shape[] = [
+    { name: 'one sheet', expect: 'ok', files: { 'index.html': page(link('a.css')), 'a.css': 'b{background:url(i.png)}', 'i.png': bytes(100) } },
+    {
+      name: 'several sheets', expect: 'ok',
+      files: {
+        'index.html': page(['a', 'b', 'c', 'd', 'e'].map(n => link(`${n}.css`)).join('')),
+        ...Object.fromEntries(['a', 'b', 'c', 'd', 'e'].map(n => [`${n}.css`, `.${n}{background:url(i.png)}`])),
+        'i.png': bytes(100),
+      },
+    },
+    {
+      name: 'shared images', expect: 'ok',
+      files: {
+        'index.html': page('', Array.from({ length: 30 }, (_, i) => `<img src="${['x', 'y', 'z'][i % 3]}.png">`).join('')),
+        'x.png': bytes(50), 'y.png': bytes(50), 'z.png': bytes(50),
+      },
+    },
+    { name: 'a cycle of 1', expect: 'ok', files: { 'index.html': page(link('a.css')), 'a.css': '@import "a.css"; a{color:red}' } },
+    {
+      name: 'a cycle of 2, both linked', expect: 'ok',
+      files: { 'index.html': page(link('a.css') + link('b.css')), 'a.css': '@import "b.css"; a{}', 'b.css': '@import "a.css"; b{}' },
+      check: html => expect(parse(html).querySelectorAll('link[rel=stylesheet]').length).toBeGreaterThanOrEqual(1),
+    },
+    {
+      name: 'a cycle of 3, all linked', expect: 'ok',
+      files: {
+        'index.html': page(link('a.css') + link('b.css') + link('c.css')),
+        'a.css': '@import "b.css"; a{}', 'b.css': '@import "c.css"; b{}', 'c.css': '@import "a.css"; c{}',
+      },
+    },
+    {
+      name: 'one sheet linked twice and imported once', expect: 'ok',
+      files: { 'index.html': page(link('a.css') + link('a.css') + link('b.css')), 'a.css': 'a{color:red}', 'b.css': '@import "a.css"; b{}' },
+      check: html => expect(parse(html).querySelectorAll('link[rel=stylesheet]')).toHaveLength(3),
+    },
+    {
+      name: 'an import chain at the depth limit', expect: 'ok',
+      files: { 'index.html': page(link('s0.css')), ...chain(8) },
+      check: (_html, reads) => expect(reads.get('s8.css')).toBe(1),
+    },
+    {
+      name: 'an import chain one past the depth limit', expect: 'ok',
+      files: { 'index.html': page(link('s0.css')), ...chain(9) },
+      check: (_html, reads) => expect(reads.get('s9.css')).toBeUndefined(),
+    },
+    {
+      name: 'one large file used many times', expect: 'document',
+      files: { 'index.html': page('', '<img src="big.png">'.repeat(50)), 'big.png': bytes(30_000) },
+    },
+    { name: 'many small files at the count limit', expect: 'ok', files: many },
+    {
+      name: 'an entry near the size limit, full of escaped characters', expect: 'document',
+      files: { 'index.html': page('', `<p>${'&'.repeat(95_000)}</p>`) },
+    },
+    { name: 'files past the limit', expect: 'files', files: { 'index.html': page('', '<img src="a.png"><img src="b.png">'), 'a.png': bytes(60_000), 'b.png': bytes(60_000) } },
+  ];
+
+  it.each(shapes.map(s => [s.name, s] as const))('%s', async (_name, shape) => {
+    const { description } = bundle(shape.files);
+    const reads = new Map<string, number>();
+    const read = async (path: string) => {
+      reads.set(path, (reads.get(path) ?? 0) + 1);
+      const v = shape.files[path];
+      return (typeof v === 'string' ? new TextEncoder().encode(v) : v).slice().buffer;
+    };
+    const hung = new Promise<'hung'>(resolve => setTimeout(() => resolve('hung'), ENDS_WITHIN_MS));
+    const outcome = await Promise.race([
+      buildPreviewDocument(description, read, SMALL_LIMIT).then(r => r, e => e as Error),
+      hung,
+    ]);
+    expect(outcome, 'the build ends').not.toBe('hung');
+    for (const [path, count] of reads) expect(count, `reads of ${path}`).toBe(1);
+    if (shape.expect === 'ok') {
+      expect(outcome).not.toBeInstanceOf(Error);
+      const html = (outcome as { html: string }).html;
+      expect(html.length).toBeLessThanOrEqual(SMALL_LIMIT * DOCUMENT_BUDGET_FACTOR);
+      shape.check?.(html, reads);
+    } else {
+      expect(outcome).toBeInstanceOf(PreviewTooLarge);
+      expect((outcome as PreviewTooLarge).what).toBe(shape.expect);
+    }
+  });
+
+  it('ends a build that never gets its files, at the time limit', async () => {
+    const { description } = bundle({ 'index.html': page('', '<img src="a.png">'), 'a.png': bytes(1) });
+    const never = () => new Promise<ArrayBuffer>(() => {});
+    const error = await buildPreviewDocument(description, never, SMALL_LIMIT, 50).catch(e => e);
+    expect(error).toBeInstanceOf(PreviewTimedOut);
   });
 });

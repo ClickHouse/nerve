@@ -87,6 +87,14 @@ def _refusal(e: BundleError) -> HTTPException:
     return HTTPException(status_code=_STATUS.get(e.code, 422), detail={"code": e.code.value, "message": e.message})
 
 
+# How many descriptions the file route keeps. One entry is the description
+# of one bundle state: the path, size, media type, times, inode and device
+# of each of its files (at most 1000), so at most a few hundred KiB.
+MAX_KEPT_DESCRIPTIONS = 64
+# A kept description goes when it was not used for this long.
+KEPT_DESCRIPTION_IDLE_SECONDS = 60.0
+
+
 class DescriptionCache:
     """The descriptions that the bundle route answered last, by workspace,
     path and fingerprint: at most ``size`` of them. A description goes when
@@ -96,7 +104,9 @@ class DescriptionCache:
     find their own. With more than ``size`` previews built at the same time
     a build can lose its description and start again."""
 
-    def __init__(self, size: int = 16, max_age: float = 60.0) -> None:
+    def __init__(
+        self, size: int = MAX_KEPT_DESCRIPTIONS, max_age: float = KEPT_DESCRIPTION_IDLE_SECONDS,
+    ) -> None:
         self.size = size
         self.max_age = max_age
         self._items: OrderedDict[tuple[str, str, str], tuple[float, Bundle]] = OrderedDict()
