@@ -581,11 +581,35 @@ async def task_update_handler(ctx: ToolContext, args: dict) -> ToolResult:
         if err:
             return ToolResult.text(err, is_error=True)
 
-    # Route done transitions through task_done to ensure file move + FTS sync
+    # Route done transitions through task_done to ensure file move + FTS sync.
+    # The tags, title and deadline of the same call land first, on the open
+    # task, so that one call can close a task and drop its working tags;
+    # task_done takes only the note. A refused edit closes nothing.
     if status == TERMINAL_STATUS:
-        return await task_done_handler(
+        if not has_field_edits:
+            return await task_done_handler(
+                ctx, {"task_id": task_id, "note": note, "expect_revision": expect_revision},
+            )
+        edited = await task_update_handler(
+            ctx, {k: v for k, v in args.items() if k not in ("status", "note")},
+        )
+        if edited.is_error:
+            return edited
+        if expect_revision is not None:
+            # The edit wrote the row once, so the close is fenced on the next
+            # revision. Worked out, not read, as for a reopen: a read could
+            # take a write of somebody else after the edit for the edit's own.
+            expect_revision += 1
+        done = await task_done_handler(
             ctx, {"task_id": task_id, "note": note, "expect_revision": expect_revision},
         )
+        if done.is_error and expect_revision is not None:
+            return ToolResult.text(
+                f"The tags, title or deadline of task {task_id} were written, but it changed "
+                "again before it was closed, so it is still open. Re-read it and retry the close.",
+                is_error=True,
+            )
+        return done
 
     # ...and the mirror. A task leaving the terminal status has to have its
     # markdown moved back out of done/ *before* anything else edits it —
@@ -1282,7 +1306,8 @@ TASK_UPDATE_SPEC = ToolSpec(
     name="task_update",
     description=(
         "Update a task's status, deadline, tags, title, or add an update note. "
-        "The status done closes the task as task_done does. "
+        "The status done closes the task as task_done does, after the tags, "
+        "title and deadline of the same call are applied. "
         "Pass expect_revision (from task_read) to refuse the update, writing "
         "nothing, if the task has changed since."
     ),
