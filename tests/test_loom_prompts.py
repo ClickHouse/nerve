@@ -16,6 +16,7 @@ import logging
 import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 from nerve.agent.backends.base import config_excluded_tools
@@ -347,19 +348,26 @@ def test_a_system_yaml_from_before_the_switch_runs_in_loom_wording() -> None:
     assert loom_wording_of_shipped_job("memory-maintenance", "Tidy up.", "") is None
 
 
-def test_a_system_yaml_with_the_first_loom_wording_runs_the_current_one(tmp_path: Path) -> None:
+@pytest.mark.parametrize("earlier", ["_FIRST_LOOM_MEMORY_MAINTENANCE", "_SECOND_LOOM_MEMORY_MAINTENANCE"])
+def test_a_system_yaml_with_an_earlier_loom_wording_runs_the_current_one(
+    tmp_path: Path, earlier: str,
+) -> None:
     """A system.yaml written under Loom holds the Loom wording of that
     release. The first one named the tool loom_namespace_validate, which
-    Loom's default tool list does not carry from Loom 1.2.0."""
+    Loom's default tool list does not carry from Loom 1.2.0. Both earlier ones
+    had the agent notify the human about conflicts."""
     from types import SimpleNamespace
 
+    from nerve import setup_writer
     from nerve.cron.service import CronService
-    from nerve.setup_writer import _FIRST_LOOM_MEMORY_MAINTENANCE
 
-    assert "loom_namespace_validate" in _FIRST_LOOM_MEMORY_MAINTENANCE
+    wording = getattr(setup_writer, earlier)
+    assert "loom_namespace_validate" in setup_writer._FIRST_LOOM_MEMORY_MAINTENANCE
     assert "loom_namespace_validate" not in loom_prompts.MAINTENANCE_PROMPT
+    assert "a conflict you cannot judge" in wording
+    assert "conflicts and operations Loom refused are no reason to notify" in loom_prompts.MAINTENANCE_PROMPT
     jobs = [
-        dict(job, prompt=_FIRST_LOOM_MEMORY_MAINTENANCE)
+        dict(job, prompt=wording)
         for job in _jobs("loom").values() if job["id"] == "memory-maintenance"
     ]
     (tmp_path / "system.yaml").write_text(yaml.safe_dump({"jobs": jobs}), encoding="utf-8")
