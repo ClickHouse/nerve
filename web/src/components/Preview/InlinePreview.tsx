@@ -119,14 +119,15 @@ class FramePlace {
 }
 
 /** The sandbox frame. A new key starts a new frame; a new `id` hands over `html` again. */
-function SandboxFrame({ html, id, onContent, onFail }: {
+function SandboxFrame({ html, id, onContent, onFail, hostRef }: {
   html: string;
   id: number;
   onContent: (message: ContentMessage) => void;
   onFail: (reason: string) => void;
+  /** The host of the frame, while it exists. */
+  hostRef: React.MutableRefObject<PreviewHost | null>;
 }) {
   const place = useRef<HTMLDivElement>(null);
-  const host = useRef<PreviewHost | null>(null);
   const handlers = useRef({ onContent, onFail });
   useEffect(() => {
     handlers.current = { onContent, onFail };
@@ -138,15 +139,15 @@ function SandboxFrame({ html, id, onContent, onFail }: {
       onFail: reason => handlers.current.onFail(reason),
     });
     if (place.current) created.start(place.current);
-    host.current = created;
+    hostRef.current = created;
     return () => {
       created.dispose();
-      if (host.current === created) host.current = null;
+      if (hostRef.current === created) hostRef.current = null;
     };
-  }, []);
+  }, [hostRef]);
 
   useEffect(() => {
-    host.current?.show(html);
+    hostRef.current?.show(html);
     // The identity decides a hand-over: each build is a new document, also with the same text.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id]);
@@ -182,6 +183,7 @@ function InlinePreviewFrame({ path }: { path: string }) {
   const shown = useRef<string | null>(null);
   const builds = useRef(0);
   const bundle = useRef<PreviewBundle | null>(null);
+  const hostRef = useRef<PreviewHost | null>(null);
 
   useEffect(() => {
     alive.current = true;
@@ -226,7 +228,8 @@ function InlinePreviewFrame({ path }: { path: string }) {
           } else {
             shown.current = null;
             place.drop();
-            setProblem(isStale(e) ? CHANGING : problemText(e));
+            // The inline preview builds again only on Try again.
+            setProblem(isStale(e) ? CHANGING : problemText(e, ''));
           }
         }
         if (again.current === 'no') break;
@@ -254,7 +257,12 @@ function InlinePreviewFrame({ path }: { path: string }) {
   }, [fileChange, live, refresh]);
 
   const onContent = useCallback((message: ContentMessage) => {
-    if (message.type === 'ready') setDeck(message.kind === 'deck');
+    if (message.type !== 'ready') return;
+    setDeck(message.kind === 'deck');
+    // A deck shows its first slide: it takes no input, so the person cannot move it back.
+    if (message.kind === 'deck' && message.slide !== undefined && message.slide !== 1) {
+      hostRef.current?.send({ type: 'slide', to: 'first' });
+    }
   }, []);
 
   const onFail = useCallback((reason: string) => {
@@ -290,7 +298,9 @@ function InlinePreviewFrame({ path }: { path: string }) {
           {doc && (
             // A deck takes no input: no click, no focus, so it stays on its first slide.
             <div className="absolute inset-0" inert={deck}>
-              <SandboxFrame key={frameKey} html={doc.html} id={doc.id} onContent={onContent} onFail={onFail} />
+              <SandboxFrame
+                key={frameKey} html={doc.html} id={doc.id} onContent={onContent} onFail={onFail} hostRef={hostRef}
+              />
             </div>
           )}
           {doc && deck && (
@@ -309,10 +319,12 @@ function InlinePreviewFrame({ path }: { path: string }) {
                   <button type="button" onClick={() => place.sync(true, true)} className={TEXT_BUTTON}>Load preview</button>
                   <span>Other previews or widgets are running. Loading this one stops the one used longest ago.</span>
                 </>
-              ) : (
+              ) : live ? (
                 <span className="flex items-center gap-2">
                   <Loader2 size={14} className="motion-safe:animate-spin" aria-hidden="true" /> Loading the preview...
                 </span>
+              ) : (
+                <span>Preview</span>
               )}
             </div>
           )}

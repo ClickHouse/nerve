@@ -14,10 +14,16 @@ export function isStale(e: unknown): boolean {
   return apiErrorDetail(e)?.code === 'stale_description';
 }
 
-/** The sentence of a failed read or build. */
-export function problemText(e: unknown): string {
+/** What the Preview tab does after a build that took too long. */
+export const TAB_RETRY = 'It tries again when a file changes, or with Reload.';
+
+/**
+ * The sentence of a failed read or build. `retry` follows the sentence of a
+ * build that took too long: what the place of the preview does next.
+ */
+export function problemText(e: unknown, retry: string = TAB_RETRY): string {
   if (e instanceof PreviewTimedOut) {
-    return `${e.message} It tries again when a file changes, or with Reload.`;
+    return retry ? `${e.message} ${retry}` : e.message;
   }
   if (e instanceof PreviewTooLarge) {
     return e.what === 'files'

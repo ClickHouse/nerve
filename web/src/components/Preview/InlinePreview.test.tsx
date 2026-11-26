@@ -7,6 +7,7 @@ import type { ContentMessage } from './messages';
 interface FakeHost {
   options: { onContent: (message: ContentMessage) => void; onFail: (reason: string) => void };
   shown: string[];
+  sent: unknown[];
   disposed: boolean;
 }
 
@@ -16,6 +17,7 @@ vi.mock('./host', () => ({
   PreviewHost: class {
     options: FakeHost['options'];
     shown: string[] = [];
+    sent: unknown[] = [];
     disposed = false;
     constructor(options: FakeHost['options']) {
       this.options = options;
@@ -23,7 +25,7 @@ vi.mock('./host', () => ({
     }
     start() {}
     show(html: string) { this.shown.push(html); }
-    send() {}
+    send(message: unknown) { this.sent.push(message); }
     focus() {}
     dispose() { this.disposed = true; }
   },
@@ -50,6 +52,7 @@ const { claimWidgetSlot, liveWidgets, MAX_LIVE_WIDGETS, resetWidgetSlots } = awa
 const { InlinePreview } = await import('./InlinePreview');
 const { SendFileBlock } = await import('../Chat/tools/SendFileBlock');
 const { MAX_RESTARTS } = await import('./problems');
+const { MAX_BUILD_MS } = await import('./document');
 const { canPreviewInline, previewTabId } = await import('./open');
 
 const PATH = '/ws/decks/demo/index.html';
@@ -149,6 +152,14 @@ describe('the inline preview', () => {
     expect(useChatStore.getState().panelVisible).toBe(true);
   });
 
+  it('takes a deck that starts on another slide back to its first slide', async () => {
+    await show();
+    act(() => lastHost().options.onContent({ type: 'ready', kind: 'deck', canPrint: true, slides: 6, slide: 1 }));
+    expect(lastHost().sent).toEqual([]);
+    act(() => lastHost().options.onContent({ type: 'ready', kind: 'deck', canPrint: true, slides: 6, slide: 3 }));
+    expect(lastHost().sent).toEqual([{ type: 'slide', to: 'first' }]);
+  });
+
   it('keeps a page that is not a deck usable in place', async () => {
     await show();
     act(() => lastHost().options.onContent({ type: 'ready', kind: 'table', canPrint: false }));
@@ -211,6 +222,16 @@ describe('the inline preview', () => {
     expect(screen.getByRole('status')).toHaveTextContent('No preview: The files change while the preview is read.');
   });
 
+  it('says that a build took too long, and promises no retry that the card does not make', async () => {
+    getFile().mockImplementation(() => new Promise<ArrayBuffer>(() => {}));
+    await show();
+    await act(async () => { await vi.advanceTimersByTimeAsync(MAX_BUILD_MS + 1); });
+    expect(screen.getByRole('status').textContent).toBe(
+      `No preview: The preview took longer than ${MAX_BUILD_MS / 1000} s to build.Try again`,
+    );
+    expect(liveWidgets()).toBe(0);
+  });
+
   it('says why when the sandbox fails, and frees its place', async () => {
     await show();
     act(() => lastHost().options.onFail('The preview sandbox does not answer.'));
@@ -220,6 +241,32 @@ describe('the inline preview', () => {
 });
 
 describe('the frames of the chat', () => {
+  it('loads nothing while the card is far from the screen', async () => {
+    const observers: Array<(entries: Array<{ isIntersecting: boolean }>) => void> = [];
+    vi.stubGlobal('IntersectionObserver', class {
+      constructor(callback: (entries: Array<{ isIntersecting: boolean }>) => void) { observers.push(callback); }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      takeRecords() { return []; }
+    });
+    try {
+      await show();
+      expect(getBundle()).not.toHaveBeenCalled();
+      expect(hosts).toHaveLength(0);
+      expect(liveWidgets()).toBe(0);
+      expect(screen.getByRole('figure', { name: 'Preview of index.html' })).toHaveTextContent('Preview');
+
+      act(() => observers.at(-1)!([{ isIntersecting: true }]));
+      await settle();
+      expect(getBundle()).toHaveBeenCalledTimes(1);
+      expect(hosts).toHaveLength(1);
+      expect(liveWidgets()).toBe(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it('waits for a click when every place is held by a frame near the screen', async () => {
     for (let i = 0; i < MAX_LIVE_WIDGETS; i++) claimWidgetSlot(() => {});
     await show();
