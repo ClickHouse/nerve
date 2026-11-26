@@ -415,6 +415,53 @@ describe('NerveWebSocket credentials and session checks', () => {
     expect(JSON.parse(MockWebSocket.instances[0].send.mock.calls[0][0]))
       .toEqual({ type: 'switch_session', session_id: 's2' });
   });
+
+  it('keeps a queued message when more frames than the cap queue after it', () => {
+    const client = new NerveWebSocket();
+    client.connect();
+    expect(client.sendMessage('hello', 's1')).toBe('queued');
+    // The person opens five other chats before the socket opens.
+    for (const id of ['s2', 's3', 's4', 's5', 's6']) client.switchSession(id);
+
+    MockWebSocket.instances[0].open();
+
+    // The message is still sent, and only the chat on screen is switched to.
+    expect(MockWebSocket.instances[0].send.mock.calls.map(([frame]) => JSON.parse(frame))).toEqual([
+      { type: 'message', content: 'hello', session_id: 's1' },
+      { type: 'switch_session', session_id: 's6' },
+    ]);
+  });
+
+  it('drops the oldest other frame past the cap, never a chat message', () => {
+    const client = new NerveWebSocket();
+    client.connect();
+    client.sendMessage('first', 's1');
+    for (const id of ['s1', 's2', 's3', 's4', 's5', 's6']) client.stopSession(id);
+    client.sendMessage('second', 's1');
+
+    MockWebSocket.instances[0].open();
+
+    expect(MockWebSocket.instances[0].send.mock.calls.map(([frame]) => JSON.parse(frame))).toEqual([
+      { type: 'message', content: 'first', session_id: 's1' },
+      { type: 'stop', session_id: 's2' },
+      { type: 'stop', session_id: 's3' },
+      { type: 'stop', session_id: 's4' },
+      { type: 'stop', session_id: 's5' },
+      { type: 'stop', session_id: 's6' },
+      { type: 'message', content: 'second', session_id: 's1' },
+    ]);
+  });
+
+  it('keeps every queued chat message, in order, past the cap', () => {
+    const client = new NerveWebSocket();
+    client.connect();
+    const texts = ['one', 'two', 'three', 'four', 'five', 'six', 'seven'];
+    for (const text of texts) expect(client.sendMessage(text, 's1')).toBe('queued');
+
+    MockWebSocket.instances[0].open();
+
+    expect(MockWebSocket.instances[0].send.mock.calls.map(([frame]) => JSON.parse(frame).content)).toEqual(texts);
+  });
 });
 
 describe('NerveWebSocket after the page comes back', () => {
