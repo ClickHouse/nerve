@@ -23,7 +23,7 @@ const { usePreviewStore, resetPreviewConfig } = await import('../../stores/previ
 const { SidePanel } = await import('../Chat/SidePanel');
 const { openPreview, previewTabId, canPreview } = await import('./open');
 const { POLL_MS, agoText, fileEventNamesBundle } = await import('./live');
-const { MAX_RESTARTS } = await import('./PreviewTab');
+const { MAX_RESTARTS } = await import('./problems');
 const { ApiError } = await import('../../api/hosted');
 const { MOBILE_QUERY } = await import('../../hooks/useMediaQuery');
 

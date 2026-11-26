@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { api, apiErrorDetail } from '../../api/client';
+import { api } from '../../api/client';
 import { useHostedStore } from '../../api/hosted';
 import { useChatStore } from '../../stores/chatStore';
 import { usePreviewStore } from '../../stores/previewStore';
@@ -7,10 +7,11 @@ import type { PanelTab } from '../../types/chat';
 import type { PreviewBundle } from '../../types/preview';
 import { Button, IconButton } from '../ui';
 import { ChevronLeft, ChevronRight, CodeXml, Loader2, Lock, Play, RefreshCw, X } from '../ui/icons';
-import { buildPreviewDocument, formatMiB, PreviewTimedOut, PreviewTooLarge, type PreviewDocument } from './document';
+import { buildPreviewDocument, type PreviewDocument } from './document';
 import { PreviewHost } from './host';
 import { agoText, fileEventNamesBundle, POLL_MS } from './live';
 import type { ContentKind, ContentMessage, HostMessage } from './messages';
+import { isStale, MAX_RESTARTS, problemText } from './problems';
 
 /**
  * The Preview tab of the side panel: the bundle of one workspace path, drawn
@@ -39,33 +40,9 @@ function Updated({ at }: { at: number }) {
   return <span className="text-xs text-text-dim shrink-0 tabular-nums">Updated {agoText(now - at)}</span>;
 }
 
-/** The sentence of a failed read, for the person. */
-/** How often one refresh starts again from a new description after a stale answer. */
-export const MAX_RESTARTS = 3;
-
-/** The file route's word that the files changed after the description the tab builds from. */
-function isStale(e: unknown): boolean {
-  return apiErrorDetail(e)?.code === 'stale_description';
-}
-
 const NO_FULL_SCREEN = 'Present needs full screen, and this browser did not allow it.';
 
 const KEEPS_CHANGING = 'The files change while the preview is read. The tab tries again in a moment.';
-
-function problemText(e: unknown): string {
-  if (e instanceof PreviewTimedOut) {
-    return `${e.message} It tries again when a file changes, or with Reload.`;
-  }
-  if (e instanceof PreviewTooLarge) {
-    return e.what === 'files'
-      ? `This preview needs ${formatMiB(e.bytes)} of files or more. The limit is ${formatMiB(e.limit)}.`
-      : `This preview is too large to show: its document would be more than ${formatMiB(e.limit)}`
-        + ' (a file that the page uses many times counts each time).';
-  }
-  const message = apiErrorDetail(e)?.message;
-  if (typeof message === 'string' && message) return message;
-  return 'The preview cannot be read.';
-}
 
 /** The sandbox frame of the preview. A new key starts a new frame. */
 function PreviewFrame({ html, onContent, onFail, hostRef }: {

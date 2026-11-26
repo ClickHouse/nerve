@@ -207,6 +207,19 @@ sent (`send_file`), and in the diff view of the Modified Files panel. On the
 Files page it is in the toolbar of an open file that has a preview, and opens
 the tab in the open chat. One tab for each path: a second open focuses it.
 
+**In the chat.** Under the card of a file that the agent sent (`send_file`)
+and that has a preview, the chat shows the preview itself, in the sandbox
+frame of the tab. An image shows as an image, as before. A page (an HTML
+file, a folder) is 360 pixels high and works in place. A page that says it
+is a deck shows its first slide at 16 by 9 and takes no input: a click opens
+the Preview tab, which has the slide controls and Present. The frame is made
+when the card comes near the screen, and made again when a file event names
+a file of the bundle; it does not poll. It takes one of the six frame places
+of the chat that widgets also use (see [Widgets](widgets.md)): when frames
+near the screen hold all six, the card shows **Load preview**. When the
+bundle cannot be shown (for example, a file outside the workspace, or a file
+that is gone), one line under the card says why, with **Try again**.
+
 **The header.** The path, "Updated … ago" (the newest change of a file of
 the bundle), **Reload the preview**, **Show the source** (`</>`, the text of
 the entry file), **Present** (the frame fills the screen) and the close

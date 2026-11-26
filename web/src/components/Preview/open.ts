@@ -14,6 +14,14 @@ export function canPreview(path: string | null | undefined): boolean {
   return typeof path === 'string' && PREVIEW_FILE.test(path.trim());
 }
 
+/** An image: the chat shows it itself, as an image. */
+const IMAGE_FILE = /\.(png|jpe?g|gif|webp|avif|svg)$/i;
+
+/** True for a file path that has a preview inside the chat (`InlinePreview`): a file with a preview that is not an image. */
+export function canPreviewInline(path: string | null | undefined): boolean {
+  return canPreview(path) && !IMAGE_FILE.test((path ?? '').trim());
+}
+
 /** The id of the preview tab of a path. */
 export function previewTabId(path: string): string {
   return `preview:${path}`;

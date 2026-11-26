@@ -1,0 +1,275 @@
+import { act, render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { PreviewBundle } from '../../types/preview';
+import type { ContentMessage } from './messages';
+
+interface FakeHost {
+  options: { onContent: (message: ContentMessage) => void; onFail: (reason: string) => void };
+  shown: string[];
+  disposed: boolean;
+}
+
+const { hosts } = vi.hoisted(() => ({ hosts: [] as FakeHost[] }));
+
+vi.mock('./host', () => ({
+  PreviewHost: class {
+    options: FakeHost['options'];
+    shown: string[] = [];
+    disposed = false;
+    constructor(options: FakeHost['options']) {
+      this.options = options;
+      hosts.push(this);
+    }
+    start() {}
+    show(html: string) { this.shown.push(html); }
+    send() {}
+    focus() {}
+    dispose() { this.disposed = true; }
+  },
+}));
+vi.mock('../../api/client', async (orig) => ({
+  ...(await orig<typeof import('../../api/client')>()),
+  api: new Proxy({} as Record<string, unknown>, {
+    get: (target, key: string) => (target[key] ??= vi.fn(async () => ({}))),
+  }),
+}));
+vi.mock('../../api/websocket', () => ({
+  ws: {
+    sendMessage: vi.fn(() => 'sent'), switchSession: vi.fn(), send: vi.fn(), connect: vi.fn(),
+    subscribeAgent: vi.fn(() => 'sent'), unsubscribeAgent: vi.fn(() => 'sent'), onOpen: vi.fn(() => () => {}),
+    answerInteraction: vi.fn(),
+  },
+}));
+
+const { api } = await import('../../api/client');
+const { ApiError } = await import('../../api/hosted');
+const { useChatStore } = await import('../../stores/chatStore');
+const { usePreviewStore, resetPreviewConfig } = await import('../../stores/previewStore');
+const { claimWidgetSlot, liveWidgets, MAX_LIVE_WIDGETS, resetWidgetSlots } = await import('../Chat/widgets/budget');
+const { InlinePreview } = await import('./InlinePreview');
+const { SendFileBlock } = await import('../Chat/tools/SendFileBlock');
+const { MAX_RESTARTS } = await import('./problems');
+const { canPreviewInline, previewTabId } = await import('./open');
+
+const PATH = '/ws/decks/demo/index.html';
+const encoder = new TextEncoder();
+
+let entry = '<!doctype html><html><body><h1>Slide one</h1></body></html>';
+let fingerprint = 'f1';
+
+function description(): PreviewBundle {
+  return {
+    path: 'decks/demo/index.html', root: 'decks/demo', root_path: '/ws/decks/demo', kind: 'folder', entry: 'index.html',
+    files: [{ path: 'index.html', size: encoder.encode(entry).length, type: 'text/html' }],
+    size: 0, fingerprint, modified: Date.now(),
+  };
+}
+
+const getBundle = () => vi.mocked(api.getPreviewBundle);
+const getFile = () => vi.mocked(api.getPreviewFile);
+const lastHost = () => hosts[hosts.length - 1];
+
+async function settle() {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(0);
+  });
+}
+
+async function show(path = PATH) {
+  const view = render(<InlinePreview path={path} />);
+  await settle();
+  return view;
+}
+
+beforeEach(() => {
+  vi.useFakeTimers({ shouldAdvanceTime: true });
+  hosts.length = 0;
+  resetWidgetSlots();
+  entry = '<!doctype html><html><body><h1>Slide one</h1></body></html>';
+  fingerprint = 'f1';
+  getBundle().mockImplementation(async () => description());
+  getFile().mockImplementation(async () => encoder.encode(entry).slice().buffer);
+  usePreviewStore.setState({ enabled: true, maxBytes: 10 * 1024 * 1024 });
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  getBundle().mockReset();
+  getFile().mockReset();
+  resetPreviewConfig();
+  resetWidgetSlots();
+  document.body.innerHTML = '';
+});
+
+describe('which files have an inline preview', () => {
+  it.each([
+    ['/ws/deck/index.html', true], ['/ws/page.HTML', true],
+    ['/ws/logo.svg', false], ['/ws/photo.jpeg', false], ['/ws/app.js', false], ['', false],
+  ])('%s: %s', (path, inline) => {
+    expect(canPreviewInline(path)).toBe(inline);
+  });
+
+  it('shows nothing while previews are off', async () => {
+    usePreviewStore.setState({ enabled: false });
+    const { container } = await show();
+    expect(container).toBeEmptyDOMElement();
+    expect(getBundle()).not.toHaveBeenCalled();
+  });
+
+  it('shows nothing for an image: the card shows the image itself', async () => {
+    const { container } = await show('/ws/shots/chart.png');
+    expect(container).toBeEmptyDOMElement();
+    expect(getBundle()).not.toHaveBeenCalled();
+  });
+});
+
+describe('the inline preview', () => {
+  it('builds the document of the bundle and gives it to the sandbox frame', async () => {
+    await show();
+    expect(screen.getByRole('figure', { name: 'Preview of index.html' })).toBeInTheDocument();
+    expect(getBundle()).toHaveBeenCalledWith(PATH);
+    expect(getFile()).toHaveBeenCalledWith(PATH, 'index.html', 'f1');
+    expect(hosts).toHaveLength(1);
+    expect(lastHost().shown).toHaveLength(1);
+    expect(lastHost().shown[0]).toContain('Slide one');
+    expect(liveWidgets()).toBe(1);
+  });
+
+  it('shows a deck as its first slide that takes no input, and a click opens the Preview tab', async () => {
+    useChatStore.setState({ activeSession: 'session-1', panels: [], activePanelId: null, panelVisible: false });
+    await show();
+    const figure = screen.getByRole('figure', { name: 'Preview of index.html' });
+    expect(figure).not.toHaveClass('aspect-video');
+    act(() => lastHost().options.onContent({ type: 'ready', kind: 'deck', canPrint: true, slides: 6, slide: 1 }));
+    expect(figure).toHaveClass('aspect-video');
+    expect(figure.querySelector('[inert]')).not.toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: 'Open index.html in the Preview tab' }));
+    expect(useChatStore.getState().activePanelId).toBe(previewTabId(PATH));
+    expect(useChatStore.getState().panelVisible).toBe(true);
+  });
+
+  it('keeps a page that is not a deck usable in place', async () => {
+    await show();
+    act(() => lastHost().options.onContent({ type: 'ready', kind: 'table', canPrint: false }));
+    const figure = screen.getByRole('figure', { name: 'Preview of index.html' });
+    expect(figure).not.toHaveClass('aspect-video');
+    expect(figure.querySelector('[inert]')).toBeNull();
+    expect(screen.queryByRole('button', { name: /in the Preview tab/ })).not.toBeInTheDocument();
+  });
+
+  it('builds again when a file event names a file of the bundle, and only when the fingerprint changed', async () => {
+    await show();
+    expect(getFile()).toHaveBeenCalledTimes(1);
+
+    act(() => usePreviewStore.getState().noteFileChange('/ws/elsewhere/index.html'));
+    await settle();
+    expect(getBundle()).toHaveBeenCalledTimes(1);
+
+    act(() => usePreviewStore.getState().noteFileChange('/ws/decks/demo/index.html'));
+    await settle();
+    expect(getBundle()).toHaveBeenCalledTimes(2);
+    expect(getFile()).toHaveBeenCalledTimes(1);
+
+    entry = '<!doctype html><html><body><h1>Slide two</h1></body></html>';
+    fingerprint = 'f2';
+    act(() => usePreviewStore.getState().noteFileChange('/ws/decks/demo/index.html'));
+    await settle();
+    expect(getFile()).toHaveBeenCalledTimes(2);
+    expect(lastHost().shown.at(-1)).toContain('Slide two');
+  });
+
+  it('says in one line why a file has no preview, frees its place, and tries again on request', async () => {
+    getBundle().mockRejectedValueOnce(new ApiError(403, JSON.stringify({
+      detail: { code: 'outside_workspace', message: 'The path is outside the workspace.' },
+    })));
+    await show('/tmp/report.html');
+    expect(screen.getByRole('status')).toHaveTextContent('No preview: The path is outside the workspace.');
+    expect(screen.queryByRole('figure')).not.toBeInTheDocument();
+    expect(liveWidgets()).toBe(0);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    await settle();
+    expect(getBundle()).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole('figure', { name: 'Preview of report.html' })).toBeInTheDocument();
+    expect(liveWidgets()).toBe(1);
+  });
+
+  it('starts again from a new description when the files change while it reads them', async () => {
+    const stale = new ApiError(409, JSON.stringify({ detail: { code: 'stale_description', message: 'changed' } }));
+    getFile().mockRejectedValueOnce(stale);
+    await show();
+    expect(getBundle()).toHaveBeenCalledTimes(2);
+    expect(lastHost().shown[0]).toContain('Slide one');
+  });
+
+  it('says so when the files keep changing', async () => {
+    const stale = new ApiError(409, JSON.stringify({ detail: { code: 'stale_description', message: 'changed' } }));
+    getFile().mockRejectedValue(stale);
+    await show();
+    expect(getBundle()).toHaveBeenCalledTimes(MAX_RESTARTS + 1);
+    expect(screen.getByRole('status')).toHaveTextContent('No preview: The files change while the preview is read.');
+  });
+
+  it('says why when the sandbox fails, and frees its place', async () => {
+    await show();
+    act(() => lastHost().options.onFail('The preview sandbox does not answer.'));
+    expect(screen.getByRole('status')).toHaveTextContent('No preview: The preview sandbox does not answer.');
+    expect(liveWidgets()).toBe(0);
+  });
+});
+
+describe('the frames of the chat', () => {
+  it('waits for a click when every place is held by a frame near the screen', async () => {
+    for (let i = 0; i < MAX_LIVE_WIDGETS; i++) claimWidgetSlot(() => {});
+    await show();
+    expect(getBundle()).not.toHaveBeenCalled();
+    expect(hosts).toHaveLength(0);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Load preview' }));
+    await settle();
+    expect(liveWidgets()).toBe(MAX_LIVE_WIDGETS);
+    expect(lastHost().shown[0]).toContain('Slide one');
+  });
+
+  it('removes its frame when another frame takes the place, and offers to load it again', async () => {
+    await show();
+    const first = lastHost();
+    // Every other place is taken; the person asks for one more frame.
+    for (let i = 1; i < MAX_LIVE_WIDGETS; i++) claimWidgetSlot(() => {});
+    act(() => { claimWidgetSlot(() => {}, true); });
+    expect(first.disposed).toBe(true);
+    expect(screen.getByRole('button', { name: 'Load preview' })).toBeInTheDocument();
+  });
+
+  it('gives its place back when the card goes', async () => {
+    const { unmount } = await show();
+    expect(liveWidgets()).toBe(1);
+    unmount();
+    expect(liveWidgets()).toBe(0);
+    expect(lastHost().disposed).toBe(true);
+  });
+});
+
+describe('the card of a sent file', () => {
+  const sent = (filePath: string) => ({
+    type: 'tool_call' as const, toolUseId: 'tu-1', tool: 'mcp__nerve__send_file', input: { file_path: filePath },
+    result: JSON.stringify([{ type: 'text', text: 'Sent file' }]), status: 'complete' as const,
+  });
+
+  it('shows the preview of a page under the download card', async () => {
+    render(<SendFileBlock block={sent(PATH)} />);
+    await settle();
+    expect(screen.getByRole('link', { name: /index\.html/ })).toHaveAttribute('download', 'index.html');
+    expect(screen.getByRole('button', { name: 'Preview index.html' })).toBeInTheDocument();
+    expect(screen.getByRole('figure', { name: 'Preview of index.html' })).toBeInTheDocument();
+  });
+
+  it('shows an image as an image, with no inline preview', async () => {
+    render(<SendFileBlock block={sent('/ws/shots/chart.png')} />);
+    await settle();
+    expect(screen.getByRole('img', { name: 'chart.png' })).toBeInTheDocument();
+    expect(screen.queryByRole('figure', { name: /^Preview of/ })).not.toBeInTheDocument();
+    expect(getBundle()).not.toHaveBeenCalled();
+  });
+});

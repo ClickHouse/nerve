@@ -4,6 +4,7 @@ import { Modal } from '../../ui';
 import { authUrl } from '../../../api/hosted';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { extractResultText } from '../../../utils/extractResultText';
+import { InlinePreview } from '../../Preview/InlinePreview';
 import { PreviewButton } from '../../Preview/PreviewButton';
 
 /** The file names that show as an image. An `<img>` element runs no script, also for an SVG file. */
@@ -24,7 +25,8 @@ function failure(block: ToolCallBlockData): string | null {
 
 /**
  * A `send_file` call. An image file shows in the chat, and a click opens it
- * at full size; another file shows as a download card.
+ * at full size; another file shows as a download card, with its preview
+ * under the card when it has one (`InlinePreview`).
  */
 export function SendFileBlock({ block }: { block: ToolCallBlockData }) {
   const [open, setOpen] = useState(false);
@@ -62,9 +64,12 @@ export function SendFileBlock({ block }: { block: ToolCallBlockData }) {
 
   if (!IMAGE_FILE.test(filename) || broken) {
     return (
-      <div className="my-2 flex items-center gap-1">
-        {card}
-        <PreviewButton path={filePath} />
+      <div className="my-2">
+        <div className="flex items-center gap-1">
+          {card}
+          <PreviewButton path={filePath} />
+        </div>
+        <InlinePreview path={filePath} />
       </div>
     );
   }
