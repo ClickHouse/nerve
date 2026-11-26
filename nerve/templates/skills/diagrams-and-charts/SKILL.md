@@ -1,13 +1,12 @@
 ---
 name: Diagrams and Charts
 description: >
-  This skill should be used when the person asks to "draw a diagram", "make a
-  chart", "plot this data", "show the flow", "sketch the architecture", "show
-  the data model", or needs a picture for Telegram, Slack, a deck or a report.
-  It covers what the Nerve web chat does with mermaid, vega-lite, svg and
-  widget blocks (what it themes, strips and refuses), channels that show text
-  only, and picture files for other places. Not for a whole deck, report or
-  page (slide-deck, research-report, shareable-html).
+  This skill should be used when the person asks to "draw a diagram", "make
+  a chart", "plot this data", "show the flow", "sketch the architecture", or
+  needs a picture for Telegram, Slack, a deck or a report. It covers
+  choosing the form, what the Nerve web chat does with mermaid, vega-lite,
+  svg and widget blocks, text-only channels, and picture files. Not for a
+  whole deck, report or page (slide-deck, research-report, shareable-html).
 version: 1.0.0
 ---
 

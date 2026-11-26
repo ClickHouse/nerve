@@ -2,13 +2,12 @@
 name: Research Report
 description: >
   This skill should be used when the person asks for research that needs
-  sources: "research X", "compare A and B", "which tool should we pick for Y",
-  "how do others solve X", "scan the market for Z", "survey these products",
-  "write a report on X", "track X every month". It covers the choice between a
-  short sourced answer and a full report, parallel research agents, source and
-  citation checks, and delivery as one self-contained HTML page. Not for slides
-  (slide-deck), a data dashboard (shareable-html) or one chart
-  (diagrams-and-charts).
+  sources: "research X", "compare A and B", "which tool should we pick for
+  Y", "how do others solve X", "survey these products", "track X every
+  month". It covers a short sourced answer or a full report, parallel
+  research agents, source and citation checks, and one self-contained HTML
+  page. Not for slides (slide-deck), a dashboard (shareable-html) or one
+  chart (diagrams-and-charts).
 version: 1.0.0
 ---
 

@@ -1,13 +1,13 @@
 ---
 name: Slide Deck
 description: >
-  This skill should be used when the person asks for a slide deck or a change
-  to one: "build a deck for X", "make slides for the team meeting", "add a slide
-  on Y", "cut slide 3", "move this to the speaker notes", "a PDF of the deck",
-  "export it to PowerPoint / Google Slides". It covers the content draft, one
-  offline HTML deck with speaker notes, edit rounds, picture checks, PDF and
-  PPTX, and delivery. Not for one chart (diagrams-and-charts), a report
-  (research-report) or a one-page dashboard (shareable-html).
+  This skill should be used when the person asks for a slide deck or a
+  change to one: "build a deck for X", "add a slide on Y", "cut slide 3",
+  "move this to the notes", "a PDF of the deck", "export it to PowerPoint".
+  It covers the draft, one offline HTML deck with speaker notes, edit
+  rounds, picture checks, PDF, PPTX and delivery. Not for one chart
+  (diagrams-and-charts), a report (research-report) or a dashboard
+  (shareable-html).
 version: 1.0.0
 ---
 

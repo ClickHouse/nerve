@@ -1,12 +1,11 @@
 ---
 name: Shareable HTML Page
 description: >
-  This skill should be used when the person asks for a page or dashboard as a
-  file to open, keep or forward: "make a dashboard of X", "a status page for
-  Y", "a one-page summary as HTML", "an interactive table of these results", "a
-  small calculator page", "send me this as an HTML file". It covers when a page
-  is better than a chat answer or a widget, the rules for a file that works
-  offline, the check in a browser, delivery and scheduled rebuilds. Not for
+  This skill should be used when the person asks for a page or dashboard as
+  a file to open, keep or forward: "make a dashboard of X", "a status page
+  for Y", "an interactive table of these results", "send me this as an HTML
+  file". It covers when a page beats a chat answer or a widget, an offline
+  single file, the browser check, delivery and scheduled rebuilds. Not for
   slides (slide-deck), a sourced report (research-report) or one chart
   (diagrams-and-charts).
 version: 1.0.0

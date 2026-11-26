@@ -1,14 +1,13 @@
 ---
 name: Browser Testing
 description: >
-  This skill should be used when the person asks to check a web app in a real
-  browser: "test the UI", "screenshot the page", "check it on mobile", "run an
-  accessibility check", "check the contrast", "does the sign-up flow work",
-  "find the console errors", "verify the frontend change before the PR". It
-  covers the headless Chromium setup on this machine, serving the app under
-  test, sign-in, the checks, triage and evidence. It also holds the browser
-  setup that the other bundled skills use. Not for building a page to share
-  (shareable-html) or slides (slide-deck).
+  This skill should be used when the person asks to check a web app in a
+  real browser: "test the UI", "screenshot the page", "check it on mobile",
+  "run an accessibility check", "does the sign-up flow work", "verify the
+  frontend change before the PR". It covers serving the app, sign-in, the
+  checks, triage and evidence, and the headless Chromium setup that the
+  other bundled skills use. Not for building a page (shareable-html) or
+  slides (slide-deck).
 version: 1.0.0
 ---
 
