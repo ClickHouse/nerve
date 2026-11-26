@@ -41,8 +41,6 @@ export const SANDBOX_WAIT_MS = 8_000;
 export const HELLO_MS = 1_000;
 /** A frame that sends more messages than this in a second is stopped. */
 export const MAX_MESSAGES_PER_SECOND = 300;
-/** Content messages count again this long after a hand-over when the proxy has not answered by then. */
-export const SETTLE_MS = 500;
 
 const FLOODED = 'The preview was stopped: it sent messages without end.';
 
@@ -67,7 +65,6 @@ export class PreviewHost {
   private countedFrom = 0;
   private waitTimer: ReturnType<typeof setTimeout> | undefined;
   private helloTimer: ReturnType<typeof setTimeout> | undefined;
-  private settleTimer: ReturnType<typeof setTimeout> | undefined;
   /** The content page said `ready` for the document that the proxy holds. */
   private ready = false;
   /** Who asked the proxy about a press, in order: the proxy answers in the same order. */
@@ -124,7 +121,6 @@ export class PreviewHost {
     window.removeEventListener('message', this.onMessage);
     clearTimeout(this.waitTimer);
     clearTimeout(this.helloTimer);
-    clearTimeout(this.settleTimer);
     this.keyboard?.stop();
     this.keyboard = null;
     this.frame?.remove();
@@ -159,11 +155,11 @@ export class PreviewHost {
       method: RESOURCE_READY,
       params: { html: this.html, sandbox: PREVIEW_SANDBOX },
     });
-    // The answer comes after every message of the page before (see the class comment).
+    // The answer comes after every message of the page before (see the class
+    // comment). The proxy answers each question, in order: the queue of
+    // askers stays in step, and no timer may end the wait.
     this.settling += 1;
     this.ask('hand-over');
-    clearTimeout(this.settleTimer);
-    this.settleTimer = setTimeout(() => { this.settling = 0; }, SETTLE_MS);
     this.options.onHandOver?.();
     clearTimeout(this.helloTimer);
     this.helloTimer = setTimeout(() => {
@@ -201,7 +197,6 @@ export class PreviewHost {
     if (pressed !== null) {
       if (this.askers.shift() === 'hand-over') {
         this.settling = Math.max(0, this.settling - 1);
-        if (this.settling === 0) clearTimeout(this.settleTimer);
         return;
       }
       this.keyboard?.answer(pressed);

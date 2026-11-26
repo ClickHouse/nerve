@@ -172,6 +172,24 @@ describe('the inline preview', () => {
     expect(figure.querySelector('[inert]')).toBeNull();
   });
 
+  it('is no deck when its frame comes back after another frame took the place, until the page says so', async () => {
+    await show();
+    act(() => lastHost().options.onContent({ type: 'ready', kind: 'deck', canPrint: true, slides: 6, slide: 1 }));
+    const figure = () => screen.getByRole('figure', { name: 'Preview of index.html' });
+    expect(figure()).toHaveClass('aspect-video');
+    for (let i = 1; i < MAX_LIVE_WIDGETS; i++) claimWidgetSlot(() => {});
+    act(() => { claimWidgetSlot(() => {}, true); });
+    // The place is gone: a placeholder of the height of a page, not a deck.
+    expect(figure()).not.toHaveClass('aspect-video');
+    await userEvent.click(screen.getByRole('button', { name: 'Load preview' }));
+    await settle();
+    // The new frame has its document; the proxy has not taken it yet.
+    expect(lastHost().shown).toHaveLength(1);
+    expect(figure()).not.toHaveClass('aspect-video');
+    expect(figure().querySelector('[inert]')).toBeNull();
+    expect(screen.queryByRole('button', { name: /in the Preview tab/ })).not.toBeInTheDocument();
+  });
+
   it('keeps a page that is not a deck usable in place', async () => {
     await show();
     act(() => lastHost().options.onContent({ type: 'ready', kind: 'table', canPrint: false }));

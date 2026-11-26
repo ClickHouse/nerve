@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SANDBOX_PATH } from '../Chat/mcpApps/sandbox';
 import { PREVIEW_POLICY } from './document';
 import { KeyboardGuard } from '../Chat/mcpApps/keyboard';
-import { HELLO_MS, MAX_MESSAGES_PER_SECOND, PREVIEW_SANDBOX, PreviewHost, SANDBOX_WAIT_MS, SETTLE_MS } from './host';
+import { HELLO_MS, MAX_MESSAGES_PER_SECOND, PREVIEW_SANDBOX, PreviewHost, SANDBOX_WAIT_MS } from './host';
 import { ARTIFACT_CHANNEL, type ContentMessage } from './messages';
 
 /**
@@ -163,16 +163,24 @@ describe('PreviewHost', () => {
     expect(content).toEqual([{ type: 'ready', kind: 'markdown', canPrint: true }]);
   });
 
-  it('takes content messages again after a while when the proxy does not answer', () => {
-    const { host, proxyReady, say, content } = setup();
+  it('waits for a late answer, and the next answer still goes to the keyboard guard', () => {
+    const { host, proxyReady, answer, say, content } = setup();
+    const answered = vi.spyOn(KeyboardGuard.prototype, 'answer');
+    const ready = { channel: ARTIFACT_CHANNEL, v: 1, type: 'ready', kind: 'markdown', canPrint: true };
     host.show(HTML);
     proxyReady();
-    const ready = { channel: ARTIFACT_CHANNEL, v: 1, type: 'ready', kind: 'markdown', canPrint: true };
+    // No answer for a long time: no content message counts, and no timer ends the wait.
+    vi.advanceTimersByTime(60_000);
     say(ready);
     expect(content).toEqual([]);
-    vi.advanceTimersByTime(SETTLE_MS + 1);
+    (host as unknown as { ask: (who: string) => void }).ask('keyboard');
+    answer();
     say(ready);
     expect(content).toHaveLength(1);
+    expect(answered).not.toHaveBeenCalled();
+    answer(true);
+    expect(answered).toHaveBeenCalledTimes(1);
+    expect(answered).toHaveBeenLastCalledWith(true);
   });
 
   it('asks a page that said nothing with hello, once', () => {

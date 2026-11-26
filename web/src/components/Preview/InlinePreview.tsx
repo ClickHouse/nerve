@@ -227,6 +227,8 @@ function InlinePreviewFrame({ path }: { path: string }) {
             if (!alive.current || !place.holds) return;
             shown.current = next.fingerprint;
             builds.current += 1;
+            // Not a deck until the new page says so (onHandOver resets it again at the hand-over).
+            setDeck(false);
             place.show({ html: built.html, id: builds.current });
           }
           setProblem(null);
@@ -293,6 +295,8 @@ function InlinePreviewFrame({ path }: { path: string }) {
 
   const name = path.split('/').pop() || path;
   const note = problem ?? frameError;
+  // What a page said of itself counts only while a document is shown.
+  const isDeck = deck && doc !== null;
 
   // One element for the whole life of the card: `useNear` watches it.
   return (
@@ -306,19 +310,19 @@ function InlinePreviewFrame({ path }: { path: string }) {
         <figure
           aria-label={`Preview of ${name}`}
           aria-busy={!doc || undefined}
-          className={`relative mt-1.5 mb-0 mx-0 w-full overflow-hidden rounded-lg border border-border-subtle bg-surface ${deck ? 'aspect-video' : ''}`}
-          style={deck ? undefined : { height: INLINE_HEIGHT }}
+          className={`relative mt-1.5 mb-0 mx-0 w-full overflow-hidden rounded-lg border border-border-subtle bg-surface ${isDeck ? 'aspect-video' : ''}`}
+          style={isDeck ? undefined : { height: INLINE_HEIGHT }}
         >
           {doc && (
             // A deck takes no input: no click, no focus, so it stays on its first slide.
-            <div className="absolute inset-0" inert={deck}>
+            <div className="absolute inset-0" inert={isDeck}>
               <SandboxFrame
                 key={frameKey} html={doc.html} id={doc.id} onContent={onContent} onFail={onFail}
                 onHandOver={onHandOver} hostRef={hostRef}
               />
             </div>
           )}
-          {doc && deck && (
+          {doc && isDeck && (
             <button
               type="button"
               aria-label={`Open ${name} in the Preview tab`}

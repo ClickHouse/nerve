@@ -323,7 +323,8 @@ or as an address. A page that sends no `ready` is a plain page. When a new
 document goes to the frame, a message of the page before can still be on
 its way: the tab (and the inline preview) asks the sandbox document a
 question and takes no message until the answer, which comes after every
-message of the page before (at most 0.5 s when no answer comes).
+message of the page before. The sandbox document answers each question, in
+order.
 
 **Limits.** A page that loads files at run time (`fetch`, a module script
 that imports another file, a link to another page of the bundle) does not
