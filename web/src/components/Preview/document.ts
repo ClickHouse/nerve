@@ -146,6 +146,27 @@ function folderOf(path: string): string {
   return slash < 0 ? '' : path.slice(0, slash + 1);
 }
 
+/** A fragment that may follow a `data:` address: `#` and a name of letters, digits, `-`, `_`, `.` or `:`. */
+const SAFE_FRAGMENT = /^#[A-Za-z0-9_.:-]+$/;
+
+/**
+ * The fragment of an address (`#mark` of `icons.svg#mark`, the element of an
+ * SVG file that the page names), to put after the `data:` address of the
+ * file; '' when the address has none, or one with other characters.
+ */
+function fragmentOf(address: string): string {
+  const value = address.trim();
+  const at = value.indexOf('#');
+  if (at < 0) return '';
+  const fragment = value.slice(at);
+  return SAFE_FRAGMENT.test(fragment) ? fragment : '';
+}
+
+/** An address of an element of the document itself (`#clip`): it loads nothing and stays as it is. */
+function isOwnElement(address: string): boolean {
+  return address.trim().startsWith('#');
+}
+
 /**
  * The bundle path that `address` names from a file in `folder`, `'data'`
  * for a `data:` address (it carries its own bytes), or null for every
@@ -329,8 +350,9 @@ async function replaceAsync(
 }
 
 /**
- * CSS with each address of the bundle as a `data:` address, and every other
- * address removed. An imported stylesheet goes the same way, as a `data:`
+ * CSS with each address of the bundle as a `data:` address, an address of
+ * an element of the page (`url(#clip)`) as it is, and every other address
+ * removed. An imported stylesheet goes the same way, as a `data:`
  * stylesheet of its own.
  */
 async function rewriteCss(
@@ -347,17 +369,22 @@ async function rewriteCss(
   });
   const urls = await replaceAsync(imported, CSS_URL, async match => {
     const address = match[1] ?? match[2] ?? match[3] ?? '';
+    // `url(#clip)`: a gradient, clip path, mask or filter of the page itself.
+    if (isOwnElement(address)) return match[0];
     const path = resolveAddress(address, folder, files.paths);
     if (path === 'data') return match[0];
-    return `url("${path === null ? files.use(NO_FILE) : await files.dataUrlOf(path)}")`;
+    if (path === null) return `url("${files.use(NO_FILE)}")`;
+    return `url("${await files.dataUrlOf(path)}${files.use(fragmentOf(address))}")`;
   });
   // The string form of an image set: `image-set("a.png" 1x, "b.png" 2x)`.
   return replaceAsync(urls, CSS_IMAGE_SET, async match => {
     const inner = await replaceAsync(match[2], CSS_STRING, async string => {
       if (string[1] !== undefined) return string[0];
-      const path = resolveAddress(string[2] ?? string[3] ?? '', folder, files.paths);
+      const address = string[2] ?? string[3] ?? '';
+      const path = resolveAddress(address, folder, files.paths);
       if (path === 'data') return string[0];
-      return `"${path === null ? files.use(NO_FILE) : await files.dataUrlOf(path)}"`;
+      if (path === null) return `"${files.use(NO_FILE)}"`;
+      return `"${await files.dataUrlOf(path)}${files.use(fragmentOf(address))}"`;
     });
     return `${match[1]}${inner})`;
   });
@@ -386,12 +413,16 @@ async function stylesheetUrl(
   return files.use(url);
 }
 
-/** An attribute that names a file: the file as a `data:` address, or no attribute. */
+/**
+ * An attribute that names a file: the file as a `data:` address (with the
+ * fragment of the address, `fragmentOf`), or no attribute.
+ */
 async function inlineAttribute(element: Element, name: string, folder: string, files: Files): Promise<void> {
-  const path = resolveAddress(element.getAttribute(name) ?? '', folder, files.paths);
+  const address = element.getAttribute(name) ?? '';
+  const path = resolveAddress(address, folder, files.paths);
   if (path === 'data') return;
   if (path === null) element.removeAttribute(name);
-  else element.setAttribute(name, await files.dataUrlOf(path));
+  else element.setAttribute(name, `${await files.dataUrlOf(path)}${files.use(fragmentOf(address))}`);
 }
 
 /**

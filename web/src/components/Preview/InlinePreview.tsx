@@ -56,6 +56,8 @@ interface FrameState {
 class FramePlace {
   private slot: WidgetSlot | null = null;
   private near = false;
+  /** The last build failed: no place until the person asks again (Try again). */
+  private failed = false;
   private state: FrameState = { live: false, waiting: false, doc: null };
   private readonly listeners = new Set<() => void>();
 
@@ -70,14 +72,19 @@ class FramePlace {
     return this.slot !== null;
   }
 
-  /** The card came near the screen or left it. `asked`: the person clicked, so a place is always found. */
+  /**
+   * The card came near the screen or left it. `asked`: the person clicked
+   * (Load preview, Try again), so a place is always found. A card whose
+   * build failed takes a place only when asked.
+   */
   sync(near: boolean, asked = false): void {
     this.near = near;
     if (this.slot) {
       this.slot.seen(near);
       return;
     }
-    if (!near && !asked) return;
+    if (asked) this.failed = false;
+    if ((!near && !asked) || this.failed) return;
     const slot = claimWidgetSlot(this.evicted, asked);
     if (!slot) {
       this.set({ live: false, waiting: true, doc: null });
@@ -92,10 +99,11 @@ class FramePlace {
     if (this.slot) this.set({ ...this.state, doc });
   }
 
-  /** Nothing to show (the preview failed): the place is free for another frame. */
-  drop(): void {
+  /** The preview failed: the place is free for another frame, and the card takes none until asked. */
+  fail(): void {
     this.slot?.release();
     this.slot = null;
+    this.failed = true;
     this.set({ live: false, waiting: false, doc: null });
   }
 
@@ -221,13 +229,14 @@ function InlinePreviewFrame({ path }: { path: string }) {
           }
           setProblem(null);
         } catch (e) {
-          if (!alive.current) return;
+          // Another frame took the place while this one read: the card shows that, not this error.
+          if (!alive.current || !place.holds) return;
           if (isStale(e) && restarts < MAX_RESTARTS) {
             restarts += 1;
             again.current = 'build';
           } else {
             shown.current = null;
-            place.drop();
+            place.fail();
             // The inline preview builds again only on Try again.
             setProblem(isStale(e) ? CHANGING : problemText(e, ''));
           }
@@ -266,7 +275,7 @@ function InlinePreviewFrame({ path }: { path: string }) {
   }, []);
 
   const onFail = useCallback((reason: string) => {
-    place.drop();
+    place.fail();
     setFrameError(reason);
   }, [place]);
 

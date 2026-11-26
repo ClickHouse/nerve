@@ -289,6 +289,55 @@ describe('the frames of the chat', () => {
     expect(screen.getByRole('button', { name: 'Load preview' })).toBeInTheDocument();
   });
 
+  it('takes no place again after a failure when it comes back near the screen, only on Try again', async () => {
+    const observers: Array<(entries: Array<{ isIntersecting: boolean }>) => void> = [];
+    vi.stubGlobal('IntersectionObserver', class {
+      constructor(callback: (entries: Array<{ isIntersecting: boolean }>) => void) { observers.push(callback); }
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+      takeRecords() { return []; }
+    });
+    try {
+      getBundle().mockRejectedValueOnce(new ApiError(404, JSON.stringify({
+        detail: { code: 'not_found', message: 'The file does not exist.' },
+      })));
+      await show();
+      const near = (on: boolean) => act(() => observers.at(-1)!([{ isIntersecting: on }]));
+      near(true);
+      await settle();
+      expect(screen.getByRole('status')).toHaveTextContent('No preview: The file does not exist.');
+      expect(liveWidgets()).toBe(0);
+
+      near(false);
+      near(true);
+      await settle();
+      expect(getBundle()).toHaveBeenCalledTimes(1);
+      expect(liveWidgets()).toBe(0);
+
+      await userEvent.click(screen.getByRole('button', { name: 'Try again' }));
+      await settle();
+      expect(getBundle()).toHaveBeenCalledTimes(2);
+      expect(liveWidgets()).toBe(1);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('keeps Load preview when its read fails after another frame took the place', async () => {
+    let refuse: (e: unknown) => void = () => {};
+    getBundle().mockImplementationOnce(() => new Promise<PreviewBundle>((_resolve, reject) => { refuse = reject; }));
+    await show();
+    for (let i = 1; i < MAX_LIVE_WIDGETS; i++) claimWidgetSlot(() => {});
+    act(() => { claimWidgetSlot(() => {}, true); });
+    expect(screen.getByRole('button', { name: 'Load preview' })).toBeInTheDocument();
+
+    refuse(new ApiError(404, JSON.stringify({ detail: { code: 'not_found', message: 'gone' } })));
+    await settle();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Load preview' })).toBeInTheDocument();
+  });
+
   it('gives its place back when the card goes', async () => {
     const { unmount } = await show();
     expect(liveWidgets()).toBe(1);

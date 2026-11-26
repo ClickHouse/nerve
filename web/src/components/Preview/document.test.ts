@@ -344,6 +344,36 @@ describe('buildPreviewDocument', () => {
     expect((error as PreviewTooLarge).what).toBe('document');
   });
 
+  it('keeps an address of an element of the page, and the fragment of a file', async () => {
+    const { description, read, asked } = bundle({
+      'index.html': '<!doctype html><html><head><style>'
+        + `.a { fill: url(#grad); clip-path: url("#clip"); mask: url( '#m' ) }`
+        + '.b { background: url(icons.svg#mark) }'
+        + '.c { background: url("icons.svg#a)b") }'
+        + '</style></head><body>'
+        + '<svg><image href="icons.svg#mark"></image><use href="#shape"></use></svg>'
+        + '<img src="icons.svg#other"><div style="fill: url(#grad2)"></div>'
+        + '</body></html>',
+      'icons.svg': '<svg xmlns="http://www.w3.org/2000/svg"><g id="mark"/></svg>',
+    });
+    const doc = parse((await buildPreviewDocument(description, read, LIMIT)).html);
+    const css = doc.querySelector('style')!.textContent!;
+    // An element of the page: nothing to load, the address stays.
+    expect(css).toContain('fill: url(#grad)');
+    expect(css).toContain('clip-path: url("#clip")');
+    expect(css).toContain("mask: url( '#m' )");
+    expect(doc.querySelector('div')!.getAttribute('style')).toBe('fill: url(#grad2)');
+    expect(doc.querySelector('use')!.getAttribute('href')).toBe('#shape');
+    // A file of the bundle: its data address, and the element it names.
+    expect(css).toMatch(/\.b \{ background: url\("data:image\/svg\+xml;charset=utf-8;base64,[A-Za-z0-9+/=]+#mark"\) \}/);
+    expect(doc.querySelector('image')!.getAttribute('href')).toMatch(/^data:image\/svg\+xml;charset=utf-8;base64,[A-Za-z0-9+/=]+#mark$/);
+    expect(doc.querySelector('img')!.getAttribute('src')).toMatch(/;base64,[A-Za-z0-9+/=]+#other$/);
+    // A fragment with other characters is left out: the file loads, the fragment does not.
+    expect(css).toMatch(/\.c \{ background: url\("data:image\/svg\+xml;charset=utf-8;base64,[A-Za-z0-9+/=]+"\) \}/);
+    // No address of an element is asked for as a file.
+    expect(asked.sort()).toEqual(['icons.svg', 'index.html']);
+  });
+
   it('keeps a data address in srcset whole', async () => {
     const { description, read } = bundle({
       'index.html': '<html><body><img srcset="data:image/png;base64,AAAA 1x, a.png 2x, https://example.com/c.png 3x"></body></html>',

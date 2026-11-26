@@ -218,7 +218,8 @@ a file of the bundle; it does not poll. It takes one of the six frame places
 of the chat that widgets also use (see [Widgets](widgets.md)): when frames
 near the screen hold all six, the card shows **Load preview**. When the
 bundle cannot be shown (for example, a file outside the workspace, or a file
-that is gone), one line under the card says why, with **Try again**.
+that is gone), one line under the card says why, with **Try again**. That
+card holds no frame place, and it builds again only on **Try again**.
 
 **The header.** The path, "Updated … ago" (the newest change of a file of
 the bundle), **Reload the preview**, **Show the source** (`</>`, the text of
@@ -274,7 +275,10 @@ each resource element and attribute, each kind of `<link>`, CSS `url()` and
 `@import`, `<base>` and `<meta http-equiv=refresh>`. Each stylesheet,
 script, image, font, and each address in CSS (`url()`, `@import`, the
 strings of `image-set()`) that names a file of the bundle goes into the
-document as a `data:` address. Another address (another host, a path from
+document as a `data:` address, with the fragment of the address
+(`icons.svg#mark`) when it has only letters, digits, `-`, `_`, `.` and `:`.
+An address of an element of the page itself (`url(#clip)`, a gradient, clip
+path, mask or filter) stays as it is. Another address (another host, a path from
 the root of a host, a file that is not in the bundle) is removed where the
 builder knows the construct. In every case it is never asked for: for any
 other construct, the policy of the frame allows no request. `<base>`, `<meta http-equiv>`, and links that load
