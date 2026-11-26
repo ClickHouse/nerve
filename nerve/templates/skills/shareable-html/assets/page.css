@@ -1,0 +1,132 @@
+/* page.css (shareable-html skill): theme, layout and print styles.
+   Change the colours only in :root and in the dark block. One accent colour.
+   The background, text and accent colours match the export theme of the
+   diagrams-and-charts render script, so a rendered chart blends in. */
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --surface: #f5f6f8;
+  --text: #1c1f26;
+  --muted: #5b6472;
+  --border: #d8dce2;
+  --accent: #104ec6;
+  --good: #1a7a36;
+  --bad: #b42323;
+  --warn-bg: #fff3c4;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  /* type scale: one step is about 1.25 */
+  --fs-small: 0.8125rem;
+  --fs-body: 0.9375rem;
+  --fs-h2: 1.25rem;
+  --fs-kpi: 1.75rem;
+  --fs-h1: 1.875rem;
+  --gap: 1rem;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #22252b;
+    --surface: #2a2e35;
+    --text: #e8eaed;
+    --muted: #a3a9b3;
+    --border: #3a3f48;
+    --accent: #6d9bf3;
+    --good: #5cc27a;
+    --bad: #ff7a7a;
+    --warn-bg: #3b3206;
+  }
+}
+
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  margin: 0 auto;
+  max-width: 72rem;
+  padding: 2rem 1.5rem 3rem;
+  background: var(--bg);
+  color: var(--text);
+  font: var(--fs-body)/1.5 var(--font);
+}
+a { color: var(--accent); }
+h1, h2 { line-height: 1.2; margin: 0; }
+h1 { font-size: var(--fs-h1); font-weight: 650; letter-spacing: -0.01em; }
+h2 { font-size: var(--fs-h2); font-weight: 600; margin-bottom: 0.75rem; }
+img, svg { max-width: 100%; height: auto; }
+.pg-muted { color: var(--muted); font-size: var(--fs-small); }
+
+/* header */
+.pg-head { border-bottom: 1px solid var(--border); padding-bottom: 1rem; margin-bottom: 1.5rem; }
+.pg-head-row { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; }
+.pg-logo { height: 2rem; width: auto; }
+.pg-label {
+  border: 1px solid var(--muted); border-radius: 3px; color: var(--muted);
+  font-size: var(--fs-small); font-weight: 600; letter-spacing: 0.04em;
+  padding: 0.05rem 0.4rem; text-transform: uppercase;
+}
+.pg-sub { margin: 0.5rem 0 0.25rem; max-width: 46rem; }
+.pg-meta { margin: 0; color: var(--muted); font-size: var(--fs-small); }
+.pg-warn { background: var(--warn-bg); border-left: 4px solid var(--bad); padding: 0.5rem 0.75rem; font-weight: 600; }
+
+/* key figures: left-aligned, a rule on top, no shadow */
+.pg-kpis {
+  display: grid; gap: var(--gap); margin-bottom: 2rem;
+  grid-template-columns: repeat(auto-fill, minmax(13rem, 1fr));
+}
+.pg-kpi { border-top: 3px solid var(--accent); padding-top: 0.5rem; }
+.pg-kpi-label { color: var(--muted); font-size: var(--fs-small); }
+.pg-kpi-value { font-size: var(--fs-kpi); font-weight: 650; font-variant-numeric: tabular-nums; }
+.pg-kpi-unit { font-size: var(--fs-body); font-weight: 400; color: var(--muted); margin-left: 0.25rem; }
+.pg-kpi-note { font-size: var(--fs-small); color: var(--muted); }
+.pg-good { color: var(--good); }
+.pg-bad { color: var(--bad); }
+
+/* sections, charts */
+.pg-section { margin-bottom: 2.25rem; }
+/* A chart shows at its drawn size and is never stretched. On a narrow screen
+   a wide chart shrinks to 36rem at most, then scrolls sideways, so its text
+   stays readable. */
+.pg-chart { margin: 0; overflow-x: auto; }
+.pg-chart img, .pg-chart svg { display: block; max-width: max(100%, 36rem); height: auto; }
+.pg-chart figcaption { margin-top: 0.4rem; color: var(--muted); font-size: var(--fs-small); max-width: 52rem; }
+
+/* table */
+.pg-table-head { display: flex; align-items: baseline; gap: 1rem; flex-wrap: wrap; margin-bottom: 0.5rem; }
+.pg-table-head h2 { margin: 0; }
+.pg-filter input {
+  font: inherit; color: inherit; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 4px; padding: 0.3rem 0.5rem; width: 14rem; max-width: 100%;
+}
+.pg-table-wrap { overflow-x: auto; border-top: 1px solid var(--border); }
+table { border-collapse: collapse; width: 100%; font-variant-numeric: tabular-nums; }
+th, td { padding: 0.4rem 0.75rem 0.4rem 0; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+th { font-size: var(--fs-small); color: var(--muted); font-weight: 600; }
+th button { all: unset; cursor: pointer; }
+th button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+th[aria-sort="ascending"] button::after { content: " \2191"; }
+th[aria-sort="descending"] button::after { content: " \2193"; }
+td.num, th.num { text-align: right; }
+tbody tr:hover { background: var(--surface); }
+
+.pg-foot { border-top: 1px solid var(--border); padding-top: 0.75rem; color: var(--muted); font-size: var(--fs-small); }
+
+@media (max-width: 40rem) {
+  body { padding: 1.25rem 1rem 2rem; }
+  h1 { font-size: 1.5rem; }
+  .pg-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .pg-kpi-value { font-size: 1.4rem; }
+}
+
+@media print {
+  :root {
+    --bg: #ffffff; --surface: #ffffff; --text: #000000; --muted: #444444;
+    --border: #bbbbbb; --accent: #000000; --good: #1a7a36; --bad: #b42323; --warn-bg: #ffffff;
+  }
+  body { max-width: none; padding: 0; font-size: 10pt; }
+  .pg-filter, .pg-noprint { display: none !important; }
+  .pg-kpi, .pg-chart, tr { break-inside: avoid; }
+  h2 { break-after: avoid; }
+  .pg-table-wrap { overflow: visible; }
+  th, td { white-space: normal; }
+  a[href^="http"]::after { content: " (" attr(href) ")"; color: var(--muted); font-size: 0.85em; }
+}
+@page { margin: 14mm 12mm; }

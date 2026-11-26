@@ -241,6 +241,10 @@ A revision goes back to the session that proposed the plan — for the planner's
 ## Skills
 
 Workers create their own skills during onboarding and refine them over time.
+A new workspace already has the [bundled skills](architecture.md#bundled-skills)
+for general methods (slide decks, research reports, diagrams and charts,
+shareable HTML pages, browser testing). Onboarding names the ones the work uses,
+leaves them on, and writes a skill only for a procedure of this work.
 
 **How skills work:**
 - Skills are plain Markdown files in `workspace/skills/<name>/SKILL.md`

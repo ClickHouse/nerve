@@ -161,6 +161,31 @@ Filesystem-based skill system (Claude SDK compatible):
 - Automated revision: `skill-reviser` cron reviews existing skills for accuracy, completeness, and quality
 - An approved skill plan (`skill-create` / `skill-update`) is implemented by an `impl-<id>` session, like any plan, which creates or updates the skill with `skill_create`/`skill_update`
 
+#### Bundled skills
+
+Nerve ships skills in `nerve/templates/skills/`. Setup (`nerve init` and the
+setup's Mode step) copies each one into `workspace/skills/` with
+`install_bundled_skills` (`nerve/workspace.py`). It copies a skill only when the
+workspace has no skill with the same id, and it never overwrites one. After the
+copy, a bundled skill is a workspace skill: the person and the agent can change,
+disable or delete it. A workspace set up by an earlier release does not get the
+skills that a later release adds.
+
+| Skill | What it covers |
+|---|---|
+| `nerve-dev` | Changes to the Nerve code: layout, tests, the build, pull requests |
+| `nerve-workspace` | Changes to the agent's own configuration: skills, cron jobs, settings |
+| `slide-deck` | A slide deck as one self-contained HTML file with speaker notes; PDF and PPTX export |
+| `research-report` | A sourced research report on any topic: notes, one self-contained HTML page, a summary image |
+| `diagrams-and-charts` | Diagrams and charts that the web chat draws (mermaid, Vega-Lite, SVG, widgets), and PNG or SVG files for other channels and documents |
+| `shareable-html` | One self-contained HTML page or dashboard, with its data inside, to send or keep |
+| `browser-testing` | A web app tested in a headless browser: screenshots, user flows, accessibility and layout checks |
+
+The skills that need a browser install Playwright and Chromium on first use,
+in a tools folder outside the workspace. The onboarding conversation names
+the installed skills that the work uses and writes new skills only for the
+procedures of that work.
+
 #### Platform skills
 
 The operator or the hosting platform can give the agent skills that the person

@@ -1,0 +1,151 @@
+<!doctype html>
+<!--
+Summary card of a research report: one 1440 x 900 image (a laptop screen) with
+the key points, for sharing in a chat, a slide or a document.
+
+Copy this file to <working folder>/build/summary.html, change only the DATA
+block, and render it with scripts/summary_shot.mjs of the research-report skill.
+Take every line from REPORT.md: the card adds no new claims.
+Text markup in DATA: **bold** and `code`. Everything else is plain text.
+The example DATA is an invented report on two invented products.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Summary card</title>
+<script>
+const DATA = {
+  kicker: "Research report · 2026-11-26",
+  title: "Acme Notes vs Globex Notes",
+  label: "Internal",   // "" when the report holds no internal facts
+
+  // From the build output line "tally {...}", same order as the Tally line of
+  // REPORT.md. null when the report has no comparison table: the bar is left out.
+  tally: { column: "Who leads", counts: [["Acme", 2], ["Globex", 2], ["Split", 1], ["Even", 2], ["Neither", 1]] },
+
+  // 1 to 3 boxes under the title: what each side is, or the question and the
+  // short answer. dot: 1 to 5 = the colour of that tally value (neutral values
+  // such as "Even" do not count), 0 = no dot.
+  top: [
+    { title: "Acme Notes", dot: 1, text: "A local-first note app for desktop and phone. Every note stays on the device. 8 USD a month per person." },
+    { title: "Globex Notes", dot: 2, text: "A cloud-first note app for web and desktop, made for teams: shared spaces and comments on all plans. 8 USD a month per person." },
+  ],
+
+  // 1 to 3 columns, 3 to 5 points each, about 12 words a point.
+  // An item is "text" or ["text", "reference"]; the reference is a small grey tag.
+  columns: [
+    { title: "Where Acme leads", dot: 1, items: [
+      "**Offline:** all notes on the device; Globex keeps the last 50",
+      "**Export:** Markdown and PDF; Globex has PDF only",
+      "**Phone app:** shipped; Globex has a tablet app only",
+    ] },
+    { title: "Where Globex leads", dot: 2, items: [
+      "**Shared spaces:** on all plans; Beta in Acme",
+      "**Comments:** shipped; Acme only announced them",
+      "**Tablet app:** shipped; Acme has none yet",
+    ] },
+    { title: "What to do", dot: 0, ordered: true, items: [
+      ["Pick Acme for people who work offline", "section 1"],
+      ["Pick Globex for teams that share notes", "section 1"],
+      ["Ask Globex about a private API", "section 7"],
+    ] },
+  ],
+
+  bottomLine: "**Two good note apps for different people.** Acme leads on offline work and export, Globex on team work. The price is the same.",
+  footer: "Full report: acme-vs-globex-2026-11-26.html · Sources read 2026-11-26 · The tally counts rows, not their weight",
+};
+</script>
+<style>
+:root{
+  --surface:#fcfcfb;--panel:#fff;--ink:#1d2330;--muted:#5b6474;--line:#e3e6eb;--soft:#f1f3f6;--code:#eef1f5;
+  --c1:#2a78d6;--c2:#eb6834;--c3:#1baf7a;--c4:#eda100;--c5:#e87ba4;--cn:#898781;--cn2:#c3c2b7;
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--surface)}
+body{color:var(--ink);font:16px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Liberation Sans","DejaVu Sans",sans-serif}
+.card{width:1440px;height:900px;padding:30px 40px 22px;display:grid;
+  grid-template-rows:auto auto minmax(0,1fr) auto auto;gap:16px;overflow:hidden}
+header{display:grid;grid-template-columns:minmax(0,1fr) 540px;gap:40px;align-items:end}
+header.no-tally{grid-template-columns:1fr}
+.kicker{font-size:14px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+h1{margin:4px 0 8px;font-size:36px;line-height:1.15}
+.chip{display:inline-block;font-size:13px;font-weight:700;color:#a12a2a;background:#fde8e8;border:1px solid #a12a2a;border-radius:999px;padding:2px 10px}
+.tally-label{font-size:14px;color:var(--muted);margin-bottom:6px}
+.tally-label b{color:var(--ink)}
+.bar{display:flex;gap:2px;height:28px}
+.seg{border-radius:4px;display:flex;align-items:center;padding:0 8px;font-size:15px;font-weight:700;color:#fff;min-width:0;white-space:nowrap}
+.seg.c4,.seg.cn2{color:#0b0b0b}
+.legend{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:8px;font-size:14px;color:var(--muted)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+i.dot{width:12px;height:12px;border-radius:3px;display:inline-block;flex:none}
+.c1{background:var(--c1)}.c2{background:var(--c2)}.c3{background:var(--c3)}.c4{background:var(--c4)}.c5{background:var(--c5)}.cn{background:var(--cn)}.cn2{background:var(--cn2)}
+.row{display:grid;gap:16px;min-height:0}
+.box{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 18px;min-height:0;overflow:hidden}
+.box h2{margin:0 0 8px;font-size:15px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);display:flex;align-items:center;gap:8px}
+.top p{margin:0;font-size:17.5px}
+ul,ol{margin:0;padding-left:20px}
+li{margin:0 0 10px;font-size:18px}
+.ref{display:inline-block;margin-left:6px;font-size:13px;font-weight:700;color:var(--muted);background:var(--soft);border:1px solid var(--line);border-radius:6px;padding:0 6px;white-space:nowrap}
+code{font:14px ui-monospace,Menlo,Consolas,"Liberation Mono",monospace;background:var(--code);border-radius:4px;padding:0 4px}
+.bottom{background:var(--soft);border:1px solid var(--line);border-radius:12px;padding:14px 18px;font-size:18.5px;line-height:1.45;overflow:hidden}
+footer{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden}
+</style>
+</head>
+<body>
+<div class="card" id="card" data-fit data-name="whole card">
+  <header id="head">
+    <div>
+      <div class="kicker" id="kicker"></div>
+      <h1 id="title"></h1>
+      <span class="chip" id="label"></span>
+    </div>
+    <div id="tally"></div>
+  </header>
+  <section class="row top" id="top"></section>
+  <section class="row" id="cols"></section>
+  <div class="bottom" id="bottom" data-fit data-name="bottom line"></div>
+  <footer id="footer" data-fit data-name="footer"></footer>
+</div>
+<script>
+const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+const md = s => esc(s).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/`(.+?)`/g, "<code>$1</code>");
+const $ = id => document.getElementById(id);
+const dot = n => n ? `<i class="dot c${n}"></i>` : "";
+const box = (title, n, inner) => `<div class="box" data-fit data-name="${esc(title)}"><h2>${dot(n)}${esc(title)}</h2>${inner}</div>`;
+const D = DATA;
+$("kicker").textContent = D.kicker;
+$("title").textContent = D.title;
+if (D.label) $("label").textContent = D.label; else $("label").remove();
+$("top").style.gridTemplateColumns = `repeat(${D.top.length}, 1fr)`;
+$("top").innerHTML = D.top.map(b => box(b.title, b.dot, `<p>${md(b.text)}</p>`)).join("");
+$("cols").style.gridTemplateColumns = `repeat(${D.columns.length}, 1fr)`;
+$("cols").innerHTML = D.columns.map(c => {
+  const tag = c.ordered ? "ol" : "ul";
+  const items = c.items.map(x => Array.isArray(x)
+    ? `<li>${md(x[0])}${x[1] ? `<span class="ref">${md(x[1])}</span>` : ""}</li>` : `<li>${md(x)}</li>`).join("");
+  return box(c.title, c.dot, `<${tag}>${items}</${tag}>`);
+}).join("");
+$("bottom").innerHTML = md(D.bottomLine);
+$("footer").innerHTML = md(D.footer);
+if (!D.tally) { $("head").classList.add("no-tally"); $("tally").remove(); }
+else {
+  // Sides take c1..c5 in order; the first neutral value is grey, later ones
+  // light grey: the same rule as build_report.py.
+  const neutral = new Set(["even", "neither", "tie", "same", "none", "equal"]);
+  let k = 0, grey = 0;
+  const parts = D.tally.counts.map(([name, n]) => [name, n,
+    neutral.has(name.toLowerCase()) ? (grey++ ? "cn2" : "cn") : "c" + Math.min(++k, 5)]).filter(p => p[1] > 0);
+  const total = parts.reduce((a, p) => a + p[1], 0);
+  $("tally").innerHTML =
+    `<div class="tally-label">${esc(D.tally.column)}: <b>${total} rows</b></div>` +
+    `<div class="bar" role="img" aria-label="${esc(parts.map(p => `${p[0]} ${p[1]}`).join(", "))}">` +
+    parts.map(([, n, c]) => `<div class="seg ${c}" style="flex:${n}"><span>${n}</span></div>`).join("") +
+    `</div><div class="legend">` + parts.map(([name, , c]) => `<span><i class="dot ${c}"></i>${esc(name)}</span>`).join("") + `</div>`;
+  for (const seg of document.querySelectorAll(".seg")) {
+    const label = seg.firstElementChild;   // print a count only where it fits
+    if (label.offsetWidth + 16 > seg.clientWidth) label.remove();
+  }
+}
+</script>
+</body>
+</html>

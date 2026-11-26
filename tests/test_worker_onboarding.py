@@ -111,6 +111,19 @@ class TestPrompt:
         ):
             assert needle in step_four, needle
 
+    def test_step_three_builds_on_the_installed_skills(self) -> None:
+        """The bundled skills already cover general methods: the worker reads
+        the list first, leaves them on and writes only work-specific skills."""
+        steps = worker_onboarding_prompt(DESCRIPTION, "guide text").split("### 3. Create skills", 1)[1]
+        step_three = " ".join(steps.split("### 4.", 1)[0].split())
+        for needle in (
+            "Read `skill_list` first",
+            "leave them on, and do not write a skill that repeats one",
+            "names it and adds only what this work needs",
+        ):
+            assert needle in step_three, needle
+        assert step_three.index("Read `skill_list` first") < step_three.index("`skill_create`")
+
     def test_step_six_walks_through_every_change_and_ends_with_next_steps(self) -> None:
         prompt = worker_onboarding_prompt(DESCRIPTION, "guide text")
         step_six = prompt.split("### 6. Walk through everything you did, then give next steps", 1)[1]

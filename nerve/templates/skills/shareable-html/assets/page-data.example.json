@@ -1,0 +1,24 @@
+{
+  "meta": {
+    "example": true,
+    "source": "Name of the system, file or query the numbers come from",
+    "source_url": "",
+    "as_of": "2026-01-31",
+    "built": "2026-01-31",
+    "note": "Delete \"example\" when the data is real."
+  },
+  "kpis": [
+    {"label": "Example count", "value": 100, "unit": "items", "period": "week 5", "change": 0.1, "change_label": "vs week 4", "better": "up"},
+    {"label": "Example rate", "value": 0.25, "type": "percent", "period": "week 5", "change": -2, "change_unit": "pts", "change_label": "vs week 4", "better": "down"}
+  ],
+  "columns": [
+    {"key": "week", "label": "Week starting", "type": "date"},
+    {"key": "count", "label": "Count", "type": "number", "unit": "items"},
+    {"key": "rate", "label": "Rate", "type": "percent"},
+    {"key": "owner", "label": "Owner", "type": "text"}
+  ],
+  "rows": [
+    {"week": "2026-01-19", "count": 80, "rate": 0.2, "owner": "alice"},
+    {"week": "2026-01-26", "count": 100, "rate": 0.25, "owner": "bob"}
+  ]
+}

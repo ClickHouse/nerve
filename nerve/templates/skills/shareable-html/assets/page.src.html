@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Page title</title>
+<link rel="stylesheet" href="page.css">
+</head>
+<body>
+<header class="pg-head">
+  <div class="pg-head-row">
+    <!-- optional logo: <img class="pg-logo" src="logo.png" alt="Acme"> -->
+    <h1>Page title: what and for which period</h1>
+    <!-- keep the label when the page holds internal facts; delete it otherwise -->
+    <span class="pg-label">Internal</span>
+  </div>
+  <p class="pg-sub">One sentence: what this page shows, for whom, and the main finding.</p>
+  <p class="pg-meta">Data as of <span data-meta="as_of"></span>. Source: <span data-meta="source"></span>.</p>
+</header>
+<noscript><p class="pg-warn">This page needs JavaScript to show its figures and table.</p></noscript>
+
+<main>
+  <section class="pg-kpis" id="kpis" aria-label="Key figures"></section>
+
+  <section class="pg-section">
+    <h2>Chart title with unit and period</h2>
+    <figure class="pg-chart">
+      <picture>
+        <source srcset="charts/dark/chart.svg" media="screen and (prefers-color-scheme: dark)">
+        <img src="charts/light/chart.svg" alt="Say what the chart shows and its main point">
+      </picture>
+      <figcaption>What the bars or lines mean, the unit, the period. Source: as above.</figcaption>
+    </figure>
+  </section>
+
+  <section class="pg-section">
+    <div class="pg-table-head">
+      <h2>Table title</h2>
+      <label class="pg-filter">Filter <input type="search" id="filter" autocomplete="off"></label>
+      <span class="pg-muted" id="rowcount"></span>
+    </div>
+    <div class="pg-table-wrap"><table id="table"><thead></thead><tbody></tbody></table></div>
+  </section>
+</main>
+
+<footer class="pg-foot">
+  Made on <span data-meta="built"></span> from <span data-meta="source"></span>. <span data-meta="note"></span>
+</footer>
+
+<script type="application/json" id="data" src="page-data.json"></script>
+<script src="page.js"></script>
+</body>
+</html>

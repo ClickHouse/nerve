@@ -132,11 +132,15 @@ rationale, measurements and history go to `memory/contexts/`, not here.
 
 ### 3. Create skills
 
-`skill_create` one skill per procedure the worker will repeat: the \
-build-and-test routine, querying the failure database or CI API, reproducing \
-a failure class, publishing a PR the way the project expects. Steps, exact \
-commands, gotchas and an example in each; a third-person description with \
-trigger phrases.
+Read `skill_list` first. The skills already installed cover general methods, \
+for example slide decks, research reports, diagrams and charts, shareable \
+HTML pages and browser tests: leave them on, and do not write a skill that \
+repeats one. `skill_create` one skill per procedure the worker will repeat: \
+the build-and-test routine, querying the failure database or CI API, \
+reproducing a failure class, publishing a PR the way the project expects. A \
+skill that uses an installed one names it and adds only what this work needs: \
+its sources, targets, schedule and delivery. Steps, exact commands, gotchas \
+and an example in each; a third-person description with trigger phrases.
 
 ### 4. Configure cron jobs
 
@@ -634,7 +638,11 @@ waits for a decision; `plan_propose` moves the task there and notifies the \
 person), `in_progress`, `done` and `deferred`. Add a status only for another \
 kind of wait, such as a PR in review. One tag for each kind of work, so that \
 each job selects its own tasks.
-- **Skills**: one for each procedure that runs repeatedly.
+- **Skills**: first the installed skills (`skill_list`) that the work will \
+use, by name; they stay on. Then one new skill for each procedure of this \
+work that runs repeatedly. Do not write a skill that repeats an installed \
+one: a new skill names the installed skill it builds on and adds only what \
+this work needs (sources, targets, schedule, delivery).
 - **What I will remember**: what you will `memorize`.
 - **What I need from you**: access to grant, accounts to create, a \
 connection the work needs that this instance lacks, decisions left open; each \

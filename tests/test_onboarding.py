@@ -608,6 +608,19 @@ class TestPrompt:
             assert part in plan, part
 
     @pytest.mark.parametrize("mode, description", VARIANTS)
+    def test_the_skills_of_the_plan_build_on_the_installed_ones(self, mode, description):
+        """The plan names the installed skills the work uses and leaves them on;
+        a new skill is only for a procedure of this work."""
+        plan = _flat(_between(onboarding_prompt(mode, description, GUIDE), "### 3. Propose the setup as a plan", "### 4."))
+        skills = _between(plan, "- **Skills**:", "- **What I will remember**")
+        for part in (
+            "first the installed skills (`skill_list`) that the work will use, by name; they stay on",
+            "one new skill for each procedure of this work that runs repeatedly",
+            "Do not write a skill that repeats an installed one",
+        ):
+            assert part in skills, part
+
+    @pytest.mark.parametrize("mode, description", VARIANTS)
     def test_a_timeout_is_no_answer_and_plan_mode_waits_with_exit_plan_mode(self, mode, description):
         rules = _flat(_between(onboarding_prompt(mode, description, GUIDE), "## Rules", "## Nerve features"))
         for part in (
