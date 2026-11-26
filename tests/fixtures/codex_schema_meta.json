@@ -1,8 +1,8 @@
 {
-  "codex_cli_version": "0.171.0",
+  "codex_cli_version": "0.172.0",
   "generated_with": "codex app-server generate-json-schema",
-  "verified_date": "2026-11-20",
-  "canonical_v2_schema_sha256": "e9d095b3f320b5a0b9ef6f89eee3bc1aafde377c94adfcf4abede31340e842bd",
+  "verified_date": "2026-11-26",
+  "canonical_v2_schema_sha256": "604ceee5f910a6d83ce9b334c61f70ab8e3bbaddf7cf24fdf17ed19c33c9d7e1",
   "required_methods": [
     "initialize",
     "account/read",
@@ -14,5 +14,5 @@
     "turn/start",
     "turn/interrupt"
   ],
-  "notes": "Canonical JSON hash is stable across generator output ordering. Regenerate with scripts/check_codex_schema.py when changing the tested CLI range. 0.164.0 -> 0.171.0: 46 definitions added, 40 changed, none removed. New client methods account/securitySetup/read, modelProvider/config/write, modelProvider/default/set and modelProvider/list; new notifications thread/search/partial and thread/section/changed; server-initiated requests unchanged (with --experimental, currentTime/read is gone; nerve does not handle it). Every method and notification nerve uses is still present. TurnStartParams, ThreadStartParams, ThreadResumeParams and the model/list entries are unchanged; the changes in other shapes nerve uses are additive or optional: ThreadForkParams.attachToSource, ModelListParams.modelProvider, Account.workspaceName and a gcp account type, new CodexErrorInfo values (cyberPolicy unchanged), InitializeCapabilities.requiredHumanApproval, ItemCompletedNotification.contentTokenCount, ThreadUsage.nativeUsageUsdMicros. Audio user input takes url or fileId; nerve sends none."
+  "notes": "Canonical JSON hash is stable across generator output ordering. Regenerate with scripts/check_codex_schema.py when changing the tested CLI range. 0.171.0 -> 0.172.0: 2 definitions added (DaybreakAvailability, ThreadRealtimeSessionInputReason), 6 changed (10 with --experimental), none removed. No client method, notification or server request is added or removed. The changes are additive or optional: ModelAccessPrograms.daybreakAvailability (cyber is still required; nerve reads only cyber), new CodexErrorInfo values apiKeySpendLimitExceeded, projectSpendLimitExceeded and organizationSpendLimitExceeded (cyberPolicy unchanged), LoginAccountParams and BedrockSetupParams providerId (nerve logs in with apiKey), AppToolConfig.approvals_reviewer, realtime items (nerve opts out of realtime notifications); with --experimental also Thread.daybreakProgramPropagationEnrolled, ThreadStartParams.daybreakProgramPropagationEnrolled (nerve does not send it, so the server uses its configured rule) and ThreadSampleParams.model. TurnStartParams, ThreadResumeParams, ThreadForkParams and the model/list entries are unchanged."
 }

@@ -70,6 +70,55 @@ from nerve.inference_principal import (
 
 logger = logging.getLogger(__name__)
 
+# The Codex CLI version of tests/fixtures/codex_schema_meta.json
+# (``codex_cli_version``; a test keeps the two equal). Nerve runs any CLI in
+# [codex.min_version, codex.max_version), but the model catalog depends on
+# the CLI version: the catalog of an older CLI can be without the models of
+# codex.models, and then the model menu shows only codex.model.
+TESTED_CLI_VERSION = "0.172.0"
+
+
+def _parse_version(value: str) -> tuple[int, ...] | None:
+    match = re.search(r"(\d+(?:\.\d+){1,3})", value)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def cli_version_problem(
+    version_output: str, min_version: str, max_version: str,
+) -> tuple[bool, str] | None:
+    """What is wrong with a Codex CLI, from its ``--version`` output.
+
+    ``None`` when nothing is wrong, else ``(fatal, message)``. Fatal: Nerve
+    does not run the CLI, because a version does not parse or the CLI is
+    outside ``[min_version, max_version)``. Not fatal: the CLI is older than
+    ``TESTED_CLI_VERSION``, and ``max_version`` admits that version.
+    """
+    parsed = []
+    for value in (version_output, min_version, max_version, TESTED_CLI_VERSION):
+        version = _parse_version(value)
+        if version is None:
+            return True, f"Could not parse Codex CLI version from {value!r}"
+        parsed.append(version)
+    current, minimum, maximum, tested = parsed
+    if not minimum <= current < maximum:
+        return True, (
+            f"Unsupported {version_output}; Nerve tested Codex versions "
+            f">={min_version}, <{max_version}"
+        )
+    if current < tested < maximum:
+        found = ".".join(map(str, current))
+        return False, (
+            f"Codex CLI {found} is older than {TESTED_CLI_VERSION}, the version "
+            "that Nerve is tested with. The model menu shows only the models "
+            "of codex.models that the catalog of this CLI serves, so some "
+            "models can be missing. To fix: install @openai/codex "
+            f"{TESTED_CLI_VERSION} or a newer version below {max_version}."
+        )
+    return None
+
+
 # Backend notes appended to the developer instructions so the model
 # knows how this runtime differs from the docs it may have absorbed.
 _BACKEND_NOTES = """
@@ -251,6 +300,8 @@ class CodexBackend:
         # The version that the Codex CLI reported last (a client build and a
         # preflight both read it). ``None``: none was read yet.
         self._cli_version: tuple[int, ...] | None = None
+        # The not-fatal ``cli_version_problem`` of that version, if any.
+        self._cli_warning: str | None = None
 
     def catalog(self, entries: list[dict]) -> dict[str, Any]:
         """Digest a ``model/list`` (``includeHidden``) result.
@@ -412,13 +463,6 @@ class CodexBackend:
             await client.disconnect()
             raise
 
-    @staticmethod
-    def _version_tuple(value: str) -> tuple[int, ...]:
-        match = re.search(r"(\d+(?:\.\d+){1,3})", value)
-        if not match:
-            raise BackendError(f"Could not parse Codex CLI version from {value!r}")
-        return tuple(int(part) for part in match.group(1).split("."))
-
     async def _check_cli_version(self) -> str:
         def _read() -> str:
             try:
@@ -436,15 +480,18 @@ class CodexBackend:
             return (completed.stdout or completed.stderr).strip()
 
         output = await asyncio.to_thread(_read)
-        current = self._version_tuple(output)
-        self._cli_version = current
-        minimum = self._version_tuple(self.codex.min_version)
-        maximum = self._version_tuple(self.codex.max_version)
-        if current < minimum or current >= maximum:
-            raise BackendError(
-                f"Unsupported {output}; Nerve tested Codex versions "
-                f">={self.codex.min_version}, <{self.codex.max_version}"
-            )
+        current = _parse_version(output)
+        if current is not None:
+            self._cli_version = current
+        problem = cli_version_problem(
+            output, self.codex.min_version, self.codex.max_version,
+        )
+        if problem is not None and problem[0]:
+            raise BackendError(problem[1])
+        warning = problem[1] if problem is not None else None
+        if warning is not None and warning != self._cli_warning:
+            logger.warning("%s", warning)
+        self._cli_warning = warning
         return output
 
     async def preflight(self, *, force: bool = False) -> dict[str, Any]:
@@ -530,6 +577,7 @@ class CodexBackend:
                 result = {
                     "available": True,
                     "version": version,
+                    "version_warning": self._cli_warning,
                     "auth": effective_auth,
                     "configured_auth": self.codex.auth,
                     "auth_mismatch": (

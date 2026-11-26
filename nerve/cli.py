@@ -2559,6 +2559,25 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         else:
             warnings.append(f"[WARN] {tool_name} CLI not found (needed for sync)")
 
+    # Codex CLI. Codex is optional: without the CLI there is no line.
+    codex_bin = shutil.which(config.codex.bin_path)
+    if codex_bin:
+        from nerve.agent.backends.codex.backend import cli_version_problem
+        try:
+            completed = subprocess.run(
+                [codex_bin, "--version"], capture_output=True, text=True, timeout=5,
+            )
+            version = (completed.stdout or completed.stderr).strip()
+            problem = cli_version_problem(
+                version, config.codex.min_version, config.codex.max_version,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            problem = (True, f"Codex CLI at {codex_bin} did not report a version: {e}")
+        if problem is None:
+            lines.append(f"[OK] Codex CLI: {version}")
+        else:
+            warnings.append(f"[WARN] {problem[1]}")
+
     # Summary
     lines.append("")
     lines.extend(warnings)
@@ -3038,6 +3057,8 @@ def codex_doctor(ctx: click.Context, json_output: bool) -> None:
             click.echo(f"[--] Endpoint: {status['base_url']} (no Codex login)")
         if status.get("available"):
             click.echo(f"[OK] {status.get('version')} ({status.get('auth')})")
+            if status.get("version_warning"):
+                click.echo(f"[WARN] {status['version_warning']}")
             offered = status.get("models") or []
             click.echo(f"[OK] Model menu (codex.models): {', '.join(offered)}")
             hidden = set(status.get("hidden_models") or [])
