@@ -349,6 +349,11 @@ async function replaceAsync(
   return (await Promise.all(parts)).join('');
 }
 
+/** The `data:` address of the bundle file `path` for one more use, with the fragment of `address` (`fragmentOf`). */
+async function fileUrl(path: string, address: string, files: Files): Promise<string> {
+  return `${await files.dataUrlOf(path)}${files.use(fragmentOf(address))}`;
+}
+
 /**
  * CSS with each address of the bundle as a `data:` address, an address of
  * an element of the page (`url(#clip)`) as it is, and every other address
@@ -374,7 +379,7 @@ async function rewriteCss(
     const path = resolveAddress(address, folder, files.paths);
     if (path === 'data') return match[0];
     if (path === null) return `url("${files.use(NO_FILE)}")`;
-    return `url("${await files.dataUrlOf(path)}${files.use(fragmentOf(address))}")`;
+    return `url("${await fileUrl(path, address, files)}")`;
   });
   // The string form of an image set: `image-set("a.png" 1x, "b.png" 2x)`.
   return replaceAsync(urls, CSS_IMAGE_SET, async match => {
@@ -384,7 +389,7 @@ async function rewriteCss(
       const path = resolveAddress(address, folder, files.paths);
       if (path === 'data') return string[0];
       if (path === null) return `"${files.use(NO_FILE)}"`;
-      return `"${await files.dataUrlOf(path)}${files.use(fragmentOf(address))}"`;
+      return `"${await fileUrl(path, address, files)}"`;
     });
     return `${match[1]}${inner})`;
   });
@@ -422,7 +427,7 @@ async function inlineAttribute(element: Element, name: string, folder: string, f
   const path = resolveAddress(address, folder, files.paths);
   if (path === 'data') return;
   if (path === null) element.removeAttribute(name);
-  else element.setAttribute(name, `${await files.dataUrlOf(path)}${files.use(fragmentOf(address))}`);
+  else element.setAttribute(name, await fileUrl(path, address, files));
 }
 
 /**
@@ -466,7 +471,7 @@ async function inlineSrcset(element: Element, folder: string, files: Files): Pro
     const descriptor = described ? [described] : [];
     const path = resolveAddress(address, folder, files.paths);
     if (path === null) continue;
-    const url = path === 'data' ? address : await files.dataUrlOf(path);
+    const url = path === 'data' ? address : await fileUrl(path, address, files);
     kept.push([url, ...descriptor].join(' '));
   }
   if (kept.length > 0) element.setAttribute('srcset', kept.join(', '));
@@ -489,11 +494,12 @@ async function inlineTree(root: ParentNode, folder: string, files: Files): Promi
       link.remove();
       continue;
     }
-    const path = resolveAddress(link.getAttribute('href') ?? '', folder, files.paths);
+    const href = link.getAttribute('href') ?? '';
+    const path = resolveAddress(href, folder, files.paths);
     if (path === null) {
       link.remove();
     } else if (path !== 'data') {
-      const url = rel.includes('stylesheet') ? await stylesheetUrl(path, files) : await files.dataUrlOf(path);
+      const url = rel.includes('stylesheet') ? await stylesheetUrl(path, files) : await fileUrl(path, href, files);
       if (url === null) link.remove();
       else link.setAttribute('href', url);
     }

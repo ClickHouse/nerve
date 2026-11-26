@@ -216,7 +216,8 @@ the Preview tab, which has the slide controls and Present. The frame is made
 when the card comes near the screen, and made again when a file event names
 a file of the bundle; it does not poll. It takes one of the six frame places
 of the chat that widgets also use (see [Widgets](widgets.md)): when frames
-near the screen hold all six, the card shows **Load preview**. When the
+near the screen hold all six, the card shows **Load preview**. A card that
+loses its frame place stops the reads of its build. When the
 bundle cannot be shown (for example, a file outside the workspace, or a file
 that is gone), one line under the card says why, with **Try again**. That
 card holds no frame place, and it builds again only on **Try again**.

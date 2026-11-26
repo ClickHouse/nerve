@@ -55,6 +55,10 @@ interface FrameState {
  */
 class FramePlace {
   private slot: WidgetSlot | null = null;
+  /** Stops the reads of the builds of a place that the card lost. */
+  private reads: AbortController | null = null;
+  /** Counts the places that the card took: a build belongs to the place it started with. */
+  private taken = 0;
   private near = false;
   /** The last build failed: no place until the person asks again (Try again). */
   private failed = false;
@@ -68,8 +72,19 @@ class FramePlace {
 
   readonly get = (): FrameState => this.state;
 
-  get holds(): boolean {
-    return this.slot !== null;
+  /** The place the card holds now (0 when none), for `owns`. */
+  get generation(): number {
+    return this.slot ? this.taken : 0;
+  }
+
+  /** Stops when the card loses the place of `generation`. */
+  get signal(): AbortSignal | undefined {
+    return this.reads?.signal;
+  }
+
+  /** The card still holds the place of `generation`: a build of an earlier place changes nothing. */
+  owns(generation: number): boolean {
+    return this.slot !== null && this.taken === generation;
   }
 
   /**
@@ -91,6 +106,8 @@ class FramePlace {
       return;
     }
     this.slot = slot;
+    this.taken += 1;
+    this.reads = new AbortController();
     this.set({ live: true, waiting: false, doc: null });
   }
 
@@ -103,6 +120,7 @@ class FramePlace {
   fail(): void {
     this.slot?.release();
     this.slot = null;
+    this.stopReads();
     this.failed = true;
     this.set({ live: false, waiting: false, doc: null });
   }
@@ -111,14 +129,21 @@ class FramePlace {
   release(): void {
     this.slot?.release();
     this.slot = null;
+    this.stopReads();
     this.state = { live: false, waiting: false, doc: null };
   }
 
   /** Another frame took the place. Near the screen, the card offers to load the preview again. */
   private readonly evicted = (): void => {
     this.slot = null;
+    this.stopReads();
     this.set({ live: false, waiting: this.near, doc: null });
   };
+
+  private stopReads(): void {
+    this.reads?.abort();
+    this.reads = null;
+  }
 
   private set(next: FrameState): void {
     this.state = next;
@@ -188,7 +213,8 @@ function InlinePreviewFrame({ path }: { path: string }) {
   const [deck, setDeck] = useState(false);
 
   const alive = useRef(true);
-  const running = useRef(false);
+  /** The place whose build runs now. */
+  const running = useRef<number | null>(null);
   const again = useRef<'no' | 'read' | 'build'>('no');
   /** The fingerprint of the document in the frame. */
   const shown = useRef<string | null>(null);
@@ -204,27 +230,34 @@ function InlinePreviewFrame({ path }: { path: string }) {
     };
   }, [place]);
 
-  /** Read the description; build the document when the fingerprint changed (or `build`). */
+  /**
+   * Read the description; build the document when the fingerprint changed
+   * (or `build`). A build belongs to the place it started with: when the
+   * card loses that place, its reads stop and its result changes nothing.
+   */
   const refresh = useCallback(async (build: boolean) => {
-    if (running.current) {
+    const generation = place.generation;
+    const signal = place.signal;
+    if (!place.owns(generation)) return;
+    if (running.current === generation) {
       if (build || again.current === 'no') again.current = build ? 'build' : 'read';
       return;
     }
-    running.current = true;
+    running.current = generation;
     try {
       let force = build;
       let restarts = 0;
       for (;;) {
         again.current = 'no';
         try {
-          const next = await api.getPreviewBundle(path);
-          if (!alive.current || !place.holds) return;
+          const next = await api.getPreviewBundle(path, signal);
+          if (!alive.current || !place.owns(generation)) return;
           bundle.current = next;
           if (force || next.fingerprint !== shown.current) {
             const built = await buildPreviewDocument(
-              next, file => api.getPreviewFile(path, file, next.fingerprint), maxBytes,
+              next, file => api.getPreviewFile(path, file, next.fingerprint, signal), maxBytes,
             );
-            if (!alive.current || !place.holds) return;
+            if (!alive.current || !place.owns(generation)) return;
             shown.current = next.fingerprint;
             builds.current += 1;
             // Not a deck until the new page says so (onHandOver resets it again at the hand-over).
@@ -234,7 +267,7 @@ function InlinePreviewFrame({ path }: { path: string }) {
           setProblem(null);
         } catch (e) {
           // Another frame took the place while this one read: the card shows that, not this error.
-          if (!alive.current || !place.holds) return;
+          if (!alive.current || !place.owns(generation)) return;
           if (isStale(e) && restarts < MAX_RESTARTS) {
             restarts += 1;
             again.current = 'build';
@@ -249,7 +282,7 @@ function InlinePreviewFrame({ path }: { path: string }) {
         force = again.current === 'build';
       }
     } finally {
-      running.current = false;
+      if (running.current === generation) running.current = null;
     }
   }, [path, maxBytes, place]);
 
@@ -273,7 +306,7 @@ function InlinePreviewFrame({ path }: { path: string }) {
     if (message.type !== 'ready') return;
     setDeck(message.kind === 'deck');
     // A deck shows its first slide: it takes no input, so the person cannot move it back.
-    if (message.kind === 'deck' && message.slide !== undefined && message.slide !== 1) {
+    if (message.kind === 'deck' && message.slide !== 1) {
       hostRef.current?.send({ type: 'slide', to: 'first' });
     }
   }, []);

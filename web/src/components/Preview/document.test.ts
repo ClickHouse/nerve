@@ -374,6 +374,21 @@ describe('buildPreviewDocument', () => {
     expect(asked.sort()).toEqual(['icons.svg', 'index.html']);
   });
 
+  it('keeps the fragment of a file in srcset and in an icon link', async () => {
+    const { description, read } = bundle({
+      'index.html': '<!doctype html><html><head><link rel="icon" href="icons.svg#fav"></head>'
+        + '<body><img srcset="icons.svg#small 1x, icons.svg#large 2x"></body></html>',
+      'icons.svg': '<svg xmlns="http://www.w3.org/2000/svg"><g id="fav"/></svg>',
+    });
+    const doc = parse((await buildPreviewDocument(description, read, LIMIT)).html);
+    expect(doc.querySelector('link[rel="icon"]')!.getAttribute('href')).toMatch(/^data:image\/svg\+xml;charset=utf-8;base64,[A-Za-z0-9+/=]+#fav$/);
+    const candidates = srcsetCandidates(doc.querySelector('img')!.getAttribute('srcset')!);
+    expect(candidates.map(c => [c.address.replace(/base64,[A-Za-z0-9+/=]+/, 'base64,X'), c.descriptor])).toEqual([
+      ['data:image/svg+xml;charset=utf-8;base64,X#small', '1x'],
+      ['data:image/svg+xml;charset=utf-8;base64,X#large', '2x'],
+    ]);
+  });
+
   it('keeps a data address in srcset whole', async () => {
     const { description, read } = bundle({
       'index.html': '<html><body><img srcset="data:image/png;base64,AAAA 1x, a.png 2x, https://example.com/c.png 3x"></body></html>',

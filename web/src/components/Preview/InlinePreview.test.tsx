@@ -133,8 +133,8 @@ describe('the inline preview', () => {
   it('builds the document of the bundle and gives it to the sandbox frame', async () => {
     await show();
     expect(screen.getByRole('figure', { name: 'Preview of index.html' })).toBeInTheDocument();
-    expect(getBundle()).toHaveBeenCalledWith(PATH);
-    expect(getFile()).toHaveBeenCalledWith(PATH, 'index.html', 'f1');
+    expect(getBundle()).toHaveBeenCalledWith(PATH, expect.any(AbortSignal));
+    expect(getFile()).toHaveBeenCalledWith(PATH, 'index.html', 'f1', expect.any(AbortSignal));
     expect(hosts).toHaveLength(1);
     expect(lastHost().shown).toHaveLength(1);
     expect(lastHost().shown[0]).toContain('Slide one');
@@ -160,6 +160,9 @@ describe('the inline preview', () => {
     expect(lastHost().sent).toEqual([]);
     act(() => lastHost().options.onContent({ type: 'ready', kind: 'deck', canPrint: true, slides: 6, slide: 3 }));
     expect(lastHost().sent).toEqual([{ type: 'slide', to: 'first' }]);
+    // A deck that does not say its slide numbers is sent to its first slide too.
+    act(() => lastHost().options.onContent({ type: 'ready', kind: 'deck', canPrint: false }));
+    expect(lastHost().sent).toEqual([{ type: 'slide', to: 'first' }, { type: 'slide', to: 'first' }]);
   });
 
   it('is no deck any more when the frame gets a new document, until the new page says so', async () => {
@@ -366,6 +369,33 @@ describe('the frames of the chat', () => {
     await settle();
     expect(screen.queryByRole('status')).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Load preview' })).toBeInTheDocument();
+  });
+
+  it('stops the build of a place it lost, and that build changes nothing of the next place', async () => {
+    let refuse: (e: unknown) => void = () => {};
+    let firstSignal: AbortSignal | undefined;
+    getBundle().mockImplementationOnce((_path: string, signal?: AbortSignal) => {
+      firstSignal = signal;
+      return new Promise<PreviewBundle>((_resolve, reject) => { refuse = reject; });
+    });
+    await show();
+    // Another frame takes the place while the first build reads.
+    for (let i = 1; i < MAX_LIVE_WIDGETS; i++) claimWidgetSlot(() => {});
+    act(() => { claimWidgetSlot(() => {}, true); });
+    expect(firstSignal?.aborted).toBe(true);
+    // The person loads it again: a new place, a new build.
+    await userEvent.click(screen.getByRole('button', { name: 'Load preview' }));
+    await settle();
+    expect(getBundle()).toHaveBeenCalledTimes(2);
+    expect(lastHost().shown[0]).toContain('Slide one');
+    const held = liveWidgets();
+    // The first build ends now, with an error: nothing changes.
+    refuse(new DOMException('The operation was aborted.', 'AbortError'));
+    await settle();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    expect(screen.getByRole('figure', { name: 'Preview of index.html' })).toBeInTheDocument();
+    expect(liveWidgets()).toBe(held);
+    expect(lastHost().disposed).toBe(false);
   });
 
   it('gives its place back when the card goes', async () => {
