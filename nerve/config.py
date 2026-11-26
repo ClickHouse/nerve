@@ -3812,7 +3812,9 @@ _DEFAULT_CODEX_PRICING: dict[str, dict[str, float]] = {
 # unset: the newest model of each tier, largest first. Update it when a tier
 # gets a new model. A model shows only when the account's catalog serves it,
 # hidden entries included. The catalog serves GPT-6.2 only to codex-cli
-# 0.166.0 or newer, so an older CLI shows the other tiers.
+# 0.166.0 or newer, and the catalog of codex-cli 0.155.1 has none of these
+# models, so its menu shows only ``codex.model``. See ``TESTED_CLI_VERSION``
+# in nerve/agent/backends/codex/backend.py.
 _DEFAULT_CODEX_MODELS: tuple[str, ...] = (
     "gpt-6.2-astra",
     "gpt-6.2-sol",
@@ -3906,7 +3908,7 @@ class CodexConfig:
 
     bin_path: str = "codex"                 # PATH-resolved codex binary
     min_version: str = "0.153.1"            # inclusive tested protocol range
-    max_version: str = "0.172.0"            # exclusive
+    max_version: str = "0.173.0"            # exclusive
     home_dir: str = field(default_factory=lambda: str(paths.nerve_path("codex")))  # isolated CODEX_HOME (auth/config/sessions)
     model: str = "gpt-5.6-sol"
     cron_model: str = ""                    # empty → model
@@ -3984,7 +3986,7 @@ class CodexConfig:
         return cls(
             bin_path=str(d.get("bin_path", "codex")),
             min_version=str(d.get("min_version", "0.153.1")),
-            max_version=str(d.get("max_version", "0.172.0")),
+            max_version=str(d.get("max_version", "0.173.0")),
             home_dir=_setting_str(
                 d.get("home_dir"), str(paths.nerve_path("codex"))
             ),
