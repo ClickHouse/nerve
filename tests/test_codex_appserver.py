@@ -102,7 +102,8 @@ def _mode(monkeypatch, mode: str) -> None:
     ("0.153.1", True),
     ("0.164.0", True),
     ("0.171.0", True),
-    ("0.172.0", False),
+    ("0.172.0", True),
+    ("0.173.0", False),
 ])
 async def test_default_codex_version_range(tmp_path, monkeypatch, version, accepted):
     monkeypatch.setenv("FAKE_CODEX_VERSION", version)
@@ -110,7 +111,7 @@ async def test_default_codex_version_range(tmp_path, monkeypatch, version, accep
     if accepted:
         assert await backend._check_cli_version() == f"codex-cli {version}"
     else:
-        with pytest.raises(BackendError, match=r">=0\.153\.1, <0\.172\.0"):
+        with pytest.raises(BackendError, match=r">=0\.153\.1, <0\.173\.0"):
             await backend._check_cli_version()
 
 

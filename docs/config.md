@@ -1033,9 +1033,9 @@ agent:
   cron_backend: null       # null → backend; new cron/hook sessions only
 
 codex:                     # active when a codex backend is selected
-  bin_path: codex          # tested: >= 0.153.1 and < 0.172.0
+  bin_path: codex          # tested: >= 0.153.1 and < 0.173.0
   min_version: 0.153.1
-  max_version: 0.172.0
+  max_version: 0.173.0
   home_dir: ~/.nerve/codex # isolated CODEX_HOME (auth, config, sessions)
   model: gpt-5.6-sol
   cron_model: null         # null → model
@@ -1073,6 +1073,13 @@ does not name it. Every model in the list is also accepted as a session
 model. Unset: the newest model of each tier; the catalog serves GPT-6.2
 only to codex-cli 0.166.0 or newer. `[]`: only `codex.model`.
 `nerve codex doctor` lists the catalog models that the list does not name.
+
+The catalog depends on the CLI version, and the catalog of an older CLI can
+be without the models of `codex.models`. `nerve upgrade` does not update the
+Codex CLI. When the CLI is older than the version that Nerve is tested with
+(0.172.0, below `codex.max_version`), the gateway log, `nerve doctor` and
+`nerve codex doctor` show a warning, and the Codex preflight returns it as
+`version_warning`.
 
 `codex.ultracode.dashboard` exposes run journals in Nerve's authenticated UI.
 It does not start Ultracode's detached dashboard process. Keep
