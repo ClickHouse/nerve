@@ -31,6 +31,22 @@ and keep the source, its backups and a `HANDOFF.md` there.
 - Give each component class a long prefix (`dk-card`). Short global class
   names clash as the deck grows.
 
+## The look
+
+- When the person has a company template or brand, follow it. Else choose
+  one look and keep it on every slide: plain (a sans font, white, one accent
+  colour), editorial (a serif headline font, a paper-coloured background,
+  wide margins) or a Swiss grid (strict columns, black and white, one strong
+  accent).
+- One idea per slide, and show it: a diagram, a mockup, one big number with
+  its unit and date, or a short list. A slide of bullets only usually belongs
+  in the notes.
+- One alignment grid and one type scale for the whole deck. Text that reads
+  from the back of a room: on a 1920x1080 canvas, body text of 24 px or more.
+- Mockups of real tools (a chat, an issue, a dashboard) in HTML and CSS: they
+  look real and carry invented data, and they stay sharp at any size.
+- For a talk, plan about one minute per slide.
+
 ## Step 1: content draft first
 
 For a new deck, write `DRAFT.md` before any HTML: the run of show (block,

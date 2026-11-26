@@ -50,6 +50,22 @@ script. Never type a number into the page, and never ship sample data. Keep
 only the columns the page needs: anyone can read all of the data with "View
 source".
 
+## Layout
+
+A layout that works for most pages, top to bottom:
+
+1. Title, a one-sentence finding, the date of the data and its source.
+2. Three to five key figures, each with its unit, its period and the change
+   against the period before.
+3. The main chart, with a headline that states what it shows.
+4. The table of rows, which the reader can sort and filter (a few lines of
+   vanilla JS), with numbers right-aligned.
+5. A footer: how the page was made, from what, and when.
+
+A calculator or explorer shows its inputs first, then the result, then how
+the result is computed. Save what the reader changes in `localStorage` (keys
+with the page's prefix), so a reload keeps it.
+
 ## Look
 
 Avoid what makes a page look machine-made: a gradient hero, emoji as icons,

@@ -29,6 +29,47 @@ A parse error shows in the chat, in front of the person, as one line with the
 position and the reason. Check a diagram that is not trivial before you send
 it (render it once, as for a file).
 
+## Choose the form
+
+Ask what the reader must see, then pick:
+
+| The question | Form |
+|---|---|
+| What happens in which order, with decisions? | mermaid `flowchart TB` |
+| Who sends what to whom, in time order? | mermaid `sequenceDiagram` |
+| What are the parts of a system and how do they connect? | mermaid `flowchart` with `subgraph` groups |
+| Which states, and what moves between them? | mermaid `stateDiagram-v2` |
+| Which tables, keys and relations? | mermaid `erDiagram` |
+| What is planned, from when to when? | mermaid `gantt` |
+| Which is bigger, by category? | vega-lite `bar`, sorted; horizontal for long labels |
+| How did a value change over time? | vega-lite `line` on a temporal axis |
+| What share of the whole? | vega-lite stacked `bar`; a donut only for 2 to 5 parts |
+| How are values spread, or do two measures move together? | vega-lite histogram or `boxplot`; `point` for a scatter |
+| A layout you must place yourself (a floor plan, a rack) | `svg` |
+| Something to explore (filter, slider, tabs) | `widget`, where the Rendering line allows it |
+| Exact values, four or fewer, or items to look up | no picture: a table or one sentence |
+
+Prefer the common types (flowchart, sequence, state, ER, gantt): people know
+how to read them. For numbers, prefer vega-lite to mermaid `pie` and
+`xychart`.
+
+## Draw it well
+
+- One idea per picture. Split a diagram of more than about 15 nodes into an
+  overview and one diagram per part.
+- A title that states the finding ("Sign-ups doubled after the March
+  launch"), not only the topic ("Sign-ups by week").
+- Labels of a few words; the detail goes into the text around the picture.
+- The same shape for the same kind of thing; the main path first and
+  straight; few line crossings (change the order of declarations, or split).
+- Label lines and series directly where you can, instead of a legend.
+- Colour only when it means something, and never as the only cue: add a
+  label, a dash pattern or a shape. At most about 7 colours or series.
+- Sort bars by value unless the categories have their own order. Start a bar
+  axis at zero. Dates as a temporal field, never as free text. Give every
+  vega-lite field a `type`.
+- Say the finding in the text of the reply too.
+
 ## Mermaid in the chat
 
 - The chat renders mermaid 12 and themes every diagram type from the app's
@@ -86,8 +127,7 @@ one line inside the widget.
 
 ## Limits
 
-A block of more than 200,000 characters stays source. Split big diagrams:
-more than about 15 nodes is rarely readable.
+A block of more than 200,000 characters stays source.
 
 ## Picture files
 

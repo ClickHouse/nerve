@@ -181,11 +181,11 @@ skills that a later release adds.
 | `shareable-html` | One offline HTML page or dashboard with its data inside, and its delivery and scheduled rebuilds |
 | `browser-testing` | A web app tested in headless Chromium, and the browser setup that the other skills use |
 
-The general skills hold no scripts: only what an agent cannot know without
-them, such as how Nerve delivers files and renders diagrams, and the setup
-problems of a bare machine. The onboarding conversation names the installed
-skills that the work uses and writes new skills only for the procedures of
-that work.
+Each general skill is one `SKILL.md` with no scripts. It recommends how to do
+the work, and states how Nerve delivers files and renders diagrams and the
+setup problems of a bare machine. The onboarding conversation names the
+installed skills that the work uses and writes new skills only for the
+procedures of that work.
 
 #### Platform skills
 

@@ -18,6 +18,11 @@ Type checks and unit tests do not see the rendered page. Low contrast, a box
 with zero width, a page that scrolls sideways on a phone and a console error
 show only in a browser.
 
+A good order: serve the app, look at the pages the change touches, run the
+checks on those routes and then on the shared layout, test the changed flow,
+and give the evidence. For a frontend PR, do this before you open it, not
+after a reviewer finds the problem.
+
 ## Rules
 
 - Never install test tooling into the repo under test: it changes

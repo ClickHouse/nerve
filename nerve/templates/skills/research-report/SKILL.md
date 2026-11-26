@@ -70,17 +70,28 @@ person for a budget and use `workflow_run_start` with `budget_usd`. Without an
    disagree, the code is the fact and the difference is a finding.
 3. Write `REPORT.md`: the bottom line in 5 to 7 points, what each option is,
    the comparison table (a status in each cell: has it, partial, beta,
-   announced, does not have it), where each side leads, the open questions,
-   and the key sources with dates.
+   announced, does not have it), where each side leads, what to do, the open
+   questions, and the key sources with dates. How to write it:
+   - Lead with the answer and the recommendation; the detail follows.
+   - Keep facts and inference apart, and mark inference "(inferred)".
+   - Tie each recommendation to the person's own work where you can (an
+     issue, a plan, a decision they named).
+   - Put numbers side by side with their dates, and say what would change
+     the conclusion.
+   - Be as hard on the person's own side as on the others.
 4. Citation pass before delivery: reopen the source of every number, quote,
    date and price in the bottom line and the table. Fix what is wrong. Mark
    what you could not check as "(unverified, <why>)".
 
 ## Step 5: build and deliver
 
-- Build one self-contained HTML page from `REPORT.md` and the notes: a table
-  of contents, light and dark, print styles, the images inside (at most about
-  10, resized), nothing from the network. Put "Internal" in the header when it
+- Build one self-contained HTML page from `REPORT.md` and the notes: the
+  report first, then one part per note, a table of contents beside them,
+  light and dark, print styles, the images inside (at most about 10, resized;
+  look at each one before you keep it, and prefer real product screens to
+  marketing art), nothing from the network. Give each status the same colour
+  everywhere (for example green shipped, teal beta, pink announced, red
+  absent). Put "Internal" in the header when it
   holds internal facts. Look at it in light, dark and phone width (headless
   Chromium; setup in the `browser-testing` skill).
 - A summary image for sharing, when the person wants one: the key points on
