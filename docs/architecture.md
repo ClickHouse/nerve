@@ -175,16 +175,17 @@ skills that a later release adds.
 |---|---|
 | `nerve-dev` | Changes to the Nerve code: layout, tests, the build, pull requests |
 | `nerve-workspace` | Changes to the agent's own configuration: skills, cron jobs, settings |
-| `slide-deck` | A slide deck as one self-contained HTML file with speaker notes; PDF and PPTX export |
-| `research-report` | A sourced research report on any topic: notes, one self-contained HTML page, a summary image |
-| `diagrams-and-charts` | Diagrams and charts that the web chat draws (mermaid, Vega-Lite, SVG, widgets), and PNG or SVG files for other channels and documents |
-| `shareable-html` | One self-contained HTML page or dashboard, with its data inside, to send or keep |
-| `browser-testing` | A web app tested in a headless browser: screenshots, user flows, accessibility and layout checks |
+| `slide-deck` | A slide deck as one offline HTML file with speaker notes: draft first, edit rounds by slide title, PDF and PPTX |
+| `research-report` | Research with a dated source for each claim: parallel research agents, a citation check, one offline HTML page |
+| `diagrams-and-charts` | What the web chat does with mermaid, Vega-Lite, SVG and widget blocks, channels that show text only, and picture files |
+| `shareable-html` | One offline HTML page or dashboard with its data inside, and its delivery and scheduled rebuilds |
+| `browser-testing` | A web app tested in headless Chromium, and the browser setup that the other skills use |
 
-The skills that need a browser install Playwright and Chromium on first use,
-in a tools folder outside the workspace. The onboarding conversation names
-the installed skills that the work uses and writes new skills only for the
-procedures of that work.
+The general skills hold no scripts: only what an agent cannot know without
+them, such as how Nerve delivers files and renders diagrams, and the setup
+problems of a bare machine. The onboarding conversation names the installed
+skills that the work uses and writes new skills only for the procedures of
+that work.
 
 #### Platform skills
 
