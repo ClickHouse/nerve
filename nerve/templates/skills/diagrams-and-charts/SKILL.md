@@ -132,12 +132,20 @@ A block of more than 200,000 characters stays source.
 ## Picture files
 
 A file cannot follow the viewer's theme, so it carries its own colours and an
-opaque background (light by default). Render it in headless Chromium with the
-`mermaid` and `vega`, `vega-lite`, `vega-embed` npm packages from the shared
-tools folder (setup: the `browser-testing` skill): load their browser bundles
-into the page from disk, block every network request, and save SVG and a 2x
-PNG. Look at the PNG with the Read tool before you send it. Use PNG for chat
-apps, documents and PowerPoint; SVG for an HTML page.
+opaque background (light by default). Render it in headless Chromium from the
+shared tools folder. Its setup (the `browser-testing` skill) installs only
+Playwright, so add the diagram packages there once, at the major versions the
+chat uses, so that a file accepts the same syntax as the chat:
+
+```bash
+cd "${NERVE_BROWSER_DIR:-$HOME/.local/share/nerve-browser}"
+npm install --no-audit --no-fund mermaid@12 vega@6 vega-lite@6 vega-embed@7
+```
+
+Load their browser bundles into the page from disk, block every network
+request, and save SVG and a 2x PNG. Look at the PNG with the Read tool before
+you send it. Use PNG for chat apps, documents and PowerPoint; SVG for an HTML
+page.
 
 To send it, copy it to `<workspace>/.uploads/diagrams/<name>-<date or
 round>.png` (a new name for each round), then call `send_file` with that path.
