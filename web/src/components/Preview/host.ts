@@ -20,7 +20,12 @@ import { hostMessage, readContentMessage, type ContentMessage, type HostMessage 
  *    hands it the document of the preview; a new document (after a change
  *    of a file) goes to the same proxy, which makes a new inner frame;
  * 2. reads the messages of the content page (`messages.ts`) and sends its
- *    own; nothing else from the frame is read;
+ *    own; nothing else from the frame is read. After a new document is
+ *    handed over, a message of the page before it can still be on its way:
+ *    the host asks the proxy a question (the press question of the
+ *    keyboard guard) and takes no content message until the answer. The
+ *    proxy answers in order, so every message of the page before comes
+ *    first;
  * 3. keeps the keyboard where the person put it (`Chat/mcpApps/keyboard.ts`);
  * 4. stops a frame that sends messages without end.
  */
@@ -36,6 +41,8 @@ export const SANDBOX_WAIT_MS = 8_000;
 export const HELLO_MS = 1_000;
 /** A frame that sends more messages than this in a second is stopped. */
 export const MAX_MESSAGES_PER_SECOND = 300;
+/** Content messages count again this long after a hand-over when the proxy has not answered by then. */
+export const SETTLE_MS = 500;
 
 const FLOODED = 'The preview was stopped: it sent messages without end.';
 
@@ -44,6 +51,8 @@ export interface PreviewHostOptions {
   onFail: (reason: string) => void;
   /** A checked message of the content page. */
   onContent: (message: ContentMessage) => void;
+  /** A document went to the proxy: what the page before said counts no more. */
+  onHandOver?: () => void;
 }
 
 export class PreviewHost {
@@ -58,8 +67,13 @@ export class PreviewHost {
   private countedFrom = 0;
   private waitTimer: ReturnType<typeof setTimeout> | undefined;
   private helloTimer: ReturnType<typeof setTimeout> | undefined;
+  private settleTimer: ReturnType<typeof setTimeout> | undefined;
   /** The content page said `ready` for the document that the proxy holds. */
   private ready = false;
+  /** Who asked the proxy about a press, in order: the proxy answers in the same order. */
+  private readonly askers: Array<'keyboard' | 'hand-over'> = [];
+  /** Hand-overs whose question the proxy has not answered: no content message counts. */
+  private settling = 0;
 
   constructor(options: PreviewHostOptions) {
     this.options = options;
@@ -77,7 +91,7 @@ export class PreviewHost {
     place.appendChild(frame);
     this.keyboard = new KeyboardGuard(frame, place, {
       onTaken: () => this.fail(`The preview was stopped: ${TAKEN_REASON}`),
-      ask: () => this.post({ jsonrpc: '2.0', method: PROXY_PRESSED }),
+      ask: () => this.ask('keyboard'),
     });
     this.keyboard.start();
     // No `csp` in the address: the policy that allows no origin.
@@ -110,6 +124,7 @@ export class PreviewHost {
     window.removeEventListener('message', this.onMessage);
     clearTimeout(this.waitTimer);
     clearTimeout(this.helloTimer);
+    clearTimeout(this.settleTimer);
     this.keyboard?.stop();
     this.keyboard = null;
     this.frame?.remove();
@@ -130,6 +145,12 @@ export class PreviewHost {
     this.target()?.postMessage(message, SANDBOX_TARGET);
   }
 
+  /** Ask the proxy whether the person just pressed in the content. */
+  private ask(who: 'keyboard' | 'hand-over'): void {
+    this.askers.push(who);
+    this.post({ jsonrpc: '2.0', method: PROXY_PRESSED });
+  }
+
   private handOver(): void {
     if (this.html === null) return;
     this.ready = false;
@@ -138,6 +159,12 @@ export class PreviewHost {
       method: RESOURCE_READY,
       params: { html: this.html, sandbox: PREVIEW_SANDBOX },
     });
+    // The answer comes after every message of the page before (see the class comment).
+    this.settling += 1;
+    this.ask('hand-over');
+    clearTimeout(this.settleTimer);
+    this.settleTimer = setTimeout(() => { this.settling = 0; }, SETTLE_MS);
+    this.options.onHandOver?.();
     clearTimeout(this.helloTimer);
     this.helloTimer = setTimeout(() => {
       if (!this.ready) this.send({ type: 'hello' });
@@ -172,6 +199,11 @@ export class PreviewHost {
     }
     const pressed = sandboxPressed(event, target);
     if (pressed !== null) {
+      if (this.askers.shift() === 'hand-over') {
+        this.settling = Math.max(0, this.settling - 1);
+        if (this.settling === 0) clearTimeout(this.settleTimer);
+        return;
+      }
       this.keyboard?.answer(pressed);
       return;
     }
@@ -188,8 +220,9 @@ export class PreviewHost {
       this.handOver();
       return;
     }
-    // Content messages count only for a document that the tab handed over.
-    if (!this.proxyReady || this.html === null) return;
+    // Content messages count only for a document that the tab handed over,
+    // and only once the messages of the page before it have arrived.
+    if (!this.proxyReady || this.html === null || this.settling > 0) return;
     const message = readContentMessage(data);
     if (!message) return;
     if (message.type === 'ready') this.ready = true;

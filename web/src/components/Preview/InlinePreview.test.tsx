@@ -5,7 +5,9 @@ import type { PreviewBundle } from '../../types/preview';
 import type { ContentMessage } from './messages';
 
 interface FakeHost {
-  options: { onContent: (message: ContentMessage) => void; onFail: (reason: string) => void };
+  options: {
+    onContent: (message: ContentMessage) => void; onFail: (reason: string) => void; onHandOver?: () => void;
+  };
   shown: string[];
   sent: unknown[];
   disposed: boolean;
@@ -158,6 +160,16 @@ describe('the inline preview', () => {
     expect(lastHost().sent).toEqual([]);
     act(() => lastHost().options.onContent({ type: 'ready', kind: 'deck', canPrint: true, slides: 6, slide: 3 }));
     expect(lastHost().sent).toEqual([{ type: 'slide', to: 'first' }]);
+  });
+
+  it('is no deck any more when the frame gets a new document, until the new page says so', async () => {
+    await show();
+    const figure = screen.getByRole('figure', { name: 'Preview of index.html' });
+    act(() => lastHost().options.onContent({ type: 'ready', kind: 'deck', canPrint: true, slides: 6, slide: 1 }));
+    expect(figure).toHaveClass('aspect-video');
+    act(() => lastHost().options.onHandOver?.());
+    expect(figure).not.toHaveClass('aspect-video');
+    expect(figure.querySelector('[inert]')).toBeNull();
   });
 
   it('keeps a page that is not a deck usable in place', async () => {

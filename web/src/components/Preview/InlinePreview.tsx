@@ -127,24 +127,27 @@ class FramePlace {
 }
 
 /** The sandbox frame. A new key starts a new frame; a new `id` hands over `html` again. */
-function SandboxFrame({ html, id, onContent, onFail, hostRef }: {
+function SandboxFrame({ html, id, onContent, onFail, onHandOver, hostRef }: {
   html: string;
   id: number;
   onContent: (message: ContentMessage) => void;
   onFail: (reason: string) => void;
+  /** A document went to the frame: what the page before said counts no more. */
+  onHandOver: () => void;
   /** The host of the frame, while it exists. */
   hostRef: React.MutableRefObject<PreviewHost | null>;
 }) {
   const place = useRef<HTMLDivElement>(null);
-  const handlers = useRef({ onContent, onFail });
+  const handlers = useRef({ onContent, onFail, onHandOver });
   useEffect(() => {
-    handlers.current = { onContent, onFail };
-  }, [onContent, onFail]);
+    handlers.current = { onContent, onFail, onHandOver };
+  }, [onContent, onFail, onHandOver]);
 
   useEffect(() => {
     const created = new PreviewHost({
       onContent: message => handlers.current.onContent(message),
       onFail: reason => handlers.current.onFail(reason),
+      onHandOver: () => handlers.current.onHandOver(),
     });
     if (place.current) created.start(place.current);
     hostRef.current = created;
@@ -224,7 +227,6 @@ function InlinePreviewFrame({ path }: { path: string }) {
             if (!alive.current || !place.holds) return;
             shown.current = next.fingerprint;
             builds.current += 1;
-            setDeck(false);
             place.show({ html: built.html, id: builds.current });
           }
           setProblem(null);
@@ -274,6 +276,9 @@ function InlinePreviewFrame({ path }: { path: string }) {
     }
   }, []);
 
+  // A page that is not a deck until it says so (the new page says what it is).
+  const onHandOver = useCallback(() => setDeck(false), []);
+
   const onFail = useCallback((reason: string) => {
     place.fail();
     setFrameError(reason);
@@ -308,7 +313,8 @@ function InlinePreviewFrame({ path }: { path: string }) {
             // A deck takes no input: no click, no focus, so it stays on its first slide.
             <div className="absolute inset-0" inert={deck}>
               <SandboxFrame
-                key={frameKey} html={doc.html} id={doc.id} onContent={onContent} onFail={onFail} hostRef={hostRef}
+                key={frameKey} html={doc.html} id={doc.id} onContent={onContent} onFail={onFail}
+                onHandOver={onHandOver} hostRef={hostRef}
               />
             </div>
           )}

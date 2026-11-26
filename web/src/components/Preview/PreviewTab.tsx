@@ -45,22 +45,25 @@ const NO_FULL_SCREEN = 'Present needs full screen, and this browser did not allo
 const KEEPS_CHANGING = 'The files change while the preview is read. The tab tries again in a moment.';
 
 /** The sandbox frame of the preview. A new key starts a new frame. */
-function PreviewFrame({ html, onContent, onFail, hostRef }: {
+function PreviewFrame({ html, onContent, onFail, onHandOver, hostRef }: {
   html: string;
   onContent: (message: ContentMessage) => void;
   onFail: (reason: string) => void;
+  /** A document went to the frame: what the page before said counts no more. */
+  onHandOver: () => void;
   hostRef: React.MutableRefObject<PreviewHost | null>;
 }) {
   const place = useRef<HTMLDivElement>(null);
-  const handlers = useRef({ onContent, onFail });
+  const handlers = useRef({ onContent, onFail, onHandOver });
   useEffect(() => {
-    handlers.current = { onContent, onFail };
-  }, [onContent, onFail]);
+    handlers.current = { onContent, onFail, onHandOver };
+  }, [onContent, onFail, onHandOver]);
 
   useEffect(() => {
     const host = new PreviewHost({
       onContent: message => handlers.current.onContent(message),
       onFail: reason => handlers.current.onFail(reason),
+      onHandOver: () => handlers.current.onHandOver(),
     });
     if (place.current) host.start(place.current);
     hostRef.current = host;
@@ -222,6 +225,9 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
 
   const onFail = useCallback((reason: string) => setFrameError(reason), []);
 
+  // No deck controls of the page before: the new page says what it is.
+  const onHandOver = useCallback(() => setContent(null), []);
+
   const reload = () => {
     setFrameError(null);
     setFrameKey(k => k + 1);
@@ -362,7 +368,10 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
               onKeyDown={onStageKey}
               className="absolute inset-0 bg-bg-sunken"
             >
-              <PreviewFrame key={frameKey} html={doc.html} onContent={onContent} onFail={onFail} hostRef={hostRef} />
+              <PreviewFrame
+                key={frameKey} html={doc.html} onContent={onContent} onFail={onFail} onHandOver={onHandOver}
+                hostRef={hostRef}
+              />
             </div>
           </>
         )}

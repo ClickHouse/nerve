@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SANDBOX_PATH } from '../Chat/mcpApps/sandbox';
 import { PREVIEW_POLICY } from './document';
-import { HELLO_MS, MAX_MESSAGES_PER_SECOND, PREVIEW_SANDBOX, PreviewHost, SANDBOX_WAIT_MS } from './host';
+import { KeyboardGuard } from '../Chat/mcpApps/keyboard';
+import { HELLO_MS, MAX_MESSAGES_PER_SECOND, PREVIEW_SANDBOX, PreviewHost, SANDBOX_WAIT_MS, SETTLE_MS } from './host';
 import { ARTIFACT_CHANNEL, type ContentMessage } from './messages';
 
 /**
@@ -13,6 +14,7 @@ import { ARTIFACT_CHANNEL, type ContentMessage } from './messages';
 const NONE = 'null';
 const PROXY_READY = 'ui/notifications/sandbox-proxy-ready';
 const RESOURCE_READY = 'ui/notifications/sandbox-resource-ready';
+const PRESSED = 'ui/notifications/sandbox-pressed';
 const HTML = `<!DOCTYPE html><html><head><meta http-equiv="Content-Security-Policy" content="${PREVIEW_POLICY}"></head><body>deck</body></html>`;
 
 type Posted = { message: Record<string, unknown>; target: string };
@@ -22,7 +24,10 @@ function setup() {
   document.body.appendChild(place);
   const content: ContentMessage[] = [];
   const failures: string[] = [];
-  const host = new PreviewHost({ onContent: m => content.push(m), onFail: r => failures.push(r) });
+  const handOvers: number[] = [];
+  const host = new PreviewHost({
+    onContent: m => content.push(m), onFail: r => failures.push(r), onHandOver: () => handOvers.push(handOvers.length),
+  });
   host.start(place);
   const frame = place.querySelector('iframe')!;
   const posted: Posted[] = [];
@@ -35,9 +40,12 @@ function setup() {
     }));
   };
   return {
-    host, place, frame, posted, content, failures, say,
+    host, place, frame, posted, content, failures, say, handOvers,
     proxyReady: () => say({ jsonrpc: '2.0', method: PROXY_READY, params: {} }),
+    // The proxy's answer to a question about a press.
+    answer: (pressed: boolean | null = false) => say({ jsonrpc: '2.0', method: PRESSED, params: { pressed } }),
     resources: () => posted.filter(p => p.message.method === RESOURCE_READY),
+    questions: () => posted.filter(p => p.message.method === PRESSED),
   };
 }
 
@@ -97,9 +105,10 @@ describe('PreviewHost', () => {
   });
 
   it('passes on a checked content message from its frame only', () => {
-    const { host, proxyReady, say, content } = setup();
+    const { host, proxyReady, answer, say, content } = setup();
     host.show(HTML);
     proxyReady();
+    answer();
     const ready = { channel: ARTIFACT_CHANNEL, v: 1, type: 'ready', kind: 'deck', canPrint: false, slides: 4, slide: 1 };
     // Another window, and the right window with an origin: not the proxy.
     say(ready, { source: window });
@@ -109,6 +118,61 @@ describe('PreviewHost', () => {
     expect(content).toEqual([]);
     say(ready);
     expect(content).toEqual([{ type: 'ready', kind: 'deck', canPrint: false, slides: 4, slide: 1 }]);
+  });
+
+  it('takes no message of the page before a new document until the proxy answered its question', () => {
+    const { host, proxyReady, answer, say, content, questions, handOvers } = setup();
+    const deck = { channel: ARTIFACT_CHANNEL, v: 1, type: 'ready', kind: 'deck', canPrint: true, slides: 4, slide: 1 };
+    host.show(HTML);
+    proxyReady();
+    expect(questions()).toHaveLength(1);
+    expect(handOvers).toHaveLength(1);
+    answer();
+    say(deck);
+    expect(content).toHaveLength(1);
+
+    // The next document: the deck's own ready was still on its way.
+    host.show(HTML.replace('deck', 'page'));
+    expect(questions()).toHaveLength(2);
+    expect(handOvers).toHaveLength(2);
+    say(deck);
+    expect(content).toHaveLength(1);
+    answer();
+    say({ ...deck, kind: 'table', canPrint: false, slides: undefined, slide: undefined });
+    expect(content.at(-1)).toEqual({ type: 'ready', kind: 'table', canPrint: false });
+  });
+
+  it('waits for the answer to its own question, not to an earlier one of the keyboard guard', () => {
+    const { host, proxyReady, answer, say, content } = setup();
+    const answered = vi.spyOn(KeyboardGuard.prototype, 'answer');
+    const ready = { channel: ARTIFACT_CHANNEL, v: 1, type: 'ready', kind: 'markdown', canPrint: true };
+    host.show(HTML);
+    proxyReady();
+    answer();
+    // The keyboard guard asks, then a new document goes to the proxy before the answer.
+    (host as unknown as { ask: (who: string) => void }).ask('keyboard');
+    host.show(HTML.replace('deck', 'page'));
+    answer(true);
+    expect(answered).toHaveBeenCalledTimes(1);
+    expect(answered).toHaveBeenLastCalledWith(true);
+    say(ready);
+    expect(content).toEqual([]);
+    answer();
+    expect(answered).toHaveBeenCalledTimes(1);
+    say(ready);
+    expect(content).toEqual([{ type: 'ready', kind: 'markdown', canPrint: true }]);
+  });
+
+  it('takes content messages again after a while when the proxy does not answer', () => {
+    const { host, proxyReady, say, content } = setup();
+    host.show(HTML);
+    proxyReady();
+    const ready = { channel: ARTIFACT_CHANNEL, v: 1, type: 'ready', kind: 'markdown', canPrint: true };
+    say(ready);
+    expect(content).toEqual([]);
+    vi.advanceTimersByTime(SETTLE_MS + 1);
+    say(ready);
+    expect(content).toHaveLength(1);
   });
 
   it('asks a page that said nothing with hello, once', () => {

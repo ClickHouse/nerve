@@ -319,7 +319,11 @@ canPrint, slides?, slide?}` at load and as the answer to `hello`, and
 1). From the tab: `{type: "hello"}`, `{type: "slide", to: "next" | "prev" |
 "first" | "last" | <number>}` and `{type: "present", on}`. The tab takes a
 message only from its own frame, checks each value, and uses none as markup
-or as an address. A page that sends no `ready` is a plain page.
+or as an address. A page that sends no `ready` is a plain page. When a new
+document goes to the frame, a message of the page before can still be on
+its way: the tab (and the inline preview) asks the sandbox document a
+question and takes no message until the answer, which comes after every
+message of the page before (at most 0.5 s when no answer comes).
 
 **Limits.** A page that loads files at run time (`fetch`, a module script
 that imports another file, a link to another page of the bundle) does not
