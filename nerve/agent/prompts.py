@@ -1117,7 +1117,10 @@ PREVIEW_RENDERING_NOTE = (
     "search and sort); for a folder with an `index.html`, send that file. "
     "The person can open the page in the Preview tab of the side panel. Send "
     "the file to show a table, a report or a page in the chat; it does not "
-    "need to be published for that. A file that the person uploaded is under "
+    "need to be published for that. A Markdown page shows a ```mermaid or "
+    "```vega-lite block as code and an image as its alt text: for a page with "
+    "a diagram or a picture, write an `.html` page with an inline `<svg>` or "
+    "with the image files beside it. A file that the person uploaded is under "
     "`.uploads/`, where no page shows: copy it to another workspace path "
     "first."
 )
