@@ -192,7 +192,7 @@ class TestSettings:
 
     def test_email_is_a_hosted_chat_provider_that_refuses_while_off_and_subscribes(self):
         assert EMAIL in HOSTED_CHAT_PROVIDERS
-        assert (EMAIL.name, EMAIL.hold_while_off, EMAIL.subscribes) == ("email", False, True)
+        assert (EMAIL.name, EMAIL.subscribes) == ("email", True)
         assert EMAIL.settings(hosted_config()) == HostedChannelSettings()
         assert EMAIL.channel_options() == {}
 
@@ -320,6 +320,22 @@ class TestMemberMail:
         assert [run["channel"] for run in hosted.turns.runs] == ["slack"]
         assert await hosted.db.get_channel_session(CHANNEL_KEY) is None
         assert hosted.runtime.channels["email"].can_accept()
+
+    async def test_while_slack_is_off_its_events_are_refused_and_mail_goes_on(self, hosted):
+        hosted.config.slack.enabled = False
+        stream = await hosted.stream(advertise=False)
+        await announce(hosted, stream)
+        refused = hosted.gateway.store(message_event(conversation="D0DIRECT", conversation_kind="direct"))
+        taken = hosted.gateway.store(mail())
+
+        await stream.nudge("invoke")
+
+        assert await hosted.acknowledged(refused, taken) == {refused: "rejected", taken: "accepted"}
+        [rejection] = [item for ack in hosted.gateway.acks for item in ack if item["inbox_id"] == refused]
+        assert rejection["reason_code"] == "configuration_invalid"
+        await hosted.turns.wait_for(1)
+        assert [run["channel"] for run in hosted.turns.runs] == ["email"]
+        assert hosted.runtime.channels["slack"].can_accept()
 
     async def test_the_agent_cannot_post_through_the_email_channel(self, hosted):
         verdict = await hosted.runtime.channels["email"].authorize_outbound(CONVERSATION)
@@ -539,15 +555,11 @@ class TestDoctor:
 
         assert "[ERR] Email is on but channels.hosted.gateway_jwks_file: cannot read" in report
 
-    @pytest.mark.parametrize(("slack", "warned"), [
-        ({"mode": "hosted", "enabled": False}, True),
-        ({"mode": "hosted"}, False),
-        ({"mode": "socket", "enabled": False}, False),
-    ])
-    def test_a_switched_off_hosted_slack_is_said_to_hold_mail_back(self, tmp_path, slack, warned):
+    def test_a_switched_off_hosted_slack_gives_no_warning_about_mail(self, tmp_path):
         config = doctor_config(tmp_path)
-        config.slack = SlackConfig.from_dict(slack)
+        config.slack = SlackConfig.from_dict({"mode": "hosted", "enabled": False})
 
         report = doctor_report(config)
 
-        assert ("so member mail waits there too" in report) is warned
+        assert "[OK] Email from members comes from the channel gateway" in report
+        assert "[WARN] Slack is hosted but switched off" not in report

@@ -295,17 +295,6 @@ running. Nerve reads them over the hosted channel streams.
   to the `github_repos` source, independently of `sync.github.enabled`. It
   needs a gateway that knows the repository watch; see
   [Hosted repository watch](#hosted-repository-watch).
-- **A switched-off hosted Slack holds GitHub back.** Nerve reads the events of
-  every hosted provider from one ordered inbox at the gateway, and it stops
-  reading while a hosted channel cannot take events. With `slack.mode: hosted`
-  and `slack.enabled: false`, Nerve therefore reads nothing from the gateway:
-  the GitHub records wait there too, no delivery starts a job, and past the
-  gateway's limit of stored records the oldest are dropped. They arrive once
-  Slack is switched on again. While GitHub is hosted, keep a hosted Slack
-  switched on, or switch both off; `nerve doctor` warns about this
-  combination. This is a known limitation: reading each provider's events on
-  its own, so that GitHub records arrive while hosted Slack is off, is a
-  follow-up.
 - **Restart-only.** A change of `mode` takes effect at the next restart. To go
   back from `hosted` to `poll`, switch the source off first: set
   `enabled: false` (and `sync.github_repos.enabled: false`, if the repository

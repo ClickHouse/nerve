@@ -257,7 +257,7 @@ A reload is always explicit. Two things cause one:
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
 | `telegram.dm_policy`, `.stream_mode`, `.reply_routes_to_origin_session` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; toggling `reply_routes_to_origin_session` takes effect on the next message, and applies to replies to earlier messages too (routes are recorded while it is off); `allowed_users` does not follow it (see the restart table) |
-| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source and the events of the other hosted providers included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
+| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` makes Nerve reject the Slack events that arrive and stops notifications until it is `true` again, while the records of a hosted GitHub source and the events of the other hosted providers continue to arrive; `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
 | `email.enabled` | ✅ read per event. The reload publishes the subscriptions to the gateway again, which then takes or refuses new mail. When no stream sends them, the reload reports `subscriptions` with a "not sent yet" note, which is not an error: the next stream that connects sends them before Nerve reads from it. The email channel must exist: usable `channels.hosted` settings at startup give it. Without usable settings the reload repeats the startup warning under `email`; with usable settings and no email channel it says that a restart is needed (see [Email](#email)) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
@@ -1563,14 +1563,15 @@ The inbox record shows that person (see
 nothing: the `slack.source` sender rules match only the member ID and the
 display name in the event.
 
-`slack.enabled: false` pauses the hosted channel, at startup or after a
-reload. The stream endpoint still accepts streams, and events stay in the
-gateway's inbox until a reload sets `enabled` to `true`. While it is paused,
-Nerve sends no notifications and refuses `send_channel_message`. A turn that
-is already running still sends its reply. Nerve reads nothing from the
-gateway's inbox while Slack is paused, so the records of a hosted GitHub
-source and the events of the other hosted providers wait there too (see
-below and [Connection behaviour](#connection-behaviour)).
+`slack.enabled: false` switches the hosted channel off, at startup or after
+a reload. The stream endpoint still accepts streams. Nerve rejects each
+Slack event that arrives while Slack is off, and the gateway removes it, so
+a reload that sets `enabled` to `true` does not deliver it later. While
+Slack is off, Nerve sends no notifications and refuses
+`send_channel_message`. A turn that is already running still sends its
+reply. The records of a hosted GitHub source and the events of the other
+hosted providers continue to arrive (see
+[Connection behaviour](#connection-behaviour)).
 
 Replies, reactions, and `send_channel_message` go to Slack as operations on
 a gateway stream that advertises them for the connection. A reply goes on the
@@ -1653,16 +1654,6 @@ carry the mail that members send to the agent: the usable `channels.hosted`
 settings give the email channel, which `email.enabled` switches on (see
 [Email](#email)).
 
-When Slack is hosted as well, its switch also holds GitHub and member mail
-back. Nerve reads the events of every hosted provider from one ordered
-inbox, and it reads nothing while hosted Slack is switched off
-(`slack.enabled: false`): the GitHub records wait at the gateway until Slack
-is switched on again, and past the gateway's limit of stored records the
-oldest are dropped. Keep a hosted Slack switched on while GitHub is hosted;
-`nerve doctor` warns when it is off. This is a known limitation: a read for
-each provider on its own, which would keep GitHub records arriving while
-hosted Slack is off, is a follow-up.
-
 #### Connection behaviour
 
 Nerve builds one hosted channel for each chat provider in hosted mode. The
@@ -1686,16 +1677,11 @@ session is not sent to anyone. To answer, use the *reply tool* tool."
 Without a reply tool, the line ends with "This channel does not send
 answers."
 
-Each hosted chat provider has its own switch. Because the gateway keeps the
-events of every provider in one ordered inbox, a provider that is switched
-off either holds the events of all providers or refuses its own events.
-Hosted Slack holds them: while `slack.enabled` is `false`, Nerve reads
-nothing, and the events of the other hosted providers wait in the gateway
-inbox too. Any other hosted chat provider refuses, email included: while it
-is switched off, Nerve rejects its events and continues to read the events
-of the other providers. Nerve also stops reading, for every provider, while
-one hosted channel has 100 turns in progress, and continues when one of them
-ends.
+Each hosted chat provider has its own switch. While a provider is switched
+off, Nerve rejects its events and continues to read the events of the other
+providers. The gateway keeps the events of every provider in one ordered
+inbox, so Nerve stops reading, for every provider, while one hosted channel
+has 100 turns in progress, and continues when one of them ends.
 
 An event on a connection whose capabilities name another provider is
 rejected, and Nerve sends no operation of a channel through such a
@@ -2047,10 +2033,7 @@ warning under `email`. When the settings are usable but this process has no
 email channel, because the settings became usable after startup or the
 hosted channels did not start, it says that a restart is needed.
 
-While a hosted Slack is switched off, Nerve reads nothing from the gateway
-inbox, so member mail waits there too (see
-[Connection behaviour](#connection-behaviour)). `send_channel_message`
-cannot post through the email channel.
+`send_channel_message` cannot post through the email channel.
 
 ## Notification delivery
 
