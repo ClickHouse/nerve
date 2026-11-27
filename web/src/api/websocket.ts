@@ -104,7 +104,10 @@ export type SendStatus = 'sent' | 'queued' | 'dropped';
 // Past the cap the oldest of them is dropped. Chat messages are never dropped
 // from the queue: the caller got 'queued', the bubble is on screen and the
 // draft is cleared, so a dropped message would lose the person's text. A
-// person types each one, so they stay few.
+// person types each one, so they stay few. The one queued `switch_session`
+// is never dropped either: a queued message for another chat rebinds the
+// socket to that chat when it flushes, and only the switch after it puts the
+// socket back on the chat on screen.
 const MAX_PENDING = 5;
 
 /** The interval of the ping on an open socket. */
@@ -354,15 +357,17 @@ export class NerveWebSocket {
   /**
    * Queue a frame for the next open socket. Only the chat on screen when the
    * socket opens needs a `switch_session`, so a newer one replaces an older
-   * one. Past MAX_PENDING frames other than chat messages, the oldest of them
-   * is dropped; chat messages always stay.
+   * one. Past MAX_PENDING frames other than chat messages and that switch,
+   * the oldest of them is dropped; chat messages and the switch always stay.
    */
   private enqueue(data: Record<string, unknown>) {
     if (data.type === 'switch_session') {
       this._pending = this._pending.filter((frame) => frame.type !== 'switch_session');
     }
     this._pending.push(data);
-    const others = this._pending.filter((frame) => frame.type !== 'message');
+    const others = this._pending.filter(
+      (frame) => frame.type !== 'message' && frame.type !== 'switch_session',
+    );
     if (others.length > MAX_PENDING) {
       const oldest = others[0];
       this._pending = this._pending.filter((frame) => frame !== oldest);

@@ -452,6 +452,28 @@ describe('NerveWebSocket credentials and session checks', () => {
     ]);
   });
 
+  it('keeps the switch to the chat on screen when other frames pass the cap', () => {
+    const client = new NerveWebSocket();
+    client.connect();
+    client.sendMessage('for a', 'a');
+    client.switchSession('b');
+    for (const id of ['s1', 's2', 's3', 's4', 's5']) client.stopSession(id);
+
+    MockWebSocket.instances[0].open();
+
+    // The message for a rebinds the socket to a when it flushes; the switch
+    // after it must still be there to put it back on b, the chat on screen.
+    expect(MockWebSocket.instances[0].send.mock.calls.map(([frame]) => JSON.parse(frame))).toEqual([
+      { type: 'message', content: 'for a', session_id: 'a' },
+      { type: 'switch_session', session_id: 'b' },
+      { type: 'stop', session_id: 's1' },
+      { type: 'stop', session_id: 's2' },
+      { type: 'stop', session_id: 's3' },
+      { type: 'stop', session_id: 's4' },
+      { type: 'stop', session_id: 's5' },
+    ]);
+  });
+
   it('keeps every queued chat message, in order, past the cap', () => {
     const client = new NerveWebSocket();
     client.connect();
