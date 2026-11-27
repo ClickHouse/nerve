@@ -96,6 +96,14 @@ PUBLISH_TOOL = "publish_artifact"
 #: The most paths of one ``get_artifact_upload_links`` call. The platform
 #: says its own value (``link_batch_size``); the runtime takes the smaller.
 MAX_LINK_BATCH = 100
+#: The most characters of an address of an answer, such as the viewer
+#: address of a published version.
+MAX_URL_CHARS = 2048
+#: The most characters of an upload link. A link signed with temporary
+#: credentials carries their session token in its query, often more than
+#: 1000 characters, besides the key and the signature; the platform bounds
+#: a link at 8 KiB.
+MAX_LINK_URL_CHARS = 8 * 1024
 #: How long an upload link lives, when the answer has no valid ``expires_at``.
 LINK_LIFETIME_SECONDS = 15 * 60
 #: A link that has less than this left is not used: new links are asked
@@ -461,10 +469,10 @@ def _number(data: dict[str, Any], key: str, name: str) -> int:
     return value
 
 
-def _http_url(value: str, name: str) -> str:
+def _http_url(value: str, name: str, max_chars: int = MAX_URL_CHARS) -> str:
     """An absolute ``http`` or ``https`` address with a host and no user
-    information, of at most 2048 printable ASCII characters (no space, no
-    control character)."""
+    information, of at most ``max_chars`` printable ASCII characters (no
+    space, no control character)."""
     from urllib.parse import urlsplit
 
     try:
@@ -474,7 +482,7 @@ def _http_url(value: str, name: str) -> str:
         raise _invalid_answer(name) from None
     if (
         parts.scheme not in ("https", "http") or not parts.hostname or "@" in parts.netloc
-        or len(value) > 2048 or not _printable(value)
+        or len(value) > max_chars or not _printable(value)
     ):
         raise _invalid_answer(name)
     return value
@@ -519,7 +527,9 @@ def _links(data: dict[str, Any], asked: list[str], asked_at: float) -> dict[str,
             isinstance(k, str) and isinstance(v, str) for k, v in headers.items()
         ):
             raise _invalid_answer(TOOL_UPLOAD_LINKS)
-        links[path] = _Link(url=_http_url(url, TOOL_UPLOAD_LINKS), headers=dict(headers), deadline=deadline)
+        links[path] = _Link(
+            url=_http_url(url, TOOL_UPLOAD_LINKS, MAX_LINK_URL_CHARS), headers=dict(headers), deadline=deadline,
+        )
     return links
 
 

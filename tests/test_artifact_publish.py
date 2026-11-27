@@ -35,6 +35,8 @@ from nerve.agent.tools.registry import ToolContext
 from nerve.artifacts.bundle import KIT_FILES
 from nerve.artifacts.publish import (
     MAX_LINK_BATCH,
+    MAX_LINK_URL_CHARS,
+    MAX_URL_CHARS,
     PUBLISH_TOOL,
     REFUSAL_SENTENCES,
     RUNTIME_ONLY_TOOLS,
@@ -1182,6 +1184,46 @@ class TestUploadOriginSettings:
         assert publish_mod.publish_settings(later).upload_origins == {("https", "store.example.test", 443)}
 
 
+class TestLinkLength:
+    """An upload link signed with temporary credentials carries their session
+    token in its query, so it is longer than any other address of an answer."""
+
+    @staticmethod
+    def _token(chars: int) -> str:
+        # The form of an encoded session token: base64, with + / = escaped.
+        return ("IQoJb3JpZ2luX2VjE%2F%2F%2F%2F%2BAWS" * (chars // 32 + 1))[:chars]
+
+    def _links_with_token(self, rig, chars: int) -> None:
+        def links(args):
+            answer = rig.platform._get_artifact_upload_links(args)
+            for link in answer["links"]:
+                link["url"] += "&X-Amz-Security-Token=" + self._token(chars)
+            return answer
+
+        rig.platform.hooks["get_artifact_upload_links"] = links
+
+    @pytest.mark.asyncio
+    async def test_a_link_with_a_session_token_uploads(self, rig):
+        files = rig.deck()
+        self._links_with_token(rig, 2400)
+        published = await rig.publish()
+        assert published.version == 1
+        assert len(rig.store.requests) == len(files)
+        for request in rig.store.requests:
+            assert len(str(request.url)) > MAX_URL_CHARS
+            assert request.url.params["X-Amz-Security-Token"]
+
+    @pytest.mark.asyncio
+    async def test_a_link_longer_than_the_link_limit_sends_nothing(self, rig):
+        rig.deck()
+        self._links_with_token(rig, MAX_LINK_URL_CHARS)
+        with pytest.raises(PublishError) as raised:
+            await rig.publish()
+        assert (raised.value.code, raised.value.message) == ("platform_error", publish_mod.INVALID_ANSWER_SENTENCE)
+        assert rig.store.requests == []
+        assert "complete_artifact_version" not in rig.platform.names()
+
+
 class TestUploadOrigins:
     def _one_link_at(self, rig, address: str) -> None:
         """The answer of the links has the last link at ``address`` (the
@@ -1346,6 +1388,7 @@ class TestAnswerFields:
         {"viewer_url": "https://artifacts.example.test/t/x\x9b31m"},    # C1 (CSI)
         {"viewer_url": "https://artifacts.example.test/t/x\x1b[31m"},   # C0 (ESC)
         {"viewer_url": "https://artifacts.example.test/t/x y"},          # space
+        {"viewer_url": "https://artifacts.example.test/t/" + "x" * MAX_URL_CHARS},  # too long
         {"viewer_url": "https://artifacts.example.test/t/\u00e4"},       # not ASCII
         {"expires_at": "2026-12-25T10:00:00Z\x7f"},
         {"expires_at": "2026-12-25T10:00:00\x85Z"},
