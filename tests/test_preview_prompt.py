@@ -59,7 +59,8 @@ def test_the_preview_sentences_say_how_to_show_a_page():
     for words in (
         "`send_file`", "`.html`", "`.md`", "`.csv`", "search and sort", "`index.html`",
         "Preview tab", "does not need to be published", "`.uploads/`",
-        "block as code", "alt text", "inline `<svg>`",
+        "block as code", "alt text", "inline `<svg>`", "a folder with an `index.html` and the image files",
+        "another `.html` file is shown alone",
     ):
         assert words in PREVIEW_RENDERING_NOTE, words
 

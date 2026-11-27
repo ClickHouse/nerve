@@ -1119,8 +1119,10 @@ PREVIEW_RENDERING_NOTE = (
     "the file to show a table, a report or a page in the chat; it does not "
     "need to be published for that. A Markdown page shows a ```mermaid or "
     "```vega-lite block as code and an image as its alt text: for a page with "
-    "a diagram or a picture, write an `.html` page with an inline `<svg>` or "
-    "with the image files beside it. A file that the person uploaded is under "
+    "a diagram or a picture, write an `.html` page with an inline `<svg>`, or "
+    "a folder with an `index.html` and the image files (only an `index.html` "
+    "takes the other files of its folder; another `.html` file is shown "
+    "alone). A file that the person uploaded is under "
     "`.uploads/`, where no page shows: copy it to another workspace path "
     "first."
 )
