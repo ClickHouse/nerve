@@ -2695,6 +2695,52 @@ class MemoryCategoryConfig:
 MEMORY_BACKENDS: tuple[str, ...] = ("memu", "loom")
 DEFAULT_MEMORY_BACKEND = "memu"
 
+# Where memU's vectors come from (``memory.embedder``): ``local`` runs a
+# fastembed model inside the process, so no memory text leaves the machine;
+# ``openai`` calls the OpenAI embeddings API with ``openai_api_key``; ``none``
+# has no vectors, and recall falls back to LLM ranking. Empty keeps the old
+# rule: OpenAI when ``openai_api_key`` is set, else none.
+MEMORY_EMBEDDERS: tuple[str, ...] = ("", "none", "openai", "local")
+
+
+def _fastembed_installed() -> bool:
+    """Whether ``memory.embedder: local`` can run: fastembed is an optional
+    extra (``local-embeddings``)."""
+    import importlib.util
+    import sys
+
+    if "fastembed" in sys.modules:
+        return True
+    try:
+        return importlib.util.find_spec("fastembed") is not None
+    except (ImportError, ValueError):
+        return False
+
+# The fastembed models ``memory.local_model`` names: alias -> (model id, the
+# width of its vectors). The same aliases as Loom's local embedder.
+LOCAL_EMBED_MODELS: dict[str, tuple[str, int]] = {
+    "bge-small": ("BAAI/bge-small-en-v1.5", 384),
+    "bge-base": ("BAAI/bge-base-en-v1.5", 768),
+    "minilm": ("sentence-transformers/all-MiniLM-L6-v2", 384),
+}
+DEFAULT_LOCAL_EMBED_MODEL = "bge-small"
+
+# The semantic dedup threshold with a local model when
+# ``memory.semantic_dedup_threshold`` is not set. The 0.85 default suits
+# OpenAI's vectors; bge-small rates related-but-different facts higher (on
+# 5.8K real memories the median nearest neighbour is 0.854), so at 0.85 half
+# of all new facts would merge into an old one. Pairs at 0.96 and above
+# were restatements, and dedup also refuses pairs whose numbers or dates
+# differ.
+LOCAL_SEMANTIC_DEDUP_THRESHOLD = 0.96
+
+# How memU turns what it is given into memories (``memory.extraction``):
+# ``llm`` is memU's pipeline, a model extracting facts from conversations and
+# files and rewriting category summaries; ``none`` calls no model at all — a
+# memorized fact is stored as written, and conversations and files are stored
+# as embedded chunks, which needs an embedder.
+MEMORY_EXTRACTIONS: tuple[str, ...] = ("llm", "none")
+
 
 # Loom's names: a namespace is lowercase letters, digits and hyphens, starting
 # with a letter or digit, at most 128 characters; an org name is checked as
@@ -2741,6 +2787,14 @@ class MemoryConfig:
     memorize_model: str = DEFAULT_MEMORIZE_MODEL  # Extraction & preprocessing
     fast_model: str = DEFAULT_FAST_MODEL  # Category summaries, date resolution
     embed_model: str = ""
+    # Where vectors come from: "", "none", "openai" or "local" (MEMORY_EMBEDDERS).
+    embedder: str = ""
+    # The fastembed model of embedder "local" (LOCAL_EMBED_MODELS).
+    local_model: str = DEFAULT_LOCAL_EMBED_MODEL
+    # "llm" (memU's extraction pipeline) or "none" (no model; MEMORY_EXTRACTIONS).
+    extraction: str = "llm"
+    # Session-id globs whose conversations are never indexed ("cron:nightly-report*").
+    skip_sessions: list[str] = field(default_factory=list)
     sqlite_dsn: str = ""
     semantic_dedup_threshold: float = 0.85  # Cosine similarity threshold for semantic dedup
     knowledge_filter: bool = False  # Post-extraction LLM filter for generic knowledge (extra API call)
@@ -2760,18 +2814,51 @@ class MemoryConfig:
                 type(raw_loom).__name__,
             )
             raw_loom = None
-        return cls(
+        config = cls(
             backend=str(d.get("backend") or DEFAULT_MEMORY_BACKEND).strip().lower(),
             recall_model=d.get("recall_model", DEFAULT_RECALL_MODEL),
             memorize_model=d.get("memorize_model", DEFAULT_MEMORIZE_MODEL),
             fast_model=d.get("fast_model", DEFAULT_FAST_MODEL),
             embed_model=d.get("embed_model", ""),
+            embedder=str(d.get("embedder") or "").strip().lower(),
+            local_model=str(d.get("local_model") or DEFAULT_LOCAL_EMBED_MODEL).strip().lower(),
+            extraction=str(d.get("extraction") or "llm").strip().lower(),
+            skip_sessions=_str_list(d.get("skip_sessions") or [], clean=True),
             sqlite_dsn=d.get("sqlite_dsn", default_dsn),
             semantic_dedup_threshold=d.get("semantic_dedup_threshold", 0.85),
             knowledge_filter=d.get("knowledge_filter", False),
             categories=categories,
             loom=LoomMemoryConfig.from_dict(raw_loom or {}),
         )
+        # Whether the threshold was configured, else the embedder's default
+        # applies (dedup_threshold). An attribute, not a field: every field
+        # is a config key, and this is not one.
+        config._dedup_threshold_set = d.get("semantic_dedup_threshold") is not None
+        return config
+
+    def dedup_threshold(self, embedder_kind: str) -> float:
+        """The semantic dedup threshold in force: the configured one, else
+        LOCAL_SEMANTIC_DEDUP_THRESHOLD with a local model, else 0.85."""
+        if embedder_kind == "local" and not getattr(self, "_dedup_threshold_set", False):
+            return LOCAL_SEMANTIC_DEDUP_THRESHOLD
+        return self.semantic_dedup_threshold
+
+    def embedder_kind(self, openai_api_key: str) -> str:
+        """Where vectors come from: ``"local"``, ``"openai"`` or ``"none"``.
+
+        An unset ``embedder`` keeps the rule from before it existed: OpenAI
+        when ``openai_api_key`` is set, else none.
+        """
+        if self.embedder in ("local", "openai", "none"):
+            return self.embedder
+        return "openai" if openai_api_key else "none"
+
+    @property
+    def local_model_id(self) -> str:
+        """The fastembed model id of ``local_model`` (the default for an
+        unknown alias, which config validation refuses first)."""
+        model = LOCAL_EMBED_MODELS.get(self.local_model) or LOCAL_EMBED_MODELS[DEFAULT_LOCAL_EMBED_MODEL]
+        return model[0]
 
 
 def _cron_dir_has_jobs(d: Path) -> bool:
@@ -4986,8 +5073,9 @@ class NerveConfig:
         return config
 
     def _validate_memory_backend(self) -> None:
-        """Refuse an unknown ``memory.backend``, and check ``memory.loom``
-        when Loom is the backend.
+        """Refuse an unknown ``memory.backend`` or ``memory.embedder``, check
+        ``memory.local_model`` and ``openai_api_key`` when memU's embedder
+        needs them, and check ``memory.loom`` when Loom is the backend.
 
         A typo in the backend name is a hard error, as it is for
         ``agent.backend``: falling back to memU would boot an instance with
@@ -4999,6 +5087,36 @@ class NerveConfig:
         if backend not in MEMORY_BACKENDS:
             raise ValueError(
                 f"memory.backend must be one of {MEMORY_BACKENDS}, got {backend!r}"
+            )
+        embedder = self.memory.embedder
+        if embedder not in MEMORY_EMBEDDERS:
+            raise ValueError(
+                f"memory.embedder must be one of {MEMORY_EMBEDDERS[1:]}, got {embedder!r}"
+            )
+        if backend == "memu" and embedder == "local" and self.memory.local_model not in LOCAL_EMBED_MODELS:
+            raise ValueError(
+                f"memory.local_model must be one of {tuple(LOCAL_EMBED_MODELS)}, "
+                f"got {self.memory.local_model!r}"
+            )
+        if backend == "memu" and embedder == "local" and not _fastembed_installed():
+            raise ValueError(
+                "memory.embedder: local needs fastembed, which is an extra: "
+                "uv sync --extra local-embeddings (or pip install 'nerve[local-embeddings]')"
+            )
+        if backend == "memu" and embedder == "openai" and not self.openai_api_key:
+            raise ValueError("memory.embedder: openai needs openai_api_key")
+        extraction = self.memory.extraction
+        if extraction not in MEMORY_EXTRACTIONS:
+            raise ValueError(
+                f"memory.extraction must be one of {MEMORY_EXTRACTIONS}, got {extraction!r}"
+            )
+        if (
+            backend == "memu" and extraction == "none"
+            and self.memory.embedder_kind(self.openai_api_key) == "none"
+        ):
+            raise ValueError(
+                "memory.extraction: none needs an embedder (memory.embedder: local or openai): "
+                "without a model, recall can only search vectors and keywords"
             )
         if backend == "loom":
             loom = self.memory.loom

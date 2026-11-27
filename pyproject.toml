@@ -91,6 +91,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# memory.embedder: local. fastembed runs the embedding model inside the
+# process (ONNX Runtime on the CPU); the model downloads once into
+# ~/.nerve/models/fastembed and no memory text leaves the machine. An extra,
+# because onnxruntime has no wheel for every platform (none for Intel macOS or
+# macOS before 14). Install with: uv sync --extra local-embeddings
+local-embeddings = [
+    "fastembed>=0.4",
+]
 # Test/dev dependencies. Install with: uv sync --extra test
 # Upper bounds guard CI against surprise major-version breaks (notably the
 # pytest-asyncio 1.x event_loop changes the suite's conftest relies on).

@@ -177,7 +177,12 @@ def _read_memu_snapshot_sync(db_path: str) -> str:
             })
 
         items = []
-        for row in db.execute("SELECT id, memory_type, summary, resource_id, created_at, happened_at FROM memu_memory_items ORDER BY created_at DESC"):
+        # Transcript and file chunks (memory.extraction: none) are raw text,
+        # not facts: the Facts and Timeline tabs list facts only.
+        for row in db.execute(
+            "SELECT id, memory_type, summary, resource_id, created_at, happened_at FROM memu_memory_items "
+            "WHERE memory_type NOT IN ('conversation', 'document') ORDER BY created_at DESC"
+        ):
             items.append({
                 "id": row["id"],
                 "memory_type": row["memory_type"],

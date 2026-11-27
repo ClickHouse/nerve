@@ -33,7 +33,7 @@ import numpy as np
 from nerve import paths
 from nerve.config import ANTHROPIC_CLIENT_OPTIONS, NerveConfig
 from nerve.inference_principal import system_inference_headers
-from nerve.memory.backend import MemoryBackendUnavailable
+from nerve.memory.backend import MemoryBackendUnavailable, MemoryRecallFailed
 from nerve.observability.langfuse import attributes as lf_attrs
 from nerve.utils.llm import response_text
 
@@ -127,6 +127,29 @@ def _is_sqlite_locked_error(exc: BaseException) -> bool:
 
 # Semantic dedup threshold — set from config at init time.
 _SEMANTIC_DEDUP_THRESHOLD = 0.85
+
+# Numbers, IDs, dates and times in a memory: two texts close in meaning but
+# differing in one of these ("3 failures" / "4 failures", "PR #71918
+# targets release/26.6" / "#71917 … release/26.4") are different facts, and
+# cosine similarity alone cannot tell (bge-small rates such pairs 0.95–0.98).
+_VALUE_TOKEN_RE = re.compile(r"[#@]?[a-z0-9]*\d[a-z0-9._:/-]*", re.IGNORECASE)
+_MONTH_WORDS = frozenset(
+    "january february march april june july august september october november december "
+    "jan feb mar apr jun jul aug sep sept oct nov dec".split()
+)
+
+
+def _value_tokens(text: str) -> frozenset[str]:
+    lower = (text or "").lower()
+    tokens = {t.strip(".:/-") for t in _VALUE_TOKEN_RE.findall(lower)}
+    tokens.update(w for w in re.findall(r"[a-z]+", lower) if w in _MONTH_WORDS)
+    return frozenset(tokens)
+
+
+def _values_differ(a: str, b: str) -> bool:
+    """Whether ``a`` and ``b`` carry different numbers, IDs, dates or times
+    — then they are not the same fact however close their vectors are."""
+    return _value_tokens(a) != _value_tokens(b)
 
 # Max characters for a category breadcrumb in recall() output. A category
 # summary is a whole rolled-up topic document (often 5–20KB); recall must
@@ -545,6 +568,421 @@ class _BedrockLLMClient:
         except Exception:
             pass
 
+
+def _local_embed_threads() -> int:
+    """ONNX threads for the local embedder: half the CPUs, at most 8.
+
+    Measured on 14 Apple cores with bge-small (batches of 16, sorted by
+    length): 2 threads 118 texts/s, 4 225/s, 6 318/s, 8 398/s; 14 threads
+    with batches of 64 was slower than 4. Half the CPUs leaves room for the
+    agent sessions sharing the machine.
+    """
+    import os
+
+    return max(1, min(8, (os.cpu_count() or 2) // 2))
+
+
+class _LocalEmbeddingClient:
+    """memU embedding client backed by fastembed: ONNX inside this process,
+    no API key, and no memory text leaves the machine (``memory.embedder:
+    local``).
+
+    memU asks its embedding profile's client for ``embed(inputs) ->
+    list[list[float]]``; Nerve puts this client in that profile's slot right
+    after memU starts, as it does with the Bedrock chat clients. The model is
+    loaded on the first embed: the first load downloads it into
+    ``~/.nerve/models/fastembed`` (65 MB for bge-small) and later loads read
+    it from there.
+
+    Inputs are embedded shortest first in batches of 4: padding then costs
+    least, and the ONNX arena, which keeps its high-water mark, stays small.
+    Measured with bge-small on 5.8K memories: batches of 4 run at 333
+    texts/s and grow the process by 28 MB over the loaded model (~170 MB);
+    16 run at 363/s and grow it by 102 MB; 64 by ~400 MB. Vectors are scaled
+    to length 1; an empty input gets a zero vector, so it never matches.
+    Calls are serialized: the model is fast, and one at a time keeps memory
+    flat.
+    """
+
+    _BATCH_SIZE = 4
+
+    def __init__(self, *, model_id: str, dim: int, cache_dir: str, threads: int | None = None) -> None:
+        self.embed_model = model_id
+        self.chat_model = ""
+        self.dim = dim
+        self._cache_dir = cache_dir
+        self._threads = threads or _local_embed_threads()
+        self._model: Any = None
+        self._lock = threading.Lock()
+
+    def _load(self) -> Any:
+        if self._model is None:
+            from fastembed import TextEmbedding
+
+            t0 = time.monotonic()
+            Path(self._cache_dir).mkdir(parents=True, exist_ok=True)
+            self._model = TextEmbedding(
+                model_name=self.embed_model, cache_dir=self._cache_dir, threads=self._threads,
+            )
+            logger.info(
+                "Local embedder %s loaded in %.1fs (%d threads)",
+                self.embed_model, time.monotonic() - t0, self._threads,
+            )
+        return self._model
+
+    def embed_array_sync(self, inputs: list[str]) -> np.ndarray:
+        """Embed ``inputs`` in order into one ``(len, dim)`` float32 matrix
+        (blocking; call off the event loop). No per-number Python objects,
+        which is what keeps a bulk pass's memory flat."""
+        out = np.zeros((len(inputs), self.dim), dtype=np.float32)
+        live = sorted(
+            (i for i, text in enumerate(inputs) if text and text.strip()),
+            key=lambda i: len(inputs[i]),
+        )
+        if not live:
+            return out
+        with self._lock:
+            model = self._load()
+            vectors = model.embed([inputs[i] for i in live], batch_size=self._BATCH_SIZE)
+            for i, vec in zip(live, vectors, strict=True):
+                out[i] = vec
+        norms = np.linalg.norm(out, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        out /= norms
+        return out
+
+    def embed_sync(self, inputs: list[str]) -> list[list[float]]:
+        """Embed ``inputs`` in order, as memU's clients return them."""
+        return self.embed_array_sync(inputs).tolist()
+
+    async def embed(self, inputs: list[str]) -> list[list[float]]:
+        return await asyncio.to_thread(self.embed_sync, list(inputs))
+
+    async def embed_array(self, inputs: list[str]) -> np.ndarray:
+        return await asyncio.to_thread(self.embed_array_sync, list(inputs))
+
+    async def chat(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("the local embedding client only embeds")
+
+    async def summarize(self, *args: Any, **kwargs: Any) -> Any:
+        raise NotImplementedError("the local embedding client only embeds")
+
+    async def close(self) -> None:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Hybrid recall (vector + keyword) — used whenever an embedder is configured
+# ---------------------------------------------------------------------------
+
+# Candidates each search leg contributes before the lists are fused.
+_HYBRID_CANDIDATES = 50
+# Reciprocal rank fusion constant: a hit's leg score is 1 / (k + rank).
+_RRF_K = 60
+# The FTS5 table Nerve keeps beside memU's items table (triggers keep it in
+# step; see MemUBridge._ensure_fts_index).
+_FTS_TABLE = "memu_items_fts"
+# Words too common to help a keyword search, plus generic verbs a question
+# carries ("what makes …", "how do I use …"): BM25 rates a rare-ish verb
+# like "makes" as informative and pulls in rows that merely share it.
+_FTS_STOPWORDS = frozenset(
+    "a an and are as at be but by can did do does for from had has have how i if in into is it its "
+    "me my no not of on or our she so that the their them then there these they this to was we were "
+    "what when where which who why will with you your about after all also any been before being "
+    "could just more most other over should some such than too very would "
+    "make makes made get gets got use uses used want wants need needs like likes know think say said "
+    "tell told thing things way much many".split()
+)
+_FTS_MAX_TERMS = 24
+
+# How memU's extraction names the user ("The user's name is Alice", "The user
+# is named Alice Smith"); recall learns the name from these rows.
+_USER_NAME_RE = re.compile(
+    r"\bThe user(?:'s (?:first |full )?name is| is (?:named|called)| goes by)\s+"
+    r"([A-Z][\w-]+(?:\s+[A-Z][\w-]+)?)",
+)
+
+
+def _fts_match_expr(query: str, drop: frozenset[str] | set[str] = frozenset()) -> str:
+    """An FTS5 ``MATCH`` expression for free text: each word quoted (so
+    ``#4100``, ``a:b`` or a stray quote cannot break the syntax), common
+    words and the words in ``drop`` left out, joined with ``OR`` so BM25 ranks
+    rows by how many and how rare the matched words are. Empty when nothing
+    searchable is left."""
+    terms: list[str] = []
+    for word in re.findall(r"\w+", query.lower()):
+        if len(word) < 2 or word in _FTS_STOPWORDS or word in drop or word in terms:
+            continue
+        terms.append(word)
+        if len(terms) >= _FTS_MAX_TERMS:
+            break
+    return " OR ".join(f'"{t}"' for t in terms)
+
+
+def _learn_user_name_terms(summaries: Any) -> frozenset[str]:
+    """The words of the user's name, lowercased, from rows that state it
+    (``_USER_NAME_RE``); a name must be stated twice to count."""
+    counts: dict[str, int] = {}
+    for summary in summaries:
+        if not summary or "The user" not in summary:
+            continue
+        for match in _USER_NAME_RE.finditer(summary):
+            counts[match.group(1)] = counts.get(match.group(1), 0) + 1
+    terms: set[str] = set()
+    for name, n in counts.items():
+        if n >= 2:
+            terms.update(word.lower() for word in name.split())
+    return frozenset(terms)
+
+
+def _as_the_user(query: str, name_terms: frozenset[str] | set[str]) -> str:
+    """``query`` with the user's name written as memU writes it ("the
+    user"): "what makes Alice angry" → "what makes the user angry". The same
+    string when the query does not name the user."""
+    if not name_terms:
+        return query
+    alternation = "|".join(sorted((re.escape(t) for t in name_terms), key=len, reverse=True))
+    pattern = re.compile(rf"\b(?:{alternation})(?:\s+(?:{alternation}))*('s)?\b", re.IGNORECASE)
+    return pattern.sub(lambda m: "the user" + (m.group(1) or ""), query)
+
+
+def _parse_iso(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _fuse_recall_hits(
+    legs: list[list[str]],
+    items: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> list[tuple[str, float]]:
+    """Merge ranked candidate lists (item ids, best first) into one ranking.
+
+    Reciprocal rank fusion (each list adds ``1 / (_RRF_K + rank)``), so a
+    row found by several legs beats one found by one, and no leg's raw
+    scores need to be comparable. Then two mild tie-breakers from memU's own
+    salience: a fact stated again (``reinforcement_count``) gains up to
+    ~25 %, and a fresh one up to ~33 % over a years-old one (half-life 90
+    days, never below 0.75), so stale snapshots sink without old facts
+    vanishing. Returns ``(item_id, score)`` best first; ids missing from
+    ``items`` are dropped.
+    """
+    import math
+
+    now = now or datetime.now(timezone.utc)
+    scores: dict[str, float] = {}
+    for leg in legs:
+        for rank, item_id in enumerate(leg):
+            scores[item_id] = scores.get(item_id, 0.0) + 1.0 / (_RRF_K + rank + 1)
+
+    fused: list[tuple[str, float]] = []
+    for item_id, score in scores.items():
+        item = items.get(item_id)
+        if item is None:
+            continue
+        extra = getattr(item, "extra", None) or {}
+        try:
+            reinforced = max(1, int(extra.get("reinforcement_count", 1) or 1))
+        except (TypeError, ValueError):
+            reinforced = 1
+        score *= 1.0 + min(0.25, 0.1 * math.log(reinforced))
+        stamp = (
+            _parse_iso(extra.get("last_reinforced_at"))
+            or _parse_iso(getattr(item, "updated_at", None))
+            or _parse_iso(getattr(item, "created_at", None))
+        )
+        if stamp is not None:
+            age_days = max(0.0, (now - stamp).total_seconds() / 86400.0)
+            score *= 0.75 + 0.25 * (0.5 ** (age_days / 90.0))
+        fused.append((item_id, score))
+    fused.sort(key=lambda pair: pair[1], reverse=True)
+    return fused
+
+
+# ---------------------------------------------------------------------------
+# No-LLM writes (memory.extraction: none)
+# ---------------------------------------------------------------------------
+
+# Memory types of stored text that is not a fact: transcript chunks and
+# workspace-file chunks. Recall finds them (labelled, a few per answer);
+# the date and maintenance listings and the web UI's fact lists leave them out.
+CHUNK_MEMORY_TYPES: tuple[str, ...] = ("conversation", "document")
+FACT_MEMORY_TYPES: frozenset[str] = frozenset({"profile", "event", "knowledge", "behavior"})
+# Chunk size: about a screen of transcript, ~400 tokens, well inside the
+# local model's 512-token window; neighbouring pieces of one long message
+# overlap so a sentence cut at the border is whole in one of them.
+_CHUNK_CHARS = 1500
+_CHUNK_OVERLAP = 200
+# At most this share of a recall answer is chunks, so facts are not crowded out.
+_CHUNK_SHARE = 0.3
+
+
+class _RefusingLLMClient:
+    """Fills memU's chat profiles when ``memory.extraction`` is ``none``: any
+    call raises, so a code path that still reaches for a model fails loudly
+    (and in tests) instead of quietly sending memory text out."""
+
+    def __init__(self, profile: str) -> None:
+        self.profile = profile
+        self.chat_model = ""
+        self.embed_model = ""
+
+    def _refuse(self) -> RuntimeError:
+        return RuntimeError(
+            f"memory.extraction is 'none': memU may not call a language model (profile {self.profile!r})"
+        )
+
+    async def chat(self, *args: Any, **kwargs: Any) -> Any:
+        raise self._refuse()
+
+    async def summarize(self, *args: Any, **kwargs: Any) -> Any:
+        raise self._refuse()
+
+    async def embed(self, *args: Any, **kwargs: Any) -> Any:
+        raise self._refuse()
+
+    async def close(self) -> None:
+        return None
+
+
+def _split_long(text: str, size: int = _CHUNK_CHARS, overlap: int = _CHUNK_OVERLAP) -> list[str]:
+    """``text`` in pieces of at most ``size`` characters, cut at whitespace
+    where possible, each overlapping the previous by about ``overlap``."""
+    text = text.strip()
+    if len(text) <= size:
+        return [text] if text else []
+    pieces: list[str] = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + size)
+        if end < len(text):
+            cut = text.rfind(" ", start + size // 2, end)
+            if cut > start:
+                end = cut
+        pieces.append(text[start:end].strip())
+        if end >= len(text):
+            break
+        start = max(end - overlap, start + 1)
+    return [p for p in pieces if p]
+
+
+def _chunk_conversation(entries: list[dict[str, str]]) -> list[tuple[str, str | None]]:
+    """A transcript as ``(chunk text, created_at of its first message)``:
+    consecutive messages packed into chunks of about ``_CHUNK_CHARS``, each
+    line ``role: content``; a message too long for one chunk is split."""
+    chunks: list[tuple[str, str | None]] = []
+    lines: list[str] = []
+    size = 0
+    first_ts: str | None = None
+    for entry in entries:
+        content = (entry.get("content") or "").strip()
+        if not content:
+            continue
+        for piece in _split_long(f"{entry.get('role', 'unknown')}: {content}"):
+            if lines and size + len(piece) + 1 > _CHUNK_CHARS:
+                chunks.append(("\n".join(lines), first_ts))
+                lines, size, first_ts = [], 0, None
+            if not lines:
+                first_ts = entry.get("created_at")
+            lines.append(piece)
+            size += len(piece) + 1
+    if lines:
+        chunks.append(("\n".join(lines), first_ts))
+    return chunks
+
+
+def _chunk_document(text: str) -> list[str]:
+    """A file's text in chunks of about ``_CHUNK_CHARS``, cut at blank lines
+    where possible."""
+    chunks: list[str] = []
+    buf: list[str] = []
+    size = 0
+    for para in re.split(r"\n\s*\n", text):
+        for piece in _split_long(para):
+            if buf and size + len(piece) + 2 > _CHUNK_CHARS:
+                chunks.append("\n\n".join(buf))
+                buf, size = [], 0
+            buf.append(piece)
+            size += len(piece) + 2
+    if buf:
+        chunks.append("\n\n".join(buf))
+    return chunks
+
+
+_MONTH_NUMBERS: dict[str, int] = {
+    name: number
+    for number, names in enumerate(
+        (("jan", "january"), ("feb", "february"), ("mar", "march"), ("apr", "april"),
+         ("may",), ("jun", "june"), ("jul", "july"), ("aug", "august"),
+         ("sep", "sept", "september"), ("oct", "october"), ("nov", "november"),
+         ("dec", "december")),
+        start=1,
+    )
+    for name in names
+}
+_MONTH_ALT = "|".join(sorted(_MONTH_NUMBERS, key=len, reverse=True))
+_ISO_DATE_RE = re.compile(r"\b(20\d{2})-(\d{2})-(\d{2})\b")
+_MONTH_DAY_RE = re.compile(
+    rf"\b({_MONTH_ALT})\.?\s+(\d{{1,2}})(?:st|nd|rd|th)?\b(?:,?\s+(20\d{{2}}))?", re.IGNORECASE,
+)
+_DAY_MONTH_RE = re.compile(
+    rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({_MONTH_ALT})\b\.?(?:,?\s+(20\d{{2}}))?", re.IGNORECASE,
+)
+
+
+def _parse_event_date(text: str, reference: datetime) -> str | None:
+    """The date an event happened, from its own words: the first ISO date,
+    "November 3, 2026", "Nov 3", "3 November", or "today"/"yesterday"
+    (relative to ``reference``). A date without a year takes
+    ``reference``'s, or the year before when that would put it in the
+    future. ``YYYY-MM-DD``, or None when the text names no date."""
+    from datetime import date as _date
+
+    found: list[tuple[int, _date]] = []
+    for match in _ISO_DATE_RE.finditer(text):
+        try:
+            found.append((match.start(), _date(int(match[1]), int(match[2]), int(match[3]))))
+        except ValueError:
+            pass
+    for regex, month_group, day_group in ((_MONTH_DAY_RE, 1, 2), (_DAY_MONTH_RE, 2, 1)):
+        for match in regex.finditer(text):
+            month = _MONTH_NUMBERS[match[month_group].lower()]
+            year = int(match[3]) if match[3] else reference.year
+            try:
+                day = _date(year, month, int(match[day_group]))
+            except ValueError:
+                continue
+            if not match[3] and day > reference.date() + timedelta(days=1):
+                try:
+                    day = day.replace(year=year - 1)
+                except ValueError:
+                    continue
+            found.append((match.start(), day))
+    for match in re.finditer(r"\b(today|yesterday)\b", text, re.IGNORECASE):
+        offset = 0 if match[1].lower() == "today" else 1
+        found.append((match.start(), reference.date() - timedelta(days=offset)))
+    if not found:
+        return None
+    return min(found, key=lambda pair: pair[0])[1].isoformat()
+
+
+_SESSION_FILE_RE = re.compile(r"session-(?P<sid>.+)-(?P<ts>\d{9,})\.json$")
+
+
+def _session_of_url(url: str | None) -> str:
+    """The session id in a conversation file's name, or ""."""
+    match = _SESSION_FILE_RE.search(url or "")
+    return match["sid"] if match else ""
+
+
 # ---------------------------------------------------------------------------
 # Custom event extraction prompt blocks
 # ---------------------------------------------------------------------------
@@ -857,6 +1295,19 @@ class MemUBridge:
         # Debounce tracking for file re-indexing (path -> asyncio.Task)
         self._reindex_tasks: dict[str, asyncio.Task] = {}
         self._anthropic_client: Any | None = None  # Lazy sync Anthropic
+        # Where vectors come from: "local" (fastembed), "openai" or "none".
+        self._embedder_kind = config.memory.embedder_kind(config.openai_api_key)
+        # memory.extraction: none — no model call anywhere in memory: facts
+        # are stored as written, conversations and files as embedded chunks.
+        self._verbatim = config.memory.extraction == "none"
+        self._local_embedder: _LocalEmbeddingClient | None = None
+        # Progress of the background pass that embeds rows stored without a
+        # vector (shown under ``embedder`` in the health snapshot).
+        self._embed_backfill: dict[str, Any] = {"state": "idle"}
+        self._embed_backfill_task: asyncio.Task | None = None
+        # The user's name words recall reads as "the user" (learned lazily).
+        self._user_name_terms: frozenset[str] | None = None
+        self._user_name_terms_rows = -1
         # Dedicated event loop (own thread) that runs ALL memU service
         # coroutines.  memU's async pipeline steps call synchronous
         # SQLite/numpy work inline; isolating the whole service on its own
@@ -1356,25 +1807,33 @@ class MemUBridge:
                         embedding, k=1, memory_type=str(memory_type),
                     )
                     if hits:
-                        if hits[0][1] >= threshold:
+                        if hits[0][1] >= threshold and not _values_differ(
+                            summary, getattr(self.items.get(hits[0][0]), "summary", ""),
+                        ):
                             match_id, score = hits[0]
                             matched = self.items[match_id]
                             logger.info(
                                 "Semantic dedup: reinforcing %s item %s (%.3f) instead of creating '%s'",
                                 memory_type, match_id, score, summary[:80],
                             )
-                            # Update DB row
+                            # Update DB row.  The count starts from the row's
+                            # own extra, not the cache's: memU's loader leaves
+                            # extra out of cached items, so a cache-based
+                            # write after a restart would drop the row's
+                            # content_hash and restart its count.
                             from sqlmodel import select as _sel
                             now = self._now()
                             extra = dict(matched.extra or {})
-                            extra["reinforcement_count"] = extra.get("reinforcement_count", 1) + 1
-                            extra["last_reinforced_at"] = now.isoformat()
                             with self._sessions.session() as session:
                                 row = session.exec(
                                     _sel(self._memory_item_model).where(
                                         self._memory_item_model.id == match_id
                                     )
                                 ).first()
+                                if row:
+                                    extra = {**extra, **dict(row.extra or {})}
+                                extra["reinforcement_count"] = int(extra.get("reinforcement_count", 1) or 1) + 1
+                                extra["last_reinforced_at"] = now.isoformat()
                                 if row:
                                     row.extra = extra
                                     row.updated_at = now
@@ -1433,7 +1892,9 @@ class MemUBridge:
                     ]
                     if corpus:
                         hits = cosine_topk(embedding, corpus, k=1)
-                        if hits and hits[0][1] >= threshold:
+                        if hits and hits[0][1] >= threshold and not _values_differ(
+                            summary, getattr(self.items.get(hits[0][0]), "summary", ""),
+                        ):
                             match_id, score = hits[0]
                             matched = self.items[match_id]
                             logger.info(
@@ -1611,6 +2072,584 @@ class MemUBridge:
         except Exception as exc:
             logger.warning("memU index setup skipped: %s", exc)
 
+    @staticmethod
+    def _ensure_fts_index(sqlite_dsn: str, table: str = "memu_memory_items") -> None:
+        """Create the FTS5 table of item summaries and the triggers that keep
+        it in step with ``table``; fill it the first time.
+
+        A plain (not external-content) FTS5 table keyed by item id, as
+        ``tasks_fts`` in nerve.db: it does not depend on the items table's
+        rowid, and an update rewrites the id's row. Idempotent. Without FTS5
+        in the SQLite build it logs and returns: hybrid recall then runs on
+        vectors alone.
+        """
+        import sqlite3 as _sqlite3
+
+        db_path = sqlite_dsn.replace("sqlite:///", "")
+        fts = _FTS_TABLE
+        try:
+            conn = _sqlite3.connect(db_path, timeout=60)
+            conn.execute("PRAGMA busy_timeout=60000")
+            exists = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (fts,),
+            ).fetchone()
+            t0 = time.monotonic()
+            conn.executescript(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS {fts}
+                    USING fts5(item_id UNINDEXED, summary, tokenize='unicode61 remove_diacritics 2');
+                CREATE TRIGGER IF NOT EXISTS {fts}_ai AFTER INSERT ON {table} BEGIN
+                    INSERT INTO {fts}(item_id, summary) VALUES (new.id, new.summary);
+                END;
+                CREATE TRIGGER IF NOT EXISTS {fts}_ad AFTER DELETE ON {table} BEGIN
+                    DELETE FROM {fts} WHERE item_id = old.id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS {fts}_au AFTER UPDATE OF id, summary ON {table} BEGIN
+                    DELETE FROM {fts} WHERE item_id = old.id;
+                    INSERT INTO {fts}(item_id, summary) VALUES (new.id, new.summary);
+                END;
+            """)
+            if not exists:
+                conn.execute(f"DELETE FROM {fts}")
+                conn.execute(f"INSERT INTO {fts}(item_id, summary) SELECT id, summary FROM {table}")
+                conn.commit()
+                logger.info(
+                    "memU keyword index %s built in %.1fs", fts, time.monotonic() - t0,
+                )
+            conn.close()
+        except Exception as exc:
+            logger.warning("memU keyword index setup skipped: %s", exc)
+
+    def _user_name_terms_for(self, items: dict[str, Any]) -> frozenset[str]:
+        """The user's name words, learned from the stored rows once (again
+        while none are known and the row count has changed)."""
+        cached = getattr(self, "_user_name_terms", None)
+        if cached is not None and (cached or self._user_name_terms_rows == len(items)):
+            return cached
+        terms = _learn_user_name_terms(getattr(item, "summary", "") for item in list(items.values()))
+        self._user_name_terms = terms
+        self._user_name_terms_rows = len(items)
+        if terms:
+            logger.info("Recall treats %s as 'the user'", sorted(terms))
+        return terms
+
+    def _fts_search(self, query: str, limit: int, drop: frozenset[str] = frozenset()) -> list[str]:
+        """Item ids whose summary matches ``query``'s words (less ``drop``),
+        best BM25 first (blocking; run off the memU loop). Empty when nothing
+        matches or the keyword index is missing."""
+        import sqlite3 as _sqlite3
+
+        expr = _fts_match_expr(query, drop)
+        if not expr:
+            return []
+        db_path = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
+        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+        try:
+            rows = conn.execute(
+                f"SELECT item_id FROM {_FTS_TABLE} WHERE {_FTS_TABLE} MATCH ? "
+                f"ORDER BY bm25({_FTS_TABLE}) LIMIT ?",
+                (expr, limit),
+            ).fetchall()
+        except _sqlite3.OperationalError as exc:
+            if "no such table" in str(exc):
+                return []
+            raise
+        finally:
+            conn.close()
+        return [row[0] for row in rows]
+
+    def _inject_local_embedder(self) -> None:
+        """Put the fastembed client in memU's ``embedding`` profile slot
+        (memU's placeholder OpenAI client is never built)."""
+        from nerve.config import LOCAL_EMBED_MODELS
+
+        alias = self.config.memory.local_model
+        model_id, dim = LOCAL_EMBED_MODELS.get(alias, LOCAL_EMBED_MODELS["bge-small"])
+        if self._local_embedder is None:
+            self._local_embedder = _LocalEmbeddingClient(
+                model_id=model_id,
+                dim=dim,
+                cache_dir=str(paths.nerve_path("models", "fastembed")),
+            )
+        self._service._llm_clients["embedding"] = self._local_embedder
+        logger.info("Local embedder for memU: %s (%s, %d-d)", alias, model_id, dim)
+
+    # ------------------------------------------------------------------
+    # No-LLM writes (memory.extraction: none)
+    # ------------------------------------------------------------------
+
+    @property
+    def verbatim_facts(self) -> bool:
+        """Whether memory runs without a model (``memory.extraction: none``):
+        ``memorize`` stores a fact as written (:meth:`memorize_fact`)."""
+        return self._verbatim
+
+    def _inject_refusing_clients(self) -> None:
+        """Put a refusing client in every memU chat profile slot."""
+        for name in list(self._service.llm_profiles.profiles):
+            if name == "embedding":
+                continue
+            self._service._llm_clients[name] = _RefusingLLMClient(name)
+        logger.info("memory.extraction is 'none': memU's chat profiles refuse every call")
+
+    def _skips_session(self, session_id: str) -> bool:
+        """Whether ``memory.skip_sessions`` keeps this session out of memory."""
+        import fnmatch
+
+        return any(fnmatch.fnmatchcase(session_id, pattern) for pattern in self.config.memory.skip_sessions)
+
+    async def _embed_texts(self, texts: list[str]) -> np.ndarray:
+        """``texts`` as one ``(len, dim)`` float32 matrix (memU loop)."""
+        if self._embedder_kind == "local" and self._local_embedder is not None:
+            return await self._local_embedder.embed_array(texts)
+        return np.asarray(await self._service._get_llm_client("embedding").embed(texts), dtype=np.float32)
+
+    def _nearest_category_id(self, vec: np.ndarray) -> str | None:
+        """The category whose vector is closest to ``vec``; None without one."""
+        best: str | None = None
+        best_sim = -2.0
+        vnorm = float(np.linalg.norm(vec)) or 1.0
+        for cat_id, cat in self._service.database.memory_category_repo.categories.items():
+            cvec = getattr(cat, "embedding", None)
+            if cvec is None:
+                continue
+            arr = np.asarray(cvec, dtype=np.float32)
+            if arr.shape != vec.shape:
+                continue
+            sim = float(arr @ vec) / ((float(np.linalg.norm(arr)) or 1.0) * vnorm)
+            if sim > best_sim:
+                best, best_sim = cat_id, sim
+        return best
+
+    def _local_now(self) -> datetime:
+        try:
+            return datetime.now(ZoneInfo(self.config.timezone))
+        except Exception:
+            return datetime.now(timezone.utc)
+
+    def _local_stamp(self, value: str | None) -> str:
+        """A message timestamp as local ``YYYY-MM-DD HH:MM:SS`` in the
+        configured timezone (now when missing or unreadable)."""
+        parsed = _parse_iso(value) if value else None
+        try:
+            tz: Any = ZoneInfo(self.config.timezone)
+        except Exception:
+            tz = timezone.utc
+        moment = (parsed or datetime.now(timezone.utc)).astimezone(tz)
+        return moment.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _set_happened_at_sync(self, pairs: list[tuple[str, str]]) -> None:
+        """Write ``happened_at`` for (item id, value) pairs (blocking)."""
+        import sqlite3 as _sqlite3
+
+        if not pairs:
+            return
+        db_path = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
+        conn = _sqlite3.connect(db_path, timeout=60)
+        try:
+            conn.execute("PRAGMA busy_timeout=60000")
+            conn.executemany(
+                "UPDATE memu_memory_items SET happened_at = ? WHERE id = ?",
+                [(value, item_id) for item_id, value in pairs],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _hydrate_item_cache(self) -> int:
+        """Fill in what memU's loader leaves out of its cached items: each
+        row's ``extra`` (reinforcement count, content hash) and
+        ``happened_at``. Without them a restart blinds recall's salience and
+        chunk labels, and the semantic dedup would rewrite a row's extra
+        from an empty dict. One read of the items table (memU loop)."""
+        import sqlite3 as _sqlite3
+
+        items = self._service.database.memory_item_repo.items
+        db_path = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
+        try:
+            conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=30)
+            try:
+                rows = conn.execute("SELECT id, extra, happened_at FROM memu_memory_items").fetchall()
+            finally:
+                conn.close()
+        except _sqlite3.Error as exc:
+            logger.warning("Could not hydrate memU's item cache: %s", exc)
+            return 0
+        filled = 0
+        for item_id, extra_json, happened in rows:
+            item = items.get(item_id)
+            if item is None:
+                continue
+            if extra_json and not getattr(item, "extra", None):
+                try:
+                    item.__dict__["extra"] = json.loads(extra_json) if isinstance(extra_json, str) else dict(extra_json)
+                except (TypeError, ValueError):
+                    pass
+            if happened and getattr(item, "happened_at", None) is None:
+                parsed = _parse_iso(happened)
+                if parsed is not None:
+                    item.__dict__["happened_at"] = parsed.replace(tzinfo=None)
+            filled += 1
+        return filled
+
+    def _chunk_sources(self, resource_ids: list[str]) -> dict[str, str]:
+        """Resource id → URL, from the database (blocking): memU keeps no
+        resource cache after a restart."""
+        import sqlite3 as _sqlite3
+
+        if not resource_ids:
+            return {}
+        db_path = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
+        try:
+            conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=10)
+            try:
+                marks = ",".join("?" * len(resource_ids))
+                return dict(conn.execute(
+                    f"SELECT id, url FROM memu_resources WHERE id IN ({marks})", resource_ids,
+                ).fetchall())
+            finally:
+                conn.close()
+        except _sqlite3.Error:
+            return {}
+
+    def _cache_vector(self, repo: Any, item: Any, vec: np.ndarray) -> None:
+        """Keep a written row's vector in the cache and the vector index."""
+        cached = repo.items.get(item.id)
+        if cached is None:
+            return
+        cached.__dict__["embedding"] = vec
+        idx = _vec_index_note(repo)
+        if idx is not None:
+            idx.upsert(item.id, str(cached.memory_type), vec)
+            idx.seen_items_len = len(repo.items)
+
+    async def memorize_fact(
+        self,
+        content: str,
+        memory_type: str = "knowledge",
+        *,
+        date: str | None = None,
+        source_path: str | None = None,
+        source: str = "agent_tool",
+    ) -> bool:
+        """Store one fact as written — no model (``memory.extraction: none``).
+
+        The text is embedded locally; a near-identical fact of the same type
+        (see the semantic dedup) is reinforced instead of stored twice; a new
+        fact is linked to the category whose vector is closest. ``date``
+        (``YYYY-MM-DD``) is when an event happened; without it the date is
+        read from the text, and an event that names none happened today.
+        """
+        if not self._available or not self._service:
+            return False
+        op_id = self._metrics.begin_op("memorize_file", f"fact ({memory_type})")
+        try:
+            item_id, reinforced = await self._submit(
+                self._memorize_fact_impl(content, memory_type, date, source_path),
+            )
+        except Exception as exc:
+            self._metrics.end_op(op_id, success=False, error=str(exc))
+            raise
+        self._metrics.end_op(op_id, success=True)
+        await self._audit(
+            "item_updated" if reinforced else "item_created", "item", item_id, source,
+            {"memory_type": memory_type, "reinforced": reinforced, "verbatim": True},
+        )
+        return True
+
+    async def _memorize_fact_impl(
+        self, content: str, memory_type: str, date: str | None, source_path: str | None,
+    ) -> tuple[str, bool]:
+        content = content.strip()
+        if not content:
+            raise ValueError("nothing to memorize")
+        if memory_type not in FACT_MEMORY_TYPES:
+            raise ValueError(f"memory_type must be one of {sorted(FACT_MEMORY_TYPES)}, got {memory_type!r}")
+        db = self._service.database
+        vec = (await self._embed_texts([content]))[0]
+        resource = db.resource_repo.create_resource(
+            url=source_path or f"memorize:{int(time.time() * 1000)}",
+            modality="document",
+            local_path=source_path or "",
+            caption=content[:160],
+            embedding=None,
+            user_data={},
+        )
+        item = db.memory_item_repo.create_item(
+            resource_id=resource.id,
+            memory_type=memory_type,
+            summary=content,
+            embedding=vec,
+            user_data={},
+            reinforce=True,
+        )
+        reinforced = item.summary != content or int((item.extra or {}).get("reinforcement_count", 1) or 1) > 1
+        if reinforced:
+            logger.info("Memorize: reinforced %s instead of storing a near-identical fact", item.id)
+            return item.id, True
+        self._cache_vector(db.memory_item_repo, item, vec)
+        category_id = self._nearest_category_id(vec)
+        if category_id is not None:
+            db.category_item_repo.link_item_category(item.id, category_id, user_data={})
+        happened = None
+        if date:
+            happened = datetime.strptime(date, "%Y-%m-%d").date().isoformat()
+        elif memory_type == "event":
+            now = self._local_now()
+            happened = _parse_event_date(content, now) or now.date().isoformat()
+        if happened:
+            await asyncio.to_thread(self._set_happened_at_sync, [(item.id, happened)])
+            cached = db.memory_item_repo.items.get(item.id)
+            if cached is not None:
+                cached.__dict__["happened_at"] = datetime.strptime(happened, "%Y-%m-%d")
+        return item.id, False
+
+    async def _index_conversation_chunks_impl(
+        self, session_id: str, entries: list[dict[str, str]], conv_path: str,
+    ) -> int:
+        """Store a transcript as embedded ``conversation`` chunks (memU loop);
+        returns how many. The resource row carries the first user message as
+        its caption, which the date listing shows for the session."""
+        chunks = _chunk_conversation(entries)
+        if not chunks:
+            return 0
+        db = self._service.database
+        first_user = next((e["content"] for e in entries if e.get("role") == "user" and e.get("content")), "")
+        resource = db.resource_repo.create_resource(
+            url=conv_path,
+            modality="conversation",
+            local_path=conv_path,
+            caption=" ".join(first_user.split())[:160] or None,
+            embedding=None,
+            user_data={},
+        )
+        vectors = await self._embed_texts([text for text, _ in chunks])
+        stamps: list[tuple[str, str]] = []
+        for (text, first_ts), vec in zip(chunks, vectors, strict=True):
+            item = db.memory_item_repo.create_item(
+                resource_id=resource.id,
+                memory_type="conversation",
+                summary=text,
+                embedding=vec,
+                user_data={},
+            )
+            self._cache_vector(db.memory_item_repo, item, vec)
+            stamp = self._local_stamp(first_ts)
+            stamps.append((item.id, stamp))
+            cached = db.memory_item_repo.items.get(item.id)
+            if cached is not None:
+                cached.__dict__["happened_at"] = datetime.strptime(stamp, "%Y-%m-%d %H:%M:%S")
+        await asyncio.to_thread(self._set_happened_at_sync, stamps)
+        return len(chunks)
+
+    async def _index_document_chunks_impl(self, file_path: str, modality: str) -> int:
+        """Store a file as embedded ``document`` chunks (memU loop)."""
+        text = await asyncio.to_thread(Path(file_path).read_text, encoding="utf-8", errors="replace")
+        chunks = _chunk_document(text)
+        if not chunks:
+            return 0
+        db = self._service.database
+        resource = db.resource_repo.create_resource(
+            url=file_path,
+            modality=modality,
+            local_path=file_path,
+            caption=Path(file_path).name,
+            embedding=None,
+            user_data={},
+        )
+        vectors = await self._embed_texts(chunks)
+        for text, vec in zip(chunks, vectors, strict=True):
+            item = db.memory_item_repo.create_item(
+                resource_id=resource.id,
+                memory_type="document",
+                summary=text,
+                embedding=vec,
+                user_data={},
+            )
+            self._cache_vector(db.memory_item_repo, item, vec)
+        return len(chunks)
+
+    async def _update_item_verbatim_impl(
+        self, memory_id: str, content: str | None, memory_type: str | None, categories: list[str] | None,
+    ) -> bool:
+        """Update an item without memU's category-summary step (memU loop)."""
+        db = self._service.database
+        repo = db.memory_item_repo
+        if memory_id not in repo.items:
+            return False
+        vec = (await self._embed_texts([content]))[0] if content is not None else None
+        repo.update_item(item_id=memory_id, memory_type=memory_type, summary=content, embedding=vec)
+        cached = repo.items.get(memory_id)
+        if vec is not None and cached is not None:
+            self._cache_vector(repo, cached, vec)
+        elif cached is not None and memory_type is not None:
+            idx = _vec_index_note(repo)
+            if idx is not None and getattr(cached, "embedding", None) is not None:
+                idx.upsert(memory_id, memory_type, cached.embedding)
+        if categories is not None:
+            ctx = self._service._get_context()
+            wanted = set(self._service._map_category_names_to_ids(categories, ctx))
+            current = {rel.category_id for rel in db.category_item_repo.get_item_categories(memory_id)}
+            for category_id in current - wanted:
+                db.category_item_repo.unlink_item_category(memory_id, category_id)
+            for category_id in wanted - current:
+                db.category_item_repo.link_item_category(memory_id, category_id, user_data={})
+        return True
+
+    async def _delete_item_verbatim_impl(self, memory_id: str) -> None:
+        """Delete an item and its category links, without memU's
+        category-summary step (memU loop)."""
+        db = self._service.database
+        for rel in list(db.category_item_repo.get_item_categories(memory_id)):
+            db.category_item_repo.unlink_item_category(memory_id, rel.category_id)
+        db.memory_item_repo.delete_item(memory_id)
+        idx = _vec_index_note(db.memory_item_repo)
+        if idx is not None:
+            idx.remove(memory_id)
+            idx.seen_items_len = len(db.memory_item_repo.items)
+
+    async def _backfill_embeddings(self) -> None:
+        """Give every item and category stored without a vector one (memU
+        loop, in the background).
+
+        Writes ``embedding_json`` directly, leaving ``updated_at`` alone: an
+        embedding is not an edit, and ``memory_records_by_date(updated=true)``
+        (the daily maintenance job) must not see thousands of rows as changed.
+        The cached rows and the vector index are updated in place, so recall
+        finds a row as soon as its batch lands.
+        """
+        state = self._embed_backfill
+        try:
+            item_repo = self._service.database.memory_item_repo
+            cat_repo = self._service.database.memory_category_repo
+            local = self._local_embedder if self._embedder_kind == "local" else None
+            # Vectors from another model live in another space: re-embed
+            # every row when the recorded model changed, and any row whose
+            # width is not the local model's.
+            model_id = self.config.memory.local_model_id if local is not None else self.config.memory.embed_model
+            recorded = await asyncio.to_thread(self._embedding_model_marker)
+            redo_all = bool(recorded) and recorded != model_id
+            want_dim = local.dim if local is not None else None
+
+            def needs_vector(vec: Any) -> bool:
+                if redo_all or vec is None:
+                    return True
+                return want_dim is not None and len(vec) != want_dim
+
+            items = [
+                (item_id, item.summary or "")
+                for item_id, item in item_repo.items.items()
+                if needs_vector(getattr(item, "embedding", None))
+            ]
+            cats = [
+                (cat_id, f"{cat.name}: {cat.description or ''}\n{cat.summary or ''}".strip())
+                for cat_id, cat in cat_repo.categories.items()
+                if needs_vector(getattr(cat, "embedding", None))
+            ]
+            if not items and not cats:
+                await asyncio.to_thread(self._embedding_model_marker, model_id)
+                state.update({"state": "done", "missing": 0})
+                return
+            total = len(items) + len(cats)
+            state.update({"state": "running", "total": total, "done": 0})
+            logger.info(
+                "Embedding %d memories and %d categories with %s%s",
+                len(items), len(cats), model_id or "the configured embedder",
+                f" (vectors were from {recorded})" if redo_all else "",
+            )
+            client = self._service._get_llm_client("embedding")
+
+            async def embed(texts: list[str]) -> Any:
+                # The local embedder hands back one float32 matrix: no Python
+                # float per number, so thousands of rows cost megabytes.
+                if local is not None:
+                    return await local.embed_array(texts)
+                return await client.embed(texts)
+
+            t0 = time.monotonic()
+            idx = _vec_index_for(item_repo)
+            batch = 256
+            for start in range(0, len(items), batch):
+                chunk = items[start:start + batch]
+                vectors = await embed([text for _, text in chunk])
+                pairs = list(zip([item_id for item_id, _ in chunk], vectors, strict=True))
+                await asyncio.to_thread(self._store_embeddings_sync, item_repo, pairs)
+                for item_id, vec in pairs:
+                    cached = item_repo.items.get(item_id)
+                    if cached is None:
+                        continue
+                    arr = np.asarray(vec, dtype=np.float32)
+                    cached.__dict__["embedding"] = arr
+                    idx.upsert(item_id, str(cached.memory_type), arr)
+                idx.seen_items_len = len(item_repo.items)
+                state["done"] = start + len(chunk)
+            if cats:
+                vectors = await embed([text for _, text in cats])
+                pairs = list(zip([cat_id for cat_id, _ in cats], vectors, strict=True))
+                await asyncio.to_thread(self._store_embeddings_sync, cat_repo, pairs)
+                for cat_id, vec in pairs:
+                    cached = cat_repo.categories.get(cat_id)
+                    if cached is not None:
+                        cached.__dict__["embedding"] = np.asarray(vec, dtype=np.float32)
+            await asyncio.to_thread(self._embedding_model_marker, model_id)
+            seconds = round(time.monotonic() - t0, 1)
+            state.update({"state": "done", "done": total, "seconds": seconds})
+            logger.info("Embedded %d rows in %.1fs", total, seconds)
+            # Hand the pass's transient buffers back to the OS.
+            await asyncio.to_thread(self._release_memory)
+        except Exception as exc:
+            state.update({"state": "failed", "error": str(exc)[:300]})
+            logger.error("Embedding backfill failed: %s", exc, exc_info=True)
+
+    def _embedding_model_marker(self, model_id: str | None = None) -> str:
+        """Read (or, given ``model_id``, record) which model produced the
+        stored vectors, in a one-row table Nerve keeps in memU's database
+        (blocking). Empty when nothing is recorded yet."""
+        import sqlite3 as _sqlite3
+
+        db_path = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
+        conn = _sqlite3.connect(db_path, timeout=60)
+        try:
+            conn.execute("PRAGMA busy_timeout=60000")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS nerve_memu_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            if model_id is not None:
+                conn.execute(
+                    "INSERT INTO nerve_memu_meta (key, value) VALUES ('embedding_model', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (model_id,),
+                )
+                conn.commit()
+                return model_id
+            row = conn.execute("SELECT value FROM nerve_memu_meta WHERE key = 'embedding_model'").fetchone()
+            return row[0] if row else ""
+        finally:
+            conn.close()
+
+    def _store_embeddings_sync(self, repo: Any, pairs: list[tuple[str, list[float]]]) -> None:
+        """Write ``embedding_json`` for ``pairs`` of (row id, vector) into
+        ``repo``'s table, without touching ``updated_at`` (blocking)."""
+        import sqlite3 as _sqlite3
+
+        model = getattr(repo, "_memory_item_model", None) or getattr(repo, "_memory_category_model", None)
+        table = getattr(model, "__tablename__", None)
+        if not table:
+            raise RuntimeError(f"cannot tell the table of {type(repo).__name__}")
+        db_path = self.config.memory.sqlite_dsn.replace("sqlite:///", "")
+        conn = _sqlite3.connect(db_path, timeout=60)
+        try:
+            conn.execute("PRAGMA busy_timeout=60000")
+            conn.executemany(
+                f"UPDATE {table} SET embedding_json = ? WHERE id = ?",
+                (
+                    (json.dumps(np.round(np.asarray(vec, dtype=np.float32), 6).tolist()), row_id)
+                    for row_id, vec in pairs
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def _attach_engine_pragmas(self) -> None:
         """Per-connection pragmas for memU's SQLAlchemy engine.
 
@@ -1667,7 +2706,7 @@ class MemUBridge:
 
             # Set semantic dedup threshold from config before patches run.
             global _SEMANTIC_DEDUP_THRESHOLD
-            _SEMANTIC_DEDUP_THRESHOLD = self.config.memory.semantic_dedup_threshold
+            _SEMANTIC_DEDUP_THRESHOLD = self.config.memory.dedup_threshold(self._embedder_kind)
 
             self._patch_sqlite_bugs()
 
@@ -1713,11 +2752,23 @@ class MemUBridge:
                 },
             }
 
-            if self.config.openai_api_key:
+            embedder = self._embedder_kind
+            if embedder == "openai":
                 llm_profiles["embedding"] = {
                     "base_url": "https://api.openai.com/v1",
                     "api_key": self.config.openai_api_key,
                     "embed_model": self.config.memory.embed_model,
+                    "client_backend": "sdk",
+                }
+            elif embedder == "local":
+                # memU wants an embedding profile to exist; its placeholder
+                # OpenAI client is never built, because the local fastembed
+                # client takes the profile's slot right after memU starts
+                # (_inject_local_embedder), before anything embeds.
+                llm_profiles["embedding"] = {
+                    "base_url": "https://placeholder.invalid/v1",
+                    "api_key": "local",
+                    "embed_model": self.config.memory.local_model_id,
                     "client_backend": "sdk",
                 }
 
@@ -1767,11 +2818,12 @@ class MemUBridge:
                     # conversations as instructions, generating long off-topic
                     # responses that exceed the per-call timeout.
                     "preprocess_llm_profile": fast_profile,
-                    # When no embedding provider is configured, all memory
-                    # work goes through Anthropic — use Haiku for extraction
-                    # too to avoid saturating the rate-limit budget.
+                    # Unless OpenAI also takes the embeddings, every model
+                    # call of memory work goes through Anthropic — use Haiku
+                    # for extraction too to avoid saturating the rate-limit
+                    # budget. (Local embeddings call no API at all.)
                     "memory_extract_llm_profile": (
-                        fast_profile if not self.config.openai_api_key
+                        fast_profile if embedder != "openai"
                         else memorize_profile
                     ),
                     "category_update_llm_profile": fast_profile,
@@ -1798,15 +2850,18 @@ class MemUBridge:
                         # See _KNOWLEDGE_CUSTOM_RULES / _KNOWLEDGE_CUSTOM_EXAMPLES.
                     },
                 },
+                # With an embedder, recall() runs Nerve's hybrid search and
+                # memU's retrieve workflow is not used; "rag" keeps memU's
+                # own vector paths consistent with that.
                 retrieve_config={
-                    "method": "llm" if not self.config.openai_api_key else "rag",
+                    "method": "llm" if embedder == "none" else "rag",
                     "route_intention": False,
                     "sufficiency_check": False,
                     "resource": {"enabled": False},
                     # Use Haiku for LLM-based ranking — cheaper and avoids
                     # sharing Sonnet's rate-limit budget with the main agent.
                     **({"llm_ranking_llm_profile": fast_profile}
-                       if not self.config.openai_api_key else {}),
+                       if embedder == "none" else {}),
                 },
             )
             self._available = True
@@ -1830,6 +2885,16 @@ class MemUBridge:
                 None,
             ) or "memu_memory_items"
             self._ensure_sqlite_indexes(sqlite_dsn, item_table)
+            # Keyword leg of hybrid recall: an FTS5 table kept in step with
+            # the items table by triggers.  Cheap to keep even without an
+            # embedder, so it is always there when one is switched on.
+            self._ensure_fts_index(sqlite_dsn, item_table)
+
+            # ── Local embedder injection ──
+            # Before anything embeds (category sync below creates missing
+            # categories with a vector).
+            if embedder == "local":
+                self._inject_local_embedder()
 
             # ── Bedrock client injection ──
             # Replace the placeholder OpenAISDKClient instances with real
@@ -1840,6 +2905,10 @@ class MemUBridge:
                 self._inject_bedrock_clients()
             else:
                 self._name_system_principal()
+            # No-LLM memory: every chat profile refuses, so nothing in memU
+            # can reach a model (warm-up skips clients it cannot ping).
+            if self._verbatim:
+                self._inject_refusing_clients()
 
             await self._ensure_categories()
 
@@ -1868,7 +2937,7 @@ class MemUBridge:
             # memorize pipeline's "categorize_items" step with one that
             # stores items and resources with embedding=None.  This
             # avoids KeyError on the missing "embedding" LLM profile.
-            if not self.config.openai_api_key:
+            if embedder == "none":
                 from memu.workflow.step import WorkflowStep as _WfStep
 
                 _svc = self._service
@@ -2088,6 +3157,10 @@ class MemUBridge:
                 # search doesn't pay the full matrix stack.
                 _vec_index_for(self._service.database.memory_item_repo)
 
+                # memU's loader leaves each row's extra (reinforcement,
+                # content hash) and happened_at out of the cache.
+                self._hydrate_item_cache()
+
                 logger.info(
                     "Preloaded %d items and %d categories into vector cache "
                     "(%d embeddings converted to numpy float32)",
@@ -2124,6 +3197,14 @@ class MemUBridge:
 
                 _numpy_create_item._nerve_numpy_wrapped = True  # type: ignore[attr-defined]
                 SQLiteMemoryItemRepo.create_item = _numpy_create_item
+
+            # Rows stored without a vector (everything written while no
+            # embedder was configured) get one in the background; recall
+            # works meanwhile, its keyword leg covering the rest.
+            if self._hybrid_recall:
+                self._embed_backfill_task = asyncio.get_running_loop().create_task(
+                    self._backfill_embeddings(),
+                )
 
             return True
 
@@ -2575,6 +3656,21 @@ class MemUBridge:
         """Memorize a local file by its absolute path."""
         if not self._available or not self._service:
             return False
+        if self._verbatim:
+            # No extraction: the file's text as embedded chunks.
+            op_id = self._metrics.begin_op("memorize_file", file_path)
+            try:
+                count = await asyncio.wait_for(
+                    self._submit(self._index_document_chunks_impl(file_path, modality)),
+                    timeout=self._MEMORIZE_TIMEOUT,
+                )
+            except Exception as exc:
+                self._metrics.end_op(op_id, success=False, error=str(exc))
+                logger.error("Indexing %s failed: %s", file_path, exc)
+                return False
+            self._metrics.end_op(op_id, success=True)
+            await self._audit("file_indexed", "resource", file_path, source, {"chunks": count})
+            return True
 
         file_size = -1
         try:
@@ -2741,6 +3837,10 @@ class MemUBridge:
         """
         if not messages or not self._available:
             return False
+        if self._skips_session(session_id):
+            # Handled, not failed: the caller's watermark moves past it.
+            logger.info("Not indexing session %s (memory.skip_sessions)", session_id)
+            return True
 
         entries: list[dict[str, str]] = []
         earliest_ts: str | None = None
@@ -2782,6 +3882,17 @@ class MemUBridge:
                 "Memorizing conversation: session=%s, messages=%d, file=%s (%d bytes)",
                 session_id, len(entries), conv_path.name, payload_bytes,
             )
+            if self._verbatim:
+                # No extraction: the transcript itself, as embedded chunks.
+                count = await asyncio.wait_for(
+                    self._submit(self._index_conversation_chunks_impl(session_id, entries, str(conv_path))),
+                    timeout=self._MEMORIZE_TIMEOUT,
+                )
+                await self._audit("conversation_indexed", "resource", session_id, "bridge", {
+                    "message_count": len(entries), "chunks": count,
+                })
+                self._metrics.end_op(op_id, success=True)
+                return True
             ok = await self.memorize_file(str(conv_path), modality="conversation")
 
             # memU doesn't set happened_at from conversation timestamps.
@@ -2823,7 +3934,12 @@ class MemUBridge:
 
         Runs synchronous work (sqlite3 + Anthropic API) in a dedicated thread
         pool so it cannot starve the default asyncio executor.
+
+        Never with ``memory.extraction: none``: no model is called there, and
+        the no-LLM writes set their own dates.
         """
+        if self._verbatim:
+            return
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
             self._blocking_pool, self._resolve_event_dates_sync, conversation_ts,
@@ -3160,6 +4276,15 @@ class MemUBridge:
             return []
         op_id = self._metrics.begin_op("recall", query[:80])
         try:
+            if self._hybrid_recall:
+                # Vector + keyword search over the stored rows; no model
+                # reads the memory (memU's retrieve workflow is not used).
+                items_out, cats_out = await self._submit(
+                    self._hybrid_recall_impl(query, limit, category_limit),
+                )
+                self._metrics.end_op(op_id, success=True)
+                return items_out + cats_out
+
             # Retrieve runs vector search (numpy) and possibly SQLite reads
             # inline — keep it on the memU loop.
             result = await self._submit(self._service.retrieve(
@@ -3215,12 +4340,111 @@ class MemUBridge:
         except Exception as e:
             logger.error("memU recall failed: %s", e)
             self._metrics.end_op(op_id, success=False, error=str(e))
-            # A transient backend outage must not masquerade as "no results" —
-            # surface it so the caller can flag amnesia instead of trusting the
-            # empty list.
+            # A failed recall must not masquerade as "no results": surface it
+            # so the caller can flag amnesia instead of trusting an empty
+            # list.  An outage may pass; anything else (a prompt over the
+            # model's limit, a broken index) will not, and is named so.
             if _is_transient_llm_error(e):
                 raise MemoryBackendUnavailable(f"memory backend unavailable: {e}") from e
-            return []
+            raise MemoryRecallFailed(f"memory recall failed: {e}") from e
+
+    def _recall_entry(self, item_id: str, item: Any, sources: dict[str, str] | None = None) -> dict[str, str]:
+        """One recall result. A chunk is prefixed with where it is from:
+        ``(2026-11-03 14:19, session 3f9a1c07)`` for a transcript, the file
+        name for a workspace file. ``sources`` maps resource ids to URLs
+        (read from the database: memU keeps no resource cache)."""
+        mtype = str(item.memory_type or "")
+        summary = item.summary
+        if mtype in CHUNK_MEMORY_TYPES:
+            url = (sources or {}).get(str(getattr(item, "resource_id", "") or ""), "")
+            if mtype == "conversation":
+                when = getattr(item, "happened_at", None)
+                stamp = when.strftime("%Y-%m-%d %H:%M") if isinstance(when, datetime) else str(when or "")[:16]
+                where = ", ".join(part for part in (stamp, f"session {_session_of_url(url)}" if url else "") if part)
+            else:
+                where = Path(url).name if url else ""
+            if where:
+                summary = f"({where}) {summary}"
+        return {"id": item_id, "type": mtype, "summary": summary}
+
+    async def _hybrid_recall_impl(
+        self, query: str, limit: int, category_limit: int,
+    ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+        """Hybrid recall (memU loop): the question's vector against every
+        item's, its words against the keyword index, fused by rank (see
+        :func:`_fuse_recall_hits`); categories ranked by their vectors and
+        reduced to breadcrumbs as in the LLM path."""
+        item_repo = self._service.database.memory_item_repo
+        name_terms = self._user_name_terms_for(item_repo.items)
+        # memU writes "the user", while a question names them ("what makes
+        # Alice angry"): searched as written, the name pulls up rows that
+        # merely state it.  A question that names the user is searched both
+        # ways, and its keyword leg leaves the name out; a question about the
+        # name itself ("who is Alice") is still found by the as-written leg.
+        as_user = _as_the_user(query, name_terms)
+        queries = [query] if as_user == query else [query, as_user]
+        client = self._service._get_llm_client("embedding")
+        qvecs = np.asarray(await client.embed(queries), dtype=np.float32)
+        qvec = qvecs[0]
+        index = _vec_index_for(item_repo)
+        legs = [
+            [item_id for item_id, _sim in index.search(vec, _HYBRID_CANDIDATES)]
+            for vec in qvecs
+        ]
+        legs.append(await asyncio.to_thread(
+            self._fts_search, query, _HYBRID_CANDIDATES, name_terms,
+        ))
+        fused = _fuse_recall_hits(legs, item_repo.items)
+
+        # Facts first: chunks (transcripts, files) take at most _CHUNK_SHARE
+        # of the answer, and fill it only when the facts run out.
+        chosen: list[str] = []
+        chunk_cap = max(1, int(limit * _CHUNK_SHARE)) if limit > 0 else 0
+        chunks_taken = 0
+        held_back: list[str] = []
+        for item_id, _score in fused:
+            if len(chosen) >= limit:
+                break
+            item = item_repo.items[item_id]
+            if not item.summary:
+                continue
+            if str(item.memory_type or "") in CHUNK_MEMORY_TYPES:
+                if chunks_taken >= chunk_cap:
+                    held_back.append(item_id)
+                    continue
+                chunks_taken += 1
+            chosen.append(item_id)
+        for item_id in held_back:
+            if len(chosen) >= limit:
+                break
+            chosen.append(item_id)
+        chunk_resources = sorted({
+            str(getattr(item_repo.items[i], "resource_id", "") or "")
+            for i in chosen
+            if str(item_repo.items[i].memory_type or "") in CHUNK_MEMORY_TYPES
+        } - {""})
+        sources = await asyncio.to_thread(self._chunk_sources, chunk_resources) if chunk_resources else {}
+        items_out = [self._recall_entry(i, item_repo.items[i], sources) for i in chosen]
+
+        cats_out: list[dict[str, str]] = []
+        qnorm = float(np.linalg.norm(qvec)) or 1.0
+        ranked: list[tuple[float, Any]] = []
+        for cat in self._service.database.memory_category_repo.categories.values():
+            vec = getattr(cat, "embedding", None)
+            if vec is None:
+                continue
+            arr = np.asarray(vec, dtype=np.float32)
+            if arr.shape != qvec.shape:
+                continue
+            ranked.append((float(arr @ qvec) / ((float(np.linalg.norm(arr)) or 1.0) * qnorm), cat))
+        ranked.sort(key=lambda pair: pair[0], reverse=True)
+        for _sim, cat in ranked[:category_limit]:
+            crumb = _category_breadcrumb(cat.name or "", cat.description or "", cat.summary or "")
+            if crumb or cat.name:
+                cats_out.append({
+                    "id": f"cat:{cat.id}", "type": "category", "name": cat.name or "", "summary": crumb,
+                })
+        return items_out, cats_out
 
     async def expand_category(
         self, category_id: str, query: str = "", limit: int = 20,
@@ -3346,7 +4570,14 @@ class MemUBridge:
                 kwargs["memory_type"] = memory_type
             if categories is not None:
                 kwargs["memory_categories"] = categories
-            await self._submit(self._service.update_memory_item(**kwargs))
+            if self._verbatim:
+                # memU's update rewrites category summaries with a model.
+                if not await self._submit(
+                    self._update_item_verbatim_impl(memory_id, content, memory_type, categories),
+                ):
+                    return False
+            else:
+                await self._submit(self._service.update_memory_item(**kwargs))
             logger.info("Updated memory item: %s", memory_id)
             await self._audit("item_updated", "item", memory_id, source, {
                 "content_changed": content is not None,
@@ -3363,7 +4594,11 @@ class MemUBridge:
         if not self._available or not self._service:
             return False
         try:
-            await self._submit(self._service.delete_memory_item(memory_id=memory_id))
+            if self._verbatim:
+                # memU's delete rewrites category summaries with a model.
+                await self._submit(self._delete_item_verbatim_impl(memory_id))
+            else:
+                await self._submit(self._service.delete_memory_item(memory_id=memory_id))
             logger.info("Deleted memory item: %s", memory_id)
             await self._audit("item_deleted", "item", memory_id, source)
             return True
@@ -3497,7 +4732,7 @@ class MemUBridge:
             new_desc = description if description is not None else cat.description
             new_summary = summary if summary is not None else cat.summary
 
-            # Re-embed from the updated text (requires OpenAI key)
+            # Re-embed from the updated text (when an embedder is configured)
             embedding = None
             if self._has_embeddings:
                 try:
@@ -3613,7 +4848,10 @@ class MemUBridge:
                 items = self._service.database.memory_item_repo.list_items()
                 for item_id, item in items.items():
                     if getattr(item, "resource_id", None) == res_id:
-                        await self._service.delete_memory_item(memory_id=item_id)
+                        if self._verbatim:
+                            await self._delete_item_verbatim_impl(item_id)
+                        else:
+                            await self._service.delete_memory_item(memory_id=item_id)
 
     def _collect_md_files(self, workspace: Path) -> list[tuple[Path, str]]:
         """Collect all .md files that should be indexed."""
@@ -3658,6 +4896,7 @@ class MemUBridge:
             "total_resources": 0,
             "type_distribution": {},
             "events_missing_happened_at": 0,
+            "items_with_embeddings": 0,
             "db_size_mb": 0,
         }
 
@@ -3679,6 +4918,9 @@ class MemUBridge:
             stats["events_missing_happened_at"] = db.execute(
                 "SELECT COUNT(*) FROM memu_memory_items WHERE happened_at IS NULL AND memory_type = 'event'"
             ).fetchone()[0]
+            stats["items_with_embeddings"] = db.execute(
+                "SELECT COUNT(*) FROM memu_memory_items WHERE embedding_json IS NOT NULL"
+            ).fetchone()[0]
             db.close()
         except Exception as e:
             logger.warning("Failed to query memU DB stats: %s", e)
@@ -3689,6 +4931,15 @@ class MemUBridge:
         """Complete health snapshot for the diagnostics endpoint."""
         result = self._metrics.to_dict()
         result["database"] = await self.get_db_stats()
+        result["embedder"] = {
+            "kind": self._embedder_kind,
+            "model": (
+                self.config.memory.local_model_id if self._embedder_kind == "local"
+                else self.config.memory.embed_model if self._embedder_kind == "openai"
+                else ""
+            ),
+            "backfill": dict(self._embed_backfill),
+        }
         return result
 
     @property
@@ -3701,5 +4952,17 @@ class MemUBridge:
 
     @property
     def _has_embeddings(self) -> bool:
-        """Whether an embedding provider (e.g. OpenAI) is configured."""
-        return bool(self.config.openai_api_key)
+        """Whether an embedder is configured: fastembed (``local``) or OpenAI."""
+        return self._embedder_kind != "none"
+
+    @property
+    def _hybrid_recall(self) -> bool:
+        """Whether recall runs Nerve's hybrid search and the startup backfill
+        embeds stored rows: when ``memory.embedder`` names an embedder, and
+        in ``extraction: none`` mode with whichever embedder is in effect
+        (its chunks need the labelled, capped hybrid path). Otherwise an
+        install that leaves ``embedder`` unset keeps memU's own recall, as
+        before, even with ``openai_api_key`` set."""
+        if not self._has_embeddings:
+            return False
+        return self.config.memory.embedder in ("local", "openai") or self._verbatim
