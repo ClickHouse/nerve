@@ -1051,6 +1051,31 @@ SEND_FILE_SCHEMA = {
     "required": ["file_path"],
 }
 
+PUBLISH_ARTIFACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {
+            "type": "string",
+            "description": (
+                "The workspace path to publish: a folder with an index.html, an index.html, "
+                "another .html file, a Markdown (.md) or CSV (.csv) file, or an image"
+            ),
+        },
+        "title": {
+            "type": "string",
+            "description": "The title that people see in the viewer, at most 200 characters",
+        },
+        "artifact_id": {
+            "type": "string",
+            "description": (
+                "Optional. The artifact ID of an earlier result of this tool: the publish "
+                "becomes a new version of that artifact, at the same address"
+            ),
+        },
+    },
+    "required": ["path", "title"],
+}
+
 SEND_CHANNEL_MESSAGE_SCHEMA = {
     "type": "object",
     "properties": {

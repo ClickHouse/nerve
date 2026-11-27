@@ -37,6 +37,7 @@ from nerve.agent.streaming import broadcaster
 from nerve.config import EXTERNAL_VERIFICATION_LOG, NerveConfig, get_config
 from nerve.db import Database, init_db, close_db
 from nerve.db.base import check_database_file
+from nerve.artifacts.publish import pin_publish_settings
 from nerve.gateway.actor_context import KeysUnavailable
 from nerve.gateway.auth import (
     ACTOR_CONTEXT_HEADER,
@@ -1188,6 +1189,9 @@ def create_app() -> FastAPI:
     startup.
     """
     pin_auth_mode(auth_mode_from_env())
+    # The publish of artifacts follows the mode and needs a restart, as the
+    # mode does: its route, GET /api/auth/me and the tool list read this.
+    pin_publish_settings(get_config())
     if is_external_mode():
         external = get_config().auth.external
         if external.gateway_jwks_file is None:

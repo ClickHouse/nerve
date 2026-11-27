@@ -13,6 +13,7 @@ import { clearAllSeen } from './helpers/agentSeen';
 import { selectViewerStorage } from './helpers/viewerStorage';
 import { useSetupStore } from './setupStore';
 import { applyViewerPreview } from './previewStore';
+import { applyViewerArtifacts } from './artifactStore';
 
 /** Who a session belongs to. Enough to tell one person's session from another's. */
 export interface SignedInAccount {
@@ -177,6 +178,7 @@ async function loadIdentity(): Promise<Identity | null> {
   try {
     const viewer = await api.getViewer();
     applyViewerPreview(viewer.preview);
+    applyViewerArtifacts(viewer.artifacts);
     return identityOf(viewer);
   } catch {
     return null;
@@ -380,6 +382,7 @@ async function enterHosted(authSession: number, statusRead: boolean): Promise<vo
     try {
       viewer = await api.getViewer();
       applyViewerPreview(viewer.preview);
+      applyViewerArtifacts(viewer.artifacts);
     } catch {
       viewer = null;
     }

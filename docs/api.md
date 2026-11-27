@@ -106,6 +106,15 @@ the answer also has `"preview": { "max_bytes": 10485760 }`: the most bytes
 that the files of one preview may have together. Without the switch the
 member is absent, and the web UI shows no preview.
 
+In external mode with `artifacts.publish` or `artifacts.viewer_origin`
+set, the answer also has
+`"artifacts": { "publish": true, "viewer_origin": "https://artifacts.example.test" }`:
+whether the Preview tab has the **Publish** button (`artifacts.publish`), and
+the origin of the artifact viewer (`artifacts.viewer_origin`, `null` when it
+is not set). In local mode, and in external mode with neither setting, the
+member is absent. See
+[Published artifacts](web-ui.md#published-artifacts).
+
 ### Accounts
 
 Every signed-in account can manage accounts. System credentials cannot. Account
@@ -2186,6 +2195,57 @@ Content-Security-Policy: sandbox; default-src 'none'
 X-Content-Type-Options: nosniff
 Cache-Control: no-store
 ```
+
+### Artifacts
+
+#### `POST /api/artifacts/publish`
+The **Publish** button of the Preview tab: publish the bundle of `path` (see
+[Preview](web-ui.md#preview)) to the platform as an artifact, for the
+members of this agent. The route runs the handler of the tool
+`publish_artifact` with the person of the request as the actor, and names
+that person to the platform as the publisher. With `artifact_id`, the
+publish is a new version of that artifact. It exists only in external mode
+with `artifacts.publish` on (see [Artifacts](config.md#artifacts)).
+
+```json
+Request: { "path": "decks/q3/index.html", "title": "Q3 review", "artifact_id": null }
+Response: {
+  "artifact_id": "7d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+  "version": 1,
+  "viewer_url": "https://artifacts.example.test/t/<tenant>/a/7d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+  "expires_at": "2026-12-25T10:00:00Z",
+  "title": "Q3 review",
+  "changed_after": false
+}
+```
+
+The version is exactly the bytes that the publish read and hashed.
+`changed_after` is `true` when a file of the bundle changed after the
+publish read it: the version has the earlier state, and the next publish
+sends the newer one.
+
+Errors are `{"detail": {"code": "<code>", "message": "<sentence>"}}`. The
+`message` is a sentence for a person. 400 `invalid_arguments`; 404
+`not_found` (no artifact `artifact_id` of this agent); 409 `server_missing`
+(the catalog of the MCP gateway has no `nerve-artifacts` server for this agent),
+`server_refused` (the gateway did not let the agent use the server: the
+policy of the tenant, or no working credential) and
+`upload_origins_missing` (`artifacts.upload_origins` is empty); 502
+`upload_failed` (an upload did not end: the message names the file and the
+HTTP status; also bytes that differ from the hashed ones when they are
+sent), `upload_origin_refused` (the platform returned an upload address
+outside `artifacts.upload_origins`; nothing was sent to any link of that
+answer) and `platform_error` (also an answer of the platform that is not
+valid: a field that is not of its type, an `artifact_id` that is not the
+one of the version; the message then has no text of the answer); 503
+`platform_unavailable` and `platform_busy`; 422 for every
+other code: a refusal of the bundle (the codes of
+[`GET /api/preview/bundle`](#get-apipreviewbundlepathpath), also its
+`not_found` for a path that does not exist, and `changed` for a file that
+is not the described file when it is opened for the upload) or a refusal
+reason of the platform (for example
+`restricted_egress` or `limit_tenant_storage`). No answer holds an upload
+link.
 
 ### Memory Files
 

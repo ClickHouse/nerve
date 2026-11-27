@@ -3719,6 +3719,107 @@ class McpAppsConfig:
         return cls(enabled=d.get("enabled", False))
 
 
+#: The refused viewer origins that this process logged already: a config is
+#: built again at every reload.
+_refused_viewer_origins: set[str] = set()
+
+
+def _viewer_origin(value: Any) -> str:
+    """``value`` as the origin of the artifact viewer, in lower case, or
+    ``""`` when it is not one.
+
+    An origin is ``http://`` or ``https://``, a host and an optional port,
+    with the rules of ``gateway.public_url`` (a ``/`` at the end is
+    dropped). A refused value gives ``""`` and one warning: then the web chat
+    shows each published artifact as a link, and nothing stops. A value that
+    still holds a ``${VAR}`` reference gives ``""`` without a warning.
+    """
+    origin = "" if value is None else str(value).strip()
+    if not origin or "${" in origin:
+        return ""
+    address = origin.rstrip("/")
+    match = _PUBLIC_URL_RE.fullmatch(address)
+    if match and (match["port"] is None or 0 < int(match["port"]) <= 65535):
+        return address.lower()
+    if origin not in _refused_viewer_origins:
+        _refused_viewer_origins.add(origin)
+        logger.warning(
+            "artifacts.viewer_origin must be an origin: http:// or https://, a "
+            "host name or an IP address, an optional port, and nothing after "
+            "it; the web chat shows published artifacts as links",
+        )
+    return ""
+
+
+def _is_loopback_host(host: str) -> bool:
+    """A name or an address of this machine only: ``localhost``, a name
+    below ``.localhost``, or a loopback IP address."""
+    import ipaddress
+
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def upload_origin(value: str) -> tuple[str, str, int] | None:
+    """The origin of an absolute ``http`` or ``https`` address as
+    ``(scheme, host, port)``, or None.
+
+    The rules, for an entry of ``artifacts.upload_origins`` and for an upload
+    link alike: the address is parsed with :func:`urllib.parse.urlsplit`; it
+    has no user information; the scheme and the host are in lower case; one
+    dot at the end of the host is dropped; the host is ASCII; the port is the
+    one of the address, else 443 for ``https`` and 80 for ``http``.
+    """
+    from urllib.parse import urlsplit
+
+    if not isinstance(value, str) or any(c.isspace() for c in value):
+        return None
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").rstrip(".") if parts.hostname and not parts.hostname.endswith("..") else ""
+    if scheme not in ("https", "http") or not host or "@" in parts.netloc or not host.isascii():
+        return None
+    return scheme, host.lower(), port if port is not None else (443 if scheme == "https" else 80)
+
+
+def _upload_origins(value: Any) -> tuple[str, ...]:
+    """``artifacts.upload_origins``: a list, or one text with the origins
+    separated by commas (the ``${VAR}`` form). Each entry is an origin and
+    nothing more. ``https`` only; ``http`` only for a loopback host (a local
+    stack). Any other entry stops the start with :class:`ConfigError`."""
+    if value is None or value == "":
+        return ()
+    items = value.split(",") if isinstance(value, str) else value
+    if not isinstance(items, (list, tuple)):
+        raise ConfigError("artifacts.upload_origins must be a list of origins")
+    origins: list[str] = []
+    for item in items:
+        text = str(item).strip().rstrip("/") if item is not None else ""
+        if not text:
+            continue
+        origin = upload_origin(text)
+        if origin is None or text.count("/") != 2 or "?" in text or "#" in text:
+            raise ConfigError(
+                f"artifacts.upload_origins: {text!r} is not an origin (https://host[:port], nothing after it)",
+            )
+        scheme, host, port = origin
+        if scheme == "http" and not _is_loopback_host(host):
+            raise ConfigError(
+                f"artifacts.upload_origins: {text!r} is http; only https is allowed, "
+                "except for a loopback host of a local stack",
+            )
+        origins.append(f"{scheme}://{f'[{host}]' if ':' in host else host}:{port}")
+    return tuple(dict.fromkeys(origins))
+
+
 @dataclass
 class ArtifactsConfig:
     """Artifacts: static bundles of workspace files that a person sees.
@@ -3729,14 +3830,34 @@ class ArtifactsConfig:
     gateway serves the sandbox document for it, in local mode and in external
     mode. MCP App views and widgets keep their own switch (``mcp_apps``).
     Off by default; see docs/web-ui.md.
+
+    With ``publish`` on, in external mode only, the agent has the tool
+    ``publish_artifact`` and the Preview tab has a Publish button: both send
+    a bundle to the platform through the artifacts MCP server
+    (``nerve/artifacts/publish.py``). ``viewer_origin`` is the scheme and
+    host of the viewer of the platform: the web chat shows a published
+    artifact in a frame only when its address has exactly this origin.
+    ``upload_origins`` is the list of origins of the object
+    store: the runtime sends file bytes only to an upload link of one of
+    them, and publishes nothing while the list is empty.
     """
 
     preview: bool = False
+    publish: bool = False
+    viewer_origin: str = ""
+    # The origins of the object store to which the runtime may send file
+    # bytes, each as ``scheme://host:port`` (``upload_origin``).
+    upload_origins: tuple[str, ...] = ()
 
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> ArtifactsConfig:
-        return cls(preview=d.get("preview", False))
+        return cls(
+            preview=d.get("preview", False),
+            publish=d.get("publish", False),
+            viewer_origin=_viewer_origin(d.get("viewer_origin")),
+            upload_origins=_upload_origins(d.get("upload_origins")),
+        )
 
 
 @dataclass

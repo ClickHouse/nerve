@@ -331,11 +331,22 @@ class ViewerPreview(BaseModel):
     max_bytes: int
 
 
+class ViewerArtifacts(BaseModel):
+    """External mode only: whether the Preview tab has the Publish button
+    (``artifacts.publish``), and the origin of the artifact viewer whose
+    addresses the chat shows in a frame (``artifacts.viewer_origin``)."""
+
+    publish: bool
+    viewer_origin: str | None
+
+
 class ViewerResponse(BaseModel):
     actor: ViewerActor
     account: AccountOut | None
     # Only while the gateway serves previews; absent otherwise.
     preview: ViewerPreview | None = None
+    # Only in external mode with artifacts.publish or artifacts.viewer_origin.
+    artifacts: ViewerArtifacts | None = None
 
 
 @router.get("/api/auth/me", response_model=ViewerResponse)
@@ -345,7 +356,9 @@ async def who_am_i(actor: Actor = Depends(require_auth)):
     The web UI compares message and session authors with ``actor``.
     ``account`` is ``None`` for a credential without an account, such as the
     system principal's. ``preview`` is there only while the gateway serves
-    the Preview tab (``nerve/gateway/routes/preview.py``).
+    the Preview tab (``nerve/gateway/routes/preview.py``). ``artifacts`` is
+    there only in external mode with ``artifacts.publish`` or
+    ``artifacts.viewer_origin`` set (``nerve/gateway/routes/artifacts.py``).
     """
     db = get_deps().db
     ref = await db.get_actor_ref(actor.actor_id)
@@ -357,9 +370,19 @@ async def who_am_i(actor: Actor = Depends(require_auth)):
         account=await _render(db, account) if account else None,
     ).model_dump(mode="json", by_alias=True)
     body.pop("preview")
+    body.pop("artifacts")
     if get_deps().preview_serving:
         from nerve.gateway.routes.preview import PREVIEW_MAX_BYTES
 
         body["preview"] = ViewerPreview(max_bytes=PREVIEW_MAX_BYTES).model_dump()
+    from nerve.artifacts.publish import publish_settings
+
+    # The settings pinned at start; external mode only. As it is without
+    # them: no ``artifacts`` member.
+    artifacts = publish_settings(get_config())
+    if artifacts.publish or artifacts.viewer_origin:
+        body["artifacts"] = ViewerArtifacts(
+            publish=artifacts.publish, viewer_origin=artifacts.viewer_origin or None,
+        ).model_dump()
     # As it is, so that the answer has no ``preview`` member while it is off.
     return JSONResponse(body)

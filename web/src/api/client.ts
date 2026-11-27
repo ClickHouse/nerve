@@ -9,6 +9,7 @@ import type {
 import type { PullRequestResult } from '../types/github';
 import type { McpAppResource, McpAppTool, McpAppsConfig, McpCallToolResult } from '../types/mcpApps';
 import type { PreviewBundle, ViewerPreview } from '../types/preview';
+import type { PublishedArtifact, ViewerArtifacts } from '../types/artifacts';
 import type { NotificationSettingValues, NotificationSettings, NotificationTestResult } from './settings';
 import {
   gatewayDeletePushDevice, gatewayPushDevices, gatewaySavePushDevice,
@@ -630,6 +631,8 @@ export interface Viewer {
   account: Account | null;
   /** Only while the gateway serves the Preview tab. */
   preview?: ViewerPreview;
+  /** Only in hosted mode. */
+  artifacts?: ViewerArtifacts;
 }
 
 /** One page of a lazily-loaded sidebar group (Archived / System). */
@@ -1900,6 +1903,16 @@ export const api = {
     );
     return res.arrayBuffer();
   },
+  /**
+   * Publish the bundle of `path` for the members of this agent (the Publish
+   * button; hosted mode with `artifacts.publish`). With `artifactId`, a new
+   * version of that artifact.
+   */
+  publishArtifact: (path: string, title: string, artifactId?: string | null) =>
+    request<PublishedArtifact>('/artifacts/publish', {
+      method: 'POST',
+      body: JSON.stringify({ path, title, ...(artifactId ? { artifact_id: artifactId } : {}) }),
+    }),
   /** The document of the view at a `ui://` address of `server`. */
   getMcpAppResource: (sessionId: string, server: string, uri: string, signal?: AbortSignal) =>
     request<McpAppResource>(

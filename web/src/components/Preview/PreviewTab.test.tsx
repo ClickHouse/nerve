@@ -1,4 +1,4 @@
-import { act, render, screen } from '@testing-library/react';
+import { act, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import type { PreviewBundle } from '../../types/preview';
@@ -104,6 +104,23 @@ describe('the Preview tab', () => {
     expect(screen.getByRole('button', { name: 'Show the source' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Present' })).toBeEnabled();
     expect(screen.getByTitle('Preview')).toBeInTheDocument();
+    // Local mode: no Publish button.
+    expect(screen.queryByRole('button', { name: 'Publish' })).toBeNull();
+  });
+
+  it('has the Publish button in its header in hosted mode with publish on', async () => {
+    const { useHostedStore } = await import('../../api/hosted');
+    const { useArtifactStore, resetArtifactConfig } = await import('../../stores/artifactStore');
+    useHostedStore.setState({ mode: 'external' });
+    useArtifactStore.setState({ publish: true });
+    try {
+      await openTab();
+      const header = screen.getByRole('group', { name: 'Preview header' });
+      expect(within(header).getByRole('button', { name: 'Publish' })).toBeEnabled();
+    } finally {
+      resetArtifactConfig();
+      useHostedStore.setState({ mode: 'local' });
+    }
   });
 
   it('shows the source of the entry as text', async () => {

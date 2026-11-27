@@ -1,7 +1,7 @@
 import { writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { expect, test, type Page, type Request } from '@playwright/test'
+import { expect, test, type Page, type Request, type Route } from '@playwright/test'
 
 // The Preview tab against the sample deck of scripts/ui_snapshot_server.py
 // (workspace/decks/demo), in a real browser. The server's state directory is
@@ -141,5 +141,67 @@ test.describe('on a phone of 390 by 844', () => {
 
     await region.getByRole('button', { name: 'Close the panel' }).click()
     await expect(region).toBeHidden()
+  })
+})
+
+/**
+ * Hosted mode with the publish of artifacts on, as GET /api/auth/status and
+ * GET /api/auth/me of a Nerve in external mode answer it. The rest comes
+ * from the local test server.
+ */
+async function asHosted(page: Page) {
+  // In hosted mode the page sends no token (the gateway signs it in); the
+  // passwordless test server needs one, so each API request gets it here.
+  const login = await page.request.post('/api/auth/login', { data: { password: '' } })
+  const { token } = await login.json()
+  const withToken = (route: Route) => ({ headers: { ...route.request().headers(), authorization: `Bearer ${token}` } })
+  await page.route('**/api/**', route => route.continue(withToken(route)))
+  await page.route('**/api/auth/status', async route => {
+    const response = await route.fetch(withToken(route))
+    await route.fulfill({ response, json: { ...(await response.json()), mode: 'external' } })
+  })
+  await page.route('**/api/auth/me', async route => {
+    const response = await route.fetch(withToken(route))
+    await route.fulfill({
+      response,
+      json: { ...(await response.json()), artifacts: { publish: true, viewer_origin: 'https://artifacts.example.test' } },
+    })
+  })
+}
+
+test.describe('on a phone of 390 by 844, hosted, with Publish', () => {
+  test.use({ viewport: { width: 390, height: 844 } })
+
+  test('the header has the Publish button and every control on screen', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'phone', 'the phone layout')
+    await asHosted(page)
+    await openPreview(page)
+    const region = page.getByRole('region', { name: 'Preview' })
+    const header = region.getByRole('group', { name: 'Preview header' })
+    await expect(region.getByRole('group', { name: 'Slides' })).toContainText('/ 12')
+    for (const name of ['Previous slide', 'Next slide', 'Reload the preview', 'Show the source', 'Present', 'Publish', 'Close the panel']) {
+      const control = header.getByRole('button', { name, exact: true })
+      await expect(control, name).toBeVisible()
+      const box = (await control.boundingBox())!
+      expect(box.x, name).toBeGreaterThanOrEqual(0)
+      expect(box.y, name).toBeGreaterThanOrEqual(0)
+      expect(box.x + box.width, name).toBeLessThanOrEqual(390)
+      expect(box.y + box.height, name).toBeLessThanOrEqual(844)
+    }
+    const pathBox = (await header.getByText('decks/demo/index.html').boundingBox())!
+    expect(pathBox.width, 'the path keeps its room').toBeGreaterThan(120)
+    const overflow = await header.evaluate(el => {
+      const box = el as unknown as { scrollWidth: number; clientWidth: number }
+      return box.scrollWidth - box.clientWidth
+    })
+    expect(overflow, 'no horizontal overflow of the header').toBeLessThanOrEqual(0)
+    // The button is reachable: it opens the dialog with the title field.
+    await header.getByRole('button', { name: 'Publish', exact: true }).click()
+    const dialog = page.getByRole('dialog', { name: 'Publish' })
+    await expect(dialog.getByLabel('Title')).toHaveValue('demo')
+    const dialogBox = (await dialog.boundingBox())!
+    expect(dialogBox.x).toBeGreaterThanOrEqual(0)
+    expect(dialogBox.x + dialogBox.width).toBeLessThanOrEqual(390)
+    await page.screenshot({ path: testInfo.outputPath('hosted-phone-publish.png') })
   })
 })

@@ -66,8 +66,8 @@ class TestSetting:
         assert config.artifacts_preview_active is True
         assert config.mcp_apps_active is False
 
-    def test_the_section_has_one_setting(self):
-        assert list(ArtifactsConfig.__dataclass_fields__) == ["preview"]
+    def test_the_preview_is_the_first_setting(self):
+        assert list(ArtifactsConfig.__dataclass_fields__)[0] == "preview"
 
     def test_a_bare_section_is_the_default(self):
         assert NerveConfig.from_dict({"artifacts": None}).artifacts_preview_active is False

@@ -10,6 +10,7 @@ import { Button, IconButton } from '../ui';
 import { ChevronLeft, ChevronRight, CodeXml, Loader2, Lock, Play, RefreshCw, X } from '../ui/icons';
 import { buildPreviewDocument, type PreviewDocument } from './document';
 import { PreviewHost } from './host';
+import { PublishButton } from './PublishButton';
 import { agoText, fileEventNamesBundle, POLL_MS } from './live';
 import { downloadSource } from './download';
 import type { ContentKind, ContentMessage, HostMessage } from './messages';
@@ -395,6 +396,7 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
             <Play size={12} aria-hidden="true" />
             Present
           </Button>
+          <PublishButton path={path} disabled={!bundle || !!problem} />
           <IconButton label="Close the panel" size="xs" onClick={togglePanel}>
             <X size={14} />
           </IconButton>
