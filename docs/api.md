@@ -101,6 +101,20 @@ Response: {
 the system principal's. The web UI compares message and session authors with
 `actor.id`.
 
+While the gateway serves the [Preview tab](#preview) (`artifacts.preview`),
+the answer also has `"preview": { "max_bytes": 10485760 }`: the most bytes
+that the files of one preview may have together. Without the switch the
+member is absent, and the web UI shows no preview.
+
+In external mode with `artifacts.publish` or `artifacts.viewer_origin`
+set, the answer also has
+`"artifacts": { "publish": true, "viewer_origin": "https://artifacts.example.test" }`:
+whether the Preview tab has the **Publish** button (`artifacts.publish`), and
+the origin of the artifact viewer (`artifacts.viewer_origin`, `null` when it
+is not set). In local mode, and in external mode with neither setting, the
+member is absent. See
+[Published artifacts](web-ui.md#published-artifacts).
+
 ### Accounts
 
 Every signed-in account can manage accounts. System credentials cannot. Account
@@ -1935,7 +1949,8 @@ The sandbox document: the page of every view's and widget's frame (see
 authentication, like the files of the web UI: a frame's load carries no
 token, and the document is static and holds nothing. `csp` is the
 `_meta.ui.csp` of the view's resource, as the web UI passes it on; it is
-optional.
+optional. The gateway answers for this path while MCP Apps or the Preview
+tab is on; `csp` counts only while MCP Apps is on (a preview sends none).
 
 Every answer for this path carries the header that takes the document's
 origin away, also the ones that are not the document:
@@ -1959,8 +1974,8 @@ and is not on Nerve's own host.
 
 | Status | When |
 |--------|------|
-| 200 | `GET` or `HEAD`, the feature on |
-| 404 | The feature is off |
+| 200 | `GET` or `HEAD`, MCP Apps or the Preview tab on |
+| 404 | Both are off |
 | 405 | Another method (`Allow: GET, HEAD`) |
 | 503 | The web UI is not built: the document is missing |
 
@@ -2108,6 +2123,129 @@ there was something. 400 `bad_widget_id`; 404 `session_not_found`,
 Response: { "deleted": true }
 Response: { "deleted": false }
 ```
+
+### Preview
+
+What the Preview tab of the web UI reads (see
+[Preview](web-ui.md#preview)). `path` is the path of a bundle: relative to
+the workspace, or an absolute path below it. Errors are
+`{"detail": {"code": "<code>", "message": "<sentence>"}}`. The routes exist
+only with `artifacts.preview` on; the web UI learns of them from
+[`GET /api/auth/me`](#get-apiauthme).
+
+#### `GET /api/preview/bundle?path=<path>`
+The description of the bundle of `path`. `files[].path` is relative to the
+root of the bundle, `type` comes from the file extension. `fingerprint`
+changes when a file of the bundle is added, removed or written. `modified`
+is the newest modification time of a file, in milliseconds since the epoch.
+
+```json
+Response: {
+  "path": "decks/demo/index.html",
+  "root": "decks/demo",
+  "root_path": "/home/alice/workspace/decks/demo",
+  "kind": "folder",
+  "entry": "index.html",
+  "files": [
+    { "path": "index.html", "size": 2048, "type": "text/html" },
+    { "path": "style.css", "size": 512, "type": "text/css" }
+  ],
+  "size": 2560,
+  "fingerprint": "<64 hexadecimal digits>",
+  "modified": 1767225600000
+}
+```
+
+`kind` is `folder`, `page`, `image`, `markdown` or `csv`. The bundle of a
+Markdown or CSV file has a generated `index.html`, the source file as
+`source.md` or `data.csv`, and the kit files that the page names (see
+[the artifact kit](artifact-kit.md)); its `root` is the folder of the file.
+The entry page of any bundle that names a kit file (`nerve-kit/<name>`,
+found as text in its first 1 MiB) gets that file in `files`. A refused path: 403 `outside_workspace`; 404 `not_found`;
+422 `invalid_path`, `workspace_root`, `hidden`, `link`, `special_file`,
+`unsupported`, `no_entry`, `file_too_large`, `too_many_files`,
+`path_too_long`, `reserved_path` (a folder with its own `nerve-kit/`
+folder), `kit_missing` (the web UI is not built), `not_text` (a Markdown or
+CSV file that is not UTF-8 text), `source_too_large` (a Markdown or CSV file
+above 5 MiB, or a CSV file with more than 10,000 rows, 200 columns or
+200,000 cells). 409 `stale_description` when a file changed while it was
+described (the entry page or the Markdown or CSV file is opened again after
+the walk): read the description again.
+
+#### `GET /api/preview/file?path=<path>&file=<file>&fingerprint=<fingerprint>`
+The bytes of the file `file` (relative to the root of the bundle of `path`).
+Only a file of the description: any other is 404 `not_in_bundle`.
+`fingerprint` is the one of the description that the bundle route answered.
+The gateway keeps at most 64 descriptions (by path and fingerprint, so two
+states of one path can be kept). One goes when it was not used for one
+minute (a successful read here uses it), or when it is the one used least
+recently and a new one needs its place. This route never walks the bundle. 409 `stale_description` when the description is not
+kept (or `fingerprint` is missing), or when the opened file is not the
+described one (its size, modification time, status change time, inode or
+device differ, or it changes during the read): read the bundle again. Each
+read opens the file below the workspace without following a link on any
+name, and refuses a file that is not a regular file. A file
+above the limit of one preview is 413 `too_large`. The answer has the type
+of the description and these headers, so that it is never a page of this
+address:
+
+```
+Content-Disposition: attachment
+Content-Security-Policy: sandbox; default-src 'none'
+X-Content-Type-Options: nosniff
+Cache-Control: no-store
+```
+
+### Artifacts
+
+#### `POST /api/artifacts/publish`
+The **Publish** button of the Preview tab: publish the bundle of `path` (see
+[Preview](web-ui.md#preview)) to the platform as an artifact, for the
+members of this agent. The route runs the handler of the tool
+`publish_artifact` with the person of the request as the actor, and names
+that person to the platform as the publisher. With `artifact_id`, the
+publish is a new version of that artifact. It exists only in external mode
+with `artifacts.publish` on (see [Artifacts](config.md#artifacts)).
+
+```json
+Request: { "path": "decks/q3/index.html", "title": "Q3 review", "artifact_id": null }
+Response: {
+  "artifact_id": "7d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+  "version": 1,
+  "viewer_url": "https://artifacts.example.test/t/<tenant>/a/7d1c2b3a-4e5f-4a6b-8c7d-9e0f1a2b3c4d",
+  "expires_at": "2026-12-25T10:00:00Z",
+  "title": "Q3 review",
+  "changed_after": false
+}
+```
+
+The version is exactly the bytes that the publish read and hashed.
+`changed_after` is `true` when a file of the bundle changed after the
+publish read it: the version has the earlier state, and the next publish
+sends the newer one.
+
+Errors are `{"detail": {"code": "<code>", "message": "<sentence>"}}`. The
+`message` is a sentence for a person. 400 `invalid_arguments`; 404
+`not_found` (no artifact `artifact_id` of this agent); 409 `server_missing`
+(the catalog of the MCP gateway has no `nerve-artifacts` server for this agent),
+`server_refused` (the gateway did not let the agent use the server: the
+policy of the tenant, or no working credential) and
+`upload_origins_missing` (`artifacts.upload_origins` is empty); 502
+`upload_failed` (an upload did not end: the message names the file and the
+HTTP status; also bytes that differ from the hashed ones when they are
+sent), `upload_origin_refused` (the platform returned an upload address
+outside `artifacts.upload_origins`; nothing was sent to any link of that
+answer) and `platform_error` (also an answer of the platform that is not
+valid: a field that is not of its type, an `artifact_id` that is not the
+one of the version; the message then has no text of the answer); 503
+`platform_unavailable` and `platform_busy`; 422 for every
+other code: a refusal of the bundle (the codes of
+[`GET /api/preview/bundle`](#get-apipreviewbundlepathpath), also its
+`not_found` for a path that does not exist, and `changed` for a file that
+is not the described file when it is opened for the upload) or a refusal
+reason of the platform (for example
+`restricted_egress` or `limit_tenant_storage`). No answer holds an upload
+link.
 
 ### Memory Files
 

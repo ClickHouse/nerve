@@ -1,0 +1,63 @@
+/* The deck helper of the Nerve kit (nerve-kit/deck.css, with
+   nerve-kit/deck.js). Each section.slide is one slide of 1280 by 720 CSS
+   pixels. The helper shows one slide at a time, scaled to fit the window.
+   The print layout has one slide on each page. The file loads nothing. */
+
+html.nerve-deck, html.nerve-deck body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #e9eaee;
+}
+@media (prefers-color-scheme: dark) {
+  html.nerve-deck, html.nerve-deck body { background: #111214; }
+}
+html.nerve-deck.nerve-present, html.nerve-deck.nerve-present body { background: #000; }
+
+html.nerve-deck section.slide {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 1280px;
+  height: 720px;
+  margin: 0;
+  box-sizing: border-box;
+  overflow: hidden;
+  transform-origin: center center;
+}
+html.nerve-deck section.slide:not(.nerve-current) { display: none; }
+html.nerve-deck:not(.nerve-present) section.slide { box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25); }
+
+/* Defaults that the styles of the page win over (no specificity). */
+:where(html.nerve-deck section.slide) { background: #fff; color: #16181d; }
+:where(.nerve-slide-number) {
+  position: absolute;
+  right: 48px;
+  bottom: 24px;
+  font: 13px/1 ui-sans-serif, system-ui, sans-serif;
+  opacity: 0.6;
+  font-variant-numeric: tabular-nums;
+}
+
+@page { size: 1280px 720px; margin: 0; }
+@media print {
+  html.nerve-deck, html.nerve-deck body {
+    height: auto;
+    overflow: visible;
+    background: none;
+  }
+  html.nerve-deck section.slide,
+  html.nerve-deck section.slide:not(.nerve-current) {
+    display: block !important;
+    position: relative !important;
+    left: auto !important;
+    top: auto !important;
+    transform: none !important;
+    box-shadow: none !important;
+    break-after: page;
+    break-inside: avoid;
+    print-color-adjust: exact;
+    -webkit-print-color-adjust: exact;
+  }
+  html.nerve-deck section.slide:last-of-type { break-after: auto; }
+}

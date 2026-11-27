@@ -296,6 +296,18 @@ class TestViewer:
         assert body["account"]["id"] == install.owner_id
         assert body["account"]["actor_id"] == body["actor"]["id"]
 
+    async def test_with_the_preview_served_the_viewer_carries_its_limit(self, install: _Install):
+        """The web UI learns of the Preview tab from this answer; while the
+        gateway does not serve previews the member is absent (above)."""
+        from nerve.gateway.routes._deps import get_deps
+        from nerve.gateway.routes.preview import PREVIEW_MAX_BYTES
+
+        get_deps().preview_serving = True
+        async with _client(install.app) as client:
+            body = (await client.get("/api/auth/me", headers=install.headers())).json()
+        assert set(body) == {"actor", "account", "preview"}
+        assert body["preview"] == {"max_bytes": PREVIEW_MAX_BYTES}
+
     async def test_the_system_principal_has_an_actor_and_no_account(
         self, install: _Install,
     ):

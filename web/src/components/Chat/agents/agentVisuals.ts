@@ -7,7 +7,7 @@
 
 import {
   Bot, CheckCircle2, CircleDashed, CircleHelp, CircleX, Files, Hourglass, Lightbulb, ListChecks, ListTree, Loader2,
-  MessageCircleQuestion, Radio, Search, Square, SquareTerminal, Unlink, Users, Workflow, Wrench,
+  MessageCircleQuestion, Monitor, Radio, Search, Square, SquareTerminal, Unlink, Users, Workflow, Wrench,
   type Icon,
 } from '../../ui/icons';
 import {
@@ -73,6 +73,7 @@ const IDENTITY: Record<string, IdentityVisual> = {
   files: { Icon: Files, className: 'text-hue-teal' },
   tasks: { Icon: ListChecks, className: 'text-hue-blue' },
   agents: { Icon: ListTree, className: 'text-text-muted' },
+  preview: { Icon: Monitor, className: 'text-hue-sky' },
 };
 
 const DEFAULT_IDENTITY: IdentityVisual = { Icon: Bot, className: 'text-text-muted' };

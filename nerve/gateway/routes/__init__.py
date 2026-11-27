@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from nerve.artifacts.publish import publish_active
+from nerve.config import get_config
 from nerve.gateway.auth import is_external_mode
 from nerve.notifications import webpush
 from nerve.gateway.routes._deps import (
@@ -18,10 +20,12 @@ from nerve.gateway.routes._deps import (
     set_external_agents_sync,
     set_mcp_apps_serving,
     set_notification_service,
+    set_preview_serving,
 )
 from nerve.gateway.routes import (
     accounts,
     actors,
+    artifacts,
     agents,
     auth,
     setup,
@@ -34,6 +38,7 @@ from nerve.gateway.routes import (
     mcp_servers,
     mcp_apps,
     memory,
+    preview,
     diagnostics,
     cron,
     sources,
@@ -57,6 +62,7 @@ __all__ = [
     "set_notification_service",
     "set_external_agents_sync",
     "set_mcp_apps_serving",
+    "set_preview_serving",
     "get_deps",
 ]
 
@@ -90,6 +96,12 @@ def register_all_routes() -> APIRouter:
     router.include_router(mcp_apps.router)
     router.include_router(widget_state.router)
     router.include_router(memory.router)
+    # Only with artifacts.preview: with the switch off no preview route exists.
+    if get_config().artifacts_preview_active:
+        router.include_router(preview.router)
+    # Only in external mode with artifacts.publish: the Publish button.
+    if publish_active(get_config()):
+        router.include_router(artifacts.router)
     router.include_router(diagnostics.router)
     router.include_router(cron.router)
     router.include_router(sources.router)

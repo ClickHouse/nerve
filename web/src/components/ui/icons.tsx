@@ -33,7 +33,7 @@ export {
   Moon, MoreHorizontal, OctagonX, PanelLeftClose, PanelLeftOpen, Paperclip,
   Pause, Pencil, Play, Plug, Plus, Radio, RefreshCw, Repeat, Reply, Rocket,
   RotateCcw, RotateCw, Save, Search, SearchCheck, Send, Server, Settings,
-  ShieldCheck, ShieldQuestion, SlidersHorizontal, Sparkle, Sparkles,
+  Share, ShieldCheck, ShieldQuestion, SlidersHorizontal, Sparkle, Sparkles,
   Square, SquareTerminal, Star, StickyNote, Sun, Tag, Terminal, Timer,
   User, Users,
   Trash2, TrendingDown, TrendingUp, Unlink, Workflow, WrapText, Wrench, X,

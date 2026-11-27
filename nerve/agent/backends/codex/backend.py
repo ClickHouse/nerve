@@ -45,6 +45,7 @@ from nerve.agent.backends.base import (
     TurnInput,
     TurnRefusedError,
     config_excluded_tools,
+    runtime_only_catalog_tools,
 )
 from nerve.agent.backends.codex import daybreak
 from nerve.agent.backends.codex.appserver import (
@@ -181,6 +182,15 @@ def _is_missing_thread_error(error: CodexRpcError) -> bool:
     """
     detail = f"{error.message}\n{json.dumps(error.data, default=str)}"
     return bool(_MISSING_THREAD_RE.search(detail))
+
+
+def _disabled_tools_server(key: str) -> str | None:
+    """The server of a ``mcp_servers.<server>.disabled_tools`` config key
+    (quoted names too), else None."""
+    parts = [part.strip().strip('"').strip("'") for part in str(key).split(".")]
+    if len(parts) == 3 and parts[0] == "mcp_servers" and parts[2] == "disabled_tools":
+        return parts[1]
+    return None
 
 
 def _toml_str(value: str) -> str:
@@ -721,6 +731,10 @@ class CodexBackend:
                 "or token minter unavailable", spec.session_id,
             )
 
+        # The disabled tools of each server that has tools only the runtime
+        # calls: those tools, and the ones that ``extra_config`` disables.
+        protected: dict[str, set[str]] = {}
+
         # External MCP servers (grafana, langfuse, ...) — translate the
         # nerve config into codex's mcp_servers shape. Claude-plugin MCPs
         # have no codex equivalent and are skipped (docs plan §14).
@@ -736,6 +750,12 @@ class CodexBackend:
                     overrides.append(
                         f'mcp_servers.{srv.name}.default_tools_approval_mode="approve"'
                     )
+                    # The tools that only the runtime calls (the upload tools
+                    # of the artifacts server) are not offered to the model.
+                    # Their entry goes last (see below).
+                    hidden = runtime_only_catalog_tools([srv]).get(srv.name)
+                    if hidden:
+                        protected[srv.name] = set(hidden)
             except Exception as e:
                 logger.warning(
                     "Skipping MCP server %r for codex: %s", srv.name, e,
@@ -747,12 +767,30 @@ class CodexBackend:
         overrides += self.endpoint_overrides(spec.inference_principal)
 
         for key, value in (self.codex.extra_config or {}).items():
+            server = _disabled_tools_server(key)
+            if server in protected:
+                # An entry after Nerve's would give the model the tools that
+                # only the runtime calls: its tools are merged into Nerve's.
+                if isinstance(value, list) and all(isinstance(v, str) for v in value):
+                    protected[server].update(value)
+                    logger.info(
+                        "codex.extra_config %s is merged into the tools that Nerve disables", key,
+                    )
+                else:
+                    logger.warning(
+                        "codex.extra_config %s is not a list of tool names; it is not used", key,
+                    )
+                continue
             if isinstance(value, str):
                 overrides.append(f"{key}={_toml_str(value)}")
             elif isinstance(value, bool):
                 overrides.append(f"{key}={'true' if value else 'false'}")
             else:
                 overrides.append(f"{key}={value}")
+        # Last, so that no other override sets the key again. Workers get
+        # the same entries in the same order (CodexClient).
+        for name, tools in sorted(protected.items()):
+            overrides.append(f"mcp_servers.{name}.disabled_tools=" + json.dumps(sorted(tools)))
         return overrides
 
     _TOML_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")

@@ -5,6 +5,8 @@ import { getToolSummary } from '../../utils/toolSummary';
 import type { ToolCallBlockData } from '../../types/chat';
 import { EditToolBlock } from './tools/EditToolBlock';
 import { SendFileBlock } from './tools/SendFileBlock';
+import { PublishArtifactBlock } from './tools/PublishArtifactBlock';
+import { isPublishArtifactTool } from './tools/publishedArtifact';
 import { BashToolBlock } from './tools/BashToolBlock';
 import { FileToolBlock } from './tools/FileToolBlock';
 import { MemoryToolBlock } from './tools/MemoryToolBlock';
@@ -105,6 +107,8 @@ export function ToolCallBlock({
   // Nerve's send_file (`mcp__nerve__send_file`): the image or a download card, no tool chrome.
   const baseName = toolBaseName(block.tool);
   if (baseName === 'send_file') return <SendFileBlock block={block} />;
+  // Nerve's publish_artifact: the viewer of the platform in a frame, or a link card.
+  if (isPublishArtifactTool(block.tool)) return <PublishArtifactBlock block={block} />;
 
   // Nerve's notification tools (`mcp__nerve__ask_user`, `mcp__nerve__notify`)
   if (baseName === 'ask_user') return <AskUserBlock block={block} />;

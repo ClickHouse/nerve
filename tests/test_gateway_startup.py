@@ -273,6 +273,32 @@ async def test_mcp_apps_is_on_for_the_routes_only_where_the_gateway_serves_its_p
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("preview", "external", "views", "said"),
+    [(True, False, [], [True]), (False, False, [], []), (True, True, [], [True])],
+    ids=["on", "off", "on in external mode"],
+)
+async def test_the_preview_is_on_for_the_routes_in_both_modes_and_views_stay_off(
+    harness, monkeypatch, preview, external, views, said,
+):
+    """With ``artifacts.preview``, the lifespan tells the routes that this
+    gateway serves the sandbox document for previews, also in external
+    mode, and it says nothing of MCP App views."""
+    heard: list[bool] = []
+    heard_views: list[bool] = []
+    monkeypatch.setattr(harness["server"], "set_preview_serving", heard.append)
+    monkeypatch.setattr(harness["server"], "set_mcp_apps_serving", heard_views.append)
+    monkeypatch.setattr("nerve.gateway.mcp_apps_sandbox.is_external_mode", lambda: external)
+    harness["config"].artifacts.preview = preview
+
+    async with harness["server"].lifespan(MagicMock()):
+        pass
+
+    assert heard == said
+    assert heard_views == views
+
+
+@pytest.mark.asyncio
 async def test_a_failure_after_the_hosted_channels_start_stops_them(harness, monkeypatch):
     """Hosted channels that started are stopped when a later step fails."""
     import nerve.channels.hosted.runtime as hosted_module

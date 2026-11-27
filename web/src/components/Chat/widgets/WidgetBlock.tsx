@@ -1,5 +1,5 @@
 import {
-  useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore, type RefObject,
+  useCallback, useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore,
 } from 'react';
 import { useMcpAppsStore } from '../../../stores/mcpAppsStore';
 import { useThemeStore } from '../../../stores/themeStore';
@@ -11,6 +11,7 @@ import { MessageChatContext } from '../messageChat';
 import { MarkdownStreamingContext } from '../streamingContext';
 import { WidgetController } from './controller';
 import { widgetHeight, widgetKey } from './heights';
+import { useNear } from './near';
 import { widgetScope } from './storage';
 import { WidgetSource } from './WidgetSource';
 
@@ -42,9 +43,6 @@ import { WidgetSource } from './WidgetSource';
 
 /** While the text still streams, the widget is drawn once it has stopped changing for this long. */
 const SETTLE_MS = 800;
-
-/** How far outside the screen a block counts as near it. */
-const NEAR_MARGIN = '600px 0px';
 
 /** The room a block holds for a widget that was never drawn. */
 const PLACEHOLDER_HEIGHT = 96;
@@ -84,25 +82,6 @@ function useFeatureKnown(): boolean {
     };
   }, []);
   return known;
-}
-
-/** True while the block is on the screen or close to it; always, where the browser cannot tell. */
-function useNear(block: RefObject<HTMLElement | null>): boolean {
-  const [near, setNear] = useState(() => typeof IntersectionObserver === 'undefined');
-  useEffect(() => {
-    const element = block.current;
-    if (!element || typeof IntersectionObserver === 'undefined') return;
-    const observer = new IntersectionObserver((entries) => {
-      setNear(entries[entries.length - 1].isIntersecting);
-    }, {
-      rootMargin: NEAR_MARGIN,
-      // The chat scrolls in an element of its own: the margin counts there too.
-      scrollMargin: NEAR_MARGIN,
-    } as IntersectionObserverInit);
-    observer.observe(element);
-    return () => observer.disconnect();
-  }, [block]);
-  return near;
 }
 
 function sizeOf(source: string): string {

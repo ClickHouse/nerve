@@ -1,6 +1,7 @@
 import { useState } from 'react';
 import { ChevronRight, ChevronDown, FileText, FilePlus, Loader2 } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
+import { PreviewButton } from '../../Preview/PreviewButton';
 
 export function FileToolBlock({ block }: { block: ToolCallBlockData }) {
   const [expanded, setExpanded] = useState(false);
@@ -14,23 +15,26 @@ export function FileToolBlock({ block }: { block: ToolCallBlockData }) {
 
   return (
     <div className="my-1.5 border border-border rounded-lg bg-surface overflow-hidden">
-      <button
-        onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-2 w-full px-3 py-2 text-left cursor-pointer hover:bg-surface-raised transition-colors"
-      >
-        {isRunning
-          ? <Loader2 size={14} className="text-accent animate-spin shrink-0" />
-          : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-error' : 'text-hue-blue'}`} />
-        }
-        <span className="text-sm leading-tight font-mono font-medium text-text-secondary">{block.tool}</span>
-        <span className="text-xs text-text-dim truncate font-mono">{filePath}</span>
-        {lineCount && !isWrite && (
-          <span className="text-2xs text-text-faint shrink-0">{lineCount} lines</span>
-        )}
-        <div className="ml-auto shrink-0">
-          {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
-        </div>
-      </button>
+      <div className="flex items-center">
+        <button
+          onClick={() => setExpanded(!expanded)}
+          className="flex items-center gap-2 flex-1 min-w-0 px-3 py-2 text-left cursor-pointer hover:bg-surface-raised transition-colors"
+        >
+          {isRunning
+            ? <Loader2 size={14} className="text-accent animate-spin shrink-0" />
+            : <Icon size={14} className={`shrink-0 ${block.isError ? 'text-error' : 'text-hue-blue'}`} />
+          }
+          <span className="text-sm leading-tight font-mono font-medium text-text-secondary">{block.tool}</span>
+          <span className="text-xs text-text-dim truncate font-mono">{filePath}</span>
+          {lineCount && !isWrite && (
+            <span className="text-2xs text-text-faint shrink-0">{lineCount} lines</span>
+          )}
+          <div className="ml-auto shrink-0">
+            {expanded ? <ChevronDown size={14} className="text-text-faint" /> : <ChevronRight size={14} className="text-text-faint" />}
+          </div>
+        </button>
+        {isWrite && !isRunning && !block.isError && <PreviewButton path={filePath} className="mx-1.5 shrink-0" />}
+      </div>
 
       {expanded && (
         <div className="border-t border-border">

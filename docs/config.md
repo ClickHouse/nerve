@@ -23,7 +23,7 @@ and migration splits a legacy `config.yaml` on the same table:
 
 | Layer | Gets |
 |-------|------|
-| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `gateway.public_url`, `proxy`, `docker`, `telegram.enabled`, `slack.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `mcp_apps`, `workflows.runs_dir` |
+| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `gateway.public_url`, `proxy`, `docker`, `telegram.enabled`, `slack.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `mcp_apps`, `artifacts`, `workflows.runs_dir` |
 | `settings.yaml` | `timezone`, `gateway.host`/`port`/`loop`, `provider.type`/`aws_region` (incl. the region-scoped Bedrock model IDs), `agent.*`, `memory.*`, `sessions.*`, `sync.*`, the rest of `workflows.*` (the budget caps and cadence), `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode` |
 
 The test is whether the value would be wrong on another machine: filesystem
@@ -297,6 +297,7 @@ reload cannot inspect, and are documented here only.
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
 | `mcp_apps.*` | whether the gateway answers for the sandbox document, and whether the documents of its web UI refuse every frame, is settled once at startup. Until a restart, turning the feature on shows no view. Turning it off does take effect at once: new sessions are no longer told to host, and the web UI is told that the feature is off; the sandbox document itself stays answered until the restart, which harms nothing (it is static and holds nothing). See [MCP Apps](#mcp-apps) |
+| `artifacts.*` | whether the gateway answers for the sandbox document for previews, and whether the documents of its web UI refuse every frame, is settled once at startup, and so are `artifacts.publish`, `artifacts.viewer_origin` and `artifacts.upload_origins`: the route of the Publish button, the `artifacts` member of `GET /api/auth/me` and the tool `publish_artifact` follow the values at start. Until a restart, turning the Preview tab or the publish on or off changes nothing. See [Artifacts](#artifacts) |
 | `mcp_gateway_url` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
 | `slack.mode`, `channels.hosted.*` | the hosted channels, the email channel included, their stream endpoint, and their token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
 | `sync.github.mode` | the GitHub sources (`github` and the repository watch, `github_repos`), and in hosted mode the stream endpoint and the consumers of the gateway's records, are chosen at startup. Until a restart the sources keep the mode they started with, and so does the `github_pr_activity` gate. The filters, `pr_watch`, `thread_items`, `inbox` and `sync.github_repos` do follow a reload: in hosted mode the reload publishes them to the gateway again. To go back to `poll`, set `enabled: false` (and `sync.github_repos.enabled: false`) and reload first (see [sources.md](sources.md#hosted-github-source)) |
@@ -2516,6 +2517,10 @@ environment variables for this request. One request takes at most 5 seconds.
   [Catalog changes in running sessions](#catalog-changes-in-running-sessions)).
 - A catalog server with the ID `nerve` is not used, because Nerve's own server
   has that name.
+- The model does not get the three upload tools of the server `nerve-artifacts`
+  (`begin_artifact_version`, `get_artifact_upload_links`,
+  `complete_artifact_version`): Nerve calls them itself (see
+  [Publishing artifacts](#publishing-artifacts)).
 
 The clients get each gateway server as an HTTP MCP server at its URL, without
 headers:
@@ -2601,6 +2606,138 @@ lockdown, state it in the tracked settings with a `${VAR}` reference:
 mcp_apps:
   enabled: ${NERVE_MCP_APPS:-false}
 ```
+
+## Artifacts
+
+Artifacts are static bundles of workspace files that a person sees. The
+Preview tab of the web chat shows the bundle of a workspace path in the side
+panel: an HTML file, a folder with an `index.html`, or an image (see
+[Preview](web-ui.md#preview)). Off by default. It works in local mode and in
+[external mode](#authentication-mode), and it does not need `mcp_apps`.
+
+```yaml
+# config.yaml
+artifacts:
+  preview: true
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `artifacts.preview` | bool | `false` | Show the Preview tab (`GET /api/auth/me` then has `preview`), and serve the preview routes and the sandbox document that a preview runs in (`/mcp-app-sandbox.html`, the document of MCP App views and widgets). A preview gets the policy that allows no origin. This key does not turn on MCP App views or widgets: they keep `mcp_apps.enabled`, and stay off in external mode. |
+| `artifacts.publish` | bool | `false` | External mode only. Give the agent the tool `publish_artifact` and the Preview tab the **Publish** button: both publish a bundle to the platform as an artifact, through the server `nerve-artifacts` of the MCP gateway's catalog (see [Publishing artifacts](#publishing-artifacts)). In local mode the key does nothing. |
+| `artifacts.viewer_origin` | string | `""` | External mode only. The origin of the artifact viewer of the platform: `https://` or `http://`, a host and an optional port, nothing after it. The web chat shows a published artifact in a frame only when its viewer address has exactly this origin; else, and when the key is empty, as a link. A value that is not an origin is logged once and counts as empty. |
+| `artifacts.upload_origins` | list | `[]` | External mode only. The origins of the object store to which Nerve may send the bytes of a published file: `https://host[:port]` each, nothing after it (a list, or one text with commas). An `http://` entry is accepted only for a loopback host (`localhost`, a name below `.localhost`, a loopback IP address) of a local stack; any other `http://` entry, or an entry that is not an origin, stops the start. Required for publishing: while it is empty, `publish_artifact` and the Publish button refuse with a configuration error. |
+
+The key needs a restart (see
+[What still needs a restart](#what-still-needs-a-restart)). When the web UI
+is not built, startup logs a warning and no preview can load until it is.
+
+Like `mcp_apps`, the section is decided for each machine, so it belongs in
+`config.yaml`. Under lockdown, and where the platform sets it, state it in
+the tracked settings with a `${VAR}` reference:
+
+```yaml
+# workspace/config/settings.yaml
+artifacts:
+  preview: ${NERVE_ARTIFACTS_PREVIEW:-false}
+  publish: ${NERVE_ARTIFACTS_PUBLISH:-false}
+  viewer_origin: ${NERVE_ARTIFACTS_VIEWER_ORIGIN:-}
+  upload_origins: ${NERVE_ARTIFACTS_UPLOAD_ORIGINS:-}
+```
+
+`NERVE_ARTIFACTS_UPLOAD_ORIGINS` is a list separated by commas, for example
+`https://store.example.test,https://store-2.example.test`.
+
+### Publishing artifacts
+
+In external mode, the platform can serve artifacts: the members of the agent
+see a published bundle in the viewer of the platform, and a member can share
+one version with everyone in the tenant there. With `artifacts.publish` on,
+the agent has the tool `publish_artifact(path, title, artifact_id?)`, and the
+Preview tab has a **Publish** button that runs the same code for the person
+who clicks (`POST /api/artifacts/publish`). Publishing also needs
+`artifacts.upload_origins`, the origins of the object store of the platform.
+A path has the bundle of the
+[Preview](web-ui.md#preview) tab.
+
+Nerve sends the bundle through the server `nerve-artifacts` of the MCP gateway's
+catalog (see [MCP servers in external mode](#mcp-servers-in-external-mode)):
+
+1. It describes the bundle and reads each file once for its size and SHA-256.
+2. `begin_artifact_version` with the title, the entry file and the files,
+   with `artifact_id` for a new version of an artifact, and with
+   `on_behalf_of` when the session has a person: the cause of the session,
+   or the person of the button. The platform checks its limits.
+3. `get_artifact_upload_links` for at most 100 files at a time (or the
+   smaller batch that the platform says). An upload link is a short-lived
+   right to write one object. Every link of the answer must have an origin
+   of `artifacts.upload_origins` (the scheme, the host and the port, compared
+   exactly after Nerve puts the scheme and the host in lower case, drops a
+   dot at the end of the host, and fills in the default port; an address with
+   user information or that is not absolute is refused). One link outside
+   the list fails the publish, and Nerve sends nothing to any link of that
+   answer. Nerve sends a `PUT` to each link with exactly
+   the headers of the link and the bytes of the file, with a fixed
+   `Content-Length`, 4 at the same time. It follows no redirect. A
+   connection must open in 10 seconds, and the upload of one file must end
+   in 10 minutes. A link that has less than one minute of its lifetime (15
+   minutes) left is not used: Nerve asks new links for the files that are
+   left.
+4. `complete_artifact_version`: the platform checks the objects and gives
+   the viewer address.
+
+The model does not get the three tools of these steps: Nerve keeps them out
+of its tool list (Claude: `--disallowedTools`; Codex and its workers:
+`mcp_servers.nerve-artifacts.disabled_tools`). The other tools of
+`nerve-artifacts`, `list_artifacts` and `unpublish_artifact`, stay tools of
+the model.
+
+The tool result has the viewer address, the version and who can see it: the
+members of the agent, until a member shares the version in the viewer. It has
+no upload link and no ID of a person. An upload link is in no tool result,
+error text, log line or stored message: the error of an upload names the
+file and the HTTP status. The uploads go out through the proxy environment
+variables of the Nerve service (`HTTPS_PROXY`), as the channels do; the calls
+to the MCP gateway do not.
+
+A version is exactly the bytes that were hashed: the link signs their size
+and checksum. Each file is read again for its upload. A file that is not the
+described file when it is opened (another size, times, inode or device)
+fails the publish with an error that names it, and so do bytes that differ
+from the hashed ones when they are sent: the store refuses them. A file that
+changes after its bytes were read (for example, bytes appended
+during its upload) is a newer state: the version keeps the earlier one, the
+result says "The files changed while they were published. This version has
+the earlier state.", and the next publish sends the newer state.
+
+The model does not get the upload tools also when `codex.extra_config` sets
+`mcp_servers.nerve-artifacts.disabled_tools`: Nerve merges the names of that
+list into its own entry, which comes after every other override. This keeps
+upload links out of the transcript in ordinary use. It is not a barrier
+against code on the machine of the agent, which can call the tools of the
+MCP gateway itself. Each refusal reason of the platform is a sentence in
+the result, for example "Agents with restricted internet access cannot
+publish artifacts." for an agent with restricted egress. Without a
+`nerve-artifacts` server in the catalog, the result says that the agent has
+no artifact tools (the server `nerve-cloud` does not publish); when the
+gateway refuses the call by its policy (JSON-RPC `-32001`), the result says
+that the policy of the tenant
+does not allow the tools, or that the gateway has no working credential for
+them. A failure of the platform and a busy agent are said as such, not as
+refusals. Nerve checks the fields of each answer before it uses them (UUIDs,
+the version number, the time, the viewer address, the origin of each link);
+an answer that fails a check fails the publish with "The platform answer was
+not valid.", and no text of the answer goes into the result.
+
+While a task uploads, Nerve empties each log record of the `httpx` and
+`httpcore` loggers (and their children) to a fixed text, whatever their
+level: these records name the address of a request and the headers of an
+answer, and an object store can repeat the link in a header.
+
+Limits: a publish that stops after `begin_artifact_version` leaves a pending
+version, which the platform removes after 24 hours. Until the platform and
+Nerve both run a release with artifacts, a call is refused with a clear
+error.
 
 ## Auth
 

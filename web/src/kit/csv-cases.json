@@ -1,0 +1,104 @@
+[
+ {
+  "name": "two rows",
+  "text": "a,b\n1,2\n",
+  "rows": 2,
+  "width": 2
+ },
+ {
+  "name": "empty",
+  "text": "",
+  "rows": 0,
+  "width": 0
+ },
+ {
+  "name": "byte order mark",
+  "text": "﻿a\n",
+  "rows": 1,
+  "width": 1
+ },
+ {
+  "name": "empty lines",
+  "text": "a\n\n\nb",
+  "rows": 2,
+  "width": 1
+ },
+ {
+  "name": "line end in quotes",
+  "text": "a,\"x\ny\",c\r\nd",
+  "rows": 2,
+  "width": 3
+ },
+ {
+  "name": "doubled quotes only",
+  "text": "\"\"\"\"",
+  "rows": 1,
+  "width": 1
+ },
+ {
+  "name": "quote inside a field",
+  "text": "a\"b,c",
+  "rows": 1,
+  "width": 2
+ },
+ {
+  "name": "quote not closed",
+  "text": "\"open,\nstill open",
+  "rows": 1,
+  "width": 1
+ },
+ {
+  "name": "only line ends",
+  "text": "\r\r\n\n",
+  "rows": 0,
+  "width": 0
+ },
+ {
+  "name": "empty fields",
+  "text": ",,\n",
+  "rows": 1,
+  "width": 3
+ },
+ {
+  "name": "empty quoted fields",
+  "text": "\"\",\"\"",
+  "rows": 1,
+  "width": 2
+ },
+ {
+  "name": "text after a closing quote",
+  "text": "\"a\"b,c\n",
+  "rows": 1,
+  "width": 2
+ },
+ {
+  "name": "carriage return",
+  "text": "x\r",
+  "rows": 1,
+  "width": 1
+ },
+ {
+  "name": "quote after an empty quoted field",
+  "text": "\"\"\"x\",y",
+  "rows": 1,
+  "width": 2
+ },
+ {
+  "name": "three quotes",
+  "text": "\"\"\"",
+  "rows": 1,
+  "width": 1
+ },
+ {
+  "name": "comma in quotes",
+  "text": "\"a,b,c\"\n1",
+  "rows": 2,
+  "width": 1
+ },
+ {
+  "name": "ragged rows",
+  "text": "a\n1,2,3\n4,5",
+  "rows": 3,
+  "width": 3
+ }
+]

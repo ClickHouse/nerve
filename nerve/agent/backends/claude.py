@@ -62,6 +62,7 @@ from nerve.agent.backends.base import (
     TransportDiedError,
     TurnInput,
     config_excluded_tools,
+    runtime_only_catalog_tools,
 )
 from nerve.agent.backends.images import validate_image_data, validate_image_file
 from nerve.agent.cache_policy import cache_ttl_env
@@ -838,7 +839,10 @@ class ClaudeBackend:
             # wakeup harness (capture hook + cron-service sweep); the
             # CLI's own autonomous firing is suppressed via the
             # CLAUDE_CODE_DISABLE_CRON env var set in ``_build_env``.
-            disallowed_tools=["CronCreate", "CronList", "CronDelete"],
+            #
+            # Also remove the tools of the MCP gateway's catalog that only the
+            # runtime calls (``_runtime_only_tools``).
+            disallowed_tools=["CronCreate", "CronList", "CronDelete", *self._runtime_only_tools()],
             env=self._build_env(
                 cache_ttl=spec.cache_ttl,
                 inference_principal=spec.inference_principal,
@@ -1042,6 +1046,16 @@ class ClaudeBackend:
             inference_principal, trigger=inference_trigger, origin=inference_origin,
         ))
         return env
+
+    def _runtime_only_tools(self) -> list[str]:
+        """The CLI names (``mcp__<server>__<tool>``) of the catalog tools that
+        only the runtime calls, such as the upload tools of the artifacts
+        server (:func:`runtime_only_catalog_tools`). External mode only: the
+        catalog exists only there."""
+        if not self._deps.managed_mcp:
+            return []
+        hidden = runtime_only_catalog_tools(self._deps.external_mcp_servers())
+        return [f"mcp__{server}__{tool}" for server, tools in sorted(hidden.items()) for tool in tools]
 
     def _build_mcp_servers(
         self, session_id: str, excluded: frozenset[str] = frozenset(),

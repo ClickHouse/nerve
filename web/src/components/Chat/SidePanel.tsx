@@ -18,11 +18,12 @@ import { SessionTasksPanel } from './SessionTasksPanel';
 import { WorkflowPanel } from './WorkflowPanel';
 import { AgentsPanel } from './agents/AgentsPanel';
 import { AgentTranscript } from './agents/AgentTranscript';
+import { PreviewTab } from '../Preview/PreviewTab';
 import { identityVisual, statusVisual } from './agents/agentVisuals';
 import type { PanelTab } from '../../types/chat';
 
-/** Tabs that draw their own header (the roster and an agent's transcript). */
-const OWN_HEADER = new Set<PanelTab['type']>(['agents', 'agent']);
+/** Tabs that draw their own header (the roster, an agent's transcript, a preview). */
+const OWN_HEADER = new Set<PanelTab['type']>(['agents', 'agent', 'preview']);
 
 function formatElapsed(startedAt: number, completedAt?: number): string {
   const ms = (completedAt || Date.now()) - startedAt;
@@ -316,6 +317,8 @@ function PanelBody({ tab, containerRef }: { tab: PanelTab; containerRef: React.R
       return <AgentsPanel />;
     case 'agent':
       return tab.agentId ? <AgentTranscript key={tab.agentId} agentId={tab.agentId} /> : null;
+    case 'preview':
+      return <PreviewTab key={tab.id} tab={tab} />;
     default:
       return <TabContent tab={tab} containerRef={containerRef} />;
   }

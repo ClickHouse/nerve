@@ -305,7 +305,8 @@ def config_excluded_tools(config: Any) -> set[str]:
     other: they serve memU, and with ``memory.backend: loom`` the agent
     uses Loom's own tools from the MCP gateway's catalog instead.
     ``widget_state`` reads what the web chat's widgets saved, and without
-    the sandbox that draws widgets there is no widget.
+    the sandbox that draws widgets there is no widget. ``publish_artifact``
+    exists only in external mode with ``artifacts.publish`` on.
     """
     excluded: set[str] = set()
     if not config.outbound_channels:
@@ -316,4 +317,24 @@ def config_excluded_tools(config: Any) -> set[str]:
         from nerve.agent.tools.handlers.memory import MEMORY_SPECS
 
         excluded.update(spec.name for spec in MEMORY_SPECS)
+    from nerve.artifacts.publish import PUBLISH_TOOL, publish_active
+
+    if not publish_active(config):
+        excluded.add(PUBLISH_TOOL)
     return excluded
+
+
+def runtime_only_catalog_tools(servers: Any) -> dict[str, list[str]]:
+    """The tools of the MCP gateway's catalog servers in ``servers`` that the
+    model is not offered, by server name, sorted.
+
+    The runtime calls these tools itself: the upload tools of the
+    ``nerve-artifacts`` server, which ``publish_artifact`` uses
+    (:data:`nerve.artifacts.publish.RUNTIME_ONLY_TOOLS`). Each backend keeps
+    them out of the tool list of the model in its own form. Every other tool
+    of a server stays, also a tool that the runtime does not know.
+    """
+    from nerve.artifacts.publish import RUNTIME_ONLY_TOOLS
+
+    names = {getattr(server, "name", "") for server in servers if getattr(server, "enabled", True)}
+    return {name: sorted(tools) for name, tools in RUNTIME_ONLY_TOOLS.items() if name in names}

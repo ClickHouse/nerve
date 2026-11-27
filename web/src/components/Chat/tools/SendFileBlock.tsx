@@ -4,6 +4,8 @@ import { Modal } from '../../ui';
 import { authUrl } from '../../../api/hosted';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { extractResultText } from '../../../utils/extractResultText';
+import { InlinePreview } from '../../Preview/InlinePreview';
+import { PreviewButton } from '../../Preview/PreviewButton';
 
 /** The file names that show as an image. An `<img>` element runs no script, also for an SVG file. */
 const IMAGE_FILE = /\.(png|jpe?g|gif|webp|avif|svg)$/i;
@@ -23,7 +25,8 @@ function failure(block: ToolCallBlockData): string | null {
 
 /**
  * A `send_file` call. An image file shows in the chat, and a click opens it
- * at full size; another file shows as a download card.
+ * at full size; another file shows as a download card, with its preview
+ * under the card when it has one (`InlinePreview`).
  */
 export function SendFileBlock({ block }: { block: ToolCallBlockData }) {
   const [open, setOpen] = useState(false);
@@ -59,7 +62,17 @@ export function SendFileBlock({ block }: { block: ToolCallBlockData }) {
     </a>
   );
 
-  if (!IMAGE_FILE.test(filename) || broken) return <div className="my-2">{card}</div>;
+  if (!IMAGE_FILE.test(filename) || broken) {
+    return (
+      <div className="my-2">
+        <div className="flex items-center gap-1">
+          {card}
+          <PreviewButton path={filePath} />
+        </div>
+        <InlinePreview path={filePath} />
+      </div>
+    );
+  }
 
   return (
     <figure className="my-2 max-w-full">
@@ -87,6 +100,7 @@ export function SendFileBlock({ block }: { block: ToolCallBlockData }) {
         >
           <Download size={12} aria-hidden="true" />
         </a>
+        <PreviewButton path={filePath} className="shrink-0" />
       </figcaption>
       <Modal open={open} onClose={() => setOpen(false)} title={filename} size="wide" footer={card}>
         <img src={fileUrl} alt={filename} className="block mx-auto max-w-full max-h-[75vh] object-contain" />

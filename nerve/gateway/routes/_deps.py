@@ -27,6 +27,9 @@ class RouteDeps:
     # The gateway serves the sandbox document of MCP Apps, and with it shows
     # views and widgets. The lifespan decides it once, at startup.
     mcp_apps_serving: bool = False
+    # The gateway serves the sandbox document for the Preview tab
+    # (``artifacts.preview``). It turns on no view and no widget.
+    preview_serving: bool = False
 
 
 def set_mcp_apps_serving(serving: bool) -> None:
@@ -41,6 +44,19 @@ def set_mcp_apps_serving(serving: bool) -> None:
     if _deps is None:
         raise RuntimeError("init_deps() must be called before set_mcp_apps_serving()")
     _deps.mcp_apps_serving = bool(serving)
+
+
+def set_preview_serving(serving: bool) -> None:
+    """Say whether this gateway serves the sandbox document for the Preview
+    tab, once the lifespan has decided it
+    (:func:`nerve.gateway.mcp_apps_sandbox.serves_preview`).
+
+    The preview routes, the route of the document and the headers of the web
+    UI read it. The MCP Apps and widget routes do not.
+    """
+    if _deps is None:
+        raise RuntimeError("init_deps() must be called before set_preview_serving()")
+    _deps.preview_serving = bool(serving)
 
 
 def set_external_agents_sync(service: "SyncService | None") -> None:
