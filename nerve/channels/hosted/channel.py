@@ -903,18 +903,16 @@ class HostedChannel(BaseChannel):
     # ------------------------------------------------------------------ #
 
     def can_accept(self) -> bool:
-        """Whether the channel runs, holds no events, and has room for a turn.
+        """Whether the channel runs and has room for a turn.
 
-        The provider's switch is read per call. Turning a provider that
-        holds its events while off (Slack) off by a reload stops intake
-        until it is turned on again. A provider that does not hold them
-        never stops intake by its switch: :meth:`deliver` rejects its
-        events. Intake also stops while the engine drains: the gateway keeps
-        the events, and the next start reads them.
+        The provider's switch never stops intake: while it is off,
+        :meth:`deliver` rejects the provider's events, and the reader
+        continues with the events of the other providers. Intake stops
+        while the engine drains: the gateway keeps the events, and the next
+        start reads them.
         """
         return (
             self._running
-            and (self._switched_on() or not self._spec.hold_while_off)
             and len(self._inflight) < self._max_inflight
             and self.router.accepting_turns
         )
@@ -922,12 +920,13 @@ class HostedChannel(BaseChannel):
     async def deliver(self, event: Event) -> Disposition:
         """Dispatch one admitted event and say what happened to it.
 
-        While the provider is switched off, and it does not hold its events,
-        each event is rejected. So is an event on a connection whose
-        capabilities name another provider: it is not remembered, and its
-        connection's behaviour does not apply.
+        While the provider is switched off, each event is rejected, and the
+        gateway removes it: a reload that switches the provider on does not
+        bring it back. So is an event on a connection whose capabilities
+        name another provider: it is not remembered, and its connection's
+        behaviour does not apply.
         """
-        if not self._spec.hold_while_off and not self._switched_on():
+        if not self._switched_on():
             return Disposition.rejected("configuration_invalid", f"{self._provider} is switched off")
         if self._foreign(event.connection_id):
             return Disposition.rejected(

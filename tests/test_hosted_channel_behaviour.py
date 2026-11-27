@@ -7,7 +7,7 @@ stream endpoint, with a real router, session manager, and database, and a
 stand-in for the agent turn.
 
 Covered here: the table and its defaults, a switched-off provider that
-refuses its events while Slack goes on, channels that use only the
+refuses its events while the other provider goes on, channels that use only the
 connections of their own provider, the ``tool`` answer mode, in which the
 router sends nothing to the conversation and the turn's text starts with a
 note for the agent, the ``keep`` session mode, in which a conversation
@@ -146,9 +146,8 @@ async def announce(stream, provider: str | None, connection_id: str, **behaviour
 
 
 class TestProviderTable:
-    def test_slack_holds_its_events_while_off_and_email_refuses_them(self):
+    def test_the_providers_are_slack_and_email(self):
         assert HOSTED_CHAT_PROVIDERS == (SLACK, EMAIL)
-        assert SLACK.hold_while_off and not EMAIL.hold_while_off
 
     def test_a_provider_is_hosted_as_its_config_says(self):
         config = NerveConfig()
@@ -172,10 +171,9 @@ class TestProviderTable:
         config.slack.enabled = False
         assert not SLACK.switched_on(config)
 
-    def test_a_new_provider_refuses_its_events_while_off_and_has_default_settings(self, switch):
+    def test_a_new_provider_has_default_settings(self, switch):
         provider = chat_provider(switch)
 
-        assert not provider.hold_while_off
         assert provider.settings(NerveConfig()) == HostedChannelSettings()
         assert provider.channel_options() == {}
 
@@ -232,17 +230,20 @@ class TestProviderWithoutSettings:
         await stream.nudge("invoke")
         assert (await two.acknowledged(again))[again] == "accepted"
 
-    async def test_a_switched_off_slack_holds_its_events_and_the_test_providers_too(self, two):
+    async def test_a_switched_off_slack_refuses_its_events_and_the_test_provider_goes_on(self, two):
         two.config.slack.enabled = False
         stream = await two.stream()
-        held = two.gateway.store(chat_event())
+        refused = two.gateway.store(slack_event())
+        taken = two.gateway.store(chat_event())
 
         await stream.nudge("invoke")
-        await asyncio.sleep(0.3)
 
-        assert two.gateway.reads == []
-        two.config.slack.enabled = True
-        assert (await two.acknowledged(held))[held] == "accepted"
+        assert await two.acknowledged(refused, taken) == {refused: "rejected", taken: "accepted"}
+        [rejection] = [item for ack in two.gateway.acks for item in ack if item["inbox_id"] == refused]
+        assert rejection["reason_code"] == "configuration_invalid"
+        await two.turns.wait_for(1)
+        assert [run["channel"] for run in two.turns.runs] == [CHAT]
+        assert two.runtime.channels["slack"].can_accept()
 
     async def test_a_provider_that_the_config_does_not_host_has_no_channel(self, tmp_path, db, monkeypatch):
         harness = await start_two(tmp_path, db, monkeypatch, Switch(hosted=False))

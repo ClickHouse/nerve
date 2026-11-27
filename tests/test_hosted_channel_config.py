@@ -402,7 +402,7 @@ class TestHostedRuntime:
         with pytest.raises(RuntimeError, match="already registered"):
             await runtime.start()
 
-    async def test_a_switched_off_provider_gets_a_channel_that_waits_to_be_switched_on(self):
+    async def test_a_switched_off_provider_gets_a_channel_that_does_not_stop_intake(self):
         router = _Router()
         config = hosted_config()
         config.slack.enabled = False
@@ -411,7 +411,9 @@ class TestHostedRuntime:
         await runtime.start()
         try:
             channel = router.channels["slack"]
-            assert not channel.can_accept()
+            assert channel.can_accept()
+            verdict = await channel.authorize_outbound("C0123ABCD")
+            assert verdict.reason == "slack is switched off (slack.enabled is false)"
             config.slack.enabled = True
             assert channel.can_accept()
         finally:
