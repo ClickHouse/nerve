@@ -161,6 +161,30 @@ Filesystem-based skill system (Claude SDK compatible):
 - Automated revision: `skill-reviser` cron reviews existing skills for accuracy, completeness, and quality
 - An approved skill plan (`skill-create` / `skill-update`) is implemented by an `impl-<id>` session, like any plan, which creates or updates the skill with `skill_create`/`skill_update`
 
+#### Bundled skills
+
+Nerve ships skills in `nerve/templates/skills/`. Setup (`nerve init` and the
+setup's Mode step) copies each one into `workspace/skills/` with
+`install_bundled_skills` (`nerve/workspace.py`). It copies a skill only when the
+workspace has no skill with the same id, and it never overwrites one. After the
+copy, a bundled skill is a workspace skill: the person and the agent can change,
+disable or delete it. A workspace set up by an earlier release does not get the
+skills that a later release adds.
+
+| Skill | What it covers |
+|---|---|
+| `nerve-dev` | Changes to the Nerve code: layout, tests, the build, pull requests |
+| `nerve-workspace` | Changes to the agent's own configuration: skills, cron jobs, settings |
+| `slide-deck` | A slide deck as one offline HTML file with speaker notes: draft first, edit rounds by slide title, PDF and PPTX |
+| `research-report` | Research with a dated source for each claim: parallel research agents, a citation check, one offline HTML page |
+| `diagrams-and-charts` | What the web chat does with mermaid, Vega-Lite, SVG and widget blocks, channels that show text only, and picture files |
+| `shareable-html` | One offline HTML page or dashboard with its data inside, and its delivery and scheduled rebuilds |
+| `browser-testing` | A web app tested in headless Chromium, and the browser setup that the other skills use |
+
+Each general skill is one `SKILL.md` with no scripts. It recommends how to do
+the work, and states how Nerve delivers files and renders diagrams and the
+setup problems of a bare machine.
+
 #### Platform skills
 
 The operator or the hosting platform can give the agent skills that the person

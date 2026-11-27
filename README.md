@@ -218,6 +218,7 @@ workspace/skills/
 ```
 
 - Progressive disclosure: only name + description in system prompt; full content loaded on demand
+- Bundled skills: a new workspace starts with skills for slide decks, research reports, diagrams and charts, shareable HTML pages and browser testing, next to `nerve-dev` and `nerve-workspace` ([details](docs/architecture.md#bundled-skills))
 - `skill-extractor` cron proposes new skills from repeated workflows
 - `skill-reviser` cron reviews existing skills for accuracy
 - Usage statistics tracked per skill
