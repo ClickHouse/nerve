@@ -1109,8 +1109,12 @@ WIDGET_RENDERING_NOTE = (
 # web chat shows a sent .html, .md or .csv file as a page under its card
 # (web/src/components/Preview/InlinePreview.tsx), and opens it in the Preview
 # tab. Without them the model knows only that publish_artifact makes a page,
-# and publishes to show a table.
-PREVIEW_RENDERING_NOTE = (
+# and publishes to show a table. The deck sentences and the pointer to the
+# kit guide (docs/artifact-kit.md) follow, so that a deck uses the kit's
+# deck helper. The guide is in the docs of the install, which a runtime
+# built from the repository has; an install without it gets no pointer.
+ARTIFACT_KIT_GUIDE = Path(__file__).resolve().parents[2] / "docs" / "artifact-kit.md"
+_PREVIEW_PAGE_NOTE = (
     " A workspace file that you send with `send_file` also shows as a page "
     "under its card when it is an `.html` file, a `.md` file (drawn as a "
     "Markdown page) or a `.csv` file (drawn as a table that the person can "
@@ -1125,6 +1129,22 @@ PREVIEW_RENDERING_NOTE = (
     "alone). A file that the person uploaded is under "
     "`.uploads/`, where no page shows: copy it to another workspace path "
     "first."
+)
+_PREVIEW_DECK_NOTE = (
+    " For a slide deck, write one `.html` page with a `<section "
+    "class=\"slide\">` for each slide, laid out for 1280 by 720 px, "
+    "`<link rel=\"stylesheet\" href=\"nerve-kit/deck.css\">` before your own "
+    "styles and `<script src=\"nerve-kit/deck.js\"></script>` after the "
+    "slides: the page then has keys, slide numbers, Present and print. Set no "
+    "`position`, `width`, `height` or `transform` on a slide."
+)
+PREVIEW_RENDERING_NOTE = (
+    _PREVIEW_PAGE_NOTE
+    + _PREVIEW_DECK_NOTE
+    + (
+        f" The rules of decks and of the other kit pages: `{ARTIFACT_KIT_GUIDE}`."
+        if ARTIFACT_KIT_GUIDE.is_file() else ""
+    )
 )
 
 

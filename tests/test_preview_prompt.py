@@ -65,6 +65,19 @@ def test_the_preview_sentences_say_how_to_show_a_page():
         assert words in PREVIEW_RENDERING_NOTE, words
 
 
+def test_the_preview_sentences_say_how_to_write_a_deck():
+    for words in (
+        '<section class="slide">', "1280 by 720 px", 'href="nerve-kit/deck.css"',
+        'src="nerve-kit/deck.js"', "Present and print", "`transform`",
+    ):
+        assert words in PREVIEW_RENDERING_NOTE, words
+
+
+def test_the_preview_sentences_point_to_the_kit_guide_of_this_install():
+    assert prompts.ARTIFACT_KIT_GUIDE.is_file()
+    assert PREVIEW_RENDERING_NOTE.endswith(f"`{prompts.ARTIFACT_KIT_GUIDE}`.")
+
+
 def test_send_file_points_to_the_rendering_line_for_pages():
     description = SEND_FILE_SPEC.description
     assert "Rendering line" in description
