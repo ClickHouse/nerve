@@ -1,3 +1,5 @@
+import type { LiveUsage } from '../../api/websocket';
+
 /** The last turn's usage, as the `done` event and the session's last usage
  *  carry it. */
 export interface ContextUsage {
@@ -60,4 +62,61 @@ export function turnCalls(usage: ContextUsage): number {
 export function contextTokens(usage: ContextUsage): { tokens: number; exact: boolean } {
   if (usage.context_tokens != null) return { tokens: usage.context_tokens, exact: true };
   return { tokens: Math.round(turnInputTokens(usage) / turnCalls(usage)), exact: false };
+}
+
+/** The running turn's usage (the server's `usage_update`) as a usage: its
+ *  calls so far, with the latest call's context (exact). */
+export function liveContextUsage(live: LiveUsage): ContextUsage {
+  return {
+    input_tokens: live.usage.input_tokens,
+    output_tokens: live.usage.output_tokens,
+    cache_creation_input_tokens: live.usage.cache_creation_input_tokens,
+    cache_read_input_tokens: live.usage.cache_read_input_tokens,
+    cache_creation_5m_input_tokens: live.usage.cache_creation?.ephemeral_5m_input_tokens ?? 0,
+    cache_creation_1h_input_tokens: live.usage.cache_creation?.ephemeral_1h_input_tokens ?? 0,
+    max_context_tokens: live.max_context_tokens,
+    num_turns: live.calls,
+    context_tokens: live.context_tokens,
+  };
+}
+
+export function formatDollars(value: number): string {
+  return value < 0.01 ? `$${value.toFixed(4)}` : `$${value.toFixed(2)}`;
+}
+
+/** The session's cost as the header shows it. */
+export interface SessionCost {
+  /** Billed total, or with `estimate` the billed total plus what is not billed yet. */
+  total: number;
+  /** Part of `total` is an estimate at list prices. */
+  estimate: boolean;
+  /** While a turn runs: its main-chain calls so far and their estimated cost. */
+  turn: { calls: number; costUsd: number } | null;
+  /** The agents' estimated spend since the last turn ended (or in this turn). */
+  agentsUsd: number;
+}
+
+/**
+ * While a turn runs, `live` gives the session's billed total plus the turn's
+ * calls so far and the agents' spend, priced at list rates. Between turns the
+ * billed total shows, plus what the agents spent since the last turn ended
+ * (`agentsCostUsd` over `agentsCostBase`).
+ */
+export function sessionCost({ live, sessionCostUsd, agentsCostUsd, agentsCostBase }: {
+  live?: LiveUsage | null;
+  sessionCostUsd?: number;
+  agentsCostUsd?: number | null;
+  agentsCostBase?: number | null;
+}): SessionCost {
+  if (live) {
+    return {
+      total: live.session_cost_usd,
+      estimate: true,
+      turn: { calls: live.calls, costUsd: live.turn_cost_usd },
+      agentsUsd: live.agents_cost_usd,
+    };
+  }
+  const agentsUsd = agentsCostUsd != null && agentsCostBase != null
+    ? Math.max(0, agentsCostUsd - agentsCostBase) : 0;
+  return { total: (sessionCostUsd ?? 0) + agentsUsd, estimate: agentsUsd > 0, turn: null, agentsUsd };
 }

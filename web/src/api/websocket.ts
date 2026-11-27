@@ -4,6 +4,26 @@ import type { WorkflowSnapshot } from '../types/chat';
 import type { AgentSnapshot, AgentWSMessage, AutoTurnTrigger, InteractionAgentRef } from '../types/agents';
 import type { McpCallToolResult } from '../types/mcpApps';
 
+/** A running turn's usage and cost estimate (the server's ``usage_update``):
+ *  the main-chain model calls so far, priced at list rates, on top of the
+ *  session's billed total, plus the agents' spend since the last turn. */
+export interface LiveUsage {
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_read_input_tokens: number;
+    cache_creation_input_tokens: number;
+    cache_creation?: { ephemeral_5m_input_tokens?: number; ephemeral_1h_input_tokens?: number };
+  };
+  /** The latest call's context: exact. */
+  context_tokens: number;
+  max_context_tokens: number;
+  calls: number;
+  turn_cost_usd: number;
+  agents_cost_usd: number;
+  session_cost_usd: number;
+}
+
 export type WSMessage =
   | { type: 'token'; session_id: string; content: string; parent_tool_use_id?: string }
   | { type: 'thinking'; session_id: string; content: string; parent_tool_use_id?: string }
@@ -13,8 +33,12 @@ export type WSMessage =
   | { type: 'tool_result'; session_id: string; tool_use_id?: string; result: string; is_error?: boolean; parent_tool_use_id?: string; mcp_app_result?: McpCallToolResult }
   | { type: 'tool_output'; session_id: string; tool_use_id?: string; content: string; parent_tool_use_id?: string }
   // usage.context_tokens: the context use measured after a compact.
-  // context_tokens: the input tokens of the turn's last model call (Codex).
-  | { type: 'done'; session_id: string; usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number; context_tokens?: number }; max_context_tokens?: number; num_turns?: number; context_tokens?: number }
+  // context_tokens: the last model call's context (the live cost tally, or Codex's
+  // report); session_cost_usd: the session's new billed total; agents_cost_base: the
+  // agents' cost that total covers.
+  | { type: 'done'; session_id: string; usage?: { input_tokens?: number; output_tokens?: number; cache_creation_input_tokens?: number; cache_read_input_tokens?: number; context_tokens?: number }; max_context_tokens?: number; num_turns?: number; context_tokens?: number; session_cost_usd?: number; agents_cost_base?: number }
+  // The running turn's estimate, at each model call's start and end.
+  | ({ type: 'usage_update'; session_id: string } & LiveUsage)
   | { type: 'stopped'; session_id: string }
   // client_msg_id: the refused message, when the error refuses a message (Nerve is shutting down).
   | { type: 'error'; session_id: string; error: string; client_msg_id?: string | null }
@@ -25,7 +49,7 @@ export type WSMessage =
   | { type: 'session_updated'; session_id: string; title: string }
   // `agents` is the roster snapshot, sent on every bind and switch (also when
   // the session is idle); `buffered_events` only while a turn runs.
-  | { type: 'session_status'; session_id: string; is_running: boolean; status?: string; buffered_events?: WSMessage[]; agents?: AgentSnapshot }
+  | { type: 'session_status'; session_id: string; is_running: boolean; status?: string; buffered_events?: WSMessage[]; agents?: AgentSnapshot; live_usage?: LiveUsage; agents_cost_base?: number }
   | { type: 'session_forked'; source_id: string; fork_id: string; title: string }
   | { type: 'session_resumed'; session_id: string }
   | { type: 'session_archived'; session_id: string }

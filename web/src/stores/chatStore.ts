@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import { api, type SessionTask } from '../api/client';
 import { setBeforeReenter } from '../api/hosted';
 import { ws } from '../api/websocket';
-import type { WSMessage } from '../api/websocket';
+import type { LiveUsage, WSMessage } from '../api/websocket';
 import type { ChatMessage, MessageBlock, Session, AgentStatus, PanelTab, ModifiedFileSummary, PlanSummary } from '../types/chat';
 import type { InteractionAgentRef } from '../types/agents';
 import { hydrateMessage } from '../utils/hydrateMessage';
@@ -22,7 +22,7 @@ import { loadVirtualSession, persistVirtualSession, clearVirtualSession } from '
 import { onViewerStorageChange } from './helpers/viewerStorage';
 import { registerSessionsLoader, reloadSessionsSoon } from './helpers/sessionsReload';
 // Handlers
-import { discardStreamDeltas, flushStreamDeltas, handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
+import { discardStreamDeltas, flushStreamDeltas, handleThinking, handleToken, handleToolUse, handleToolResult, handleToolOutput, handleDone, handleUsageUpdate, handleStopped, handleError, handleWakeup, handleAutoTurn, handleModelChanged } from './handlers/streamingHandlers';
 import { handleSessionUpdated, handleSessionStatus, handleSessionSwitched, handleSessionNotFound, handleSessionForked, handleSessionResumed, handleSessionArchived, handleSessionRunning, handleSessionAwaitingInput, handleAnswerInjected, handleUserMessage, handleReviewLoopUpdate, emptyChatView, exitStreaming } from './handlers/sessionHandlers';
 import { handlePlanUpdate, handleWorkflowProgress } from './handlers/panelHandlers';
 import { handleInteraction, handleInteractionResolved, handlePlanSummary, handleFileChanged, handleNotification, handleNotificationAnswered, handleNotificationExpired, handleNotificationDismissed } from './handlers/auxiliaryHandlers';
@@ -171,7 +171,7 @@ const VIEW_SCOPED_EVENTS = new Set<WSMessage['type']>([
   'wakeup', 'auto_turn', 'model_changed', 'session_status', 'session_not_found', 'plan_update', 'plan_summary',
   'backend_status', 'workflow_progress',
   'agent_update', 'agent_event', 'queue_update', 'interaction',
-  'interaction_resolved', 'file_changed',
+  'interaction_resolved', 'file_changed', 'usage_update',
 ]);
 
 /** The singleton Agents roster tab. */
@@ -235,10 +235,14 @@ interface ChatState {
     cache_creation_1h_input_tokens?: number;
     max_context_tokens: number;
     num_turns: number;
-    // Measured after a compact, or the input of the last model call (Codex);
-    // the bar shows it instead of its estimate.
+    // Measured after a compact, or the input of the last model call (the
+    // live cost tally, or Codex); the bar shows it instead of its estimate.
     context_tokens?: number;
   } | null;
+  /** The running turn's cost estimate (usage_update); null between turns. */
+  liveUsage: LiveUsage | null;
+  /** The agents' cost the session's billed total covers (done/session_status). */
+  agentsCostBase: number | null;
   backendStatus:{ subtype: string; data: Record<string, unknown> } | null;
   // TodoWrite panel state (legacy Claude Code todos)
   currentTodos: TodoItem[];
@@ -541,6 +545,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   loading: false,
   agentStatus: { state: 'idle' },
   contextUsage: null,
+  liveUsage: null,
+  agentsCostBase: null,
   backendStatus: null,
   currentTodos: [],
   currentCCTasks: [],
@@ -1730,6 +1736,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       case 'tool_result':  return handleToolResult(msg, get, set);
       case 'tool_output':  return handleToolOutput(msg, get, set);
       case 'done':         return handleDone(msg, get, set);
+      case 'usage_update': return handleUsageUpdate(msg, get, set);
       case 'wakeup':       return handleWakeup(msg, get, set);
       case 'auto_turn':    return handleAutoTurn(msg, get, set);
       case 'model_changed': return handleModelChanged(msg, get, set);
