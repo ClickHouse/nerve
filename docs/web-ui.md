@@ -226,9 +226,10 @@ card holds no frame place, and it builds again only on **Try again**.
 the bundle), **Reload the preview**, **Show the source** (`</>`, the text of
 the entry file), **Present** (the frame fills the screen) and the close
 button of the panel. A page that says it is a deck gets slide controls
-("3 / 12"); in Present the arrow keys, Page Up, Page Down, Home and End move
-the slides when the page has the keyboard. The footer says that the preview
-comes from the agent.
+("3 / 12"). Present gives the keyboard to the slides: the arrow keys, Page
+Up, Page Down, Space, Home and End move them. After a click in the page,
+the keys go to the page. The footer says that the preview comes from the
+agent.
 
 The tab reads at most 4 files at the same time, each for the description
 it just read (`fingerprint`). The file route never walks the bundle: it

@@ -28,7 +28,6 @@ vi.mock('./host', () => ({
     start() {}
     show(html: string) { this.shown.push(html); }
     send(message: unknown) { this.sent.push(message); }
-    focus() {}
     dispose() { this.disposed = true; }
   },
 }));

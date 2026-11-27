@@ -110,11 +110,6 @@ export class PreviewHost {
     this.post(hostMessage(message));
   }
 
-  /** Give the keyboard to the frame (the page's own act, see KeyboardGuard). */
-  focus(): void {
-    this.frame?.focus();
-  }
-
   dispose(): void {
     if (this.closed) return;
     this.closed = true;

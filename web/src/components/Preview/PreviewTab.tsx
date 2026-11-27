@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { flushSync } from 'react-dom';
 import { api } from '../../api/client';
 import { useHostedStore } from '../../api/hosted';
 import { useChatStore } from '../../stores/chatStore';
@@ -247,24 +248,30 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
 
   // The page gets `present: on` only from `fullscreenchange`, when the
   // stage really fills the screen. Without full screen it stays as it is.
+  // The browser makes only a shown element fill the screen, so the stage is
+  // shown before the request. The stage gets the keyboard, not the frame:
+  // a key in the frame does not get to `onStageKey`.
   const present = () => {
     const stage = stageRef.current;
     if (!stage) return;
-    setShowSource(false);
-    setPresentError(null);
+    flushSync(() => {
+      setShowSource(false);
+      setPresentError(null);
+    });
     if (typeof stage.requestFullscreen !== 'function') {
       setPresentError(NO_FULL_SCREEN);
       return;
     }
     stage.requestFullscreen().catch(() => setPresentError(NO_FULL_SCREEN));
-    hostRef.current?.focus();
+    stage.focus();
   };
 
   const isDeck = content?.kind === 'deck' && content.slides !== null;
   const onStageKey = (event: React.KeyboardEvent) => {
-    if (!isDeck) return;
+    if (!isDeck || event.altKey || event.ctrlKey || event.metaKey) return;
     const to = ({
-      ArrowRight: 'next', PageDown: 'next', ' ': 'next', ArrowLeft: 'prev', PageUp: 'prev', Home: 'first', End: 'last',
+      ArrowRight: 'next', ArrowDown: 'next', PageDown: 'next', ' ': 'next',
+      ArrowLeft: 'prev', ArrowUp: 'prev', PageUp: 'prev', Home: 'first', End: 'last',
     } as Record<string, 'next' | 'prev' | 'first' | 'last'>)[event.key];
     if (!to) return;
     event.preventDefault();
@@ -365,8 +372,9 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
             <div
               ref={stageRef}
               hidden={showSource}
+              tabIndex={-1}
               onKeyDown={onStageKey}
-              className="absolute inset-0 bg-bg-sunken"
+              className="absolute inset-0 bg-bg-sunken outline-none"
             >
               <PreviewFrame
                 key={frameKey} html={doc.html} onContent={onContent} onFail={onFail} onHandOver={onHandOver}

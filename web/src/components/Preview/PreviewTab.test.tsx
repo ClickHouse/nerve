@@ -2,6 +2,7 @@ import { act, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from 'vitest';
 import type { PreviewBundle } from '../../types/preview';
+import type { PreviewHostOptions } from './host';
 
 vi.mock('../../api/client', async (orig) => ({
   ...(await orig<typeof import('../../api/client')>()),
@@ -189,6 +190,60 @@ describe('the Preview tab', () => {
     } finally {
       Object.defineProperty(HTMLElement.prototype, 'requestFullscreen', { configurable: true, value: original });
       sent.mockRestore();
+    }
+  });
+
+  it('gives the keyboard to the slides in Present, and the keys move them', async () => {
+    const { PreviewHost } = await import('./host');
+    const started = vi.spyOn(PreviewHost.prototype, 'start');
+    const sent = vi.spyOn(PreviewHost.prototype, 'send');
+    const original = HTMLElement.prototype.requestFullscreen;
+    Object.defineProperty(HTMLElement.prototype, 'requestFullscreen', {
+      configurable: true, value: () => Promise.resolve(),
+    });
+    try {
+      await openTab();
+      const host = started.mock.contexts[0] as unknown as { options: PreviewHostOptions };
+      act(() => host.options.onContent({ type: 'ready', kind: 'deck', canPrint: true, slides: 6, slide: 1 }));
+      await userEvent.click(screen.getByRole('button', { name: 'Present' }));
+      // The keyboard is on the stage around the frame, not in the frame.
+      const frame = screen.getByTitle('Preview');
+      expect(document.activeElement).not.toBe(frame);
+      expect(document.activeElement).toContainElement(frame);
+
+      sent.mockClear();
+      await userEvent.keyboard('{ArrowRight}{ArrowUp}{End}{Home}[Space]{PageDown}');
+      await userEvent.keyboard('{Alt>}{ArrowLeft}{/Alt}{Control>}{End}{/Control}');
+      expect(sent.mock.calls.map(([m]) => m)).toEqual(
+        ['next', 'prev', 'last', 'first', 'next', 'next'].map(to => ({ type: 'slide', to })),
+      );
+    } finally {
+      Object.defineProperty(HTMLElement.prototype, 'requestFullscreen', { configurable: true, value: original });
+      started.mockRestore();
+      sent.mockRestore();
+    }
+  });
+
+  it('shows the stage before it asks for full screen, also when the source is shown', async () => {
+    const hiddenAtRequest: Array<HTMLElement['hidden']> = [];
+    const original = HTMLElement.prototype.requestFullscreen;
+    Object.defineProperty(HTMLElement.prototype, 'requestFullscreen', {
+      configurable: true,
+      value(this: HTMLElement) {
+        hiddenAtRequest.push(this.hidden);
+        return Promise.resolve();
+      },
+    });
+    try {
+      await openTab();
+      await userEvent.click(screen.getByRole('button', { name: 'Show the source' }));
+      expect(screen.getByLabelText('Source')).toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', { name: 'Present' }));
+      expect(hiddenAtRequest).toEqual([false]);
+      expect(screen.queryByLabelText('Source')).toBeNull();
+      expect(document.activeElement).toContainElement(screen.getByTitle('Preview'));
+    } finally {
+      Object.defineProperty(HTMLElement.prototype, 'requestFullscreen', { configurable: true, value: original });
     }
   });
 
