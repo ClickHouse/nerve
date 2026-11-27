@@ -7,6 +7,10 @@ vi.mock('../../api/client', async (orig) => ({
   ...(await orig<typeof import('../../api/client')>()),
   api: { publishArtifact: (...args: unknown[]) => publishArtifact(...args) },
 }));
+const copyToClipboard = vi.fn();
+vi.mock('../../utils/clipboard', () => ({
+  copyToClipboard: (...args: unknown[]) => copyToClipboard(...args),
+}));
 
 const { useHostedStore } = await import('../../api/hosted');
 const { useArtifactStore, resetArtifactConfig, applyViewerArtifacts } = await import('../../stores/artifactStore');
@@ -23,6 +27,7 @@ const PUBLISHED = {
 
 beforeEach(() => {
   publishArtifact.mockReset();
+  copyToClipboard.mockReset();
 });
 afterEach(() => {
   resetArtifactConfig();
@@ -57,8 +62,9 @@ describe('the Publish button of the Preview tab', () => {
     await userEvent.type(field, 'Q3 review');
     await userEvent.click(screen.getAllByRole('button', { name: 'Publish' }).at(-1)!);
     expect(publishArtifact).toHaveBeenLastCalledWith('decks/q3/index.html', 'Q3 review', undefined);
-    expect(dialog).toHaveTextContent('as version 1');
-    expect(dialog).not.toHaveTextContent('earlier state');
+    expect(dialog).toHaveTextContent('q3 is published as version 1.');
+    expect(dialog).toHaveTextContent('open it and select Share');
+    expect(dialog).not.toHaveTextContent('Publish again');
     expect(screen.getByRole('link', { name: /Open/ })).toHaveAttribute('href', PUBLISHED.viewer_url);
     await userEvent.click(screen.getByRole('button', { name: 'Close' }));
 
@@ -66,7 +72,25 @@ describe('the Publish button of the Preview tab', () => {
     expect(screen.getByRole('dialog')).toHaveTextContent('a new version of q3');
     await userEvent.click(screen.getAllByRole('button', { name: 'Publish' }).at(-1)!);
     expect(publishArtifact).toHaveBeenLastCalledWith('decks/q3/index.html', 'Q3 review', PUBLISHED.artifact_id);
-    expect(await screen.findByText(/This version has the earlier state/)).toBeInTheDocument();
+    expect(await screen.findByText(/This version does not have the changes/)).toBeInTheDocument();
+  });
+
+  it('copies the link', async () => {
+    on();
+    publishArtifact.mockResolvedValue(PUBLISHED);
+    copyToClipboard.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    render(<PublishButton path="decks/q3" disabled={false} />);
+    await userEvent.click(screen.getByRole('button', { name: 'Publish' }));
+    expect(screen.getByRole('dialog')).toHaveTextContent('Only members of this agent will see it.');
+    await userEvent.click(screen.getAllByRole('button', { name: 'Publish' }).at(-1)!);
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Copy link' }));
+    expect(copyToClipboard).toHaveBeenLastCalledWith(PUBLISHED.viewer_url);
+    expect(screen.getByRole('button', { name: 'Copied' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'Copy link' }, { timeout: 3000 })).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Copy link' }));
+    expect(screen.getByRole('alert')).toHaveTextContent('Could not copy the link.');
   });
 
   it('says the sentence of a refusal', async () => {
