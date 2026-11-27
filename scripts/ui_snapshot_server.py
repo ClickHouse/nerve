@@ -33,6 +33,11 @@ def write_config(root: Path, port: int) -> Path:
     }))
     write_deck(workspace / "decks" / "demo")
     (workspace / "decks" / "live.html").write_text('<!doctype html><h1 id="title">First version</h1>\n')
+    # A Markdown file and a CSV file: the pages of the artifact kit draw them.
+    (workspace / "decks" / "notes.md").write_text(
+        "# Release notes\n\nSee [the plan](https://example.org/plan).\n\n<b>raw html</b>\n"
+    )
+    (workspace / "decks" / "cost.csv").write_text("Service,Cost\ningest,148\nquery,109\n")
     # Without it `start -f` takes the directory for a fresh install and runs the setup wizard.
     (config_dir / "config.local.yaml").write_text("{}\n")
     return config_dir
@@ -163,6 +168,12 @@ async def seed(db_path: Path, workspace: Path) -> None:
                 {"type": "tool_call", "tool": "Write",
                  "input": {"file_path": str(workspace / "decks" / "live.html"), "content": "..."},
                  "tool_use_id": "tu-live", "result": "File written", "is_error": False},
+                {"type": "tool_call", "tool": "Write",
+                 "input": {"file_path": str(workspace / "decks" / "notes.md"), "content": "..."},
+                 "tool_use_id": "tu-notes", "result": "File written", "is_error": False},
+                {"type": "tool_call", "tool": "Write",
+                 "input": {"file_path": str(workspace / "decks" / "cost.csv"), "content": "..."},
+                 "tool_use_id": "tu-cost", "result": "File written", "is_error": False},
                 {"type": "text", "content": "The deck is in decks/demo."},
             ],
             created_at=minute(1), actor=None,

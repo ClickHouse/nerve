@@ -59,6 +59,7 @@ describe('resolveAddress', () => {
   it.each([
     'https://cdn.example.com/a.css', '//cdn.example.com/a.css', '/css/a.css', '../index.html', 'javascript:alert(1)',
     'missing.css', '', '%E0%A4%A', 'blob:https://example.com/x',
+    'css%2Fa.css', 'css%2fa.css', '%2Fcss/a.css', 'css%5Ca.css', 'css%5ca.css',
   ])('finds no file for %s', address => {
     expect(resolveAddress(address, '', files)).toBeNull();
   });
@@ -421,7 +422,10 @@ describe('the builder over shapes of pages', () => {
   const SMALL_LIMIT = 100_000;
   const ENDS_WITHIN_MS = 5_000;
   type Expect = 'ok' | 'files' | 'document';
-  type Shape = { name: string; files: Record<string, string | Uint8Array>; expect: Expect; check?: (html: string, reads: Map<string, number>) => void };
+  type Shape = {
+    name: string; files: Record<string, string | Uint8Array>; expect: Expect; kind?: PreviewBundle['kind'];
+    check?: (html: string, reads: Map<string, number>) => void;
+  };
 
   const page = (head: string, body = '') => `<!doctype html><html><head>${head}</head><body>${body}</body></html>`;
   const link = (href: string) => `<link rel="stylesheet" href="${href}">`;
@@ -447,6 +451,16 @@ describe('the builder over shapes of pages', () => {
     sheets[`s${length}.css`] = '.end{color:blue}';
     return sheets;
   }
+
+  /** The generated page of a Markdown or CSV file, in the form of `kit_page` (nerve/artifacts/bundle.py). */
+  const kitPage = (name: string, text: string, script: string) => page(
+    `<title>${name}</title>${link('nerve-kit/kit.css')}`,
+    `<script type="application/json" id="nerve-kit-source">${JSON.stringify({ name, text }).replace(/<\//g, '<\\/').replace(/<!/g, '\\u003c!')}</script>`
+      + `<main id="nerve-kit-page"></main><script src="nerve-kit/${script}"></script>`,
+  );
+  const kit = { 'nerve-kit/kit.css': 'body{margin:0}', 'nerve-kit/table.js': 'window.t=1', 'nerve-kit/markdown.js': 'window.m=1' };
+  const onlyThePageAndTheKit = (_html: string, reads: Map<string, number>) =>
+    expect([...reads.keys()].every(p => p === 'index.html' || p.startsWith('nerve-kit/'))).toBe(true);
 
   const many: Record<string, string | Uint8Array> = {};
   for (let i = 0; i < 999; i += 1) many[`img/${i}.png`] = bytes(10);
@@ -532,11 +546,38 @@ describe('the builder over shapes of pages', () => {
       },
       check: html => expect(stylesheetLinks(html)).toEqual({ total: 3, inlined: 3 }),
     },
+    {
+      name: 'a Markdown bundle with its kit files', expect: 'ok', kind: 'markdown', check: onlyThePageAndTheKit,
+      files: {
+        'index.html': kitPage('notes.md', '# Notes\n</script><!-- x -->\n'.repeat(200), 'markdown.js'),
+        'source.md': '# Notes\n', 'nerve-kit/kit.css': kit['nerve-kit/kit.css'], 'nerve-kit/markdown.js': kit['nerve-kit/markdown.js'],
+      },
+    },
+    {
+      name: 'a CSV bundle with its kit files', expect: 'ok', kind: 'csv', check: onlyThePageAndTheKit,
+      files: {
+        'index.html': kitPage('cost.csv', 'a,b\n1,2\n'.repeat(2000), 'table.js'),
+        'data.csv': 'a,b\n', 'nerve-kit/kit.css': kit['nerve-kit/kit.css'], 'nerve-kit/table.js': kit['nerve-kit/table.js'],
+      },
+    },
+    {
+      name: 'a deck with the kit files', expect: 'ok',
+      files: {
+        'index.html': page(link('nerve-kit/deck.css') + link('style.css'),
+          `${'<section class="slide"><h1>Slide</h1><img src="chart.png"></section>'.repeat(12)}<script src="nerve-kit/deck.js"></script>`),
+        'style.css': '.slide{background:#111}', 'chart.png': bytes(500),
+        'nerve-kit/deck.css': 'section.slide{width:1280px}', 'nerve-kit/deck.js': 'window.d=1',
+      },
+      check: (html, reads) => {
+        expect(parse(html).querySelectorAll('script[src^="data:"]')).toHaveLength(1);
+        expect(reads.get('nerve-kit/deck.js')).toBe(1);
+      },
+    },
     { name: 'files past the limit', expect: 'files', files: { 'index.html': page('', '<img src="a.png"><img src="b.png">'), 'a.png': bytes(60_000), 'b.png': bytes(60_000) } },
   ];
 
   it.each(shapes.map(s => [s.name, s] as const))('%s', async (_name, shape) => {
-    const { description } = bundle(shape.files);
+    const { description } = bundle(shape.files, 'index.html', shape.kind);
     const reads = new Map<string, number>();
     const read = async (path: string) => {
       reads.set(path, (reads.get(path) ?? 0) + 1);
@@ -566,5 +607,27 @@ describe('the builder over shapes of pages', () => {
     const never = () => new Promise<ArrayBuffer>(() => {});
     const error = await buildPreviewDocument(description, never, SMALL_LIMIT, 50).catch(e => e);
     expect(error).toBeInstanceOf(PreviewTimedOut);
+  });
+
+  it('shows a generated table page with its kit files, and its source text in the source view', async () => {
+    // The form of `kit_page` in nerve/artifacts/bundle.py.
+    const text = 'name,note\nalice,"</script><script>window.bad=1</script>"\n';
+    const data = JSON.stringify({ name: 'cost.csv', text }).replace(/<\//g, '<\\/').replace(/<!/g, '\\u003c!');
+    const page = '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<title>cost.csv</title>\n'
+      + '<link rel="stylesheet" href="nerve-kit/kit.css">\n</head>\n<body>\n'
+      + `<script type="application/json" id="nerve-kit-source">${data}</script>\n`
+      + '<main id="nerve-kit-page"></main>\n<script src="nerve-kit/table.js"></script>\n</body>\n</html>\n';
+    const { description, read, asked } = bundle({
+      'index.html': page, 'data.csv': text, 'nerve-kit/kit.css': 'body{margin:0}', 'nerve-kit/table.js': 'window.kit=1',
+    }, 'index.html', 'csv');
+    const result = await buildPreviewDocument(description, read, LIMIT);
+    expect(result.source).toBe(text);
+    expect(asked.sort()).toEqual(['index.html', 'nerve-kit/kit.css', 'nerve-kit/table.js']);
+    const doc = parse(result.html);
+    const scripts = Array.from(doc.querySelectorAll('script'));
+    expect(scripts.map(s => s.getAttribute('type') ?? 'classic')).toEqual(['application/json', 'classic']);
+    expect(JSON.parse(scripts[0].textContent!)).toEqual({ name: 'cost.csv', text });
+    expect(decodeData(scripts[1].getAttribute('src')!)).toBe('window.kit=1');
+    expect(decodeData(doc.querySelector('link')!.getAttribute('href')!)).toBe('body{margin:0}');
   });
 });

@@ -89,7 +89,7 @@ describe('opening a preview', () => {
 
   it.each([
     ['deck/index.html', true], ['page.HTML', true], ['logo.svg', true], ['photo.jpeg', true],
-    ['notes.md', false], ['data.csv', false], ['app.js', false], ['', false],
+    ['notes.md', true], ['data.CSV', true], ['app.js', false], ['notes.txt', false], ['', false],
   ])('offers a preview for %s: %s', (path, offered) => {
     expect(canPreview(path)).toBe(offered);
   });
@@ -310,6 +310,10 @@ describe('helpers', () => {
     const page = { ...folder, kind: 'page' as const, root_path: '/ws', entry: 'page.html', files: [{ path: 'page.html', size: 1, type: 'text/html' }] };
     expect(fileEventNamesBundle(page, '/ws/page.html')).toBe(true);
     expect(fileEventNamesBundle(page, '/ws/other.html')).toBe(false);
+    const table = { ...folder, kind: 'csv' as const, path: 'data/cost.csv', root_path: '/ws/data', entry: 'index.html',
+      files: [{ path: 'index.html', size: 1, type: 'text/html' }, { path: 'data.csv', size: 1, type: 'text/csv' }] };
+    expect(fileEventNamesBundle(table, '/ws/data/cost.csv')).toBe(true);
+    expect(fileEventNamesBundle(table, '/ws/data/other.csv')).toBe(false);
   });
 
   it('says how long ago', () => {

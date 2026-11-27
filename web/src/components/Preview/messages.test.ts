@@ -15,6 +15,10 @@ describe('readContentMessage', () => {
     expect(readContentMessage({ ...base, type: 'slide', slide: 2, slides: 5 })).toEqual({ type: 'slide', slide: 2, slides: 5 });
   });
 
+  it('reads a download, with no data', () => {
+    expect(readContentMessage({ ...base, type: 'download', file: '../secret' })).toEqual({ type: 'download' });
+  });
+
   it('keeps only the checked values', () => {
     const read = readContentMessage({ ...base, type: 'slide', slide: 2, slides: 5, html: '<img src=x>' });
     expect(read).toEqual({ type: 'slide', slide: 2, slides: 5 });

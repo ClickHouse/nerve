@@ -11,6 +11,8 @@
  * or as an address. A page that sends no `ready` is a plain page.
  */
 
+import type { PreviewBundleKind } from '../../types/preview';
+
 export const ARTIFACT_CHANNEL = 'nerve-artifact';
 export const ARTIFACT_PROTOCOL_VERSION = 1;
 
@@ -23,11 +25,27 @@ export const MAX_SLIDES = 10_000;
 
 /**
  * From the content: `ready` when it has loaded and as the answer to
- * `hello`; `slide` when the slide changes. Slides count from 1.
+ * `hello`; `slide` when the slide changes (slides count from 1);
+ * `download` when the person asks for the source file of a table or
+ * Markdown page. A content frame cannot start a download itself, so the
+ * host downloads the file of the bundle with the fixed name of the kind
+ * of the bundle (`DOWNLOAD_FILES`). The message has no data.
  */
 export type ContentMessage =
   | { type: 'ready'; kind: ContentKind; canPrint: boolean; slides?: number; slide?: number }
-  | { type: 'slide'; slide: number; slides: number };
+  | { type: 'slide'; slide: number; slides: number }
+  | { type: 'download' };
+
+/**
+ * The file of a bundle that a `download` message gets, by the kind of the
+ * bundle in its description (trusted: the server says it). The kind that a
+ * page states never decides: a page of a bundle of another kind gets no
+ * download, also when the bundle has a file of that name.
+ */
+export const DOWNLOAD_FILES: Readonly<Partial<Record<PreviewBundleKind, string>>> = {
+  csv: 'data.csv',
+  markdown: 'source.md',
+};
 
 /** To the content. */
 export type HostMessage =
@@ -70,6 +88,7 @@ export function readContentMessage(data: unknown): ContentMessage | null {
     if (!isSlideCount(data.slides) || !isSlideOf(data.slide, data.slides)) return null;
     return { type: 'slide', slide: data.slide, slides: data.slides };
   }
+  if (data.type === 'download') return { type: 'download' };
   return null;
 }
 

@@ -6,6 +6,7 @@ import { claimWidgetSlot, type WidgetSlot } from '../Chat/widgets/budget';
 import { useNear } from '../Chat/widgets/near';
 import { Loader2 } from '../ui/icons';
 import { buildPreviewDocument } from './document';
+import { downloadSource } from './download';
 import { PreviewHost } from './host';
 import { fileEventNamesBundle } from './live';
 import type { ContentMessage } from './messages';
@@ -21,8 +22,11 @@ import { isStale, MAX_RESTARTS, problemText } from './problems';
  * - A deck (a page that says `ready` with the kind `deck`) shows its first
  *   slide, 16 by 9, and takes no input. A click opens the Preview tab, which
  *   has the slide controls and Present.
- * - Every other page (an HTML page, a folder) is INLINE_HEIGHT high and
- *   works in place.
+ * - Every other page (an HTML page, a folder, the table page of a CSV file,
+ *   the page of a Markdown file) is INLINE_HEIGHT high and works in place.
+ *   The download button of a table or Markdown page saves its source file,
+ *   as in the tab (`downloadSource`); a failed download is one line under
+ *   the frame, and the page stays.
  * - The frame takes one of the places of the widgets
  *   (`Chat/widgets/budget.ts`), so the chat runs at most MAX_LIVE_WIDGETS
  *   frames in all. The preview is built when the card comes near the screen,
@@ -152,11 +156,13 @@ class FramePlace {
 }
 
 /** The sandbox frame. A new key starts a new frame; a new `id` hands over `html` again. */
-function SandboxFrame({ html, id, onContent, onFail, onHandOver, hostRef }: {
+function SandboxFrame({ html, id, onContent, onFail, onShown, onHandOver, hostRef }: {
   html: string;
   id: number;
   onContent: (message: ContentMessage) => void;
   onFail: (reason: string) => void;
+  /** Called with the document that the frame was just given. */
+  onShown: (id: number) => void;
   /** A document went to the frame: what the page before said counts no more. */
   onHandOver: () => void;
   /** The host of the frame, while it exists. */
@@ -184,9 +190,10 @@ function SandboxFrame({ html, id, onContent, onFail, onHandOver, hostRef }: {
 
   useEffect(() => {
     hostRef.current?.show(html);
+    onShown(id);
     // The identity decides a hand-over: each build is a new document, also with the same text.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [id]);
+  }, [id, onShown]);
 
   // The keyboard guard makes this element `position: relative`, so it fills its place by its size.
   return <div ref={place} className="h-full w-full" />;
@@ -211,6 +218,10 @@ function InlinePreviewFrame({ path }: { path: string }) {
   const [frameError, setFrameError] = useState<string | null>(null);
   const [frameKey, setFrameKey] = useState(0);
   const [deck, setDeck] = useState(false);
+  /** A download that failed: one line under the frame, and the page stays. */
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+  /** Counts the downloads and the hand-overs: a failure shows only for the last download of the page in the frame. */
+  const downloads = useRef(0);
 
   const alive = useRef(true);
   /** The place whose build runs now. */
@@ -220,6 +231,10 @@ function InlinePreviewFrame({ path }: { path: string }) {
   const shown = useRef<string | null>(null);
   const builds = useRef(0);
   const bundle = useRef<PreviewBundle | null>(null);
+  /** The document of the frame, the bundle it was built from, and whether it said `ready`. */
+  const displayed = useRef<{ id: number; bundle: PreviewBundle; ready: boolean } | null>(null);
+  /** The identity of the document that the frame was given last. */
+  const shownId = useRef<number | null>(null);
   const hostRef = useRef<PreviewHost | null>(null);
 
   useEffect(() => {
@@ -260,6 +275,7 @@ function InlinePreviewFrame({ path }: { path: string }) {
             if (!alive.current || !place.owns(generation)) return;
             shown.current = next.fingerprint;
             builds.current += 1;
+            displayed.current = { id: builds.current, bundle: next, ready: false };
             // Not a deck until the new page says so (onHandOver resets it again at the hand-over).
             setDeck(false);
             place.show({ html: built.html, id: builds.current });
@@ -273,6 +289,7 @@ function InlinePreviewFrame({ path }: { path: string }) {
             again.current = 'build';
           } else {
             shown.current = null;
+            displayed.current = null;
             place.fail();
             // The inline preview builds again only on Try again.
             setProblem(isStale(e) ? CHANGING : problemText(e, ''));
@@ -302,17 +319,44 @@ function InlinePreviewFrame({ path }: { path: string }) {
     if (fileEventNamesBundle(bundle.current, fileChange.path)) void refresh(false);
   }, [fileChange, live, refresh]);
 
-  const onContent = useCallback((message: ContentMessage) => {
-    if (message.type !== 'ready') return;
-    setDeck(message.kind === 'deck');
-    // A deck shows its first slide: it takes no input, so the person cannot move it back.
-    if (message.kind === 'deck' && message.slide !== 1) {
-      hostRef.current?.send({ type: 'slide', to: 'first' });
-    }
+  const onShown = useCallback((id: number) => {
+    shownId.current = id;
+    // A frame that was just given the document has not said `ready` for it.
+    if (displayed.current?.id === id) displayed.current.ready = false;
   }, []);
 
-  // A page that is not a deck until it says so (the new page says what it is).
-  const onHandOver = useCallback(() => setDeck(false), []);
+  const onContent = useCallback((message: ContentMessage) => {
+    const current = displayed.current;
+    const isShown = current !== null && shownId.current === current.id;
+    if (message.type === 'ready') {
+      // Only the page of the document in the frame says what it is.
+      if (!isShown) return;
+      current.ready = true;
+      setDeck(message.kind === 'deck');
+      // A deck shows its first slide: it takes no input, so the person cannot move it back.
+      if (message.kind === 'deck' && message.slide !== 1) {
+        hostRef.current?.send({ type: 'slide', to: 'first' });
+      }
+    } else if (message.type === 'download') {
+      // Only for the bundle of the document in the frame, after it said `ready` (`downloadSource`).
+      if (!isShown || !current.ready) return;
+      const attempt = ++downloads.current;
+      setDownloadError(null);
+      downloadSource(path, current.bundle).catch((e: unknown) => {
+        // A newer download, or a new document in the frame, decides the line.
+        if (alive.current && downloads.current === attempt) {
+          setDownloadError(`The download failed: ${problemText(e, '')}`);
+        }
+      });
+    }
+  }, [path]);
+
+  // A page that is not a deck until it says so, and no failed download of the page before.
+  const onHandOver = useCallback(() => {
+    setDeck(false);
+    downloads.current += 1;
+    setDownloadError(null);
+  }, []);
 
   const onFail = useCallback((reason: string) => {
     place.fail();
@@ -321,6 +365,7 @@ function InlinePreviewFrame({ path }: { path: string }) {
 
   const tryAgain = () => {
     setProblem(null);
+    setDownloadError(null);
     setFrameError(null);
     setFrameKey(k => k + 1);
     place.sync(true, true);
@@ -351,7 +396,7 @@ function InlinePreviewFrame({ path }: { path: string }) {
             <div className="absolute inset-0" inert={isDeck}>
               <SandboxFrame
                 key={frameKey} html={doc.html} id={doc.id} onContent={onContent} onFail={onFail}
-                onHandOver={onHandOver} hostRef={hostRef}
+                onShown={onShown} onHandOver={onHandOver} hostRef={hostRef}
               />
             </div>
           )}
@@ -381,6 +426,9 @@ function InlinePreviewFrame({ path }: { path: string }) {
             </div>
           )}
         </figure>
+      )}
+      {note === null && downloadError !== null && (
+        <p role="status" className="mt-1 mb-0 text-xs text-error">{downloadError}</p>
       )}
     </div>
   );

@@ -2147,10 +2147,21 @@ Response: {
 }
 ```
 
-`kind` is `folder`, `page` or `image`. A refused path: 403
-`outside_workspace`; 404 `not_found`; 422 `invalid_path`, `workspace_root`,
-`hidden`, `link`, `special_file`, `unsupported`, `no_entry`,
-`file_too_large`, `too_many_files`, `path_too_long`.
+`kind` is `folder`, `page`, `image`, `markdown` or `csv`. The bundle of a
+Markdown or CSV file has a generated `index.html`, the source file as
+`source.md` or `data.csv`, and the kit files that the page names (see
+[the artifact kit](artifact-kit.md)); its `root` is the folder of the file.
+The entry page of any bundle that names a kit file (`nerve-kit/<name>`,
+found as text in its first 1 MiB) gets that file in `files`. A refused path: 403 `outside_workspace`; 404 `not_found`;
+422 `invalid_path`, `workspace_root`, `hidden`, `link`, `special_file`,
+`unsupported`, `no_entry`, `file_too_large`, `too_many_files`,
+`path_too_long`, `reserved_path` (a folder with its own `nerve-kit/`
+folder), `kit_missing` (the web UI is not built), `not_text` (a Markdown or
+CSV file that is not UTF-8 text), `source_too_large` (a Markdown or CSV file
+above 5 MiB, or a CSV file with more than 10,000 rows, 200 columns or
+200,000 cells). 409 `stale_description` when a file changed while it was
+described (the entry page or the Markdown or CSV file is opened again after
+the walk): read the description again.
 
 #### `GET /api/preview/file?path=<path>&file=<file>&fingerprint=<fingerprint>`
 The bytes of the file `file` (relative to the root of the bundle of `path`).

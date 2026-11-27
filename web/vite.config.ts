@@ -22,7 +22,8 @@ export default defineConfig({
     include: ['src/**/*.test.{ts,tsx}'],
     // Components are asserted on behaviour and ARIA, never on Tailwind
     // classes, so there is nothing to gain from processing the stylesheet.
-    css: false,
+    // The stylesheets of the kit are read as text by their specs (`?raw`).
+    css: { include: [/\/src\/kit\/[^/]+\.css/] },
     server: {
       deps: {
         // Click UI's components import their own CSS alongside themselves.

@@ -377,6 +377,30 @@ class TestDescriptionCache:
             assert r.status_code == 200
         assert walks == ["decks/demo"]
 
+    async def test_a_file_that_changes_while_it_is_described_is_stale(self, api, monkeypatch):
+        """The kit scan opens the entry with the identity of the walk. A write
+        between the two is the stale answer (409), which the web UI reads again,
+        not a refusal of the bundle (422)."""
+        from nerve.artifacts import bundle as bundle_module
+
+        real = bundle_module._open_below
+        written: list[str] = []
+
+        def write_first(workspace, names, path, described=None):
+            if described is not None and path == "index.html" and not written:
+                target = Path(workspace, *names)
+                target.write_text(target.read_text() + "<!-- changed -->")
+                written.append(path)
+            return real(workspace, names, path, described)
+
+        monkeypatch.setattr(bundle_module, "_open_below", write_first)
+        r = await api.http.get(BUNDLE, params={"path": "decks/demo"})
+        assert written == ["index.html"]
+        assert (r.status_code, r.json()["detail"]["code"]) == (409, "stale_description")
+        # The next read describes the new state.
+        r = await api.http.get(BUNDLE, params={"path": "decks/demo"})
+        assert r.status_code == 200
+
     @pytest.mark.parametrize("fingerprint", ["0" * 64, ""])
     async def test_a_description_that_is_not_kept_is_stale_and_nothing_is_walked(self, api, monkeypatch, fingerprint):
         from nerve.gateway.routes import preview

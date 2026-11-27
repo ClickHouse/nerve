@@ -67,12 +67,13 @@ describe('the preview action of a file', () => {
     render(
       <MemoryRouter initialEntries={['/files']}>
         <Routes>
-          <Route path="/files" element={<>{editor('site/index.html')}{editor('memory/notes.md')}</>} />
+          <Route path="/files" element={<>{editor('site/index.html')}{editor('memory/notes.md')}{editor('memory/notes.txt')}</>} />
           <Route path="/chat/:sessionId" element={<p>chat page</p>} />
         </Routes>
       </MemoryRouter>,
     );
-    expect(screen.queryByRole('button', { name: 'Preview notes.md' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Preview notes.txt' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Preview notes.md' })).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Preview index.html' }));
     expect(screen.getByText('chat page')).toBeInTheDocument();
     expect(useChatStore.getState().panels).toEqual([expect.objectContaining({ previewPath: 'site/index.html' })]);

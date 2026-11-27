@@ -1,3 +1,4 @@
+import { readSource } from '../../kit/source';
 import type { PreviewBundle } from '../../types/preview';
 
 /**
@@ -101,7 +102,10 @@ export type ReadBundleFile = (path: string) => Promise<ArrayBuffer>;
 export interface PreviewDocument {
   /** The document for the frame. */
   html: string;
-  /** The text of the entry file, for the source view; null for an image. */
+  /**
+   * The text for the source view: the entry file, or for a Markdown or CSV
+   * bundle the source text in its generated page; null for an image.
+   */
   source: string | null;
   /** The bytes of the files that went into the document. */
   bytes: number;
@@ -180,6 +184,9 @@ export function resolveAddress(address: string, folder: string, files: ReadonlyS
   if (SCHEME.test(value) || value.startsWith('/') || value.startsWith('\\')) return null;
   const bare = value.split('#')[0].split('?')[0];
   if (!bare) return null;
+  // An encoded separator names no file: the content server of a publish
+  // refuses it too, so the preview does the same.
+  if (/%(2f|5c)/i.test(bare)) return null;
   let decoded: string;
   try {
     decoded = decodeURIComponent(bare);
@@ -617,8 +624,10 @@ async function build(bundle: PreviewBundle, read: ReadBundleFile, limit: number)
   if (bundle.kind === 'image') {
     return { html: await imageDocument(files), source: null, bytes: files.bytes };
   }
-  const source = files.use(await files.textOf(bundle.entry));
-  const doc = new DOMParser().parseFromString(source, 'text/html');
+  const entry = files.use(await files.textOf(bundle.entry));
+  const doc = new DOMParser().parseFromString(entry, 'text/html');
+  // The source view of a Markdown or CSV bundle shows the text of the file.
+  const source = bundle.kind === 'markdown' || bundle.kind === 'csv' ? readSource(doc)?.text ?? entry : entry;
   doc.documentElement.removeAttribute('manifest');
   await inlineTree(doc, folderOf(bundle.entry), files);
   addOwnHead(doc);

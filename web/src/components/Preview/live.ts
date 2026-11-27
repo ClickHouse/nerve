@@ -8,6 +8,8 @@ export function fileEventNamesBundle(bundle: PreviewBundle, path: string): boole
   const prefix = `${bundle.root_path.replace(/\/+$/, '')}/`;
   if (!path.startsWith(prefix)) return false;
   const inner = path.slice(prefix.length);
+  // A Markdown or CSV bundle changes with its one source file.
+  if (bundle.kind === 'markdown' || bundle.kind === 'csv') return inner === bundle.path.split('/').pop();
   // A new file of a folder is a change of the bundle too.
   return bundle.kind === 'folder' || bundle.files.some(f => f.path === inner);
 }

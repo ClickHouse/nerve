@@ -15,12 +15,19 @@ function record(page: Page): string[] {
   return seen
 }
 
-async function openPreview(page: Page, name = 'index.html', title = 'Quarterly review') {
+/** Open the Preview tab of the file `name` of the Write calls of snap-older. */
+async function openTab(page: Page, name: string) {
   await page.goto('/chat/snap-older')
-  // The two Write calls of the message are one folded burst.
-  await page.getByRole('button', { name: 'Edited 2 files' }).click()
+  // The Write calls of the message are one folded burst.
+  await page.getByRole('button', { name: 'Edited 4 files' }).click()
+  // The burst shows its last rows; the first one is behind "Show 1 more".
+  await page.getByRole('button', { name: /^Show 1 more/ }).click()
   await page.getByRole('button', { name: `Preview ${name}` }).click()
-  const content = page.frameLocator('iframe[title="Preview"]').frameLocator('iframe')
+  return page.frameLocator('iframe[title="Preview"]').frameLocator('iframe')
+}
+
+async function openPreview(page: Page, name = 'index.html', title = 'Quarterly review') {
+  const content = await openTab(page, name)
   await expect(content.locator('#title')).toHaveText(title)
   return content
 }
@@ -56,6 +63,34 @@ test('a change by a shell command shows within a few seconds', async ({ page }, 
   // What a shell command does: a write that sends no file event.
   writeFileSync(join(DECKS, 'live.html'), '<!doctype html><h1 id="title">Second version</h1>\n')
   await expect(content.locator('#title')).toHaveText('Second version', { timeout: 8000 })
+})
+
+test('a Markdown file shows as the Markdown page of the kit', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop', 'one layout is enough')
+  const notes = await openTab(page, 'notes.md')
+  await expect(notes.getByRole('heading', { name: 'Release notes' })).toBeVisible()
+  // A link is its text and its address; raw HTML of the file is text.
+  await expect(notes.locator('article')).toContainText('the plan (https://example.org/plan)')
+  await expect(notes.locator('article')).toContainText('<b>raw html</b>')
+  await expect(notes.locator('article a, article b')).toHaveCount(0)
+  const frame = await page.locator('iframe[title="Preview"]').boundingBox()
+  expect(frame!.height).toBeGreaterThan(300)
+})
+
+test('a CSV file shows as the table page of the kit', async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== 'desktop', 'one layout is enough')
+  const cost = await openTab(page, 'cost.csv')
+  await expect(cost.getByRole('table', { name: 'cost.csv' })).toBeVisible()
+  await expect(cost.locator('[aria-live="polite"]')).toHaveText('2 rows')
+  await expect(cost.getByRole('cell', { name: 'query' })).toBeVisible()
+  // The frame sleeps under the veil of the keyboard guard until the pointer is on it.
+  const box = (await page.locator('iframe[title="Preview"]').boundingBox())!
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2)
+  await cost.getByRole('button', { name: 'Cost', exact: true }).click()
+  await expect(cost.locator('tbody tr').first()).toContainText('query')
+  await cost.getByRole('searchbox', { name: 'Search the table' }).fill('ingest')
+  await expect(cost.locator('[aria-live="polite"]')).toHaveText('1 of 2 rows')
+  expect(box.height).toBeGreaterThan(300)
 })
 
 test.describe('on a phone of 390 by 844', () => {

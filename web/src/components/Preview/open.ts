@@ -4,10 +4,11 @@ import { useChatStore } from '../../stores/chatStore';
  * Which files have a preview, and how a preview tab opens.
  *
  * The same rules as the bundles of the server (`nerve/artifacts/bundle.py`):
- * an HTML file (a file named `index.html` shows its whole folder), and an
- * image. The server decides; this only says where to offer the action.
+ * an HTML file (a file named `index.html` shows its whole folder), an
+ * image, a Markdown file and a CSV file (drawn by a page of the kit). The
+ * server decides; this only says where to offer the action.
  */
-const PREVIEW_FILE = /\.(html|png|jpe?g|gif|webp|avif|svg)$/i;
+const PREVIEW_FILE = /\.(html|png|jpe?g|gif|webp|avif|svg|md|csv)$/i;
 
 /** True for a file path that has a preview. */
 export function canPreview(path: string | null | undefined): boolean {

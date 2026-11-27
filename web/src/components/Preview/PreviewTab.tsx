@@ -11,6 +11,7 @@ import { ChevronLeft, ChevronRight, CodeXml, Loader2, Lock, Play, RefreshCw, X }
 import { buildPreviewDocument, type PreviewDocument } from './document';
 import { PreviewHost } from './host';
 import { agoText, fileEventNamesBundle, POLL_MS } from './live';
+import { downloadSource } from './download';
 import type { ContentKind, ContentMessage, HostMessage } from './messages';
 import { isStale, MAX_RESTARTS, problemText } from './problems';
 
@@ -46,10 +47,14 @@ const NO_FULL_SCREEN = 'Present needs full screen, and this browser did not allo
 const KEEPS_CHANGING = 'The files change while the preview is read. The tab tries again in a moment.';
 
 /** The sandbox frame of the preview. A new key starts a new frame. */
-function PreviewFrame({ html, onContent, onFail, onHandOver, hostRef }: {
+function PreviewFrame({ html, id, onContent, onFail, onShown, onHandOver, hostRef }: {
   html: string;
+  /** The identity of the built document: a new one is handed over, also with the same text. */
+  id: number;
   onContent: (message: ContentMessage) => void;
   onFail: (reason: string) => void;
+  /** Called with the document that the frame was just given. */
+  onShown: (id: number) => void;
   /** A document went to the frame: what the page before said counts no more. */
   onHandOver: () => void;
   hostRef: React.MutableRefObject<PreviewHost | null>;
@@ -76,7 +81,11 @@ function PreviewFrame({ html, onContent, onFail, onHandOver, hostRef }: {
 
   useEffect(() => {
     hostRef.current?.show(html);
-  }, [html, hostRef]);
+    onShown(id);
+    // The identity decides a hand-over: a rebuild with the same text is a new
+    // document for the page's `ready`, and the text belongs to the identity.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [id, hostRef, onShown]);
 
   // The keyboard guard makes this element `position: relative` for its veil,
   // so it fills the stage by its size, not by `inset`.
@@ -92,7 +101,7 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
   const hosted = useHostedStore(s => s.mode === 'external');
 
   const [bundle, setBundle] = useState<PreviewBundle | null>(null);
-  const [doc, setDoc] = useState<PreviewDocument | null>(null);
+  const [doc, setDoc] = useState<(PreviewDocument & { id: number }) | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [showSource, setShowSource] = useState(false);
@@ -101,8 +110,18 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
   const [content, setContent] = useState<ContentState | null>(null);
   const [presenting, setPresenting] = useState(false);
   const [presentError, setPresentError] = useState<string | null>(null);
+  /** A download that failed: one line, and the page stays. */
+  const [downloadError, setDownloadError] = useState<string | null>(null);
+  /** Counts the downloads and the hand-overs: a failure shows only for the last download of the page in the frame. */
+  const downloads = useRef(0);
 
   const hostRef = useRef<PreviewHost | null>(null);
+  /** The document of the frame, the bundle it was built from, and whether it said `ready`. */
+  const displayed = useRef<{ id: number; bundle: PreviewBundle; ready: boolean } | null>(null);
+  /** The identity of the document that the frame was given last. */
+  const shownId = useRef<number | null>(null);
+  /** Counts the built documents: each one has its own identity. */
+  const builds = useRef(0);
   const stageRef = useRef<HTMLDivElement>(null);
   /** The fingerprint of the document on screen. */
   const shown = useRef<string | null>(null);
@@ -151,7 +170,11 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
             if (!alive.current) return;
             shown.current = next.fingerprint;
             failed.current = null;
-            setDoc(built);
+            // The frame shows this document of this bundle from now on: a
+            // `ready` of an earlier document does not count for it.
+            builds.current += 1;
+            displayed.current = { id: builds.current, bundle: next, ready: false };
+            setDoc({ ...built, id: builds.current });
             setContent(null);
           }
           if (!failedBefore) setProblem(null);
@@ -165,7 +188,10 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
           } else {
             shown.current = null;
             failed.current = isStale(e) ? null : attempt;
+            displayed.current = null;
             setDoc(null);
+            // No page is shown: no deck controls of the page that was.
+            setContent(null);
             setProblem(isStale(e) ? KEEPS_CHANGING : problemText(e));
           }
         }
@@ -209,8 +235,42 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
 
   const send = useCallback((message: HostMessage) => hostRef.current?.send(message), []);
 
+  const onShown = useCallback((id: number) => {
+    shownId.current = id;
+    // A frame that was just given the document has not said `ready` for it
+    // (also a new frame after Reload with the same document).
+    if (displayed.current?.id === id) displayed.current.ready = false;
+  }, []);
+
+  /**
+   * `download` from a table or Markdown page (`downloadSource`). A page that
+   * said no `ready` gets nothing.
+   */
+  const download = useCallback(async () => {
+    // Only for the bundle of the document in the frame, after that document
+    // was given to the frame and said `ready`; never for a newer description.
+    const shown = displayed.current;
+    if (!shown || !shown.ready || shownId.current !== shown.id) return;
+    const attempt = ++downloads.current;
+    setDownloadError(null);
+    try {
+      await downloadSource(path, shown.bundle);
+    } catch (e) {
+      // A newer download, or a new document in the frame, decides the line.
+      if (alive.current && downloads.current === attempt) {
+        setDownloadError(`The download failed: ${problemText(e, '')}`);
+      }
+    }
+  }, [path]);
+
   const onContent = useCallback((message: ContentMessage) => {
-    if (message.type === 'ready') {
+    if (message.type === 'download') {
+      void download();
+    } else if (message.type === 'ready') {
+      // Only the page of the document in the frame says what it is.
+      const shown = displayed.current;
+      if (!shown || shownId.current !== shown.id) return;
+      shown.ready = true;
       setContent({ kind: message.kind, slides: message.slides ?? null, slide: message.slide ?? null });
       // A new document of the same deck: back to the slide the person was on.
       const wanted = lastSlide.current;
@@ -218,19 +278,24 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
         send({ type: 'slide', to: wanted });
       }
       if (presentingRef.current) send({ type: 'present', on: true });
-    } else {
+    } else if (message.type === 'slide') {
       lastSlide.current = message.slide;
       setContent(c => (c ? { ...c, slide: message.slide, slides: message.slides } : c));
     }
-  }, [send]);
+  }, [send, download]);
 
   const onFail = useCallback((reason: string) => setFrameError(reason), []);
 
-  // No deck controls of the page before: the new page says what it is.
-  const onHandOver = useCallback(() => setContent(null), []);
+  // No deck controls and no failed download of the page before: the new page says what it is.
+  const onHandOver = useCallback(() => {
+    setContent(null);
+    downloads.current += 1;
+    setDownloadError(null);
+  }, []);
 
   const reload = () => {
     setFrameError(null);
+    setDownloadError(null);
     setFrameKey(k => k + 1);
     void refresh(true);
   };
@@ -336,6 +401,11 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
         </div>
       </div>
 
+      {downloadError && (
+        <p role="status" className="px-3 py-1 text-xs text-error border-b border-border-subtle bg-bg shrink-0">
+          {downloadError}
+        </p>
+      )}
       {presentError && (
         <p role="status" className="px-3 py-1 text-xs text-error border-b border-border-subtle bg-bg shrink-0">
           {presentError}
@@ -377,8 +447,8 @@ export function PreviewTab({ tab }: { tab: PanelTab }) {
               className="absolute inset-0 bg-bg-sunken outline-none"
             >
               <PreviewFrame
-                key={frameKey} html={doc.html} onContent={onContent} onFail={onFail} onHandOver={onHandOver}
-                hostRef={hostRef}
+                key={frameKey} html={doc.html} id={doc.id} onContent={onContent} onFail={onFail}
+                onShown={onShown} onHandOver={onHandOver} hostRef={hostRef}
               />
             </div>
           </>

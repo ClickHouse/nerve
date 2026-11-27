@@ -103,7 +103,7 @@ On a phone (narrower than 768 px), a bar at the bottom replaces the nav rail: **
 In the chat, each run of tool calls and thinking between two text blocks of a message is one **tool burst**. A finished burst with a tool call and at least two blocks shows as one muted line that names the work, for example "Read 3 files, ran 4 commands, searched 2 times, edited 2 files" (reads and edits count distinct files; MCP tools count per server, "used 2 nerve tools"), with "1 failed" in red when calls failed. A click opens the rows. While a turn runs, its last burst stays open, so the newest calls show; it folds when text follows or the turn ends. Question cards (`ask_user`, AskUserQuestion, `ask_form`), the ExitPlanMode decision card, files that the agent sends (`send_file`) and the first card of a workflow run are never in a burst. Agent tabs and plan tabs show the rows without bursts.
 
 Tool calls are collapsed by default with specialized renderers:
-- **Edit** — Unified diff with red/green highlighting. With the Preview tab on, an edit of a file that has a preview (an HTML file or an image) has a **Preview** button (a screen icon) at the end of its row; see [Preview](#preview)
+- **Edit** — Unified diff with red/green highlighting. With the Preview tab on, an edit of a file that has a preview (an HTML file, an image, a Markdown file or a CSV file) has a **Preview** button (a screen icon) at the end of its row; see [Preview](#preview)
 - **Bash** — Terminal-styled with `$` prompt and output
 - **Read/Write** — File path prominent, line count, collapsible content. A Write of a file that has a preview has the **Preview** button too
 - **Memory** (recall/memorize/history) — Parsed memory items with colored type badges (event, profile, knowledge, behavior)
@@ -114,7 +114,7 @@ Tool calls are collapsed by default with specialized renderers:
 - **AskUserQuestion** — Interactive question card with clickable options (radio for single-select, checkboxes for multi-select). Each question also offers **Other…**, which opens a "Your answer" field: the typed text (required once chosen) is that question's answer — it replaces the option in a single-select question and is appended to the chosen labels in a multi-select one. A card with one single-select question still answers on one click of an option. Multiple questions grouped in one card with a shared Submit button. Markdown previews on hover. When the agent is paused mid-turn (via `can_use_tool`), answers are sent through the interaction protocol (`answer_interaction` WebSocket message), injecting them into the SDK's `answers` field so the agent continues seamlessly. Once the question is no longer pending (answered here or in another tab, after a reload, or closed by a timeout), the card is read-only and shows the chosen answers; it never posts an answer as a chat message.
 - **ask_form** (Nerve's form tool, `mcp__nerve__ask_form`) — One card for up to six questions while the agent's tool call waits for the answers (up to an hour). The call's optional intro (Markdown, the agent's explanation of why it asks) shows above the card as chat text, and stays there after the card is answered and folds. In the card: an optional title, then each question with its label chip (`*` when required, or "Optional"), the question and the agent's reason in muted text. By kind: `choice` is option rows to pick one and `multi` option rows to pick any, each with **Other…** for the person's own words unless the agent turned it off (in `multi` the Other… text is one more answer); `text` is a two-row box that grows (Enter is a new line); `url` is checked to be http(s) with a host and no spaces; `list` is chips (a comma or Enter adds one, Backspace in the empty field removes the last, a paste splits at commas and line breaks, and leaving the field keeps the typed text); `repos` is chips like `list`, each `owner/name` (a pasted GitHub URL becomes `owner/name`; an invalid one is red with a hint and blocks Submit). Defaults are prefilled. **Submit** (or Cmd/Ctrl+Enter anywhere in the card) is enabled once every required question has an answer and nothing is invalid; Escape inside the card never stops the waiting turn. The answers go back through `answer_interaction` (`result: { answers }`), and the agent gets one line per question plus the same answers as JSON. The card answers only while its own form waits; after an answer here or in another tab, a timeout or a reload it is read-only. Answered cards fold, `ask_form` and AskUserQuestion alike: an answered or closed card shows one line per question, `LABEL → answer` (chips for a list, "—" for no answer); **Show questions** opens the full card, read-only, and **Hide** folds it again. Cards start folded, also after a reload, where the answers are read from the tool result; a card that still waits is shown in full. "Closed" means it ended without an answer (a timeout, the form was closed, or the session stopped).
 - **ask_user** (Nerve's question tool, `mcp__nerve__ask_user`): the question and its options, answerable in the chat while it waits. The card reads the question's notification, so the chat, the Notifications page and the toast show the same question with the same option list: one full-width row per option with a letter key (A, B, C). While focus is in the list, a letter or a digit 1 to 9 chooses that row. An option that ends in "(recommended)" shows first with a "Recommended" tag. The last row, **Other…**, opens a field for an answer in your own words (Enter sends, Escape closes the field). An approval (`propose_action`, on the Notifications page and in the toast) has no Other… row and says "Nothing happens until you choose."; a question does not, because the agent can continue without the answer. In an approval, Approve (green, ✓), Decline (red, ✕) and Snooze 24h (moon) show their icon in place of the letter, and the answer line shows that icon in place of `✓`. The letter keys also choose these rows. After an answer from any place (the chat, the Notifications page, the toast, Telegram, Slack), each place shows `✓ <answer>` with who answered, when, and through which channel; **Show options** opens the list, read-only. When the server refuses an answer, the card reads the question again and shows the answer from a different place, if there is one; if not, "Could not send the answer. Try again." shows under the options. While a question or an approval waits, **Dismiss** under the options in the chat and on the Notifications page ends it without an answer: the agent that asked a question gets a note, and the Telegram and Slack cards lose their buttons (see [api.md](api.md#post-apinotificationsiddismiss)). A question that expired shows "Expired without an answer"; one that was dismissed in any place shows "Dismissed without an answer". The toast shows all options and stays open until you answer or dismiss it; when the question is answered in another place, the toast shows the answer and closes after 5 seconds. A `notify` call shows as a "Notify" row.
-- **send_file** (`mcp__nerve__send_file`): an image file (PNG, JPEG, GIF, WebP, AVIF or SVG) shows in the chat, at most 320 px high, with its name and a download link below it. A click on the image opens it at full size, with a download card. Another file, or an image that does not load (for example, a file that was deleted later), shows as a download card. A call that sent nothing shows "Could not send `<name>`" and the reason, for example a file outside the workspace. The image comes from `GET /api/files/download`, the same as the download card. With the Preview tab on, a sent HTML file or image has the **Preview** button next to its card.
+- **send_file** (`mcp__nerve__send_file`): an image file (PNG, JPEG, GIF, WebP, AVIF or SVG) shows in the chat, at most 320 px high, with its name and a download link below it. A click on the image opens it at full size, with a download card. Another file, or an image that does not load (for example, a file that was deleted later), shows as a download card. A call that sent nothing shows "Could not send `<name>`" and the reason, for example a file outside the workspace. The image comes from `GET /api/files/download`, the same as the download card. With the Preview tab on, a sent HTML file, image, Markdown file or CSV file has the **Preview** button next to its card.
 - **EnterPlanMode** — A status line, "Entering plan mode…" while it runs and "Entered plan mode" when complete ("Plan mode declined" on an error), with no buttons: entering plan mode only restricts the agent, so no approval is involved (the Claude CLI switches the mode itself; if a CLI asks, the server allows it at once).
 - **ExitPlanMode** — The decision card. The agent pauses mid-turn until the person decides. The card shows an autogenerated summary, not the plan itself: up to six short bullets that the server writes with `agent.title_model` when the pause starts (the `plan_summary` event), with "Summarizing…" until they arrive and the plan's first heading and two lines when no summary can be made; the full plan (the interaction's `tool_input.plan`, which the CLI fills with the plan file's text) is in the side panel, which **Read the plan** opens. **Approve** lets the agent go on (it starts on the plan in the same turn) and closes the plan tab. **Request changes…** opens a required "What should change?" field; **Send** refuses the plan with that text, which reaches the agent verbatim: it stays in plan mode, revises the plan and asks again with a new card. **Edit**, offered when the pause carries the plan text, opens the side panel with the plan as a text field ("Edit the plan"); there **Apply edited plan** (enabled once the text changed) approves the person's text instead (`answer_interaction` with `result: { plan }`): the CLI saves it to the plan file and tells the agent the plan was approved with the person's edits. **Cancel** drops the edits. A decided card keeps its outcome line and a **Read the plan** link that opens that plan read-only (the edited text, for an edited approval). In the onboarding conversation the card is titled "Setup proposal" with **Apply setup**, **Change something…** and "Edit the setup proposal". After an approval, while that turn still runs, the card reads "Approved — applying…" ("Approved with your edits — applying…"; "Applying the setup…" in the onboarding conversation), then "Approved" or "Approved with your edits"; a change request reads "Changes requested" with the first line of the feedback, and an error that is not the person's feedback (a timeout, a stopped session, a CLI validation error) reads "Closed" with its reason.
 
@@ -193,7 +193,16 @@ The bundle of a path (`nerve/artifacts/bundle.py`):
   (required);
 - a file named `index.html`: its folder, as above;
 - another `.html` file: that one file;
-- an image (PNG, JPEG, GIF, WebP, AVIF, SVG): that one file.
+- an image (PNG, JPEG, GIF, WebP, AVIF, SVG): that one file;
+- a Markdown file (`.md`) or a CSV file (`.csv`): a generated `index.html`
+  that holds the text of the file as data, the page of the
+  [artifact kit](artifact-kit.md) that draws it (a Markdown page or a table
+  page), and the file itself as `source.md` or `data.csv`.
+
+The entry page of a bundle that names a file of the kit
+(`nerve-kit/deck.js` and the like, found as text in its first 1 MiB) gets
+that file in the bundle, from the web build. A folder cannot have its own
+`nerve-kit/` folder.
 
 A symbolic link or a special file in the path or in the folder refuses the
 bundle. Files and folders whose name starts with a dot are left out, and a
@@ -210,9 +219,12 @@ the tab in the open chat. One tab for each path: a second open focuses it.
 **In the chat.** Under the card of a file that the agent sent (`send_file`)
 and that has a preview, the chat shows the preview itself, in the sandbox
 frame of the tab. An image shows as an image, as before. A page (an HTML
-file, a folder) is 360 pixels high and works in place. A page that says it
-is a deck shows its first slide at 16 by 9 and takes no input: a click opens
-the Preview tab, which has the slide controls and Present. The frame is made
+file, a folder, the table of a CSV file, the page of a Markdown file) is 360
+pixels high and works in place; the download button of a table or Markdown
+page saves the file, as in the tab (a failed download is one line under the
+frame). A page that says it is a deck shows its
+first slide at 16 by 9 and takes no input: a click opens the Preview tab,
+which has the slide controls and Present. The frame is made
 when the card comes near the screen, and made again when a file event names
 a file of the bundle; it does not poll. It takes one of the six frame places
 of the chat that widgets also use (see [Widgets](widgets.md)): when frames
@@ -224,7 +236,7 @@ card holds no frame place, and it builds again only on **Try again**.
 
 **The header.** The path, "Updated … ago" (the newest change of a file of
 the bundle), **Reload the preview**, **Show the source** (`</>`, the text of
-the entry file), **Present** (the frame fills the screen) and the close
+the entry file, or of the Markdown or CSV file), **Present** (the frame fills the screen) and the close
 button of the panel. A page that says it is a deck gets slide controls
 ("3 / 12"). Present gives the keyboard to the slides: the arrow keys, Page
 Up, Page Down, Space, Home and End move them. After a click in the page,
@@ -318,7 +330,19 @@ on.
 `v: 1`. From the page: `{type: "ready", kind: "deck" | "table" | "markdown",
 canPrint, slides?, slide?}` at load and as the answer to `hello`, and
 `{type: "slide", slide, slides}` when the slide changes (slides count from
-1). From the tab: `{type: "hello"}`, `{type: "slide", to: "next" | "prev" |
+1), and `{type: "download"}` when the person clicks the download button of a
+table or Markdown page. For `download` the tab saves the source file of the
+bundle (`data.csv` of a CSV bundle, `source.md` of a Markdown bundle) under
+the name of the workspace file. The kind of the bundle in its description
+decides, never the kind that the page states: the tab does nothing for a
+bundle of another kind or for a page that sent no `ready`. It counts only
+the bundle that the document in the frame was built from, and only a
+`ready` that came after the frame got that document: a newer description
+does not count for the page that is still shown. A download that fails is
+one line under the header ("The download failed: ..."); the page stays, and
+the line goes when the frame gets the next document. Only the last download
+of the page in the frame can show the line.
+The frame cannot start a download itself. From the tab: `{type: "hello"}`, `{type: "slide", to: "next" | "prev" |
 "first" | "last" | <number>}` and `{type: "present", on}`. The tab takes a
 message only from its own frame, checks each value, and uses none as markup
 or as an address. A page that sends no `ready` is a plain page. When a new
@@ -331,7 +355,8 @@ order.
 **Limits.** A page that loads files at run time (`fetch`, a module script
 that imports another file, a link to another page of the bundle) does not
 work in the preview: only what the entry page names goes into the document,
-and the frame has no network. Text files are read as UTF-8. `window.print()`
+and the frame has no network. Text files are read as UTF-8. A Markdown page
+shows the alt text of an image, not the image, and the address of a link as text. `window.print()`
 and forms do nothing in the frame.
 
 ### Setup
@@ -733,8 +758,8 @@ npm install
 # Dev server (proxies to backend on :8900)
 npm run dev
 
-# Production build
-npx vite build
+# Production build (the web UI and the artifact kit)
+npm run build
 ```
 
 The dev server proxies `/api` and `/ws` to `localhost:8900`.
@@ -763,12 +788,18 @@ before/after image diff in the pull request. When the CI job fails, its
 ## Build & Deploy
 
 ```bash
-# Build production bundle
-cd web && npx vite build
+# Build production bundle (the web UI, then the artifact kit)
+cd web && npm run build
 
-# Output goes to web/dist/
+# Output goes to web/dist/, the kit to web/dist/nerve-kit/
 # FastAPI serves this directory automatically
 ```
+
+`npm run build` ends with `node scripts/build-kit.mjs`, the second build:
+the files of the [artifact kit](artifact-kit.md) with fixed names
+(`web/src/kit/files.json`). Each script is one classic script that imports
+nothing. The build fails when a kit file names an address of the network or
+has a call that loads from it.
 
 ## State Management
 

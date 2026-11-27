@@ -13,7 +13,7 @@ export interface ViewerPreview {
 }
 
 /** What the path of a bundle names. */
-export type PreviewBundleKind = 'folder' | 'page' | 'image';
+export type PreviewBundleKind = 'folder' | 'page' | 'image' | 'markdown' | 'csv';
 
 /** One file of a bundle. */
 export interface PreviewBundleFile {

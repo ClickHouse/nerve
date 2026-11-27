@@ -13,7 +13,14 @@ interface FakeHost {
   disposed: boolean;
 }
 
-const { hosts } = vi.hoisted(() => ({ hosts: [] as FakeHost[] }));
+const { hosts, downloads } = vi.hoisted(() => ({
+  hosts: [] as FakeHost[],
+  downloads: [] as Array<{ name: string; type: string }>,
+}));
+
+vi.mock('../Chat/rich/export', () => ({
+  downloadBlob: (blob: Blob, name: string) => downloads.push({ name, type: blob.type }),
+}));
 
 vi.mock('./host', () => ({
   PreviewHost: class {
@@ -89,6 +96,7 @@ async function show(path = PATH) {
 beforeEach(() => {
   vi.useFakeTimers({ shouldAdvanceTime: true });
   hosts.length = 0;
+  downloads.length = 0;
   resetWidgetSlots();
   entry = '<!doctype html><html><body><h1>Slide one</h1></body></html>';
   fingerprint = 'f1';
@@ -108,7 +116,7 @@ afterEach(() => {
 
 describe('which files have an inline preview', () => {
   it.each([
-    ['/ws/deck/index.html', true], ['/ws/page.HTML', true],
+    ['/ws/deck/index.html', true], ['/ws/page.HTML', true], ['/ws/notes.md', true], ['/ws/data.csv', true],
     ['/ws/logo.svg', false], ['/ws/photo.jpeg', false], ['/ws/app.js', false], ['', false],
   ])('%s: %s', (path, inline) => {
     expect(canPreviewInline(path)).toBe(inline);
@@ -426,5 +434,107 @@ describe('the card of a sent file', () => {
     expect(screen.getByRole('img', { name: 'chart.png' })).toBeInTheDocument();
     expect(screen.queryByRole('figure', { name: /^Preview of/ })).not.toBeInTheDocument();
     expect(getBundle()).not.toHaveBeenCalled();
+  });
+});
+
+describe('the download of a table or Markdown page', () => {
+  const PAGE = '<!doctype html><html><body><main id="nerve-kit-page"></main></body></html>';
+  const table = (): PreviewBundle => ({
+    path: 'reports/sales.csv', root: 'reports', root_path: '/ws/reports', kind: 'csv', entry: 'index.html',
+    files: [
+      { path: 'data.csv', size: 4, type: 'text/csv' },
+      { path: 'index.html', size: PAGE.length, type: 'text/html' },
+    ],
+    size: 0, fingerprint: 'f1', modified: Date.now(),
+  });
+
+  beforeEach(() => {
+    getFile().mockImplementation(async () => encoder.encode(PAGE).slice().buffer);
+  });
+
+  it('saves the source file of the bundle in the frame, after the page said ready', async () => {
+    getBundle().mockImplementation(async () => table());
+    await show('/ws/reports/sales.csv');
+    act(() => lastHost().options.onContent({ type: 'download' }));
+    await settle();
+    expect(downloads).toEqual([]);
+
+    act(() => lastHost().options.onContent({ type: 'ready', kind: 'table', canPrint: false }));
+    act(() => lastHost().options.onContent({ type: 'download' }));
+    await settle();
+    expect(getFile()).toHaveBeenLastCalledWith('/ws/reports/sales.csv', 'data.csv', 'f1');
+    expect(downloads).toEqual([{ name: 'sales.csv', type: 'text/csv' }]);
+  });
+
+  it('keeps the page when the download fails, with one line under it', async () => {
+    getBundle().mockImplementation(async () => table());
+    await show('/ws/reports/sales.csv');
+    getFile().mockImplementation(async (_path: string, file: string) => {
+      if (file === 'data.csv') {
+        throw new ApiError(409, JSON.stringify({ detail: { code: 'stale_description', message: 'The files changed.' } }));
+      }
+      return encoder.encode(PAGE).slice().buffer;
+    });
+    act(() => lastHost().options.onContent({ type: 'ready', kind: 'table', canPrint: false }));
+    act(() => lastHost().options.onContent({ type: 'download' }));
+    await settle();
+    expect(downloads).toEqual([]);
+    expect(screen.getByRole('status')).toHaveTextContent('The download failed: The files changed.');
+    expect(screen.getByRole('figure', { name: 'Preview of sales.csv' })).toBeInTheDocument();
+    expect(lastHost().disposed).toBe(false);
+  });
+
+  it('forgets a failed download when the frame gets a new document', async () => {
+    getBundle().mockImplementation(async () => table());
+    await show('/ws/reports/sales.csv');
+    getFile().mockImplementation(async (_path: string, file: string) => {
+      if (file === 'data.csv') {
+        throw new ApiError(409, JSON.stringify({ detail: { code: 'stale_description', message: 'The files changed.' } }));
+      }
+      return encoder.encode(PAGE).slice().buffer;
+    });
+    act(() => lastHost().options.onContent({ type: 'ready', kind: 'table', canPrint: false }));
+    act(() => lastHost().options.onContent({ type: 'download' }));
+    await settle();
+    expect(screen.getByRole('status')).toHaveTextContent('The download failed');
+    act(() => lastHost().options.onHandOver?.());
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+  });
+
+  it('shows no line for a download that fails after the next document or after a newer download', async () => {
+    getBundle().mockImplementation(async () => table());
+    await show('/ws/reports/sales.csv');
+    const refusals: Array<(e: unknown) => void> = [];
+    getFile().mockImplementation((_path: string, file: string) => (file === 'data.csv'
+      ? new Promise<ArrayBuffer>((_resolve, reject) => { refusals.push(reject); })
+      : Promise.resolve(encoder.encode(PAGE).slice().buffer)));
+    const stale = () => new ApiError(409, JSON.stringify({ detail: { code: 'stale_description', message: 'The files changed.' } }));
+    act(() => lastHost().options.onContent({ type: 'ready', kind: 'table', canPrint: false }));
+
+    // A download, then the frame gets the next document, then the download fails.
+    act(() => lastHost().options.onContent({ type: 'download' }));
+    act(() => lastHost().options.onHandOver?.());
+    refusals[0](stale());
+    await settle();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+
+    // Two downloads; the first fails after the second started.
+    act(() => lastHost().options.onContent({ type: 'ready', kind: 'table', canPrint: false }));
+    act(() => lastHost().options.onContent({ type: 'download' }));
+    act(() => lastHost().options.onContent({ type: 'download' }));
+    refusals[1](stale());
+    await settle();
+    expect(screen.queryByRole('status')).not.toBeInTheDocument();
+    refusals[2](stale());
+    await settle();
+    expect(screen.getByRole('status')).toHaveTextContent('The download failed');
+  });
+
+  it('saves nothing for a bundle of another kind, whatever the page says', async () => {
+    await show();
+    act(() => lastHost().options.onContent({ type: 'ready', kind: 'table', canPrint: false }));
+    act(() => lastHost().options.onContent({ type: 'download' }));
+    await settle();
+    expect(downloads).toEqual([]);
   });
 });

@@ -147,6 +147,11 @@ async def _describe(path: str) -> Bundle:
     try:
         bundle = await asyncio.to_thread(describe_bundle, workspace, path)
     except BundleError as e:
+        # A file changed while it was described (the kit scan of the entry
+        # and the page of a Markdown or CSV file open it with the identity of
+        # the walk): the stale answer, so the web UI describes it again.
+        if e.code is BundleRefusal.CHANGED:
+            raise _stale() from None
         raise _refusal(e) from None
     descriptions.put(workspace, path, bundle)
     return bundle
