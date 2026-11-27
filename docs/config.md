@@ -2594,8 +2594,11 @@ mcp_apps:
 
 Artifacts are static bundles of workspace files that a person sees. The
 Preview tab of the web chat shows the bundle of a workspace path in the side
-panel: an HTML file, a folder with an `index.html`, or an image (see
-[Preview](web-ui.md#preview)). Off by default. It works in local mode and in
+panel: an HTML file, a folder with an `index.html`, an image, a Markdown file
+(drawn as a page) or a CSV file (drawn as a table to search and sort) (see
+[Preview](web-ui.md#preview)). A file of these kinds that the agent sends with
+`send_file` shows the same page under its card in the chat, and the session
+context of a web chat tells the model so. Off by default. It works in local mode and in
 [external mode](#authentication-mode), and it does not need `mcp_apps`.
 
 ```yaml

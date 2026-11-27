@@ -3825,8 +3825,11 @@ class ArtifactsConfig:
     """Artifacts: static bundles of workspace files that a person sees.
 
     With ``preview`` on, the web chat has a Preview tab in its side panel. It
-    shows an HTML page, a folder with an ``index.html``, or an image of the
-    workspace, in the sandbox frame that widgets use, with no network. The
+    shows an HTML page, a folder with an ``index.html``, an image, a Markdown
+    file or a CSV file of the workspace, in the sandbox frame that widgets
+    use, with no network; a file of these kinds that the agent sends with
+    ``send_file`` shows the same page under its card, and the system prompt
+    tells the model so. The
     gateway serves the sandbox document for it, in local mode and in external
     mode. MCP App views and widgets keep their own switch (``mcp_apps``).
     Off by default; see docs/web-ui.md.
