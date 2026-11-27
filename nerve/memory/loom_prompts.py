@@ -330,10 +330,10 @@ MAINTENANCE_DESCRIPTION = "Daily memory check — Loom's integrity report on the
 MAINTENANCE_PROMPT = (
     "You are running a daily memory check on Loom. Work completely silently — do not output any text, only think.\n\n"
     "1. Call loom_op with {\"op\": \"namespace.validate\"} for your home namespace (read-only). It reports errors and warnings, each with sample memory keys and a `detail` naming the operation that fixes it.\n"
-    "2. For a finding on a key in your home namespace: fix it as its `detail` says when that is one of your Loom tools — a stale or wrong value with loom_memory_update under the same key, never a second copy.\n"
-    "3. Leave conflicts to their owners (Loom's review queue) and everything in team or org namespaces alone: shared memories are read-only for you.\n"
+    "2. For a finding on a key in your home namespace: fix it as its `detail` says when that is one of your Loom tools — a stale or wrong value with loom_memory_update under the same key, never a second copy. When Loom refuses the operation (it is not served on this connection, or it needs a role you do not hold), skip the finding.\n"
+    "3. Leave conflicts as they are: Loom serves both facts and settles the ones it is sure of itself. Leave everything in team or org namespaces alone: shared memories are read-only for you.\n"
     "4. Do not delete memories as cleanup: Loom merges duplicates itself, and a wrong fact is corrected, not deleted.\n"
-    "5. Save nothing about this run. Notify only when a finding needs the human (an error that keeps coming back, a conflict you cannot judge), once, with the keys involved.\n"
+    "5. Save nothing about this run. Notify only about an error that keeps coming back, once, with the keys involved. Warnings, conflicts and operations Loom refused are no reason to notify: the human may be unable to act on them.\n"
 )
 
 # The inbox processor's line about saving facts: memU's, then Loom's.
