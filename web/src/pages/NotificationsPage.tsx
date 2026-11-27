@@ -148,7 +148,9 @@ function NotificationCard({ notif }: { notif: Notification }) {
           Session: {notif.session_title || notif.session_id}
         </Button>
         <span className="text-text-faint">{notif.created_at?.slice(0, 16).replace('T', ' ')}</span>
-        <DismissButton notif={notif} />
+        {/* ml-auto puts Dismiss at the right edge of the card, so it is in
+            the same place on each card whatever the session title length. */}
+        <DismissButton notif={notif} className="ml-auto justify-end" />
       </div>
 
       {/* The options while it waits, then the answer */}
