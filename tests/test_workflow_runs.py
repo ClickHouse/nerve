@@ -162,6 +162,40 @@ async def test_background_run_result_taken_from_final_auto_turn(db, engine, serv
     assert result_md.read_text(encoding="utf-8") == "FINAL: the real verdict"
 
 
+@pytest.mark.asyncio
+async def test_background_run_preview_is_final_text_block(db, engine, service):
+    """For a background run, the preview comes from the auto-turn message's
+    last text block, and the stored result stays its full content."""
+    service.config.workflows.poll_interval_seconds = 1
+    calls = {"n": 0}
+
+    def _bg(session_id: str) -> bool:
+        calls["n"] += 1
+        return calls["n"] <= 1  # busy exactly once, then quiescent
+
+    engine.has_live_background_tasks = MagicMock(side_effect=_bg)
+    engine.run = AsyncMock(return_value="opening message only")
+    run = await service.start_run(ENGINE_CLAUDE, {"prompt": "p"}, 1.0)
+    session_id = f"workflow:{run['id']}"
+    deadline = time.monotonic() + 5
+    while await db.get_session(session_id) is None:
+        assert time.monotonic() < deadline, "leg session never appeared"
+        await asyncio.sleep(0.01)
+    content = "The agents are done. I collect their results.FINAL: 3 of 3 passed."
+    blocks = [
+        {"type": "text", "content": "The agents are done. I collect their results."},
+        _tool_block("t1"),
+        {"type": "text", "content": "FINAL: 3 of 3 passed."},
+    ]
+    await db.add_message(session_id, "assistant", content, blocks=blocks, actor=None)
+    await _drain(service, timeout=20)
+    fresh = await db.get_workflow_run(run["id"])
+    assert fresh["status"] == "done"
+    assert fresh["result"] == content
+    bodies = [c.kwargs["body"] for c in _notif_calls(engine) if "finished" in c.kwargs["title"]]
+    assert len(bodies) == 1 and bodies[0].endswith("\n\nFINAL: 3 of 3 passed.")
+
+
 async def _seed_running(db, run_id: str, budget, engine_kind: str = ENGINE_CLAUDE) -> str:
     """Insert a running run wired to a real session row; returns session id.
 
@@ -186,6 +220,14 @@ async def _seed_running(db, run_id: str, budget, engine_kind: str = ENGINE_CLAUD
 
 def _notif_calls(engine) -> list:
     return engine.notification_service.send_notification.call_args_list
+
+
+def _tool_block(tool_use_id: str) -> dict:
+    """A tool block as the engine stores it in a message's ``blocks``."""
+    return {
+        "type": "tool_call", "tool": "Bash", "input": {"command": "ls"},
+        "tool_use_id": tool_use_id, "result": "a.txt", "is_error": False,
+    }
 
 
 @pytest_asyncio.fixture
@@ -485,6 +527,87 @@ class TestExecute:
         result_md = Path(fresh["journal_dir"]) / "result.md"
         assert result_md.read_text(encoding="utf-8") == "final answer"
         assert any("finished" in c.kwargs["title"] for c in _notif_calls(engine))
+
+    async def _finished_body(self, service, db, engine, text: str, blocks: list | None) -> str:
+        """Run once; engine.run persists ``text``/``blocks`` as the assistant
+        message, as the real engine does. Returns the "finished" body."""
+
+        async def _run(*, session_id: str, **_kwargs):
+            await db.add_message(session_id, "assistant", text, blocks=blocks, actor=None)
+            return text
+
+        engine.run = AsyncMock(side_effect=_run)
+        run = await service.start_run(ENGINE_CLAUDE, {"prompt": "p"}, 5.0)
+        await _drain(service)
+        fresh = await db.get_workflow_run(run["id"])
+        assert fresh["result"] == text  # the stored result stays the full text
+        bodies = [c.kwargs["body"] for c in _notif_calls(engine) if "finished" in c.kwargs["title"]]
+        assert len(bodies) == 1
+        return bodies[0]
+
+    async def test_finished_notification_shows_text_after_last_tool_call(
+        self, service, db, engine,
+    ):
+        """Progress messages come first in the result; the notification shows
+        the final text block, so the preview holds the run's answer."""
+        progress = "I will read the files and then write the report. " * 8
+        answer = "Report written: 2 findings."
+        blocks = [
+            {"type": "text", "content": progress},
+            _tool_block("t1"),
+            {"type": "text", "content": "Now I check the second file."},
+            _tool_block("t2"),
+            {"type": "text", "content": answer},
+        ]
+        body = await self._finished_body(
+            service, db, engine, progress + "Now I check the second file." + answer, blocks,
+        )
+        assert body.endswith(f"\n\n{answer}")
+        assert "I will read" not in body
+
+    async def test_finished_notification_skips_blank_and_tool_blocks(self, service, db, engine):
+        """A whitespace-only text block and a tool block after the answer are
+        skipped: the preview is the last text block with content."""
+        answer = "Report written: 2 findings."
+        blocks = [
+            {"type": "text", "content": "I will read the files."},
+            _tool_block("t1"),
+            {"type": "text", "content": answer},
+            _tool_block("t2"),
+            {"type": "text", "content": "  \n"},
+        ]
+        body = await self._finished_body(
+            service, db, engine, "I will read the files." + answer + "  \n", blocks,
+        )
+        assert body.endswith(f"\n\n{answer}")
+
+    async def test_finished_notification_falls_back_to_full_text(self, service, db, engine):
+        """No text block: the start of the full result, as before."""
+        long_text = "word " * 100
+        body = await self._finished_body(service, db, engine, long_text, None)
+        assert body.endswith("\n\n" + " ".join(long_text.split())[:300] + "…")
+
+    async def test_finished_notification_when_message_read_fails(
+        self, service, db, engine, monkeypatch,
+    ):
+        """A failed read of the final message falls back to the turn text for
+        both the stored result and the preview."""
+        monkeypatch.setattr(db, "get_messages", AsyncMock(side_effect=RuntimeError("db down")))
+        run = await service.start_run(ENGINE_CLAUDE, {"prompt": "p"}, 5.0)
+        await _drain(service)
+        fresh = await db.get_workflow_run(run["id"])
+        assert fresh["status"] == "done"
+        assert fresh["result"] == "final answer"
+        bodies = [c.kwargs["body"] for c in _notif_calls(engine) if "finished" in c.kwargs["title"]]
+        assert len(bodies) == 1 and bodies[0].endswith("\n\nfinal answer")
+
+    async def test_finished_notification_ignores_block_not_in_result(self, service, db, engine):
+        """A text block that is not part of the recorded result is not shown."""
+        body = await self._finished_body(
+            service, db, engine, "the recorded result",
+            [{"type": "text", "content": "something else"}],
+        )
+        assert body.endswith("\n\nthe recorded result")
 
     async def test_leg_is_nested_and_named_after_origin_session(self, service, db, engine):
         """The leg nests under the session the run was started from AND is
