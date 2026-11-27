@@ -83,7 +83,7 @@ Note: `task_search` (user-facing) uses strict AND matching for precision. Duplic
 
 ### Status Transitions
 
-Setting a task's status to `done` via `task_update` automatically delegates to `task_done`, which:
+Setting a task's status to `done` via `task_update` automatically delegates to `task_done`. The tags, title and deadline of the same call are written first, to the open task, so one call can close a task and change its tags; the note goes to the completion line. `task_done`:
 - Moves the markdown file from `active/` to `done/`
 - Syncs the FTS index
 - Appends a completion note
@@ -195,7 +195,10 @@ Pass the value you read as `expect_revision` to `task_update` or `task_done`
 to make the write conditional: if the row has changed since, nothing is
 written and the tool reports a conflict, so re-read and retry. Without it,
 writes stay last-write-wins, except that a reopen is always conditional on
-the task still being done. In code, `upsert_task`, `update_task_tags` and
+the task still being done. A `task_update` to `done` that also changes fields
+is two writes, the edit and the close, each conditional on the revision that
+the step before it left: when the task changes between them, the edit is
+kept, the task stays open, and the tool says so. In code, `upsert_task`, `update_task_tags` and
 `transition_task` take the same argument and return `False` instead of
 writing.
 

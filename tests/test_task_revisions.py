@@ -325,6 +325,76 @@ class TestFencedTools:
         assert result.is_error
         assert (await db.get_task(task_id))["status"] == "pending"
 
+    async def test_edits_before_a_completion_are_fenced_on_the_open_row(self, ctx, db, workspace):
+        task_id = await _create(ctx)
+        await db.update_task_tags(task_id, "working")
+        token = await _rev(db, task_id)
+        result = await task_update_handler(ctx, {
+            "task_id": task_id, "status": "done", "tags": "-working,+checked",
+            "expect_revision": token,
+        })
+        assert not result.is_error
+        row = await db.get_task(task_id)
+        assert (row["status"], row["tags"], row["revision"]) == ("done", "checked", token + 2)
+        assert "**Tags:** checked" in _file(workspace, task_id, "done").read_text()
+        assert not _file(workspace, task_id).exists()
+
+    async def test_a_tags_edit_without_a_task_file_is_fenced_too(self, ctx, db, workspace):
+        task_id = await _create(ctx)
+        _file(workspace, task_id).unlink()
+        token = await _rev(db, task_id)
+        result = await task_update_handler(ctx, {
+            "task_id": task_id, "status": "done", "tags": "checked", "expect_revision": token,
+        })
+        assert not result.is_error
+        row = await db.get_task(task_id)
+        assert (row["status"], row["tags"], row["revision"]) == ("done", "checked", token + 2)
+
+    async def test_a_write_between_the_edits_and_the_completion_keeps_it_open(
+        self, ctx, db, workspace, monkeypatch,
+    ):
+        task_id = await _create(ctx)
+        token = await _rev(db, task_id)
+        real_done = handlers.task_done_handler
+
+        async def comment_then_done(*args, **kwargs):
+            assert await db.add_task_comment(task_id, "a comment in between")
+            return await real_done(*args, **kwargs)
+
+        monkeypatch.setattr(handlers, "task_done_handler", comment_then_done)
+        result = await task_update_handler(ctx, {
+            "task_id": task_id, "status": "done", "tags": "checked", "expect_revision": token,
+        })
+        assert result.is_error
+        assert "were written" in result.text_content and "still open" in result.text_content
+        row = await db.get_task(task_id)
+        assert (row["status"], row["tags"]) == ("pending", "checked")
+        assert _file(workspace, task_id).exists()
+        assert not _file(workspace, task_id, "done").exists()
+
+    async def test_a_stale_token_neither_edits_nor_completes(self, ctx, db, workspace):
+        task_id = await _create(ctx)
+        stale = await _stale_token(db, task_id)
+        before = _file(workspace, task_id).read_bytes()
+        result = await task_update_handler(ctx, {
+            "task_id": task_id, "status": "done", "tags": "+checked", "expect_revision": stale,
+        })
+        assert result.is_error
+        row = await db.get_task(task_id)
+        assert (row["status"], row["tags"]) == ("pending", "moved-on")
+        assert _file(workspace, task_id).read_bytes() == before
+        assert not _file(workspace, task_id, "done").exists()
+
+    async def test_a_refused_edit_does_not_complete(self, ctx, db, workspace):
+        task_id = await _create(ctx)
+        _file(workspace, task_id).unlink()
+        result = await task_update_handler(ctx, {
+            "task_id": task_id, "status": "done", "title": "Renamed",
+            "expect_revision": await _rev(db, task_id),
+        })
+        assert result.is_error
+        assert (await db.get_task(task_id))["status"] == "pending"
+
     async def test_task_update_out_of_done_forwards_it(self, ctx, db):
         task_id = await _create(ctx)
         await task_done_handler(ctx, {"task_id": task_id})
@@ -372,6 +442,27 @@ class TestFencedTools:
         assert "x" not in (row["tags"] or "")
         assert _file(workspace, task_id, "done").exists()
         assert not _file(workspace, task_id).exists()
+
+
+@pytest.mark.asyncio
+async def test_task_update_to_done_keeps_the_other_fields(ctx, db, workspace):
+    task_id = await _create(ctx)
+    await task_update_handler(ctx, {"task_id": task_id, "tags": "working"})
+    result = await task_update_handler(ctx, {
+        "task_id": task_id, "status": "done", "tags": "-working,+checked",
+        "title": "Renamed", "deadline": "2030-01-01", "note": "all checked",
+    })
+    assert not result.is_error
+    row = await db.get_task(task_id)
+    assert (row["status"], row["tags"], row["title"], row["deadline"]) == (
+        "done", "checked", "Renamed", "2030-01-01",
+    )
+    text = _file(workspace, task_id, "done").read_text()
+    assert text.startswith("# Renamed")
+    assert "**Tags:** checked" in text and "working" not in text
+    assert "**Deadline:** 2030-01-01" in text
+    assert text.count("all checked") == 1 and "DONE — all checked" in text
+    assert not _file(workspace, task_id).exists()
 
 
 @pytest.mark.asyncio
