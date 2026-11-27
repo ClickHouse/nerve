@@ -73,6 +73,22 @@ describe('AgentDock', () => {
     expect(dockButton()).toHaveAttribute('aria-expanded', 'true');
   });
 
+  it('hides the panel when clicked again while Agents is showing', async () => {
+    const user = userEvent.setup();
+    render(<AgentDock sessionId={FX_SESSION_ID} />);
+
+    await user.click(dockButton()!);
+    expect(useChatStore.getState().panelVisible).toBe(true);
+
+    await user.click(dockButton()!);
+    expect(useChatStore.getState().panelVisible).toBe(false);
+    expect(dockButton()).toHaveAttribute('aria-expanded', 'false');
+
+    await user.click(dockButton()!);
+    expect(useChatStore.getState().panelVisible).toBe(true);
+    expect(useChatStore.getState().activePanelId).toBe(AGENTS_PANEL_ID);
+  });
+
   it('announces an agent that settles, politely', async () => {
     render(<AgentDock sessionId={FX_SESSION_ID} />);
     const region = screen.getByRole('status');
