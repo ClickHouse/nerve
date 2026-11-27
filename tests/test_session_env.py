@@ -40,8 +40,11 @@ SESSION_VARS = {
     "NERVE_SESSION_ID": "old-session",
     "NERVE_MCP_TOKEN": "old-mcp-token",
     "NERVE_MCP_PARENT_SESSION_ID": "old-parent",
+    "NERVE_MCP_WORKER_TOKEN_URL": "http://127.0.0.1:1/old",
     "NERVE_CODEX_REAL_BIN": "codex",
     "NERVE_CODEX_CHILD_CONFIG": "[]",
+    "NERVE_CODEX_INFERENCE_PRINCIPAL": "old-principal",
+    "NERVE_CODEX_MCP_EXTERNAL_HTTP_0123": "old-header",
 }
 
 # Configuration a user may export for the server: kept.
@@ -51,6 +54,9 @@ CONFIG_VARS = {
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "4096",
     "ANTHROPIC_BASE_URL": "http://192.0.2.1:3128",
     "NERVE_HOME": "/tmp/nerve-home",
+    # Referenced from settings.yaml as ${NERVE_MCP_BASE_URL} / ${NERVE_MCP_APPS}.
+    "NERVE_MCP_BASE_URL": "http://192.0.2.1:8900",
+    "NERVE_MCP_APPS": "true",
 }
 
 
@@ -77,6 +83,15 @@ class TestStrip:
 
         for name, value in CONFIG_VARS.items():
             assert os.environ[name] == value
+
+    def test_covers_what_the_codex_backend_sets_per_process(self):
+        from nerve.agent.backends.codex import backend as codex_backend
+        from nerve.agent.backends.codex.mcp_stdio_wrapper import EXTERNAL_MCP_ENV_PREFIX
+
+        for name in (codex_backend._ENDPOINT_KEY_ENV,
+                     codex_backend._ENDPOINT_PRINCIPAL_ENV,
+                     EXTERNAL_MCP_ENV_PREFIX + "STDIO_0123"):
+            assert env_mod.is_session_env_name(name), name
 
     def test_nothing_to_remove(self, monkeypatch):
         for name in list(os.environ):

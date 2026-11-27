@@ -67,8 +67,9 @@ def apply_env_defaults() -> None:
 # Variables that describe one CLI session or process, not the machine. A
 # server started from a session's shell (``nerve restart`` in a Bash tool)
 # inherits them, and every CLI it spawns would then see that session's
-# identity, MCP token and messaging socket. Configuration such as
-# CLAUDE_CODE_OAUTH_TOKEN or CLAUDE_CODE_USE_BEDROCK is not listed.
+# identity, MCP token and messaging socket. Names are listed one by one:
+# configuration that shares a prefix (CLAUDE_CODE_OAUTH_TOKEN,
+# NERVE_MCP_BASE_URL, NERVE_MCP_APPS) is kept for settings to reference.
 _SESSION_ENV_NAMES = frozenset({
     # Claude Code, for the commands one CLI runs.
     "CLAUDECODE",
@@ -92,12 +93,20 @@ _SESSION_ENV_NAMES = frozenset({
     "ULTRACODE_MAX_CONCURRENCY",
     "ULTRACODE_DEFAULT_TOKEN_BUDGET",
     "ULTRACODE_MAX_AGENTS",
+    # Set by Nerve for one session's process.
     "NERVE_SESSION_ID",
+    "NERVE_MCP_TOKEN",
+    "NERVE_MCP_PARENT_SESSION_ID",
+    "NERVE_MCP_WORKER_TOKEN_URL",
+    "NERVE_CODEX_REAL_BIN",
+    "NERVE_CODEX_CHILD_CONFIG",
+    "NERVE_CODEX_ENDPOINT_KEY",
+    "NERVE_CODEX_INFERENCE_PRINCIPAL",
 })
 _SESSION_ENV_PREFIXES = (
     "CLAUDE_CODE_MESSAGING_",
-    "NERVE_MCP_",
-    "NERVE_CODEX_",
+    # External MCP credentials the Codex backend passes to one process.
+    "NERVE_CODEX_MCP_EXTERNAL_",
 )
 
 
