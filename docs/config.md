@@ -2238,13 +2238,16 @@ vision use it too.
 
 ### Loom memory backend
 
-With `memory.backend: loom`, long-term memory is kept in a Loom memory service,
-and both the agent and Nerve reach it through the MCP gateway
+With `memory.backend: loom`, [ClickHouse Loom](https://loom.clickhouse.com/)
+stores the agent's long-term memory. The agent and Nerve reach it through the MCP gateway
 ([MCP servers in external mode](#mcp-servers-in-external-mode)): the gateway's
 catalog lists Loom as the server `loom`. Nerve has no Loom URL or credential of
 its own. The gateway knows the agent from its connection and holds its Loom
 credential, so `memory.backend: loom` and `mcp_gateway_url` are all an
 instance needs.
+
+If you operate the memory service, see the [Loom deployment guide](https://loom.clickhouse.com/docs/operations/deployment)
+for storage, authentication and client connectivity.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
