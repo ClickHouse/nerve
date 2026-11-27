@@ -1174,7 +1174,14 @@ class AgentEngine:
         """Get the channel router (lazy-initialized)."""
         if self._router is None:
             from nerve.channels.router import ChannelRouter
+            from nerve.channels.web import WebChannel
+
             self._router = ChannelRouter(self)
+            # The web chat, the channel of every web turn: a tool that such a
+            # turn calls finds it, and send_file succeeds there, because the
+            # chat draws the stored tool call as the file's card. It sends
+            # nothing unasked (authorize_outbound stays refused).
+            self._router.register(WebChannel())
         return self._router
 
     def register_channel(self, channel: Any) -> None:
@@ -1864,6 +1871,9 @@ class AgentEngine:
                 # The web chat draws ```widget blocks in the MCP Apps
                 # sandbox, which runs in local mode only.
                 widgets=bool(self.config.mcp_apps_active) and not self._managed_mcp,
+                # The web chat shows a sent .html, .md or .csv file as a page
+                # under its card while artifacts.preview is on.
+                previews=bool(self.config.artifacts_preview_active),
             )
 
             # Observer sessions of a review loop get a context block so the

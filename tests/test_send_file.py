@@ -577,3 +577,47 @@ class TestEngineActiveChannel:
         engine._active_channel = {"sess-1": "telegram"}
         assert engine.get_active_channel("sess-1") == "telegram"
         assert engine.get_active_channel("sess-other") is None
+
+
+# ---------------------------------------------------------------------------
+# The web chat as a channel of the engine's router
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestWebChannel:
+    """Every web turn passes channel="web". The engine's router has the web
+    chat as that channel, so send_file in a web turn is delivered: the chat
+    draws the stored tool call as the file's card (and its preview)."""
+
+    @staticmethod
+    def _engine(tmp_path, db):
+        from nerve.agent.engine import AgentEngine
+
+        workspace = tmp_path / "ws"
+        workspace.mkdir(exist_ok=True)
+        config = NerveConfig.from_dict({"workspace": str(workspace), "gateway": {"port": 8900}})
+        return AgentEngine(config, db), workspace
+
+    async def test_the_router_has_the_web_channel(self, tmp_path, db):
+        from nerve.channels.web import WebChannel
+
+        engine, _ = self._engine(tmp_path, db)
+        web = engine.router.get_channel("web")
+        assert isinstance(web, WebChannel)
+        assert ChannelCapability.SEND_FILES in web.capabilities
+        # It sends nothing unasked.
+        assert not (await web.authorize_outbound("anything")).allowed
+
+    async def test_send_file_of_a_web_turn_is_delivered(self, tmp_path, db):
+        from nerve.agent import tools
+
+        engine, workspace = self._engine(tmp_path, db)
+        table = workspace / "test.csv"
+        table.write_text("item,count\na,1\n")
+        engine._active_channel["sess"] = "web"
+        with patch.object(tools, "_workspace", workspace), patch.object(tools, "_engine", engine):
+            result = await tools._send_file_impl({"file_path": str(table)}, "sess")
+        text = result["content"][0]["text"]
+        assert text.startswith("Sent file: test.csv")
+        assert "Native delivery not available" not in text

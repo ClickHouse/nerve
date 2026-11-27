@@ -1105,6 +1105,22 @@ WIDGET_RENDERING_NOTE = (
     "fixed colour. Write it directly, like a diagram — no files or tool runs "
     "to build or test it. Say in the text what it shows."
 )
+# The preview sentences of the "Rendering" line: with artifacts.preview the
+# web chat shows a sent .html, .md or .csv file as a page under its card
+# (web/src/components/Preview/InlinePreview.tsx), and opens it in the Preview
+# tab. Without them the model knows only that publish_artifact makes a page,
+# and publishes to show a table.
+PREVIEW_RENDERING_NOTE = (
+    " A workspace file that you send with `send_file` also shows as a page "
+    "under its card when it is an `.html` file, a `.md` file (drawn as a "
+    "Markdown page) or a `.csv` file (drawn as a table that the person can "
+    "search and sort); for a folder with an `index.html`, send that file. "
+    "The person can open the page in the Preview tab of the side panel. Send "
+    "the file to show a table, a report or a page in the chat; it does not "
+    "need to be published for that. A file that the person uploaded is under "
+    "`.uploads/`, where no page shows: copy it to another workspace path "
+    "first."
+)
 
 
 def surface_excluded_tools(source: str) -> set[str]:
@@ -1118,18 +1134,25 @@ def surface_excluded_tools(source: str) -> set[str]:
     return set() if source in RENDERING_SOURCES else {WIDGET_STATE_TOOL}
 
 
-def rendering_note(source: str, widgets: bool = False) -> str:
+def rendering_note(source: str, widgets: bool = False, previews: bool = False) -> str:
     """The "Rendering" line for a session read on ``source``.
 
     ``widgets`` says that this instance draws ```widget blocks: the MCP Apps
     sandbox is active (see :attr:`nerve.config.NerveConfig.mcp_apps_active`).
-    Only a rendering source hears of them; without ``widgets`` the line says
+    ``previews`` says that the chat shows a sent page under its card
+    (``artifacts.preview``, :attr:`nerve.config.NerveConfig.artifacts_preview_active`).
+    Only a rendering source hears of either; without them the line says
     nothing of them. Either way it depends on the source and the
     configuration only, so the prompt stays static.
     """
     if source not in RENDERING_SOURCES:
         return TEXT_RENDERING_NOTE
-    return RICH_RENDERING_NOTE + WIDGET_RENDERING_NOTE if widgets else RICH_RENDERING_NOTE
+    note = RICH_RENDERING_NOTE
+    if widgets:
+        note += WIDGET_RENDERING_NOTE
+    if previews:
+        note += PREVIEW_RENDERING_NOTE
+    return note
 
 
 # Tells the agent to offer a cron job for work the person will probably want
@@ -1177,6 +1200,7 @@ def build_system_prompt(
     config_dir: Path | None = None,
     rendering_source: str | None = None,
     widgets: bool = False,
+    previews: bool = False,
 ) -> str:
     """Build the system prompt for the agent.
 
@@ -1191,7 +1215,7 @@ def build_system_prompt(
     is not the session's surface: a scheduled wakeup (``source="wakeup"``)
     of a web session is still read in the web chat. ``widgets`` adds the
     ```widget sentences to the "Rendering" line for a source that renders
-    (:func:`rendering_note`).
+    (:func:`rendering_note`), and ``previews`` the sentences of a sent page.
 
     ``static=True`` (default) renders a prompt that is byte-identical for
     every session of the same workspace, source and tool set: the
@@ -1265,7 +1289,7 @@ def build_system_prompt(
         )
         context = f"""# Session Context
 - **Source:** {source}
-{rendering_note(rendering_source or source, widgets)}
+{rendering_note(rendering_source or source, widgets, previews)}
 - **Current date:** {today}
 - **Workspace:** {workspace}
 
@@ -1279,7 +1303,7 @@ You have access to the following custom tools:
         context = f"""# Session Context
 - **Session ID:** {session_id}
 - **Source:** {source}
-{rendering_note(rendering_source or source, widgets)}
+{rendering_note(rendering_source or source, widgets, previews)}
 - **Current date:** {today}
 - **Workspace:** {workspace}
 
