@@ -1248,10 +1248,15 @@ class TestBuildHooksBackgroundPermissions:
         assert out["hookSpecificOutput"].get("permissionDecision") == "allow"
 
     @pytest.mark.asyncio
-    async def test_no_grant_hook_when_disabled(self):
+    async def test_no_grant_when_disabled(self):
         backend = _make_hook_backend(False)
         hooks = backend._build_hooks(_hook_spec("sess-y"))
-        assert _catch_all_grant_hook(hooks) is None
+        # The only catch-all left notes the effort and decides nothing.
+        catch_all = _catch_all_grant_hook(hooks)
+        assert catch_all is not None
+        for tool in ("Bash", "Write", "Read", "mcp__some_server__write_thing"):
+            out = await catch_all({"tool_name": tool}, "tid", None)
+            assert "permissionDecision" not in out["hookSpecificOutput"], tool
         # Snapshot + image-validator hooks stay registered regardless.
         matchers = {m.matcher for m in hooks["PreToolUse"]}
         assert "Edit|Write|NotebookEdit" in matchers

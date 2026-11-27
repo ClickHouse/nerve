@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, type KeyboardEvent, type ClipboardEvent, type DragEvent, type MouseEvent as ReactMouseEvent } from 'react';
 import { ArrowUp, X, Plus, Trash2, Sparkles, HelpCircle, StickyNote, Paperclip, FileText, Loader2, Repeat, MoreHorizontal, Clock, ChevronRight } from '../ui/icons';
-import { Button, IconButton, TextField } from '../ui';
+import { Button, IconButton, Select, TextField } from '../ui';
 import { useChatStore, EMPTY_REVIEW_LOOP, registerComposerFlush, daybreakPrograms, offersDaybreak } from '../../stores/chatStore';
 import type { QuoteAction, QuoteEntry } from '../../stores/chatStore';
 import { useAgentStore } from '../../stores/agentStore';
@@ -45,6 +45,22 @@ const RUN_LATER_OPTIONS: Array<{ delay: string; label: string }> = [
   { delay: '24h', label: 'Run in 24 hours' },
   { delay: 'none', label: 'Just accept it' },
 ];
+
+// Reasoning effort levels, weakest first (the server's vocabulary).
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+/** The level a model actually runs ``level`` at: itself when the model takes
+ *  it, else the strongest level it takes below it — the cap the server
+ *  applies (ClaudeBackend._effective_effort). ``null`` when nothing fits. */
+function capEffort(level: string, allowed: string[]): string | null {
+  if (allowed.includes(level)) return level;
+  const rank = EFFORT_LEVELS.indexOf(level);
+  if (rank < 0) return null;
+  for (let i = rank - 1; i >= 0; i--) {
+    if (allowed.includes(EFFORT_LEVELS[i])) return EFFORT_LEVELS[i];
+  }
+  return null;
+}
 
 // Prompt rewrite — refine the first message of a new chat before sending.
 const REWRITE_PREF_KEY = 'nerve_prompt_rewrite';
@@ -207,6 +223,30 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
   // Switching the model recreates the runtime, which would end every live
   // agent of this session (the server refuses it too).
   const liveAgents = useAgentStore(s => (s.sessionId === activeSession ? s.summary.live : 0));
+
+  // ── Effort picker (per-chat) ──
+  // Bound exactly like the model: a virtual chat's pick waits in
+  // newChatEffort until the session is created; a real session's effort is
+  // its row (sessions[].effort). null = the server's default. Subagents the
+  // chat spawns inherit it unless a call asks for its own.
+  const effortDefault = useChatStore(s => s.effortDefault);
+  const effortLevels = useChatStore(s => s.effortLevels);
+  const newChatEffort = useChatStore(s => s.newChatEffort);
+  const setNewChatEffort = useChatStore(s => s.setNewChatEffort);
+  const setSessionEffort = useChatStore(s => s.setSessionEffort);
+  const currentEffort = isVirtualChat
+    ? newChatEffort
+    : (activeSessionRow?.effort ?? null);
+  // Levels the current model takes: absent from the map = all of them,
+  // [] = effort doesn't apply to it (e.g. a local Ollama model).
+  const modelEffortLevels: string[] | undefined = currentModel ? effortLevels[currentModel] : undefined;
+  const allowedEfforts = modelEffortLevels ?? EFFORT_LEVELS;
+  const effortNotApplicable = modelEffortLevels !== undefined && modelEffortLevels.length === 0;
+  // The default as this model runs it (a `max` default on a model that tops
+  // out at `high` runs at `high`).
+  const effectiveDefault = effortDefault && !effortNotApplicable
+    ? capEffort(effortDefault, allowedEfforts)
+    : null;
 
   const [prevQuoteCount, setPrevQuoteCount] = useState(0);
 
@@ -799,7 +839,6 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
               ))}
             </div>
           )}
-
           {attachments.length > 0 && (
             <div data-composer-blank="" className="px-3 pt-3 flex gap-2 flex-wrap">
               {attachments.map(a => (
@@ -891,6 +930,51 @@ export function ChatInput({ onSend, onStop, isStreaming, disabled, seed = null }
                 disabled={disabled || isStreaming || rewriteActive}
               />
             )}
+            {/* PER-CHAT reasoning effort, beside the model it applies to.
+                Subagents the chat spawns inherit it. Same binding as the
+                model picker: virtual chats bind it at creation, real sessions
+                PATCH their own row; changing it restarts the runtime, so it
+                locks while agents run. */}
+            <Select
+              aria-label="Effort"
+              value={currentEffort ?? ''}
+              onChange={(e) => {
+                const picked = e.target.value || null;
+                if (isVirtualChat) {
+                  setNewChatEffort(picked);
+                } else {
+                  void setSessionEffort(activeSession, picked);
+                }
+              }}
+              disabled={disabled || isStreaming || rewriteActive || liveAgents > 0 || effortNotApplicable}
+              title={effortNotApplicable
+                ? "Effort doesn't apply to this model"
+                : liveAgents > 0
+                  ? `Switching effort restarts the runtime and would stop ${liveAgents} running agent${liveAgents === 1 ? '' : 's'}`
+                  : 'Reasoning effort for this chat; subagents inherit it (other chats keep theirs)'}
+              // Looks like the model menu's trigger beside it: no box, h-8.
+              className="h-8 py-0 px-2 shrink-0 truncate max-w-[140px] rounded-lg border-0 bg-transparent text-sm text-text-secondary hover:bg-surface-hover"
+            >
+              <option value="">{effectiveDefault ? `Default (${effectiveDefault})` : 'Default'}</option>
+              {EFFORT_LEVELS.map(level => {
+                const capped = capEffort(level, allowedEfforts);
+                const allowed = capped === level;
+                // A chat can hold a level its (since switched) model doesn't
+                // take: keep it selectable-as-is and say what it runs at.
+                const held = !allowed && level === currentEffort;
+                return (
+                  <option key={level} value={level} disabled={!allowed && !held}>
+                    {held && capped ? `${level} → ${capped}` : level}
+                  </option>
+                );
+              })}
+              {/* An effort outside the five levels (set through the API by
+                  an older or newer server) stays visible instead of the
+                  control silently snapping to Default. */}
+              {currentEffort && !EFFORT_LEVELS.includes(currentEffort) && (
+                <option value={currentEffort}>{currentEffort}</option>
+              )}
+            </Select>
             {/* Prompt rewrite toggle, only on a fresh chat, where it applies */}
             {rewriteAvailable && isNewChat && (
               <button

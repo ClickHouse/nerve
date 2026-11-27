@@ -1097,9 +1097,11 @@ class ClaudeBackend:
         """Build SDK hooks for this session.
 
         PreToolUse: file snapshots (Edit/Write/NotebookEdit) and image
-        validation (Read). PostToolUse: ScheduleWakeup capture, recorded
-        via ``spec.record_wakeup`` so the cron-service sweep can fire it
-        through ``engine.run(..., source="wakeup")``.
+        validation (Read), and on every tool the effort the main loop or a
+        sub-agent runs at, reported once per agent via
+        ``spec.observe_effort``. PostToolUse: ScheduleWakeup capture,
+        recorded via ``spec.record_wakeup`` so the cron-service sweep can
+        fire it through ``engine.run(..., source="wakeup")``.
         """
         session_id = spec.session_id
         captured_files: set[str] = set()
@@ -1170,6 +1172,57 @@ class ClaudeBackend:
                     )
             return {"hookSpecificOutput": {"hookEventName": "PostToolUse"}}
 
+        # Agents (and "" for the main loop) whose effort this client has
+        # recorded: once each, so a busy sub-agent doesn't write an event per
+        # tool call.
+        effort_seen: set[str] = set()
+
+        async def _note_effort(hook_input) -> None:
+            """Record the effort a turn or a sub-agent runs at (PreToolUse).
+
+            The CLI puts the level in effect into the hook input
+            (``effort.level``, after any cap for the model). Inside a
+            sub-agent the input also names it (``agent_id``,
+            ``agent_type``). Recording the first report per agent shows
+            whether sub-agents inherited the session's effort, which comes
+            from the CLI, not from Nerve. Never decides anything: a failure is
+            logged and the tool call goes ahead.
+            """
+            try:
+                effort = hook_input.get("effort")
+                level = effort.get("level") if isinstance(effort, dict) else None
+                agent_id = str(hook_input.get("agent_id") or "")
+                if level and agent_id not in effort_seen:
+                    effort_seen.add(agent_id)
+                    agent_type = hook_input.get("agent_type") or None
+                    logger.info(
+                        "Session %s %s runs at effort %s",
+                        session_id[:8],
+                        f"agent {agent_id} ({agent_type})" if agent_id else "main loop",
+                        level,
+                    )
+                    if spec.observe_effort:
+                        await spec.observe_effort(session_id, {
+                            "agent_id": agent_id or None,
+                            "agent_type": agent_type,
+                            "effort": level,
+                        })
+            except Exception as e:  # noqa: BLE001 — observation only
+                logger.warning(
+                    "Could not record the effort for session %s: %s",
+                    session_id[:8], e,
+                )
+
+        async def _observe_effort_hook(hook_input, tool_use_id, context):
+            """PreToolUse on every tool: :func:`_note_effort`, no decision.
+
+            Only registered when the permission hook below is off; otherwise
+            that hook notes the effort itself, which saves a hook round trip
+            per tool call.
+            """
+            await _note_effort(hook_input)
+            return {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
+
         async def _grant_permission_hook(hook_input, tool_use_id, context):
             """PreToolUse: pre-approve non-interactive tools.
 
@@ -1194,6 +1247,7 @@ class ClaudeBackend:
             It only ever refuses the path-naming write tools, so the Read
             parity above is unaffected by it.
             """
+            await _note_effort(hook_input)
             tool_name = hook_input.get("tool_name", "")
             if tool_name in INTERACTIVE_TOOLS:
                 return {"hookSpecificOutput": {"hookEventName": "PreToolUse"}}
@@ -1225,10 +1279,16 @@ class ClaudeBackend:
         # Catch-all permission grant so background sub-agents inherit the
         # foreground's tool permissions. Registered last so the snapshot/
         # validator hooks still run for their tools; a deny from the
-        # validator wins over this allow.
+        # validator wins over this allow. It also notes the effort (every
+        # tool call, main loop and sub-agents); without it a catch-all that
+        # only notes the effort and decides nothing takes its place.
         if self.config.agent.background_agent_permissions:
             pre_tool_use.append(
                 HookMatcher(matcher=None, hooks=[_grant_permission_hook])
+            )
+        else:
+            pre_tool_use.append(
+                HookMatcher(matcher=None, hooks=[_observe_effort_hook])
             )
 
         return {
@@ -1312,18 +1372,27 @@ class ClaudeBackend:
     _EFFORT_RANK: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
     @staticmethod
-    def _effective_effort(value: str, model: str | None = None) -> str | None:
-        """Return ``value`` capped to the highest effort level ``model`` supports."""
-        if value not in ClaudeBackend._EFFORT_RANK:
-            return None
-        allowed: tuple[str, ...] | None = None
+    def supported_efforts(model: str | None) -> tuple[str, ...]:
+        """The effort levels ``model`` accepts, weakest first.
+
+        A model the table doesn't know gets every level (the CLI caps what
+        the model can't take). The composer's effort picker offers these
+        (GET /api/models ``effort_levels``).
+        """
         if model:
             m = model.lower()
             for key, levels in ClaudeBackend._MODEL_EFFORT_LEVELS.items():
                 if key in m:
-                    allowed = levels
-                    break
-        if not allowed or value in allowed:
+                    return levels
+        return ClaudeBackend._EFFORT_RANK
+
+    @staticmethod
+    def _effective_effort(value: str, model: str | None = None) -> str | None:
+        """Return ``value`` capped to the highest effort level ``model`` supports."""
+        if value not in ClaudeBackend._EFFORT_RANK:
+            return None
+        allowed = ClaudeBackend.supported_efforts(model)
+        if value in allowed:
             return value
         requested_rank = ClaudeBackend._EFFORT_RANK.index(value)
         for level in reversed(ClaudeBackend._EFFORT_RANK[: requested_rank + 1]):

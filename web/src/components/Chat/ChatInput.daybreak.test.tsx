@@ -280,7 +280,7 @@ describe('the Daybreak switch of a new chat', () => {
     createSession.mockResolvedValueOnce({ id: SESSION, source: 'web', backend: 'codex', model: SOL, codex_daybreak: true });
     await act(async () => { await useChatStore.getState().ensureRealSession(); });
 
-    expect(createSession).toHaveBeenCalledWith(undefined, 'codex', undefined, null, undefined, true);
+    expect(createSession).toHaveBeenCalledWith(undefined, 'codex', undefined, null, undefined, true, undefined);
     // The created chat has it on its row, and the next new chat starts off.
     expect(useChatStore.getState().newChatDaybreak).toBe(false);
     expect(toggle()).toHaveAttribute('aria-pressed', 'true');
@@ -291,7 +291,7 @@ describe('the Daybreak switch of a new chat', () => {
     await renderComposer();
     createSession.mockResolvedValueOnce({ id: SESSION, source: 'web', backend: 'codex', model: SOL });
     await act(async () => { await useChatStore.getState().ensureRealSession(); });
-    expect(createSession).toHaveBeenCalledWith(undefined, 'codex', undefined, null, undefined, false);
+    expect(createSession).toHaveBeenCalledWith(undefined, 'codex', undefined, null, undefined, false, undefined);
   });
 
   it('is cleared by a pick of a model without Daybreak', async () => {
@@ -315,7 +315,7 @@ describe('the Daybreak switch of a new chat', () => {
 
     createSession.mockResolvedValueOnce({ id: SESSION, source: 'web', backend: 'codex', model: SOL });
     await act(async () => { await useChatStore.getState().ensureRealSession(); });
-    expect(createSession).toHaveBeenCalledWith(undefined, 'codex', undefined, null, undefined, false);
+    expect(createSession).toHaveBeenCalledWith(undefined, 'codex', undefined, null, undefined, false, undefined);
   });
 
   it('goes with a prompt that is deferred with Run later', async () => {
@@ -327,7 +327,7 @@ describe('the Daybreak switch of a new chat', () => {
     createSession.mockResolvedValueOnce({ id: SESSION, source: 'web', backend: 'codex', model: SOL, codex_daybreak: true });
     await act(async () => { await useChatStore.getState().runLater('scan the firmware image', '1h'); });
 
-    expect(createSession).toHaveBeenCalledWith(undefined, 'codex', undefined, null, null, true);
+    expect(createSession).toHaveBeenCalledWith(undefined, 'codex', undefined, null, null, true, null);
     expect(useChatStore.getState().newChatDaybreak).toBe(false);
   });
 
@@ -384,6 +384,6 @@ describe('the Daybreak switch of a new chat', () => {
 
     createSession.mockResolvedValueOnce({ id: SESSION, source: 'web', backend: 'codex', model: SOL });
     await act(async () => { await useChatStore.getState().ensureRealSession(); });
-    expect(createSession).toHaveBeenCalledWith(undefined, 'codex', undefined, null, undefined, false);
+    expect(createSession).toHaveBeenCalledWith(undefined, 'codex', undefined, null, undefined, false, undefined);
   });
 });

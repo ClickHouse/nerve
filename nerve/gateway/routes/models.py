@@ -28,6 +28,7 @@ import logging
 from fastapi import APIRouter, Depends
 
 from nerve import models_catalog
+from nerve.agent.backends.claude import ClaudeBackend
 from nerve.config import get_config
 from nerve.gateway.auth import require_auth
 from nerve.gateway.routes._deps import get_deps
@@ -46,8 +47,15 @@ async def list_models():
         {
           "default": "<anthropic model id>",
           "models": [{"id", "provider"}...],
-          "ollama": {"enabled", "routable", "available"}
+          "ollama": {"enabled", "routable", "available"},
+          "effort_default": "<agent.effort>",
+          "effort_levels": {"<model id>": ["low", ...]}
         }
+
+    ``effort_levels`` feeds the composer's effort picker: the levels each
+    Claude model accepts, weakest first, and ``[]`` for an Ollama model
+    (effort doesn't apply to it). A model it doesn't list (Codex) takes every
+    level. ``effort_default`` is what a chat left on Default runs at.
 
     ``provider`` is ``"anthropic"``, ``"openai"`` or ``"ollama"``; the
     frontend formats display labels. Discovery is best-effort — if the
@@ -127,8 +135,19 @@ async def list_models():
             "id": name, "provider": "ollama", "backend": "claude",
         } for name in names)
 
+    effort_levels: dict[str, list[str]] = {}
+    for item in models:
+        if item["provider"] == "anthropic":
+            effort_levels[item["id"]] = list(
+                ClaudeBackend.supported_efforts(item["id"]),
+            )
+        elif item["provider"] == "ollama":
+            effort_levels[item["id"]] = []
+
     return {
         "default": default_model,
+        "effort_default": config.agent.effort,
+        "effort_levels": effort_levels,
         "defaults": {
             "claude": default_model,
             "codex": config.codex.model,
