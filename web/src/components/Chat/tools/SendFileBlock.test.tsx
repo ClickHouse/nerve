@@ -1,8 +1,20 @@
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { ToolCallBlockData } from '../../../types/chat';
+import { ImageViewerHost } from '../../ImageViewer/ImageViewerHost';
 import { SendFileBlock } from './SendFileBlock';
+
+/** jsdom loads no image: this one loads at once, with a fixed size. */
+class LoadedImage {
+  naturalWidth = 640;
+  naturalHeight = 480;
+  onload: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+  set src(_: string) {
+    queueMicrotask(() => this.onload?.());
+  }
+}
 
 /** The result of a Nerve MCP tool as the chat gets it from each backend. */
 const claude = (text: string) => JSON.stringify([{ type: 'text', text }]);
@@ -25,12 +37,17 @@ describe('SendFileBlock', () => {
     expect(screen.getByRole('link', { name: 'Download chart one.png' })).toHaveAttribute('href', DOWNLOAD);
   });
 
-  it('opens the image at full size, with a download card', async () => {
-    render(<SendFileBlock block={call('/ws/shots/chart one.png')} />);
-    await userEvent.click(screen.getByRole('button', { name: 'chart one.png' }));
-    const dialog = within(screen.getByRole('dialog', { name: 'chart one.png' }));
-    expect(dialog.getByRole('img', { name: 'chart one.png' })).toHaveAttribute('src', DOWNLOAD);
-    expect(dialog.getByRole('link', { name: /chart one\.png/ })).toHaveAttribute('download', 'chart one.png');
+  it('opens the image in the image viewer, with its download', async () => {
+    vi.stubGlobal('Image', LoadedImage);
+    try {
+      render(<><ImageViewerHost /><SendFileBlock block={call('/ws/shots/chart one.png')} /></>);
+      await userEvent.click(screen.getByRole('link', { name: 'chart one.png' }));
+      const dialog = await screen.findByRole('dialog', { name: 'chart one.png' });
+      expect(dialog.querySelector('img')).toHaveAttribute('src', DOWNLOAD);
+      expect(within(dialog).getByRole('link', { name: 'Download' })).toHaveAttribute('href', DOWNLOAD);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it.each(['report.csv', 'notes.md', 'archive.tar.zst'])('shows %s as a download card', (name) => {

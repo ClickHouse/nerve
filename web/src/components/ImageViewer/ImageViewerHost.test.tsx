@@ -123,6 +123,18 @@ describe('ImageViewerHost', () => {
     open.mockRestore();
   });
 
+  it('gives an SVG file with no size of its own the size of a CSS image, 300 × 150', async () => {
+    class SizelessImage extends FakeImage {
+      naturalWidth = 0;
+      naturalHeight = 0;
+    }
+    vi.stubGlobal('Image', SizelessImage);
+    render(<><ImageViewerHost /><Message urls={['/u/drawing.svg']} /></>);
+    await clickImage('drawing.svg');
+    const dialog = await screen.findByRole('dialog', { name: 'drawing.svg' });
+    expect(dialog.querySelector('img')).toHaveStyle({ width: '300px', height: '150px' });
+  });
+
   it('ignores clicks on ordinary links', async () => {
     render(<><ImageViewerHost /><a href="/x">plain</a></>);
     const notPrevented = fireEvent.click(screen.getByRole('link', { name: 'plain' }), { button: 0 });

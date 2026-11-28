@@ -60,7 +60,9 @@ export function ImageViewerHost() {
     let cancelled = false;
     const img = new Image();
     img.onload = () => {
-      if (!cancelled) setShown({ ...current, width: img.naturalWidth || 1, height: img.naturalHeight || 1 });
+      // An SVG file with no size of its own can have none: it gets the size
+      // that CSS gives such an image, 300 × 150, as it has in Chromium.
+      if (!cancelled) setShown({ ...current, width: img.naturalWidth || 300, height: img.naturalHeight || 150 });
     };
     img.onerror = () => {
       if (cancelled) return;

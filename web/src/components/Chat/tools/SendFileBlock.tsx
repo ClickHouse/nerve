@@ -1,11 +1,11 @@
 import { useState } from 'react';
 import { Download, FileText, Loader2 } from '../../ui/icons';
-import { Modal } from '../../ui';
 import { authUrl } from '../../../api/hosted';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { extractResultText } from '../../../utils/extractResultText';
 import { InlinePreview } from '../../Preview/InlinePreview';
 import { PreviewButton } from '../../Preview/PreviewButton';
+import { imageLinkProps } from '../../../utils/imageLinks';
 
 /** The file names that show as an image. An `<img>` element runs no script, also for an SVG file. */
 const IMAGE_FILE = /\.(png|jpe?g|gif|webp|avif|svg)$/i;
@@ -25,16 +25,16 @@ function failure(block: ToolCallBlockData): string | null {
 
 /**
  * A `send_file` call. An image file shows in the chat, and a click opens it
- * at full size; another file shows as a download card, with its preview
- * under the card when it has one (`InlinePreview`).
+ * in the image viewer (`ImageViewerHost`); another file shows as a download
+ * card, with its preview under the card when it has one (`InlinePreview`).
  */
 export function SendFileBlock({ block }: { block: ToolCallBlockData }) {
-  const [open, setOpen] = useState(false);
   // The file can be gone (moved, or deleted) when an old chat is read again.
   const [broken, setBroken] = useState(false);
   const filePath = typeof block.input?.file_path === 'string' ? block.input.file_path : '';
   const filename = filePath.split('/').pop() || 'file';
-  const fileUrl = authUrl(`/api/files/download?path=${encodeURIComponent(filePath)}`);
+  const downloadPath = `/api/files/download?path=${encodeURIComponent(filePath)}`;
+  const fileUrl = authUrl(downloadPath);
 
   if (block.status === 'running') {
     return (
@@ -76,9 +76,8 @@ export function SendFileBlock({ block }: { block: ToolCallBlockData }) {
 
   return (
     <figure className="my-2 max-w-full">
-      <button
-        type="button"
-        onClick={() => setOpen(true)}
+      <a
+        {...imageLinkProps(downloadPath, filename, downloadPath)}
         title="Open at full size"
         className="block w-fit max-w-full rounded-lg overflow-hidden border border-border hover:border-accent/50 transition-colors cursor-zoom-in focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/60"
       >
@@ -89,7 +88,7 @@ export function SendFileBlock({ block }: { block: ToolCallBlockData }) {
           onError={() => setBroken(true)}
           className="block max-w-full max-h-80 object-contain"
         />
-      </button>
+      </a>
       <figcaption className="mt-1 flex items-center gap-1 min-w-0 text-xs text-text-muted">
         <span className="truncate">{filename}</span>
         <a
@@ -102,9 +101,6 @@ export function SendFileBlock({ block }: { block: ToolCallBlockData }) {
         </a>
         <PreviewButton path={filePath} className="shrink-0" />
       </figcaption>
-      <Modal open={open} onClose={() => setOpen(false)} title={filename} size="wide" footer={card}>
-        <img src={fileUrl} alt={filename} className="block mx-auto max-w-full max-h-[75vh] object-contain" />
-      </Modal>
     </figure>
   );
 }
