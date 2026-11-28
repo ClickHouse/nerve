@@ -29,6 +29,8 @@ const MEDIA_TYPES: Record<string, string> = {
   bmp: 'image/bmp',
 };
 
+const RASTER_TYPES = new Set(Object.values(MEDIA_TYPES));
+
 function guessMediaType(path: string): string {
   const ext = path.split('.').pop()?.toLowerCase() ?? '';
   return MEDIA_TYPES[ext] ?? 'image/png';
@@ -68,7 +70,9 @@ export function parseResultMedia(result: string | undefined, path = ''): ResultM
       continue;
     }
     if (type !== 'image' || !source || source.type !== 'base64' || typeof source.data !== 'string') continue;
-    const mediaType = typeof source.media_type === 'string' && source.media_type.startsWith('image/')
+    // Only a raster type: a blob URL is of the panel's origin, and an SVG
+    // image opened from one in a tab could run a script there.
+    const mediaType = typeof source.media_type === 'string' && RASTER_TYPES.has(source.media_type)
       ? source.media_type
       : guessMediaType(path);
     images.push({ mediaType, data: source.data });

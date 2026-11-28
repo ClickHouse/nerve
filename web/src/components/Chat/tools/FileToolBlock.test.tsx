@@ -1,8 +1,9 @@
 import { StrictMode } from 'react';
-import { render, screen } from '@testing-library/react';
+import { act, fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ToolCallBlockData } from '../../../types/chat';
+import { ImageViewerHost } from '../../ImageViewer/ImageViewerHost';
 import { FileToolBlock } from './FileToolBlock';
 
 // "PNG" in base64; the block only decodes it into a blob.
@@ -70,6 +71,46 @@ describe('FileToolBlock', () => {
     const src = screen.getByRole('img', { name: 's.png' }).getAttribute('src');
     expect(src).toMatch(/^blob:test\//);
     expect(revoked).not.toContain(src);
+  });
+
+  it('makes a raster blob of an image whose result names another type, such as SVG', () => {
+    render(<FileToolBlock block={read('/ws/a.png', [image({ media_type: 'image/svg+xml' })])} />);
+    expect(made[0].type).toBe('image/png');
+  });
+
+  it('shows the result as text when no image of it decodes', async () => {
+    render(<FileToolBlock block={read('/ws/x.png', [image({ data: '%%%' })])} />);
+    expect(screen.queryByRole('img')).not.toBeInTheDocument();
+    expect(screen.queryByText('image')).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button'));
+    expect(screen.getByText(/%%%/)).toBeInTheDocument();
+  });
+
+  it('keeps the blob URL of a picture that the viewer shows until the viewer closes', async () => {
+    class LoadedImage {
+      naturalWidth = 640;
+      naturalHeight = 480;
+      onload: (() => void) | null = null;
+      set src(_: string) {
+        queueMicrotask(() => this.onload?.());
+      }
+    }
+    vi.stubGlobal('Image', LoadedImage);
+    try {
+      const block = read('/ws/s.png', [image()]);
+      const { rerender } = render(<><ImageViewerHost /><FileToolBlock block={block} /></>);
+      await act(async () => {
+        fireEvent.click(screen.getByRole('link', { name: 's.png' }), { button: 0 });
+      });
+      await screen.findByRole('dialog', { name: 's.png' });
+      // The card goes (a tool burst folds); the viewer still shows its picture.
+      rerender(<><ImageViewerHost /></>);
+      expect(revoked).toEqual([]);
+      await userEvent.keyboard('{Escape}');
+      expect(revoked).toEqual(['blob:test/1']);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it('labels a PDF instead of dumping it', async () => {

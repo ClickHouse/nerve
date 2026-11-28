@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { ChevronRight, ChevronDown, FileText, FilePlus, Loader2 } from '../../ui/icons';
 import type { ToolCallBlockData } from '../../../types/chat';
 import { PreviewButton } from '../../Preview/PreviewButton';
-import { imageBlob, parseResultMedia, type ResultImage } from '../../../utils/toolResultMedia';
+import { revokeBlobUrl } from '../../../utils/blobUrls';
+import { imageBlob, parseResultMedia } from '../../../utils/toolResultMedia';
 
 interface Thumb {
   url: string;
@@ -14,27 +15,21 @@ interface Thumb {
  * goes. A blob URL rather than a `data:` one, because browsers refuse to open
  * a `data:` URL in a new tab (Cmd-click, the viewer's "Open original").
  */
-function useImageUrls(images: ResultImage[], name: string): Thumb[] {
+function useImageUrls(blobs: Blob[], name: string): Thumb[] {
   const [thumbs, setThumbs] = useState<Thumb[]>([]);
   // The effect that makes the URLs also revokes them. React can run an
   // effect, its cleanup and the effect again (StrictMode does), and each
   // run then shows URLs that are still valid.
   useEffect(() => {
-    const made: Thumb[] = [];
-    if (typeof URL.createObjectURL === 'function') {
-      images.forEach((image, i) => {
-        const blob = imageBlob(image);
-        if (!blob) return;
-        made.push({
-          url: URL.createObjectURL(blob),
-          title: images.length > 1 ? `${name} (${i + 1})` : name,
-        });
-      });
-    }
+    const made: Thumb[] = typeof URL.createObjectURL !== 'function' ? [] : blobs.map((blob, i) => ({
+      url: URL.createObjectURL(blob),
+      title: blobs.length > 1 ? `${name} (${i + 1})` : name,
+    }));
     // eslint-disable-next-line react-hooks/set-state-in-effect -- the URLs are made where they are revoked (see above).
     setThumbs(made);
-    return () => made.forEach(t => URL.revokeObjectURL(t.url));
-  }, [images, name]);
+    // The viewer can still show a URL when this card goes: it is revoked when the viewer lets it go.
+    return () => made.forEach(t => revokeBlobUrl(t.url));
+  }, [blobs, name]);
   return thumbs;
 }
 
@@ -47,19 +42,27 @@ export function FileToolBlock({ block }: { block: ToolCallBlockData }) {
   const name = filePath.split('/').pop() || 'Image';
 
   // A Read of an image or PDF: its content blocks, shown as pictures instead of base64.
-  const media = useMemo(
+  const parsed = useMemo(
     () => (block.isError ? null : parseResultMedia(block.result, filePath)),
     [block.result, block.isError, filePath],
   );
-  const images = useMemo(() => media?.images ?? [], [media]);
-  const thumbs = useImageUrls(images, name);
+  // The images whose data decodes. A result with none of them and no
+  // document shows as text, so that what it holds can still be read.
+  const blobs = useMemo(
+    () => (parsed?.images ?? []).map(imageBlob).filter((b): b is Blob => b !== null),
+    [parsed],
+  );
+  const media = parsed && (blobs.length > 0 || parsed.documents > 0)
+    ? { images: blobs.length, documents: parsed.documents }
+    : null;
+  const thumbs = useImageUrls(blobs, name);
 
   // For Read results, show line count
   const lineCount = block.result && !media ? block.result.split('\n').length : null;
   let mediaLabel: string | null = null;
   if (media) {
     const parts: string[] = [];
-    if (media.images.length) parts.push(media.images.length > 1 ? `${media.images.length} images` : 'image');
+    if (media.images) parts.push(media.images > 1 ? `${media.images} images` : 'image');
     if (media.documents) parts.push(media.documents > 1 ? `${media.documents} documents` : 'document');
     mediaLabel = parts.join(', ');
   }

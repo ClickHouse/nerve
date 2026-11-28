@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Lightbox } from '../Chat/rich/Lightbox';
 import { Download, ExternalLink } from '../ui/icons';
+import { holdBlobUrls, releaseBlobUrls } from '../../utils/blobUrls';
 
 export interface ViewerImage {
   src: string;
@@ -53,6 +54,16 @@ export function ImageViewerHost() {
   }, []);
 
   const current = state ? state.images[state.index] : null;
+  const images = state?.images;
+
+  // A card can go while the viewer is open (a tool burst folds): the blob
+  // URLs of the set stay valid until the viewer closes.
+  useEffect(() => {
+    if (!images) return;
+    const urls = images.flatMap(i => [i.src, i.download]);
+    holdBlobUrls(urls);
+    return () => releaseBlobUrls(urls);
+  }, [images]);
 
   // The Lightbox needs the picture's size at 1:1, which only loading it tells.
   useEffect(() => {
