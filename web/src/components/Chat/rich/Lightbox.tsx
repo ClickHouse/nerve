@@ -17,6 +17,8 @@ const PAN_STEP = 48;
 const MARGIN = 24;
 /** A touch that moves at least this far sideways, in CSS pixels, is a swipe. */
 const SWIPE_MIN = 50;
+/** A touch that moves this far, in CSS pixels, has a direction: sideways a swipe, up or down a drag. */
+const TOUCH_SLOP = 10;
 
 /**
  * The step of a touch that moved by (dx, dy): 1 to the next picture (a swipe
@@ -129,8 +131,9 @@ export function Lightbox({ open, onClose, ...view }: LightboxProps) {
   const nav = view.nav && view.nav.count > 1 ? view.nav : undefined;
   return (
     <Modal open={open} onClose={onClose} size="full" ariaLabel={view.title}>
-      {/* A new picture starts from its own view; the dialog, and focus in it, stay. */}
-      <LightboxView key={view.src ?? view.markup} onClose={onClose} navFocusRef={navFocusRef} {...view} />
+      {/* A new picture starts from its own view; the dialog, and focus in it, stay.
+          The place in the set is in the key: two images of a chat can have one source. */}
+      <LightboxView key={`${nav?.index ?? ''}:${view.src ?? view.markup}`} onClose={onClose} navFocusRef={navFocusRef} {...view} />
       {nav && <p className="sr-only" aria-live="polite">{`${view.title}, picture ${nav.index + 1} of ${nav.count}`}</p>}
     </Modal>
   );
@@ -162,7 +165,7 @@ function LightboxView({
   // Pointers down on the viewport, where each was last seen: one drags, two pinch.
   const pointersRef = useRef(new Map<number, { x: number; y: number }>());
   // The touch that can become a swipe, and the view when it started.
-  const swipeRef = useRef<{ id: number; x: number; y: number; view: View } | null>(null);
+  const swipeRef = useRef<{ id: number; x: number; y: number; view: View; sideways: boolean } | null>(null);
   const hintId = useId();
   const steps = nav && nav.count > 1 ? nav : undefined;
   const hasPrev = !!steps && steps.index > 0;
@@ -289,7 +292,7 @@ function LightboxView({
       swipeRef.current = null;
       setView(swipe.view);
     } else if (e.pointerType === 'touch' && pointers.size === 1 && steps && fitsWidth()) {
-      swipeRef.current = { id: e.pointerId, x: e.clientX, y: e.clientY, view };
+      swipeRef.current = { id: e.pointerId, x: e.clientX, y: e.clientY, view, sideways: false };
     }
   };
   const onPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
@@ -300,10 +303,20 @@ function LightboxView({
     pointers.set(e.pointerId, now);
     const swipe = swipeRef.current;
     if (swipe?.id === e.pointerId) {
+      const dx = now.x - swipe.x;
+      const dy = now.y - swipe.y;
+      if (!swipe.sideways) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) < TOUCH_SLOP) return;
+        if (Math.abs(dy) > Math.abs(dx)) {
+          // Up or down: no swipe, a drag that moves the picture (a tall one).
+          swipeRef.current = null;
+          setView({ ...swipe.view, x: swipe.view.x + dx, y: swipe.view.y + dy });
+          return;
+        }
+        swipe.sideways = true;
+      }
       // The picture follows the finger sideways. Past the first or the last
       // picture it moves a third as far: nothing comes.
-      const dx = now.x - swipe.x;
-      if (Math.abs(dx) < Math.abs(now.y - swipe.y)) return;
       const blocked = (dx > 0 && !hasPrev) || (dx < 0 && !hasNext);
       setView({ ...swipe.view, x: swipe.view.x + (blocked ? dx / 3 : dx) });
       return;

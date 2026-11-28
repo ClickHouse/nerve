@@ -125,13 +125,16 @@ export function ImageViewerHost() {
     setState(null);
     setShown(null);
   }, [shown]);
+  // A step goes from the picture that shows, as the title, the count and
+  // the arrows do: a second key press while the next one loads skips none.
+  const shownIndex = shown?.index;
   const step = useCallback((by: number) => {
     setState(s => {
-      if (!s) return s;
-      const to = Math.min(Math.max(s.index + by, 0), s.images.length - 1);
+      if (!s || shownIndex === undefined) return s;
+      const to = Math.min(Math.max(shownIndex + by, 0), s.images.length - 1);
       return to === s.index ? s : { ...s, index: to };
     });
-  }, []);
+  }, [shownIndex]);
 
   if (!state || !shown) return null;
   return (

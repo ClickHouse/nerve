@@ -175,6 +175,36 @@ describe('the image viewer in a chat', () => {
     expect(button('Next picture')).not.toBeInTheDocument();
   });
 
+  it('steps from the picture that shows, so that a second key press while the next one loads skips none', async () => {
+    held.add('/api/uploads/two.png');
+    renderChat();
+    await open('one.png');
+    await keys('{ArrowRight}{ArrowRight}');
+    await release();
+    await screen.findByRole('dialog', { name: 'two.png' });
+    expect(screen.getByText('2 / 3')).toBeInTheDocument();
+  });
+
+  it('starts each picture from its own view, also two images with one source', async () => {
+    const same = { type: 'image' as const, url: '/api/uploads/same.png', filename: 'same.png', media_type: 'image/png' };
+    render(
+      <>
+        <ImageViewerHost />
+        <div data-lightbox-group=""><BlockRenderer blocks={[same, same]} /></div>
+      </>,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole('link', { name: 'same.png' })[0], { button: 0 });
+    });
+    await screen.findByText('1 / 2');
+    await keys('+');
+    expect(screen.getByLabelText('Zoom level')).toHaveTextContent('125%');
+    await keys('{ArrowRight}');
+    await screen.findByText('2 / 2');
+    expect(screen.getByLabelText('Zoom level')).toHaveTextContent('100%');
+    await waitFor(() => expect(viewport()).toHaveFocus());
+  });
+
   it('says which picture shows, for a screen reader', async () => {
     renderChat();
     await open('two.png');
@@ -266,6 +296,18 @@ describe('the image viewer in a chat', () => {
       fireEvent.pointerDown(viewport(), at(200));
       fireEvent.pointerMove(viewport(), at(170));
       expect(content().style.transform).toMatch(/^translate\(-10px/);
+    });
+
+    it('moves the picture up and down with one finger, also while it fits the width', async () => {
+      renderChat();
+      await open('two.png');
+      fireEvent.pointerDown(viewport(), at(200));
+      fireEvent.pointerMove(viewport(), at(205, 380));
+      expect(content().style.transform).toMatch(/^translate\(5px, 80px\)/);
+      fireEvent.pointerUp(viewport(), at(205, 380));
+      await act(async () => {});
+      expect(screen.getByRole('dialog')).toHaveAccessibleName('two.png');
+      expect(content().style.transform).toMatch(/^translate\(5px, 80px\)/);
     });
 
     it('moves a picture that is zoomed in wider than the window, and does not step', async () => {
