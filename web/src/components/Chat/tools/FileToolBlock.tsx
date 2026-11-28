@@ -15,20 +15,26 @@ interface Thumb {
  * a `data:` URL in a new tab (Cmd-click, the viewer's "Open original").
  */
 function useImageUrls(images: ResultImage[], name: string): Thumb[] {
-  const thumbs = useMemo(() => {
-    if (!images.length || typeof URL.createObjectURL !== 'function') return [];
+  const [thumbs, setThumbs] = useState<Thumb[]>([]);
+  // The effect that makes the URLs also revokes them. React can run an
+  // effect, its cleanup and the effect again (StrictMode does), and each
+  // run then shows URLs that are still valid.
+  useEffect(() => {
     const made: Thumb[] = [];
-    images.forEach((image, i) => {
-      const blob = imageBlob(image);
-      if (!blob) return;
-      made.push({
-        url: URL.createObjectURL(blob),
-        title: images.length > 1 ? `${name} (${i + 1})` : name,
+    if (typeof URL.createObjectURL === 'function') {
+      images.forEach((image, i) => {
+        const blob = imageBlob(image);
+        if (!blob) return;
+        made.push({
+          url: URL.createObjectURL(blob),
+          title: images.length > 1 ? `${name} (${i + 1})` : name,
+        });
       });
-    });
-    return made;
+    }
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- the URLs are made where they are revoked (see above).
+    setThumbs(made);
+    return () => made.forEach(t => URL.revokeObjectURL(t.url));
   }, [images, name]);
-  useEffect(() => () => thumbs.forEach(t => URL.revokeObjectURL(t.url)), [thumbs]);
   return thumbs;
 }
 

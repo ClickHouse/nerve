@@ -1,3 +1,4 @@
+import { StrictMode } from 'react';
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -62,6 +63,13 @@ describe('FileToolBlock', () => {
     const { unmount } = render(<FileToolBlock block={read('/ws/s.png', [image()])} />);
     unmount();
     expect(revoked).toEqual(['blob:test/1']);
+  });
+
+  it('shows a blob URL that is still valid when React runs the effects twice (StrictMode)', () => {
+    render(<StrictMode><FileToolBlock block={read('/ws/s.png', [image()])} /></StrictMode>);
+    const src = screen.getByRole('img', { name: 's.png' }).getAttribute('src');
+    expect(src).toMatch(/^blob:test\//);
+    expect(revoked).not.toContain(src);
   });
 
   it('labels a PDF instead of dumping it', async () => {
