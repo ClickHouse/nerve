@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, configure, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ChatMessage, ToolCallBlockData } from '../../types/chat';
@@ -26,6 +26,10 @@ class FakeImage {
     else queueMicrotask(go);
   }
 }
+
+// Each test waits for several pictures in a row, and on a loaded machine one
+// wait (a load, then a frame for focus) can pass the default of 1 s.
+configure({ asyncUtilTimeout: 3000 });
 
 /** jsdom lays nothing out: every box is 1000 × 800, so a 640 × 480 picture fits. */
 const BOX = { left: 0, top: 0, right: 1000, bottom: 800, x: 0, y: 0, width: 1000, height: 800 };
