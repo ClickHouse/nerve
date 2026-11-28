@@ -157,11 +157,14 @@ class TestScaffold:
                 ["git", "check-ignore", "-q", rel], cwd=str(tmp_path),
             ).returncode == 0
 
-        for rel in ("MEMORY.md", "TASK.md", "memory/entity.md"):
+        for rel in (
+            "MEMORY.md", "TASK.md", "memory/entity.md", "output/generated-images/session/image.png",
+        ):
             assert ignored(rel), f"{rel} is runtime state and must not be staged"
         for rel in _ALLOWED_ROOT_FILES:
             assert not ignored(rel), f"{rel} is reviewed instruction and must stay committable"
         assert not ignored("skills/x/MEMORY.md"), "the exclusion must be root-anchored"
+        assert not ignored("output/report.png"), "ordinary output can still be tracked"
 
     def test_gitignore_covers_backup_secret_members(self, tmp_path):
         # If the workspace doubles as the state dir, `git add -A` (which the

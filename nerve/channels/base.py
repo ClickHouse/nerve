@@ -9,12 +9,17 @@ management and message dispatch.
 from __future__ import annotations
 
 import abc
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Flag, auto
+from pathlib import Path
 from typing import Any
 
 from nerve.channels.access import Decision
 from nerve.identity import Actor
+
+
+GeneratedImageSender = Callable[[Path, bytes], Awaitable[bool]]
 
 
 class ChannelCapability(Flag):
@@ -280,13 +285,26 @@ class BaseChannel(abc.ABC):
     #  Only called if channel declares ChannelCapability.SEND_FILES.        #
     # ------------------------------------------------------------------ #
 
+    def bind_generated_image_sender(
+        self, message: InboundMessage, session_id: str,
+    ) -> GeneratedImageSender | None:
+        """Capture the reply destination for automatic attachments."""
+        target = message.sender_id
+
+        async def send(path: Path, content: bytes) -> bool:
+            return await self.send_file(target, str(path), session_id=session_id, content=content)
+
+        return send
+
     async def send_file(
         self, target: str, file_path: str, *, session_id: str | None = None,
+        content: bytes | None = None,
     ) -> bool:
         """Deliver a file to a target as a downloadable attachment.
 
         ``session_id`` is the session that sends the file, for channels
-        that track which session produced a message.
+        that track which session produced a message. When ``content`` is
+        provided, upload those bytes and use ``file_path`` for the name only.
 
         Returns True on successful delivery, False if the channel
         cannot deliver the file (size limits, missing transport, etc.).

@@ -86,6 +86,7 @@ class WebChannel(BaseChannel):
 
     async def send_file(
         self, target: str, file_path: str, *, session_id: str | None = None,
+        content: bytes | None = None,
     ) -> bool:
         """Web file delivery is handled by the persisted tool_call block.
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from types import SimpleNamespace
 
 import pytest
@@ -42,6 +43,152 @@ def _client(tmp_path, **codex_overrides) -> CodexClient:
         system_prompt="", cwd=str(tmp_path),
     )
     return CodexClient(backend, spec)
+
+
+_GENERATED_PNG = (
+    "data:image/png;base64,"
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGP4DwAB"
+    "AQEAsTj2FAAAAABJRU5ErkJggg=="
+)
+
+
+def _generated_image_item(**overrides):
+    return {
+        "id": "generated-call-1", "type": "imageGeneration",
+        "generationId": "generation-1", "status": "completed", "failure": None,
+        "result": _GENERATED_PNG.partition(",")[2],
+        "savedPath": "/runtime/generated_images/session/image.png",
+        "revisedPrompt": "A synthetic illustration.",
+        **overrides,
+    }
+
+
+@pytest.mark.asyncio
+async def test_native_generated_image_start_does_not_persist_inline_data(tmp_path):
+    client = _client(tmp_path)
+    events = await client._map_item_started(_generated_image_item())
+    assert events == [ev.ToolUse(
+        tool_use_id="generated-call-1", name="ImageGeneration", input={},
+    )]
+
+
+@pytest.mark.asyncio
+async def test_native_generated_image_preserves_bare_base64_after_summary(tmp_path):
+    client = _client(tmp_path)
+    item = _generated_image_item()
+    events = await client._map_item_completed(item)
+    assert len(events) == 2
+    assert isinstance(events[0], ev.ToolResult)
+    assert events[0].content == "Image generation completed."
+    assert events[0].is_error is False
+    assert item["result"] not in events[0].content
+    assert item["savedPath"] not in events[0].content
+    assert item["revisedPrompt"] not in events[0].content
+    assert events[1] == ev.GeneratedImage(
+        tool_use_id="generated-call-1", image_url=_GENERATED_PNG,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool", ["exec", "wait", "view_image"])
+async def test_dynamic_image_outputs_are_not_generation_provenance(tmp_path, tool):
+    client = _client(tmp_path)
+    events = await client._map_item_completed({
+        "id": "tool-1", "type": "dynamicToolCall", "tool": tool,
+        "status": "completed",
+        "contentItems": [
+            {"type": "inputImage", "imageUrl": _GENERATED_PNG},
+            {"type": "inputText", "text": (
+                "Generated images are saved to /runtime/generated_images/session "
+                "as /runtime/generated_images/session/image.png by default."
+            )},
+        ],
+    })
+    assert len(events) == 1
+    assert isinstance(events[0], ev.ToolResult)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header,mime", [
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"\xff\xd8\xff\xe0", "image/jpeg"),
+    (b"RIFF\x10\0\0\0WEBP", "image/webp"),
+])
+async def test_native_generated_image_sniffs_supported_inline_format(tmp_path, header, mime):
+    client = _client(tmp_path)
+    encoded = base64.b64encode(header + b"synthetic payload").decode()
+    events = await client._map_item_completed(_generated_image_item(result=encoded))
+    assert events[1].image_url == f"data:{mime};base64,{encoded}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["failed", "cancelled", "inProgress"])
+async def test_native_unsuccessful_generation_has_error_summary_only(tmp_path, status):
+    client = _client(tmp_path)
+    events = await client._map_item_completed(_generated_image_item(status=status))
+    assert len(events) == 1
+    assert isinstance(events[0], ev.ToolResult)
+    assert events[0].is_error is True
+
+
+@pytest.mark.asyncio
+async def test_native_completed_generation_with_failure_is_not_delivered(tmp_path):
+    client = _client(tmp_path)
+    events = await client._map_item_completed(_generated_image_item(failure={
+        "type": "usageLimitExceeded", "limitId": "image_generation", "resetsAt": None,
+    }))
+    assert events[0].is_error is True
+    assert not any(isinstance(event, ev.GeneratedImage) for event in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result", [
+    "https://example.com/image.png",
+    "file:///runtime/generated_images/image.png",
+    "not-valid-base64",
+    "dGV4dA==",
+    "",
+    None,
+    123,
+])
+async def test_native_invalid_inline_result_requests_visible_import_failure(tmp_path, result):
+    client = _client(tmp_path)
+    events = await client._map_item_completed(_generated_image_item(result=result))
+    assert events[1] == ev.GeneratedImage(tool_use_id="generated-call-1", image_url="")
+
+
+@pytest.mark.asyncio
+async def test_native_file_id_only_result_never_reads_saved_path(tmp_path, monkeypatch):
+    from nerve.agent.backends.codex import backend as codex_backend
+
+    client = _client(tmp_path)
+
+    def forbidden_read(*_args):
+        raise AssertionError("savedPath must never be read")
+
+    monkeypatch.setattr(codex_backend.Path, "read_bytes", forbidden_read)
+    item = _generated_image_item()
+    item.pop("result")
+    item["fileId"] = "attachment-1"
+    events = await client._map_item_completed(item)
+    assert events[1] == ev.GeneratedImage(tool_use_id="generated-call-1", image_url="")
+
+
+@pytest.mark.asyncio
+async def test_native_generated_image_result_is_bounded(tmp_path, monkeypatch):
+    from nerve.agent.backends.codex import backend as codex_backend
+
+    client = _client(tmp_path)
+    monkeypatch.setattr(codex_backend, "_MAX_GENERATED_IMAGE_URL_CHARS", 32)
+    events = await client._map_item_completed(_generated_image_item())
+    assert events[1] == ev.GeneratedImage(tool_use_id="generated-call-1", image_url="")
+
+
+@pytest.mark.asyncio
+async def test_native_generated_image_can_use_generation_identity(tmp_path):
+    client = _client(tmp_path)
+    events = await client._map_item_completed(_generated_image_item(id=None))
+    assert events[1] == ev.GeneratedImage(tool_use_id="generation-1", image_url=_GENERATED_PNG)
 
 
 @pytest.mark.asyncio

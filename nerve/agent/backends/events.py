@@ -132,6 +132,20 @@ class ToolOutputDelta:
 
 
 @dataclass
+class GeneratedImage:
+    """An image explicitly produced for the person by a runtime tool.
+
+    This is not an image merely opened for the agent's inspection. The
+    engine validates and materializes the data URI before channel delivery;
+    backend-native save paths do not cross the event boundary.
+    """
+
+    tool_use_id: str | None
+    image_url: str
+    parent_tool_use_id: str | None = None
+
+
+@dataclass
 class SubagentStarted:
     """A backend-native sub-agent began (Claude Task or Codex collab item).
 
@@ -225,6 +239,7 @@ AgentEvent = (
     | ToolUse
     | ToolResult
     | ToolOutputDelta
+    | GeneratedImage
     | SubagentStarted
     | SubagentUsage
     | ModelObserved

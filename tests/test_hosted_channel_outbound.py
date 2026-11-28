@@ -695,6 +695,17 @@ class TestFileSend:
             upload["file"]["transfer_id"],
         }
 
+    async def test_supplied_file_bytes_are_uploaded_without_reading_the_path(self, hosted, tmp_path):
+        await small_frame_stream(hosted, file_bytes=1000)
+        path = tmp_path / "report.csv"
+        path.write_bytes(b"replacement" * 100)
+        channel = hosted.runtime.channels["slack"]
+
+        assert await channel.send_file(TOOL_TARGET, str(path), content=b"validated content")
+        [upload] = hosted.gateway.uploads
+        assert upload["data"] == b"validated content"
+        assert upload["file"]["name"] == "report.csv"
+
     async def test_a_result_before_the_last_chunk_stops_the_upload(self, hosted, tmp_path):
         stream = await small_frame_stream(hosted)
         hosted.gateway.script("file_send", {"outcome": "forbidden", "reason_code": "policy_denied"})
@@ -733,12 +744,17 @@ class TestFileSend:
         assert await waiting
         assert [upload["data"][:1] for upload in hosted.gateway.uploads] == [b"2"]
 
-    async def test_a_file_above_the_connection_limit_is_not_sent(self, hosted, tmp_path):
+    @pytest.mark.parametrize("inline", [False, True])
+    async def test_a_file_above_the_connection_limit_is_not_sent(self, hosted, tmp_path, inline):
         await small_frame_stream(hosted, file_bytes=1000)
         path = tmp_path / "big.txt"
-        path.write_bytes(b"x" * 1001)
+        data = b"x" * 1001
+        if not inline:
+            path.write_bytes(data)
 
-        assert not await hosted.runtime.channels["slack"].send_file(TOOL_TARGET, str(path))
+        assert not await hosted.runtime.channels["slack"].send_file(
+            TOOL_TARGET, str(path), content=data if inline else None,
+        )
         assert hosted.gateway.operations == []
 
     async def test_an_edit_too_large_for_the_frame_is_shortened_before_it_is_sent(self, hosted):

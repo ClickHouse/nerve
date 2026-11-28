@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import inspect
 import json
 import logging
@@ -25,7 +26,8 @@ from collections import OrderedDict
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace as dc_replace
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, TYPE_CHECKING
 
 from nerve.agent.agents import AgentRegistry
 from nerve.agent.agents.errors import (
@@ -58,7 +60,8 @@ from nerve.agent.backends import (
     TurnRefusedError,
     build_backends,
 )
-from nerve.agent.backends.events import TurnStatus
+from nerve.agent.backends.events import GeneratedImage, TurnStatus
+from nerve.agent.generated_images import store_generated_image
 from nerve.agent.cache_policy import resolve_cache_ttl
 from nerve.agent.interactive import (
     InteractiveToolHandler,
@@ -120,10 +123,19 @@ from nerve.session_origin import cron_origin, session_origin
 from nerve.skills.manager import SkillManager
 from nerve.utils.llm import response_text
 
+if TYPE_CHECKING:
+    from nerve.channels.base import GeneratedImageSender
+
+
 logger = logging.getLogger(__name__)
 
 
 _SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+
+# Keep immutable upload payloads bounded when the runtime produces several
+# images faster than the channel can accept them.
+_MAX_PENDING_IMAGE_UPLOADS = 4
+_IMAGE_UPLOAD_TIMEOUT_SECONDS = 60
 
 # Injected as an internal turn when a session is resumed after a
 # ``nerve restart --resume`` (see AgentEngine.resume_enrolled_sessions).
@@ -365,6 +377,13 @@ def _accepts_cancel_queued(client: Any) -> bool:
     )
 
 
+def _generated_image_key(event: GeneratedImage) -> str:
+    digest = hashlib.sha256(event.image_url.encode(errors="surrogatepass"))
+    digest.update(b"\0")
+    digest.update((event.tool_use_id or "").encode(errors="surrogatepass"))
+    return digest.hexdigest()
+
+
 @dataclass
 class _TurnState:
     """Accumulates one agent turn's worth of streamed content.
@@ -379,6 +398,9 @@ class _TurnState:
     tool_calls_log: list[dict] = field(default_factory=list)
     tool_results_map: dict[str, dict] = field(default_factory=dict)
     ordered_blocks: list[dict] = field(default_factory=list)
+    generated_image_sender: GeneratedImageSender | None = None
+    generated_image_deliveries: set[str] = field(default_factory=set)
+    image_uploads: dict[str, tuple[str, asyncio.Task[bool]]] = field(default_factory=dict)
     last_usage: dict | None = None
     sdk_session_id: str | None = None
     # True when ``sdk_session_id`` comes from the turn's terminal event, not
@@ -3501,6 +3523,107 @@ class AgentEngine:
             downgrade=downgrade,
         )
 
+    async def _process_generated_image(
+        self, session_id: str, event: GeneratedImage, st: _TurnState,
+    ) -> None:
+        """Materialize main-chain generation output and reuse file delivery.
+
+        Only the normalized backend event enters here, never arbitrary tool
+        text or inspected images. The saved send_file block also makes the
+        artifact available in web history without storing inline image bytes.
+        """
+        key = await asyncio.to_thread(_generated_image_key, event)
+        if key in st.generated_image_deliveries:
+            return
+        # Reserve before I/O so duplicate completions cannot retry an
+        # ambiguous send.
+        st.generated_image_deliveries.add(key)
+        st.got_content = True
+        try:
+            path, content = await asyncio.to_thread(
+                store_generated_image, self.config.workspace, session_id, event.image_url,
+            )
+        except (OSError, ValueError) as exc:
+            logger.warning("Generated image import failed for %s: %s", session_id, type(exc).__name__)
+            await self._generated_image_notice(
+                session_id, st, "Generated image could not be prepared for delivery.",
+            )
+            return
+
+        await self._settle_image_uploads(session_id, st)
+        call_id = f"generated-image-{key[:24]}"
+        await self._process_agent_event(session_id, ToolUse(
+            tool_use_id=call_id, name="send_file", input={"file_path": str(path)},
+        ), st)
+        label = f"{path.name} ({len(content):,} bytes)"
+        sender = st.generated_image_sender
+        if sender is not None and len(st.image_uploads) < _MAX_PENDING_IMAGE_UPLOADS:
+            task = asyncio.create_task(self._upload_generated_image(session_id, sender, path, content))
+            st.image_uploads[call_id] = (label, task)
+        else:
+            await self._finish_generated_image(session_id, st, call_id, label, delivered=False)
+            if sender is not None:
+                await self._generated_image_notice(
+                    session_id, st, "Attachment delivery is busy. Open the web panel to download.",
+                )
+
+    @staticmethod
+    async def _generated_image_notice(session_id: str, st: _TurnState, message: str) -> None:
+        note = f"\n\n{message}\n\n"
+        st.ordered_blocks.append({"type": "text", "content": note})
+        await broadcaster.broadcast_token(session_id, note)
+
+    @staticmethod
+    async def _upload_generated_image(
+        session_id: str, sender: GeneratedImageSender, path: Path, content: bytes,
+    ) -> bool:
+        try:
+            async with asyncio.timeout(_IMAGE_UPLOAD_TIMEOUT_SECONDS):
+                return await sender(path, content)
+        except Exception as exc:
+            logger.warning("Generated image delivery failed for %s: %s", session_id, type(exc).__name__)
+            return False
+
+    async def _finish_generated_image(
+        self, session_id: str, st: _TurnState, call_id: str, label: str, *, delivered: bool,
+    ) -> None:
+        result = (
+            f"Sent file: {label}" if delivered
+            else f"File ready: {label}. Open the web panel to download."
+        )
+        # A failed upload must leave a usable web card for the saved image.
+        await self._process_tool_result(
+            ToolResult(tool_use_id=call_id, content=result, is_error=False),
+            session_id, st.tool_results_map, st.ordered_blocks, st.tool_calls_log,
+        )
+
+    @staticmethod
+    def _cancel_image_uploads(st: _TurnState) -> None:
+        for _, upload in st.image_uploads.values():
+            if not upload.done():
+                upload.cancel()
+
+    async def _settle_image_uploads(
+        self, session_id: str, st: _TurnState, *, finish: bool = False, cancel: bool = False,
+    ) -> None:
+        if not st.image_uploads:
+            return
+        tasks = [task for _, task in st.image_uploads.values()]
+        if cancel:
+            self._cancel_image_uploads(st)
+        if finish or cancel:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for call_id, (label, task) in list(st.image_uploads.items()):
+            if not task.done():
+                continue
+            delivered = not task.cancelled() and task.result()
+            await self._finish_generated_image(session_id, st, call_id, label, delivered=delivered)
+            del st.image_uploads[call_id]
+            if not delivered and not cancel:
+                await self._generated_image_notice(
+                    session_id, st, "Image created, but attachment delivery failed. Open the web panel to download.",
+                )
+
     async def _process_agent_event(
         self, session_id: str, event: Any, st: _TurnState,
     ) -> bool:
@@ -3607,6 +3730,9 @@ class AgentEngine:
             # completion) or fails its agent.
             await self.agents.on_main_tool_result(session_id, event)
 
+        elif isinstance(event, GeneratedImage):
+            await self._process_generated_image(session_id, event, st)
+
         elif isinstance(event, ToolOutputDelta):
             st.got_content = True
             for block in reversed(st.ordered_blocks):
@@ -3637,6 +3763,7 @@ class AgentEngine:
         elif isinstance(event, TurnCompleted):
             self._record_turn_result(event, st)
             if event.status != "completed":
+                self._cancel_image_uploads(st)
                 # Abnormal ends still complete: surface them inline so the
                 # conversation shows what happened (the runtime itself stays healthy).
                 logger.warning(
@@ -4214,6 +4341,7 @@ class AgentEngine:
         client_msg_id: str | None = None,
         origin: str | None = None,
         drop_leading_thinking: bool = False,
+        generated_image_sender: GeneratedImageSender | None = None,
     ) -> str:
         """Run the agent for a user message and return the final text response.
 
@@ -4261,6 +4389,8 @@ class AgentEngine:
             origin: Label of where the message came from, shown on its queue
                       entry (``"web"``, ``"api"``, a channel name). Defaults
                       to ``source``.
+            generated_image_sender: Optional attachment sender bound by the
+                      originating channel to this invocation's reply destination.
             drop_leading_thinking: If True, the thinking that comes before
                       the turn's first text or tool call is neither broadcast
                       nor stored with the reply. Thinking after that is kept.
@@ -4289,6 +4419,7 @@ class AgentEngine:
             client_msg_id=client_msg_id,
             origin=origin,
             drop_leading_thinking=drop_leading_thinking,
+            generated_image_sender=generated_image_sender,
         )).text
 
     async def _run_turn(
@@ -4309,6 +4440,7 @@ class AgentEngine:
         client_msg_id: str | None = None,
         origin: str | None = None,
         drop_leading_thinking: bool = False,
+        generated_image_sender: GeneratedImageSender | None = None,
         compact: bool = False,
     ) -> TurnResult:
         """``run()`` plus how the invocation's turn ended. ``compact``: the
@@ -4401,6 +4533,7 @@ class AgentEngine:
                 bump_updated_at=bump_updated_at, actor=actor,
                 cause_id=cause_id,
                 drop_leading_thinking=drop_leading_thinking,
+                generated_image_sender=generated_image_sender,
                 compact=compact,
             )
         finally:
@@ -4423,6 +4556,7 @@ class AgentEngine:
         actor: Actor | None,
         cause_id: str | None,
         drop_leading_thinking: bool = False,
+        generated_image_sender: GeneratedImageSender | None = None,
         compact: bool = False,
     ) -> TurnResult:
         """The turn of :meth:`run`, with the run lock held: framing
@@ -4466,6 +4600,7 @@ class AgentEngine:
                     actor=actor,
                     cause_id=cause_id,
                     drop_leading_thinking=drop_leading_thinking,
+                    generated_image_sender=generated_image_sender,
                 )
             finally:
                 self.sessions.mark_not_running(session_id)
@@ -4566,6 +4701,7 @@ class AgentEngine:
         actor: Actor | None,
         cause_id: str | None,
         drop_leading_thinking: bool = False,
+        generated_image_sender: GeneratedImageSender | None = None,
     ) -> TurnResult:
         # Ensure session exists in DB. ``cause_id`` applies only if the row
         # is created here.
@@ -4624,7 +4760,10 @@ class AgentEngine:
             )
 
         # Turn accumulator — shared shape with the autonomous-turn drain.
-        st = _TurnState(drop_leading_thinking=drop_leading_thinking)
+        st = _TurnState(
+            drop_leading_thinking=drop_leading_thinking,
+            generated_image_sender=generated_image_sender,
+        )
 
         # Wakeup turns (fired by the cron-service sweep) carry a leading
         # marker block so the UI shows a "scheduled wakeup" chip. Persisted
@@ -4860,11 +4999,20 @@ class AgentEngine:
                         continue  # retry query + response
                     break  # success — exit retry loop
 
+            # Read the whole runtime turn before joining transfers so a
+            # slow channel cannot block the Codex notification consumer.
+            # Interrupted and failed turns retain local cards only for
+            # uploads that were still pending when the runtime ended.
+            await self._settle_image_uploads(
+                session_id, st, finish=True, cancel=st.status != "completed",
+            )
+
         except asyncio.CancelledError:
             outcome = self._end_turn(session_id, TurnOutcome(
                 "interrupted", "gateway shutdown" if self._shutting_down else "stopped by user",
             ))
             logger.info("Session %s cancelled by user", session_id)
+            self._cancel_image_uploads(st)
             partial = st.full_response_text + (
                 "\n\n[Stopped by user]"
                 if st.full_response_text
@@ -4899,6 +5047,7 @@ class AgentEngine:
 
             # --- Non-critical: save message, broadcast, memorize -----------
             try:
+                await self._settle_image_uploads(session_id, st, cancel=True)
                 self._merge_tool_results(st.tool_calls_log, st.tool_results_map)
                 await self.sessions.add_message(
                     session_id, "assistant", partial,
@@ -4928,6 +5077,7 @@ class AgentEngine:
             )
 
         except Exception as e:
+            await self._settle_image_uploads(session_id, st, cancel=True)
             error_msg = f"Agent error: {e}"
             logger.error(error_msg, exc_info=True)
 

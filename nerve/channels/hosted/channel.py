@@ -91,6 +91,7 @@ from nerve.channels.base import (
     BaseChannel,
     ChannelCapability,
     ChannelConstraints,
+    GeneratedImageSender,
     InboundMessage,
     ObservedMessage,
     OutboundMessage,
@@ -707,8 +708,27 @@ class HostedChannel(BaseChannel):
         except OperationFailed as error:
             logger.warning("Hosted %s reaction in %s failed: %s", self._provider, target, _why(error))
 
+    def bind_generated_image_sender(
+        self, message: InboundMessage, session_id: str,
+    ) -> GeneratedImageSender | None:
+        """Capture both the conversation and the connection that delivered it."""
+        connection = message.metadata.get("connection_id")
+        if not isinstance(connection, str):
+            return None
+        try:
+            connection_id = uuid.UUID(connection)
+        except ValueError:
+            return None
+        target = message.sender_id
+
+        async def send(path: Path, content: bytes) -> bool:
+            return await self._send_file(target, str(path), content=content, connection=connection_id)
+
+        return send
+
     async def send_file(
         self, target: str, file_path: str, *, session_id: str | None = None,
+        content: bytes | None = None,
     ) -> bool:
         """Upload a file into *target* through ``file_send``.
 
@@ -718,24 +738,34 @@ class HostedChannel(BaseChannel):
         serves the connection, the stream that takes the upload checks its
         limit.
         """
+        return await self._send_file(target, file_path, content=content)
+
+    async def _send_file(
+        self, target: str, file_path: str, *,
+        content: bytes | None, connection: uuid.UUID | None = None,
+    ) -> bool:
         path = Path(file_path)
         conversation, thread = parse_target(target)
         try:
-            connection = await self._connection(conversation, "file_send")
+            if connection is None:
+                connection = await self._connection(conversation, "file_send")
             capabilities = (
                 self._operations.streams.capabilities_for(connection) if self._operations else None
             )
             limit = MAX_TRANSFER_BYTES
             if capabilities is not None:
                 limit = min(capabilities.limits.file_bytes, limit)
-            size = path.stat().st_size if path.is_file() else 0
+            if content is None:
+                size = path.stat().st_size if path.is_file() else 0
+            else:
+                size = len(content)
             if not 0 < size <= limit:
                 logger.info(
                     "Hosted %s file %s not sent: %d bytes, limit %d",
                     self._provider, path.name, size, limit,
                 )
                 return False
-            data = await asyncio.to_thread(path.read_bytes)
+            data = content if content is not None else await asyncio.to_thread(path.read_bytes)
             if not 0 < len(data) <= limit:
                 return False
             await self._perform(connection, "file_send", FileSendOperation(
@@ -1014,7 +1044,6 @@ class HostedChannel(BaseChannel):
         metadata: dict[str, Any] = {
             "message_id": event.message.id,
             "author_id": event.author.id,
-            "connection_id": str(event.connection_id),
         }
         logger.info(
             "Hosted %s message in %s: %s", self._provider, target,
@@ -1193,6 +1222,7 @@ class HostedChannel(BaseChannel):
             return Disposition.deferred(f"{self._provider} has {len(self._inflight)} turns starting")
         behaviour = self._behaviour(event)
         message.post_answer = behaviour.posts_answer
+        message.metadata["connection_id"] = str(event.connection_id)
         task = asyncio.create_task(self._run_turn(message, event, attachments, behaviour))
         self._inflight.add(task)
         task.add_done_callback(self._inflight.discard)

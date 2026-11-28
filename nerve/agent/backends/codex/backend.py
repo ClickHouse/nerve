@@ -20,6 +20,8 @@ attribute to the real session exactly like the in-process Claude MCP.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import collections
 import hashlib
 import json
@@ -70,6 +72,8 @@ from nerve.inference_principal import (
 )
 
 logger = logging.getLogger(__name__)
+
+_MAX_GENERATED_IMAGE_URL_CHARS = 32 * 1024 * 1024
 
 # The Codex CLI version of tests/fixtures/codex_schema_meta.json
 # (``codex_cli_version``; a test keeps the two equal). Nerve runs any CLI in
@@ -1693,6 +1697,12 @@ class CodexClient(AgentClient):
                 name="WebSearch",
                 input={"query": item.get("query", "")},
             ))
+        elif item_type == "imageGeneration":
+            out.append(ev.ToolUse(
+                tool_use_id=item_id or None,
+                name="ImageGeneration",
+                input={},
+            ))
         elif item_type == "collabAgentToolCall":
             # A collab agent lives inside the turn: an Agent call (so the
             # spawn persists as a tool_call block and becomes a foreground
@@ -1786,6 +1796,15 @@ class CodexClient(AgentClient):
                 )[:4000],
                 is_error=False,
             ))
+        elif item_type == "imageGeneration":
+            completed = item.get("status") == "completed" and item.get("failure") is None
+            out.append(ev.ToolResult(
+                tool_use_id=item_id or None,
+                content="Image generation completed." if completed else "Image generation failed or cancelled.",
+                is_error=not completed,
+            ))
+            if completed:
+                out.append(await asyncio.to_thread(self._generated_image_event, item))
         elif item_type == "collabAgentToolCall":
             status = str(item.get("status") or "").lower()
             out.append(ev.ToolResult(
@@ -2031,6 +2050,42 @@ class CodexClient(AgentClient):
             cache_creation_tokens=0,
             raw={"last": usage.get("last"), "total": usage.get("total")},
         )
+
+    @staticmethod
+    def _generated_image_event(item: dict[str, Any]) -> ev.GeneratedImage:
+        """Preserve inline bytes from the native imageGeneration item.
+
+        Codex 0.169 represents generated results as bare base64 or a durable
+        fileId. Only the inline representation is imported here. Never read
+        savedPath or fetch a fileId: either could add authority beyond the
+        result itself. An empty URI requests a visible failed import from
+        the engine instead of silently dropping an unsupported result.
+        """
+        native_id = item.get("id") or item.get("generationId")
+        image = ev.GeneratedImage(
+            tool_use_id=native_id if isinstance(native_id, str) and native_id.strip() else None,
+            image_url="",
+        )
+        result = item.get("result")
+        if (not isinstance(result, str) or not result
+                or len(result) > _MAX_GENERATED_IMAGE_URL_CHARS or not result.isascii()):
+            return image
+        # Sniff a bounded header only. The engine owns full decoding, magic
+        # validation and its output-size limit, including visible errors.
+        try:
+            header = base64.b64decode(result[:64], validate=True)
+        except (ValueError, binascii.Error):
+            return image
+        if header.startswith(b"\x89PNG\r\n\x1a\n"):
+            media_type = "image/png"
+        elif header.startswith(b"\xff\xd8\xff"):
+            media_type = "image/jpeg"
+        elif header.startswith(b"RIFF") and header[8:12] == b"WEBP":
+            media_type = "image/webp"
+        else:
+            return image
+        image.image_url = f"data:{media_type};base64,{result}"
+        return image
 
     @staticmethod
     def _dynamic_tool_output(item: dict[str, Any]) -> str:
