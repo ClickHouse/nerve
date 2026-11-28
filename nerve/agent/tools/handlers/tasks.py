@@ -254,12 +254,18 @@ async def _claim_task_id(
         candidate = base_id if n == 1 else f"{base_id}-{n}"
         if ctx.db and await ctx.db.get_task(candidate) is not None:
             continue
+        if getattr(ctx.db, "persistent_task_content", False) and not await ctx.db.reserve_task_id(candidate):
+            continue
         if (done_dir / f"{candidate}.md").exists():
+            if getattr(ctx.db, "persistent_task_content", False):
+                await ctx.db.release_task_id(candidate)
             continue
         path = active_dir / f"{candidate}.md"
         try:
             await asyncio.to_thread(_write_new_file, path, body)
         except FileExistsError:
+            if getattr(ctx.db, "persistent_task_content", False):
+                await ctx.db.release_task_id(candidate)
             # Either an untracked leftover or a racing session got there
             # first. Both mean the ID is spoken for.
             continue
@@ -487,7 +493,7 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
                 source_url=source_url or None,
                 deadline=deadline or None,
                 tags=tags_to_string(tags),
-                content=content,
+                content="\n".join(md_parts) if getattr(ctx.db, "persistent_task_content", False) else content,
                 actor=ctx.session_id,
                 attribution=ctx.attribution,
             )
@@ -497,6 +503,8 @@ async def task_create_handler(ctx: ToolContext, args: dict) -> ToolResult:
             # forever. The file was created exclusively by this call, so
             # dropping it is safe and leaves the retry the ID it started with.
             await asyncio.to_thread(file_path.unlink, missing_ok=True)
+            if getattr(ctx.db, "persistent_task_content", False):
+                await ctx.db.release_task_id(task_id)
             raise
 
     _tasks_read.add(task_id)

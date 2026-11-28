@@ -10,9 +10,9 @@ from nerve.identity import UNATTRIBUTED, Attribution
 from nerve.utils.time import utc_now_iso
 
 #: A source run that found nothing new. Agent and workflow runs have no
-#: ``records`` (NULL), so they never match. ``IS`` keeps the result true or
+#: ``records`` (NULL), so they never match. ``IS TRUE`` keeps the result true or
 #: false for a NULL, so ``NOT EMPTY_RUN`` keeps those rows.
-EMPTY_RUN = "(records IS 0 AND status IS 'success')"
+EMPTY_RUN = "((records = 0 AND status = 'success') IS TRUE)"
 
 
 #: The finished runs that tell whether a job works. A missed run did not run,
@@ -233,8 +233,8 @@ class CronStore:
         stats: dict[str, dict[str, int]] = {}
         async with self.db.execute(
             "SELECT job_id, COUNT(*) AS runs, "
-            "SUM(status = 'success') AS success, SUM(status = 'error') AS error, "
-            "SUM(status = 'missed') AS missed "
+            "SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) AS success, SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS error, "
+            "SUM(CASE WHEN status = 'missed' THEN 1 ELSE 0 END) AS missed "
             "FROM cron_logs WHERE started_at >= datetime('now', ? || ' days') "
             "GROUP BY job_id",
             (f"-{days}",),

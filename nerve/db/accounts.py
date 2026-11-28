@@ -1002,7 +1002,10 @@ class AccountStore:
         return deleted
 
 
-def _read_only(db_path: Path) -> sqlite3.Connection | None:
+def _read_only(db_path: Path, config=None) -> sqlite3.Connection | None:
+    if config is not None and config.use_postgresql:
+        from nerve.db.postgres.reader import SyncConnection
+        return SyncConnection(config)
     db_path = Path(db_path)
     if not db_path.is_file():
         return None
@@ -1012,9 +1015,9 @@ def _read_only(db_path: Path) -> sqlite3.Connection | None:
         return None
 
 
-def read_instance_secret(db_path: Path, name: str) -> str:
+def read_instance_secret(db_path: Path, name: str, *, config=None) -> str:
     """Read a daemon-held secret from another process, or return ``""``."""
-    conn = _read_only(db_path)
+    conn = _read_only(db_path, config)
     if conn is None:
         return ""
     try:
@@ -1028,13 +1031,13 @@ def read_instance_secret(db_path: Path, name: str) -> str:
         conn.close()
 
 
-def read_system_actor_id(db_path: Path) -> str | None:
+def read_system_actor_id(db_path: Path, *, config=None) -> str | None:
     """Read the system actor ID from another process, or return ``None``.
 
     ``None`` when the database does not exist, cannot be read, or does not
     hold exactly one system actor.
     """
-    conn = _read_only(db_path)
+    conn = _read_only(db_path, config)
     if conn is None:
         return None
     try:
@@ -1050,14 +1053,14 @@ def read_system_actor_id(db_path: Path) -> str | None:
     return rows[0][0]
 
 
-def read_setup_required(db_path: Path, *, configured_password: bool) -> bool:
+def read_setup_required(db_path: Path, *, configured_password: bool, config=None) -> bool:
     """Read from another process whether setup is required; ``False`` if unknown.
 
     The same rule as ``nerve.gateway.routes.accounts.setup_required``.
     """
     if configured_password:
         return False
-    conn = _read_only(db_path)
+    conn = _read_only(db_path, config)
     if conn is None:
         return False
     try:
@@ -1072,7 +1075,7 @@ def read_setup_required(db_path: Path, *, configured_password: bool) -> bool:
         conn.close()
 
 
-def inspect_system_actor(db_path: Path, wanted_id: str) -> tuple[str, str | None] | None:
+def inspect_system_actor(db_path: Path, wanted_id: str, *, config=None) -> tuple[str, str | None] | None:
     """Read-only: the stored system actor ID, and why it cannot become ``wanted_id``.
 
     Returns ``(actor_id, blocker)``. ``blocker`` is ``None`` when the stored
@@ -1081,7 +1084,7 @@ def inspect_system_actor(db_path: Path, wanted_id: str) -> tuple[str, str | None
     database does not exist, has no system actor yet, or cannot be read. All
     reads use one snapshot, so a concurrent change gives a consistent answer.
     """
-    conn = _read_only(db_path)
+    conn = _read_only(db_path, config)
     if conn is None:
         return None
     try:
@@ -1118,9 +1121,9 @@ def inspect_system_actor(db_path: Path, wanted_id: str) -> tuple[str, str | None
         conn.close()
 
 
-def inspect_bootstrap_state(db_path: Path) -> tuple[list[str], bool] | None:
+def inspect_bootstrap_state(db_path: Path, *, config=None) -> tuple[list[str], bool] | None:
     """Read-only dry-run state: credential sources and stored-secret presence."""
-    conn = _read_only(db_path)
+    conn = _read_only(db_path, config)
     if conn is None:
         return None
     try:
