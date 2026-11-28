@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from unittest.mock import MagicMock
@@ -415,6 +416,7 @@ class TestToolAnswer:
         run = await turn_of(two, stream, chat_event(text="Please check the report."), turns)
 
         assert kinds(two) == []
+        assert run["generated_image_sender"] is None
         assert run["user_message"] == (
             "This message came through fixture_chat. Your answer in this session is not sent to anyone. "
             "To answer, use the send_reply tool.\n\nPlease check the report."
@@ -462,6 +464,33 @@ class TestToolAnswer:
         assert {"reaction", "send", "delete"} <= set(kinds(two))
         assert two.gateway.sent_operations("send")[-1]["content"][0]["text"]["body"] == "The report is fine."
 
+    @pytest.mark.parametrize("kind", ["message", "reaction_added"])
+    async def test_a_generated_attachment_keeps_the_turns_hosted_connection(self, two, kind, tmp_path):
+        stream = await two.stream(advertise=False)
+        second_connection = str(uuid.uuid4())
+        await announce(stream, CHAT, CHAT_CONNECTION)
+        await announce(stream, CHAT, second_connection, answer="tool")
+        turns = StreamingTurns()
+
+        event = chat_event(kind=kind)
+        if kind == "reaction_added":
+            await turn_of(two, stream, chat_event(), turns)
+            event["reaction"] = {"action": "add", "name": "thumbsup"}
+        run = await turn_of(two, stream, event, turns)
+        await turn_of(
+            two, stream,
+            chat_event(connection_id=second_connection, message_id="m-2"),
+            turns,
+        )
+        assert two.runtime.channels[CHAT].connection_for("room-1") == uuid.UUID(second_connection)
+
+        send_image = run["generated_image_sender"]
+        assert await send_image(tmp_path / "image.png", b"image content")
+
+        [upload] = [record for record in two.gateway.operations if record["kind"] == "file_send"]
+        assert upload["connection_id"] == CHAT_CONNECTION
+        assert upload["operation"]["file_send"]["destination"] == {"conversation": {"id": "room-1"}}
+
     async def test_a_connection_without_capabilities_posts_its_answer(self, two):
         stream = await two.stream(advertise=False)
 
@@ -473,16 +502,21 @@ class TestToolAnswer:
 class RecordingChannel(BaseChannel):
     """A channel that streams and shows typing, and records every call."""
 
-    def __init__(self) -> None:
+    def __init__(self, name: str = "recording") -> None:
+        self._name = name
         self.calls: list[tuple[str, ...]] = []
+        self.files: list[tuple[str, str, str | None, bytes | None]] = []
 
     @property
     def name(self) -> str:
-        return "recording"
+        return self._name
 
     @property
     def capabilities(self) -> ChannelCapability:
-        return ChannelCapability.SEND_TEXT | ChannelCapability.STREAMING | ChannelCapability.TYPING_INDICATOR
+        return (
+            ChannelCapability.SEND_TEXT | ChannelCapability.STREAMING
+            | ChannelCapability.TYPING_INDICATOR | ChannelCapability.SEND_FILES
+        )
 
     @property
     def constraints(self) -> ChannelConstraints:
@@ -509,6 +543,17 @@ class RecordingChannel(BaseChannel):
 
     async def send_typing(self, target: str) -> None:
         self.calls.append(("typing", target))
+
+    async def send_file(
+        self,
+        target: str,
+        file_path: str,
+        *,
+        session_id: str | None = None,
+        content: bytes | None = None,
+    ) -> bool:
+        self.files.append((target, file_path, session_id, content))
+        return True
 
 
 def recording_router(db, turns: StreamingTurns) -> tuple[ChannelRouter, RecordingChannel]:
@@ -549,6 +594,7 @@ class TestRouterAnswerMode:
         assert channel.calls == []
         [run] = turns.runs
         assert run["user_message"] == "hello"
+        assert run["generated_image_sender"] is None
         assert await db.get_channel_session("recording:room-1") is not None
 
     async def test_a_batch_posts_only_when_every_message_asks_for_it(self, db):
@@ -565,6 +611,88 @@ class TestRouterAnswerMode:
         assert channel.calls == []
         [run] = turns.runs
         assert run["user_message"] == "first\n\nsecond"
+        assert run["generated_image_sender"] is None
+
+    async def test_an_attachment_stays_with_its_turn_when_another_room_queues(
+        self, db, monkeypatch,
+    ):
+        router, channel = recording_router(db, StreamingTurns())
+        session_id = await router.create_session("recording:room-1", source="recording")
+        first_running = asyncio.Event()
+        second_received = asyncio.Event()
+        note_original = router._note_message_context
+
+        def note_message(session, message):
+            note_original(session, message)
+            if message.sender_id == "room-2":
+                second_received.set()
+
+        monkeypatch.setattr(router, "_note_message_context", note_message)
+
+        async def run(*, user_message, generated_image_sender, **kwargs):
+            if user_message == "first":
+                first_running.set()
+                await second_received.wait()
+            assert await generated_image_sender(Path("image.png"), user_message.encode())
+            return user_message
+
+        router.engine.run = run
+        first = inbound("first")
+        first.metadata["message_id"] = "m-1"
+        second = InboundMessage(
+            channel_name=channel.name, channel_key=f"{channel.name}:room-2",
+            sender_id="room-2", text="second", session_id=session_id,
+            metadata={"message_id": "m-2"},
+        )
+
+        async def queue_second():
+            await first_running.wait()
+            return await router.handle_message(second)
+
+        async with asyncio.timeout(EVENT_TIMEOUT):
+            replies = await asyncio.gather(router.handle_message(first), queue_second())
+
+        assert replies == ["first", "second"]
+        assert channel.files == [
+            ("room-1", "image.png", session_id, b"first"),
+            ("room-2", "image.png", session_id, b"second"),
+        ]
+
+    @pytest.mark.parametrize("same_channel", [True, False])
+    async def test_simultaneous_messages_for_one_session_keep_separate_destinations(
+        self, db, same_channel,
+    ):
+        turns = StreamingTurns()
+        router, first_channel = recording_router(db, turns)
+        second_channel = first_channel if same_channel else RecordingChannel("another")
+        if not same_channel:
+            router.register(second_channel)
+        router.BATCH_DEBOUNCE = 0.1
+        session_id = await router.create_session("recording:room-1", source="recording")
+        second = InboundMessage(
+            channel_name=second_channel.name, channel_key=f"{second_channel.name}:room-2",
+            sender_id="room-2", text="second", session_id=session_id,
+        )
+
+        await asyncio.gather(
+            router.handle_message(inbound("first")),
+            router.handle_message(second),
+        )
+
+        assert len(turns.runs) == 2
+        assert {run["user_message"]: run["channel"] for run in turns.runs} == {
+            "first": first_channel.name, "second": second_channel.name,
+        }
+        for run in turns.runs:
+            send_image = run["generated_image_sender"]
+            assert await send_image(Path("image.png"), run["user_message"].encode())
+        first_file = ("room-1", "image.png", session_id, b"first")
+        second_file = ("room-2", "image.png", session_id, b"second")
+        if same_channel:
+            assert set(first_channel.files) == {first_file, second_file}
+        else:
+            assert first_channel.files == [first_file]
+            assert second_channel.files == [second_file]
 
 
 # ---------------------------------------------------------------------- #

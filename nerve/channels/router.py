@@ -67,14 +67,23 @@ def turn_stop_note(result: dict[str, Any], session_id: str) -> str | None:
     return None
 
 
-def _turns_by_actor(
+def _group_inbound_turns(
     pending: list[tuple[InboundMessage, asyncio.Future[str]]],
 ) -> list[list[tuple[InboundMessage, asyncio.Future[str]]]]:
-    """Split pending messages into consecutive runs from one actor, in order.
+    """Split pending messages into consecutive runs from one actor and destination.
 
     Messages without an actor count as one actor.
     """
-    runs = itertools.groupby(pending, key=lambda item: actor_id_of(item[0].actor))
+    def turn_key(
+        item: tuple[InboundMessage, asyncio.Future[str]],
+    ) -> tuple[str | None, str, str, str, str | None]:
+        msg = item[0]
+        return (
+            actor_id_of(msg.actor), msg.channel_name, msg.channel_key, msg.sender_id,
+            (msg.metadata or {}).get("connection_id"),
+        )
+
+    runs = itertools.groupby(pending, key=turn_key)
     return [list(run) for _, run in runs]
 
 
@@ -199,9 +208,8 @@ class ChannelRouter:
         batched turn.  Messages that arrive while the engine is busy are
         queued for the next batch.
 
-        A turn runs as one actor. When a batch holds messages from more than
-        one actor, each consecutive run of messages from one actor is a
-        separate turn, in arrival order.
+        Each consecutive run of messages from the same actor and destination
+        makes one turn, in arrival order.
 
         A turn whose messages do not ask to post their answer
         (``post_answer``) sends nothing to the channel: no typing
@@ -230,8 +238,7 @@ class ChannelRouter:
 
     async def _handle_message(self, msg: InboundMessage) -> str:
         """:meth:`handle_message` for one session resolution."""
-        channel = self._channels.get(msg.channel_name)
-        if not channel:
+        if msg.channel_name not in self._channels:
             raise ValueError(f"Unknown channel: {msg.channel_name}")
 
         future: asyncio.Future[str] = asyncio.get_running_loop().create_future()
@@ -268,11 +275,13 @@ class ChannelRouter:
             await asyncio.sleep(self.BATCH_DEBOUNCE)
 
             while pending := self._pending_batches.pop(session_id, None):
-                for turn in _turns_by_actor(pending):
+                for turn in _group_inbound_turns(pending):
                     try:
+                        first_message = turn[0][0]
+                        channel = self._channels[first_message.channel_name]
                         if len(turn) == 1:
                             response = await self._run_single(
-                                channel, turn[0][0], session_id,
+                                channel, first_message, session_id,
                             )
                         else:
                             response = await self._run_batch(
@@ -325,6 +334,11 @@ class ChannelRouter:
                 # channel sets the person that the channel gateway resolved.
                 actor=msg.actor,
                 origin=msg.channel_name,
+                generated_image_sender=(
+                    channel.bind_generated_image_sender(msg, session_id)
+                    if msg.post_answer and ChannelCapability.SEND_FILES in channel.capabilities
+                    else None
+                ),
             )
         )
         self.engine.register_task(session_id, task)
@@ -381,6 +395,11 @@ class ChannelRouter:
                 images=all_images or None,
                 actor=last_msg.actor,
                 origin=last_msg.channel_name,
+                generated_image_sender=(
+                    channel.bind_generated_image_sender(last_msg, session_id)
+                    if post_answer and ChannelCapability.SEND_FILES in channel.capabilities
+                    else None
+                ),
             )
         )
         self.engine.register_task(session_id, task)

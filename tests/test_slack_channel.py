@@ -1239,6 +1239,17 @@ class TestOutbound:
         assert not await _channel().send_file("C1", "/nope/missing.txt")
 
     @pytest.mark.asyncio
+    async def test_send_file_uses_provided_content(self, tmp_path):
+        channel = _channel()
+        channel._web.files_upload_v2 = AsyncMock()
+        path = tmp_path / "image.png"
+
+        assert await channel.send_file("C1:1.0", str(path), content=b"validated bytes")
+        channel._web.files_upload_v2.assert_awaited_once_with(
+            channel="C1", file=b"validated bytes", filename="image.png", thread_ts="1.0",
+        )
+
+    @pytest.mark.asyncio
     async def test_rebuild_uses_the_active_credential_pair(self):
         channel = _channel()
         channel._active_app_token = "xapp-active"

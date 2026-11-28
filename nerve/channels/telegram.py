@@ -1255,6 +1255,7 @@ class TelegramChannel(BaseChannel):
 
     async def send_file(
         self, target: str, file_path: str, *, session_id: str | None = None,
+        content: bytes | None = None,
     ) -> bool:
         """Deliver a file to a Telegram chat as a document attachment.
 
@@ -1266,13 +1267,13 @@ class TelegramChannel(BaseChannel):
         if self._app is None:
             return False
         path = Path(file_path)
-        if not path.is_file():
+        if content is None and not path.is_file():
             return False
         try:
             chat_id = int(target)
             sent = await self._app.bot.send_document(
                 chat_id=chat_id,
-                document=path,
+                document=path if content is None else content,
                 filename=path.name,
             )
             if session_id and sent is not None:

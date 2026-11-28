@@ -41,6 +41,7 @@ certs/
 /MEMORY.md
 /TASK.md
 /memory/
+/output/generated-images/
 
 # The nerve source checkout used by the CI validation workflow
 .nerve-src/

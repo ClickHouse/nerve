@@ -328,6 +328,15 @@ class TestTelegramSendFile:
         assert kwargs["chat_id"] == 12345
         assert kwargs["filename"] == "note.md"
 
+    async def test_document_content_does_not_require_a_workspace_file(self, tmp_path):
+        ch = _make_telegram_channel()
+        path = tmp_path / "image.png"
+
+        assert await ch.send_file("12345", str(path), content=b"validated bytes")
+        ch._app.bot.send_document.assert_awaited_once_with(
+            chat_id=12345, document=b"validated bytes", filename="image.png",
+        )
+
     async def test_send_document_failure_returns_false(self, tmp_path):
         ch = _make_telegram_channel()
         ch._app.bot.send_document.side_effect = RuntimeError("boom")

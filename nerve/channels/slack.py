@@ -1846,18 +1846,19 @@ class SlackChannel(BaseChannel):
 
     async def send_file(
         self, target: str, file_path: str, *, session_id: str | None = None,
+        content: bytes | None = None,
     ) -> bool:
         """Upload a file into the conversation as an attachment."""
         if not self.is_available or not target:
             return False
         path = Path(file_path)
-        if not path.is_file():
+        if content is None and not path.is_file():
             return False
         channel_id, thread_ts = parse_target(target)
         try:
             await self._web.files_upload_v2(
                 channel=channel_id,
-                file=str(path),
+                file=str(path) if content is None else content,
                 filename=path.name,
                 thread_ts=thread_ts,
             )

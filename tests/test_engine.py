@@ -898,6 +898,69 @@ async def test_engine_fails_turn_when_eof_follows_content(db, tmp_path):
     assert json.dumps(asst["blocks"] or []).count("half an answer") == 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", ["completed", "interrupted", "failed", "cancelled"])
+async def test_generated_upload_does_not_block_runtime_turn(db, tmp_path, monkeypatch, ending):
+    session_id = "image-upload"
+    engine, _ = await _engine_with_scripted_clients(db, tmp_path, session_id, [[]])
+    image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAAAAAA6fptVAAAACklEQVR4nGP4DwABAQEAsTj2FAAAAABJRU5ErkJggg=="
+    upload_started = asyncio.Event()
+    release_upload = asyncio.Event()
+    upload_ended = asyncio.Event()
+    terminal_read = asyncio.Event()
+    record_result = engine._record_turn_result
+
+    async def receive_turn(self):
+        yield ev.GeneratedImage("image-1", f"data:image/png;base64,{image}")
+        await upload_started.wait()
+        yield ev.TextDelta("Image complete.")
+        yield ev.TurnCompleted(status="completed" if ending == "cancelled" else ending)
+
+    def record(event, state):
+        assert not upload_ended.is_set()
+        record_result(event, state)
+        terminal_read.set()
+
+    async def send_image(path, content):
+        upload_started.set()
+        try:
+            await release_upload.wait()
+            return True
+        finally:
+            upload_ended.set()
+
+    monkeypatch.setattr(_ScriptedClient, "receive_turn", receive_turn)
+    monkeypatch.setattr(engine, "_record_turn_result", record)
+    sender = AsyncMock(side_effect=send_image)
+    turn = asyncio.create_task(engine.run(
+        session_id, "Draw an image", source="web", channel="web",
+        actor=None, generated_image_sender=sender,
+    ))
+    try:
+        await asyncio.wait_for(terminal_read.wait(), timeout=5)
+        if ending in {"cancelled", "completed"}:
+            assert not upload_ended.is_set()
+            assert not turn.done()
+        if ending == "cancelled":
+            turn.cancel()
+        elif ending == "completed":
+            release_upload.set()
+        response = await asyncio.wait_for(turn, timeout=5)
+    finally:
+        if not turn.done():
+            turn.cancel()
+            await asyncio.gather(turn, return_exceptions=True)
+
+    assert "Image complete." in response
+    if ending in {"interrupted", "failed"}:
+        assert f"Turn {ending}" in response
+    assert upload_ended.is_set()
+    sender.assert_awaited_once()
+    card = "Sent file:" if ending == "completed" else "File ready:"
+    assistant = [row for row in await db.get_messages(session_id) if row["role"] == "assistant"][-1]
+    assert card in json.dumps(assistant["blocks"])
+
+
 # ---------------------------------------------------------------------------
 # ClaudeBackend.validate_resume_target
 # ---------------------------------------------------------------------------
