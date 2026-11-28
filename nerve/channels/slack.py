@@ -1706,7 +1706,7 @@ class SlackChannel(BaseChannel):
                 "Slack card edit failed for %s: %s", message_id, exc,
             )
 
-    async def send(self, message: OutboundMessage) -> None:
+    async def send(self, message: OutboundMessage) -> str | None:
         """Send a complete message, split to fit Slack's render limit.
 
         The limit counts what Slack receives, so the text is converted before
@@ -1720,12 +1720,19 @@ class SlackChannel(BaseChannel):
         Propagates a failure so StreamAdapter can fall back to editing the
         streaming placeholder; swallowing it loses the whole turn. An
         unavailable channel is one of those failures.
+
+        Returns the thread target of the first chunk.
         """
         self._available_web()
+        first_ts = None
         for chunk in split_message(_md_to_slack(message.text), MAX_MSG_LEN):
             ts = await self._post(message.target, chunk)
             if ts:
                 self._cache_message(ts, message.target, slack_to_plain(chunk))
+                first_ts = first_ts or ts
+        channel_id, thread_ts = parse_target(message.target)
+        thread = thread_ts or first_ts
+        return f"{channel_id}:{thread}" if thread else None
 
     def format_response(self, text: str) -> str:
         """Return text unchanged — :meth:`send` converts and splits it."""

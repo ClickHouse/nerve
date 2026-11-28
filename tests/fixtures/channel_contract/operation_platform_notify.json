@@ -1,0 +1,20 @@
+{
+  "version": "1",
+  "kind": "operation",
+  "request_id": "n-28",
+  "connection_id": "2ddc77d6-2244-4fd9-baa4-e1de2ca9e220",
+  "payload": {
+    "operation": {
+      "kind": "platform_notify",
+      "deadline_millis": 10000,
+      "platform_notify": {
+        "notification_id": "ask-3f9c2a71",
+        "type": "question",
+        "title": "Deploy the release?",
+        "body": "The tests passed.\nThe release notes are ready.",
+        "priority": "high",
+        "agent_name": "Release helper"
+      }
+    }
+  }
+}

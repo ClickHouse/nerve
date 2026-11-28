@@ -1,8 +1,8 @@
 {
-  "codex_cli_version": "0.164.0",
+  "codex_cli_version": "0.172.0",
   "generated_with": "codex app-server generate-json-schema",
-  "verified_date": "2026-10-23",
-  "canonical_v2_schema_sha256": "25febad0b85cbf3de2b841abfb716c5843e0b7d20fce7cfa40eb03c0d4214d17",
+  "verified_date": "2026-11-26",
+  "canonical_v2_schema_sha256": "604ceee5f910a6d83ce9b334c61f70ab8e3bbaddf7cf24fdf17ed19c33c9d7e1",
   "required_methods": [
     "initialize",
     "account/read",
@@ -14,5 +14,5 @@
     "turn/start",
     "turn/interrupt"
   ],
-  "notes": "Canonical JSON hash is stable across generator output ordering. Regenerate with scripts/check_codex_schema.py when changing the tested CLI range. 0.155.1 -> 0.164.0: 32 definitions added, 49 changed. Removed: thread/rollback (ThreadRollbackParams, ThreadRollbackResponse), ConfigRequirements.windowsSandboxPrivateDesktop, ModelProviderCapabilitiesReadResponse.namespaceTools; nerve uses none of them. Every method and notification nerve uses is still present. Changes in shapes nerve uses are additive or optional: UserInput image takes url or fileId (nerve sends url), new optional TurnStartParams.parentTurnId/rootTurnId/disabledPluginIds, Turn.rootTurnId, McpServerStatus.httpOrigin/serverCapabilities/toolListMeta, ThreadItem mcpToolCall.mcpAppUi, subAgentActivity.model/reasoningEffort, imageGeneration result or fileId, new notifications thread/readState/changed, thread/prediction/updated, account/gatewayOAuth/changed."
+  "notes": "Canonical JSON hash is stable across generator output ordering. Regenerate with scripts/check_codex_schema.py when changing the tested CLI range. 0.171.0 -> 0.172.0: 2 definitions added (DaybreakAvailability, ThreadRealtimeSessionInputReason), 6 changed (10 with --experimental), none removed. No client method, notification or server request is added or removed. The changes are additive or optional: ModelAccessPrograms.daybreakAvailability (cyber is still required; nerve reads only cyber), new CodexErrorInfo values apiKeySpendLimitExceeded, projectSpendLimitExceeded and organizationSpendLimitExceeded (cyberPolicy unchanged), LoginAccountParams and BedrockSetupParams providerId (nerve logs in with apiKey), AppToolConfig.approvals_reviewer, realtime items (nerve opts out of realtime notifications); with --experimental also Thread.daybreakProgramPropagationEnrolled, ThreadStartParams.daybreakProgramPropagationEnrolled (nerve does not send it, so the server uses its configured rule) and ThreadSampleParams.model. TurnStartParams, ThreadResumeParams, ThreadForkParams and the model/list entries are unchanged."
 }

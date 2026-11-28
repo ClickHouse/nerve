@@ -24,12 +24,14 @@ export function DismissButton({ notif, className }: { notif: Notification; class
   };
 
   return (
+    // The error text comes first, so that the button stays at the right edge
+    // where the callers put it.
     <span className={cx('inline-flex flex-wrap items-center gap-2', className)}>
+      {failed && <span role="alert" className="text-xs text-error">Could not dismiss. Try again.</span>}
       <Button variant="ghost" size="xs" onClick={dismiss} disabled={busy}>
         <EyeOff size={11} aria-hidden="true" />
         <span>Dismiss</span>
       </Button>
-      {failed && <span role="alert" className="text-xs text-error">Could not dismiss. Try again.</span>}
     </span>
   );
 }

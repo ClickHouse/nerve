@@ -266,6 +266,41 @@ run_if:
     consumer: inbox
 ```
 
+A job that should run when a branch has new commits needs nothing more than
+this gate. Let the [repository watch](sources.md#new-commits-on-a-branch)
+report the branch's commits, and gate the job on that source's unread records:
+
+```yaml
+# config.yaml
+sync:
+  github_repos:
+    enabled: true
+    repos: [acme/widgets]
+    types: [commit]
+    branches:
+      acme/widgets: [main]
+```
+
+```yaml
+jobs:
+  - id: on-new-commits
+    schedule: "*/10 * * * *"
+    prompt: >
+      Read the new records with poll_source(source="github_repos",
+      consumer="on-new-commits"). Each one lists the new commits of a branch.
+      Then ...
+    run_if:
+      - type: messages
+        sources: [github_repos]
+        consumer: on-new-commits
+```
+
+The job stays idle while the branch does not move. The watch reports one
+record per branch however many commits arrive, so one push starts one run,
+and reading the records with `poll_source` under the gate's `consumer` marks
+them read. The gate looks at the source as a whole: when the watch also
+reports pull requests or issues, those records satisfy it too.
+
 Without `sources`, the gate checks the sources on which the consumer has a
 cursor. A consumer that reads every source with `poll_all_sources` gets a cursor
 on a new source before the source's first run, so the gate sees the first records
@@ -442,7 +477,7 @@ With `sync.github.mode: hosted` the gate always passes and runs no `gh`: the
 channel gateway watches the agent's own open pull requests (`sync.github.pr_watch`)
 and delivers a `github_pr_activity` record for each change. A record does not
 start a job by itself. It starts a job gated on `messages` with
-`sources: [github]` at once (see [Runs on delivery](#runs-on-delivery)), so gate
+`sources: [github]`, as [Runs on delivery](#runs-on-delivery) describes, so gate
 pull request monitors that way. A job gated on `github_pr_activity` alone is
 never started by a delivery, and since the gate always passes, it runs, in full,
 on every scheduled tick; `nerve doctor` names the jobs that still use this gate.
@@ -787,7 +822,7 @@ These ship in `<workspace>/config/cron/system.yaml`, written when the mode is ch
 
 | Job | Schedule | Session Mode | Description | Personal | Worker |
 |-----|----------|-------------|-------------|:--------:|:------:|
-| `memory-maintenance` | Daily 5 AM, when the agent has worked (see below) | isolated | Dedup, prune stale entries, improve memory wording. Runs silently. On an install set up with `memory.backend: loom`: runs Loom's integrity report (`loom_namespace_validate`) on the home namespace and fixes what is its own, leaving deduplication to Loom; a `system.yaml` written for memU runs in this wording while its prompt is the shipped one. | ✅ always | ✅ always |
+| `memory-maintenance` | Daily 5 AM, when the agent has worked (see below) | isolated | Dedup, prune stale entries, improve memory wording. Runs silently. On an install set up with `memory.backend: loom`: runs Loom's integrity report (`namespace.validate`, through the `loom_op` tool) on the home namespace and fixes what is its own, leaving deduplication to Loom; a `system.yaml` written for memU, or with the first Loom wording (see [After a Nerve update](#after-a-nerve-update)), runs in this wording while its prompt is the one Nerve shipped. | ✅ always | ✅ always |
 | `inbox-processor` | Every 30 min | persistent (24h rotation, reminder mode) | Polls all sync sources (email, GitHub, Telegram). Triages, creates tasks, memorizes facts, sends notifications for urgent items. | ✅ default | — |
 | `task-planner` | Every 4 hours | persistent (168h rotation) | Reviews open tasks, explores codebases, proposes implementation plans via plan-approve workflow. Gated on `tasks` (status `pending`) — stays idle when there's nothing to plan. | ✅ default | off; onboarding enables it |
 | `skill-extractor` | Daily 5 AM, when the agent has worked and fewer than three of its proposals wait for review (see below) | persistent | Identifies repeated workflows from recent conversations, memory, and completed tasks. Proposes at most one new skill per run, as a task with a plan. The plan says what the skill is for, the evidence for it and the direction it should take; it does not hold the skill. | ✅ optional | ✅ default |
@@ -853,6 +888,7 @@ A Nerve update can change the schedule, the description or the prompt of a built
 - `skill-extractor`: earlier releases ran it every 12 hours, let it propose up to two skills a run, and had it put the full SKILL.md into the plan. The earliest also had it send a notification of its own after it proposed.
 - `skill-reviser`: earlier releases had it send a notification of its own after it proposed. `plan_propose` sends one now.
 - `task-planner`: the earliest releases had it look at every open task and send a notification of its own. Later ones had it look at the `pending` tasks only, as now, and did not ask for a summary of the plan yet.
+- `memory-maintenance`, on a Loom install: the first Loom wording named the tool `loom_namespace_validate`, which Loom's default tool list does not carry from Loom 1.2.0. In its place the file gets memU's prompt, which runs in the current Loom wording (see below).
 
 When the scheduler starts, and after every reload that it applies, Nerve writes this release's values into `system.yaml`, so that the file shows what runs:
 
@@ -1068,9 +1104,32 @@ naming no source, runs once `cron.delivery_debounce_seconds` after the first
 delivery of a burst. Later deliveries in that window add nothing: one burst,
 one run.
 
+A delivery starts no run of a job that ran a short while ago and that its
+schedule is about to run again. Both have to hold: the job's last run started
+less than `cron.delivery_min_interval_seconds` ago, and the job's schedule is
+forecast to run it before that interval ends. The records then wait in the
+inbox for that scheduled run, so they never wait longer than the interval.
+
+- Every run of the job counts as its last run, whether its schedule, a delivery
+  or a person started it. A run that the gates skipped does not: nothing ran.
+- The forecast is the one of [What runs next](#what-runs-next). A scheduled run
+  that the job's gates are expected to skip is not waited for. A `messages`
+  gate that names its sources expects that when the consumer's cursor expires
+  before the run.
+- When the job's next scheduled run comes later than that, the delivery runs
+  the job, as before. So a job that is scheduled less often than the interval
+  is left to its schedule only while a scheduled run is near.
+- `0` runs the jobs for every burst. At most 21600 seconds (6 hours) apply: a
+  consumer's cursor is live for longer than that after a run of the job, so a
+  record that waits is still unread when the scheduled run comes.
+
+With the default, `inbox-processor`, which is scheduled every 30 minutes, runs
+about every half hour while a source delivers all day, not once for each burst.
+
 ```yaml
 cron:
-  delivery_debounce_seconds: 60   # default; 0 runs the jobs as soon as the records are in, at most 600 applies
+  delivery_debounce_seconds: 60        # default; 0 runs the jobs as soon as the records are in, at most 600 applies
+  delivery_min_interval_seconds: 1800  # default; 0 runs the jobs for every burst, at most 21600 applies
 ```
 
 Such a run goes through the job's gates, `lock` and run log like a scheduled
@@ -1081,8 +1140,8 @@ catch-up is skipped, as it is while any run of the job goes on; and a run
 started by hand starts as it always does. A catch-up queued before the run does
 not run the job again, since the job has run since. The drain counts as a run
 of the source's runner in the same way. Jobs without such a gate keep to their
-schedule, and the schedules stay the fallback for everything. The setting is
-read for each delivery, so a reload applies it. A scheduled run of a source
+schedule, and the schedules stay the fallback for everything. Both settings are
+read for each delivery, so a reload applies them. A scheduled run of a source
 that runs on delivery is not counted as the next scheduled task while nothing
 waits in its buffer (see [What runs next](#what-runs-next)): it normally finds
 nothing, so a platform that parks the machine is not told to wake it for that

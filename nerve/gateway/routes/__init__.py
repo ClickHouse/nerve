@@ -10,17 +10,22 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
+from nerve.artifacts.publish import publish_active
+from nerve.config import get_config
 from nerve.gateway.auth import is_external_mode
+from nerve.notifications import webpush
 from nerve.gateway.routes._deps import (
     get_deps,
     init_deps,
     set_external_agents_sync,
     set_mcp_apps_serving,
     set_notification_service,
+    set_preview_serving,
 )
 from nerve.gateway.routes import (
     accounts,
     actors,
+    artifacts,
     agents,
     auth,
     setup,
@@ -33,6 +38,7 @@ from nerve.gateway.routes import (
     mcp_servers,
     mcp_apps,
     memory,
+    preview,
     diagnostics,
     cron,
     sources,
@@ -57,6 +63,7 @@ __all__ = [
     "set_notification_service",
     "set_external_agents_sync",
     "set_mcp_apps_serving",
+    "set_preview_serving",
     "get_deps",
 ]
 
@@ -65,8 +72,10 @@ def register_all_routes() -> APIRouter:
     """Assemble and return the combined API router.
 
     In external mode, the gateway manages people, so the local account routes
-    and the first-account claim are not registered. The setup checklist is
-    registered in both modes: any signed-in person may run setup.
+    and the first-account claim are not registered. The platform delivers Web
+    Push, so the push subscription routes are not registered either; the app
+    manifest is. The setup checklist is registered in both modes: any
+    signed-in person may run setup.
     """
     local_accounts = not is_external_mode()
     router = APIRouter()
@@ -88,11 +97,19 @@ def register_all_routes() -> APIRouter:
     router.include_router(mcp_apps.router)
     router.include_router(widget_state.router)
     router.include_router(memory.router)
+    # Only with artifacts.preview: with the switch off no preview route exists.
+    if get_config().artifacts_preview_active:
+        router.include_router(preview.router)
+    # Only in external mode with artifacts.publish: the Publish button.
+    if publish_active(get_config()):
+        router.include_router(artifacts.router)
     router.include_router(diagnostics.router)
     router.include_router(cron.router)
     router.include_router(sources.router)
     router.include_router(notifications.router)
-    router.include_router(push.router)
+    router.include_router(push.manifest_router)
+    if not webpush.platform_sends():
+        router.include_router(push.router)
     router.include_router(files.router)
     router.include_router(github.router)
     router.include_router(workspace.router)

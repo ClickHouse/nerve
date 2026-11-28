@@ -868,7 +868,7 @@ class TestMemoryBackendFlag:
         assert "`loom_search`" in (ws / "skills" / "nerve-dev" / "SKILL.md").read_text(encoding="utf-8")
         jobs = yaml.safe_load((ws / "config" / "cron" / "system.yaml").read_text(encoding="utf-8"))["jobs"]
         maintenance = next(job for job in jobs if job["id"] == "memory-maintenance")
-        assert "loom_namespace_validate" in maintenance["prompt"]
+        assert 'loom_op with {"op": "namespace.validate"}' in maintenance["prompt"]
 
     def test_the_terminal_path_hands_the_flag_to_the_wizard(self, tmp_path, no_daemon, monkeypatch):
         config_dir = tmp_path / "config"

@@ -260,7 +260,10 @@ _INBOXES = {
     "all": "the account's whole notification inbox (inbox `all`)",
 }
 #: How the repository watch names each of its types.
-_WATCHED_TYPES = {"pull_request": "pull requests", "issue": "issues", "release": "releases"}
+_WATCHED_TYPES = {
+    "pull_request": "pull requests", "issue": "issues", "release": "releases",
+    "commit": "branch commits",
+}
 
 
 def _github_sync_text(config: Any) -> str:
@@ -292,7 +295,10 @@ def _github_repos_text(config: Any) -> str:
     how = "the channel gateway polls" if config.sync.github.mode == "hosted" else "polled here with `gh`"
     text = f"on ({how}): new {what} in {_names(repos)}"
     if watch.updates:
-        text += "; also new commits, ready for review, merges and closes of the pull requests it reported"
+        text += (
+            "; also new commits, ready for review, merges, closes and reopenings "
+            "of the pull requests it reported"
+        )
     return text
 
 

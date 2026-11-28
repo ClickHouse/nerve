@@ -300,7 +300,7 @@ class TestSend:
 
         text, is_error = await send_tool(hosted)
 
-        assert (text, is_error) == (f"Message sent to slack target {TOOL_TARGET}.", False)
+        assert not is_error and text.startswith(f"Message sent to slack target {TOOL_TARGET}.")
         sends = records(hosted, "send")
         assert len(sends) == 2
         assert gaps(sends)[0] >= 0.25
@@ -393,12 +393,23 @@ class TestSendTool:
 
         text, is_error = await send_tool(hosted, text="Deploy **finished**.")
 
-        assert (text, is_error) == (f"Message sent to slack target {TOOL_TARGET}.", False)
+        assert not is_error and text.startswith(f"Message sent to slack target {TOOL_TARGET}.")
         [send] = hosted.gateway.sent_operations("send")
         assert send["destination"] == {"conversation": {"id": TOOL_TARGET}}
         assert send["content"] == [
             {"kind": "text", "text": {"format": "markdown", "body": "Deploy **finished**."}},
         ]
+
+    async def test_the_result_names_the_target_of_the_message_thread(self, hosted):
+        await hosted.stream()
+        thread = f"{TOOL_TARGET}:1700009000.000001"
+
+        posted, _ = await send_tool(hosted, text="parent")
+        replied, _ = await send_tool(hosted, target=thread, text="reply")
+
+        hint = f"To reply in its thread, use target {thread}."
+        assert posted.endswith(hint) and replied.endswith(hint)
+        assert hosted.gateway.sent_operations("send")[1]["destination"]["thread"] == {"id": "1700009000.000001"}
 
     async def test_a_message_the_gateway_forbids_is_a_coarse_refusal(self, hosted):
         await hosted.stream()
@@ -625,7 +636,7 @@ class TestSendToolPolicy:
         hosted.config.slack.allow_channels = [TOOL_TARGET]
         text, is_error = await send_tool(hosted)
 
-        assert (text, is_error) == (f"Message sent to slack target {TOOL_TARGET}.", False)
+        assert not is_error and text.startswith(f"Message sent to slack target {TOOL_TARGET}.")
 
     async def test_a_name_rule_in_the_deny_list_refuses_every_conversation(self, hosted):
         await hosted.stream()

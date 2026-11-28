@@ -203,3 +203,109 @@ async def test_the_job_list_has_kind_latest_run_and_counts(svc, db, tmp_path):
     assert rows["digest"]["stats_7d"] == {"runs": 1, "success": 0, "error": 1, "missed": 0}
     assert rows["audit"]["last_run"] is None
     assert rows["audit"]["stats_7d"] == {"runs": 0, "success": 0, "error": 0, "missed": 0}
+
+
+# --------------------------------------------------------------------------- #
+#  Failing jobs: streaks from the logs, the breaker of the sources            #
+# --------------------------------------------------------------------------- #
+
+
+async def test_a_streak_is_the_failures_after_the_latest_success(db):
+    await _add_log(db, "digest", "error", started="2030-01-01 00:00:00")
+    await _add_log(db, "digest", "success", started="2030-01-01 01:00:00")
+    await _add_log(db, "digest", "error", started="2030-01-01 02:00:00")
+    await _add_log(db, "digest", "error", started="2030-01-01 03:00:00")
+    await _add_log(db, "audit", "error", started="2030-01-01 00:00:00")
+    await _add_log(db, "audit", "success", started="2030-01-01 01:00:00")
+
+    streaks = await db.get_failing_cron_streaks()
+
+    assert streaks == {
+        "digest": {"failures": 2, "since": "2030-01-01 02:00:00", "last_run": "2030-01-01 03:00:00"},
+    }
+
+
+async def test_missed_and_running_rows_neither_count_nor_end_a_streak(db):
+    await _add_log(db, "digest", "error", started="2030-01-01 02:00:00")
+    await db.log_cron_missed("digest", "2030-01-01 03:00:00")
+    await _add_log(db, "digest", "error", started="2030-01-01 04:00:00")
+    await _add_log(db, "digest", None, started="2030-01-01 05:00:00")
+
+    streaks = await db.get_failing_cron_streaks()
+
+    assert streaks["digest"] == {
+        "failures": 2, "since": "2030-01-01 02:00:00", "last_run": "2030-01-01 04:00:00",
+    }
+
+
+async def test_a_success_at_the_same_start_ends_the_streak_by_id(db):
+    await _add_log(db, "digest", "error", started="2030-01-01 02:00:00")
+    await _add_log(db, "digest", "success", started="2030-01-01 02:00:00")
+    assert await db.get_failing_cron_streaks() == {}
+
+    await _add_log(db, "digest", "error", started="2030-01-01 02:00:00")
+    assert (await db.get_failing_cron_streaks())["digest"]["failures"] == 1
+
+
+async def test_job_health_names_agent_jobs_and_sources_that_fail(svc, db):
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from nerve.sources.runner import SourceHealth
+
+    svc._jobs = [
+        _job("digest"),
+        _job("review"),
+        _job("paused-job", enabled=False),
+        CronJob(id="audit", schedule="1h",
+                workflow={"engine": "claude-workflow", "prompt": "audit", "budget_usd": 1}),
+    ]
+    await _add_log(db, "digest", "error", started="2030-01-01 02:00:00")
+    await _add_log(db, "review", "success", started="2030-01-01 02:00:00")
+    # A disabled job, a workflow job and a job no longer configured are not
+    # judged from the logs.
+    await _add_log(db, "paused-job", "error", started="2030-01-01 02:00:00")
+    await _add_log(db, "audit", "error", started="2030-01-01 02:00:00")
+    await _add_log(db, "gone", "error", started="2030-01-01 02:00:00")
+    # A source in backoff logs successes that found nothing: the logs say it
+    # works, the breaker says it fails.
+    await _add_log(db, "source:mail", "success", started="2030-01-01 02:00:00", records=0)
+    failing_source = SourceHealth()
+    failing_source.record_failure("refused")
+    failing_source.record_failure("refused again")
+    working_source = SourceHealth()
+    working_source.record_failure("refused")
+    working_source.record_success()
+    svc._source_runners = [
+        SimpleNamespace(job_id="source:mail", health=failing_source),
+        SimpleNamespace(job_id="source:chat", health=working_source),
+    ]
+
+    health = await svc.job_health()
+
+    assert health.total == 5  # digest, review, audit, and the two sources
+    assert health.running is False  # the service was never started
+    by_id = {job.job_id: job for job in health.failing}
+    assert set(by_id) == {"digest", "source:mail"}
+    assert by_id["digest"].failures == 1
+    assert by_id["digest"].since == datetime(2030, 1, 1, 2, 0, tzinfo=UTC)
+    assert by_id["digest"].last_run_at == datetime(2030, 1, 1, 2, 0, tzinfo=UTC)
+    mail = by_id["source:mail"]
+    assert mail.failures == 2
+    assert mail.since == failing_source.failing_since
+    assert mail.last_run_at == failing_source.last_error_at
+    assert mail.since <= mail.last_run_at
+
+
+async def test_a_source_streak_starts_at_its_first_failure_and_ends_with_a_success():
+    from nerve.sources.runner import SourceHealth
+
+    health = SourceHealth()
+    assert health.failing_since is None
+    health.record_failure("refused")
+    first = health.failing_since
+    assert first == health.last_error_at
+    health.record_failure("refused again")
+    assert health.failing_since == first
+    health.record_success()
+    assert health.failing_since is None

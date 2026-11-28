@@ -72,12 +72,59 @@ REPO_WATCH_PROVIDER = "github_repos"
 # The provider of the mail that members send to the agent. Its subscription
 # names only the provider, with empty filters.
 EMAIL_PROVIDER = "email"
+# The provider of the platform's own connection. It advertises only
+# ``platform_notify`` (:class:`PlatformNotifyOperation`): in external mode the
+# platform delivers Web Push for the agent.
+PLATFORM_PROVIDER = "platform"
+PLATFORM_NOTIFY = "platform_notify"
+# The bounds of a ``platform_notify`` payload that the gateway enforces.
+MAX_PLATFORM_NOTIFICATION_ID_BYTES = 64
+MAX_PLATFORM_TOKEN_BYTES = 32
+MAX_PLATFORM_TITLE_BYTES = 1024
+MAX_PLATFORM_BODY_BYTES = 4096
+MAX_PLATFORM_AGENT_NAME_BYTES = 256
+_PLATFORM_NOTIFICATION_ID = re.compile(rf"[A-Za-z0-9._:-]{{1,{MAX_PLATFORM_NOTIFICATION_ID_BYTES}}}")
+# The type and the priority of a ``platform_notify``: a lowercase token.
+_PLATFORM_TOKEN = re.compile(rf"[a-z][a-z0-9_]{{0,{MAX_PLATFORM_TOKEN_BYTES - 1}}}")
+# The provider that says the agent accepts one record of each comment, review
+# and description of a GitHub thread (:data:`THREAD_ITEM_RECORD_TYPE`). Its
+# subscription names only the provider, with empty filters, as for email.
+THREAD_ITEMS_PROVIDER = "github_thread_items"
+# The record type of such an item. It arrives from the ``github`` provider.
+THREAD_ITEM_RECORD_TYPE = "github_thread_item"
+# The closed values of a thread item's metadata, by key.
+THREAD_ITEM_VALUES: dict[str, tuple[str, ...]] = {
+    "subject_type": ("Issue", "PullRequest"),
+    "author_kind": ("human", "bot"),
+    "item_kind": ("body", "comment", "review", "review_comment"),
+    "author_relation": (
+        "self", "member", "team", "collaborator", "app", "agent", "listed", "outside",
+    ),
+    "mentions_agent": ("true", "false"),
+    "review_state": ("APPROVED", "CHANGES_REQUESTED", "COMMENTED", "DISMISSED", "PENDING"),
+}
+# The metadata keys that every thread item carries with a value. A review
+# also carries ``review_state``; ``title`` is optional.
+THREAD_ITEM_KEYS = (
+    "repo_name", "repo_url", "subject_type", "subject_url", "number", "state", "author",
+    "author_kind", "item_kind", "item_id", "item_url", "author_relation", "mentions_agent",
+)
 # Such a subscription names 1 to this many repositories, each once.
 MAX_REPO_WATCHES = 50
 # What a watched repository may report.
-REPO_WATCH_TYPES = ("pull_request", "issue", "release")
+REPO_WATCH_TYPES = ("pull_request", "issue", "release", "commit")
+# The type that reports the new commits of a repository's branches: only a
+# repository with it names branches, and a gateway that does not know the
+# type refuses the whole subscription.
+REPO_WATCH_COMMIT = "commit"
 # A repository as GitHub names it: owner/name.
 _REPO_NAME = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9_.-]{1,100}")
+# A watched repository names at most this many branches, each a name of this
+# shape, and its own name and a branch's have at most this many bytes
+# together: the event ID of a commit record names both.
+MAX_REPO_WATCH_BRANCHES = 8
+MAX_REPO_WATCH_BRANCH_KEY_BYTES = 194
+_REPO_BRANCH = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,120}")
 # A provider name is a lowercase token of at most this many bytes.
 MAX_PROVIDER_BYTES = 64
 _PROVIDER_CHARACTERS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789_-.")
@@ -100,6 +147,13 @@ def byte_length(value: str) -> int:
         return len(value.encode("utf-8"))
     except UnicodeEncodeError:
         return MAX_FRAME_BYTES + 1
+
+
+def valid_platform_token(value: str) -> bool:
+    """Whether the gateway takes *value* as the type or the priority of a
+    ``platform_notify``: a lowercase letter, then lowercase letters, digits
+    and ``_``, at most :data:`MAX_PLATFORM_TOKEN_BYTES` in total."""
+    return _PLATFORM_TOKEN.fullmatch(value) is not None
 
 
 def _one_of(name: str, value: str, allowed: tuple[str, ...]) -> None:
@@ -140,6 +194,23 @@ def valid_repo_name(name: str) -> bool:
     not ``.`` or ``..``.
     """
     return _REPO_NAME.fullmatch(name) is not None and name.split("/", 1)[1] not in (".", "..")
+
+
+def valid_repo_branch(repo: str, branch: str) -> bool:
+    """Whether the gateway takes *branch* as a watched branch of *repo*.
+
+    A letter or a digit, then up to 120 letters, digits, ``_``, ``.``, ``/``
+    and ``-``, without ``..``, not starting with ``refs/`` (a branch is named
+    without its ref prefix) and not ending in ``.lock``, and no longer with
+    the repository's name than :data:`MAX_REPO_WATCH_BRANCH_KEY_BYTES`.
+    """
+    return (
+        _REPO_BRANCH.fullmatch(branch) is not None
+        and ".." not in branch
+        and not branch.startswith("refs/")
+        and not branch.endswith(".lock")
+        and byte_length(repo) + byte_length(branch) <= MAX_REPO_WATCH_BRANCH_KEY_BYTES
+    )
 
 
 def valid_provider(provider: str) -> bool:
@@ -379,6 +450,37 @@ class SourceRecordPayload:
             reject(RejectionReason.LIMIT_EXCEEDED, "source record ID or type exceeds the identifier limit")
         if max(byte_length(self.summary), byte_length(self.content)) > MAX_TEXT_BYTES:
             reject(RejectionReason.LIMIT_EXCEEDED, "source record text exceeds the text limit")
+
+
+def validate_thread_item(record: SourceRecordPayload) -> None:
+    """Check the metadata of a :data:`THREAD_ITEM_RECORD_TYPE` record.
+
+    Every key of :data:`THREAD_ITEM_KEYS` holds one non-blank value, each
+    key of :data:`THREAD_ITEM_VALUES` that is present holds one of its
+    values, and ``number`` is a positive number. ``review_state`` is present
+    on a review and only there; ``title`` may be absent. No value holds a
+    control character or a line or paragraph separator: the message puts
+    the values on fixed lines, and a line break in a title, which anyone who
+    can open an issue writes, would add a false line. Other keys are not
+    checked otherwise.
+    """
+    metadata: dict[str, str] = {}
+    for entry in record.metadata:
+        if entry.key in metadata or entry.values:
+            malformed(f"thread item metadata {entry.key!r} is repeated or a list")
+        if any(unicodedata.category(c) in ("Cc", "Zl", "Zp") for c in entry.value):
+            malformed(f"thread item metadata {entry.key!r} holds a control character or a line break")
+        metadata[entry.key] = entry.value
+    missing = [key for key in THREAD_ITEM_KEYS if not metadata.get(key, "").strip()]
+    if missing:
+        malformed(f"thread item has no {', '.join(missing)}")
+    for key, allowed in THREAD_ITEM_VALUES.items():
+        if key in metadata:
+            _one_of(f"thread item {key}", metadata[key], allowed)
+    if re.fullmatch(r"[1-9][0-9]*", metadata["number"]) is None:
+        malformed("thread item number is not a positive number")
+    if ("review_state" in metadata) != (metadata["item_kind"] == "review"):
+        malformed("thread item has a review state without being a review, or a review without one")
 
 
 @_record
@@ -741,6 +843,45 @@ class TypingOperation:
 
 
 @_record
+class PlatformNotifyOperation:
+    """One notification that the platform delivers to the members' browsers.
+
+    The gateway finds the browsers of the members that want the
+    notification, builds the push that a browser shows, and sends it. It
+    applies the display limits itself. ``type`` and ``priority`` are open
+    tokens: the gateway accepts a value that it does not know, and counts it
+    as not important. ``title`` can be empty and is always sent; the gateway
+    then shows the agent name alone. ``None`` is a missing or null title,
+    which the gateway refuses. ``silent`` is left out when false.
+    """
+
+    notification_id: str = ""
+    type: str = ""
+    title: str | None = None
+    body: str = omit_empty()
+    priority: str = ""
+    silent: bool = omit_empty(False)
+    agent_name: str = omit_empty()
+
+    def validate(self) -> None:
+        """Check the bounds of each member, as the gateway does."""
+        if _PLATFORM_NOTIFICATION_ID.fullmatch(self.notification_id) is None:
+            malformed("platform notification ID is not 1 to 64 characters of A-Z a-z 0-9 . _ : -")
+        for name, token in (("type", self.type), ("priority", self.priority)):
+            if not valid_platform_token(token):
+                malformed(f"platform notification {name} is not a lowercase token")
+        if self.title is None:
+            malformed("platform notification has no title")
+        for name, value, maximum in (
+            ("title", self.title, MAX_PLATFORM_TITLE_BYTES),
+            ("body", self.body, MAX_PLATFORM_BODY_BYTES),
+            ("agent name", self.agent_name, MAX_PLATFORM_AGENT_NAME_BYTES),
+        ):
+            if byte_length(value) > maximum:
+                reject(RejectionReason.LIMIT_EXCEEDED, f"platform notification {name} is too long")
+
+
+@_record
 class Operation:
     """A bounded provider action; ``kind`` names the payload member."""
 
@@ -755,6 +896,7 @@ class Operation:
     file_read: FileReadOperation | None = omit_empty(None)
     file_send: FileSendOperation | None = omit_empty(None)
     typing: TypingOperation | None = omit_empty(None)
+    platform_notify: PlatformNotifyOperation | None = omit_empty(None)
 
 
 @_record
@@ -788,6 +930,8 @@ def validate_operation_result(operation: Operation, result: OperationResult) -> 
         malformed("successful send has no message target")
     if operation.kind == "notify":
         _validate_notify_target(result.target)
+    if operation.kind == PLATFORM_NOTIFY and result.target is not None:
+        malformed("successful platform notify carries a message target")
     if operation.kind == "file_read" and result.transfer is None:
         malformed("successful file read has no transfer")
 
@@ -851,7 +995,14 @@ class RepoWatch:
     glob never is. Without ``include_drafts`` a draft pull
     request is reported when it becomes ready for review, and with
     ``updates`` a reported pull request is reported again when its head
-    commit, its draft state or its state changes. Every member is sent.
+    commit, its draft state or its state changes. Every one of these members
+    is sent.
+
+    ``branches`` are the branches whose new commits a repository with the
+    ``commit`` type reports; without them it reports its default branch.
+    Each is the name of a branch, without its ref prefix. It is sent only
+    when it names a branch, so the frame of a repository without one is the
+    same as before the member existed.
     """
 
     name: str = ""
@@ -860,6 +1011,7 @@ class RepoWatch:
     include_drafts: bool = False
     updates: bool = False
     deny_authors: tuple[str, ...] = ()
+    branches: tuple[str, ...] = omit_empty(())
 
 
 @_record
@@ -877,7 +1029,8 @@ class SourceSubscription:
     ``pr_watch`` or ``inbox``. Nerve sends it only while the repository watch
     is switched on, so every other frame is unchanged.
 
-    The ``email`` subscription carries only its provider and empty filters.
+    The ``email`` and ``github_thread_items`` subscriptions carry only their
+    provider and empty filters.
     """
 
     provider: str = ""
@@ -904,8 +1057,8 @@ class Subscriptions:
         The version, the number of sources, each provider name and that no
         provider appears twice, each inbox, the bounds of every filter list,
         the watched repositories, which only ``github_repos`` names (see
-        :func:`_validate_repo_watches`), and that an ``email`` subscription
-        carries nothing but its provider.
+        :func:`_validate_repo_watches`), and that an ``email`` or a
+        ``github_thread_items`` subscription carries nothing but its provider.
         """
         if self.version != SUBSCRIPTIONS_VERSION:
             reject(RejectionReason.VERSION_UNSUPPORTED, f"unknown subscriptions version {self.version!r}")
@@ -930,10 +1083,10 @@ class Subscriptions:
                 _validate_repo_watches(source)
             elif source.repos:
                 malformed(f"only a {REPO_WATCH_PROVIDER} subscription names repositories")
-            if source.provider == EMAIL_PROVIDER and (
+            if source.provider in (EMAIL_PROVIDER, THREAD_ITEMS_PROVIDER) and (
                 any(source.filters.pattern_lists().values()) or source.pr_watch or source.inbox
             ):
-                malformed(f"an {EMAIL_PROVIDER} subscription carries filters, pr_watch or an inbox")
+                malformed(f"the {source.provider} subscription carries filters, pr_watch or an inbox")
 
     def without_filters(self) -> Subscriptions:
         """The same sources with no filter patterns.
@@ -970,7 +1123,9 @@ def _validate_repo_watches(source: SourceSubscription) -> None:
     ``owner/repo`` name (:func:`valid_repo_name`) and each once, ignoring
     case; every one reports one or more of :data:`REPO_WATCH_TYPES`, each
     once, and has at most :data:`MAX_SUBSCRIPTION_PATTERNS` ``deny_authors``
-    that a filter list would take. It carries no filters, ``pr_watch`` or
+    that a filter list would take, and at most
+    :data:`MAX_REPO_WATCH_BRANCHES` branches, each once and each one that
+    :func:`valid_repo_branch` takes. It carries no filters, ``pr_watch`` or
     ``inbox``.
     """
     if any(source.filters.pattern_lists().values()) or source.pr_watch or source.inbox:
@@ -1001,6 +1156,12 @@ def _validate_repo_watches(source: SourceSubscription) -> None:
                 "a watched repository's deny_authors pattern is empty, too long, or has a "
                 "control character"
             )
+        if len(repo.branches) > MAX_REPO_WATCH_BRANCHES:
+            reject(RejectionReason.LIMIT_EXCEEDED, "a watched repository names too many branches")
+        if len(set(repo.branches)) < len(repo.branches) or not all(
+            valid_repo_branch(repo.name, branch) for branch in repo.branches
+        ):
+            malformed("a watched repository names a branch twice, or one the gateway does not take")
 
 
 # ---------------------------------------------------------------------- #

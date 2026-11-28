@@ -7,6 +7,7 @@ import { SelectionToolbar } from './SelectionToolbar';
 import { MarkdownContent } from './MarkdownContent';
 import { MAX_DIFF_LINES } from '../../types/chat';
 import type { FileDiff, ModifiedFileSummary } from '../../types/chat';
+import { PreviewButton } from '../Preview/PreviewButton';
 
 // The diff renderer pulls in @pierre/diffs + Shiki — only loaded when a file
 // diff is actually opened, keeping it off the initial bundle.
@@ -139,6 +140,7 @@ function FileDetailView({ file, onBack }: { file: ModifiedFileSummary; onBack: (
           )}
         </div>
         <div className="ml-auto flex items-center gap-1">
+          <PreviewButton path={file.path} />
           {canPreview && (
             <IconButton
               label={preview ? 'Show raw diff' : 'Show rendered markdown'}

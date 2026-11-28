@@ -263,6 +263,20 @@ class CronStore:
                 async for row in cursor
             }
 
+    async def get_last_cron_start(self, job_id: str) -> str | None:
+        """When the latest run of a job started, whether or not it has ended.
+
+        A ``missed`` row is not a run: it never started. None when the job
+        has no run on record.
+        """
+        async with self.db.execute(
+            "SELECT started_at FROM cron_logs WHERE job_id = ? AND status IS NOT 'missed' "
+            "ORDER BY started_at DESC, id DESC LIMIT 1",
+            (job_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row["started_at"] if row else None
+
     async def get_previous_cron_status(self, log_id: int) -> str | None:
         """The status of the run before run ``log_id``: the latest run of the
         same job that started before it and has a result.
@@ -282,6 +296,37 @@ class CronStore:
         ) as cursor:
             row = await cursor.fetchone()
             return row["status"] if row else None
+
+    async def get_failing_cron_streaks(self) -> dict[str, dict]:
+        """Per job whose latest finished run failed, its streak of failures:
+        ``{job_id: {"failures", "since", "last_run"}}``.
+
+        A streak is the ``error`` runs after the job's latest ``success``, in
+        the order that :meth:`get_previous_cron_status` uses (start, then id).
+        ``missed`` rows and runs that are still going are not runs with a
+        result, so they neither count nor end a streak. ``since`` and
+        ``last_run`` are the ``started_at`` of the first and of the latest
+        run of the streak, as stored. A job whose latest finished run
+        succeeded has no entry. The retention of the logs can delete the
+        older runs of a long streak, which then counts from its oldest row
+        that is kept.
+        """
+        async with self.db.execute(
+            "SELECT e.job_id, COUNT(*) AS failures, MIN(e.started_at) AS since, "
+            "MAX(e.started_at) AS last_run FROM cron_logs AS e "
+            "WHERE e.status = 'error' AND NOT EXISTS ("
+            "SELECT 1 FROM cron_logs AS s WHERE s.job_id = e.job_id AND s.status = 'success' "
+            "AND (s.started_at > e.started_at OR (s.started_at = e.started_at AND s.id > e.id))"
+            ") GROUP BY e.job_id",
+        ) as cursor:
+            return {
+                row["job_id"]: {
+                    "failures": row["failures"],
+                    "since": row["since"],
+                    "last_run": row["last_run"],
+                }
+                async for row in cursor
+            }
 
     async def get_last_successful_cron_run(self, job_id: str) -> dict | None:
         """Get the most recent successful cron_logs entry for a job."""

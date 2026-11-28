@@ -14,7 +14,12 @@ from nerve.agent.backends.codex.backend import (
     clamp_effort,
 )
 from nerve.agent.backends.codex.pricing import compute_cost, match_pricing
-from nerve.config import _DEFAULT_CODEX_PRICING, CodexConfig, NerveConfig
+from nerve.config import (
+    _DEFAULT_CODEX_MODELS,
+    _DEFAULT_CODEX_PRICING,
+    CodexConfig,
+    NerveConfig,
+)
 
 
 def _client(tmp_path, **codex_overrides) -> CodexClient:
@@ -178,6 +183,20 @@ def test_default_pricing_covers_gpt_6_astra():
     )
 
 
+def test_default_pricing_covers_the_menu_models():
+    """Every model of the default menu has a price, so its turns get a cost."""
+    assert [m for m in _DEFAULT_CODEX_MODELS if m not in _DEFAULT_CODEX_PRICING] == []
+    assert _DEFAULT_CODEX_PRICING["gpt-6.2-astra"] == {
+        "input": 8.0, "cached_input": 0.4, "output": 40.0,
+    }
+    assert _DEFAULT_CODEX_PRICING["gpt-6.2-sol"] == {
+        "input": 2.0, "cached_input": 0.1, "output": 10.0,
+    }
+    # Longest-substring matching keeps GPT-6.2 apart from GPT-6.
+    assert match_pricing("gpt-6.2-astra", _DEFAULT_CODEX_PRICING)["input"] == 8.0
+    assert match_pricing("gpt-6-astra", _DEFAULT_CODEX_PRICING)["input"] == 10.0
+
+
 def test_clamp_effort_uses_the_catalog_as_a_ceiling():
     full = ["low", "medium", "high", "xhigh", "max", "ultra"]
     assert clamp_effort("ultra", full) == "ultra"
@@ -195,7 +214,8 @@ def test_catalog_offers_the_configured_models_it_serves(tmp_path):
         {"id": "gpt-5.6-sol", "hidden": False, "supportedReasoningEfforts": [
             {"reasoningEffort": "low"}, {"reasoningEffort": "ultra"},
         ]},
-        {"id": "gpt-6-astra", "hidden": True, "supportedReasoningEfforts": [
+        {"id": "gpt-6.2-sol", "hidden": False},
+        {"id": "gpt-6.2-astra", "hidden": True, "supportedReasoningEfforts": [
             {"reasoningEffort": "max"},
         ]},
         {"id": "internal-preview", "hidden": True},
@@ -205,14 +225,16 @@ def test_catalog_offers_the_configured_models_it_serves(tmp_path):
     backend = _client(tmp_path)._backend    # default codex.models: the tiers
     cat = backend.catalog(entries)
     assert cat["listed"] == [
-        "gpt-5.6-sol", "gpt-6-astra", "internal-preview", "legacy-shape",
+        "gpt-5.6-sol", "gpt-6.2-astra", "gpt-6.2-sol", "internal-preview",
+        "legacy-shape",
     ]
-    # Config order; hidden Astra opted in by name; an entry the list does not
-    # name (visible or hidden) is not offered.
-    assert cat["offered"] == ["gpt-6-astra", "gpt-5.6-sol"]
-    assert cat["hidden"] == ["gpt-6-astra", "internal-preview"]
+    # Config order after codex.model, which the tiers do not name; hidden
+    # Astra opted in by name; an entry the list does not name (visible or
+    # hidden) is not offered.
+    assert cat["offered"] == ["gpt-5.6-sol", "gpt-6.2-astra", "gpt-6.2-sol"]
+    assert cat["hidden"] == ["gpt-6.2-astra", "internal-preview"]
     # The whole catalog, plus the configured models it does not serve.
-    assert cat["allowed"] == sorted({*cat["listed"], "gpt-5.6-terra", "gpt-5.6-luna"})
+    assert cat["allowed"] == sorted({*cat["listed"], "gpt-6.1-terra", "gpt-6-luna"})
     assert cat["efforts"]["gpt-5.6-sol"] == ["low", "ultra"]
     assert cat["efforts"]["internal-preview"] == []
 
@@ -233,7 +255,7 @@ def test_catalog_offers_the_configured_models_it_serves(tmp_path):
 
 
 def test_codex_models_config_parsing():
-    tiers = ["gpt-6-astra", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
+    tiers = ["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-terra", "gpt-6-luna"]
     assert CodexConfig.from_dict({}).models == tiers
     assert CodexConfig().models == tiers
     assert CodexConfig.from_dict({"models": None}).models == tiers

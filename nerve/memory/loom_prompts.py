@@ -3,14 +3,18 @@
 Under Loom, agents use Loom's own tools: the MCP gateway's catalog lists Loom
 as the server ``loom``, so they are ``mcp__loom__<tool>``, and Nerve's nine
 memory tools are not served. Every place that names those tools has its Loom
-wording here, kept to the tools Loom's default (``core``) tool list carries:
-the system prompt's memory section, the worker onboarding step that saves
-what it learned, the Codex backend note, the workspace templates, the
-built-in cron prompts and what external agents are told. The memU wording
-stays where it was. Two texts memU sessions also see did change: the worker
-guide (``docs/worker-best-practices.md``, which the onboarding prompt
-carries in full) has a bullet on Loom, and the bundled ``nerve-dev`` skill's
-source map names the Loom backend.
+wording here: the system prompt's memory section, the worker onboarding step
+that saves what it learned, the Codex backend note, the workspace templates,
+the built-in cron prompts and what external agents are told. The wording
+gives a tool name only for a tool in Loom's default (``core``) tool list. For
+each other Loom operation it gives the dotted operation name, which the agent
+runs through the listed ``loom_op`` tool as
+``{"op": "<name>", "arguments": {...}}``. ``tests/test_loom_contract.py``
+checks both kinds of name against Loom. The memU wording stays where it
+was. Two texts memU sessions also see did change: the worker guide
+(``docs/worker-best-practices.md``, which the onboarding prompt carries in
+full) has a bullet on Loom, and the bundled ``nerve-dev`` skill's source map
+names the Loom backend.
 """
 
 from __future__ import annotations
@@ -35,10 +39,8 @@ workspace files name them, use these.
 - **Recall**: `loom_search` answers one question from memory, profile, \
 knowledge and past conversations together. Ask it before code, PRs, external \
 services or decisions that depend on history, in full questions, one call per \
-question. `loom_memory_get` reads a key you know; `loom_memory_list`, \
-`loom_memory_history` and `loom_memory_related` list keys, show a key's \
-versions and find its neighbours; `loom_context_pack` loads what a task needs \
-in one call.
+question. `loom_memory_get` reads a key you know and `loom_memory_history` \
+shows its versions; `loom_context_pack` loads what a task needs in one call.
 - **Save**: `loom_memory_set` stores one fact per call under a readable \
 `memory_key` (`<scope>/<kind>/<id>`), the claim in plain text, facets in \
 `tags`. Leave `memory_type` unset: Loom keeps a memory typed `episodic` or \
@@ -47,20 +49,21 @@ that has changed gets `loom_memory_update` under the same key, never a \
 second copy. `loom_memory_pin` is for a standing rule, \
 `loom_memory_delete` only for an explicit request to forget, and \
 `loom_blacklist_add` for something that must never be remembered.
-- **Scratch**: `loom_working_memory_set`, `loom_working_memory_append`, \
-`loom_working_memory_replace` and `loom_working_memory_delete` hold state for \
-the task at hand; it is not searched.
-- **Anything else**: `loom_op` with `{"op": "help", "query": "<words>"}` lists \
-the operations the tool list leaves out.
+- **Other operations** run through `loom_op`: \
+`{"op": "memory.related", "arguments": {"memory_key": "<key>"}}` finds a \
+key's neighbours, `memory.list` lists keys, and `working_memory.set`, \
+`working_memory.append`, `working_memory.replace` and \
+`working_memory.delete` hold state for the task at hand, which is not \
+searched. `{"op": "help", "query": "<words>"}` finds the others.
 
 **Levels.** Your writes land in your home namespace, which is yours. Team and \
 org namespaces are shared with other agents and people: `loom_search` reads \
 them together with your home, a hit that names a `namespace` comes from one of \
-them, and `loom_namespace_list_mine` lists the namespaces you reach with your \
-role in each. Shared memories are read-only for you: never update, delete or \
-overwrite one. To change one, propose instead: where your role there is \
-`writer`, `loom_memory_set` your version in that namespace with \
-`proposed: true` under a key of its own (a fact on trial, served once its \
+them, and `namespace.list_mine` (through `loom_op`) lists the namespaces you \
+reach with your role in each. Shared memories are read-only for you: never \
+update, delete or overwrite one. To change one, propose instead: where your \
+role there is `writer`, `loom_memory_set` your version in that namespace \
+with `proposed: true` under a key of its own (a fact on trial, served once its \
 owners accept it); otherwise tell the human what should change and why. Keep \
 what you need meanwhile in your home namespace.
 
@@ -184,11 +187,11 @@ _TOOLS_MEMORY = (
     (
         "**Memory** (Loom: the `loom` MCP server, so call these as `mcp__loom__<name>`)\n"
         "- `loom_search`: one question over memory, profile, knowledge and past conversations; a hit from a shared namespace names it; `abstain: true` means Loom does not know\n"
-        "- `loom_memory_get`/`loom_memory_list`/`loom_memory_history`/`loom_memory_related`: one key, the keys, a key's versions, its neighbours\n"
+        "- `loom_memory_get`/`loom_memory_history`: one key, its versions\n"
         "- `loom_memory_set`: save one fact under a readable `memory_key` in your home namespace; read the `conflict_verdict` it answers\n"
         "- `loom_memory_update`: a changed fact, under the same key; `loom_memory_pin` a standing rule; `loom_memory_delete` only when asked to forget\n"
-        "- `loom_context_pack`: what a task needs, in one call; `loom_working_memory_*`: scratch state, not searched\n"
-        "- `loom_namespace_list_mine`: the namespaces you reach and your role in each; `loom_op`: what the tool list leaves out (`{\"op\": \"help\"}`)\n"
+        "- `loom_context_pack`: what a task needs, in one call\n"
+        "- `loom_op` runs Loom's other operations as `{\"op\": \"<name>\", \"arguments\": {...}}`: `memory.list` (the keys), `memory.related` (a key's neighbours), `working_memory.*` (scratch state, not searched), `namespace.list_mine` (the namespaces you reach and your role in each); `{\"op\": \"help\"}` lists the others\n"
     ),
 )
 
@@ -326,7 +329,7 @@ MAINTENANCE_DESCRIPTION = "Daily memory check — Loom's integrity report on the
 
 MAINTENANCE_PROMPT = (
     "You are running a daily memory check on Loom. Work completely silently — do not output any text, only think.\n\n"
-    "1. Call loom_namespace_validate for your home namespace (read-only). It reports errors and warnings, each with sample memory keys and a `detail` naming the operation that fixes it.\n"
+    "1. Call loom_op with {\"op\": \"namespace.validate\"} for your home namespace (read-only). It reports errors and warnings, each with sample memory keys and a `detail` naming the operation that fixes it.\n"
     "2. For a finding on a key in your home namespace: fix it as its `detail` says when that is one of your Loom tools — a stale or wrong value with loom_memory_update under the same key, never a second copy.\n"
     "3. Leave conflicts to their owners (Loom's review queue) and everything in team or org namespaces alone: shared memories are read-only for you.\n"
     "4. Do not delete memories as cleanup: Loom merges duplicates itself, and a wrong fact is corrected, not deleted.\n"
@@ -340,19 +343,35 @@ INBOX_MEMORIZE_EDIT = (
 )
 
 
-def tool_names() -> set[str]:
-    """Every Loom tool the wording here names; ``loom_working_memory_*``
-    stands for the tools with that prefix. ``tests/test_loom_contract.py``
-    checks them against the tools Loom lists by default."""
-    texts = [
+def _texts() -> list[str]:
+    """Every Loom wording here."""
+    return [
         SYSTEM_PROMPT_SECTION, EXTERNAL_AGENT_MEMORY, EXTERNAL_AGENT_FOOTER_MEMORY,
         MAINTENANCE_PROMPT, CODEX_NOTE_EDIT[1], INBOX_MEMORIZE_EDIT[1],
         *(new for _, new in ONBOARDING_EDITS),
         *(new for _, new in CONVERSATION_EDITS),
         *(new for edits in TEMPLATE_EDITS.values() for _, new in edits),
     ]
+
+
+def tool_names() -> set[str]:
+    """Every Loom tool the wording here names; a name that ends in ``_*``
+    stands for the tools with that prefix. ``tests/test_loom_contract.py``
+    checks them against the tools Loom lists by default."""
     names: set[str] = set()
-    for text in texts:
+    for text in _texts():
         for name in re.findall(r"\bloom_[a-z_]+\*?", text):
             names.add(name if not name.endswith("_") else name + "*")
+    return names
+
+
+def op_names() -> set[str]:
+    """Every Loom operation the wording here names for ``loom_op``: a dotted
+    name in backticks, or the value of ``"op"``. ``working_memory.*`` stands
+    for the operations with that prefix. ``tests/test_loom_contract.py``
+    checks them against the operations ``loom_op`` runs."""
+    names: set[str] = set()
+    for text in _texts():
+        names.update(re.findall(r"`([a-z_]+(?:\.[a-z_]+)*\.(?:[a-z_]+|\*))`", text))
+        names.update(re.findall(r'"op": "([a-z_]+(?:\.[a-z_]+)+)"', text))
     return names

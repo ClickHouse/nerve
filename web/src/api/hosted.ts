@@ -77,6 +77,22 @@ export function csrfHeaders(method: string | undefined): Record<string, string> 
   return SAFE_METHODS.has((method ?? 'GET').toUpperCase()) ? {} : { [CSRF_HEADER]: '1' };
 }
 
+/**
+ * Send one request to a route of the gateway (`/_nerve/<path>`), with the
+ * cookie of the gateway session and the CSRF header on an unsafe method. It
+ * sends no bearer. A failed response goes to `handleHostedError` and throws
+ * an `ApiError`.
+ */
+export async function gatewayRequest(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers: Record<string, string> = { Accept: 'application/json', ...csrfHeaders(init.method) };
+  if (init.body !== undefined) headers['Content-Type'] = 'application/json';
+  const res = await fetch(`${GATEWAY_PREFIX}${path}`, { ...init, headers, credentials: 'same-origin' });
+  if (res.ok) return res;
+  const error = new ApiError(res.status, await res.text());
+  handleHostedError(error);
+  throw error;
+}
+
 let readToken: () => string | null = () => null;
 
 /**

@@ -441,22 +441,24 @@ class HostedChannel(BaseChannel):
         if background:
             await asyncio.gather(*background, return_exceptions=True)
 
-    async def send(self, message: OutboundMessage) -> None:
+    async def send(self, message: OutboundMessage) -> str | None:
         """Post *message* in parts that fit the connection's text limit.
 
         Raises :class:`OutboundRefused` when the gateway forbids the first
         part, and :class:`OperationFailed` for other failures. A failed part
         stops the message; parts before it stay posted. A part whose frame
         is too large for the stream is split again, as nothing was sent.
+        Returns the thread target of the first part.
         """
         conversation, thread = parse_target(message.target)
         connection = await self._connection(conversation, "send")
         parts = split_text(message.text, self._limits(connection).text_characters)
         posted = 0
+        first_id = None
         while parts:
             part = parts.pop(0)
             try:
-                await self._post(
+                sent = await self._post(
                     connection, conversation, thread, message.target, part, refusal=posted == 0,
                 )
             except OperationFailed as error:
@@ -464,7 +466,10 @@ class HostedChannel(BaseChannel):
                     parts[:0] = split_text(part, len(part) // 2)
                     continue
                 raise
+            first_id = first_id or sent.message.id
             posted += 1
+        thread = thread or first_id
+        return f"{conversation}:{thread}" if thread else None
 
     # ------------------------------------------------------------------ #
     #  Outbound                                                            #
@@ -898,18 +903,16 @@ class HostedChannel(BaseChannel):
     # ------------------------------------------------------------------ #
 
     def can_accept(self) -> bool:
-        """Whether the channel runs, holds no events, and has room for a turn.
+        """Whether the channel runs and has room for a turn.
 
-        The provider's switch is read per call. Turning a provider that
-        holds its events while off (Slack) off by a reload stops intake
-        until it is turned on again. A provider that does not hold them
-        never stops intake by its switch: :meth:`deliver` rejects its
-        events. Intake also stops while the engine drains: the gateway keeps
-        the events, and the next start reads them.
+        The provider's switch never stops intake: while it is off,
+        :meth:`deliver` rejects the provider's events, and the reader
+        continues with the events of the other providers. Intake stops
+        while the engine drains: the gateway keeps the events, and the next
+        start reads them.
         """
         return (
             self._running
-            and (self._switched_on() or not self._spec.hold_while_off)
             and len(self._inflight) < self._max_inflight
             and self.router.accepting_turns
         )
@@ -917,12 +920,13 @@ class HostedChannel(BaseChannel):
     async def deliver(self, event: Event) -> Disposition:
         """Dispatch one admitted event and say what happened to it.
 
-        While the provider is switched off, and it does not hold its events,
-        each event is rejected. So is an event on a connection whose
-        capabilities name another provider: it is not remembered, and its
-        connection's behaviour does not apply.
+        While the provider is switched off, each event is rejected, and the
+        gateway removes it: a reload that switches the provider on does not
+        bring it back. So is an event on a connection whose capabilities
+        name another provider: it is not remembered, and its connection's
+        behaviour does not apply.
         """
-        if not self._spec.hold_while_off and not self._switched_on():
+        if not self._switched_on():
             return Disposition.rejected("configuration_invalid", f"{self._provider} is switched off")
         if self._foreign(event.connection_id):
             return Disposition.rejected(

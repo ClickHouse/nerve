@@ -23,7 +23,7 @@ and migration splits a legacy `config.yaml` on the same table:
 
 | Layer | Gets |
 |-------|------|
-| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `gateway.public_url`, `proxy`, `docker`, `telegram.enabled`, `slack.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `mcp_apps`, `workflows.runs_dir` |
+| `config.yaml` | `workspace`, `deployment`, `provider.aws_profile`, `gateway.ssl.*`, `gateway.public_url`, `proxy`, `docker`, `telegram.enabled`, `slack.enabled`, `sync.gmail.accounts`, `external_agents`, `mcp_endpoint`, `mcp_apps`, `artifacts`, `workflows.runs_dir` |
 | `settings.yaml` | `timezone`, `gateway.host`/`port`/`loop`, `provider.type`/`aws_region` (incl. the region-scoped Bedrock model IDs), `agent.*`, `memory.*`, `sessions.*`, `sync.*`, the rest of `workflows.*` (the budget caps and cadence), `houseofagents.*`, quiet hours, `telegram.dm_policy`/`stream_mode` |
 
 The test is whether the value would be wrong on another machine: filesystem
@@ -242,8 +242,8 @@ A reload is always explicit. Two things cause one:
 | Cron jobs (`config/cron/*.yaml`) | ✅ |
 | Custom cron gate plugins (new, edited *and* deleted `.py` files) | ✅ the registry is rebuilt from the directory |
 | Cron file locations (`cron.jobs_file`, `system_file`, `gate_plugins_dir`) | ✅ re-read from the new config |
-| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. In hosted mode the GitHub filters, `pr_watch`, `inbox` and the repository watch (`sync.github_repos`) are published to the gateway again. **`sync.codex` and `sync.github.mode` are not among these**; see the restart table |
-| `cron.delivery_debounce_seconds` | ✅ read for each delivery |
+| Cron sources: `sync.telegram`, `.gmail`, `.github`, `.github_events`, `.github_repos`, `.message_ttl_days`, and each source's `schedule` | ✅ runners are rebuilt and rescheduled, all or nothing: a `schedule` the scheduler will not take refuses the source reload with the running sources on their old triggers, and reports the error rather than `ok`. In hosted mode the GitHub filters, `pr_watch`, `thread_items`, `inbox` and the repository watch (`sync.github_repos`) are published to the gateway again. **`sync.codex` and `sync.github.mode` are not among these**; see the restart table |
+| `cron.delivery_debounce_seconds`, `cron.delivery_min_interval_seconds` | ✅ read for each delivery |
 | MCP servers (`mcp_servers`) | ✅ new sessions get the new set |
 | Skills (`skills/`, and the platform skills in `skills/` in the config directory) | ✅ re-scanned |
 | `lockdown` | ✅ the write guards and the layer stack both follow |
@@ -258,7 +258,7 @@ A reload is always explicit. Two things cause one:
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
 | `sessions.sticky_period_minutes` | ✅ |
 | `telegram.dm_policy`, `.stream_mode`, `.reply_routes_to_origin_session` | ✅ read per update. Tightening `open` to `pairing` takes effect on the next message; toggling `reply_routes_to_origin_session` takes effect on the next message, and applies to replies to earlier messages too (routes are recorded while it is off); `allowed_users` does not follow it (see the restart table) |
-| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` pauses intake, the records of a hosted GitHub source and the events of the other hosted providers included, and notifications until it is `true` again, `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
+| `slack.*` | ✅ `enabled` starts or stops the channel; same-workspace token changes reconnect and roll back on failure; other changes apply to the next event. In hosted mode `enabled: false` makes Nerve reject the Slack events that arrive and stops notifications until it is `true` again, while the records of a hosted GitHub source and the events of the other hosted providers continue to arrive; `source.*` applies to the next event, and `mode` needs a restart (see the restart table) |
 | `email.enabled` | ✅ read per event. The reload publishes the subscriptions to the gateway again, which then takes or refuses new mail. When no stream sends them, the reload reports `subscriptions` with a "not sent yet" note, which is not an error: the next stream that connects sends them before Nerve reads from it. The email channel must exist: usable `channels.hosted` settings at startup give it. Without usable settings the reload repeats the startup warning under `email`; with usable settings and no email channel it says that a restart is needed (see [Email](#email)) |
 | `workflows.*` and `workflows.review_loop.*` — budget caps, concurrency, the warning fraction, iteration and criteria caps, leg engines/models, the verifier sandbox | ✅ read per use, by loops and runs already in flight as well as new ones. The two `enabled` flags and the two loop cadences are the exceptions; see the restart table |
 | `provider.*` and the API keys it selects (`aws_region`, `aws_profile`, `aws_access_key_id`, and the effective Anthropic key) | ✅ for sessions started **after** the reload. Each client's environment is built from the live reference when the session is created, by the same seam as `agent.*` below |
@@ -298,9 +298,10 @@ reload cannot inspect, and are documented here only.
 | `telegram.enabled`, `.bot_token`, `.allowed_users` | the bot was built with that token, and the allow-list was copied into a set when it was built. Notification *delivery* does follow a reload, so after changing `allowed_users` the two can disagree until a restart. `dm_policy` and `stream_mode` are read per update and do follow a reload (see the table above) |
 | `mcp_endpoint.*` | fixed when the app was created |
 | `mcp_apps.*` | whether the gateway answers for the sandbox document, and whether the documents of its web UI refuse every frame, is settled once at startup. Until a restart, turning the feature on shows no view. Turning it off does take effect at once: new sessions are no longer told to host, and the web UI is told that the feature is off; the sandbox document itself stays answered until the restart, which harms nothing (it is static and holds nothing). See [MCP Apps](#mcp-apps) |
+| `artifacts.*` | whether the gateway answers for the sandbox document for previews, and whether the documents of its web UI refuse every frame, is settled once at startup, and so are `artifacts.publish`, `artifacts.viewer_origin` and `artifacts.upload_origins`: the route of the Publish button, the `artifacts` member of `GET /api/auth/me` and the tool `publish_artifact` follow the values at start. Until a restart, turning the Preview tab or the publish on or off changes nothing. See [Artifacts](#artifacts) |
 | `mcp_gateway_url` | the catalog reader is built at startup. See [MCP servers in external mode](#mcp-servers-in-external-mode) |
 | `slack.mode`, `channels.hosted.*` | the hosted channels, the email channel included, their stream endpoint, and their token verifier are built at startup. A reload reads the file that `gateway_jwks_file` names again, but not a changed path. Changing `mode` to `socket` reports a Slack reload error until a restart, because the hosted channel still holds the `slack` name. Changing it to `hosted` stops the Socket Mode connection at once, and the stream endpoint opens after a restart |
-| `sync.github.mode` | the GitHub sources (`github` and the repository watch, `github_repos`), and in hosted mode the stream endpoint and the consumers of the gateway's records, are chosen at startup. Until a restart the sources keep the mode they started with, and so does the `github_pr_activity` gate. The filters, `pr_watch`, `inbox` and `sync.github_repos` do follow a reload: in hosted mode the reload publishes them to the gateway again. To go back to `poll`, set `enabled: false` (and `sync.github_repos.enabled: false`) and reload first (see [sources.md](sources.md#hosted-github-source)) |
+| `sync.github.mode` | the GitHub sources (`github` and the repository watch, `github_repos`), and in hosted mode the stream endpoint and the consumers of the gateway's records, are chosen at startup. Until a restart the sources keep the mode they started with, and so does the `github_pr_activity` gate. The filters, `pr_watch`, `thread_items`, `inbox` and `sync.github_repos` do follow a reload: in hosted mode the reload publishes them to the gateway again. To go back to `poll`, set `enabled: false` (and `sync.github_repos.enabled: false`) and reload first (see [sources.md](sources.md#hosted-github-source)) |
 | `auth.jwt_secret` | pinned at startup for every consumer, web gateway and MCP endpoint alike. A reload that changes or removes it is reported and changes nothing live: removing the key must not reopen the instance, and rotating it must not swap the key under live sessions half-way. The next restart applies it (with the key removed, the secret generated into `nerve.db` takes over) |
 | `workflows.enabled`, `workflows.review_loop.enabled` | each service is created at startup and only when its flag is on. Turning one **off** does not stop the service already running, and turning it **on** creates nothing for a reload to reach |
 | `workflows.poll_interval_seconds`, `workflows.review_loop.reconcile_interval_seconds` | both loops were handed their interval when they started. Everything else under `workflows.*` is read per use (see the table above) |
@@ -1033,13 +1034,13 @@ agent:
   cron_backend: null       # null → backend; new cron/hook sessions only
 
 codex:                     # active when a codex backend is selected
-  bin_path: codex          # tested: >= 0.153.1 and < 0.165.0
+  bin_path: codex          # tested: >= 0.153.1 and < 0.173.0
   min_version: 0.153.1
-  max_version: 0.165.0
+  max_version: 0.173.0
   home_dir: ~/.nerve/codex # isolated CODEX_HOME (auth, config, sessions)
   model: gpt-5.6-sol
   cron_model: null         # null → model
-  models: [gpt-6-astra, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna]  # the model menu, in order; each shows when the account serves it
+  models: [gpt-6.2-astra, gpt-6.2-sol, gpt-6.1-terra, gpt-6-luna]  # the model menu, in order; each shows when the account serves it
   auth: chatgpt            # chatgpt | api_key
   api_key: null            # config.local.yaml; or api_key_env: OPENAI_API_KEY
   base_url: ""             # OpenAI-compatible Responses endpoint; empty → Codex's own provider
@@ -1049,8 +1050,8 @@ codex:                     # active when a codex backend is selected
   tool_timeout_sec: 3600        # nerve MCP calls may block on ask_user
   turn_idle_timeout_seconds: null  # null → agent.cli_idle_timeout_seconds
   pricing:                      # $/1M tokens — cost is None for unlisted models
-    gpt-5.6-sol: {input: 5.0, cached_input: 0.5, output: 30.0}
-    gpt-6-astra: {input: 10.0, cached_input: 1.0, output: 50.0}  # >272K-token requests bill more; not modelled
+    gpt-6.2-sol: {input: 2.0, cached_input: 0.1, output: 10.0}
+    gpt-6.2-astra: {input: 8.0, cached_input: 0.4, output: 40.0}  # >272K-token requests bill more; not modelled
   extra_config: {}              # arbitrary codex -c key=value passthrough
   ultracode:                    # optional managed third-party orchestrator
     enabled: false
@@ -1070,8 +1071,16 @@ codex:                     # active when a codex backend is selected
 order. The menu shows a model only when the Codex catalog of the account
 serves it, hidden entries included. `codex.model` is put first when the list
 does not name it. Every model in the list is also accepted as a session
-model. Unset: the newest model of each tier. `[]`: only `codex.model`.
+model. Unset: the newest model of each tier; the catalog serves GPT-6.2
+only to codex-cli 0.166.0 or newer. `[]`: only `codex.model`.
 `nerve codex doctor` lists the catalog models that the list does not name.
+
+The catalog depends on the CLI version, and the catalog of an older CLI can
+be without the models of `codex.models`. `nerve upgrade` does not update the
+Codex CLI. When the CLI is older than the version that Nerve is tested with
+(0.172.0, below `codex.max_version`), the gateway log, `nerve doctor` and
+`nerve codex doctor` show a warning, and the Codex preflight returns it as
+`version_warning`.
 
 `codex.ultracode.dashboard` exposes run journals in Nerve's authenticated UI.
 It does not start Ultracode's detached dashboard process. Keep
@@ -1555,14 +1564,15 @@ The inbox record shows that person (see
 nothing: the `slack.source` sender rules match only the member ID and the
 display name in the event.
 
-`slack.enabled: false` pauses the hosted channel, at startup or after a
-reload. The stream endpoint still accepts streams, and events stay in the
-gateway's inbox until a reload sets `enabled` to `true`. While it is paused,
-Nerve sends no notifications and refuses `send_channel_message`. A turn that
-is already running still sends its reply. Nerve reads nothing from the
-gateway's inbox while Slack is paused, so the records of a hosted GitHub
-source and the events of the other hosted providers wait there too (see
-below and [Connection behaviour](#connection-behaviour)).
+`slack.enabled: false` switches the hosted channel off, at startup or after
+a reload. The stream endpoint still accepts streams. Nerve rejects each
+Slack event that arrives while Slack is off, and the gateway removes it, so
+a reload that sets `enabled` to `true` does not deliver it later. While
+Slack is off, Nerve sends no notifications and refuses
+`send_channel_message`. A turn that is already running still sends its
+reply. The records of a hosted GitHub source and the events of the other
+hosted providers continue to arrive (see
+[Connection behaviour](#connection-behaviour)).
 
 Replies, reactions, and `send_channel_message` go to Slack as operations on
 a gateway stream that advertises them for the connection. A reply goes on the
@@ -1600,6 +1610,12 @@ connection advertises it. A gateway that does not advertise it gets no card.
 When the control plane sets no notification channel, the gateway refuses the
 card, and Nerve logs one INFO line for each card. Any other failure logs one
 warning.
+
+In external mode the gateway can also advertise a connection of the provider
+`platform` with the `platform_notify` operation. The platform delivers Web
+Push for the agent, and Nerve hands each notification over on that
+connection (see [Web Push](#web-push)). This connection serves no chat
+channel and does not change the choice of the `notify` connection.
 
 A button press answers the notification only in the conversation where it
 was delivered, and the card then shows the answer without buttons. A press
@@ -1639,16 +1655,6 @@ carry the mail that members send to the agent: the usable `channels.hosted`
 settings give the email channel, which `email.enabled` switches on (see
 [Email](#email)).
 
-When Slack is hosted as well, its switch also holds GitHub and member mail
-back. Nerve reads the events of every hosted provider from one ordered
-inbox, and it reads nothing while hosted Slack is switched off
-(`slack.enabled: false`): the GitHub records wait at the gateway until Slack
-is switched on again, and past the gateway's limit of stored records the
-oldest are dropped. Keep a hosted Slack switched on while GitHub is hosted;
-`nerve doctor` warns when it is off. This is a known limitation: a read for
-each provider on its own, which would keep GitHub records arriving while
-hosted Slack is off, is a follow-up.
-
 #### Connection behaviour
 
 Nerve builds one hosted channel for each chat provider in hosted mode. The
@@ -1672,16 +1678,11 @@ session is not sent to anyone. To answer, use the *reply tool* tool."
 Without a reply tool, the line ends with "This channel does not send
 answers."
 
-Each hosted chat provider has its own switch. Because the gateway keeps the
-events of every provider in one ordered inbox, a provider that is switched
-off either holds the events of all providers or refuses its own events.
-Hosted Slack holds them: while `slack.enabled` is `false`, Nerve reads
-nothing, and the events of the other hosted providers wait in the gateway
-inbox too. Any other hosted chat provider refuses, email included: while it
-is switched off, Nerve rejects its events and continues to read the events
-of the other providers. Nerve also stops reading, for every provider, while
-one hosted channel has 100 turns in progress, and continues when one of them
-ends.
+Each hosted chat provider has its own switch. While a provider is switched
+off, Nerve rejects its events and continues to read the events of the other
+providers. The gateway keeps the events of every provider in one ordered
+inbox, so Nerve stops reading, for every provider, while one hosted channel
+has 100 turns in progress, and continues when one of them ends.
 
 An event on a connection whose capabilities name another provider is
 rejected, and Nerve sends no operation of a channel through such a
@@ -1943,7 +1944,8 @@ that an administrator sets in the control plane.
 ### Outbound Slack message tool
 
 The `send_channel_message` tool posts to a given conversation. That makes it usable
-from a cron run with no conversation attached.
+from a cron run with no conversation attached. Its result names the target of
+the posted message's thread, so the agent can reply there.
 
 It is **off by default**: `slack.allow_outbound: true` enables the capability,
 and `slack.allow_channels` then bounds where it may go. The target must be a literal conversation id.
@@ -2032,10 +2034,7 @@ warning under `email`. When the settings are usable but this process has no
 email channel, because the settings became usable after startup or the
 hosted channels did not start, it says that a restart is needed.
 
-While a hosted Slack is switched off, Nerve reads nothing from the gateway
-inbox, so member mail waits there too (see
-[Connection behaviour](#connection-behaviour)). `send_channel_message`
-cannot post through the email channel.
+`send_channel_message` cannot post through the email channel.
 
 ## Notification delivery
 
@@ -2073,9 +2072,12 @@ to the session in the web UI.
 The fan-out also sends each item as a push notification (channel `webpush`)
 to the browsers where a person turned push on. `notifications.channels` does
 not list it, and `notifications.levels.webpush: important` limits all
-browsers. The instance must reach the push services of the browsers; on Nerve
-Cloud that works only for agents in open internet mode. How push works, the
-VAPID key and the hosts: [web-ui.md](web-ui.md#push-notifications).
+browsers. In local mode the instance must reach the push services of the
+browsers. In external mode (`NERVE_AUTH_MODE=external`) the platform delivers
+Web Push: the instance needs no key, no subscription routes and no access to
+a push service, and hands each item over on a [hosted channel](#hosted-mode)
+connection (see [api.md](api.md#web-push)). How push works, the VAPID key and
+the hosts: [web-ui.md](web-ui.md#push-notifications).
 
 ## Quiet Hours
 
@@ -2180,6 +2182,7 @@ the channel transport, matching messages are written to a local buffer.
 | `sync.github.schedule` | cron | `*/15 * * * *` | Fetch frequency; in hosted mode the fallback cadence of the drain |
 | `sync.github.mode` | string | `poll` | `poll`: fetch notifications here with the gh CLI. `hosted`: the channel gateway polls GitHub, applies the guardrails, and streams the records (needs the `channels.hosted` settings, see [Hosted mode](#hosted-mode)). An unknown value falls back to `poll` with a warning. Restart-only. See [sources.md](sources.md#hosted-github-source) |
 | `sync.github.pr_watch` | bool | `true` | Hosted mode: also deliver a `github_pr_activity` record whenever one of the agent's own open pull requests changes. Its `reason` is always `author`, and only `allow_repos` and `deny_repos` apply to it (see [sources.md](sources.md#github-pull-request-activity-records)) |
+| `sync.github.thread_items` | bool | `true` | Hosted mode: take one `github_thread_item` record for each comment, review and description of a thread, where the gateway offers them. `false` keeps the one record per thread. The repository and actor lists apply to each item here, the reason lists at the gateway (see [sources.md](sources.md#hosted-github-source)). Follows a reload |
 | `sync.github.inbox` | string | `participating` | Which notification threads are listed, in both modes. `participating`: only the threads the account takes part in (GitHub's `participating=true`). `all`: the account's whole GitHub inbox as its watch settings produce it, adding `subscribed` threads of watched repositories (new issues and pull requests), `ci_activity` and `security_alert`; pick within it with the reason guardrails. Case does not matter; any other value refuses to load. Follows a reload. In hosted mode the gateway must support it. See [sources.md](sources.md#watched-repositories-inbox-all) |
 
 **GitHub Repos-specific** (repositories the agent follows without taking part
@@ -2193,15 +2196,22 @@ reload:
 | `sync.github_repos.enabled` | bool | `false` | Enable the repository watch. In hosted mode Nerve publishes it to the gateway only while it is on and `repos` lists a repository |
 | `sync.github_repos.schedule` | cron | `*/15 * * * *` | Poll frequency; in hosted mode the fallback cadence of the drain, which also runs on every delivery |
 | `sync.github_repos.repos` | list | `[]` | `owner/repo` names as GitHub writes them, each once (case does not matter), at most 50. While the watch is on, a name GitHub would not take, a repository named twice, or more than 50 refuses to load; while it is off, a warning names them. Empty = nothing is watched. Nothing older than a day is backfilled: a check more than a day after the last one (a daily schedule, an outage, the watch switched off for longer) reports the last day's items, with an hour of grace; in hosted mode, switching the watch off and on starts fresh |
-| `sync.github_repos.types` | list | `[pull_request, issue]` | What is reported: `pull_request`, `issue`, `release`. Case does not matter; an unknown type or an empty list refuses to load |
+| `sync.github_repos.types` | list | `[pull_request, issue]` | What is reported: `pull_request`, `issue`, `release`, `commit` (the new commits on a branch, one record per branch). Case does not matter; an unknown type or an empty list refuses to load. In hosted mode, name `commit` only once the gateway knows the type (see [sources.md](sources.md#hosted-repository-watch)) |
+| `sync.github_repos.branches` | map | `{}` | With the `commit` type: the branches whose new commits are reported, as `owner/repo: [branch, …]` for a repository of `repos`, at most 8 each; a repository without an entry reports its default branch. An entry is a branch's name, not a ref (`main`, not `refs/heads/main`), and a name that YAML reads as something else goes in quotes (`"1.10"`). While the watch is on, a value that is not such a map (`branches: [main]`, `branches: []`), a branch that is not a string, a branch name the watch cannot follow, a branch named twice, more than 8, or a repository that `repos` does not list refuses to load (see [sources.md](sources.md#new-commits-on-a-branch)). Without the `commit` type the setting is not read, and a value there is ignored with a warning |
 | `sync.github_repos.include_bots` | bool | `false` | Also report the pull requests and issues that a GitHub App or an account whose login ends in `[bot]` opened. A release is reported whoever published it (release automation such as `github-actions[bot]` is the normal case) |
 | `sync.github_repos.include_drafts` | bool | `true` | `false`: a draft pull request is reported when it is marked ready for review (event `ready`), not when it is opened |
-| `sync.github_repos.updates` | bool | `false` | Also report a new head commit, ready for review, and the merge or close of each pull request the watch reported |
-| `sync.github_repos.deny_authors` | list | `[]` | Case-insensitive globs on the author's login, with the guardrail rules; what they match is never reported, releases included |
+| `sync.github_repos.updates` | bool | `false` | Also report a new head commit, ready for review, and the merge or close of each pull request the watch reported. One that is closed without a merge is followed again when it is reopened within 30 days of its close, and the reopening is reported (event `reopened`). A job or a prompt that decides by `event` needs a rule for `reopened`, and the ID of a `closed` record ends in the time of the close (see [sources.md](sources.md#closed-and-reopened-pull-requests)) |
+| `sync.github_repos.deny_authors` | list | `[]` | Case-insensitive globs on the author's login, with the rules of the actor guardrail (a pattern that ends in `[bot]` names a GitHub App); what they match is never reported, releases included |
 
 `cron.delivery_debounce_seconds` (int, default `60`) spaces the job runs that a
 hosted delivery starts; a negative value reads as `0`, and a value above `600`
-waits `600` seconds (`nerve config validate` warns). See
+waits `600` seconds (`nerve config validate` warns).
+`cron.delivery_min_interval_seconds` (int, default `1800`): a hosted delivery
+starts no run of a job whose last run started less than this many seconds ago
+and whose schedule is forecast to run it again before that time is over; the
+records wait in the inbox for that scheduled run. `0` runs the jobs for every
+burst, a negative value reads as `0`, and a value above `21600` is used as
+`21600` (`nerve config validate` warns). See
 [cron.md](cron.md#runs-on-delivery).
 
 ## Memory
@@ -2316,8 +2326,8 @@ writes to the namespaces the agent reads, and it lands in the session's
 escaped as Loom escapes them (`&lt;`, `&gt;`); the fallback search's text is
 escaped the same way. A startup call has 5 seconds; a pack the gateway's
 policy refuses gets the search as well. `tests/test_loom_contract.py` holds
-these calls, and the tools the agent is told about, to
-`tests/fixtures/loom_lifecycle_ops.json`, which
+these calls, the tools the agent is told about and the operations it is told
+to run through `loom_op`, to `tests/fixtures/loom_lifecycle_ops.json`, which
 `scripts/loom_contract_fixture.py` generates from a Loom checkout.
 
 **Identity.** Loom's MCP has no `whoami`; `namespace.summary` names the org
@@ -2525,6 +2535,10 @@ environment variables for this request. One request takes at most 5 seconds.
   [Catalog changes in running sessions](#catalog-changes-in-running-sessions)).
 - A catalog server with the ID `nerve` is not used, because Nerve's own server
   has that name.
+- The model does not get the three upload tools of the server `nerve-artifacts`
+  (`begin_artifact_version`, `get_artifact_upload_links`,
+  `complete_artifact_version`): Nerve calls them itself (see
+  [Publishing artifacts](#publishing-artifacts)).
 
 The clients get each gateway server as an HTTP MCP server at its URL, without
 headers:
@@ -2610,6 +2624,141 @@ lockdown, state it in the tracked settings with a `${VAR}` reference:
 mcp_apps:
   enabled: ${NERVE_MCP_APPS:-false}
 ```
+
+## Artifacts
+
+Artifacts are static bundles of workspace files that a person sees. The
+Preview tab of the web chat shows the bundle of a workspace path in the side
+panel: an HTML file, a folder with an `index.html`, an image, a Markdown file
+(drawn as a page) or a CSV file (drawn as a table to search and sort) (see
+[Preview](web-ui.md#preview)). A file of these kinds that the agent sends with
+`send_file` shows the same page under its card in the chat, and the session
+context of a web chat tells the model so. Off by default. It works in local mode and in
+[external mode](#authentication-mode), and it does not need `mcp_apps`.
+
+```yaml
+# config.yaml
+artifacts:
+  preview: true
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `artifacts.preview` | bool | `false` | Show the Preview tab (`GET /api/auth/me` then has `preview`), and serve the preview routes and the sandbox document that a preview runs in (`/mcp-app-sandbox.html`, the document of MCP App views and widgets). A preview gets the policy that allows no origin. This key does not turn on MCP App views or widgets: they keep `mcp_apps.enabled`, and stay off in external mode. |
+| `artifacts.publish` | bool | `false` | External mode only. Give the agent the tool `publish_artifact` and the Preview tab the **Publish** button: both publish a bundle to the platform as an artifact, through the server `nerve-artifacts` of the MCP gateway's catalog (see [Publishing artifacts](#publishing-artifacts)). In local mode the key does nothing. |
+| `artifacts.viewer_origin` | string | `""` | External mode only. The origin of the artifact viewer of the platform: `https://` or `http://`, a host and an optional port, nothing after it. The web chat shows a published artifact in a frame only when its viewer address has exactly this origin; else, and when the key is empty, as a link. A value that is not an origin is logged once and counts as empty. |
+| `artifacts.upload_origins` | list | `[]` | External mode only. The origins of the object store to which Nerve may send the bytes of a published file: `https://host[:port]` each, nothing after it (a list, or one text with commas). An `http://` entry is accepted only for a loopback host (`localhost`, a name below `.localhost`, a loopback IP address) of a local stack; any other `http://` entry, or an entry that is not an origin, stops the start. Required for publishing: while it is empty, `publish_artifact` and the Publish button refuse with a configuration error. |
+
+The key needs a restart (see
+[What still needs a restart](#what-still-needs-a-restart)). When the web UI
+is not built, startup logs a warning and no preview can load until it is.
+
+Like `mcp_apps`, the section is decided for each machine, so it belongs in
+`config.yaml`. Under lockdown, and where the platform sets it, state it in
+the tracked settings with a `${VAR}` reference:
+
+```yaml
+# workspace/config/settings.yaml
+artifacts:
+  preview: ${NERVE_ARTIFACTS_PREVIEW:-false}
+  publish: ${NERVE_ARTIFACTS_PUBLISH:-false}
+  viewer_origin: ${NERVE_ARTIFACTS_VIEWER_ORIGIN:-}
+  upload_origins: ${NERVE_ARTIFACTS_UPLOAD_ORIGINS:-}
+```
+
+`NERVE_ARTIFACTS_UPLOAD_ORIGINS` is a list separated by commas, for example
+`https://store.example.test,https://store-2.example.test`.
+
+### Publishing artifacts
+
+In external mode, the platform can serve artifacts: the members of the agent
+see a published bundle in the viewer of the platform, and a member can share
+one version with everyone in the tenant there. With `artifacts.publish` on,
+the agent has the tool `publish_artifact(path, title, artifact_id?)`, and the
+Preview tab has a **Publish** button that runs the same code for the person
+who clicks (`POST /api/artifacts/publish`). Publishing also needs
+`artifacts.upload_origins`, the origins of the object store of the platform.
+A path has the bundle of the
+[Preview](web-ui.md#preview) tab.
+
+Nerve sends the bundle through the server `nerve-artifacts` of the MCP gateway's
+catalog (see [MCP servers in external mode](#mcp-servers-in-external-mode)):
+
+1. It describes the bundle and reads each file once for its size and SHA-256.
+2. `begin_artifact_version` with the title, the entry file and the files,
+   with `artifact_id` for a new version of an artifact, and with
+   `on_behalf_of` when the session has a person: the cause of the session,
+   or the person of the button. The platform checks its limits.
+3. `get_artifact_upload_links` for at most 100 files at a time (or the
+   smaller batch that the platform says). An upload link is a short-lived
+   right to write one object. Every link of the answer must have an origin
+   of `artifacts.upload_origins` (the scheme, the host and the port, compared
+   exactly after Nerve puts the scheme and the host in lower case, drops a
+   dot at the end of the host, and fills in the default port; an address with
+   user information or that is not absolute is refused). One link outside
+   the list fails the publish, and Nerve sends nothing to any link of that
+   answer. Nerve sends a `PUT` to each link with exactly
+   the headers of the link and the bytes of the file, with a fixed
+   `Content-Length`, 4 at the same time. It follows no redirect. A
+   connection must open in 10 seconds, and the upload of one file must end
+   in 10 minutes. A link that has less than one minute of its lifetime (15
+   minutes) left is not used: Nerve asks new links for the files that are
+   left.
+4. `complete_artifact_version`: the platform checks the objects and gives
+   the viewer address.
+
+The model does not get the three tools of these steps: Nerve keeps them out
+of its tool list (Claude: `--disallowedTools`; Codex and its workers:
+`mcp_servers.nerve-artifacts.disabled_tools`). The other tools of
+`nerve-artifacts`, `list_artifacts` and `unpublish_artifact`, stay tools of
+the model.
+
+The tool result has the viewer address, the version and who can see it: the
+members of the agent, until a member shares the version in the viewer. It has
+no upload link and no ID of a person. An upload link is in no tool result,
+error text, log line or stored message: the error of an upload names the
+file and the HTTP status. The uploads go out through the proxy environment
+variables of the Nerve service (`HTTPS_PROXY`), as the channels do; the calls
+to the MCP gateway do not.
+
+A version is exactly the bytes that were hashed: the link signs their size
+and checksum. Each file is read again for its upload. A file that is not the
+described file when it is opened (another size, times, inode or device)
+fails the publish with an error that names it, and so do bytes that differ
+from the hashed ones when they are sent: the store refuses them. A file that
+changes after its bytes were read (for example, bytes appended
+during its upload) is a newer state: the version keeps the earlier one, the
+result says "The files changed while they were published. This version has
+the earlier state.", and the next publish sends the newer state.
+
+The model does not get the upload tools also when `codex.extra_config` sets
+`mcp_servers.nerve-artifacts.disabled_tools`: Nerve merges the names of that
+list into its own entry, which comes after every other override. This keeps
+upload links out of the transcript in ordinary use. It is not a barrier
+against code on the machine of the agent, which can call the tools of the
+MCP gateway itself. Each refusal reason of the platform is a sentence in
+the result, for example "Agents with restricted internet access cannot
+publish artifacts." for an agent with restricted egress. Without a
+`nerve-artifacts` server in the catalog, the result says that the agent has
+no artifact tools (the server `nerve-cloud` does not publish); when the
+gateway refuses the call by its policy (JSON-RPC `-32001`), the result says
+that the policy of the tenant
+does not allow the tools, or that the gateway has no working credential for
+them. A failure of the platform and a busy agent are said as such, not as
+refusals. Nerve checks the fields of each answer before it uses them (UUIDs,
+the version number, the time, the viewer address, the origin of each link);
+an answer that fails a check fails the publish with "The platform answer was
+not valid.", and no text of the answer goes into the result.
+
+While a task uploads, Nerve empties each log record of the `httpx` and
+`httpcore` loggers (and their children) to a fixed text, whatever their
+level: these records name the address of a request and the headers of an
+answer, and an object store can repeat the link in a header.
+
+Limits: a publish that stops after `begin_artifact_version` leaves a pending
+version, which the platform removes after 24 hours. Until the platform and
+Nerve both run a release with artifacts, a call is refused with a clear
+error.
 
 ## Auth
 
@@ -2817,7 +2966,7 @@ bootstrap.
 | Value | Behavior |
 |---|---|
 | Unset or empty | The system actor keeps its ID. |
-| A UUID in canonical lower-case form, for example `00000000-0000-4000-8000-000000000001` | The system actor gets this ID when no row refers to the system actor, no other actor has the ID, and the system actor did not take an ID from this variable before. Otherwise the system actor keeps its current ID and Nerve logs a warning. See [The system actor in external mode](accounts.md#the-system-actor-in-external-mode). |
+| A UUID in canonical lower-case form, for example `00000000-0000-4000-8000-000000000001` | The system actor gets this ID when no row refers to the system actor, no other actor has the ID, and the system actor did not take an ID from this variable before. A database that is marked as migrated gets the ID together with the rows that refer to the system actor, once (see [A database from another installation](accounts.md#a-database-from-another-installation)). Otherwise the system actor keeps its current ID and Nerve logs a warning. See [The system actor in external mode](accounts.md#the-system-actor-in-external-mode). |
 | Any other value, also a UUID in upper case | The system actor keeps its ID and Nerve logs a warning. The server starts. |
 
 Set the variable before the first `nerve init` or start, so that the change

@@ -1,0 +1,11 @@
+{
+  "scripts": {
+    "deck.js": "src/kit/entries/deck.ts",
+    "table.js": "src/kit/entries/table.ts",
+    "markdown.js": "src/kit/entries/markdown.tsx"
+  },
+  "styles": {
+    "kit.css": "src/kit/kit.css",
+    "deck.css": "src/kit/deck.css"
+  }
+}

@@ -11,16 +11,10 @@ events.
 A provider needs no Slack-shaped config section. A setting that its config
 does not have gets the default of :class:`HostedChannelSettings`.
 
-A provider that is switched off does one of two things with its events. The
-gateway keeps the events of every provider in one ordered inbox, so the two
-choices are to hold all of them or to refuse those of the provider:
-
-- With ``hold_while_off``, its channel takes no events, and the inbox reader
-  stops reading until a reload switches the provider on. The events wait in
-  the gateway inbox, also those of the other providers. Slack does this.
-- Without it, which is the default, its channel rejects each of its events,
-  and the reader continues with the events of the other providers. Email
-  does this.
+While a provider is switched off, its channel rejects each of its events,
+and the inbox reader continues with the events of the other providers. The
+gateway keeps the events of every provider in one ordered inbox, so a
+channel that took no events would stop the reading for every provider.
 """
 
 from __future__ import annotations
@@ -73,10 +67,8 @@ class HostedChatProvider:
     name of its channel. ``hosted`` says whether the config puts the
     provider in hosted mode; the runtime reads it once, at startup.
     ``switched_on`` and ``settings`` are read for each use, so they follow a
-    reload. ``hold_while_off`` says what the channel does with events while
-    the provider is switched off (see the module docstring).
-    ``channel_options`` gives the provider's presentation rules, as keyword
-    arguments of :class:`~nerve.channels.hosted.channel.HostedChannel`:
+    reload. ``channel_options`` gives the provider's presentation rules, as
+    keyword arguments of :class:`~nerve.channels.hosted.channel.HostedChannel`:
     ``is_id``, ``reaction_names`` and ``button_style``. A provider without
     them gets the channel's defaults. ``subscribes`` says that the gateway
     takes the provider's events only for an agent whose ``subscriptions``
@@ -93,7 +85,6 @@ class HostedChatProvider:
     hosted: Callable[[NerveConfig], bool]
     switched_on: Callable[[NerveConfig], bool]
     settings: Callable[[NerveConfig], HostedChannelSettings] = _no_settings
-    hold_while_off: bool = False
     channel_options: Callable[[], dict[str, Any]] = _no_options
     subscribes: bool = False
     outbound_setting: str = ""
@@ -145,7 +136,6 @@ SLACK = HostedChatProvider(
     hosted=_slack_hosted,
     switched_on=_slack_switched_on,
     settings=_slack_settings,
-    hold_while_off=True,
     channel_options=_slack_channel_options,
     outbound_setting="slack.allow_outbound",
 )

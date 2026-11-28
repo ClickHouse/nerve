@@ -1,3 +1,4 @@
+import { isPublishArtifactTool } from './tools/publishedArtifact';
 import type { MessageBlock, ThinkingBlockData, ToolCallBlockData } from '../../types/chat';
 import type { RenderItem, ToolBurst } from '../../types/renderBlocks';
 import { formatMcpName } from '../../utils/formatMcpName';
@@ -36,6 +37,7 @@ export function isPinnedCall(
   if (block.tool === 'AskUserQuestion' || block.tool === 'ExitPlanMode') return true;
   const baseName = toolBaseName(block.tool);
   if (isAskFormTool(block.tool) || baseName === 'ask_user' || baseName === 'send_file') return true;
+  if (isPublishArtifactTool(block.tool)) return true;
   if (baseName === 'plan_propose' || baseName === 'plan_update') return true;
   return workflowRunCardId(block) !== null && !repeatRunCalls.has(block.toolUseId);
 }

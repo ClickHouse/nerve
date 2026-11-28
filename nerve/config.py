@@ -2170,6 +2170,11 @@ class GitHubSyncConfig:
     # pull requests and deliver a record when one changes (state, head
     # commit, review, CI, or a comment).
     pr_watch: bool = True
+    # Hosted mode only: tell the gateway that Nerve takes one record for each
+    # comment, review and description of a thread (github_thread_item), where
+    # the gateway offers them. false keeps the one record per thread. Follows
+    # a reload.
+    thread_items: bool = True
     # Which notification threads are listed, in both modes.
     # "participating": only the threads the account takes part in (GitHub's
     # participating=true), such as mentions, assignments and review requests.
@@ -2198,6 +2203,7 @@ class GitHubSyncConfig:
         return cls(
             mode=mode,
             pr_watch=d.get("pr_watch", True),
+            thread_items=d.get("thread_items", True),
             inbox=inbox,
             enabled=d.get("enabled", True),
             schedule=d.get("schedule", "*/15 * * * *"),
@@ -2248,14 +2254,43 @@ class GitHubEventsSyncConfig:
 
 # What the GitHub Repos source can report from a repository (see
 # GitHubReposSyncConfig.types), and what it reports when nothing is said.
-GITHUB_REPOS_TYPES: tuple[str, ...] = ("pull_request", "issue", "release")
+GITHUB_REPOS_TYPES: tuple[str, ...] = ("pull_request", "issue", "release", "commit")
 GITHUB_REPOS_DEFAULT_TYPES: tuple[str, ...] = ("pull_request", "issue")
 # The most repositories the source follows; the channel gateway's bound too.
 GITHUB_REPOS_MAX_REPOS = 50
+# The most branches of one repository whose commits the source follows, and
+# the most bytes that a repository's name and a branch's name have together
+# (the id of a commit record names both). The channel gateway's bounds too.
+GITHUB_REPOS_MAX_BRANCHES = 8
+GITHUB_REPOS_MAX_BRANCH_KEY_BYTES = 194
+# A branch whose commits the source can follow: a letter or a digit, then up
+# to 120 letters, digits, "_", ".", "/" and "-". It is the branch's name and
+# not a ref, so it does not start with "refs/": the source asks GitHub for
+# refs/heads/<branch>. The channel gateway checks the same.
+_GITHUB_BRANCH_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_./-]{0,120}")
+_GITHUB_REF_PREFIX = "refs/"
 # A repository as GitHub names it: an owner of 1 to 39 letters, digits and
 # hyphens that starts with a letter or a digit, then a name of 1 to 100
 # letters, digits, ".", "_" and "-". The channel gateway checks the same.
 _GITHUB_REPO_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}")
+
+
+def github_repos_branch_ok(repo: str, branch: str) -> bool:
+    """Whether the GitHub Repos source can follow the commits of *branch* of *repo*.
+
+    The name has the shape of :data:`_GITHUB_BRANCH_NAME_RE`, no ``..`` and no
+    ``.lock`` at its end, and with the repository's name it stays within
+    :data:`GITHUB_REPOS_MAX_BRANCH_KEY_BYTES`. A name that starts with
+    ``refs/`` is refused: a branch is named without its ref prefix, so that
+    ``main`` and ``refs/heads/main`` cannot both be followed.
+    """
+    return (
+        _GITHUB_BRANCH_NAME_RE.fullmatch(branch) is not None
+        and ".." not in branch
+        and not branch.endswith(".lock")
+        and not branch.startswith(_GITHUB_REF_PREFIX)
+        and len(repo.encode()) + len(branch.encode()) <= GITHUB_REPOS_MAX_BRANCH_KEY_BYTES
+    )
 
 
 def _switched_on(value: object) -> bool:
@@ -2350,6 +2385,94 @@ def _github_repos_types(value: object) -> list[str]:
     return [kind for kind in GITHUB_REPOS_TYPES if kind in chosen]
 
 
+def _github_repos_branches(
+    value: object, repos: list[str], *, enabled: bool, commits: bool,
+) -> dict[str, list[str]]:
+    """``sync.github_repos.branches``: the branches to follow, by repository.
+
+    The setting is read only with the ``commit`` type (*commits*). Without
+    it, a value that names something is ignored, with one warning.
+
+    A mapping of a repository of ``repos`` (GitHub's names ignore case) to one
+    branch or a list of branches, each a string; a blank one is left out, and
+    a repository without a value names none. It is returned under the names
+    that *repos* spells. While the watch is on (*enabled*), anything else
+    refuses to load: a value that is no mapping, a repository that ``repos``
+    does not list or that the mapping names twice, a branch that is not a
+    string, that :func:`github_repos_branch_ok` refuses, or that is named
+    twice, and more than :data:`GITHUB_REPOS_MAX_BRANCHES` branches. A branch
+    that is not a string is one that YAML read as something else, and the
+    message says to quote it: an unquoted ``1.10`` is the number ``1.1``, and
+    ``no``, ``off`` and ``0`` are values that are no names. While the watch is
+    off, those are logged in one warning and left out.
+    """
+    if value is None or value == "":
+        return {}
+    if not commits:
+        if value:
+            logger.warning(
+                "sync.github_repos.branches is set, and sync.github_repos.types does not name "
+                "commit: the branches are not read",
+            )
+        return {}
+    problems: list[str] = []
+
+    def refuse(problem: str) -> None:
+        if enabled:
+            raise ValueError(f"sync.github_repos.branches {problem}")
+        problems.append(problem)
+
+    branches: dict[str, list[str]] = {}
+    if not isinstance(value, dict):
+        refuse(f"must map owner/repo names to their branches, got {str(value)!r}")
+        value = {}
+    watched = {name.lower(): name for name in repos}
+    for key, entry in value.items():
+        repo = watched.get(str(key or "").strip().lower())
+        if repo is None:
+            refuse(f"names {str(key)!r}, which sync.github_repos.repos does not list")
+            continue
+        if repo in branches:
+            refuse(f"names {repo!r} twice")
+            continue
+        # A repository without a value names no branch, as an empty list does.
+        items = (
+            list(entry) if isinstance(entry, (list, tuple)) else [] if entry is None else [entry]
+        )
+        unquoted = [item for item in items if not isinstance(item, str)]
+        if unquoted:
+            refuse(
+                f"of {repo!r} must name each branch as a string, got {unquoted[0]!r}: put the "
+                "name in quotes, since YAML reads an unquoted 1.10 as the number 1.1, and an "
+                "unquoted no, off or 0 as a value that is no name"
+            )
+            continue
+        names = [name for name in (item.strip() for item in items) if name]
+        bad = [name for name in names if not github_repos_branch_ok(repo, name)]
+        if bad:
+            refuse(
+                f"of {repo!r} must be branch names of letters, digits, '_', '.', '/' and '-' "
+                "that start with a letter or a digit, without '..', not starting with 'refs/' "
+                f"and not ending in '.lock', at most {GITHUB_REPOS_MAX_BRANCH_KEY_BYTES} bytes "
+                f"together with the repository's name, got {bad[0]!r}"
+            )
+        elif len(set(names)) < len(names):
+            refuse(f"of {repo!r} name a branch twice")
+        elif len(names) > GITHUB_REPOS_MAX_BRANCHES:
+            refuse(
+                f"of {repo!r} must name at most {GITHUB_REPOS_MAX_BRANCHES} branches, "
+                f"got {len(names)}"
+            )
+        else:
+            branches[repo] = names
+    if problems:
+        logger.warning(
+            "sync.github_repos is switched off, and its branches would refuse to load once "
+            "it is switched on: sync.github_repos.branches %s", "; ".join(problems),
+        )
+    return {repo: names for repo, names in branches.items() if names}
+
+
 @dataclass
 class GitHubReposSyncConfig:
     """Config for the GitHub Repos source: repositories the agent follows.
@@ -2357,7 +2480,8 @@ class GitHubReposSyncConfig:
     Unlike ``github`` (notifications) and ``github_events`` (your own
     activity), this source watches an explicit set of repositories that the
     account need not take part in, and reports new pull requests, issues and
-    releases there (``types``). ``repos`` is required: an empty list makes the
+    releases there, and the new commits of its branches (``types``,
+    ``branches``). ``repos`` is required: an empty list makes the
     source a no-op. With ``sync.github.mode: hosted`` the channel gateway
     polls the repositories for the agent, as it polls the notifications;
     otherwise this process polls them with the gh CLI. All of it follows a
@@ -2369,17 +2493,25 @@ class GitHubReposSyncConfig:
     # watch is on, anything else refuses to load (while it is off, a
     # warning). Required; empty = no-op.
     repos: list[str] = field(default_factory=list)
-    # What is reported: pull_request, issue, release (GITHUB_REPOS_TYPES).
-    # An unknown type or an empty list refuses to load.
+    # What is reported: pull_request, issue, release, commit
+    # (GITHUB_REPOS_TYPES). An unknown type or an empty list refuses to load.
     types: list[str] = field(default_factory=lambda: list(GITHUB_REPOS_DEFAULT_TYPES))
+    # With the commit type: the branches whose new commits are reported, by
+    # repository (a name of repos; case does not matter). A repository
+    # without an entry reports its default branch. At most
+    # GITHUB_REPOS_MAX_BRANCHES each; while the watch is on, a name that is
+    # not a string or that github_repos_branch_ok refuses, or a repository
+    # that repos does not list, refuses to load. Without the commit type the
+    # setting is not read, and a value there is ignored with a warning.
+    branches: dict[str, list[str]] = field(default_factory=dict)
     # Also report the pull requests and issues that a GitHub App or a "[bot]"
     # account opened. A release is reported whoever published it.
     include_bots: bool = False
     # Report a draft pull request when it is opened. false: report it when it
     # is marked ready for review (event "ready") instead.
     include_drafts: bool = True
-    # Also report a new head commit, ready for review, merge and close of the
-    # pull requests already reported.
+    # Also report a new head commit, ready for review, merge, close and
+    # reopening of the pull requests already reported.
     updates: bool = False
     # Case-insensitive globs on the author's login; the guardrail rules
     # (deny wins). Dropped before anything is stored.
@@ -2390,16 +2522,28 @@ class GitHubReposSyncConfig:
     prompt_hint: str = ""
     model: str = ""
 
+    def branches_of(self, repo: str) -> list[str]:
+        """The branches of *repo* that ``branches`` names; none: its default branch."""
+        wanted = repo.strip().lower()
+        for name, names in (self.branches or {}).items():
+            if str(name).strip().lower() == wanted:
+                return [str(branch) for branch in names or ()]
+        return []
+
     @classmethod
     @_coerced
     def from_dict(cls, d: dict) -> GitHubReposSyncConfig:
+        enabled = _switched_on(d.get("enabled", False))
+        repos = _github_repos_names(d.get("repos"), enabled=enabled)
+        types = _github_repos_types(d.get("types"))
         return cls(
             enabled=d.get("enabled", False),
             schedule=d.get("schedule", "*/15 * * * *"),
-            repos=_github_repos_names(
-                d.get("repos"), enabled=_switched_on(d.get("enabled", False)),
+            repos=repos,
+            types=types,
+            branches=_github_repos_branches(
+                d.get("branches"), repos, enabled=enabled, commits="commit" in types,
             ),
-            types=_github_repos_types(d.get("types")),
             include_bots=d.get("include_bots", False),
             include_drafts=d.get("include_drafts", True),
             updates=d.get("updates", False),
@@ -2713,15 +2857,38 @@ DEFAULT_DELIVERY_DEBOUNCE_SECONDS = 60
 MAX_DELIVERY_DEBOUNCE_SECONDS = 600
 
 
-def _delivery_debounce(value: object) -> int:
-    """Coerce ``cron.delivery_debounce_seconds``, holding it at or above 0."""
-    seconds = _lenient_int(
-        value, DEFAULT_DELIVERY_DEBOUNCE_SECONDS, label="cron.delivery_debounce_seconds",
-    )
+# How long after the start of a job's last run a hosted delivery leaves its
+# records to a scheduled run of the job that comes within that time.
+DEFAULT_DELIVERY_MIN_INTERVAL_SECONDS = 1800
+# The longest interval the cron service applies; a larger value is used as
+# this, and `nerve config validate` says so. It is shorter than the time a
+# consumer's cursor has left after a run of the job (half of
+# sync.consumer_cursor_ttl_days or more), so a record that waits for a
+# scheduled run is still unread when that run comes.
+MAX_DELIVERY_MIN_INTERVAL_SECONDS = 21600
+
+
+def _seconds_from_zero(value: object, default: int, label: str) -> int:
+    """Coerce a whole number of seconds, holding it at or above 0."""
+    seconds = _lenient_int(value, default, label=label)
     if seconds >= 0:
         return seconds
-    logger.warning("cron.delivery_debounce_seconds is %r, below 0; using 0", value)
+    logger.warning("%s is %r, below 0; using 0", label, value)
     return 0
+
+
+def _delivery_debounce(value: object) -> int:
+    """Coerce ``cron.delivery_debounce_seconds``, holding it at or above 0."""
+    return _seconds_from_zero(
+        value, DEFAULT_DELIVERY_DEBOUNCE_SECONDS, "cron.delivery_debounce_seconds",
+    )
+
+
+def _delivery_min_interval(value: object) -> int:
+    """Coerce ``cron.delivery_min_interval_seconds``, holding it at or above 0."""
+    return _seconds_from_zero(
+        value, DEFAULT_DELIVERY_MIN_INTERVAL_SECONDS, "cron.delivery_min_interval_seconds",
+    )
 
 
 @dataclass
@@ -2738,6 +2905,13 @@ class CronConfig:
     # run. 0 runs them as soon as the records are in the inbox; at most
     # MAX_DELIVERY_DEBOUNCE_SECONDS applies. Read per delivery.
     delivery_debounce_seconds: int = DEFAULT_DELIVERY_DEBOUNCE_SECONDS
+    # A delivery starts no run of a job whose last run, however it was
+    # started, started less than this many seconds ago and whose schedule is
+    # forecast to run it again before that time is over. The records wait in
+    # the inbox for that scheduled run, so a steady stream of deliveries does
+    # not become a run for each burst. 0 runs the jobs for every burst; at
+    # most MAX_DELIVERY_MIN_INTERVAL_SECONDS applies. Read per delivery.
+    delivery_min_interval_seconds: int = DEFAULT_DELIVERY_MIN_INTERVAL_SECONDS
 
     @classmethod
     @_coerced
@@ -2769,6 +2943,9 @@ class CronConfig:
             system_file=system_file,
             gate_plugins_dir=gate_plugins_dir,
             delivery_debounce_seconds=_delivery_debounce(d.get("delivery_debounce_seconds")),
+            delivery_min_interval_seconds=_delivery_min_interval(
+                d.get("delivery_min_interval_seconds"),
+            ),
         )
 
 
@@ -3542,6 +3719,150 @@ class McpAppsConfig:
         return cls(enabled=d.get("enabled", False))
 
 
+#: The refused viewer origins that this process logged already: a config is
+#: built again at every reload.
+_refused_viewer_origins: set[str] = set()
+
+
+def _viewer_origin(value: Any) -> str:
+    """``value`` as the origin of the artifact viewer, in lower case, or
+    ``""`` when it is not one.
+
+    An origin is ``http://`` or ``https://``, a host and an optional port,
+    with the rules of ``gateway.public_url`` (a ``/`` at the end is
+    dropped). A refused value gives ``""`` and one warning: then the web chat
+    shows each published artifact as a link, and nothing stops. A value that
+    still holds a ``${VAR}`` reference gives ``""`` without a warning.
+    """
+    origin = "" if value is None else str(value).strip()
+    if not origin or "${" in origin:
+        return ""
+    address = origin.rstrip("/")
+    match = _PUBLIC_URL_RE.fullmatch(address)
+    if match and (match["port"] is None or 0 < int(match["port"]) <= 65535):
+        return address.lower()
+    if origin not in _refused_viewer_origins:
+        _refused_viewer_origins.add(origin)
+        logger.warning(
+            "artifacts.viewer_origin must be an origin: http:// or https://, a "
+            "host name or an IP address, an optional port, and nothing after "
+            "it; the web chat shows published artifacts as links",
+        )
+    return ""
+
+
+def _is_loopback_host(host: str) -> bool:
+    """A name or an address of this machine only: ``localhost``, a name
+    below ``.localhost``, or a loopback IP address."""
+    import ipaddress
+
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def upload_origin(value: str) -> tuple[str, str, int] | None:
+    """The origin of an absolute ``http`` or ``https`` address as
+    ``(scheme, host, port)``, or None.
+
+    The rules, for an entry of ``artifacts.upload_origins`` and for an upload
+    link alike: the address is parsed with :func:`urllib.parse.urlsplit`; it
+    has no user information; the scheme and the host are in lower case; one
+    dot at the end of the host is dropped; the host is ASCII; the port is the
+    one of the address, else 443 for ``https`` and 80 for ``http``.
+    """
+    from urllib.parse import urlsplit
+
+    if not isinstance(value, str) or any(c.isspace() for c in value):
+        return None
+    try:
+        parts = urlsplit(value)
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").rstrip(".") if parts.hostname and not parts.hostname.endswith("..") else ""
+    if scheme not in ("https", "http") or not host or "@" in parts.netloc or not host.isascii():
+        return None
+    return scheme, host.lower(), port if port is not None else (443 if scheme == "https" else 80)
+
+
+def _upload_origins(value: Any) -> tuple[str, ...]:
+    """``artifacts.upload_origins``: a list, or one text with the origins
+    separated by commas (the ``${VAR}`` form). Each entry is an origin and
+    nothing more. ``https`` only; ``http`` only for a loopback host (a local
+    stack). Any other entry stops the start with :class:`ConfigError`."""
+    if value is None or value == "":
+        return ()
+    items = value.split(",") if isinstance(value, str) else value
+    if not isinstance(items, (list, tuple)):
+        raise ConfigError("artifacts.upload_origins must be a list of origins")
+    origins: list[str] = []
+    for item in items:
+        text = str(item).strip().rstrip("/") if item is not None else ""
+        if not text:
+            continue
+        origin = upload_origin(text)
+        if origin is None or text.count("/") != 2 or "?" in text or "#" in text:
+            raise ConfigError(
+                f"artifacts.upload_origins: {text!r} is not an origin (https://host[:port], nothing after it)",
+            )
+        scheme, host, port = origin
+        if scheme == "http" and not _is_loopback_host(host):
+            raise ConfigError(
+                f"artifacts.upload_origins: {text!r} is http; only https is allowed, "
+                "except for a loopback host of a local stack",
+            )
+        origins.append(f"{scheme}://{f'[{host}]' if ':' in host else host}:{port}")
+    return tuple(dict.fromkeys(origins))
+
+
+@dataclass
+class ArtifactsConfig:
+    """Artifacts: static bundles of workspace files that a person sees.
+
+    With ``preview`` on, the web chat has a Preview tab in its side panel. It
+    shows an HTML page, a folder with an ``index.html``, an image, a Markdown
+    file or a CSV file of the workspace, in the sandbox frame that widgets
+    use, with no network; a file of these kinds that the agent sends with
+    ``send_file`` shows the same page under its card, and the system prompt
+    tells the model so. The
+    gateway serves the sandbox document for it, in local mode and in external
+    mode. MCP App views and widgets keep their own switch (``mcp_apps``).
+    Off by default; see docs/web-ui.md.
+
+    With ``publish`` on, in external mode only, the agent has the tool
+    ``publish_artifact`` and the Preview tab has a Publish button: both send
+    a bundle to the platform through the artifacts MCP server
+    (``nerve/artifacts/publish.py``). ``viewer_origin`` is the scheme and
+    host of the viewer of the platform: the web chat shows a published
+    artifact in a frame only when its address has exactly this origin.
+    ``upload_origins`` is the list of origins of the object
+    store: the runtime sends file bytes only to an upload link of one of
+    them, and publishes nothing while the list is empty.
+    """
+
+    preview: bool = False
+    publish: bool = False
+    viewer_origin: str = ""
+    # The origins of the object store to which the runtime may send file
+    # bytes, each as ``scheme://host:port`` (``upload_origin``).
+    upload_origins: tuple[str, ...] = ()
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: dict) -> ArtifactsConfig:
+        return cls(
+            preview=d.get("preview", False),
+            publish=d.get("publish", False),
+            viewer_origin=_viewer_origin(d.get("viewer_origin")),
+            upload_origins=_upload_origins(d.get("upload_origins")),
+        )
+
+
 @dataclass
 class ExternalAgentTargetConfig:
     """One configured external agent (Codex, Claude Code, ...).
@@ -3617,10 +3938,14 @@ _CODEX_SANDBOX_MODES = ("read-only", "workspace-write", "danger-full-access")
 
 # $/1M tokens; cached input bills at the discounted rate. Config values
 # under codex.pricing REPLACE entries per model key (dict deep-merge).
-# GPT-6 Astra's long-context tier (requests above 272K input tokens bill
-# 2x input / 1.5x output) is not modelled: the app-server reports usage
-# per turn, not per request, so the threshold cannot be attributed.
+# The long-context tier (requests above 272K input tokens bill 2x input /
+# 1.5x output) is not modelled: the app-server reports usage per turn,
+# not per request, so the threshold cannot be attributed.
 _DEFAULT_CODEX_PRICING: dict[str, dict[str, float]] = {
+    "gpt-6.2-astra":  {"input": 8.0,  "cached_input": 0.4,  "output": 40.0},
+    "gpt-6.2-sol":    {"input": 2.0,  "cached_input": 0.1,  "output": 10.0},
+    "gpt-6.1-terra":  {"input": 1.0,  "cached_input": 0.05, "output": 5.0},
+    "gpt-6-luna":     {"input": 0.1,  "cached_input": 0.01, "output": 0.5},
     "gpt-6-astra":    {"input": 10.0, "cached_input": 1.0,  "output": 50.0},
     "gpt-5.6-sol":    {"input": 5.0,  "cached_input": 0.5,  "output": 30.0},
     "gpt-5.6-terra":  {"input": 2.5,  "cached_input": 0.25, "output": 15.0},
@@ -3630,13 +3955,15 @@ _DEFAULT_CODEX_PRICING: dict[str, dict[str, float]] = {
 # The OpenAI models of the composer's model menu when ``codex.models`` is
 # unset: the newest model of each tier, largest first. Update it when a tier
 # gets a new model. A model shows only when the account's catalog serves it,
-# hidden entries included: GPT-6 Astra is hidden upstream on purpose
-# (API-key accounts; codex-cli 0.153.1+).
+# hidden entries included. The catalog serves GPT-6.2 only to codex-cli
+# 0.166.0 or newer, and the catalog of codex-cli 0.155.1 has none of these
+# models, so its menu shows only ``codex.model``. See ``TESTED_CLI_VERSION``
+# in nerve/agent/backends/codex/backend.py.
 _DEFAULT_CODEX_MODELS: tuple[str, ...] = (
-    "gpt-6-astra",
-    "gpt-5.6-sol",
-    "gpt-5.6-terra",
-    "gpt-5.6-luna",
+    "gpt-6.2-astra",
+    "gpt-6.2-sol",
+    "gpt-6.1-terra",
+    "gpt-6-luna",
 )
 
 
@@ -3725,7 +4052,7 @@ class CodexConfig:
 
     bin_path: str = "codex"                 # PATH-resolved codex binary
     min_version: str = "0.153.1"            # inclusive tested protocol range
-    max_version: str = "0.165.0"            # exclusive
+    max_version: str = "0.173.0"            # exclusive
     home_dir: str = field(default_factory=lambda: str(paths.nerve_path("codex")))  # isolated CODEX_HOME (auth/config/sessions)
     model: str = "gpt-5.6-sol"
     cron_model: str = ""                    # empty → model
@@ -3803,7 +4130,7 @@ class CodexConfig:
         return cls(
             bin_path=str(d.get("bin_path", "codex")),
             min_version=str(d.get("min_version", "0.153.1")),
-            max_version=str(d.get("max_version", "0.165.0")),
+            max_version=str(d.get("max_version", "0.173.0")),
             home_dir=_setting_str(
                 d.get("home_dir"), str(paths.nerve_path("codex"))
             ),
@@ -4307,6 +4634,7 @@ class NerveConfig:
     files: FilesConfig = field(default_factory=FilesConfig)
     mcp_endpoint: McpEndpointConfig = field(default_factory=McpEndpointConfig)
     mcp_apps: McpAppsConfig = field(default_factory=McpAppsConfig)
+    artifacts: ArtifactsConfig = field(default_factory=ArtifactsConfig)
     mcp_servers: list[McpServerConfig] = field(default_factory=list)
     # Base URL of the MCP gateway, without a trailing "/". In external mode
     # Nerve takes its MCP servers only from the gateway's catalog and does not
@@ -4403,6 +4731,13 @@ class NerveConfig:
         gateway shows views is decided at its startup, in local mode only
         (:func:`nerve.gateway.mcp_apps_sandbox.serves_sandbox`)."""
         return bool(self.mcp_apps.enabled)
+
+    @property
+    def artifacts_preview_active(self) -> bool:
+        """True when the Preview tab is enabled in the configuration. The
+        gateway decides at its startup whether it serves the sandbox document
+        for previews (:func:`nerve.gateway.mcp_apps_sandbox.serves_preview`)."""
+        return bool(self.artifacts.preview)
 
     @property
     def outbound_channels(self) -> list[str]:
@@ -4804,6 +5139,7 @@ class NerveConfig:
             files=FilesConfig.from_dict(d.get("files", {})),
             mcp_endpoint=McpEndpointConfig.from_dict(d.get("mcp_endpoint", {})),
             mcp_apps=McpAppsConfig.from_dict(d.get("mcp_apps") or {}),
+            artifacts=ArtifactsConfig.from_dict(d.get("artifacts") or {}),
             mcp_servers=_parse_mcp_servers(d),
             mcp_gateway_url=_normalize_mcp_gateway_url(d.get("mcp_gateway_url")),
             external_agents=ExternalAgentsConfig.from_dict(d.get("external_agents", {})),

@@ -5,6 +5,10 @@ sign-in, because the browser fetches it without the panel's token. The
 subscription routes let a person turn push on in a browser, and see and
 remove the browsers of that person. Delivery is in
 :mod:`nerve.notifications.webpush`.
+
+In external mode the platform delivers Web Push and keeps the browsers, so
+only :data:`manifest_router` is registered, and :data:`router` with the
+subscription routes is not.
 """
 
 from __future__ import annotations
@@ -25,6 +29,9 @@ from nerve.identity import Actor
 from nerve.notifications import webpush
 from nerve.onboarding import read_agent_name
 
+#: The app manifest, in both modes.
+manifest_router = APIRouter()
+#: The subscription routes, in local mode only.
 router = APIRouter()
 
 MANIFEST_MEDIA_TYPE = "application/manifest+json"
@@ -44,7 +51,7 @@ _PERSON_ONLY = "Push notifications are for a person, not for a system or MCP tok
 _TOO_MANY = f"Push is on in {MAX_PUSH_SUBSCRIPTIONS} browsers already. Remove one first."
 
 
-@router.get("/api/manifest.webmanifest", include_in_schema=False)
+@manifest_router.get("/api/manifest.webmanifest", include_in_schema=False)
 async def manifest():
     workspace = Path(get_config().workspace)
     name = await asyncio.to_thread(read_agent_name, workspace) or webpush.DEFAULT_AGENT_NAME

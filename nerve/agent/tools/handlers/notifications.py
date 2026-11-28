@@ -526,7 +526,8 @@ async def send_channel_message_handler(ctx: ToolContext, args: dict) -> ToolResu
         )
 
     if decision.allowed:
-        return ToolResult.text(f"Message sent to {channel} target {target}.")
+        thread = f" To reply in its thread, use target {decision.thread_target}." if decision.thread_target else ""
+        return ToolResult.text(f"Message sent to {channel} target {target}.{thread}")
     return ToolResult.text(
         f"Refused: cannot send to {channel} target {target} — {decision.reason}"
     )
@@ -615,9 +616,11 @@ SEND_FILE_SPEC = ToolSpec(
     description=(
         "Send a file to the user as a downloadable attachment in the chat. "
         "On Telegram the file is delivered as a document. On the web panel an image (PNG, JPEG, "
-        "GIF, WebP, AVIF, SVG) shows in the chat, and another file shows as a download card. "
-        "Use this when the user asks you to share, export, or send them a file, or to show "
-        "them an image such as a screenshot or a chart."
+        "GIF, WebP, AVIF, SVG) shows in the chat, and another file shows as a download card; "
+        "where the Rendering line of the session context says so, an .html, .md or .csv file "
+        "also shows as a page under its card. Use this when the user asks you to share, export, "
+        "or send them a file, or to show them an image such as a screenshot or a chart, or a "
+        "page or a table."
     ),
     input_schema=SEND_FILE_SCHEMA,
     handler=send_file_handler,

@@ -8,6 +8,7 @@ import time
 
 from fastapi import APIRouter, Depends
 from fastapi import HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from nerve.config import get_config
@@ -323,9 +324,29 @@ class ViewerActor(BaseModel):
     username: str | None = None
 
 
+class ViewerPreview(BaseModel):
+    """The Preview tab is on (``artifacts.preview``): the most bytes that
+    the files of one preview may have together."""
+
+    max_bytes: int
+
+
+class ViewerArtifacts(BaseModel):
+    """External mode only: whether the Preview tab has the Publish button
+    (``artifacts.publish``), and the origin of the artifact viewer whose
+    addresses the chat shows in a frame (``artifacts.viewer_origin``)."""
+
+    publish: bool
+    viewer_origin: str | None
+
+
 class ViewerResponse(BaseModel):
     actor: ViewerActor
     account: AccountOut | None
+    # Only while the gateway serves previews; absent otherwise.
+    preview: ViewerPreview | None = None
+    # Only in external mode with artifacts.publish or artifacts.viewer_origin.
+    artifacts: ViewerArtifacts | None = None
 
 
 @router.get("/api/auth/me", response_model=ViewerResponse)
@@ -334,14 +355,34 @@ async def who_am_i(actor: Actor = Depends(require_auth)):
 
     The web UI compares message and session authors with ``actor``.
     ``account`` is ``None`` for a credential without an account, such as the
-    system principal's.
+    system principal's. ``preview`` is there only while the gateway serves
+    the Preview tab (``nerve/gateway/routes/preview.py``). ``artifacts`` is
+    there only in external mode with ``artifacts.publish`` or
+    ``artifacts.viewer_origin`` set (``nerve/gateway/routes/artifacts.py``).
     """
     db = get_deps().db
     ref = await db.get_actor_ref(actor.actor_id)
     if ref is None:  # pragma: no cover - require_auth resolved it a moment ago
         raise HTTPException(status_code=401, detail="This credential names no actor")
     account = await db.get_account(actor.account_id) if actor.account_id else None
-    return ViewerResponse(
+    body = ViewerResponse(
         actor=ViewerActor(**actor_out(ref)),
         account=await _render(db, account) if account else None,
-    )
+    ).model_dump(mode="json", by_alias=True)
+    body.pop("preview")
+    body.pop("artifacts")
+    if get_deps().preview_serving:
+        from nerve.gateway.routes.preview import PREVIEW_MAX_BYTES
+
+        body["preview"] = ViewerPreview(max_bytes=PREVIEW_MAX_BYTES).model_dump()
+    from nerve.artifacts.publish import publish_settings
+
+    # The settings pinned at start; external mode only. As it is without
+    # them: no ``artifacts`` member.
+    artifacts = publish_settings(get_config())
+    if artifacts.publish or artifacts.viewer_origin:
+        body["artifacts"] = ViewerArtifacts(
+            publish=artifacts.publish, viewer_origin=artifacts.viewer_origin or None,
+        ).model_dump()
+    # As it is, so that the answer has no ``preview`` member while it is off.
+    return JSONResponse(body)

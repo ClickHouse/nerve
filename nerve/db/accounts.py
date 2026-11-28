@@ -49,6 +49,21 @@ SYSTEM_ACTOR_ID_TAKEN = "another actor already has the new ID"
 # secrets (nerve.backup._scrub_instance_secrets).
 SYSTEM_PRINCIPAL_CLAIM_NAME = "system_principal_id"
 
+# The ``instance_secrets`` row that marks a database whose state was moved
+# here from another installation, so its system actor has an ID and a history
+# from there. Nerve never writes ``true``: whatever moved the state does.
+# While the value is ``true``, AccountStore._rekey_system_actor gives the
+# system actor the system principal ID although rows refer to it: it changes
+# those rows to the new ID and sets the value to ``false`` in the same
+# transaction as the change of the ID, so a mark is used at most once. Any
+# other value, and no row, mean that the mark is not set. Like the claim it
+# is instance state, not a secret, but a backup made with ``--no-secrets``
+# does not keep it: a restored database that lost the mark keeps its ID, as
+# an unmarked one does.
+SYSTEM_ACTOR_MIGRATION_NAME = "system_actor_migration_pending"
+SYSTEM_ACTOR_MIGRATION_PENDING = "true"
+SYSTEM_ACTOR_MIGRATION_DONE = "false"
+
 
 def _already_claimed(claimed_id: str) -> str:
     return f"the system actor already took the ID {claimed_id} once, and its ID changes only once"
@@ -188,6 +203,13 @@ class SystemActorRekey:
     actor_id: str
     # Why the ID did not change, or ``None``.
     blocker: str | None = None
+    # True when the change includes the rows that refer to the system actor,
+    # because the database is marked as migrated
+    # (:data:`SYSTEM_ACTOR_MIGRATION_NAME`).
+    migrated: bool = False
+    # How many references the change gave the new ID: one for each column of
+    # a row that held the old ID. Zero for a preview.
+    moved_references: int = 0
 
     @property
     def changed(self) -> bool:
@@ -223,6 +245,10 @@ def _rekey_probes(
     from the schema, never from a caller. Each comparison uses ``COLLATE
     BINARY``, as the foreign key does with ``actor_refs.id``, so the declared
     collation of a column is never loaded.
+
+    For a database that is marked as migrated, the callers give no columns:
+    the rows that refer to the current ID change with it, so only the check
+    that no other actor has the new ID remains.
     """
     probes = [
         _Probe(
@@ -349,15 +375,18 @@ class AccountStore:
             return [(row[0], row[1]) async for row in cursor]
 
     async def _system_actor_rekey_blocker(
-        self, current_id: str, new_id: str,
+        self, current_id: str, new_id: str, *, migrated: bool = False,
     ) -> str | None:
         """Why the system actor cannot change from ``current_id`` to ``new_id``.
 
         ``None`` when no actor has ``new_id`` and no column with a foreign key
         to ``actor_refs`` holds ``current_id``. A check that cannot run is a
         reason too, so the ID changes only when every check found no row.
+        With ``migrated``, a row that holds ``current_id`` is no reason: the
+        change gives it the new ID.
         """
-        for probe in _rekey_probes(await self._actor_ref_columns(), current_id, new_id):
+        columns = [] if migrated else await self._actor_ref_columns()
+        for probe in _rekey_probes(columns, current_id, new_id):
             try:
                 async with self.db.execute(probe.sql, probe.params) as cursor:
                     found = await cursor.fetchone() is not None
@@ -367,16 +396,23 @@ class AccountStore:
                 return probe.reason
         return None
 
-    async def _decide_system_actor_rekey(self, new_id: str) -> tuple[str, str | None]:
+    async def _decide_system_actor_rekey(
+        self, new_id: str,
+    ) -> tuple[str, str | None, bool]:
         """Read the stored system actor ID and decide whether it can become ``new_id``.
 
-        Call inside a transaction. Returns ``(stored_id, blocker)``. The ID
-        changes at most once: a recorded claim
+        Call inside a transaction. Returns ``(stored_id, blocker, migrated)``.
+        The ID changes at most once: a recorded claim
         (:data:`SYSTEM_PRINCIPAL_CLAIM_NAME`) refuses every different ID, also
         from a process that opened the database after the change. Without a
         claim, the stored ID must still be the ID that this connection has
         cached: when another connection changed it, this one does not change
         it again, because the other connection uses the ID it set.
+
+        ``migrated`` is true when the database is marked as migrated
+        (:data:`SYSTEM_ACTOR_MIGRATION_NAME`) and the decision used the mark:
+        rows that refer to the stored ID did not count as a blocker, so a
+        change must give them the new ID.
         """
         async with self.db.execute(
             "SELECT id FROM actor_refs WHERE kind = 'system'"
@@ -388,17 +424,44 @@ class AccountStore:
             raise IdentityInvariantError("actor identity is corrupt: there is no system actor")
         stored_id = row[0]
         if stored_id == new_id:
-            return stored_id, None
+            return stored_id, None, False
         claimed_id = await self._get_instance_secret(SYSTEM_PRINCIPAL_CLAIM_NAME)
         if claimed_id is not None:
-            return stored_id, _already_claimed(claimed_id)
+            return stored_id, _already_claimed(claimed_id), False
         cached_id = self.system_actor_id
         if stored_id != cached_id:
             return stored_id, (
                 f"another process changed the ID from {cached_id} to {stored_id} "
                 "after this process read it"
+            ), False
+        migrated = (
+            await self._get_instance_secret(SYSTEM_ACTOR_MIGRATION_NAME)
+            == SYSTEM_ACTOR_MIGRATION_PENDING
+        )
+        blocker = await self._system_actor_rekey_blocker(
+            stored_id, new_id, migrated=migrated,
+        )
+        return stored_id, blocker, migrated
+
+    async def _move_actor_references(self, previous_id: str, new_id: str) -> int:
+        """Give ``new_id`` to every row that refers to ``previous_id``.
+
+        Call inside the transaction that changes the ID. The columns are the
+        ones that :meth:`_system_actor_rekey_blocker` checks, read from the
+        schema. Returns the number of references changed: a row with the ID
+        in two columns counts twice.
+        """
+        moved = 0
+        for table, column in await self._actor_ref_columns():
+            name = _quote_identifier(column)
+            cursor = await self.db.execute(
+                f"UPDATE {_quote_identifier(table)} SET {name} = ? "
+                f"WHERE {name} COLLATE BINARY = ?",
+                (new_id, previous_id),
             )
-        return stored_id, await self._system_actor_rekey_blocker(stored_id, new_id)
+            moved += cursor.rowcount
+            await cursor.close()
+        return moved
 
     async def _rekey_system_actor(self, new_id: str) -> SystemActorRekey:
         """Give the system actor ``new_id`` while no row refers to it.
@@ -412,30 +475,64 @@ class AccountStore:
         ID without the claim. When a blocker exists, nothing changes and the
         result names it. The result gives the IDs of this transaction. The
         cached :attr:`system_actor` is read again in all cases.
+
+        A database that is marked as migrated
+        (:data:`SYSTEM_ACTOR_MIGRATION_NAME`) takes the ID although rows refer
+        to the system actor. The same transaction gives those rows the new ID
+        and sets the mark to :data:`SYSTEM_ACTOR_MIGRATION_DONE`. The foreign
+        keys are checked at its commit: when a row still refers to the old
+        ID, or the database refuses a statement of the change, nothing
+        changes, the mark stays, and the result names the reason. So a
+        database that cannot take the change still starts.
         """
-        async with self._atomic():
-            previous_id, blocker = await self._decide_system_actor_rekey(new_id)
-            changed = previous_id != new_id and blocker is None
-            if changed:
-                await self.db.execute(f"DROP TRIGGER IF EXISTS {SYSTEM_ACTOR_ID_TRIGGER}")
-                await self.db.execute(
-                    "UPDATE actor_refs SET id = ? WHERE id = ? AND kind = 'system'",
-                    (new_id, previous_id),
-                )
-                await self.db.execute(SYSTEM_ACTOR_ID_TRIGGER_SQL)
-                await self.db.execute(
-                    "INSERT INTO instance_secrets (name, value) VALUES (?, ?)",
-                    (SYSTEM_PRINCIPAL_CLAIM_NAME, new_id),
-                )
+        previous_id, blocker, migrated = "", None, False
+        changed, moved = False, 0
+        try:
+            async with self._atomic():
+                previous_id, blocker, migrated = await self._decide_system_actor_rekey(new_id)
+                changed = previous_id != new_id and blocker is None
+                if changed:
+                    if migrated:
+                        # The parent row changes before the rows that refer
+                        # to it. SQLite ends this setting at the commit or
+                        # rollback.
+                        await self.db.execute("PRAGMA defer_foreign_keys = ON")
+                    await self.db.execute(f"DROP TRIGGER IF EXISTS {SYSTEM_ACTOR_ID_TRIGGER}")
+                    await self.db.execute(
+                        "UPDATE actor_refs SET id = ? WHERE id = ? AND kind = 'system'",
+                        (new_id, previous_id),
+                    )
+                    if migrated:
+                        moved = await self._move_actor_references(previous_id, new_id)
+                        await self.db.execute(
+                            "UPDATE instance_secrets SET value = ? WHERE name = ?",
+                            (SYSTEM_ACTOR_MIGRATION_DONE, SYSTEM_ACTOR_MIGRATION_NAME),
+                        )
+                    await self.db.execute(SYSTEM_ACTOR_ID_TRIGGER_SQL)
+                    await self.db.execute(
+                        "INSERT INTO instance_secrets (name, value) VALUES (?, ?)",
+                        (SYSTEM_PRINCIPAL_CLAIM_NAME, new_id),
+                    )
+        except sqlite3.Error as e:
+            # Without the mark, an error is a defect and stops the caller, as
+            # before. With it, the old ID stays and the start goes on.
+            if not (changed and migrated):
+                raise
+            changed, moved = False, 0
+            blocker = f"the rows that refer to the current ID could not get the new ID ({e})"
         await self._cache_system_actor()
-        return SystemActorRekey(previous_id, new_id if changed else previous_id, blocker)
+        return SystemActorRekey(
+            previous_id, new_id if changed else previous_id, blocker,
+            migrated=changed and migrated, moved_references=moved,
+        )
 
     async def _preview_system_actor_rekey(self, new_id: str) -> SystemActorRekey:
         """What :meth:`_rekey_system_actor` would do, from one snapshot, with no write."""
         async with self._read_snapshot():
-            previous_id, blocker = await self._decide_system_actor_rekey(new_id)
+            previous_id, blocker, migrated = await self._decide_system_actor_rekey(new_id)
+        changed = previous_id != new_id and blocker is None
         actor_id = new_id if blocker is None else previous_id
-        return SystemActorRekey(previous_id, actor_id, blocker)
+        return SystemActorRekey(previous_id, actor_id, blocker, migrated=changed and migrated)
 
     # -- accounts ------------------------------------------------------------
 
@@ -1000,7 +1097,13 @@ def inspect_system_actor(db_path: Path, wanted_id: str) -> tuple[str, str | None
         ).fetchone()
         if claimed is not None:
             return current_id, _already_claimed(str(claimed[0]))
-        columns = [(row[0], row[1]) for row in conn.execute(ACTOR_REF_COLUMNS_SQL)]
+        mark = conn.execute(
+            "SELECT value FROM instance_secrets WHERE name = ?", (SYSTEM_ACTOR_MIGRATION_NAME,),
+        ).fetchone()
+        if mark is not None and mark[0] == SYSTEM_ACTOR_MIGRATION_PENDING:
+            columns = []
+        else:
+            columns = [(row[0], row[1]) for row in conn.execute(ACTOR_REF_COLUMNS_SQL)]
         for probe in _rekey_probes(columns, current_id, wanted_id):
             try:
                 found = conn.execute(probe.sql, probe.params).fetchone() is not None

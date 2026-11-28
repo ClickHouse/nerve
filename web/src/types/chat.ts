@@ -242,12 +242,12 @@ export type AgentStatus =
   | { state: 'writing' };
 
 export interface PanelTab {
-  id: string;              // toolUseId; 'agents-panel'; 'tasks-panel'; `agent:<agentId>`
+  id: string;              // toolUseId; 'agents-panel'; 'tasks-panel'; `agent:<agentId>`; `preview:<path>`
   /** 'agents' is the singleton Agents roster; 'agent' is one agent's live
    *  transcript; 'tasks' is the singleton list of the session's tasks;
    *  'subagent' stays for the legacy result-only tab of old history (no
    *  agent record). */
-  type: 'plan' | 'subagent' | 'files' | 'workflow' | 'agents' | 'agent' | 'tasks';
+  type: 'plan' | 'subagent' | 'files' | 'workflow' | 'agents' | 'agent' | 'tasks' | 'preview';
   label: string;           // "Plan", "Explore", "Agent", "Files", "Workflow", "Tasks"
   subagentType: string;    // "Plan", "Explore", "general-purpose", "Workflow"
   description: string;
@@ -264,6 +264,8 @@ export interface PanelTab {
   workflow?: WorkflowSnapshot;
   /** For type==='agent': the agent record whose transcript the tab shows. */
   agentId?: string;
+  /** For type==='preview': the workspace path whose bundle the tab shows. */
+  previewPath?: string;
   /**
    * A plan opened from a decided card, to read: no decision footer, and plan
    * updates leave it alone (they go to the live plan tab).

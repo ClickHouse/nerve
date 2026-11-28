@@ -472,3 +472,80 @@ describe('agent routes', () => {
     expect(apiErrorCode('409: {"detail": {"code": "x"}}')).toBeNull();
   });
 });
+
+describe('Web Push routes', () => {
+  const DIGEST = 'q1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v';
+  const BODY = { endpoint: 'https://fcm.googleapis.com/fcm/send/x', keys: { p256dh: 'p', auth: 'a' }, level: 'all' as const };
+  const json = (status: number, body: unknown) => new Response(JSON.stringify(body), {
+    status, headers: { 'Content-Type': 'application/json' },
+  });
+  const gatewaySubscription = {
+    id: '7d0a3c2e-4b1f-4c8e-9a6d-1e2f3a4b5c6d', endpointDigest: DIGEST, level: 'important',
+    userAgent: 'Firefox', createdAt: '2026-11-05T09:00:00Z',
+  };
+
+  afterEach(() => {
+    useHostedStore.setState({ mode: 'local', problem: null, reentering: false });
+  });
+
+  it('use the local routes with the bearer in local mode', async () => {
+    setToken('session-one');
+    fetchMock.mockResolvedValueOnce(json(200, { public_key: 'K', subscriptions: [] }));
+    fetchMock.mockResolvedValueOnce(json(200, { deleted: true }));
+
+    expect(await api.pushDevices()).toEqual({ public_key: 'K', subscriptions: [] });
+    await api.deletePushDevice(3);
+
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual(['/api/push/subscriptions', '/api/push/subscriptions/3']);
+    expect(sentHeaders()).toHaveProperty('Authorization', 'Bearer session-one');
+  });
+
+  it('use the gateway routes with the cookie in hosted mode and map the answers', async () => {
+    setToken('stale');
+    setAuthMode('external');
+    fetchMock.mockResolvedValueOnce(json(200, { publicKey: 'K', subscriptions: [gatewaySubscription] }));
+    fetchMock.mockResolvedValueOnce(json(200, gatewaySubscription));
+    fetchMock.mockResolvedValueOnce(new Response(null, { status: 204 }));
+
+    const listed = await api.pushDevices();
+    const saved = await api.savePushDevice(BODY);
+    await api.deletePushDevice(gatewaySubscription.id);
+
+    const device = {
+      id: gatewaySubscription.id, endpoint_digest: DIGEST, level: 'important', user_agent: 'Firefox',
+      created_at: '2026-11-05T09:00:00Z',
+    };
+    expect(listed).toEqual({ public_key: 'K', subscriptions: [device] });
+    expect(saved).toEqual(device);
+    const calls = fetchMock.mock.calls as [string, RequestInit][];
+    expect(calls.map(([url, init]) => [url, init.method ?? 'GET'])).toEqual([
+      ['/_nerve/push/subscriptions', 'GET'],
+      ['/_nerve/push/subscriptions', 'POST'],
+      [`/_nerve/push/subscriptions/${gatewaySubscription.id}`, 'DELETE'],
+    ]);
+    expect(calls.every(([, init]) => init.credentials === 'same-origin')).toBe(true);
+    expect(calls.every(([, init]) => !('Authorization' in (init.headers as Record<string, string>)))).toBe(true);
+    expect(sentHeaders(0)).not.toHaveProperty('X-Nerve-CSRF');
+    expect(sentHeaders(1)).toMatchObject({ 'X-Nerve-CSRF': '1', 'Content-Type': 'application/json' });
+    expect(sentHeaders(2)).toHaveProperty('X-Nerve-CSRF', '1');
+    expect(JSON.parse(calls[1][1].body as string)).toEqual(BODY);
+  });
+
+  it('send a gateway error through the hosted error handling', async () => {
+    setAuthMode('external');
+    fetchMock.mockResolvedValueOnce(gatewayError(403, 'access_denied'));
+
+    await expect(api.pushDevices()).rejects.toMatchObject({ status: 403, reason: 'access_denied' });
+
+    expect(useHostedStore.getState().problem).toBe('access_denied');
+  });
+
+  it('show no screen when the gateway has no push routes', async () => {
+    setAuthMode('external');
+    fetchMock.mockResolvedValueOnce(gatewayError(404, 'not_found'));
+
+    await expect(api.pushDevices()).rejects.toBeInstanceOf(ApiError);
+
+    expect(useHostedStore.getState().problem).toBeNull();
+  });
+});

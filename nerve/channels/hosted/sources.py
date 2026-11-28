@@ -33,23 +33,29 @@ from typing import TYPE_CHECKING, Any
 from nerve.channels.hosted.contract import (
     EVENT_KIND_SOURCE_RECORD,
     SUBSCRIPTIONS_VERSION,
+    THREAD_ITEM_RECORD_TYPE,
+    THREAD_ITEMS_PROVIDER,
     Event,
     RepoWatch,
     SourceFilters,
     SourceSubscription,
     Subscriptions,
+    validate_thread_item,
 )
 from nerve.channels.hosted.contract.model import (
+    MAX_REPO_WATCH_BRANCHES,
     MAX_REPO_WATCHES,
     MAX_SUBSCRIPTION_PATTERN_BYTES,
     MAX_SUBSCRIPTION_PATTERNS,
+    REPO_WATCH_COMMIT,
     REPO_WATCH_PROVIDER,
     REPO_WATCH_TYPES,
     ZERO_TIME,
     valid_pattern,
+    valid_repo_branch,
     valid_repo_name,
 )
-from nerve.channels.hosted.contract.wire import format_time
+from nerve.channels.hosted.contract.wire import Rejected, format_time
 from nerve.channels.hosted.intake import Disposition
 
 if TYPE_CHECKING:
@@ -90,11 +96,19 @@ def subscriptions_for(config: NerveConfig, providers: Iterable[str]) -> Subscrip
     the ``github_repos`` subscription is sent only while the watch is on and
     lists a repository, and an agent without one sends the same frame as
     before the watch existed.
+
+    While ``sync.github.thread_items`` is on, the notifications go with a
+    ``github_thread_items`` entry, which says that Nerve accepts a record of
+    each comment, review and description of a thread. A gateway that does not
+    know the provider ignores the entry. With the setting off the entry is
+    left out, and the gateway keeps sending one record per thread.
     """
     providers = set(providers)
     sources: list[SourceSubscription] = []
     if GITHUB in providers and config.sync.github.enabled:
         sources.append(github_subscription(config.sync.github))
+        if config.sync.github.thread_items:
+            sources.append(SourceSubscription(provider=THREAD_ITEMS_PROVIDER))
     if GITHUB_REPOS in providers and config.sync.github_repos.enabled:
         watch = github_repos_subscription(config.sync.github_repos)
         if watch is not None:
@@ -151,6 +165,11 @@ def github_repos_subscription(settings: GitHubReposSyncConfig) -> SourceSubscrip
     :data:`MAX_REPO_WATCHES` too, with a warning, so that the gateway never
     closes the stream over them. ``deny_authors`` goes as a deny list does:
     the patterns that fit, while the inbox filter applies them all.
+
+    The types are those of :func:`repo_watch_types`. A repository carries
+    ``branches`` only with the ``commit`` type and only when the settings
+    name one for it (:func:`_published_branches`), so the frame of an agent
+    that does not ask for commits is the same as before the type existed.
     """
     names: list[str] = []
     seen: set[str] = set()
@@ -170,25 +189,69 @@ def github_repos_subscription(settings: GitHubReposSyncConfig) -> SourceSubscrip
             len(names), MAX_REPO_WATCHES,
         )
         names = names[:MAX_REPO_WATCHES]
-    chosen = {str(kind).strip().lower() for kind in settings.types or ()}
-    types = tuple(kind for kind in REPO_WATCH_TYPES if kind in chosen)
+    types = repo_watch_types(settings)
     if not names or not types:
         return None
     deny_authors = _deny_list("sync.github_repos.deny_authors", settings.deny_authors)
-    return SourceSubscription(
-        provider=GITHUB_REPOS,
-        repos=tuple(
-            RepoWatch(
-                name=name,
-                types=types,
-                include_bots=bool(settings.include_bots),
-                include_drafts=bool(settings.include_drafts),
-                updates=bool(settings.updates),
-                deny_authors=deny_authors,
-            )
-            for name in names
-        ),
-    )
+    repos: list[RepoWatch] = []
+    for name in names:
+        branches = _published_branches(settings, name) if REPO_WATCH_COMMIT in types else ()
+        # A repository whose branches cannot be published does not report the
+        # commits of its default branch in their place.
+        reported = tuple(
+            kind for kind in types if kind != REPO_WATCH_COMMIT or branches is not None
+        )
+        if not reported:
+            continue
+        repos.append(RepoWatch(
+            name=name,
+            types=reported,
+            include_bots=bool(settings.include_bots),
+            include_drafts=bool(settings.include_drafts),
+            updates=bool(settings.updates),
+            deny_authors=deny_authors,
+            branches=branches or (),
+        ))
+    return SourceSubscription(provider=GITHUB_REPOS, repos=tuple(repos)) if repos else None
+
+
+def repo_watch_types(settings: GitHubReposSyncConfig) -> tuple[str, ...]:
+    """The types of ``sync.github_repos.types`` that the gateway is sent.
+
+    Every type that the settings name, in the contract's order. The gateway
+    advertises nothing about the types that it knows, and one that does not
+    know a type refuses the whole subscription and closes the stream. So
+    ``commit`` may be named only where the gateway knows it (docs/sources.md,
+    "Hosted repository watch"). This function is the one place that decides
+    which types are sent.
+    """
+    chosen = {str(kind).strip().lower() for kind in settings.types or ()}
+    return tuple(kind for kind in REPO_WATCH_TYPES if kind in chosen)
+
+
+def _published_branches(settings: GitHubReposSyncConfig, repo: str) -> tuple[str, ...] | None:
+    """The branches of *repo* whose commits the gateway is asked for.
+
+    Empty when the settings name none: the gateway then follows the
+    repository's default branch. The config refuses to load branches the
+    gateway would not take; a setting built some other way loses those, the
+    ones named twice and the ones past :data:`MAX_REPO_WATCH_BRANCHES`, with
+    a warning. ``None`` when the settings name branches and none can be
+    published.
+    """
+    wanted = settings.branches_of(repo)
+    branches: list[str] = []
+    for branch in wanted:
+        if valid_repo_branch(repo, branch) and branch not in branches:
+            branches.append(branch)
+    if len(branches) < len(wanted) or len(branches) > MAX_REPO_WATCH_BRANCHES:
+        logger.warning(
+            "sync.github_repos.branches of %s: the gateway is sent %d of %d branches",
+            repo, min(len(branches), MAX_REPO_WATCH_BRANCHES), len(wanted),
+        )
+    if wanted and not branches:
+        return None
+    return tuple(branches[:MAX_REPO_WATCH_BRANCHES])
 
 
 def _patterns(values: object) -> list[str]:
@@ -298,6 +361,14 @@ class HostedSourceConsumer:
             return Disposition.rejected(
                 "admission_rejected", f"{event.kind} ({purpose}) is not a {self._provider} source record",
             )
+        # The message of a thread item is built from its metadata, so an item
+        # without the keys and values of the contract is refused on its own,
+        # and the stream goes on.
+        if event.record.record_type == THREAD_ITEM_RECORD_TYPE:
+            try:
+                validate_thread_item(event.record)
+            except Rejected as error:
+                return Disposition.rejected("admission_rejected", error.detail)
         config = self._config()
         try:
             await self._db.insert_channel_observation(
@@ -355,5 +426,6 @@ __all__ = [
     "github_repos_subscription",
     "github_subscription",
     "hosted_sources",
+    "repo_watch_types",
     "subscriptions_for",
 ]

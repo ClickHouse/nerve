@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from nerve.agent.tools.registry import ToolRegistry
 
+from nerve.agent.tools.handlers.artifacts import ARTIFACT_SPECS
 from nerve.agent.tools.handlers.config_pr import CONFIG_PR_SPECS
 from nerve.agent.tools.handlers.forms import FORM_SPECS
 from nerve.agent.tools.handlers.hoa import HOA_SPECS
@@ -48,6 +49,7 @@ def build_default_registry() -> ToolRegistry:
         *CONFIG_PR_SPECS,
         *WAKEUP_SPECS,
         *WIDGET_SPECS,
+        *ARTIFACT_SPECS,
         *WORKFLOW_RUN_SPECS,
         *REVIEW_LOOP_SPECS,
         *HOA_SPECS,

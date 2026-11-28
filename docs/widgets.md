@@ -121,7 +121,8 @@ widget and nowhere else.
   drawn again from its source when it comes back. What was typed or chosen
   in it is gone, unless the widget saved it. When seven are on one screen,
   the seventh shows "Load widget": a click loads it and stops the one used
-  longest ago.
+  longest ago. The inline previews of sent files
+  ([Preview](web-ui.md#preview)) take places of the same six.
 - **Tools.** A row above the widget has Reload (draw it again from its
   source, with what it saved), Source (the source as a highlighted code
   block, and back) and Copy source, and, once the widget has saved

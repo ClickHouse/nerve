@@ -254,6 +254,8 @@ _MACHINE_LOCAL_PATHS = frozenset({
     # UI: decided for each box, where its web UI is built and its address is
     # known, not for every instance that shares the settings.
     "mcp_apps",
+    # The same for the Preview tab, which also runs in that sandbox frame.
+    "artifacts",
     # Only the journal location, not the rest of the section: the budget caps
     # and cadence are policy worth reviewing and sharing, while this is one
     # box's runtime directory. Publishing it would point every instance at a
@@ -1569,7 +1571,9 @@ async def _apply_system_principal(
     only while no row refers to the system actor and no other actor has the
     new ID (:meth:`~nerve.db.accounts.AccountStore._rekey_system_actor`). A
     new installation therefore takes the ID at ``nerve init`` or at its first
-    start, before any work is attributed to it.
+    start, before any work is attributed to it. A database that is marked as
+    migrated (:data:`~nerve.db.accounts.SYSTEM_ACTOR_MIGRATION_NAME`) takes
+    the ID together with the rows that refer to the system actor, once.
 
     In all other cases the current ID stays: an unset value says nothing, and
     an invalid value, a referenced system actor, a new ID that another actor
@@ -1601,6 +1605,12 @@ async def _apply_system_principal(
                 "Identity: the system actor ID changed from %s to %s",
                 result.previous_id, result.actor_id,
             )
+            if result.migrated:
+                logger.info(
+                    "Identity: the database was marked as migrated, so the %d "
+                    "references to the old ID now name the new one",
+                    result.moved_references,
+                )
     elif result.blocker is not None:
         _warn_kept_system_actor(
             report, result.actor_id, _rekey_blocked_reason(new_id, result.blocker),

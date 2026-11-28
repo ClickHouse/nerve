@@ -569,21 +569,28 @@ class TestInvoke:
         assert str(channel.connection_for("D0FIRST")) == CONNECTION_ID
         assert str(channel.connection_for("D0SECOND")) == other_connection
 
-    async def test_turning_the_provider_off_by_reload_stops_intake(self, hosted):
+    async def test_turning_the_provider_off_by_reload_rejects_its_events(self, hosted):
         stream = await hosted.stream()
         await hosted.gateway.wait_for(lambda: len(hosted.gateway.reads) >= 1)
         hosted.config.slack.enabled = False
-        reads_before = len(hosted.gateway.reads)
-        inbox_id = hosted.gateway.store(message_event(
+        refused = hosted.gateway.store(message_event(
             conversation="D0DIRECT", conversation_kind="direct", message_id="8.3",
         ))
 
         await stream.nudge("invoke")
-        await asyncio.sleep(0.3)
-        assert len(hosted.gateway.reads) == reads_before
+        assert (await hosted.acknowledged(refused))[refused] == "rejected"
+        [rejection] = [item for ack in hosted.gateway.acks for item in ack if item["inbox_id"] == refused]
+        assert rejection["reason_code"] == "configuration_invalid"
+        assert hosted.turns.runs == []
 
         hosted.config.slack.enabled = True
-        assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
+        taken = hosted.gateway.store(message_event(
+            conversation="D0DIRECT", conversation_kind="direct", message_id="8.6",
+        ))
+        await stream.nudge("invoke")
+        assert (await hosted.acknowledged(taken))[taken] == "accepted"
+        await hosted.turns.wait_for(1)
+        assert len(hosted.turns.runs) == 1
 
     async def test_a_draining_engine_stops_intake_and_the_event_stays_in_the_inbox(self, hosted):
         stream = await hosted.stream()
@@ -608,17 +615,21 @@ class TestInvoke:
     async def test_a_provider_off_before_the_first_stream_takes_events_once_turned_on(self, hosted):
         hosted.config.slack.enabled = False
         stream = await hosted.stream()
-        inbox_id = hosted.gateway.store(message_event(
+        refused = hosted.gateway.store(message_event(
             conversation="D0DIRECT", conversation_kind="direct", message_id="8.4",
         ))
 
         await stream.nudge("invoke")
-        await asyncio.sleep(0.3)
-        assert hosted.gateway.reads == []
+        assert (await hosted.acknowledged(refused))[refused] == "rejected"
 
         hosted.config.slack.enabled = True
-        assert (await hosted.acknowledged(inbox_id))[inbox_id] == "accepted"
+        taken = hosted.gateway.store(message_event(
+            conversation="D0DIRECT", conversation_kind="direct", message_id="8.7",
+        ))
+        await stream.nudge("invoke")
+        assert (await hosted.acknowledged(taken))[taken] == "accepted"
         await hosted.turns.wait_for(1)
+        assert len(hosted.turns.runs) == 1
 
 
 class TestObserve:

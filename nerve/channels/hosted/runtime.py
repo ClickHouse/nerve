@@ -63,10 +63,8 @@ def hosted_channel_providers(config: NerveConfig) -> list[str]:
     """The chat providers whose traffic comes from the gateway.
 
     A provider that is switched off is included. Its channel reads the
-    provider's switch for each event: a provider that holds its events
-    while off (Slack) pauses intake until a reload switches it on, and any
-    other provider rejects its events (see
-    :mod:`nerve.channels.hosted.providers`).
+    provider's switch for each event and rejects the events that arrive
+    while it is off (see :mod:`nerve.channels.hosted.providers`).
     """
     return [provider.name for provider in hosted_chat_providers(config)]
 

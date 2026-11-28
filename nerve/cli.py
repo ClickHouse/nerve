@@ -1633,9 +1633,6 @@ def _hosted_github_lines(config, errors: list[str], warnings: list[str]) -> list
 
     The gateway polls GitHub, so there is no gh login to check; the hosted
     stream settings are, as for hosted Slack, also when the source is off.
-    Nerve reads the gateway's events for every hosted provider in one
-    ordered inbox and stops reading while hosted Slack is switched off, so
-    a switched-off hosted Slack holds the GitHub records back too.
     """
     github = config.sync.github
     if github.mode != "hosted":
@@ -1667,15 +1664,6 @@ def _hosted_github_lines(config, errors: list[str], warnings: list[str]) -> list
             f"published from sync.github, PR watch {'on' if github.pr_watch else 'off'}, "
             f"inbox {github.inbox}"
         )
-    if (
-        (github.enabled or config.sync.github_repos.enabled)
-        and config.slack.mode == "hosted" and not config.slack.enabled
-    ):
-        warnings.append(
-            "[WARN] Slack is hosted but switched off (slack.enabled is false): Nerve "
-            "reads nothing from the channel gateway until it is switched on, so the "
-            "hosted GitHub records wait there too"
-        )
     return lines
 
 
@@ -1683,9 +1671,8 @@ def _email_lines(config, errors: list[str], warnings: list[str]) -> list[str]:
     """Doctor lines for the email channel (``email.enabled``).
 
     Mail comes only through the channel gateway, so the channel needs usable
-    ``channels.hosted`` settings and a key file that can be read. A
-    switched-off hosted Slack holds member mail back too. Nothing is shown
-    while email is switched off.
+    ``channels.hosted`` settings and a key file that can be read. Nothing is
+    shown while email is switched off.
     """
     if not config.email.enabled:
         return []
@@ -1701,12 +1688,6 @@ def _email_lines(config, errors: list[str], warnings: list[str]) -> list[str]:
     except KeyFileError as error:
         errors.append(f"[ERR] Email is on but channels.hosted.gateway_jwks_file: {error}")
         return []
-    if config.slack.mode == "hosted" and not config.slack.enabled:
-        warnings.append(
-            "[WARN] Slack is hosted but switched off (slack.enabled is false): Nerve "
-            "reads nothing from the channel gateway until it is switched on, so member "
-            "mail waits there too"
-        )
     return ["[OK] Email from members comes from the channel gateway; Nerve posts no answer"]
 
 
@@ -2215,7 +2196,7 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
         if not config.slack.enabled:
             lines.append(
                 "[--] Slack is hosted but switched off (slack.enabled is false); "
-                "events wait in the gateway inbox"
+                "Nerve rejects the Slack events that arrive, and they are not delivered later"
             )
         hosted = config.channels.hosted
         problems = hosted.problems()
@@ -2558,6 +2539,25 @@ def doctor_report(config, config_source: str = "", check_api: bool = False) -> s
             lines.append("[--] gh CLI not found (not needed: GitHub comes from the channel gateway)")
         else:
             warnings.append(f"[WARN] {tool_name} CLI not found (needed for sync)")
+
+    # Codex CLI. Codex is optional: without the CLI there is no line.
+    codex_bin = shutil.which(config.codex.bin_path)
+    if codex_bin:
+        from nerve.agent.backends.codex.backend import cli_version_problem
+        try:
+            completed = subprocess.run(
+                [codex_bin, "--version"], capture_output=True, text=True, timeout=5,
+            )
+            version = (completed.stdout or completed.stderr).strip()
+            problem = cli_version_problem(
+                version, config.codex.min_version, config.codex.max_version,
+            )
+        except (OSError, subprocess.SubprocessError) as e:
+            problem = (True, f"Codex CLI at {codex_bin} did not report a version: {e}")
+        if problem is None:
+            lines.append(f"[OK] Codex CLI: {version}")
+        else:
+            warnings.append(f"[WARN] {problem[1]}")
 
     # Summary
     lines.append("")
@@ -3038,6 +3038,8 @@ def codex_doctor(ctx: click.Context, json_output: bool) -> None:
             click.echo(f"[--] Endpoint: {status['base_url']} (no Codex login)")
         if status.get("available"):
             click.echo(f"[OK] {status.get('version')} ({status.get('auth')})")
+            if status.get("version_warning"):
+                click.echo(f"[WARN] {status['version_warning']}")
             offered = status.get("models") or []
             click.echo(f"[OK] Model menu (codex.models): {', '.join(offered)}")
             hidden = set(status.get("hidden_models") or [])

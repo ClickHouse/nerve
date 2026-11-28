@@ -339,6 +339,14 @@ class TestRouterDeliver:
 
         assert channel._web.chat_postMessage.await_args.kwargs["channel"] == "C0123ABCD"
 
+    async def test_the_verdict_names_the_thread_of_the_posted_message(self):
+        router = ChannelRouter(MagicMock())
+        router.register(_slack(allow_channels=["C0123ABCD"]))
+
+        verdict = await router.deliver_addressed("slack", "C0123ABCD", "hello")
+
+        assert verdict.thread_target == "C0123ABCD:1.1"
+
     async def test_a_refused_target_is_not_sent_to(self):
         router = ChannelRouter(MagicMock())
         channel = _slack(allow_channels=["C0123ABCD"])

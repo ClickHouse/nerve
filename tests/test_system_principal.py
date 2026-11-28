@@ -7,6 +7,9 @@ the system actor and no other actor has the ID. It drops the trigger
 ``system_actor_id_cannot_change`` for that one update and creates it again in
 the same transaction. Otherwise the local ID stays, a warning is logged, and
 ``nerve doctor`` reports the difference. Local mode ignores the variable.
+
+A database that is marked as migrated takes the ID together with the rows
+that refer to the system actor, once.
 """
 
 from __future__ import annotations
@@ -28,6 +31,9 @@ from nerve.db.accounts import (
     SYSTEM_ACTOR_ID_TAKEN,
     SYSTEM_ACTOR_ID_TRIGGER,
     SYSTEM_ACTOR_ID_TRIGGER_SQL,
+    SYSTEM_ACTOR_MIGRATION_DONE,
+    SYSTEM_ACTOR_MIGRATION_NAME,
+    SYSTEM_ACTOR_MIGRATION_PENDING,
     SYSTEM_PRINCIPAL_CLAIM_NAME,
     inspect_system_actor,
 )
@@ -538,6 +544,228 @@ class TestRekey:
             assert inspect_system_actor(path, ALICE) == (local_id, SYSTEM_ACTOR_ID_TAKEN)
         finally:
             await database.close()
+
+
+# --------------------------------------------------------------------------- #
+#  A database that is marked as migrated                                       #
+# --------------------------------------------------------------------------- #
+
+
+async def _mark_migrated(database: Database, value: str = SYSTEM_ACTOR_MIGRATION_PENDING) -> None:
+    """Set the mark, as the tool that moved the database here does."""
+    await database._write(
+        "INSERT INTO instance_secrets (name, value) VALUES (?, ?) "
+        "ON CONFLICT(name) DO UPDATE SET value = excluded.value",
+        (SYSTEM_ACTOR_MIGRATION_NAME, value),
+    )
+
+
+async def _mark(database: Database) -> str | None:
+    return await database._get_instance_secret(SYSTEM_ACTOR_MIGRATION_NAME)
+
+
+async def _add_history(database: Database) -> None:
+    """Rows of the system actor in four columns, and one session of a person."""
+    system = database.system_actor
+    await database.upsert_external_actor(ALICE, "Alice Example")
+    alice = Actor(actor_id=ALICE, kind="human")
+    await database.create_session("s-cron", source="cron", actor=system, cause=system)
+    await database.add_message("s-cron", "user", "hello", actor=system)
+    await database.create_session("s-alice", actor=alice, cause=alice)
+    # A column that a later migration adds is found from the schema.
+    await database._write(
+        "CREATE TABLE later_story (id INTEGER PRIMARY KEY, "
+        "caused_by_actor_id TEXT REFERENCES actor_refs(id))"
+    )
+    await database._write(
+        "INSERT INTO later_story (caused_by_actor_id) VALUES (?)", (system.actor_id,),
+    )
+
+
+async def _references(database: Database, actor_id: str) -> int:
+    """How many rows refer to ``actor_id`` in the columns that the schema names."""
+    count = 0
+    for table, column in await database._actor_ref_columns():
+        async with database.db.execute(
+            f'SELECT COUNT(*) FROM "{table}" WHERE "{column}" = ?', (actor_id,),
+        ) as cursor:
+            count += (await cursor.fetchone())[0]
+    return count
+
+
+async def _foreign_key_errors(database: Database) -> list:
+    async with database.db.execute("PRAGMA foreign_key_check") as cursor:
+        return [tuple(row) async for row in cursor]
+
+
+@pytest.mark.asyncio
+class TestMigrated:
+    async def test_the_system_actor_takes_the_id_with_its_history(self, tmp_path):
+        database = await _open(tmp_path / "nerve.db")
+        try:
+            local_id = database.system_actor_id
+            await _add_history(database)
+            await _mark_migrated(database)
+            fresh = await _trigger_sql(database)
+            assert await _references(database, local_id) == 4
+            assert await _references(database, ALICE) == 2
+
+            result = await database._rekey_system_actor(PRINCIPAL)
+
+            assert result.changed and result.blocker is None
+            assert result.migrated and result.moved_references == 4
+            assert database.system_actor == Actor(actor_id=PRINCIPAL, kind="system")
+            assert await _system_rows(database) == [PRINCIPAL]
+            assert await database.get_actor_ref(local_id) is None
+            assert await _references(database, local_id) == 0
+            assert await _references(database, PRINCIPAL) == 4
+            # The rows of a person keep their actor.
+            assert await _references(database, ALICE) == 2
+            assert await _foreign_key_errors(database) == []
+            assert await _trigger_sql(database) == fresh
+            assert await _claim(database) == PRINCIPAL
+            assert await _mark(database) == SYSTEM_ACTOR_MIGRATION_DONE
+        finally:
+            await database.close()
+
+        reopened = await _open(tmp_path / "nerve.db")
+        try:
+            assert reopened.system_actor_id == PRINCIPAL
+            # The system actor can still write, and later rows have the new ID.
+            await reopened.create_session("s-later", actor=reopened.system_actor, cause=None)
+            assert await _references(reopened, PRINCIPAL) == 5
+        finally:
+            await reopened.close()
+
+    async def test_a_mark_is_used_once(self, database):
+        await _add_history(database)
+        await _mark_migrated(database)
+        await database._rekey_system_actor(PRINCIPAL)
+
+        # Someone sets the mark again and the environment names another ID.
+        await _mark_migrated(database)
+        other = "00000000-0000-4000-8000-0000000000b0"
+        result = await database._rekey_system_actor(other)
+
+        assert not result.changed and not result.migrated
+        assert result.blocker == _claimed(PRINCIPAL)
+        assert database.system_actor_id == PRINCIPAL
+        assert await _references(database, PRINCIPAL) == 4
+        assert await _references(database, other) == 0
+
+    @pytest.mark.parametrize("value", [None, SYSTEM_ACTOR_MIGRATION_DONE, "TRUE", "1"])
+    async def test_only_the_value_true_is_a_mark(self, database, value):
+        local_id = database.system_actor_id
+        await _add_history(database)
+        if value is not None:
+            await _mark_migrated(database, value)
+
+        result = await database._rekey_system_actor(PRINCIPAL)
+
+        assert not result.changed and not result.migrated
+        assert result.blocker.endswith("refers to the current ID")
+        assert database.system_actor_id == local_id
+        assert await _references(database, local_id) == 4
+        assert await _mark(database) == value
+
+    async def test_an_id_that_another_actor_has_keeps_the_id_and_the_mark(self, database):
+        local_id = database.system_actor_id
+        await _add_history(database)
+        await _mark_migrated(database)
+        await database.upsert_external_actor(PRINCIPAL, "Bob Example")
+
+        result = await database._rekey_system_actor(PRINCIPAL)
+
+        assert not result.changed and result.blocker == SYSTEM_ACTOR_ID_TAKEN
+        assert database.system_actor_id == local_id
+        assert await _references(database, local_id) == 4
+        assert await _mark(database) == SYSTEM_ACTOR_MIGRATION_PENDING
+        assert await _claim(database) is None
+
+    @pytest.mark.parametrize("failure", ["refused", "left", "error"])
+    async def test_a_change_that_fails_keeps_everything(self, database, monkeypatch, failure):
+        """A row that a trigger refuses to change, references that still have
+        the old ID at the commit, and a statement that SQLite cannot run."""
+        import nerve.db.accounts as accounts
+
+        local_id = database.system_actor_id
+        await _add_history(database)
+        await _mark_migrated(database)
+        fresh = await _trigger_sql(database)
+        if failure == "refused":
+            await database._write(
+                "CREATE TRIGGER later_story_is_frozen BEFORE UPDATE ON later_story "
+                "BEGIN SELECT RAISE(ABORT, 'later_story does not change'); END"
+            )
+            reason = "(later_story does not change)"
+        elif failure == "left":
+            async def move_nothing(previous_id: str, new_id: str) -> int:
+                return 0
+
+            monkeypatch.setattr(database, "_move_actor_references", move_nothing)
+            reason = "(FOREIGN KEY constraint failed)"
+        else:
+            monkeypatch.setattr(accounts, "SYSTEM_ACTOR_ID_TRIGGER_SQL", "CREATE TRIGGER broken")
+            reason = ")"
+
+        result = await database._rekey_system_actor(PRINCIPAL)
+
+        assert not result.changed and not result.migrated and result.moved_references == 0
+        assert result.blocker.startswith(
+            "the rows that refer to the current ID could not get the new ID ("
+        )
+        assert result.blocker.endswith(reason)
+        assert not database.db.in_transaction
+        async with database.db.execute("PRAGMA defer_foreign_keys") as cursor:
+            assert (await cursor.fetchone())[0] == 0
+        assert database.system_actor_id == local_id
+        assert await _system_rows(database) == [local_id]
+        assert await _references(database, local_id) == 4
+        assert await _references(database, PRINCIPAL) == 0
+        assert await _foreign_key_errors(database) == []
+        assert await _trigger_sql(database) == fresh
+        assert await _mark(database) == SYSTEM_ACTOR_MIGRATION_PENDING
+        assert await _claim(database) is None
+
+    async def test_the_preview_and_the_inspection_use_the_mark(self, tmp_path):
+        path = tmp_path / "nerve.db"
+        database = await _open(path)
+        try:
+            local_id = database.system_actor_id
+            await _add_history(database)
+            assert inspect_system_actor(path, PRINCIPAL)[1].endswith("refers to the current ID")
+
+            await _mark_migrated(database)
+
+            assert inspect_system_actor(path, PRINCIPAL) == (local_id, None)
+            preview = await database._preview_system_actor_rekey(PRINCIPAL)
+            assert preview.changed and preview.migrated and preview.moved_references == 0
+            # Neither wrote.
+            assert database.system_actor_id == local_id
+            assert await _references(database, local_id) == 4
+            assert await _mark(database) == SYSTEM_ACTOR_MIGRATION_PENDING
+        finally:
+            await database.close()
+
+    async def test_the_bootstrap_moves_the_history(self, database, external, seeded, caplog):
+        local_id = database.system_actor_id
+        await _add_history(database)
+        await _mark_migrated(database)
+
+        with caplog.at_level(logging.INFO, logger="nerve.migrate"):
+            report = await bootstrap_identity(database, _config())
+
+        assert report.rekeyed_system_actor and not report.warnings
+        assert database.system_actor_id == PRINCIPAL
+        assert await _references(database, local_id) == 0
+        assert (
+            "the database was marked as migrated, so the 4 references to the old "
+            "ID now name the new one"
+        ) in caplog.text
+
+        # The next start finds the ID in place and changes nothing.
+        second = await bootstrap_identity(database, _config())
+        assert not second.rekeyed_system_actor and not second.warnings
 
 
 # --------------------------------------------------------------------------- #

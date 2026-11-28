@@ -183,13 +183,18 @@ def _unpin_auth_mode(monkeypatch):
     ``create_app()`` pins the mode once per process, and before a pin the mode
     comes from ``NERVE_AUTH_MODE``. Each test starts in local mode, whatever
     the shell sets, and a test that pins a mode does not leave it in force.
+    The publish settings of artifacts, which ``create_app()`` pins too, are
+    cleared the same way.
     """
+    from nerve.artifacts.publish import unpin_publish_settings
     from nerve.gateway.auth import AUTH_MODE_ENV, unpin_auth_mode
 
     monkeypatch.delenv(AUTH_MODE_ENV, raising=False)
     unpin_auth_mode()
+    unpin_publish_settings()
     yield
     unpin_auth_mode()
+    unpin_publish_settings()
 
 
 @pytest.fixture(autouse=True)

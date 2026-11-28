@@ -7,8 +7,13 @@ check of a subscription, the payload and the send. A sender outside the
 agent's machine can replace :func:`deliver` and keep the rest of the fan-out.
 
 The push services are those of the browsers (:data:`PUSH_SERVICE_HOSTS`,
-:data:`PUSH_SERVICE_DOMAINS`). The instance must reach them: on Nerve Cloud an
-agent in restricted internet mode cannot, so push works only in open mode.
+:data:`PUSH_SERVICE_DOMAINS`). The instance must reach them.
+
+In external mode the platform delivers Web Push (:func:`platform_sends`), so
+the runtime needs no key, no subscription routes and no access to a push
+service. The fan-out then hands each notification over to the platform
+(:mod:`nerve.notifications.platform_push`), and nothing in this module that
+reads the key or the subscriptions runs.
 """
 
 from __future__ import annotations
@@ -67,6 +72,13 @@ BODY_LINES = 3
 BODY_CHARS = 180
 DEFAULT_AGENT_NAME = "Nerve"
 _URGENT_PRIORITIES = frozenset({"high", "urgent"})
+
+
+def platform_sends() -> bool:
+    """Whether the platform delivers Web Push for this agent: in external mode."""
+    from nerve.gateway.auth import is_external_mode  # local import: no cycle
+
+    return is_external_mode()
 
 
 def check_endpoint(endpoint: str) -> str:
@@ -143,14 +155,19 @@ async def public_key(db: Database) -> str:
     return _b64url(key.public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint))
 
 
+def short_body(body: str) -> str:
+    """What a push shows of *body*: the first :data:`BODY_LINES` lines that
+    are not blank, at most :data:`BODY_CHARS` characters in total."""
+    lines = [line for line in body.splitlines() if line.strip()]
+    return "\n".join(lines[:BODY_LINES])[:BODY_CHARS]
+
+
 def payload(agent: str, notification_id: str, title: str, body: str, silent: bool) -> str:
     """The JSON that the service worker shows: ``<agent>: <title>``, the
     first lines of the body, the notification id as tag, and the page to open."""
-    lines = "\n".join(line for line in body.splitlines() if line.strip())
-    short = "\n".join(lines.splitlines()[:BODY_LINES])
     return json.dumps({
         "title": f"{agent}: {title}"[:TITLE_CHARS],
-        "body": short[:BODY_CHARS],
+        "body": short_body(body),
         "tag": notification_id,
         "url": OPEN_PATH,
         "silent": silent,

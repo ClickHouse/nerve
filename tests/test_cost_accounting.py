@@ -1,23 +1,33 @@
-"""Tests for reset-aware per-turn cost accounting.
+"""Tests for per-turn cost accounting from the SDK's cumulative counter.
 
-The SDK's ``ResultMessage.total_cost_usd`` is cumulative per CLI client
-process.  This subsystem has produced two accounting incidents: treating
-the cumulative as per-turn (over-count, fixed by v024) and clamping the
-delta with ``max(delta, 0)`` (under-count on every client recycle —
-recorded $0 for the first turn of each new client, i.e. every persistent
-cron run).  These tests pin the reset-aware semantics
-(``nerve.db.usage.compute_turn_cost``), the engine's baseline reset on
-client creation, the v036 backfill migration, and the FTS5 query
-sanitization that broke while filing the incident.
+The SDK's ``ResultMessage.total_cost_usd`` is cumulative.  This subsystem
+has produced three accounting incidents: treating the cumulative as
+per-turn (over-count, fixed by v024); clamping the delta with
+``max(delta, 0)`` (under-count: $0 for the first turn of each new
+client); and a baseline of zero for every new client (over-count: a
+process that resumes a conversation counts from the total that an
+earlier process of it saved, so the first turn of each new client paid
+for that total again).  These tests pin the delta
+semantics (``nerve.db.usage.compute_turn_cost``), the baseline that the
+engine sets when it creates a client, the v036 backfill migration, and
+the FTS5 query sanitization that broke while filing the second incident.
 """
 
 from __future__ import annotations
 
 import json
+import os
+import re
 from types import SimpleNamespace
 
 import pytest
 
+from nerve.agent.backends import claude as claude_backend
+from nerve.agent.backends.base import BackendCapabilities, SessionSpec
+from nerve.agent.backends.claude import ClaudeBackend
+from nerve.agent.backends.events import NormalizedUsage, TextDelta, TurnCompleted
+from nerve.agent.engine import AgentEngine
+from nerve.config import NerveConfig
 from nerve.db import Database
 from nerve.db.migrations.v036_backfill_zero_cost_turns import up as v036_up
 from nerve.db.usage import compute_turn_cost, estimate_turn_cost
@@ -49,9 +59,10 @@ class TestComputeTurnCost:
         # prev=0 is the fresh-session baseline: plain delta, no reset.
         assert source == "sdk_delta"
 
-    def test_counter_reset_attributes_new_cumulative(self):
-        # Client recycled: cumulative dropped from 5.0 to 0.3.  The old
-        # max(delta, 0) clamp recorded $0 here — the core of the bug.
+    def test_counter_below_baseline_attributes_new_cumulative(self):
+        # The new process did not count from the baseline: cumulative
+        # dropped from 5.0 to 0.3.  The old max(delta, 0) clamp recorded
+        # $0 here.
         cost, source = compute_turn_cost(0.3, 5.0, _BUSY_USAGE, model="claude-fable-5")
         assert cost == pytest.approx(0.3)
         assert source == "sdk_reset"
@@ -104,46 +115,348 @@ class TestComputeTurnCost:
 
 
 # ---------------------------------------------------------------------------
-# Engine: baseline zeroed when a new CLI client is created
+# Engine: baseline set when a new CLI client is created
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-class TestResetCostBaseline:
+class TestSetCostBaseline:
     async def _shim(self, db: Database):
         return SimpleNamespace(db=db)
 
-    async def test_baseline_zeroed(self, db: Database):
-        from nerve.agent.engine import AgentEngine
-
+    async def _baseline_after(
+        self, db: Database, before: dict, start: float, *, same_conversation: bool = False,
+    ) -> dict:
         await db.create_session("sess-base", source="web", actor=None)
-        await db.update_session_metadata(
-            "sess-base", {"_sdk_cumulative_cost": 4.2, "other_key": "kept"},
+        await db.update_session_metadata("sess-base", before)
+        await AgentEngine._set_cost_baseline(
+            await self._shim(db), "sess-base", start,
+            same_conversation=same_conversation,
         )
+        return json.loads((await db.get_session("sess-base"))["metadata"])
 
-        await AgentEngine._reset_cost_baseline(await self._shim(db), "sess-base")
-
-        session = await db.get_session("sess-base")
-        meta = json.loads(session["metadata"])
-        assert meta["_sdk_cumulative_cost"] == 0
+    async def test_baseline_set_to_the_counter_start(self, db: Database):
+        # A fork, or a new conversation: the stored value is of no use.
+        meta = await self._baseline_after(
+            db, {"_sdk_cumulative_cost": 4.2, "other_key": "kept"}, 3.5,
+        )
+        assert meta["_sdk_cumulative_cost"] == 3.5
         # Sibling metadata keys survive the rewrite.
         assert meta["other_key"] == "kept"
 
-    async def test_noop_when_baseline_absent(self, db: Database):
-        from nerve.agent.engine import AgentEngine
+    async def test_baseline_zeroed_for_a_counter_that_starts_at_zero(self, db: Database):
+        meta = await self._baseline_after(db, {"_sdk_cumulative_cost": 4.2}, 0.0)
+        assert meta["_sdk_cumulative_cost"] == 0
 
-        await db.create_session("sess-nobase", source="web", actor=None)
-        await db.update_session_metadata("sess-nobase", {"other_key": "kept"})
-
-        await AgentEngine._reset_cost_baseline(await self._shim(db), "sess-nobase")
-
-        meta = json.loads((await db.get_session("sess-nobase"))["metadata"])
+    async def test_noop_when_baseline_absent_and_start_is_zero(self, db: Database):
+        meta = await self._baseline_after(db, {"other_key": "kept"}, 0.0)
         assert meta == {"other_key": "kept"}
 
-    async def test_missing_session_is_safe(self, db: Database):
-        from nerve.agent.engine import AgentEngine
+    async def test_resumed_conversation_takes_a_lower_start(self, db: Database):
+        # The previous process was killed: it saved less than the engine saw.
+        meta = await self._baseline_after(
+            db, {"_sdk_cumulative_cost": 4.2}, 3.5, same_conversation=True,
+        )
+        assert meta["_sdk_cumulative_cost"] == 3.5
 
-        await AgentEngine._reset_cost_baseline(await self._shim(db), "no-such-session")
+    async def test_resumed_conversation_keeps_a_lower_stored_value(self, db: Database):
+        # The previous process spent after the last result the engine saw.
+        meta = await self._baseline_after(
+            db, {"_sdk_cumulative_cost": 3.5}, 4.2, same_conversation=True,
+        )
+        assert meta["_sdk_cumulative_cost"] == 3.5
+
+    async def test_resumed_conversation_without_a_stored_value_takes_the_start(self, db: Database):
+        meta = await self._baseline_after(db, {}, 3.5, same_conversation=True)
+        assert meta["_sdk_cumulative_cost"] == 3.5
+
+    async def test_missing_session_is_safe(self, db: Database):
+        await AgentEngine._set_cost_baseline(await self._shim(db), "no-such-session", 1.0)
+
+
+# ---------------------------------------------------------------------------
+# Claude backend: where the counter of a new process starts
+# ---------------------------------------------------------------------------
+
+
+def _backend_with_history(tmp_path, monkeypatch, text: str) -> tuple[ClaudeBackend, str]:
+    """A ClaudeBackend on a host where the CLI's history of the
+    conversation ``conv-1`` is *text*. Returns it with the cwd."""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    project = home / ".claude" / "projects" / re.sub(
+        r"[^a-zA-Z0-9]", "-", os.path.realpath(str(ws)),
+    )
+    project.mkdir(parents=True)
+    (project / "conv-1.jsonl").write_text(text)
+    backend = ClaudeBackend(SimpleNamespace(config=lambda: SimpleNamespace()))
+    return backend, str(ws)
+
+
+def _lines(*entries: dict) -> str:
+    return "".join(json.dumps(entry) + "\n" for entry in entries)
+
+
+class TestCostCounterStart:
+    def test_the_last_saved_total_is_the_start(self, tmp_path, monkeypatch):
+        backend, cwd = _backend_with_history(tmp_path, monkeypatch, _lines(
+            {"type": "user", "message": {"content": "one"}},
+            {"type": "cost-state", "totalCostUSD": 1.5},
+            {"type": "user", "message": {"content": "two"}},
+            {"type": "cost-state", "totalCostUSD": 2.25},
+            {"type": "last-prompt"},
+        ))
+        assert backend.cost_counter_start("conv-1", cwd) == 2.25
+
+    def test_a_history_without_a_total_starts_at_zero(self, tmp_path, monkeypatch):
+        backend, cwd = _backend_with_history(tmp_path, monkeypatch, _lines(
+            {"type": "user", "message": {"content": "one"}},
+        ))
+        assert backend.cost_counter_start("conv-1", cwd) == 0.0
+        # A conversation without a history on this host.
+        assert backend.cost_counter_start("conv-2", cwd) == 0.0
+
+    def test_only_a_cost_entry_with_a_total_counts(self, tmp_path, monkeypatch):
+        text = _lines(
+            {"type": "cost-state", "totalCostUSD": 1.5},
+            # Text that names the entry type, and an entry that holds one.
+            {"type": "assistant", "message": {
+                "content": 'see the "cost-state" entry {"type":"cost-state","totalCostUSD":9}',
+            }},
+            {"type": "attachment", "attachment": {"type": "cost-state", "totalCostUSD": 9}},
+            {"type": "cost-state", "totalCostUSD": "much"},
+            {"type": "cost-state", "totalCostUSD": -1},
+            {"type": "cost-state"},
+        ) + '{"type":"cost-state","totalCostUSD":7'  # a line that is not complete
+        backend, cwd = _backend_with_history(tmp_path, monkeypatch, text)
+        assert backend.cost_counter_start("conv-1", cwd) == 1.5
+
+    def test_a_total_far_from_the_end_is_found(self, tmp_path, monkeypatch):
+        # Read in small pieces: lines that span several of them come after
+        # the total, as they do after a process that was killed.
+        monkeypatch.setattr(claude_backend, "_HISTORY_CHUNK", 64)
+        backend, cwd = _backend_with_history(tmp_path, monkeypatch, _lines(
+            {"type": "user", "message": {"content": "one"}},
+            {"type": "cost-state", "totalCostUSD": 3.75},
+            *[{"type": "assistant", "message": {"content": "x" * size}}
+              for size in (10, 500, 63, 64, 65, 1)],
+        ))
+        assert backend.cost_counter_start("conv-1", cwd) == 3.75
+
+    def test_a_history_that_cannot_be_read_starts_at_zero(self, tmp_path, monkeypatch):
+        backend, cwd = _backend_with_history(tmp_path, monkeypatch, "")
+
+        def _denied(path):
+            raise OSError("denied")
+
+        monkeypatch.setattr(claude_backend, "_last_saved_cost", _denied)
+        assert backend.cost_counter_start("conv-1", cwd) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Engine: the cost of a turn across clients of one conversation
+# ---------------------------------------------------------------------------
+
+
+class _CountingClient:
+    """A runtime process whose cost counter works as the CLI's does: it
+    counts from what the conversation it resumes or forks from has saved,
+    and it saves its own total when it ends normally (``end_normally``:
+    the gateway stops, and the input of the process closes). ``disconnect``
+    kills the process, as the Claude backend's does, and saves nothing."""
+
+    def __init__(self, backend: "_CountingBackend", spec: SessionSpec, n: int):
+        self.backend = backend
+        self.model = "claude-test"
+        self.resume_dropped = False
+        # A fork gets its own id with its first message.
+        self._native = None if spec.fork else spec.resume_native_id
+        self._own = (
+            f"native-fork-{n}" if spec.fork
+            else spec.resume_native_id or f"native-{n}"
+        )
+        self.counter = backend.saved.get(spec.resume_native_id, 0.0)
+        self.turns = 0
+
+    @property
+    def native_session_id(self):
+        return self._native
+
+    async def connect(self):
+        pass
+
+    async def start_turn(self, turn):
+        pass
+
+    async def receive_turn(self):
+        self._native = self._own
+        self.turns += 1
+        self.counter += self.backend.turn_costs.pop(0)
+        yield TextDelta(text="reply")
+        yield TurnCompleted(
+            native_session_id=self._native,
+            native_turn_id=f"{self._own}-turn-{self.turns}",
+            usage=NormalizedUsage.from_anthropic(
+                {"input_tokens": 10, "output_tokens": 5},
+            ),
+            total_cost_usd=self.counter,
+        )
+
+    async def interrupt(self, **kw):
+        pass
+
+    def is_alive(self):
+        return True
+
+    def end_normally(self):
+        self.backend.saved[self._own] = self.counter
+
+    async def disconnect(self, timeout: float = 5.0):
+        pass
+
+    def try_receive_idle_events(self):
+        return None
+
+    def buffer_used(self):
+        return 0
+
+
+class _CountingBackend:
+    name = "claude"
+
+    def __init__(self, turn_costs: list[float]):
+        self.capabilities = BackendCapabilities(
+            supports_idle_stream=False, supports_cache_ttl=False,
+        )
+        # The cost of each turn, in the order the turns run.
+        self.turn_costs = list(turn_costs)
+        # What the runtime keeps per conversation: the total that its last
+        # process saved when it ended normally.
+        self.saved: dict[str, float] = {}
+        self.clients: list[_CountingClient] = []
+
+    def default_model(self, source):
+        return "claude-test"
+
+    def excluded_tools(self):
+        return set()
+
+    def validate_resume_target(self, native_id, cwd):
+        return True
+
+    def cost_counter_start(self, native_id, cwd):
+        return self.saved.get(native_id, 0.0)
+
+    async def create_client(self, spec):
+        client = _CountingClient(self, spec, len(self.clients))
+        self.clients.append(client)
+        return client
+
+
+async def _engine(tmp_path, db: Database, turn_costs: list[float]):
+    """An engine with the session ``chat`` on a counting backend."""
+    ws = tmp_path / "ws"
+    ws.mkdir(exist_ok=True)
+    cfg = NerveConfig.from_dict({"workspace": str(ws), "agent": {"backend": "claude"}})
+    engine = AgentEngine(cfg, db)
+    backend = _CountingBackend(turn_costs)
+    engine._backends["claude"] = backend
+    await engine.sessions.get_or_create(
+        "chat", title="c", source="web", backend="claude", actor=None,
+    )
+    return engine, backend
+
+
+async def _turn(engine: AgentEngine, session_id: str = "chat") -> None:
+    await engine.run(session_id, "hello", source="web", channel="web", actor=None)
+
+
+async def _end_client(engine: AgentEngine, session_id: str = "chat", *, normally: bool) -> None:
+    """End the live client: the next turn builds anew. *normally* is the
+    end at a gateway stop, which saves the total. The other end is the
+    kill of an idle reap, which saves nothing."""
+    client = engine.sessions.remove_client(session_id, reason="idle_timeout")
+    if normally:
+        client.end_normally()
+    await client.disconnect()
+
+
+@pytest.mark.asyncio
+class TestTurnCostAcrossClients:
+    async def test_a_client_after_a_kill_counts_from_zero(self, tmp_path, db: Database):
+        engine, backend = await _engine(tmp_path, db, [0.30, 0.20])
+        await _turn(engine)
+        # Nothing was saved, so the next process counts from zero, below
+        # the last value the engine saw.
+        await _end_client(engine, normally=False)
+        await _turn(engine)
+
+        assert [c.counter for c in backend.clients] == pytest.approx([0.30, 0.20])
+        assert await _fetch_costs(db, "chat") == pytest.approx([0.30, 0.20])
+
+    async def test_a_client_after_a_normal_end_charges_each_turn_once(self, tmp_path, db: Database):
+        engine, backend = await _engine(tmp_path, db, [0.30, 0.20, 0.05])
+        await _turn(engine)
+        await _end_client(engine, normally=True)
+        # The new process counts from 0.30: it reports 0.50, then 0.55.
+        await _turn(engine)
+        await _turn(engine)
+
+        assert [c.counter for c in backend.clients] == pytest.approx([0.30, 0.55])
+        assert await _fetch_costs(db, "chat") == pytest.approx([0.30, 0.20, 0.05])
+        assert await _session_total(db, "chat") == pytest.approx(0.55)
+
+    async def test_each_later_client_counts_from_the_saved_total(self, tmp_path, db: Database):
+        engine, backend = await _engine(tmp_path, db, [0.30, 0.20, 0.10])
+        await _turn(engine)
+        await _end_client(engine, normally=True)
+        await _turn(engine)
+        # Killed at 0.50: the conversation still holds 0.30, and the next
+        # process counts from there, below the last value the engine saw.
+        await _end_client(engine, normally=False)
+        await _turn(engine)
+
+        assert [c.counter for c in backend.clients] == pytest.approx([0.30, 0.50, 0.40])
+        assert await _fetch_costs(db, "chat") == pytest.approx([0.30, 0.20, 0.10])
+
+    async def test_spend_after_the_last_result_goes_to_the_next_turn(self, tmp_path, db: Database):
+        engine, backend = await _engine(tmp_path, db, [0.30, 0.05])
+        await _turn(engine)
+        # The process spends 0.07 that no result reports (a turn that was
+        # stopped), and saves 0.37 when it ends.
+        backend.clients[0].counter += 0.07
+        await _end_client(engine, normally=True)
+        await _turn(engine)
+
+        assert [c.counter for c in backend.clients] == pytest.approx([0.37, 0.42])
+        assert await _fetch_costs(db, "chat") == pytest.approx([0.30, 0.12])
+        assert await _session_total(db, "chat") == pytest.approx(0.42)
+
+    async def test_a_fork_does_not_pay_for_its_source(self, tmp_path, db: Database):
+        engine, backend = await _engine(tmp_path, db, [0.30, 0.20, 0.05])
+        await _turn(engine)
+        await _end_client(engine, normally=True)
+        fork = await engine.fork_session("chat", None, None, actor=None)
+        # The fork's process counts from the 0.30 of its source.
+        await _turn(engine, fork["id"])
+        await _end_client(engine, fork["id"], normally=True)
+        await _turn(engine, fork["id"])
+
+        assert [c.counter for c in backend.clients] == pytest.approx([0.30, 0.50, 0.55])
+        assert await _fetch_costs(db, fork["id"]) == pytest.approx([0.20, 0.05])
+        assert await _fetch_costs(db, "chat") == pytest.approx([0.30])
+
+    async def test_a_fork_of_a_source_that_saved_nothing_counts_from_zero(self, tmp_path, db: Database):
+        engine, backend = await _engine(tmp_path, db, [0.30, 0.20])
+        await _turn(engine)
+        # The source's process has not ended, so it has saved nothing.
+        fork = await engine.fork_session("chat", None, None, actor=None)
+        await _turn(engine, fork["id"])
+
+        assert [c.counter for c in backend.clients] == pytest.approx([0.30, 0.20])
+        assert await _fetch_costs(db, fork["id"]) == pytest.approx([0.20])
 
 
 # ---------------------------------------------------------------------------

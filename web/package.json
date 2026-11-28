@@ -13,11 +13,12 @@
   },
   "scripts": {
     "dev": "vite",
-    "build": "tsc -b && vite build",
+    "build": "tsc -b && vite build && node scripts/build-kit.mjs",
     "lint": "eslint .",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "build:kit": "node scripts/build-kit.mjs"
   },
   "dependencies": {
     "@clickhouse/click-ui": "0.15.0",

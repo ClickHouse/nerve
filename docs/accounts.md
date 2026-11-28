@@ -187,13 +187,11 @@ In external mode:
 - Startup can give the system actor the ID of the agent's system principal.
   See [The system actor in external mode](#the-system-actor-in-external-mode).
 - Accounts and history from an earlier local mode stay in `nerve.db`.
-- Nerve does not know when the gateway removes the access of a person. The
-  browsers where that person turned on
-  [push notifications](web-ui.md#push-notifications) continue to show them.
-  This stops when the person blocks the notifications of the panel in each
-  browser, or when somebody with access to `nerve.db` deletes the rows of
-  that person from `push_subscriptions` (`actor_id` is the principal ID). No
-  route removes the browsers of a different person.
+- The platform delivers [push notifications](web-ui.md#push-notifications).
+  The gateway keeps the browsers of each person and decides at send time who
+  gets a push. Nerve does not create, read or use a VAPID key or push
+  subscriptions for Web Push, and does not register its own push
+  subscription routes.
 - Each model request names the principal that caused the work, in the
   `X-Nerve-Inference-Principal` header: the session's cause, or the system
   actor for Nerve's own model calls. See
@@ -216,7 +214,9 @@ when these conditions are true:
 - No row refers to the system actor. Nerve finds each column that has a
   foreign key to `actor_refs` in the schema, for example `accounts.actor_id`,
   `sessions.created_by_actor_id` and `messages.actor_id`, and checks all of
-  them. A check that cannot run counts as a row.
+  them. A check that cannot run counts as a row. A database that is marked
+  as migrated does not need this condition: see
+  [A database from another installation](#a-database-from-another-installation).
 - No other actor has the new ID.
 - The system actor did not take an ID from the variable before. Nerve records
   the ID it took in `nerve.db`, in the same transaction as the change, so the
@@ -237,6 +237,41 @@ ignores the variable.
 The schema trigger `system_actor_id_cannot_change` prevents all other changes
 to the ID. The bootstrap removes the trigger, changes the ID and creates the
 trigger again in one transaction.
+
+#### A database from another installation
+
+A database that was moved from another installation has a system actor with
+the ID of that installation, and rows that refer to it. Without help it keeps
+that ID, and autonomous work is attributed to an ID that the environment does
+not name.
+
+Whatever moves the database can mark it as migrated. The mark is one row in
+`nerve.db`:
+
+```sql
+INSERT INTO instance_secrets (name, value)
+VALUES ('system_actor_migration_pending', 'true');
+```
+
+At the next start, while the value is `true`, the identity bootstrap gives
+the system actor the ID in `NERVE_SYSTEM_PRINCIPAL_ID` although rows refer to
+it. In the same transaction as the change of the ID, Nerve gives the new ID
+to each row that refers to the old one, in every column that has a foreign
+key to `actor_refs`, and sets the value to `false`. Nerve logs how many
+references it changed. It checks the foreign keys when the transaction
+commits. If a row still refers to the old ID, or the database refuses a
+statement of the change, nothing changes, the value stays `true`, Nerve logs
+a warning, and the server starts with the old ID.
+
+The other two conditions stay: no other actor has the new ID, and the system
+actor did not take an ID from the variable before. So a mark is used at most
+once. After the change, the record of the taken ID refuses every other ID,
+also when the value is set to `true` again.
+
+Nerve changes only the rows of the system actor. The actors of people keep
+their IDs. Text that contains the old ID, for example in a message, does not
+change. Nerve never sets the value to `true`. A backup made with
+`--no-secrets` does not keep the mark.
 
 ## Attribution
 
