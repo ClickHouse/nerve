@@ -1,15 +1,23 @@
-import { useId, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { api, apiErrorDetail } from '../../api/client';
 import { useHostedStore } from '../../api/hosted';
 import { useArtifactStore } from '../../stores/artifactStore';
 import type { PublishedArtifact } from '../../types/artifacts';
 import { Button, Modal, TextField } from '../ui';
-import { ExternalLink, Loader2, Share } from '../ui/icons';
+import { Check, Copy, ExternalLink, Loader2, Share } from '../ui/icons';
+import { copyToClipboard } from '../../utils/clipboard';
 import { httpLink } from '../../utils/httpLink';
 import { defaultTitle } from './title';
 
 /** The most characters of a title (the platform refuses more). */
 export const MAX_TITLE_CHARS = 200;
+
+/** Who sees a new artifact, before and after the publish, and how a member shares it. */
+const BEFORE_TEXT = 'Only members of this agent will see it. You can share it with everyone in your tenant later.';
+const AFTER_TEXT = 'Only members of this agent can see it. To share it with everyone in your tenant, open it and select Share.';
+
+/** How long the Copy link button says "Copied". */
+const COPIED_MS = 1500;
 
 /** The sentence of a failed publish: the message of the runtime, else a general one. */
 function failureText(e: unknown): string {
@@ -33,13 +41,20 @@ export function PublishButton({ path, disabled }: { path: string; disabled: bool
   const [error, setError] = useState<string | null>(null);
   const [published, setPublished] = useState<PublishedArtifact | null>(null);
   const [done, setDone] = useState(false);
+  const [copied, setCopied] = useState<boolean | null>(null);
+  const copiedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fieldId = useId();
+
+  useEffect(() => () => {
+    if (copiedTimer.current) clearTimeout(copiedTimer.current);
+  }, []);
 
   if (!enabled || !hosted) return null;
 
   const start = () => {
     setError(null);
     setDone(false);
+    setCopied(null);
     setOpen(true);
   };
 
@@ -65,6 +80,14 @@ export function PublishButton({ path, disabled }: { path: string; disabled: bool
 
   const link = done && published ? httpLink(published.viewer_url) : null;
 
+  const copyLink = async () => {
+    if (!link) return;
+    const ok = await copyToClipboard(link);
+    setCopied(ok);
+    if (copiedTimer.current) clearTimeout(copiedTimer.current);
+    if (ok) copiedTimer.current = setTimeout(() => setCopied(null), COPIED_MS);
+  };
+
   return (
     <>
       <Button variant="primary" size="sm" onClick={start} disabled={disabled}>
@@ -79,6 +102,12 @@ export function PublishButton({ path, disabled }: { path: string; disabled: bool
         footer={done ? (
           <>
             <Button variant="secondary" size="sm" onClick={close}>Close</Button>
+            {link && (
+              <Button variant="secondary" size="sm" onClick={() => void copyLink()}>
+                {copied ? <Check size={12} aria-hidden="true" /> : <Copy size={12} aria-hidden="true" />}
+                {copied ? 'Copied' : 'Copy link'}
+              </Button>
+            )}
             {link && (
               <a
                 href={link}
@@ -102,14 +131,14 @@ export function PublishButton({ path, disabled }: { path: string; disabled: bool
       >
         {done && published ? (
           <div className="p-5 space-y-2 text-sm">
-            <p>
-              Published {published.title} as version {published.version}. Only the members of this agent can
-              see it. A member can share it with everyone in the tenant in the viewer.
-            </p>
+            <p>{published.title} is published as version {published.version}. {AFTER_TEXT}</p>
             {published.changed_after && (
-              <p>The files changed while they were published. This version has the earlier state.</p>
+              <p>The files changed during the publish. This version does not have the changes. Publish again to add them.</p>
             )}
             <p className="font-mono text-xs text-text-secondary break-all">{published.viewer_url}</p>
+            {copied === false && (
+              <p role="alert" className="text-error">Could not copy the link. Select it and copy it.</p>
+            )}
           </div>
         ) : (
           <form
@@ -132,8 +161,8 @@ export function PublishButton({ path, disabled }: { path: string; disabled: bool
             </div>
             <p className="text-text-muted">
               {published
-                ? `This publishes a new version of ${published.title}, at the same address.`
-                : 'Only the members of this agent can see it. A member can share it with everyone in the tenant in the viewer.'}
+                ? `This publishes a new version of ${published.title} at the same link.`
+                : BEFORE_TEXT}
             </p>
             {error && <p role="alert" className="text-error">{error}</p>}
           </form>
