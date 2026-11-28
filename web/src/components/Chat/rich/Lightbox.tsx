@@ -1,6 +1,7 @@
 import {
   useEffect, useId, useLayoutEffect, useRef, useState,
-  type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, type ReactNode,
+  type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent, type ReactNode,
 } from 'react';
 import { IconButton, Modal } from '../../ui';
 import { ChevronLeft, ChevronRight, X, ZoomIn, ZoomOut } from '../../ui/icons';
@@ -14,6 +15,31 @@ const ZOOM_STEP = 1.25;
 const PAN_STEP = 48;
 /** The gap 1:1 and Fit leave between the picture and the viewport's edge. */
 const MARGIN = 24;
+/** A touch that moves at least this far sideways, in CSS pixels, is a swipe. */
+const SWIPE_MIN = 50;
+/** A touch that moves this far, in CSS pixels, has a direction: sideways a swipe, up or down a drag. */
+const TOUCH_SLOP = 10;
+
+/**
+ * The step of a touch that moved by (dx, dy): 1 to the next picture (a swipe
+ * to the left), -1 to the previous one, 0 when it is no swipe (too short, or
+ * more up or down than sideways).
+ */
+function swipeStep(dx: number, dy: number): -1 | 0 | 1 {
+  if (Math.abs(dx) < SWIPE_MIN || Math.abs(dx) < 2 * Math.abs(dy)) return 0;
+  return dx < 0 ? 1 : -1;
+}
+
+// The arrows over the picture show on hover and on keyboard focus. Tailwind's
+// hover variants apply only where the screen has hover, so on a touch screen
+// the arrows stay hidden (a swipe steps there) and take no taps.
+const NAV_CLASS = 'absolute top-1/2 -translate-y-1/2 flex items-center justify-center w-10 h-10 rounded-full '
+  + 'bg-black/55 text-white shadow cursor-pointer transition-opacity hover:bg-black/70 '
+  + 'opacity-0 group-hover/stage:opacity-100 focus-visible:opacity-100 [@media(hover:none)]:pointer-events-none '
+  + 'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent/70';
+
+/** The arrow button that had focus when the picture changed. */
+type NavFocus = { current: 'prev' | 'next' | null };
 
 /**
  * Where the picture sits: scaled by `zoom` about its top-left corner and
@@ -84,7 +110,11 @@ export interface LightboxProps {
   size: Size;
   /** `fit-down`: open scaled to fit when the picture is larger than the window, else at 1:1. */
   initialView?: 'actual' | 'fit-down';
-  /** Step through a set of pictures: the position, and what the buttons and keys do. */
+  /**
+   * Step through a set of pictures: the position, and what the arrow
+   * buttons, the keys and a swipe do. The first picture has no previous
+   * one and the last no next one.
+   */
   nav?: { index: number; count: number; onPrev: () => void; onNext: () => void };
   /** Extra toolbar controls, before Close (Open original, Download). */
   actions?: ReactNode;
@@ -97,10 +127,14 @@ export interface LightboxProps {
  * Escape closes it (the Modal's own handling).
  */
 export function Lightbox({ open, onClose, ...view }: LightboxProps) {
+  const navFocusRef = useRef<'prev' | 'next' | null>(null);
+  const nav = view.nav && view.nav.count > 1 ? view.nav : undefined;
   return (
     <Modal open={open} onClose={onClose} size="full" ariaLabel={view.title}>
-      {/* A new picture starts from its own view; the dialog, and focus in it, stay. */}
-      <LightboxView key={view.src ?? view.markup} onClose={onClose} {...view} />
+      {/* A new picture starts from its own view; the dialog, and focus in it, stay.
+          The place in the set is in the key: two images of a chat can have one source. */}
+      <LightboxView key={`${nav?.index ?? ''}:${view.src ?? view.markup}`} onClose={onClose} navFocusRef={navFocusRef} {...view} />
+      {nav && <p className="sr-only" aria-live="polite">{`${view.title}, picture ${nav.index + 1} of ${nav.count}`}</p>}
     </Modal>
   );
 }
@@ -120,15 +154,22 @@ function ViewButton({ label, onClick, children }: { label: string; onClick: () =
 }
 
 function LightboxView({
-  onClose, title, label, markup = '', src, size, initialView = 'actual', nav, actions,
-}: Omit<LightboxProps, 'open'>) {
+  onClose, title, label, markup = '', src, size, initialView = 'actual', nav, actions, navFocusRef,
+}: Omit<LightboxProps, 'open'> & { navFocusRef: NavFocus }) {
   const [view, setView] = useState<View>(ONE_TO_ONE);
   const [dragging, setDragging] = useState(false);
   const viewportRef = useRef<HTMLDivElement>(null);
   const hostRef = useRef<HTMLDivElement>(null);
+  const prevRef = useRef<HTMLButtonElement>(null);
+  const nextRef = useRef<HTMLButtonElement>(null);
   // Pointers down on the viewport, where each was last seen: one drags, two pinch.
   const pointersRef = useRef(new Map<number, { x: number; y: number }>());
+  // The touch that can become a swipe, and the view when it started.
+  const swipeRef = useRef<{ id: number; x: number; y: number; view: View; sideways: boolean } | null>(null);
   const hintId = useId();
+  const steps = nav && nav.count > 1 ? nav : undefined;
+  const hasPrev = !!steps && steps.index > 0;
+  const hasNext = !!steps && steps.index < steps.count - 1;
 
   // The picture goes into a shadow root: its ids (markers, gradients) and its
   // <style> cannot collide with the same picture still drawn in the chat.
@@ -179,10 +220,18 @@ function LightboxView({
 
   // Focus starts on the picture, so the keys work at once. A frame later, so
   // the Modal has already noted the control to give focus back to on close.
+  // After a step with an arrow button that had focus, that button keeps it,
+  // or the other one when this picture is the first or the last.
   useEffect(() => {
-    const frame = requestAnimationFrame(() => viewportRef.current?.focus({ preventScroll: true }));
+    const frame = requestAnimationFrame(() => {
+      const wanted = navFocusRef.current;
+      navFocusRef.current = null;
+      const arrow = wanted === 'next' ? nextRef.current ?? prevRef.current
+        : wanted === 'prev' ? prevRef.current ?? nextRef.current : null;
+      (arrow ?? viewportRef.current)?.focus({ preventScroll: true });
+    });
     return () => cancelAnimationFrame(frame);
-  }, []);
+  }, [navFocusRef]);
 
   const viewportBox = () => {
     const rect = viewportRef.current?.getBoundingClientRect();
@@ -195,6 +244,14 @@ function LightboxView({
   const actualSize = () => setView(ONE_TO_ONE);
   const fit = () => setView(fitView(viewportBox(), size));
   const pan = (dx: number, dy: number) => setView(v => ({ ...v, x: v.x + dx, y: v.y + dy }));
+  // The whole width of the picture is in the window: Left, Right and a swipe
+  // step through the set, as there is nothing to move to sideways.
+  const fitsWidth = () => size.width * view.zoom <= viewportBox().width;
+  const stepBy = (by: -1 | 1, from?: 'prev' | 'next') => {
+    navFocusRef.current = from ?? null;
+    if (by < 0) nav?.onPrev();
+    else nav?.onNext();
+  };
   // Double-click switches between 1:1 and fit.
   const toggleFit = () => {
     if (view.zoom === 1 && view.x === 0 && view.y === 0) fit();
@@ -208,11 +265,12 @@ function LightboxView({
       case '+': case '=': zoomBy(ZOOM_STEP); break;
       case '-': case '_': zoomBy(1 / ZOOM_STEP); break;
       case '0': actualSize(); break;
-      case 'PageUp': case 'p': if (!nav) return; nav.onPrev(); break;
-      case 'PageDown': case 'n': if (!nav) return; nav.onNext(); break;
-      // Arrows move the view over the picture, as scrolling would.
-      case 'ArrowLeft': pan(step, 0); break;
-      case 'ArrowRight': pan(-step, 0); break;
+      case 'PageUp': case 'p': if (!nav) return; stepBy(-1); break;
+      case 'PageDown': case 'n': if (!nav) return; stepBy(1); break;
+      // Arrows move the view over the picture, as scrolling would. In a set,
+      // Left and Right step while the picture fits the width of the window.
+      case 'ArrowLeft': if (steps && !e.shiftKey && fitsWidth()) stepBy(-1); else pan(step, 0); break;
+      case 'ArrowRight': if (steps && !e.shiftKey && fitsWidth()) stepBy(1); else pan(-step, 0); break;
       case 'ArrowUp': pan(0, step); break;
       case 'ArrowDown': pan(0, -step); break;
       default: return;
@@ -225,8 +283,17 @@ function LightboxView({
   const onPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     if (e.pointerType === 'mouse' && e.button !== 0) return;
     e.currentTarget.setPointerCapture?.(e.pointerId);
-    pointersRef.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    const pointers = pointersRef.current;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     setDragging(true);
+    const swipe = swipeRef.current;
+    if (swipe) {
+      // A second finger makes it a pinch, from where the picture was.
+      swipeRef.current = null;
+      setView(swipe.view);
+    } else if (e.pointerType === 'touch' && pointers.size === 1 && steps && fitsWidth()) {
+      swipeRef.current = { id: e.pointerId, x: e.clientX, y: e.clientY, view, sideways: false };
+    }
   };
   const onPointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
     const pointers = pointersRef.current;
@@ -234,6 +301,26 @@ function LightboxView({
     if (!last) return;
     const now = { x: e.clientX, y: e.clientY };
     pointers.set(e.pointerId, now);
+    const swipe = swipeRef.current;
+    if (swipe?.id === e.pointerId) {
+      const dx = now.x - swipe.x;
+      const dy = now.y - swipe.y;
+      if (!swipe.sideways) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) < TOUCH_SLOP) return;
+        if (Math.abs(dy) > Math.abs(dx)) {
+          // Up or down: no swipe, a drag that moves the picture (a tall one).
+          swipeRef.current = null;
+          setView({ ...swipe.view, x: swipe.view.x + dx, y: swipe.view.y + dy });
+          return;
+        }
+        swipe.sideways = true;
+      }
+      // The picture follows the finger sideways. Past the first or the last
+      // picture it moves a third as far: nothing comes.
+      const blocked = (dx > 0 && !hasPrev) || (dx < 0 && !hasNext);
+      setView({ ...swipe.view, x: swipe.view.x + (blocked ? dx / 3 : dx) });
+      return;
+    }
     if (pointers.size === 1) {
       pan(now.x - last.x, now.y - last.y);
       return;
@@ -254,6 +341,18 @@ function LightboxView({
   const onPointerEnd = (e: ReactPointerEvent<HTMLDivElement>) => {
     pointersRef.current.delete(e.pointerId);
     if (pointersRef.current.size === 0) setDragging(false);
+    const swipe = swipeRef.current;
+    if (swipe?.id !== e.pointerId) return;
+    swipeRef.current = null;
+    setView(swipe.view);
+    if (e.type !== 'pointerup') return;
+    const by = swipeStep(e.clientX - swipe.x, e.clientY - swipe.y);
+    if (by === 1 && hasNext) stepBy(1);
+    if (by === -1 && hasPrev) stepBy(-1);
+  };
+  const onArrow = (e: ReactMouseEvent<HTMLButtonElement>, by: -1 | 1) => {
+    const had = document.activeElement === e.currentTarget;
+    stepBy(by, had ? (by < 0 ? 'prev' : 'next') : undefined);
   };
 
   return (
@@ -263,16 +362,8 @@ function LightboxView({
           {title}
           {label && <span className="ml-2 font-mono text-xs font-normal text-text-faint">{label}</span>}
         </h2>
-        {nav && nav.count > 1 && (
-          <div role="group" aria-label="Pictures" className="flex items-center gap-0.5 mr-2">
-            <IconButton label="Previous picture" onClick={nav.onPrev}>
-              <ChevronLeft size={16} />
-            </IconButton>
-            <span className="text-xs tabular-nums text-text-muted">{nav.index + 1} / {nav.count}</span>
-            <IconButton label="Next picture" onClick={nav.onNext}>
-              <ChevronRight size={16} />
-            </IconButton>
-          </div>
+        {steps && (
+          <span className="mr-2 shrink-0 whitespace-nowrap text-xs tabular-nums text-text-muted">{steps.index + 1} / {steps.count}</span>
         )}
         <span className="hidden md:inline mr-2 text-2xs text-text-faint">Scroll to zoom · drag to move</span>
         <div role="group" aria-label="Zoom" className="flex items-center gap-0.5">
@@ -294,47 +385,62 @@ function LightboxView({
           <X size={18} />
         </IconButton>
       </div>
-      <div
-        ref={viewportRef}
-        className="rich-lightbox-viewport"
-        data-dragging={dragging ? '' : undefined}
-        tabIndex={0}
-        role="img"
-        aria-label={title}
-        aria-describedby={hintId}
-        onPointerDown={onPointerDown}
-        onPointerMove={onPointerMove}
-        onPointerUp={onPointerEnd}
-        onPointerCancel={onPointerEnd}
-        onDoubleClick={toggleFit}
-      >
+      <div className="group/stage relative flex flex-col flex-1 min-h-0">
         <div
-          className="rich-lightbox-content"
-          style={{
-            width: size.width,
-            height: size.height,
-            left: `max(${MARGIN}px, calc(50% - ${size.width / 2}px))`,
-            top: `max(${MARGIN}px, calc(50% - ${size.height / 2}px))`,
-            transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})`,
-          }}
+          ref={viewportRef}
+          className="rich-lightbox-viewport"
+          data-dragging={dragging ? '' : undefined}
+          tabIndex={0}
+          role="img"
+          aria-label={title}
+          aria-describedby={hintId}
+          onPointerDown={onPointerDown}
+          onPointerMove={onPointerMove}
+          onPointerUp={onPointerEnd}
+          onPointerCancel={onPointerEnd}
+          onDoubleClick={toggleFit}
         >
-          {src ? (
-            <img
-              src={src}
-              alt=""
-              draggable={false}
-              className="block max-w-none select-none"
-              // Zoomed in, a screenshot's pixels stay crisp instead of blurring.
-              style={{ width: size.width, height: size.height, imageRendering: view.zoom >= 2 ? 'pixelated' : 'auto' }}
-            />
-          ) : (
-            <div ref={hostRef} />
-          )}
+          <div
+            className="rich-lightbox-content"
+            style={{
+              width: size.width,
+              height: size.height,
+              left: `max(${MARGIN}px, calc(50% - ${size.width / 2}px))`,
+              top: `max(${MARGIN}px, calc(50% - ${size.height / 2}px))`,
+              transform: `translate(${view.x}px, ${view.y}px) scale(${view.zoom})`,
+            }}
+          >
+            {src ? (
+              <img
+                src={src}
+                alt=""
+                draggable={false}
+                className="block max-w-none select-none"
+                // Zoomed in, a screenshot's pixels stay crisp instead of blurring.
+                style={{ width: size.width, height: size.height, imageRendering: view.zoom >= 2 ? 'pixelated' : 'auto' }}
+              />
+            ) : (
+              <div ref={hostRef} />
+            )}
+          </div>
         </div>
+        {/* Beside the viewport, not in it: its pointer capture would take the click. */}
+        {hasPrev && (
+          <button ref={prevRef} type="button" aria-label="Previous picture" title="Previous picture (←)"
+            onClick={e => onArrow(e, -1)} className={`${NAV_CLASS} left-3`}>
+            <ChevronLeft size={22} aria-hidden="true" />
+          </button>
+        )}
+        {hasNext && (
+          <button ref={nextRef} type="button" aria-label="Next picture" title="Next picture (→)"
+            onClick={e => onArrow(e, 1)} className={`${NAV_CLASS} right-3`}>
+            <ChevronRight size={22} aria-hidden="true" />
+          </button>
+        )}
       </div>
       <p id={hintId} className="sr-only">
         Drag or use the arrow keys to move the picture; plus and minus zoom, 0 shows it at actual size.
-        {nav && nav.count > 1 ? ' N and P, or Page Down and Page Up, show the next and previous picture.' : ''}
+        {steps ? ' While the picture fits the width of the window, Left and Right show the previous and next picture; N and P, or Page Down and Page Up, always do.' : ''}
       </p>
     </div>
   );

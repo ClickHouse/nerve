@@ -139,7 +139,13 @@ function MessageListImpl({ messages, isStreaming, onForkMessage, messageForks, u
   }, [messages.length, streamingBlockCount, isStreaming]);
 
   return (
-    <div className="flex-1 overflow-y-auto relative" ref={containerRef} onScroll={handleScroll}>
+    <div
+      className="flex-1 overflow-y-auto relative"
+      ref={containerRef}
+      onScroll={handleScroll}
+      // Its images are one set in the image viewer (ImageViewerHost).
+      data-lightbox-group=""
+    >
       <SelectionToolbar containerRef={containerRef} />
 
       {messages.length === 0 && !isStreaming && (

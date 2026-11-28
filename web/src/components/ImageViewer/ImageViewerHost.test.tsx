@@ -84,7 +84,7 @@ describe('ImageViewerHost', () => {
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 
-  it('steps through the images of the same message, not of others', async () => {
+  it('steps through the images of the same message, not of others, and stops at the last', async () => {
     render(
       <>
         <ImageViewerHost />
@@ -96,14 +96,15 @@ describe('ImageViewerHost', () => {
     await screen.findByRole('dialog', { name: '2.png' });
     expect(screen.getByText('2 / 3')).toBeInTheDocument();
     await userEvent.click(screen.getByRole('button', { name: 'Next picture' }));
-    await screen.findByRole('dialog', { name: '3.png' });
-    await userEvent.click(screen.getByRole('button', { name: 'Next picture' }));
-    // Wraps around.
-    const dialog = await screen.findByRole('dialog', { name: '1.png' });
-    // The new picture takes focus (a frame later), so the keys work at once.
-    await waitFor(() => expect(within(dialog).getByRole('img', { name: '1.png' })).toHaveFocus());
+    const dialog = await screen.findByRole('dialog', { name: '3.png' });
+    expect(within(dialog).queryByRole('button', { name: 'Next picture' })).not.toBeInTheDocument();
+    // The arrow that had focus went away: the other one takes it.
+    await waitFor(() => expect(within(dialog).getByRole('button', { name: 'Previous picture' })).toHaveFocus());
+    await userEvent.keyboard('n');
+    expect(screen.getByRole('dialog', { name: '3.png' })).toBeInTheDocument();
     await userEvent.keyboard('p');
-    await screen.findByRole('dialog', { name: '3.png' });
+    // After a key, the new picture takes focus (a frame later), so the keys work at once.
+    await waitFor(() => expect(within(dialog).getByRole('img', { name: '2.png' })).toHaveFocus());
   });
 
   it('closes on Escape', async () => {
@@ -143,6 +144,23 @@ describe('ImageViewerHost', () => {
 });
 
 describe('collectGroup', () => {
+  it('takes the outermost group, so that a group in a chat is part of the chat', () => {
+    const { container } = render(
+      <div data-lightbox-group="">
+        <div data-role="user"><a data-lightbox="/a" href="/a"><img alt="a" /></a></div>
+        <div data-role="assistant">
+          <div data-lightbox-group="">
+            <a data-lightbox="/b" href="/b"><img alt="b" /></a>
+          </div>
+        </div>
+      </div>,
+    );
+    const link = container.querySelector<HTMLAnchorElement>('a[data-lightbox="/b"]')!;
+    const { images, index } = collectGroup(link);
+    expect(images.map(i => i.src)).toEqual(['/a', '/b']);
+    expect(index).toBe(1);
+  });
+
   it('uses an explicit data-lightbox-group over the message', () => {
     const { container } = render(
       <div data-role="assistant">
@@ -153,6 +171,6 @@ describe('collectGroup', () => {
       </div>,
     );
     const link = container.querySelector<HTMLAnchorElement>('a[data-lightbox="/a"]')!;
-    expect(collectGroup(link)).toEqual({ images: [{ src: '/a', title: 'a', download: link.href }], index: 0 });
+    expect(collectGroup(link)).toEqual({ images: [{ src: '/a', title: 'a', download: link.href, link }], index: 0 });
   });
 });

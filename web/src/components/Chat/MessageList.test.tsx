@@ -30,6 +30,7 @@ const { useAgentStore } = await import('../../stores/agentStore');
 const { makeState, step, withStep } = await import('../../test/setupFixtures');
 const { makeQueueEntry } = await import('../../test/agentFixtures');
 const { MessageList } = await import('./MessageList');
+const { ImageViewerHost } = await import('../ImageViewer/ImageViewerHost');
 
 function renderEmpty() {
   return render(
@@ -195,5 +196,39 @@ describe('long history rendering', () => {
     ]));
     expect(screen.getByText('Test turn 0')).toBeInTheDocument();
     expect(screen.getByText('Test turn 36')).toBeInTheDocument();
+  });
+});
+
+describe('images of the chat', () => {
+  it('are one set in the image viewer, across messages', async () => {
+    class LoadedImage {
+      naturalWidth = 640;
+      naturalHeight = 480;
+      onload: (() => void) | null = null;
+      set src(_: string) {
+        queueMicrotask(() => this.onload?.());
+      }
+    }
+    vi.stubGlobal('Image', LoadedImage);
+    const withImage = (id: number, filename: string): ChatMessage => ({
+      id, role: 'user',
+      blocks: [{ type: 'image', url: `/api/uploads/${filename}`, filename, media_type: 'image/png' }],
+    });
+    try {
+      render(
+        <MemoryRouter>
+          <ImageViewerHost />
+          <MessageList messages={[withImage(1, 'first.png'), withImage(2, 'second.png')]} isStreaming={false} />
+        </MemoryRouter>,
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole('link', { name: 'first.png' }), { button: 0 });
+      });
+      expect(await screen.findByRole('dialog', { name: 'first.png' })).toHaveTextContent('1 / 2');
+      fireEvent.click(screen.getByRole('button', { name: 'Next picture' }));
+      expect(await screen.findByRole('dialog', { name: 'second.png' })).toHaveTextContent('2 / 2');
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });
