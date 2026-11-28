@@ -49,3 +49,44 @@ def test_an_svg_file_is_an_attachment(client, ws):
     assert disposition.split(";")[0].strip() == "attachment"
     assert 'filename="chart.svg"' in disposition
     assert r.text == _SVG
+
+
+def test_an_excluded_file_is_not_found(client, ws, monkeypatch):
+    from nerve.config import FilesConfig
+
+    cfg._config.files = FilesConfig(exclude=["secrets"])
+    (ws / "secrets").mkdir()
+    (ws / "secrets" / "token.txt").write_text("x")
+    (ws / "notes.txt").write_text("y")
+    (ws / ".git").mkdir()
+    (ws / ".git" / "config").write_text("z")
+
+    assert client.get("/api/files/download", params={"path": str(ws / "secrets" / "token.txt")}).status_code == 404
+    assert client.get("/api/files/download", params={"path": str(ws / ".git" / "config")}).status_code == 404
+    assert client.get("/api/files/download", params={"path": str(ws / "notes.txt")}).status_code == 200
+
+
+def test_a_symlink_to_an_excluded_file_is_not_found(client, ws):
+    from nerve.config import FilesConfig
+
+    cfg._config.files = FilesConfig(exclude=["secrets"])
+    (ws / "secrets").mkdir()
+    (ws / "secrets" / "token.txt").write_text("x")
+    (ws / "link.txt").symlink_to(ws / "secrets" / "token.txt")
+
+    assert client.get("/api/files/download", params={"path": str(ws / "link.txt")}).status_code == 404
+
+
+def test_a_symlink_before_dotdot_cannot_reach_an_excluded_file(client, ws):
+    from nerve.config import FilesConfig
+
+    cfg._config.files = FilesConfig(exclude=["secrets"])
+    (ws / "secrets" / "sub").mkdir(parents=True)
+    (ws / "secrets" / "token.txt").write_text("x")
+    (ws / "token.txt").write_text("decoy")
+    (ws / "L").symlink_to(ws / "secrets" / "sub")
+
+    # Lexically <ws>/token.txt, but it resolves to secrets/token.txt.
+    r = client.get("/api/files/download", params={"path": f"{ws}/L/../token.txt"})
+    assert r.status_code == 404
+    assert client.get("/api/files/download", params={"path": str(ws / "token.txt")}).text == "decoy"

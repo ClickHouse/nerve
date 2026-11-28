@@ -252,6 +252,7 @@ A reload is always explicit. Two things cause one:
 | `gateway.drain_timeout_seconds` | ✅ read when the shutdown signal arrives (see [Shutdown Sequence](architecture.md#shutdown-sequence)) |
 | `gateway.public_url` | ✅ read for each message that links to the web UI (see [Links to the web UI](#links-to-the-web-ui)) |
 | `notifications.*` | ✅ read per notification |
+| `files.*` | ✅ read on every Files page request |
 | `workspace_sync.*` | ✅ from the next sync cycle |
 | `retention.*`, `backup.*`, and the `sessions.*` the background loops read | ✅ from the next cycle of that loop |
 | `external_agents.targets` (including each target's `enabled`), `.sync_interval_minutes`, `.conflict_policy` | ✅ from the next sweep, provided at least one target existed at startup (see the restart table) |
@@ -2387,6 +2388,40 @@ and the facts Loom wrote, and names the `queue_ids` of any batch Loom queued
 instead (with `defer_extraction`, or when Loom defers one itself) for a
 lookup in Loom's dashboard: Loom tries a queued batch three times within
 about a minute, then gives up, and how it ended is not on MCP.
+
+## Files page
+
+The web UI's **Files** page shows the whole workspace, read-only. The tree loads
+one directory at a time, when you expand it, so a directory with a huge subtree
+costs nothing until it is opened. Only the memory markdown files (`*.md` at the
+workspace root and under `memory/`) can be edited and saved there; every other
+file opens read-only. Binary files and files over `max_file_bytes` show a
+notice instead of their content, with a button that downloads them. A raster
+image (PNG, JPEG, GIF, WebP, AVIF, BMP) shows as a preview instead, with its
+pixel size and the Download button; a click opens it in the image viewer. An SVG
+keeps the notice, since it can carry script.
+
+`files.exclude` hides paths from the tree, and the read and download routes refuse them as
+well, so an excluded file cannot be opened by URL either. A path is judged by
+where it resolves, so a symlink cannot reach an excluded file or anything
+outside the workspace.
+
+```yaml
+# workspace/config/settings.yaml
+files:
+  exclude:
+    - repos            # a directory or file named "repos", at any depth
+    - "*.log"          # any name matching the glob
+    - drafts/old       # with a "/": the path from the workspace root
+    - build/           # trailing "/": directories only
+```
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `files.exclude` | list of strings | `[]` | Patterns to hide, matched with `fnmatch` (case-sensitive). A pattern without `/` matches a name at any depth; one with `/` matches the path from the workspace root; a trailing `/` matches directories only. Excluding a directory hides everything under it. Added to the defaults. |
+| `files.default_excludes` | bool | `true` | Also hide `.git`, `node_modules`, `__pycache__`, `.venv`, `*.pyc` and `.DS_Store`. |
+| `files.max_file_bytes` | int | `1048576` | Larger files are listed but not opened. |
+| `files.max_entries` | int | `2000` | Entries shown per directory; the tree says how many more there are. |
 
 ## xmemory (optional, alongside memU)
 

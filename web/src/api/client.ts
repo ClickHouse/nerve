@@ -1246,6 +1246,39 @@ async function healthGeneration(): Promise<string | null> {
   }
 }
 
+/** Why a workspace file opens read-only: not a memory file, or a locked instance. */
+export type ReadOnlyReason = 'not_memory' | 'lockdown' | null;
+
+export interface WorkspaceEntry {
+  name: string;
+  /** From the workspace root, e.g. `drafts/plan.md`. */
+  path: string;
+  type: 'file' | 'directory';
+  modified?: string;
+  size?: number;
+  read_only?: boolean;
+  read_only_reason?: ReadOnlyReason;
+}
+
+export interface WorkspaceListing {
+  path: string;
+  entries: WorkspaceEntry[];
+  total: number;
+  /** More than `files.max_entries` entries; only the first ones are listed. */
+  truncated: boolean;
+}
+
+export interface WorkspaceFile {
+  path: string;
+  name: string;
+  size: number;
+  content: string;
+  binary: boolean;
+  too_large: boolean;
+  read_only: boolean;
+  read_only_reason: ReadOnlyReason;
+}
+
 export const api = {
   // Auth
   /**
@@ -1715,6 +1748,12 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ content }),
     }),
+
+  // Workspace (read-only browsing for the Files page)
+  listWorkspaceDir: (path: string) =>
+    request<WorkspaceListing>(`/workspace/list?path=${encodeURIComponent(path)}`),
+  readWorkspaceFile: (path: string) =>
+    request<WorkspaceFile>(`/workspace/file?path=${encodeURIComponent(path)}`),
 
   // memU
   getMemuData: () => request<any>('/memory/memu'),

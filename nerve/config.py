@@ -4420,6 +4420,65 @@ class LangfuseConfig:
         )
 
 
+#: Always hidden from the Files page unless ``files.default_excludes`` is off:
+#: version-control internals and build caches nobody browses.
+DEFAULT_FILES_EXCLUDES: tuple[str, ...] = (
+    ".git",
+    "node_modules",
+    "__pycache__",
+    ".venv",
+    "*.pyc",
+    ".DS_Store",
+)
+
+
+@dataclass
+class FilesConfig:
+    """The Files page: a read-only view of the whole workspace.
+
+    ``exclude`` holds gitignore-style patterns that are hidden from the
+    listing and refused by the read route. A pattern without a ``/``
+    (``tmp``, ``*.log``) matches a file or directory of that name at any
+    depth. A pattern with a ``/`` (``repos/clickhouse-private``,
+    ``drafts/*.tmp``) matches the path from the workspace root. A trailing
+    ``/`` (``build/``) matches directories only. Matching is ``fnmatch``,
+    case-sensitive. The patterns add to :data:`DEFAULT_FILES_EXCLUDES`
+    unless ``default_excludes`` is false.
+
+    Only the memory markdown files (``*.md`` at the root and under
+    ``memory/``) stay editable; every other file opens read-only.
+    """
+
+    exclude: list[str] = field(default_factory=list)
+    default_excludes: bool = True
+    # Larger files list but don't open; download them instead.
+    max_file_bytes: int = 1024 * 1024
+    # Per directory: the rest is cut off and the listing says so.
+    max_entries: int = 2000
+
+    @property
+    def patterns(self) -> list[str]:
+        base = list(DEFAULT_FILES_EXCLUDES) if self.default_excludes else []
+        return base + [p for p in self.exclude if p not in base]
+
+    @classmethod
+    @_coerced
+    def from_dict(cls, d: Any) -> FilesConfig:
+        if not isinstance(d, dict):
+            return cls()
+        raw = d.get("exclude") or []
+        if isinstance(raw, str):
+            raw = [raw]
+        exclude = [str(p).strip() for p in raw if str(p).strip()]
+        return cls(
+            exclude=exclude,
+            # Raw values: @_coerced turns "false" / "2000" into the declared types.
+            default_excludes=d.get("default_excludes", True),
+            max_file_bytes=d.get("max_file_bytes", 1024 * 1024),
+            max_entries=d.get("max_entries", 2000),
+        )
+
+
 @dataclass
 class XmemoryConfig:
     """xmemory.ai structured memory — optional, runs alongside memU.
@@ -4572,6 +4631,7 @@ class NerveConfig:
     houseofagents: HouseOfAgentsConfig = field(default_factory=HouseOfAgentsConfig)
     langfuse: LangfuseConfig = field(default_factory=LangfuseConfig)
     xmemory: XmemoryConfig = field(default_factory=XmemoryConfig)
+    files: FilesConfig = field(default_factory=FilesConfig)
     mcp_endpoint: McpEndpointConfig = field(default_factory=McpEndpointConfig)
     mcp_apps: McpAppsConfig = field(default_factory=McpAppsConfig)
     artifacts: ArtifactsConfig = field(default_factory=ArtifactsConfig)
@@ -5076,6 +5136,7 @@ class NerveConfig:
             houseofagents=HouseOfAgentsConfig.from_dict(d.get("houseofagents", {})),
             langfuse=LangfuseConfig.from_dict(d.get("langfuse", {})),
             xmemory=XmemoryConfig.from_dict(d.get("xmemory", {})),
+            files=FilesConfig.from_dict(d.get("files", {})),
             mcp_endpoint=McpEndpointConfig.from_dict(d.get("mcp_endpoint", {})),
             mcp_apps=McpAppsConfig.from_dict(d.get("mcp_apps") or {}),
             artifacts=ArtifactsConfig.from_dict(d.get("artifacts") or {}),

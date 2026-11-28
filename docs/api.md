@@ -2124,6 +2124,65 @@ Response: { "deleted": true }
 Response: { "deleted": false }
 ```
 
+### Workspace Files
+
+Read-only browsing for the Files page. Paths are relative to the workspace root.
+Paths matched by `files.exclude` (see [config.md](config.md#files-page)), paths
+outside the workspace, and symlinks that lead to either get 404. There is no
+write route: saves go through `PUT /api/memory/file/{path}`.
+
+#### `GET /api/workspace/list?path=<dir>`
+One directory's visible children, directories first. `path` is empty for the root.
+
+```json
+Response: {
+  "path": "drafts",
+  "entries": [
+    { "name": "plan.md", "path": "drafts/plan.md", "type": "file", "size": 812,
+      "modified": "2026-11-10T01:00:00+00:00",
+      "read_only": true, "read_only_reason": "not_memory" }
+  ],
+  "total": 1,
+  "truncated": false
+}
+```
+
+`read_only_reason` is `not_memory` (only memory markdown is writable) or
+`lockdown` (a reviewed file on a locked instance), and `null` for a file that
+`PUT /api/memory/file` would save. Directories carry no write state. Past
+`files.max_entries`, `truncated` is true and `total` counts every entry.
+
+#### `GET /api/workspace/file?path=<file>`
+A file's text, as UTF-8. A binary or non-UTF-8 file comes back with
+`binary: true`, and a file over `files.max_file_bytes` with `too_large: true`.
+Either way `content` is empty.
+
+```json
+Response: { "path": "TOOLS.md", "name": "TOOLS.md", "size": 17325, "content": "...",
+            "binary": false, "too_large": false,
+            "read_only": false, "read_only_reason": null }
+```
+
+#### `GET /api/workspace/download?path=<file>`
+The file itself, as `application/octet-stream` with
+`Content-Disposition: attachment`, under the name the path asks for. The same
+404s as the read route apply, and `files.max_file_bytes` does not: this is how
+the Files page offers binary and oversized files. A link can't send a header,
+so the page passes the session token as `?token=`.
+
+With `?inline=1`, a raster image (by extension: `.png`, `.jpg`/`.jpeg`, `.gif`,
+`.webp`, `.avif`, `.bmp`) comes back under its own type with
+`Content-Disposition: inline`, `X-Content-Type-Options: nosniff` and
+`Content-Security-Policy: default-src 'none'; img-src 'self' data:; sandbox`, for
+the Files page preview. Any other file ignores the flag and stays an attachment.
+
+#### `GET /api/files/uploads/{id}`
+A file uploaded to a chat. A raster image (PNG, JPEG, GIF, WebP, AVIF, BMP, by
+its stored type) is sent inline with the headers above, so it opens in a tab
+instead of downloading. Any other type, SVG and HTML included, is an
+attachment, because opened as a page of the panel's origin a script in it could
+read the session token. `?download=1` makes an image an attachment too.
+
 ### Preview
 
 What the Preview tab of the web UI reads (see
