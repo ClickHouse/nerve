@@ -238,6 +238,27 @@ async def test_a_failing_stop_does_not_hide_the_startup_failure(harness, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_startup_removes_the_calling_sessions_variables(harness, monkeypatch, caplog):
+    """Started from a session's shell, the server does not keep that
+    session's identity for the CLIs it spawns."""
+    import os
+
+    monkeypatch.setenv("NERVE_SESSION_ID", "old-session")
+    monkeypatch.setenv("NERVE_MCP_TOKEN", "old-mcp-token")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "old-cli-session")
+    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-REPLACE")
+
+    with caplog.at_level("INFO", logger="nerve.gateway.server"):
+        async with harness["server"].lifespan(MagicMock()):
+            for name in ("NERVE_SESSION_ID", "NERVE_MCP_TOKEN", "CLAUDE_CODE_SESSION_ID"):
+                assert name not in os.environ
+            assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-REPLACE"
+
+    assert "CLAUDE_CODE_SESSION_ID" in caplog.text
+    assert "NERVE_SESSION_ID" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_a_successful_startup_still_stops_everything_at_shutdown(harness):
     """The ordinary path is unchanged: start, serve, then the shutdown half."""
     async with harness["server"].lifespan(MagicMock()):
